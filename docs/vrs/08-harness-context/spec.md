@@ -15,11 +15,14 @@ replicated-record names — `src/harness_context.rs`, with the invariant rows
 *Harness context discipline* and *Replicated-path discipline* naming their
 proofs.
 
-**No producer ships yet.** Every row of the producer table below, the
-per-harness fixtures (HC-R13), and the status-line tee (HC-R18) remain
-unimplemented, so in the shipped tree the record is written by nothing and every
-declaration's `context` reads `null`. That is the honest state, not a defect of
-the envelope.
+**One producer ships: claude.** The status-line tee (HC-R18), the Claude fill
+arithmetic, its compaction accounting, and its version-pinned fixtures (HC-R13)
+are in the tree as of 2026-08-29 — `hooks/claude-statusline.sh`,
+`st2 driver claude-statusline`, and the `PreCompact`/`PostCompact`
+registrations, with the invariant row *Status-line slot chaining* naming their
+proofs. The remaining four rows of the producer table are unimplemented, so a
+codex, pi, omp, or opencode declaration's `context` still reads `null`. That is
+the honest state, not a defect of the envelope.
 
 The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
@@ -414,14 +417,36 @@ a human's status line keeps working:
 
 ```text
 .claude/settings.local.json (st2-rendered)
-  statusLine: { type: "command", command: "<st2 status-line tee>", refreshInterval: 5 }
+  statusLine: { type: "command", command: "\"$ST_HOOKS/claude-statusline.sh\"",
+                padding: 0, refreshInterval: 5 }
 
-tee:  stdin JSON --> st2 driver claude-observe (writes harness-context)
-                 --> exec the downstream renderer, resolved in order:
+tee:  stdin JSON --> st2 driver claude-statusline (writes harness-context)
+                 --> run the downstream renderer, resolved in order:
                        1. $ST_CLAUDE_STATUSLINE_RENDERER
                        2. ~/.claude/statusline-renderer.json  -> .command
                  --> if neither resolves: pass stdin through unchanged
 ```
+
+**The subcommand, decided during implementation (2026-08-29):
+`st2 driver claude-statusline`,** a sibling of `claude-observe` rather than an
+event on it. An earlier draft of the diagram above named `claude-observe`, which
+reads well and is wrong in one specific way: that command's contract is "apply
+one Claude HOOK EVENT to observed harness state", and the status line is not a
+hook — `StatusLine` is a settings key and is deliberately absent from Claude's
+registerable event list. Routing it through the hook command would have dragged
+`observe_hook_event`'s event classification and the `SessionStart` claim onto a
+payload that is neither.
+
+The tee spawns the renderer and writes the payload to its stdin rather than
+`exec`ing it, because st2 has already consumed that stdin to record the reading.
+The renderer is run as a shell command line, exactly as Claude runs its own
+`statusLine.command`. Failure is one-directional: a renderer that cannot be
+*started* falls back to the passthrough, while a renderer that started and then
+failed does not — it may already have written a partial line, and appending the
+raw JSON would corrupt the status line rather than restore it. All three settings
+keys are carried: `padding: 0`, and `refreshInterval: 5`, which is what makes the
+record a live reading rather than one frozen between turns and is well inside the
+300-second write heartbeat.
 
 **Renderer resolution, settled** (`DQ-C2`, closed 2026-08-29 by dotfiles
 PR #2160). Two sources in strict order, first hit wins:
@@ -443,8 +468,10 @@ status line has one place to look for it. The file's schema string follows the
 dotfiles namespace rather than st2's, because dotfiles owns the file and its
 shape; st2 reads `command` and nothing else.
 
-The Claude producer slice implements this; nothing in the shipped tree resolves
-a renderer yet.
+The Claude producer implements this. Resolution reads `command` from the file
+and nothing else, so a future key dotfiles adds is inert here rather than a
+second source of truth; an absent `$HOME`, an unreadable file, an unparseable
+one, or an empty `command` each fall through to the next source.
 
 **Chaining is mandatory, not a courtesy** (HC-R18). When no downstream renderer
 resolves, the tee passes its stdin through unchanged rather than discarding it —
@@ -486,10 +513,36 @@ subagent is saturating reports the parent's fill — the grain question is
 
 Compaction comes from hooks regardless of the status line: `PreCompact` and
 `PostCompact` carry `trigger ∈ manual | auto`, and `SessionStart` carries
-`source: "compact"` as a third post-compaction edge. `PreCompact` must be routed
+`source: "compact"` as a third post-compaction edge. `PreCompact` is routed
 through the observe hook **in addition to** the existing pre-compact stub script
 that writes a working-state reconstruction — the two do different jobs and the
 registration carries both.
+
+**The dedupe across three edges, decided during implementation (2026-08-29).**
+One compaction raises all three events, and each arrives in its own short-lived
+hook process with nothing durable passed between them, so a counter that
+incremented on more than one would treble-count every compaction. The dedupe is
+therefore *positional* rather than stateful:
+
+| Edge | Counts | Also does |
+| --- | --- | --- |
+| `PreCompact` | yes — the sole counting edge | writes `trigger` and `lastCompactionMs` |
+| `PostCompact` | no — holds the count it reads | advances `lastCompactionMs` from when compaction started to when the window was emptied |
+| `SessionStart source=compact` | no — deliberately inert | nothing; it is the same compaction seen a third time |
+
+Counting on the **first** edge is what makes the dedupe need no memory. The
+alternative — "count on the second only if the first was seen" — requires
+per-compaction state the record deliberately does not carry (HC-T02), and buys
+nothing: `PreCompact` fires for every compaction, including one whose
+`PostCompact` never arrives because the compaction ended the session or a future
+build dropped the event. The one case where `PostCompact` does count is when it
+finds no counted compaction at all — no record, or one whose `PreCompact` write
+never landed — because it is then the first evidence st2 has, and losing the
+event entirely would be worse than attributing it to the later edge.
+
+A compaction carrying an `agent_id` is a subagent's and never touches the record,
+matching the categorical producer's guard for the same reason: this record
+describes the top-level window (`DQ-C9`).
 
 ### codex (codex-cli 0.150.1)
 
@@ -768,7 +821,12 @@ each only once a real test proves it (per `CLAUDE.md`):
 - **Status-line slot chaining** (HC-R18) — a rendered status-line registration
   invokes the operator's downstream renderer. The slot is single-valued and the
   winner replaces rather than merges, so a test that only checks st2's command
-  is present would pass while the operator's renderer is silently gone.
+  is present would pass while the operator's renderer is silently gone. The
+  proofs therefore run the tee as a process and assert its exact stdout bytes:
+  the renderer's line and only the renderer's line, the verbatim passthrough
+  where none resolves, and a rendered line still produced when recording fails.
+  Landed as the invariant row *Status-line slot chaining*
+  (`tests/claude_statusline.rs`).
 - **Per-harness fixture tests** (HC-R13) — one per producer, each decoding a
   payload captured verbatim from the version named in the producer table and
   asserting the resulting triple, with the version asserted literally. The Codex
@@ -776,6 +834,21 @@ each only once a real test proves it (per `CLAUDE.md`):
   `tokens` stops meaning prompt-only input; the OpenCode fixture must include a
   post-compaction message list so a producer that stops skipping summary
   messages fails it.
+
+  **Claude's two fixtures and what each proves.**
+  `tests/fixtures/harness-context/claude-statusline-pre-turn.json` is the
+  verbatim 2.1.250 live capture and proves the withholding — including that
+  `usedTokens` is `null` rather than the `total_input_tokens: 0` sitting beside
+  it. `claude-statusline-mid-session.json` is a **composition**, stated here
+  because it bounds what the fixture proves: the envelope, `context_window_size`,
+  and `rate_limits` are that same verbatim capture, the `current_usage` object is
+  a verbatim `usage` object off an assistant line of a real 2.1.250 transcript,
+  and `used_percentage` / `total_input_tokens` are what the bundle's own builder
+  computes from the two. So each operand is measured and the arithmetic joining
+  them is quoted from the harness, but 2.1.250 was never observed emitting
+  exactly these bytes together — a populated live capture needs a paid turn and
+  none was taken. A bump that moves the numerator's terms or the percent rule
+  still fails the fixture, which is what HC-R13 asks of it.
 
 ## Open design questions
 

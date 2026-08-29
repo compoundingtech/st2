@@ -10,11 +10,12 @@
 //! loop re-stamps and terminates the record through [`SessionObserver`] without ever overwriting a
 //! state a hook wrote in between.
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
+use crate::harness_context::{self, Compaction, CompactionTrigger, Harness, RateLimits, Reading};
 use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
     PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
@@ -84,6 +85,13 @@ pub fn run_observe(
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    // The numeric axis is independent of the categorical one and is applied first, because the
+    // events that carry a compaction edge say nothing about top-level harness state and would
+    // otherwise return below. Fail-open: a context record that cannot be written must never stop
+    // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
+    if let Err(error) = observe_compaction(&agent_dir, identity, event, &payload) {
+        tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
+    }
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
@@ -134,11 +142,7 @@ fn observe_writer(
             None => writer.with_session(session),
         };
     }
-    if let Some(id) = payload
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-    {
-        let token = format!("{}{id}", harness_state::WRAPPERLESS_PREFIX);
+    if let Some(token) = wrapperless_token(payload) {
         if event == "SessionStart" {
             // Eligibility and the written takeover are ONE act under the record lock: a
             // hooks-only SessionStart racing a wrapper's startup can no longer steal the
@@ -159,6 +163,273 @@ fn observe_writer(
         return writer.with_session(token);
     }
     writer
+}
+
+/// Claude's own session id under the wrapperless prefix, for a seat that runs `claude` directly
+/// with no session wrapper to export a token.
+///
+/// Factored out so [`observe_writer`] and [`context_writer`] derive the same token from the same
+/// payload field: the hook subprocesses and the status-line tee of one seat must publish ONE
+/// incarnation, or a reader could not tell a straggler from a sibling (HC-A03, HC-R15).
+fn wrapperless_token(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| format!("{}{id}", harness_state::WRAPPERLESS_PREFIX))
+}
+
+/// The Claude harness-context writer for one driver subprocess, under the ownership
+/// [`observe_writer`] selects: the wrapper's exported token when a wrapper launched this seat,
+/// otherwise Claude's own session id under the wrapperless prefix.
+///
+/// The claim half of that selection is deliberately absent. `incarnation` on this record is
+/// PROVENANCE and is never consulted as a fence (HC-R15), so there is nothing here to claim —
+/// which is also why the status-line tee, which is not a hook and has no session boundary, can
+/// share the selection without sharing the takeover.
+fn context_writer(
+    agent_dir: &Path,
+    identity: &str,
+    payload: &serde_json::Value,
+) -> Result<harness_context::Writer> {
+    let writer = harness_context::Writer::new(agent_dir, identity, Harness::Claude)?;
+    let exported = std::env::var(SESSION_ENV).ok().filter(|t| !t.is_empty());
+    Ok(match exported.or_else(|| wrapperless_token(payload)) {
+        Some(token) => writer.with_session(token),
+        None => writer,
+    })
+}
+
+/// Apply one Claude compaction edge to the agent's harness-context record (HC-R12).
+///
+/// Claude publishes THREE edges for one compaction — `PreCompact`, `PostCompact`, and a
+/// `SessionStart` carrying `source: "compact"` — and each arrives in its own short-lived hook
+/// process with nothing durable passed between them. A counter incrementing on more than one of
+/// them would treble-count every compaction, so the dedupe is positional rather than stateful:
+///
+/// - **`PreCompact` is the sole counting edge.** It is the first, it fires for every compaction
+///   including one whose `PostCompact` never arrives (a compaction that ends the session, or a
+///   future build that drops the event), and it carries `trigger`. Counting on the FIRST edge is
+///   what makes the dedupe stateless — "count on the second only if the first was seen" would
+///   need per-compaction memory the record deliberately does not carry (HC-T02).
+/// - **`PostCompact` does not count.** It holds the count it finds and advances
+///   `lastCompactionMs` from when compaction *started* to when the window was actually emptied.
+///   Only if it finds no counted compaction at all — no record, or one whose `PreCompact` write
+///   never landed — does it count, because it is then the first evidence st2 has.
+/// - **`SessionStart source=compact` is recognized and deliberately inert.** It is the same
+///   compaction seen a third time; counting it is exactly the double count HC-R12 forbids.
+///
+/// The counter is incarnation-scoped: st2 does the counting, and `harness-context` is removed at
+/// the relaunch claim (HC-R15), so the count describes this incarnation and not the seat's life.
+fn observe_compaction(
+    agent_dir: &Path,
+    identity: &str,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    // A subagent's compaction is not the top-level session's, and this record describes the
+    // top-level window (the status-line payload carries no subagent window either — DQ-C9). The
+    // guard matches `observe_hook_event`'s for the same reason.
+    if payload
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Ok(());
+    }
+    let trigger = compaction_trigger(payload);
+    let edge = match event {
+        "PreCompact" => Compaction::new(trigger),
+        "PostCompact" => {
+            match harness_context::read(&harness_context::harness_context_path(agent_dir)) {
+                Some(observed) if observed.compactions > 0 => {
+                    Compaction::new(trigger).with_count(observed.compactions)
+                }
+                _ => Compaction::new(trigger),
+            }
+        }
+        _ => return Ok(()),
+    };
+    context_writer(agent_dir, identity, payload)?
+        .compacted(edge)
+        .map(|_landed| ())
+}
+
+/// The trigger word a Claude compaction hook carries. 2.1.250 publishes `manual` and `auto` on
+/// both `PreCompact` and `PostCompact`; the vocabulary is closed and additive-tolerant, so a word
+/// this version does not publish decodes as `unknown` rather than as a definite trigger.
+fn compaction_trigger(payload: &serde_json::Value) -> CompactionTrigger {
+    match payload.get("trigger").and_then(serde_json::Value::as_str) {
+        Some("manual") => CompactionTrigger::Manual,
+        Some("auto") => CompactionTrigger::Auto,
+        _ => CompactionTrigger::Unknown,
+    }
+}
+
+/// The Claude Code version this producer's arithmetic was measured against (HC-R13). A bump that
+/// moves the numerator, the denominator, or the percent rule must fail the fixture rather than
+/// silently publish a differently-meaning number.
+pub const STATUSLINE_VERSION: &str = "2.1.250";
+
+/// The environment variable holding the operator's downstream status-line renderer. Checked
+/// FIRST, so one agent, a debugging session, or a test can override without editing a file.
+pub const STATUSLINE_RENDERER_ENV: &str = "ST_CLAUDE_STATUSLINE_RENDERER";
+
+/// The operator-owned renderer file, relative to `$HOME`. Schema
+/// `dotfiles.claude-statusline-renderer.v1`, carrying `{"command": …}` — dotfiles owns the file
+/// and its shape, and st2 reads `command` and nothing else (`DQ-C2`, dotfiles PR #2160).
+///
+/// It is a file rather than a settings key because the settings file st2 wins in is the one st2
+/// rewrites: a renderer declared there would be the very thing the merge does not preserve, which
+/// is HC-R18's inverse. A user-level file st2 never writes has no such hazard.
+const STATUSLINE_RENDERER_FILE: &str = ".claude/statusline-renderer.json";
+
+/// Project one Claude status-line payload onto a harness-context reading (HC-R02, HC-R03).
+///
+/// The status-line payload is the ONLY Claude channel carrying a window: hook payloads have no
+/// token fields at all, and the transcript has per-message `usage` but no window size, so a
+/// transcript-only producer would have to invent the denominator from a model table — which
+/// cannot tell a 200k tier from a 1M tier for one model id, and is exactly what HC-R02 forbids.
+///
+/// The numerator is read from `current_usage`, NOT from the sibling `total_input_tokens`. They
+/// agree whenever Claude knows its occupancy — the bundle's builder defines the latter as
+/// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` of `current_usage` —
+/// but it emits `0` for it precisely when `current_usage` is null, so before the session's first
+/// API response the sibling is a zero DERIVED FROM AN ABSENCE. Reading `current_usage` makes the
+/// withholding structural: no reading, no numerator (HC-R03).
+///
+/// `used_percent` is Claude's own integer, already clamped to 0..100 by `QUt` in the bundle, and
+/// st2 never recomputes it from the operands (HC-R02). `sessionTotalTokens` is `null`: the
+/// payload's `total_*` keys describe the last response, not the session, and calling them
+/// cumulative would be the exact confusion HC-R16 names.
+pub fn statusline_reading(payload: &serde_json::Value) -> Reading {
+    let window = payload.pointer("/context_window");
+    let usage = window
+        .and_then(|window| window.get("current_usage"))
+        .filter(|usage| !usage.is_null());
+    Reading {
+        used_tokens: usage.map(|usage| {
+            [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .into_iter()
+            .filter_map(|key| usage.get(key).and_then(serde_json::Value::as_u64))
+            .sum()
+        }),
+        window_tokens: window
+            .and_then(|window| window.get("context_window_size"))
+            .and_then(serde_json::Value::as_u64),
+        used_percent: window
+            .and_then(|window| window.get("used_percentage"))
+            .and_then(serde_json::Value::as_f64),
+        model: payload
+            .pointer("/model/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        cost_usd: payload
+            .pointer("/cost/total_cost_usd")
+            .and_then(serde_json::Value::as_f64),
+        // The payload's `total_input_tokens`/`total_output_tokens` describe the LAST RESPONSE.
+        // Claude publishes no cumulative session total, and a producer accumulating one itself
+        // would be maintaining a second running total whose correctness depends on having seen
+        // every render — a worse answer than none (HC-R16).
+        session_total_tokens: None,
+        rate_limits: RateLimits {
+            five_hour: payload
+                .pointer("/rate_limits/five_hour/used_percentage")
+                .and_then(serde_json::Value::as_f64),
+            seven_day: payload
+                .pointer("/rate_limits/seven_day/used_percentage")
+                .and_then(serde_json::Value::as_f64),
+        },
+    }
+}
+
+/// The status-line tee: record the payload, then chain to the operator's own renderer (HC-R18).
+///
+/// Claude's `statusLine` is a SINGLE slot whose winning declaration replaces the others outright
+/// — measured 2026-08-29 against 2.1.250 through a real pty, `.claude/settings.local.json` >
+/// `.claude/settings.json` > `~/.claude/settings.json`, with the losing renderer never invoked.
+/// Since `.claude/settings.local.json` is exactly the file st2 materializes for a driver-declared
+/// seat, an st2 entry that does not chain would silently and unconditionally remove the
+/// operator's status line on every managed agent, with no warning.
+///
+/// So every failure here degrades to a rendered line, never a blank one: the payload is read
+/// first, recording is best-effort and only warns (on stderr — stdout belongs to the renderer),
+/// and a renderer that cannot be spawned falls back to passing the bytes through. A renderer that
+/// spawns and then fails is NOT followed by a passthrough: it may already have written a partial
+/// line, and appending the raw JSON to it would corrupt the status line rather than restore it.
+pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
+    crate::metrics::record_hook_invocation("claude-statusline", "StatusLine");
+    let mut raw = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut raw);
+    if let Err(error) = record_statusline(catalog_root, identity, &raw) {
+        tracing::warn!("st2 claude-statusline: recording failed; chaining anyway: {error:#}");
+    }
+    chain_statusline(&raw)
+}
+
+fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
+    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+        .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    context_writer(&agent_dir, identity, &payload)?
+        .observe(statusline_reading(&payload))
+        .map(|_landed| ())
+}
+
+/// Two sources in strict order, first hit wins, never merged and never both — so the resolution
+/// has one answer and an operator debugging their status line has one place to look for it.
+/// Neither resolving is the third case, handled by the caller as a verbatim passthrough.
+fn downstream_renderer() -> Option<String> {
+    if let Some(command) = std::env::var(STATUSLINE_RENDERER_ENV)
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+    {
+        return Some(command);
+    }
+    let path = std::path::PathBuf::from(std::env::var_os("HOME")?).join(STATUSLINE_RENDERER_FILE);
+    let declaration: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    declaration
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn chain_statusline(raw: &[u8]) -> Result<()> {
+    let Some(command) = downstream_renderer() else {
+        return passthrough(raw);
+    };
+    // The renderer is a shell command line, exactly as Claude's own `statusLine.command` is, so
+    // it is run the way Claude would run it.
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(
+                "st2 claude-statusline: downstream renderer `{command}` could not start: {error}"
+            );
+            return passthrough(raw);
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(raw);
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
+fn passthrough(raw: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(raw)?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Map one Claude hook event to an observation, or `None` when the event says nothing about
@@ -581,6 +852,222 @@ mod tests {
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Active
+        );
+    }
+
+    /// The status-line payload captured verbatim from the version in the producer table, before
+    /// the session's first API response.
+    const PRE_TURN: &str =
+        include_str!("../tests/fixtures/harness-context/claude-statusline-pre-turn.json");
+    /// The same captured 2.1.250 envelope with a real `current_usage` object composed into it.
+    ///
+    /// **Composition, stated because it matters for what this fixture proves.** The envelope, its
+    /// `context_window_size`, and its `rate_limits` are the verbatim 2.1.250 live capture; the
+    /// `current_usage` object is a verbatim `usage` object off an assistant line of a real
+    /// 2.1.250 transcript (`claude-opus-5`, 2026-08-29T11:46:14Z), and `used_percentage` /
+    /// `total_input_tokens` are what the bundle's own builder computes from the two:
+    ///
+    /// ```js
+    /// total_input_tokens: d.input_tokens + d.cache_creation_input_tokens + d.cache_read_input_tokens
+    /// used: Math.min(100, Math.max(0, Math.round(r / t * 100)))
+    /// ```
+    ///
+    /// So the numerator and the denominator are each measured, and the arithmetic joining them is
+    /// quoted from the harness rather than inferred. What this fixture does NOT prove is that
+    /// 2.1.250 emits exactly these bytes together in one payload — a populated live capture needs
+    /// a paid turn and none was taken. A bump that moves the numerator's terms or the percent rule
+    /// still fails here, which is what HC-R13 asks of it.
+    const MID_SESSION: &str =
+        include_str!("../tests/fixtures/harness-context/claude-statusline-mid-session.json");
+
+    fn fixture(raw: &str) -> serde_json::Value {
+        let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
+        // HC-R13: the version is asserted literally, so a fixture recaptured from a different
+        // build cannot quietly keep proving the old arithmetic.
+        assert_eq!(
+            payload.get("version").and_then(serde_json::Value::as_str),
+            Some(STATUSLINE_VERSION)
+        );
+        payload
+    }
+
+    #[test]
+    fn a_mid_session_statusline_payload_yields_claudes_own_triple() {
+        let reading = statusline_reading(&fixture(MID_SESSION));
+
+        // input 2 + cache_creation 2837 + cache_read 191924, read off `current_usage` rather
+        // than off the sibling `total_input_tokens` that agrees with it here.
+        assert_eq!(reading.used_tokens, Some(194_763));
+        assert_eq!(reading.window_tokens, Some(1_000_000));
+        // Claude's own integer, taken as published: st2 never divides the operands to make one.
+        assert_eq!(reading.used_percent, Some(19.0));
+        assert_eq!(reading.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(reading.cost_usd, Some(4.7312));
+        assert_eq!(reading.rate_limits.five_hour, Some(31.0));
+        assert_eq!(reading.rate_limits.seven_day, Some(55.0));
+        // The payload's `total_*` keys describe the LAST RESPONSE, so nothing here is cumulative
+        // session spend and the field stays null rather than being fed a number that would read
+        // as occupancy on division (HC-R16).
+        assert_eq!(reading.session_total_tokens, None);
+    }
+
+    #[test]
+    fn a_pre_turn_statusline_payload_withholds_rather_than_reporting_zero() {
+        let reading = statusline_reading(&fixture(PRE_TURN));
+
+        // `current_usage` is null: Claude is positively declaring it does not yet know its own
+        // occupancy, and the producer withholds (HC-R03). The trap is the sibling
+        // `total_input_tokens`, which the bundle's builder emits as 0 for exactly this state —
+        // a zero DERIVED FROM THE ABSENCE, which a producer reading it would publish as a
+        // measurement of an empty window.
+        assert_eq!(reading.used_tokens, None);
+        assert_eq!(reading.used_percent, None);
+        // The window is populated from the start and is reported (HC-R02): a legal record with a
+        // window and no percent.
+        assert_eq!(reading.window_tokens, Some(1_000_000));
+        // Zero cost is an observation, not an absence: a producer filtering it to null would
+        // lose the distinction between "free so far" and "not reported".
+        assert_eq!(reading.cost_usd, Some(0.0));
+        assert_eq!(reading.model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(reading.rate_limits.five_hour, Some(31.0));
+    }
+
+    fn agent_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        // One level down, so the writer has a parent to stage in outside the agent subtree.
+        let dir = tmp.path().join("agents/Silber/fabric");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn context(dir: &Path) -> crate::harness_context::Observed {
+        harness_context::read(&harness_context::harness_context_path(dir)).unwrap()
+    }
+
+    #[test]
+    fn a_pre_turn_reading_lands_once_and_then_sits_inside_its_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = agent_dir(&tmp);
+        let payload = fixture(PRE_TURN);
+
+        let mut writer = context_writer(&dir, "Silber.fabric", &payload).unwrap();
+        assert!(writer.observe(statusline_reading(&payload)).unwrap());
+        // A withheld percent has no bucket, so a second identical render is inside the written
+        // one and, well inside the heartbeat, writes nothing. That is the write guard (HC-R09)
+        // proved on the Claude path: a 5-second refresh interval does not mean 720 writes an hour.
+        assert!(!writer.observe(statusline_reading(&payload)).unwrap());
+
+        let observed = context(&dir);
+        assert_eq!(observed.harness, Harness::Claude);
+        assert_eq!(observed.used_percent, None);
+        assert_eq!(observed.window_tokens, Some(1_000_000));
+        assert_eq!(observed.compactions, 0);
+    }
+
+    #[test]
+    fn claudes_three_compaction_edges_count_one_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = agent_dir(&tmp);
+        let session = serde_json::json!({"session_id": "s-1"});
+        let mut payload = session.clone();
+        payload["trigger"] = "auto".into();
+
+        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        let counted = context(&dir);
+        assert_eq!(counted.compactions, 1);
+        assert_eq!(
+            counted.last_compaction_trigger,
+            Some(CompactionTrigger::Auto)
+        );
+
+        // The completion edge holds the count and only moves `lastCompactionMs` forward.
+        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        let completed = context(&dir);
+        assert_eq!(
+            completed.compactions, 1,
+            "PostCompact must not double-count"
+        );
+        assert!(completed.last_compaction_ms >= counted.last_compaction_ms);
+
+        // The third sighting of the same compaction. `SessionStart source=compact` is recognized
+        // and deliberately inert — counting it is exactly the double count HC-R12 forbids.
+        let mut restart = session;
+        restart["source"] = "compact".into();
+        observe_compaction(&dir, "Silber.fabric", "SessionStart", &restart).unwrap();
+        assert_eq!(context(&dir).compactions, 1);
+    }
+
+    #[test]
+    fn a_post_compact_without_a_counted_predecessor_counts_the_compaction_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = agent_dir(&tmp);
+        let payload = serde_json::json!({"session_id": "s-1", "trigger": "manual"});
+
+        // No record at all: the PreCompact write never landed, so PostCompact is the first
+        // evidence st2 has that a compaction happened and it counts rather than losing it.
+        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        let observed = context(&dir);
+        assert_eq!(observed.compactions, 1);
+        assert_eq!(
+            observed.last_compaction_trigger,
+            Some(CompactionTrigger::Manual)
+        );
+    }
+
+    #[test]
+    fn a_subagents_compaction_never_touches_the_top_level_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = agent_dir(&tmp);
+        let payload = serde_json::json!({
+            "session_id": "s-1", "trigger": "auto", "agent_id": "sub-7"
+        });
+
+        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        assert!(harness_context::read(&harness_context::harness_context_path(&dir)).is_none());
+    }
+
+    #[test]
+    fn an_unrecognized_trigger_word_decodes_as_unknown_not_as_a_definite_one() {
+        assert_eq!(
+            compaction_trigger(&serde_json::json!({"trigger": "auto"})),
+            CompactionTrigger::Auto
+        );
+        assert_eq!(
+            compaction_trigger(&serde_json::json!({"trigger": "manual"})),
+            CompactionTrigger::Manual
+        );
+        // Additive tolerance in the direction that matters: a future word must not be guessed
+        // into the closed vocabulary as if the harness had said it.
+        assert_eq!(
+            compaction_trigger(&serde_json::json!({"trigger": "idle"})),
+            CompactionTrigger::Unknown
+        );
+        assert_eq!(
+            compaction_trigger(&serde_json::json!({})),
+            CompactionTrigger::Unknown
+        );
+    }
+
+    #[test]
+    fn the_tees_incarnation_is_the_same_token_the_hooks_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = agent_dir(&tmp);
+        let payload = serde_json::json!({"session_id": "abc"});
+
+        // HC-A03: the wrapper's hook subprocesses and its status-line tee are driver processes of
+        // ONE session, and they must publish one incarnation or a reader could not tell a
+        // straggler from a sibling. Both derive it from the same payload field by the same rule.
+        assert_eq!(
+            wrapperless_token(&payload).as_deref(),
+            Some("claude-session-abc")
+        );
+        context_writer(&dir, "Silber.fabric", &payload)
+            .unwrap()
+            .observe(statusline_reading(&payload))
+            .unwrap();
+        let raw = fs::read_to_string(harness_context::harness_context_path(&dir)).unwrap();
+        assert!(
+            raw.contains("\"incarnation\":\"claude-session-abc\""),
+            "{raw}"
         );
     }
 }

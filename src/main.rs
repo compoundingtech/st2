@@ -363,6 +363,12 @@ enum DriverCmd {
         #[arg(long)]
         event: String,
     },
+    /// Tee Claude's status-line payload (stdin JSON) into harness context, then chain to the
+    /// operator's own renderer.
+    ClaudeStatusline {
+        #[arg(long)]
+        identity: String,
+    },
     /// Run pi under the session-owned presence wrapper.
     PiSession {
         #[arg(long)]
@@ -1025,21 +1031,23 @@ fn main() -> Result<()> {
         command,
     } = Cli::parse();
 
-    let mut telemetry = st2::telemetry::Telemetry::init(
-        if matches!(command, Command::Up { once: false, .. }) {
+    let mut telemetry =
+        st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
             "supervisor"
         } else if matches!(
             command,
             // Hook executions are their own process unit: `st2 driver claude-observe` runs per
             // Claude hook event and records hook_invocations_total, which the documented
-            // process-unit contract assigns to `st2-hook`, not `st2-cli`.
+            // process-unit contract assigns to `st2-hook`, not `st2-cli`. The status-line tee is
+            // the same kind of process — a hook-set script the harness runs, recording the same
+            // metric — and is classified with it rather than as an operator's CLI invocation.
             Command::Driver(DriverCmd::ClaudeObserve { .. })
+                | Command::Driver(DriverCmd::ClaudeStatusline { .. })
         ) {
             "hook"
         } else {
             "cli"
-        },
-    );
+        });
     let result = dispatch(command, catalog_path.as_deref());
     telemetry.shutdown();
     result
@@ -1164,6 +1172,11 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run_observe(&catalog, &identity, runtime_id.as_deref(), &event)
+        }
+        Command::Driver(DriverCmd::ClaudeStatusline { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run_statusline(&catalog, &identity)
         }
         Command::Driver(DriverCmd::OpencodeSession {
             identity,
