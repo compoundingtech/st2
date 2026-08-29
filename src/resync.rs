@@ -971,10 +971,15 @@ impl Worker {
         // Diff paths that were blind before registering newly recovered parents; otherwise the
         // new watch suppresses polling of mutations that happened during the blind interval.
         self.poll_unwatched();
-        let registered = self.refresh_watches();
-        // Registration closes the event gap first; this second digest pass covers writes between
-        // the pre-registration poll and watch installation.
-        self.poll_registered(&registered);
+        // Registration closes the event gap first; a second digest pass then covers writes
+        // between the pre-registration poll and watch installation. That pass spans the whole
+        // watch set, not only the directories this refresh touched: changing the registration
+        // can cost the backend its already-queued events for subscriptions that never moved
+        // (see `refresh_watches`), which is the same loss a backend error means and takes the
+        // same containment. Equal digests keep it silent.
+        if self.refresh_watches() {
+            self.rescan_all();
+        }
     }
 
     fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
@@ -1098,19 +1103,6 @@ impl Worker {
         self.poll_paths(unwatched);
     }
 
-    fn poll_registered(&mut self, directories: &[PathBuf]) {
-        let paths = self
-            .carriers
-            .keys()
-            .filter(|path| {
-                path.parent()
-                    .is_some_and(|parent| directories.iter().any(|dir| dir == parent))
-            })
-            .cloned()
-            .collect();
-        self.poll_paths(paths);
-    }
-
     fn rescan_all(&mut self) {
         self.poll_paths(self.carriers.keys().cloned().collect());
     }
@@ -1119,8 +1111,16 @@ impl Worker {
     /// dropping directories that left the set or were replaced (identity change). A replaced watch
     /// stays blind until the next pass rebuilds it — bounded by the reconcile interval, the same
     /// tradeoff `CatalogDeclarationWatcher` accepts for declarations.
-    fn refresh_watches(&mut self) -> Vec<PathBuf> {
-        let mut registered = Vec::new();
+    ///
+    /// Reports whether the registration set actually changed, because a backend is not obliged to
+    /// leave its other subscriptions undisturbed while it does. `notify`'s macOS FSEvents backend
+    /// stops the single shared stream on every `watch`/`unwatch`, purges the device's pending
+    /// events, and restarts at `kFSEventStreamEventIdSinceNow` — so registering one new directory
+    /// destroys mutations already queued for directories that were watched the whole time. Linux
+    /// inotify adds and removes descriptors on a shared fd and keeps its queue. Callers must treat
+    /// a changed registration as a possible drop across the entire watch set.
+    fn refresh_watches(&mut self) -> bool {
+        let mut changed = false;
         let mut desired: Vec<PathBuf> = Vec::new();
         for path in self.carriers.keys() {
             if let Some(parent) = path.parent() {
@@ -1136,6 +1136,7 @@ impl Worker {
             if stale {
                 if let Some(watcher) = self.watcher.as_mut() {
                     let _ = watcher.unwatch(dir);
+                    changed = true;
                 }
             }
             !stale
@@ -1153,11 +1154,11 @@ impl Worker {
                 .watch(&dir, notify::RecursiveMode::NonRecursive)
                 .is_ok()
             {
-                registered.push(dir.clone());
+                changed = true;
                 self.watched.insert(dir, identity);
             }
         }
-        registered
+        changed
     }
 
     fn mark_mutated(&mut self, paths: Vec<PathBuf>) {
@@ -1195,9 +1196,8 @@ impl Worker {
             }
             drop(dirty_here);
         }
-        if extend {
-            let registered = self.refresh_watches();
-            self.poll_registered(&registered);
+        if extend && self.refresh_watches() {
+            self.rescan_all();
         }
     }
 
@@ -2310,6 +2310,91 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("stream: resync"));
         assert!(events[0].contains("binding: goal"));
+    }
+
+    #[test]
+    fn registering_another_directory_rediffs_the_untouched_watch_set() {
+        // A registration change is not free of the subscriptions it does not name: notify's
+        // macOS FSEvents backend stops the one shared stream on every `watch`, purges the
+        // device's pending events, and restarts at "since now", so mutations already queued for
+        // a directory that stayed in the set are destroyed. The state that leaves behind is a
+        // registered watch that will never report a change that already happened, and the model
+        // here is exact — the live parents are recorded as covered but never handed to the
+        // backend, so no event about them can exist. Only re-diffing the whole set recovers it.
+        let root = tempfile::tempdir().unwrap();
+        let write_agent = |identity: &str| {
+            let agent_dir = root.path().join("agents/alias").join(identity);
+            let resources = agent_dir.join("resources");
+            std::fs::create_dir_all(&resources).unwrap();
+            std::fs::write(
+                agent_dir.join("agent.kdl"),
+                format!(
+                    r#"agent "{identity}" {{
+  host "alias"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}}"#
+                ),
+            )
+            .unwrap();
+            let goal = resources.join("goal.md");
+            std::fs::write(&goal, "before\n").unwrap();
+            (agent_dir, goal)
+        };
+        let (live_dir, live_goal) = write_agent("live");
+        write_agent("joining");
+        crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
+
+        let specs = crate::discover_strict(root.path()).specs;
+        let set_for = |identity: &str| {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.path.starts_with(root.path().join("agents/alias").join(identity)))
+                .expect("both declarations are valid");
+            watch_set_for(spec, "alias", &ResourceProfileRegistry::empty())
+        };
+        let live_set = set_for("live");
+        let joining_set = set_for("joining");
+
+        let (tx, _rx) = channel::<Msg>();
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "alias".to_owned(),
+            carriers: rebuild_carriers(
+                BTreeMap::new(),
+                refresh_for(vec![live_set.clone()]),
+                &BTreeMap::new(),
+            ),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: make_watcher(tx),
+        };
+        worker.watched = worker
+            .carriers
+            .keys()
+            .filter_map(|path| path.parent())
+            .map(|dir| (dir.to_path_buf(), dir_identity(dir)))
+            .collect();
+
+        std::fs::write(&live_goal, "changed with no watch able to report it\n").unwrap();
+
+        // The joining seat contributes directories the backend has not seen, so this refresh
+        // changes the registration set without touching the live subscription's own paths.
+        worker.apply_watch_sets(refresh_for(vec![live_set, joining_set]));
+        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+
+        let event = resync_inbox_event(&live_dir);
+        assert_eq!(event_field(&event, "binding"), "goal");
+        // The joining seat has no inbox at all: its baseline seeded silently, as a new
+        // subscription must, so the rescan is not simply emitting for everything it re-reads.
+        assert!(
+            !root
+                .path()
+                .join("agents/alias/joining/resources/inbox")
+                .exists(),
+            "the joining seat seeds its baseline silently"
+        );
     }
 
     #[cfg(unix)]
