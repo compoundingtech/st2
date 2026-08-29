@@ -4,7 +4,8 @@
 //! Print, reconcile, and materialization use this same expansion.
 
 use agent_spec::spec::{
-    AgentSpec, ClaudeDriver, CodexDriver, Driver, OmpDriver, OpenCodeDriver, PiDriver,
+    AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, OmpDriver, OpenCodeDriver,
+    PiDriver,
 };
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
@@ -12,6 +13,57 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 const ST2: &str = "st2";
 const CATALOG: &str = "$CATALOG";
 const CLAUDE_SERVER: &str = "st2";
+const DEV_CHANNELS_FLAG: &str = "--dangerously-load-development-channels";
+
+/// What a materialized Claude channel server can actually do, given how Claude Code admits
+/// channels.
+///
+/// Claude Code registers a `server:` channel only when its allowed-channels entry carries
+/// `dev: true`, and that flag is set in exactly one place: the merge of the entries parsed from
+/// `--dangerously-load-development-channels`. A Claude seat is therefore always in one of two
+/// states, neither of which is legible from the declaration and neither of which delivers mail on
+/// its own. Measured admission table: compoundingtech/st2#373.
+pub const CHANNEL_NOT_REGISTERED: &str = concat!(
+    "the st2 MCP channel server is materialized, but this seat launches without ",
+    "`--dangerously-load-development-channels`, so Claude Code skips the channel ",
+    "(`server st2 not in --channels list for this session`) and no inbox message reaches ",
+    "the model in-harness; delivery for this seat comes from the DING sidecar only. ",
+    "Adding `--channels server:st2` does not change this: a `server:` entry still needs ",
+    "`dev: true`. See compoundingtech/st2#373",
+);
+
+/// The `dev-channels #true` half of [`CHANNEL_NOT_REGISTERED`].
+pub const CHANNEL_DEV_CONSENT_REQUIRED: &str = concat!(
+    "`dev-channels #true` launches Claude Code with ",
+    "`--dangerously-load-development-channels`, which stops startup at a consent dialog: ",
+    "no MCP server connects and the startup prompt is not read until a human attaches to ",
+    "the pane and accepts. The consent is session state only, so the dialog returns on ",
+    "every launch. See compoundingtech/st2#373",
+);
+
+/// The channel advisories that apply to one spec.
+///
+/// Pure, like the rest of this module: it reads the declaration and nothing else. Callers that
+/// actually create a seat surface these; read-only expansion stays silent.
+pub fn claude_channel_advisories(spec: &AgentSpec) -> Vec<&'static str> {
+    let dev_channels = match (&spec.driver, spec.delivery) {
+        (Some(Driver::Claude(driver)), _) => driver.dev_channels,
+        // The legacy transport renders the same `.mcp.json` from a hand-authored argv, so the
+        // flag is read back from the launch the operator wrote rather than from a typed field.
+        (None, Some(DeliveryTransport::Mcp)) => spec
+            .tasks
+            .iter()
+            .filter_map(|task| task.argv.as_deref())
+            .flatten()
+            .any(|argument| argument.starts_with(DEV_CHANNELS_FLAG)),
+        _ => return Vec::new(),
+    };
+    vec![if dev_channels {
+        CHANNEL_DEV_CONSENT_REQUIRED
+    } else {
+        CHANNEL_NOT_REGISTERED
+    }]
+}
 
 /// Reject two launch sources before expansion, task compilation, or workspace writes.
 pub(crate) fn ensure_single_source(spec: &AgentSpec) -> Result<()> {
@@ -209,7 +261,7 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         provider.extend(["--effort".to_string(), effort.clone()]);
     }
     if driver.dev_channels {
-        provider.push("--dangerously-load-development-channels=server:st2".to_string());
+        provider.push(format!("{DEV_CHANNELS_FLAG}=server:{CLAUDE_SERVER}"));
     }
     provider.extend(driver.args.iter().cloned());
     provider.push(driver.prompt.clone());

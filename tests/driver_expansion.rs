@@ -2,6 +2,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use st2::driver::{
+    CHANNEL_DEV_CONSENT_REQUIRED, CHANNEL_NOT_REGISTERED, claude_channel_advisories,
+};
 use st2::materialize::materialize_agent;
 use st2::reconcile::{TaskCompileContext, compile_generated_tasks};
 use st2::{discover, driver::expand_driver};
@@ -161,6 +164,10 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
             output.stdout,
             fs::read(fixtures.join(format!("{provider}.out.kdl"))).unwrap()
         );
+        // Expansion is a read of the declaration, so it stays silent; the channel advisories
+        // belong to the command that actually creates the seat.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("channel"), "{provider}: {stderr}");
         assert_eq!(fs::read(&input).unwrap(), before);
     }
 }
@@ -408,4 +415,96 @@ fn ambiguous_driver_source_neither_compiles_nor_materializes() {
             .contains("choose one launch source")
     );
     assert!(!workspace.join(".mcp.json").exists());
+}
+
+fn spec_from(catalog: &Path, body: &str) -> st2::spec::AgentSpec {
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(catalog).unwrap();
+    fs::write(&path, body).unwrap();
+    let (specs, errors) = st2::discover_file(catalog, &path).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    specs.into_iter().next().unwrap()
+}
+
+/// A Claude seat is always in one of two channel states and neither is legible from the
+/// declaration: without the development-channels flag nothing ever registers, and with it startup
+/// stops at a consent dialog. Materialization names whichever one the operator just created.
+#[test]
+fn claude_driver_names_the_channel_state_the_seat_is_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let unrouted = spec_from(
+        &temp.path().join("unrouted"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { prompt "boot" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&unrouted),
+        vec![CHANNEL_NOT_REGISTERED]
+    );
+
+    let dev = spec_from(
+        &temp.path().join("dev"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { dev-channels #true; prompt "boot" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&dev),
+        vec![CHANNEL_DEV_CONSENT_REQUIRED]
+    );
+
+    // A harness that renders no st2 channel server has nothing to say.
+    let codex = spec_from(
+        &temp.path().join("codex"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  codex { prompt "boot" }
+}
+"#,
+    );
+    assert!(claude_channel_advisories(&codex).is_empty());
+}
+
+/// The legacy `deliver "mcp"` transport renders the same `.mcp.json`, so it is in the same two
+/// states — read back from the argv the operator hand-authored rather than from a typed field.
+#[test]
+fn legacy_mcp_delivery_names_the_channel_state_from_the_authored_argv() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let executable = catalog.join("bin/st2");
+
+    for (argv, expected) in [
+        (r#""claude" "boot""#, CHANNEL_NOT_REGISTERED),
+        (
+            r#""claude" "--dangerously-load-development-channels=server:st2" "boot""#,
+            CHANNEL_DEV_CONSENT_REQUIRED,
+        ),
+    ] {
+        let mut spec = spec_from(
+            &catalog,
+            &format!(
+                r#"agent "worker" {{
+  host "h"
+  workspace "/work"
+  deliver "mcp"
+  argv {argv}
+}}
+"#
+            ),
+        );
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "test binary").unwrap();
+        let context = TaskCompileContext::new(catalog.clone(), executable.clone()).unwrap();
+        compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
+
+        assert_eq!(claude_channel_advisories(&spec), vec![expected]);
+    }
 }
