@@ -3477,7 +3477,13 @@ mod tests {
         // The account-scoped snapshot carries no occupancy, so it writes nothing on its own and is
         // held for the next reading (HC-T06).
         assert!(!producer.observe(&frames[1], "thread-main").unwrap());
-        assert_eq!(context_record(&agent_dir).unwrap(), first);
+        let mut unchanged = context_record(&agent_dir).unwrap();
+        // `age_ms` is derived at read time, not stored, so it moves between two reads of one
+        // record. Everything the record itself carries — including `observed_at_ms`, which is what
+        // proves no write happened — must be identical.
+        assert!(unchanged.age_ms >= first.age_ms);
+        unchanged.age_ms = first.age_ms;
+        assert_eq!(unchanged, first);
 
         assert!(producer.observe(&frames[2], "thread-main").unwrap());
         let observed = context_record(&agent_dir).unwrap();
