@@ -177,6 +177,17 @@ pub(super) fn strip_ansi(input: &str) -> String {
 /// it can type into, or submit, a human's live draft. Scrollback is above the live composer by
 /// construction, so picking the lowest needs no per-pair special case.
 pub(super) fn classify_composer(screen: &str, expected: &str) -> ComposerState {
+    classify_located_composer(screen, expected).0
+}
+
+/// The same routing, additionally naming which maintained harness owned the composer that was
+/// classified. `None` means no maintained composer was locatable at all — which is the difference
+/// between "a human is drafting in a harness we understand" and "we do not recognise this pane",
+/// and the two want different operator responses.
+pub(super) fn classify_located_composer(
+    screen: &str,
+    expected: &str,
+) -> (ComposerState, Option<&'static str>) {
     let plain = strip_ansi(screen);
     let screen = Screen {
         raw: screen,
@@ -190,9 +201,9 @@ pub(super) fn classify_composer(screen: &str, expected: &str) -> ComposerState {
                 .map(|located| (located.row, harness))
         })
         .max_by_key(|(row, _)| *row)
-        .map(|(_, harness)| harness.classify(&screen, expected))
+        .map(|(_, harness)| (harness.classify(&screen, expected), Some(harness.name())))
         // No maintained composer is locatable, so nothing is proven either way.
-        .unwrap_or(ComposerState::Ambiguous)
+        .unwrap_or((ComposerState::Ambiguous, None))
 }
 
 /// Route post-submit receipt classification through the lowest maintained live composer, using

@@ -50,6 +50,9 @@ pub(super) struct Located {
 }
 
 pub(super) trait Harness {
+    /// How this harness is named in operator-facing diagnostics.
+    fn name(&self) -> &'static str;
+
     /// Locate this harness's composer, if this screen has one.
     fn locate(&self, screen: &Screen<'_>) -> Option<Located>;
 

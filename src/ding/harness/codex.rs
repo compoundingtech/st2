@@ -9,6 +9,10 @@ use crate::ding::composer::{
 pub(super) struct Codex;
 
 impl Harness for Codex {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
     fn locate(&self, screen: &Screen<'_>) -> Option<Located> {
         // The markers are ANSI, so this locator works in raw byte offsets while the router compares
         // stripped rows. Every marker starts at an `\x1b[` boundary, so stripping the prefix is
