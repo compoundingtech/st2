@@ -1985,6 +1985,44 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "",
                 ),
             }
+            // Harness context is advisory-only too (HC-R17), and on a narrower axis than the
+            // categorical record above: a filling window is worth a human's attention, and it is
+            // never a health failure. Absence says nothing here — no producer has published a
+            // number, which is not a fault — so only a high reading and a stale record beside a
+            // `running` desired state speak.
+            if let Some(context) =
+                st2::harness_context::read(&st2::harness_context::harness_context_path(dir))
+            {
+                // The harness's own percent, never one st2 divided out of the operands beside it,
+                // and never clamped: an overrun above 100 is exactly what this warns about.
+                if context
+                    .used_percent
+                    .is_some_and(|percent| percent >= st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT)
+                {
+                    report_advisory(
+                        &format!(
+                            "{bus_id} harness context at {}%",
+                            context.used_percent.unwrap_or_default().round()
+                        ),
+                        &format!(
+                            "at or above st2's {}% attention threshold, read {} ago — st2's own \
+                             number, not a prediction of where this harness compacts",
+                            st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT.round(),
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+                if context.stale && spec.desired_state.as_str() == "running" {
+                    report_advisory(
+                        &format!("{bus_id} harness context stale"),
+                        &format!(
+                            "the numbers are {} old while desired state is running — is its \
+                             driver still reading the harness?",
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+            }
             if st2::driver_diagnostic::expected_for(spec) {
                 let diagnostic =
                     st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
@@ -2126,6 +2164,16 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
 
 fn report_advisory(label: &str, detail: &str) {
     println!("  ⚠ {label} — {detail}");
+}
+
+/// A coarse age for an advisory line: an operator reads "12m", not "743109ms".
+fn humanize_ms(age_ms: u64) -> String {
+    let seconds = age_ms / 1_000;
+    match seconds {
+        0..=90 => format!("{seconds}s"),
+        91..=5_400 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3_600),
+    }
 }
 
 fn presentation_cmd(
