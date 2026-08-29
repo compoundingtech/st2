@@ -9,7 +9,8 @@
 //!
 //! Unlike pi, the wrapper hard-gates the provider version (OMP-R05): the delivery-critical
 //! surface — event names, the sampled idle edge, the approval events — is versioned behavior, not
-//! an API contract, so an unverified minor stays refused until the admission checks are repeated.
+//! an API contract, so an unverified MINOR stays refused until the admission checks are repeated.
+//! Patches inside an admitted minor launch without new evidence (decision 0007).
 
 use std::path::Path;
 use std::process::ExitStatus;
@@ -19,7 +20,7 @@ use anyhow::{Context as _, Result};
 use crate::provider_session::{
     PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
 };
-use crate::{harness_state, hooks, message, status};
+use crate::{harness_state, harness_version, hooks, message, status};
 
 /// The extension file inside this binary's immutable hook set.
 const EXTENSION: &str = "omp-channel.ts";
@@ -43,11 +44,15 @@ pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
 /// harmless either way.
 const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
-/// The versions verified against the admission checks in
-/// `docs/vrs/06-omp-driver/spec.md` (18.0.3 on 2026-08-25, 18.0.9 on 2026-08-28). omp releases
-/// near-daily and its delivery-critical surface is versioned behavior, so admission is per exact
-/// version: a later minor OR patch stays rejected until the checks are repeated against it.
-const SUPPORTED_OMP_VERSIONS: [&str; 2] = ["18.0.3", "18.0.9"];
+/// The omp MINORS verified against the admission checks in `docs/vrs/06-omp-driver/spec.md`
+/// (18.0 measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28).
+///
+/// Admission is per minor, per decision 0007 ("hard version gate on the minor, 18.x initially")
+/// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
+/// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
+/// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
+/// MINOR still costs the five OMP-R05 probes.
+const SUPPORTED_OMP_MINORS: [(u32, u32); 1] = [(18, 0)];
 
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
 /// the channel extension spliced in.
@@ -149,9 +154,9 @@ pub fn run(
     }
 }
 
-/// Refuse any provider whose major version this binary was not verified against. Failing loudly
-/// at launch is the point (OMP-R05): a silently degraded observed state or delivery path would
-/// read as healthy.
+/// Refuse any provider whose MINOR this binary was not verified against. Failing loudly at launch
+/// is the point (OMP-R05): a silently degraded observed state or delivery path would read as
+/// healthy. Patches inside an admitted minor pass, because the admission unit is the minor.
 fn verify_supported_version(binary: &str) -> Result<()> {
     let output = std::process::Command::new(binary)
         .arg("--version")
@@ -159,20 +164,16 @@ fn verify_supported_version(binary: &str) -> Result<()> {
         .with_context(|| format!("running {binary} --version for the omp version gate"))?;
     anyhow::ensure!(output.status.success(), "{binary} --version failed");
     // omp prefixes its banner ("omp/18.0.3"), so scan every whitespace-separated token for the
-    // first dotted-numeric version rather than trusting line order.
+    // first MAJOR.MINOR.PATCH release rather than trusting line order.
     let printed = String::from_utf8_lossy(&output.stdout);
-    let version = printed
-        .split_whitespace()
-        .map(|token| token.trim_start_matches("omp/").trim_start_matches('v'))
-        .find(|token| {
-            token.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-        });
-    let version = version.with_context(|| format!("{{binary}} --version printed no version: '{printed}'"))?;
+    let (version, release) = harness_version::find_release(&printed, "omp").with_context(|| {
+        format!("{binary} --version reported no unambiguous omp release: '{printed}'")
+    })?;
     anyhow::ensure!(
-        SUPPORTED_OMP_VERSIONS.contains(&version),
-        "omp {version} is unverified (admitted: {}); repeat the docs/vrs/06-omp-driver \
+        SUPPORTED_OMP_MINORS.contains(&release.series()),
+        "omp {version} is unverified (admitted minors: {}); repeat the docs/vrs/06-omp-driver \
          admission checks before extending the gate",
-        SUPPORTED_OMP_VERSIONS.join(", ")
+        harness_version::series_display(&SUPPORTED_OMP_MINORS)
     );
     Ok(())
 }
@@ -300,17 +301,20 @@ mod tests {
         }
     }
 
-    /// Pins the admitted set itself. Iterating `SUPPORTED_OMP_VERSIONS` cannot catch a version
-    /// that was added without measuring it, so the set is asserted literally: widening the gate
-    /// has to be a deliberate edit here, next to the `.experiments/` capture that justifies it.
+    /// Pins the admitted set itself — the intent carried over from the exact-version gate.
+    /// Iterating the constant cannot catch a minor that was added without measuring it, so the
+    /// set is asserted literally: widening has to be a deliberate edit here, next to the
+    /// `.experiments/` capture that justifies it.
     #[test]
-    fn admitted_versions_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OMP_VERSIONS, ["18.0.3", "18.0.9"]);
+    fn admitted_minors_are_exactly_the_measured_set() {
+        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0)]);
     }
 
+    /// The two versions actually measured must still launch — widening to the minor must not
+    /// drop the evidence the minor was admitted on.
     #[test]
-    fn version_gate_admits_every_verified_version() {
-        for version in SUPPORTED_OMP_VERSIONS {
+    fn version_gate_admits_every_measured_version() {
+        for version in ["18.0.3", "18.0.9"] {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
@@ -319,13 +323,64 @@ mod tests {
         }
     }
 
-    /// Admission is per exact version, so an unmeasured PATCH between two admitted ones stays
-    /// refused. This is the case the range reading would silently let through.
+    /// A pre-release must not be admitted as its base release, even though its base minor is
+    /// admitted: it is not the build any capture measured.
     #[test]
-    fn version_gate_refuses_an_unverified_patch_between_admitted_versions() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.0.4\\n'\n");
-        let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("unverified"), "{error}");
+    fn version_gate_refuses_a_prerelease_inside_an_admitted_minor() {
+        for version in ["18.0.9-rc1", "18.0.9+meta"] {
+            let fake =
+                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+            assert!(
+                verify_supported_version(fake.path().to_str().unwrap()).is_err(),
+                "{version} must not be admitted as 18.0.9"
+            );
+        }
+    }
+
+    /// A banner mentioning some other version must not bind the gate to it. Reported in review of
+    /// #370: `runtime 18.0.0 omp/18.1.0` would otherwise admit on the unrelated `18.0.0` and then
+    /// launch an unverified 18.1 provider. The provider's own label decides; an unlabelled banner
+    /// carrying two different releases fails closed.
+    #[test]
+    fn a_stray_version_in_the_banner_cannot_admit_an_unverified_provider() {
+        let fake = FakeExecutable::new(
+            "#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.1.0\\n'\n",
+        );
+        let error = verify_supported_version(fake.path().to_str().unwrap())
+            .expect_err("the omp-labelled 18.1.0 must decide, not the stray 18.0.0")
+            .to_string();
+        assert!(error.contains("18.1.0"), "must name the provider's own release: {error}");
+
+        let ambiguous =
+            FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.1.0\\n'\n");
+        assert!(
+            verify_supported_version(ambiguous.path().to_str().unwrap()).is_err(),
+            "an unlabelled banner with two different releases must fail closed"
+        );
+    }
+
+    /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.0`,
+    /// which is how a minor gate would decay into "accept anything that starts with 18".
+    #[test]
+    fn version_gate_refuses_a_neighbouring_minor_that_shares_a_prefix() {
+        for version in ["18.10.0", "18.1.0"] {
+            let fake =
+                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+            let error = verify_supported_version(fake.path().to_str().unwrap())
+                .expect_err(version)
+                .to_string();
+            assert!(error.contains("unverified"), "{version}: {error}");
+        }
+    }
+
+    /// THE assertion this lane exists for: a patch inside an already-admitted minor must launch
+    /// without a new capture (decision 0007 gates on the minor). Fails against the exact-version
+    /// allowlist; passes once the gate keys on MAJOR.MINOR.
+    #[test]
+    fn a_patch_inside_an_admitted_minor_is_accepted_without_new_evidence() {
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'omp v18.0.11\\n18.0.11\\n'\n");
+        verify_supported_version(fake.path().to_str().unwrap())
+            .expect("18.0.11 is inside admitted minor 18.0 and must launch");
     }
 
     #[test]

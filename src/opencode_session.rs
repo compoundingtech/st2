@@ -37,11 +37,18 @@ use crate::driver_diagnostic::{
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
-use crate::{ding, message, status};
+use crate::{ding, harness_version, message, status};
 
-/// OpenCode versions whose `/event`, `/session`, and `prompt_async` surfaces were verified.
-/// The live `/doc` check below guards the shape; this list guards the semantics behind it.
-const SUPPORTED_OPENCODE_VERSIONS: [&str; 1] = ["1.18.19"];
+/// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
+/// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
+/// the semantics behind it.
+///
+/// Admission is per minor so a patch bump inside a verified minor keeps native delivery instead
+/// of silently degrading to none — the profile shipping 1.18.25 against a 1.18.19 allowlist is
+/// exactly that case. The tradeoff is explicit: `/doc` still catches a SHAPE change on any
+/// version, but a SEMANTIC change within an admitted minor would not be caught, which is the
+/// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
+const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
 
 const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -87,11 +94,11 @@ pub fn run(
     let version_probe = supported_version(&opencode_argv[0]);
     let (version_ok, producer_version, support, version_failure) = match version_probe {
         Ok(version) => {
-            let supported = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
+            let supported = version_is_supported(&version);
             if !supported {
                 tracing::warn!(
-                    "st2 opencode-session: version {version} is unverified (supported: {}); native delivery disabled",
-                    SUPPORTED_OPENCODE_VERSIONS.join(", ")
+                    "st2 opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
+                    harness_version::series_display(&SUPPORTED_OPENCODE_MINORS)
                 );
             }
             (
@@ -438,6 +445,14 @@ fn supported_version(binary: &str) -> Result<String> {
         .to_string();
     anyhow::ensure!(!version.is_empty(), "{binary} --version printed nothing");
     Ok(version)
+}
+
+/// Whether a reported opencode version is inside a verified MINOR. This is the whole admission
+/// decision, named so a test can exercise the same code the wrapper runs rather than re-deriving
+/// it — an assertion that re-implements the rule cannot notice the rule changing.
+fn version_is_supported(version: &str) -> bool {
+    harness_version::find_release(version, "opencode")
+        .is_some_and(|(_, release)| SUPPORTED_OPENCODE_MINORS.contains(&release.series()))
 }
 
 /// Verify the served OpenAPI document still carries every arm st2 consumes. Substring markers are
@@ -1362,6 +1377,37 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside
+    /// the verification the minor was admitted on.
+    #[test]
+    fn admitted_opencode_minors_are_exactly_the_measured_set() {
+        assert_eq!(SUPPORTED_OPENCODE_MINORS, [(1, 18)]);
+    }
+
+    /// The principal's actual case: the profile ships 1.18.25 against a list built at 1.18.19.
+    /// A patch inside the verified minor must keep native delivery rather than degrade to none.
+    #[test]
+    fn a_patch_inside_an_admitted_opencode_minor_keeps_native_delivery() {
+        for version in ["1.18.19", "1.18.25"] {
+            assert!(
+                version_is_supported(version),
+                "{version} is inside verified minor 1.18"
+            );
+        }
+    }
+
+    /// Fail closed the other way: a different minor, a neighbouring minor sharing a prefix, and
+    /// unparseable output must all leave native delivery disabled.
+    #[test]
+    fn other_minors_and_garbled_versions_stay_unverified() {
+        for version in ["1.19.0", "1.180.0", "2.18.0", "1.18", "not-a-version", ""] {
+            assert!(
+                !version_is_supported(version),
+                "{version} must not be treated as verified"
+            );
+        }
+    }
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
