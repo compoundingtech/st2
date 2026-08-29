@@ -6,7 +6,7 @@ team "wg" {
     harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
-      prompt "You cold-started in a hermetic st2 eval inside an unusual Git checkout. Read AGENTS.md. Drain and archive every Small Talk message. Resolve the checkout, fix the failing test, commit on the current branch, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      prompt "You cold-started in a hermetic st2 eval inside an unusual Git checkout. Read AGENTS.md. Use only st2 message for Small Talk. Never use st, smalltalk, or another message command. Drain and archive every st2 message. Resolve the checkout, fix the failing test, commit on the current branch, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
       args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
     }
   }

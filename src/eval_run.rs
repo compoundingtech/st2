@@ -737,6 +737,11 @@ fn wait_done(
         }
         None => (bus.join(sup).join("inbox"), bus.join(sup).join("archive")),
     };
+    // An eval keeps its admitted routes in memory. A native seat can therefore send through the
+    // catalog's flat compatibility route because no on-disk declaration exists for address lookup.
+    // Read both routes until eval materialization publishes those declarations.
+    let flat_sup_inbox = bus.join(sup).join("inbox");
+    let flat_sup_archive = bus.join(sup).join("archive");
     // The requester is eval-owned, not an admitted Agent Spec, and deliberately keeps one explicit
     // flat mailbox. Every canonical agent route above comes from the frozen admitted vector.
     let req_inbox = bus.join(requester).join("inbox");
@@ -751,8 +756,14 @@ fn wait_done(
         // against the sup's archiving — a fully-closed loop hangs to max-timeout because the report left
         // the inbox. (The confirmation side reads the requester's inbox, which is safe — the requester is
         // a passive eval-runner seed that never archives.)
-        let sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
-        let sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        let mut sup_msgs = crate::message::list_dir(&sup_inbox).unwrap_or_default();
+        let mut sup_archived = crate::message::list_dir(&sup_archive).unwrap_or_default();
+        if flat_sup_inbox != sup_inbox {
+            sup_msgs.extend(crate::message::list_dir(&flat_sup_inbox).unwrap_or_default());
+        }
+        if flat_sup_archive != sup_archive {
+            sup_archived.extend(crate::message::list_dir(&flat_sup_archive).unwrap_or_default());
+        }
         if workers.is_empty()
             && let Some(kickoff_ts) = kickoff_ts
             && let Some(before) = requester_before_kickoff
@@ -2897,6 +2908,48 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             ),
             "an archived worker report must still be seen (else archive-on-act hygiene hangs the eval)"
         );
+    }
+
+    #[test]
+    fn canonical_wait_done_reads_a_native_flat_worker_report() {
+        let root = tempfile::tempdir().unwrap();
+        let sup = "h.mix.sup";
+        let requester = "requester";
+        let workers = vec!["h.mix.worker".to_string()];
+        let agent_dir = root.path().join("agents/h/mix.sup");
+        let routes = BTreeMap::from([(
+            sup.to_string(),
+            CanonicalRoute {
+                inbox: crate::message::inbox_dir(&agent_dir),
+                archive: crate::message::archive_dir(&agent_dir),
+            },
+        )]);
+
+        seed_msg(
+            &root.path().join(sup).join("archive"),
+            1_700_000_002_000,
+            "aaaaaa",
+            "h.mix.worker",
+        );
+        seed_msg(
+            &root.path().join(requester).join("inbox"),
+            1_700_000_003_000,
+            "bbbbbb",
+            "h.mix.sup",
+        );
+
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        assert!(wait_done(
+            root.path(),
+            Some(&routes),
+            sup,
+            requester,
+            &workers,
+            None,
+            None,
+            Duration::from_secs(1),
+            noop,
+        ));
     }
 
     #[test]

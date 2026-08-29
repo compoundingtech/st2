@@ -7,7 +7,7 @@ team "si" {
       model "claude-sonnet-5"
       effort "medium"
       dev-channels #true
-      prompt "You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only the st2 bus for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every Small Talk message. Invoke every available skill whose name contains evalskill, follow each skill exactly, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      prompt "You cold-started in a hermetic st2 eval. Read CLAUDE.md. Use only st2 message for Small Talk. Never use st, smalltalk, Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every st2 message. Invoke every available skill whose name contains evalskill, follow each skill exactly, and report once. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
       args "--permission-mode" "auto" "--plugin-dir" "../plugin/evalpkg"
     }
   }

@@ -6,7 +6,7 @@ team "tw" {
     harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
-      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. Delegate the test work, verify the result without edits, and send one final requester assessment. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Use only st2 message for Small Talk. Never use st, smalltalk, or another message command. Drain and archive every st2 message. Delegate the test work, verify the result without edits, and send one final requester assessment. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
       args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
     }
   }
@@ -15,7 +15,7 @@ team "tw" {
     harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
-      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Drain and archive every Small Talk message. Write only tests, run them, commit them, and report once to the supervisor. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
+      prompt "You cold-started in a hermetic st2 eval. Read AGENTS.md. Use only st2 message for Small Talk. Never use st, smalltalk, or another message command. Drain and archive every st2 message. Write only tests, run them, commit them, and report once to the supervisor. If no work remains, end the turn and stay idle. The native driver starts a new turn when a message arrives."
       args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
     }
   }

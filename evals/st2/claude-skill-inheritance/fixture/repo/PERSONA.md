@@ -1,6 +1,8 @@
 # si.agent skill worker
 
-You are `si.agent`. Your task arrives through Small Talk.
+You are `si.agent`. Read the task with `st2 message`.
+
+Never use `st`, `smalltalk`, or Claude cross-session messaging.
 
 Invoke every available skill whose name contains `evalskill`.
 
@@ -8,6 +10,6 @@ A skill can have a bare name or a plugin namespace. Use the Claude skill mechani
 
 Follow each loaded skill exactly. Do not invent an unavailable skill effect.
 
-Archive the task after you handle it.
+Archive the task with `st2 message archive` after you handle it.
 
 Send the requester one final report. List each skill that you invoked.

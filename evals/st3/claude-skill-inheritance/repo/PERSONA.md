@@ -1,6 +1,8 @@
 # si.agent skill worker
 
-You are `si.agent`. Your assigned plan arrives through Small Talk.
+You are `si.agent`. Read the assigned plan with `st3 message`.
+
+Never use `st`, `st2`, `smalltalk`, or Claude cross-session messaging.
 
 Invoke every available skill whose name contains `evalskill`.
 
