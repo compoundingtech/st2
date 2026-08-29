@@ -16,6 +16,9 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Restart continuity | `st2/restart-continuity` | `st3/restart-continuity` |
 | Fork in the road | `st2/fork-in-the-road` | `st3/fork-in-the-road` |
 | Poisoned pull request | `st2/poisoned-pr` | `st3/poisoned-pr` |
+| Test Writing | `st2/test-writing` | `st3/test-writing` |
+| Weird Git Setup | `st2/weird-git-setup` | `st3/weird-git-setup` |
+| Claude Skill Inheritance | `st2/claude-skill-inheritance` | `st3/claude-skill-inheritance` |
 | Resource cold start | `st2/resource-cold-start` | `st3/resource-cold-start` |
 | Resource retarget | `st2/resource-retarget` | `st3/resource-retarget` |
 | Resource handoff | `st2/resource-handoff` | `st3/resource-handoff` |
@@ -27,9 +30,9 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Network smoke | `st2/network-smoke` | `st3/network-smoke` |
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
 
-The License MIT and Restart continuity pairs use Claude Sonnet teams in both runtimes.
+The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
-The Ghost bug, Signal rename, Fork in the road, and Poisoned pull request pairs use Codex in both runtimes.
+The Ghost bug, Signal rename, Fork in the road, Poisoned pull request, Test Writing, and Weird Git Setup pairs use Codex.
 
 The other ten pairs are model-free. They use deterministic processes and mechanical judges.
 
@@ -55,8 +58,14 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Fork in the road | Codex × 4 | None |
 | st2 | Poisoned pull request | Codex × 2 | None |
 | st3 | Poisoned pull request | Codex × 2 | None |
+| st2 | Test Writing | Codex × 2 | None |
+| st3 | Test Writing | Codex × 2 | None |
+| st2 | Weird Git Setup | Codex × 1 | None |
+| st3 | Weird Git Setup | Codex × 1 | None |
+| st2 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
+| st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 
-The current corpus has eight Claude seats and 25 Codex seats. It also has three Codex LLM judges.
+The current corpus has 10 Claude seats and 31 Codex seats. It also has three Codex LLM judges.
 
 The ten model-free pairs add no model seats and no LLM judges.
 

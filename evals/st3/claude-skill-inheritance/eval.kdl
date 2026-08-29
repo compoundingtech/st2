@@ -1,0 +1,81 @@
+version 2
+
+subgraph {
+  scope "eval/claude-skill-inheritance/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/claude-skill-inheritance" state="ready" {
+      step "start-worker" timeout="10m" {
+        title "The native Claude Sonnet worker is ready"
+        subgraph {
+          agent "si.agent" {
+            workspace "${WORKSPACE}/repo"
+            harness "claude" {
+              model "claude-sonnet-5"
+              effort "medium"
+              dev-channels #true
+              prompt "Read CLAUDE.md. Use only st3 Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. st3 sends the assigned parent plan as a Small Talk message. Drain, read, and archive every message. Follow inherited nested steps through st3 work. After every child step, list assigned work and continue the same parent plan. Do not request help, poll, or publish routine progress. Send only the required final report. End only after the assigned parent step is completed and no message remains."
+              args "--permission-mode" "auto" "--plugin-dir" "../plugin/evalpkg"
+            }
+            restart "never"
+            env {
+              CATALOG "${WORKSPACE}"
+              PLAN_RUN "${PLAN_RUN}"
+              ST_ROOT "${WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+            }
+          }
+        }
+      }
+
+      step "exercise-skill-union" timeout="10m" {
+        title "The worker invokes every eval skill across both scopes"
+        goal "Invoke every available skill whose name contains evalskill. Follow each loaded skill exactly. Do not fabricate a skill effect. Report the invoked skill names when both scopes are complete."
+        assigned-to "agent/si.agent"
+        depends-on { step "start-worker" completed }
+        plan "work" {
+          step "discover-eval-skills" {
+            title "Every available evalskill is identified"
+            goal "Inspect the available Claude skills. Identify every skill whose name contains evalskill, including project and plugin namespaces. Do not read held-out judges."
+          }
+          step "invoke-project-skill" {
+            title "The project eval skill is invoked"
+            goal "Use the project-scope evalskill through Claude's skill mechanism. Follow its loaded instructions exactly. Do not invent the instruction from this plan."
+            depends-on { step "discover-eval-skills" completed }
+          }
+          step "invoke-plugin-skill" {
+            title "The plugin eval skill is invoked"
+            goal "Use the plugin-scope evalskill through Claude's skill mechanism. Follow its loaded instructions exactly. Do not invent the instruction from this plan."
+            depends-on { step "discover-eval-skills" completed }
+          }
+          step "verify-skill-effects" {
+            title "Both loaded skill effects exist"
+            goal "Verify that both invoked skills produced their requested effects. Do not change or copy either effect."
+            depends-on { step "invoke-project-skill" completed; step "invoke-plugin-skill" completed }
+          }
+          step "report-skill-check" {
+            title "The requester receives the skill union result"
+            goal "Send person/eval-requester exactly one Small Talk message. State which project and plugin skills you invoked. Do not include either secret token. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/skill-report resource.binding --actor agent/si.agent --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            depends-on { step "verify-skill-effects" completed }
+            produces { resource "plan-run/${PLAN_RUN}/skill-report" { kind "message.receipt"; state "published" } }
+          }
+        }
+      }
+
+      step "held-out-judges" timeout="5m" {
+        title "All Claude Skill Inheritance judges pass"
+        depends-on { step "exercise-skill-union" completed }
+        judges {
+          judge "the project skill wrote its secret token" { exec "bash ./judges/project-scope.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the plugin skill wrote its secret token" { exec "bash ./judges/plugin-scope.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the session did not pollute personal Claude scope" { exec "bash ./judges/isolation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the graph records skill discovery, both invocations, verification, and the report" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+        }
+      }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/claude-skill-inheritance/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/claude-skill-inheritance/${PLAN_RUN}" }
+      }
+    }
+  }
+}

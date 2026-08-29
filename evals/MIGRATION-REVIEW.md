@@ -16,7 +16,7 @@ Do not copy every eval as KDL. Product behavior with strong Rust coverage belong
 
 Use one logical eval for one behavior. A Claude or Codex variant is a harness choice, not a new eval.
 
-The proposed result has 19 logical evals. Sixteen logical evals now have both runtime forms.
+The final result has 19 logical evals. All 19 logical evals now have both runtime forms.
 
 - The review started with three logical evals represented here.
 - Sixteen new logical evals come from 18 source evals.
@@ -98,12 +98,12 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `shared-workspace-render-ownership` | Rust | `tests/materialize.rs`, `tests/validate.rs` | The Rust suite covers conflicting ownership and identical shared claims. |
 | `signal-rename` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
 | `signal-rename-codex` | Represented | `signal-rename` | The local Codex pair represents both source provider forms. |
-| `skill-inheritance` | Keep, wave 2 | `claude-skill-inheritance` | This is a useful Claude package and project-skill integration eval. |
+| `skill-inheritance` | Represented | `claude-skill-inheritance` | This is a useful Claude package and project-skill integration eval. |
 | `st2-doctor-structure` | Rust | `tests/doctor.rs` | The Rust suite checks healthy and broken catalogs with mutation-valid failures. |
 | `st2-network` | Represented | Model-free `network-smoke` | Keep one black-box proof that hosting and message delivery work together. |
 | `strict-validation-json` | Rust | `tests/validate.rs` | The Rust suite covers stable issue data and strict warning promotion. |
 | `targeted-reconcile-isolation` | Rust | `tests/targeted_reconcile.rs` | The Rust suite covers exact selection and sibling isolation. |
-| `test-writing` | Keep, wave 2 | `test-writing` | Mutation scoring makes this stronger than a test-count eval. |
+| `test-writing` | Represented | `test-writing` | Mutation scoring makes this stronger than a test-count eval. |
 | `two-networks-coexist` | Represented | Model-free `network-isolation` | Keep the concurrent catalog, message, and PTY partition proof. |
 | `vrs-cross-file-absent` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `vrs-cross-file-present` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
@@ -113,7 +113,7 @@ A candidate remains outside the active corpus until one baseline run proves that
 | `vrs-scope-drift-present` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `vrs-scope-pressure-absent` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
 | `vrs-scope-pressure-present` | Archive | Source research history | This matched pair tests a governance document treatment, not runtime behavior. |
-| `weird-git-setup` | Keep, wave 2 | `weird-git-setup` | This is a real launch environment edge case and has accepted pass evidence. |
+| `weird-git-setup` | Represented | `weird-git-setup` | This is a real launch environment edge case and has accepted pass evidence. |
 
 ## Why the selected resource evals survive
 
@@ -175,9 +175,9 @@ Wave 1 proves the runtime:
 Wave 2 broadens agent work:
 
 1. Maintain Poisoned pull request as the review-only and security eval.
-2. Import Test writing as the mutation-scored quality eval.
-3. Import Weird Git setup as the worktree launch eval.
-4. Import Claude skill inheritance as a provider integration eval.
+2. Maintain Test Writing as the mutation-scored quality eval.
+3. Maintain Weird Git Setup as the worktree launch eval.
+4. Maintain Claude Skill Inheritance as a provider integration eval.
 
 Rust-owned evals do not wait for these waves. Before source archival, run their named suites and close any missing assertion.
 

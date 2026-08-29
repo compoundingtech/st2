@@ -157,6 +157,9 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
         "restart-continuity",
         "fork-in-the-road",
         "poisoned-pr",
+        "test-writing",
+        "weird-git-setup",
+        "claude-skill-inheritance",
         "resource-cold-start",
         "resource-retarget",
         "resource-handoff",
@@ -245,6 +248,9 @@ fn selected_eval_harness_counts_match_the_inventory() {
         ("restart-continuity", (2, 0), (2, 0)),
         ("fork-in-the-road", (0, 4), (0, 4)),
         ("poisoned-pr", (0, 2), (0, 2)),
+        ("test-writing", (0, 2), (0, 2)),
+        ("weird-git-setup", (0, 1), (0, 1)),
+        ("claude-skill-inheritance", (1, 0), (1, 0)),
     ];
     let mut model_judges = Vec::new();
 
@@ -677,4 +683,118 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
         .collect::<Vec<_>>();
     assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/reviewer-report"));
     assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/final-verdict"));
+}
+
+#[test]
+fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3");
+    let cases = [
+        (
+            "test-writing",
+            "eval/test-writing",
+            [
+                ("prepare-test-brief", "agent/tw.sup"),
+                ("write-regression-suite", "agent/tw.dev"),
+                ("verify-test-suite", "agent/tw.sup"),
+            ]
+            .as_slice(),
+            [
+                "resource/plan-run/${PLAN_RUN}/test-brief",
+                "resource/plan-run/${PLAN_RUN}/test-revision",
+                "resource/plan-run/${PLAN_RUN}/developer-report",
+                "resource/plan-run/${PLAN_RUN}/final-assessment",
+            ]
+            .as_slice(),
+        ),
+        (
+            "weird-git-setup",
+            "eval/weird-git-setup",
+            [("repair-feature-worktree", "agent/wg.dev")].as_slice(),
+            [
+                "resource/plan-run/${PLAN_RUN}/feature-revision",
+                "resource/plan-run/${PLAN_RUN}/final-report",
+            ]
+            .as_slice(),
+        ),
+        (
+            "claude-skill-inheritance",
+            "eval/claude-skill-inheritance",
+            [("exercise-skill-union", "agent/si.agent")].as_slice(),
+            ["resource/plan-run/${PLAN_RUN}/skill-report"].as_slice(),
+        ),
+    ];
+
+    for (name, plan_id, assignments, expected_products) in cases {
+        let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
+        assert!(!source.contains("message \"kickoff"));
+        let intent = st3::parse_intent(&source, "local").unwrap();
+        let plan = &intent.plans[plan_id];
+        for (step, assignee) in assignments {
+            assert_eq!(plan.steps[*step].assigned_to.as_deref(), Some(*assignee));
+            assert!(plan.steps[*step].nested_plan.is_some());
+        }
+        let products = plan
+            .steps
+            .values()
+            .filter_map(|step| step.nested_plan.as_ref())
+            .flat_map(|nested| nested.steps.values())
+            .flat_map(|step| &step.products)
+            .map(|product| product.subject.as_str())
+            .collect::<Vec<_>>();
+        for product in expected_products {
+            assert!(products.contains(product), "{name} lacks {product}");
+        }
+    }
+}
+
+#[test]
+fn new_paid_eval_fixtures_match_their_native_harnesses() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals");
+
+    for runtime in ["st2", "st3"] {
+        let test_root = if runtime == "st2" {
+            root.join(runtime).join("test-writing/fixture")
+        } else {
+            root.join(runtime).join("test-writing")
+        };
+        for seat in ["sup", "worker"] {
+            let workspace = test_root.join(seat);
+            assert!(workspace.join("AGENTS.md").is_file());
+            assert!(!workspace.join("CLAUDE.md").exists());
+        }
+
+        let weird_root = if runtime == "st2" {
+            root.join(runtime).join("weird-git-setup/fixture")
+        } else {
+            root.join(runtime).join("weird-git-setup")
+        };
+        assert!(weird_root.join("persona/AGENTS.md").is_file());
+        let setup = fs::read_to_string(weird_root.join("setup-megarepo.sh")).unwrap();
+        assert!(setup.contains("persona/AGENTS.md"));
+        assert!(!setup.contains("persona/CLAUDE.md"));
+
+        let skill_root = if runtime == "st2" {
+            root.join(runtime).join("claude-skill-inheritance/fixture")
+        } else {
+            root.join(runtime).join("claude-skill-inheritance")
+        };
+        assert_eq!(
+            fs::read_to_string(skill_root.join("repo/CLAUDE.md")).unwrap(),
+            "@PERSONA.md\n"
+        );
+        assert!(
+            skill_root
+                .join("repo/.claude/skills/evalskill-project/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            skill_root
+                .join("plugin/evalpkg/skills/evalskill-plugin/SKILL.md")
+                .is_file()
+        );
+    }
 }
