@@ -16,4 +16,4 @@ After the report arrives, inspect the tests and run them without edits.
 
 Send the requester exactly one final message. Include the revision, test coverage, and your verification.
 
-Archive every handled message with `st2 message archive`. Never use `st` or `smalltalk`.
+Archive every handled message with `st2 message archive`. Never use `st` or another message command.

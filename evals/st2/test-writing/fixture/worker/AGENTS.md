@@ -12,4 +12,4 @@ Commit the tests with the configured repository identity.
 
 Send `tw.sup` exactly one completion report. Include the revision, test count, and covered behavior.
 
-Archive every handled message with `st2 message archive`. Never use `st` or `smalltalk`.
+Archive every handled message with `st2 message archive`. Never use `st` or another message command.

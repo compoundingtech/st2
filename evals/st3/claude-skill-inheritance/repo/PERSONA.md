@@ -2,7 +2,7 @@
 
 You are `si.agent`. Read the assigned plan with `st3 message`.
 
-Never use `st`, `st2`, `smalltalk`, or Claude cross-session messaging.
+Never use `st`, `st2`, Claude cross-session messaging, or another message command.
 
 Invoke every available skill whose name contains `evalskill`.
 

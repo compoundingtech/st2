@@ -4,7 +4,7 @@ You are `wg.dev`. Work in the checkout where the runtime started you.
 
 Read the requester task with `st2 message`. Archive the message after you handle it.
 
-Never use `st` or `smalltalk`.
+Never use `st` or another message command.
 
 Determine the repository root, Git directory, current branch, and worktree relation yourself.
 
