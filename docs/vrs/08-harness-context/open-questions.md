@@ -82,8 +82,10 @@ Each entry links a spec `DQ-C*`. Questions leave this file when resolved — int
 - **DQ-C9 Subagent context is invisible.** Claude's status-line payload
   describes the top-level session; a subagent's own window is not in it (there
   is a sibling `subagentStatusLine` slot, unexamined), and hook events carrying
-  `agent_id` are already excluded from top-level state by the categorical
-  producer. So a runtime whose subagent is saturating reports the parent's fill.
+  `agent_id` are excluded from top-level state by both producers — the
+  categorical one, and now the numeric one's compaction edges. So a runtime whose
+  subagent is saturating reports the parent's fill, and a subagent's compaction is
+  not counted against it.
   Whether that matters depends on whether subagents are where saturation
   actually happens on this fleet. Resolves by: a capture of the subagent status
   line, and a decision about whether one record per agent is the right grain.
@@ -109,3 +111,17 @@ Each entry links a spec `DQ-C*`. Questions leave this file when resolved — int
   to satisfy the include globs. It stays at the agent-directory root, so no
   driver record lives on the Resource-binding realization surface and the
   tension does not arise.
+- **DQ-C13 The status-line tee's telemetry cadence.** Claude's
+  `refreshInterval: 5` makes the tee 720 short-lived `st2` processes per hour per
+  agent — the highest-cadence process st2 has, where every other one is long-lived
+  or event-driven. `main` initializes telemetry for every invocation and tears it
+  down on exit; with `OTEL_EXPORTER_OTLP_ENDPOINT` set, that teardown performs a
+  final collect-and-export, and Claude waits for the command to exit, so the flush
+  is in the render path. Nothing here is measured: the whole suite runs with no
+  endpoint, so the exporting path has never executed under the tee. The
+  process-unit classification is not the lever — it sets `service.name` only.
+  Resolves by: measuring one render's wall clock with an endpoint configured. If
+  it is material, the options are exempting the tee from telemetry
+  initialization, raising `refreshInterval`, or making the flush non-blocking for
+  short-lived units — the first two are cheap and the third is a
+  `06-observability` change.

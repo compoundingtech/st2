@@ -437,6 +437,18 @@ registerable event list. Routing it through the hook command would have dragged
 `observe_hook_event`'s event classification and the `SessionStart` claim onto a
 payload that is neither.
 
+**The tee is now st2's highest-cadence process, and its telemetry cost is
+unmeasured (`DQ-C13`).** A 5-second refresh interval makes it 720 short-lived
+`st2` invocations per hour per Claude agent — roughly 432,000 per hour across a
+600-agent fleet — where every other st2 process is either long-lived or fires on
+an event. `main` initializes telemetry for every invocation and tears it down on
+exit, and with `OTEL_EXPORTER_OTLP_ENDPOINT` set that teardown performs a final
+collect-and-export. Claude waits for the command to exit, so that flush sits in
+the render path. The process-unit classification is not the lever — it sets
+`service.name` and nothing else; the endpoint variable is the only gate. This is
+recorded rather than pre-emptively engineered around, because no fleet has run
+the tee with an endpoint configured and the cost is arithmetic until one does.
+
 The tee spawns the renderer and writes the payload to its stdin rather than
 `exec`ing it, because st2 has already consumed that stdin to record the reading.
 The renderer is run as a shell command line, exactly as Claude runs its own
@@ -657,7 +669,7 @@ producer depends on them.
 
 | Harness | Edge | Trigger carried | Trigger words yielded | Count source | Counter scope |
 | --- | --- | --- | --- | --- | --- |
-| claude | `PreCompact` / `PostCompact` hooks; `SessionStart source=compact` | `trigger` | `manual`, `auto` | st2 counts (one hook process per event) | incarnation |
+| claude | `PreCompact` / `PostCompact` hooks; `SessionStart source=compact` | `trigger` | `manual`, `auto` | st2 counts, on `PreCompact` alone — see the dedupe above | incarnation |
 | codex | `contextCompaction` thread item | none | `unknown` | st2 counts | incarnation |
 | pi | `session_compact` | `reason` | `manual`, `threshold`, `overflow` | `sessionManager.getEntries()` type `compaction` | harness-durable |
 | omp | `session_compact` | none | `unknown` | `sessionManager.getEntries()` type `compaction` | harness-durable |
@@ -856,7 +868,7 @@ Tracked with context in [open-questions.md](./open-questions.md): `DQ-C1` write
 policy benchmark (accuracy half settled, wire-cost half open), `DQ-C5`
 unreadable versus absent, `DQ-C6` history, `DQ-C7` fleet transport cost, `DQ-C8`
 supervisor actionability, `DQ-C9` subagent context, `DQ-C10` OpenCode
-multi-session aggregation.
+multi-session aggregation, `DQ-C13` the status-line tee's telemetry cadence.
 
 Resolved, and kept in that file only so their identifiers do not go dangling:
 `DQ-C2` status-line renderer contract, `DQ-C3` status-line settings precedence,

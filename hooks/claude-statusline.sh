@@ -12,6 +12,13 @@
 #
 # `exec` in both arms deliberately: no command substitution anywhere, so the stdin bytes reach the
 # downstream renderer unchanged rather than through the shell's trailing-newline stripping.
+#
+# Known limitation, accepted: `exec` leaves no fallback for an `st2` that RUNS but rejects
+# `claude-statusline` — an old binary against a new hook set during an upgrade — which exits
+# non-zero having printed nothing, i.e. one blank render. Buying the fallback costs a probe
+# subprocess on every render, at 5-second cadence, forever. The window is a single upgrade,
+# materialization refuses to render this registration at all unless the hook set verifies, and it
+# is the same exposure every other hook in the set already carries.
 
 set -u
 

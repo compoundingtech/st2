@@ -361,7 +361,6 @@ pub fn statusline_reading(payload: &serde_json::Value) -> Reading {
 /// spawns and then fails is NOT followed by a passthrough: it may already have written a partial
 /// line, and appending the raw JSON to it would corrupt the status line rather than restore it.
 pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
-    crate::metrics::record_hook_invocation("claude-statusline", "StatusLine");
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
     if let Err(error) = record_statusline(catalog_root, identity, &raw) {
@@ -374,6 +373,11 @@ fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<
     let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
     let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    // Counted only once the invocation has its application target, matching `run_observe`: a tee
+    // firing for an undeclared agent applies nothing and must not inflate
+    // `hook_invocations_total`. The tee renders a status line either way, so without this the
+    // counter would measure Claude's refresh interval rather than st2's work.
+    crate::metrics::record_hook_invocation("claude-statusline", "StatusLine");
     context_writer(&agent_dir, identity, &payload)?
         .observe(statusline_reading(&payload))
         .map(|_landed| ())
