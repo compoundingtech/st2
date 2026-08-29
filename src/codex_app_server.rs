@@ -3991,7 +3991,8 @@ fn set_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
 ///
 /// Explicit cleanup covers normal returns and Rust errors. The in-group watchdog covers wrapper
 /// crashes, SIGKILL, and supervisor teardown. The watchdog holds the group ID until cleanup, so a
-/// stale PID can never identify a process group that belongs to another live owner.
+/// stale PID can never identify a process group that belongs to another live owner. A crash can
+/// leave one dead socket file; the next launch proves that it has no listener and removes it.
 fn spawn_process_group(
     command: &mut Command,
     socket_path: Option<&Path>,
@@ -4002,9 +4003,8 @@ fn spawn_process_group(
     let mut watchdog_command = Command::new("/bin/sh");
     watchdog_command
         .arg("-c")
-        .arg("IFS= read -r ignored; if [ -n \"$1\" ]; then /bin/rm -f -- \"$1\"; fi; kill -KILL 0")
+        .arg("IFS= read -r ignored; kill -KILL 0")
         .arg("st2-codex-watchdog")
-        .arg(socket_path.unwrap_or_else(|| Path::new("")))
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(watchdog_read)))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -7684,9 +7684,8 @@ mod tests {
     }
 
     #[test]
-    fn an_app_server_group_dies_when_its_wrapper_is_killed() {
-        const TEST_NAME: &str =
-            "codex_app_server::tests::an_app_server_group_dies_when_its_wrapper_is_killed";
+    fn a_killed_wrapper_reaps_its_app_server_and_the_next_launch_recovers_its_socket() {
+        const TEST_NAME: &str = "codex_app_server::tests::a_killed_wrapper_reaps_its_app_server_and_the_next_launch_recovers_its_socket";
         const ROLE: &str = "ST2_CODEX_ORPHAN_TEST_ROLE";
         const SOCKET_PATH: &str = "ST2_CODEX_ORPHAN_TEST_SOCKET";
         const PID_PATH: &str = "ST2_CODEX_ORPHAN_TEST_PID";
@@ -7773,24 +7772,39 @@ mod tests {
         }
         let _ = wrapper.wait();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while (process_can_retain_cleanup_resources(server_pid) || socket_path.exists())
-            && Instant::now() < deadline
-        {
+        while process_can_retain_cleanup_resources(server_pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let server_survived = process_can_retain_cleanup_resources(server_pid);
-        let socket_survived = socket_path.exists();
         if server_survived {
             unsafe {
                 libc::kill(server_pid, libc::SIGKILL);
             }
         }
-        let _ = fs::remove_file(&socket_path);
         assert!(!server_survived, "the app-server survived its wrapper");
         assert!(
-            !socket_survived,
-            "the app-server socket survived its wrapper"
+            socket_path.exists(),
+            "the app-server did not leave the expected recoverable socket"
         );
+        assert_eq!(
+            UnixStream::connect(&socket_path).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "the residual socket still had a live listener"
+        );
+
+        prepare_socket_for_launch(&socket_path)
+            .expect("the next launch did not recover the residual socket");
+        assert!(
+            !socket_path.exists(),
+            "the next launch did not remove the residual socket"
+        );
+        let replacement = UnixListener::bind(&socket_path)
+            .expect("the next app-server could not bind the recovered socket");
+        assert!(
+            UnixStream::connect(&socket_path).is_ok(),
+            "the replacement app-server socket did not accept a connection"
+        );
+        drop(replacement);
     }
 
     #[test]
