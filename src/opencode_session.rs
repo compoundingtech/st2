@@ -451,7 +451,7 @@ fn supported_version(binary: &str) -> Result<String> {
 /// decision, named so a test can exercise the same code the wrapper runs rather than re-deriving
 /// it — an assertion that re-implements the rule cannot notice the rule changing.
 fn version_is_supported(version: &str) -> bool {
-    harness_version::find_release(version)
+    harness_version::find_release(version, "opencode")
         .is_some_and(|(_, release)| SUPPORTED_OPENCODE_MINORS.contains(&release.series()))
 }
 

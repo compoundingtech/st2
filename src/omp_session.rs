@@ -166,8 +166,8 @@ fn verify_supported_version(binary: &str) -> Result<()> {
     // omp prefixes its banner ("omp/18.0.3"), so scan every whitespace-separated token for the
     // first MAJOR.MINOR.PATCH release rather than trusting line order.
     let printed = String::from_utf8_lossy(&output.stdout);
-    let (version, release) = harness_version::find_release(&printed).with_context(|| {
-        format!("{binary} --version printed no MAJOR.MINOR.PATCH version: '{printed}'")
+    let (version, release) = harness_version::find_release(&printed, "omp").with_context(|| {
+        format!("{binary} --version reported no unambiguous omp release: '{printed}'")
     })?;
     anyhow::ensure!(
         SUPPORTED_OMP_MINORS.contains(&release.series()),
@@ -335,6 +335,28 @@ mod tests {
                 "{version} must not be admitted as 18.0.9"
             );
         }
+    }
+
+    /// A banner mentioning some other version must not bind the gate to it. Reported in review of
+    /// #370: `runtime 18.0.0 omp/18.1.0` would otherwise admit on the unrelated `18.0.0` and then
+    /// launch an unverified 18.1 provider. The provider's own label decides; an unlabelled banner
+    /// carrying two different releases fails closed.
+    #[test]
+    fn a_stray_version_in_the_banner_cannot_admit_an_unverified_provider() {
+        let fake = FakeExecutable::new(
+            "#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.1.0\\n'\n",
+        );
+        let error = verify_supported_version(fake.path().to_str().unwrap())
+            .expect_err("the omp-labelled 18.1.0 must decide, not the stray 18.0.0")
+            .to_string();
+        assert!(error.contains("18.1.0"), "must name the provider's own release: {error}");
+
+        let ambiguous =
+            FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.1.0\\n'\n");
+        assert!(
+            verify_supported_version(ambiguous.path().to_str().unwrap()).is_err(),
+            "an unlabelled banner with two different releases must fail closed"
+        );
     }
 
     /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.0`,

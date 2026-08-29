@@ -58,19 +58,45 @@ pub fn parse_release(token: &str) -> Option<Release> {
     })
 }
 
-/// Find the first `MAJOR.MINOR.PATCH` release in a `--version` banner, tolerating the prefixes the
-/// providers actually print (`omp/18.0.9`, `v1.18.25`). Returns the exact token alongside the
-/// parsed release so a refusal can quote what the binary said.
-pub fn find_release(printed: &str) -> Option<(&str, Release)> {
-    printed
-        .split_whitespace()
-        .map(|token| {
-            token
-                .trim_start_matches("omp/")
-                .trim_start_matches("opencode/")
-                .trim_start_matches('v')
-        })
-        .find_map(|token| parse_release(token).map(|release| (token, release)))
+/// Find the release a `--version` banner reports **for `provider` itself**, tolerating the forms
+/// the providers actually print (`omp/18.0.9`, `v1.18.25`, a bare `1.18.25`). Returns the exact
+/// token alongside the parsed release so a refusal can quote what the binary said.
+///
+/// Taking the first parseable token would be wrong, not merely imprecise: a banner that mentions
+/// any other version — a runtime, an available-update notice — could bind the gate to a version
+/// the provider is not. `runtime 18.0.0 omp/18.1.0` would admit on `18.0.0` and then launch an
+/// unverified 18.1. So the provider's own label wins, and an unlabelled banner is only trusted
+/// when it is unambiguous:
+///
+/// 1. a `<provider>/<release>` token is authoritative — it is the provider naming itself;
+/// 2. otherwise every parseable release must agree, since a single release repeated across lines
+///    is still unambiguous;
+/// 3. anything else (no release, or two disagreeing ones) is `None`, and the caller fails closed.
+pub fn find_release<'a>(printed: &'a str, provider: &str) -> Option<(&'a str, Release)> {
+    let labelled = format!("{provider}/");
+    let mut unlabelled: Option<(&'a str, Release)> = None;
+    let mut ambiguous = false;
+
+    for token in printed.split_whitespace() {
+        if let Some(rest) = token.strip_prefix(labelled.as_str()) {
+            // The provider naming itself outranks anything else in the banner.
+            if let Some(release) = parse_release(rest) {
+                return Some((rest, release));
+            }
+            continue;
+        }
+        let bare = token.strip_prefix('v').unwrap_or(token);
+        let Some(release) = parse_release(bare) else {
+            continue;
+        };
+        match unlabelled {
+            Some((_, seen)) if seen != release => ambiguous = true,
+            Some(_) => {}
+            None => unlabelled = Some((bare, release)),
+        }
+    }
+
+    if ambiguous { None } else { unlabelled }
 }
 
 /// Render admitted series as `18.0.x` for a refusal message.
@@ -129,18 +155,57 @@ mod tests {
 
     #[test]
     fn a_banner_yields_its_release_and_ignores_stray_numbers() {
-        let (token, release) = find_release("build 7\nomp/18.0.9\n").unwrap();
+        let (token, release) = find_release("build 7\nomp/18.0.9\n", "omp").unwrap();
         assert_eq!(token, "18.0.9");
         assert_eq!(release.series(), (18, 0));
-        assert_eq!(find_release("opencode/1.18.25").unwrap().1.series(), (1, 18));
-        assert_eq!(find_release("v1.18.25").unwrap().1.series(), (1, 18));
+        assert_eq!(
+            find_release("opencode/1.18.25", "opencode").unwrap().1.series(),
+            (1, 18)
+        );
+        assert_eq!(find_release("v1.18.25", "opencode").unwrap().1.series(), (1, 18));
+        // The shape omp actually prints for `--version` in the wild.
+        assert_eq!(find_release("omp v18.0.3\n18.0.3\n", "omp").unwrap().1.series(), (18, 0));
+    }
+
+    /// The provider naming itself outranks any other version in the banner. Without this, a
+    /// banner mentioning an unrelated release binds the gate to the wrong version — the omp gate
+    /// would admit on `18.0.0` and then launch an unverified 18.1 provider.
+    #[test]
+    fn a_labelled_release_wins_over_any_other_version_in_the_banner() {
+        let (token, release) = find_release("runtime 18.0.0 omp/18.1.0", "omp").unwrap();
+        assert_eq!(token, "18.1.0");
+        assert_eq!(release.series(), (18, 1));
+
+        let (token, release) = find_release("omp/18.0.9 node 22.3.1", "omp").unwrap();
+        assert_eq!(token, "18.0.9");
+        assert_eq!(release.series(), (18, 0));
+    }
+
+    /// With no label to disambiguate, two DIFFERENT releases must fail closed rather than let the
+    /// first one win. The same release repeated is still unambiguous and is accepted.
+    #[test]
+    fn an_unlabelled_banner_is_trusted_only_when_it_is_unambiguous() {
+        assert!(find_release("runtime 18.0.0 18.1.0", "omp").is_none());
+        assert!(find_release("1.18.25 2.0.0", "opencode").is_none());
+        assert_eq!(
+            find_release("18.0.3\n18.0.3\n", "omp").unwrap().1.series(),
+            (18, 0)
+        );
+    }
+
+    /// A label that belongs to a DIFFERENT provider must not be read as this provider's version.
+    #[test]
+    fn another_providers_label_does_not_satisfy_this_provider() {
+        // `opencode/1.18.25` is not omp naming itself; with nothing else in the banner there is
+        // no omp release to bind to, so the omp caller fails closed.
+        assert!(find_release("opencode/1.18.25", "omp").is_none());
     }
 
     #[test]
     fn a_banner_with_no_release_is_none() {
-        assert!(find_release("not-a-version").is_none());
-        assert!(find_release("18").is_none());
-        assert!(find_release("").is_none());
+        assert!(find_release("not-a-version", "omp").is_none());
+        assert!(find_release("18", "omp").is_none());
+        assert!(find_release("", "omp").is_none());
     }
 
     #[test]
