@@ -257,6 +257,10 @@ pub enum DeferralReason {
     /// The lowest maintained composer holds text that is not the exact notice — typically a human
     /// draft. Named by harness only: the text on that pane belongs to whoever is typing it.
     ComposerChanged { harness: &'static str },
+    /// A maintained harness located its composer but proved nothing about this screen — an active
+    /// turn, a modal, or a footer it does not recognise. Distinct from an unlocatable pane: this
+    /// one is covered and can clear on its own, so it is a wait rather than a coverage gap.
+    ComposerUnproven { harness: &'static str },
     /// No maintained harness could locate a composer on this pane, so nothing is proven either
     /// way. An unrecognised, resized, or not-yet-drawn TUI lands here.
     NoMaintainedComposer,
@@ -270,6 +274,10 @@ impl std::fmt::Display for DeferralReason {
             Self::ComposerChanged { harness } => write!(
                 formatter,
                 "the {harness} composer holds other text (a draft or an unfinished turn); waiting rather than typing over it"
+            ),
+            Self::ComposerUnproven { harness } => write!(
+                formatter,
+                "the {harness} composer was located but proved nothing about this screen (an active turn, a modal, or an unrecognised footer); waiting for it to settle"
             ),
             Self::NoMaintainedComposer => formatter.write_str(
                 "no maintained harness could locate a composer on this pane; nothing will be delivered here until one can",
@@ -643,14 +651,17 @@ fn observed_poke_with_window(
         ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
         ComposerState::EmptySafe => {}
         ComposerState::Changed | ComposerState::Ambiguous => {
-            // `Ambiguous` without a located harness is the unrecognised pane; with one it is a
-            // maintained harness that proved nothing about this screen, which reads the same to an
-            // operator as an unlocatable composer.
+            // Whether a harness was located is the difference between a wait and a coverage gap,
+            // so it decides the reason rather than being folded into one catch-all.
             return Ok(PokeOutcome::Deferred(match (state, harness) {
                 (ComposerState::Changed, Some(harness)) => {
                     DeferralReason::ComposerChanged { harness }
                 }
-                _ => DeferralReason::NoMaintainedComposer,
+                // `Changed` cannot arise without a located harness — only a located composer can
+                // be read as holding other text — but the classifier owns that invariant, not
+                // this call site, so an unlocated pane is reported as exactly what was observed.
+                (_, Some(harness)) => DeferralReason::ComposerUnproven { harness },
+                (_, None) => DeferralReason::NoMaintainedComposer,
             }));
         }
     }
@@ -3940,6 +3951,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             (
                 human_codex_screen(),
                 DeferralReason::ComposerChanged { harness: "codex" },
+            ),
+            // Located, but an unrecognised footer proves nothing about the screen. This is a wait,
+            // not a coverage gap, and must not be reported as an unlocatable pane.
+            (
+                idle_codex_screen_with_footer("Esc to interrupt"),
+                DeferralReason::ComposerUnproven { harness: "codex" },
             ),
             (
                 "unrecognized renderer".to_string(),
