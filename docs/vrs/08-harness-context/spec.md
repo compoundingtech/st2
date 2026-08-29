@@ -15,7 +15,7 @@ replicated-record names — `src/harness_context.rs`, with the invariant rows
 *Harness context discipline* and *Replicated-path discipline* naming their
 proofs.
 
-**Four of the five producers ship: claude, codex, pi, and omp.** The
+**All five producers ship: claude, codex, pi, omp, and opencode.** The
 status-line tee (HC-R18), the Claude fill arithmetic, and its compaction
 accounting are in the tree as of 2026-08-29 — `hooks/claude-statusline.sh`,
 `st2 driver claude-statusline`, and the `PreCompact`/`PostCompact`
@@ -24,12 +24,12 @@ proofs. The codex app-server pump writes the record from
 `thread/tokenUsage/updated` and counts compactions off the `contextCompaction`
 thread item — `src/codex_app_server.rs`. The pi and omp rows share one extension
 path in `hooks/pi-channel.ts` and `hooks/omp-channel.ts`, consumed by
-`src/pi_channel.rs`, which writes through a harness-context `Writer` beside the
-harness-state writer it already owned and with the same incarnation. All four
-rows are fixture-pinned (HC-R13). The opencode row of the producer table below
-is unimplemented, so an OpenCode declaration still reads `context: null`. That
-is the honest state, not a defect of the envelope. HC-R11 is therefore partially
-satisfied; it is not met until all five ship.
+`src/pi_channel.rs`. The opencode row joins SSE `message.updated` with
+`GET /config/providers` in `src/opencode_session.rs`. Each producer writes
+beside the harness-state writer its wrapper already owned and under the same
+incarnation, and every row is version-pinned by an HC-R13 fixture over a
+verbatim capture, so HC-R11 is met: a declaration on any of the five harnesses
+publishes a non-`null` `context`.
 
 The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
@@ -410,7 +410,7 @@ listed is `null`, and no producer computes a fact its channel does not carry:
 | codex | `null` — the thread carries `modelProvider` only | `null` — Codex reports no cost | `account/rateLimits/updated`, `sevenDay` only — see below | `tokenUsage.total.totalTokens` |
 | pi | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — only obtainable by summing every message's usage, which is a producer-side accumulator, not a free reading |
 | omp | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — same reason as pi |
-| opencode | `session.info.model` | `session.info.cost` | `null` | `session.info.tokens` (cumulative, no `total` key — summed by the producer) |
+| opencode | `session.info.model`, written `providerID/modelID` | `session.info.cost` | `null` | `session.info.tokens` (cumulative, no `total` key — summed by the producer) |
 
 `sessionTotalTokens` is carried only where the channel already computes it. A
 producer that would have to accumulate it itself writes `null` rather than
@@ -817,15 +817,56 @@ are measured and both silently produce a wrong number:
   key. It grows without bound and is `sessionTotalTokens`, never occupancy.
 
 `tokens.total` appears only on the final `message.updated` for a message; the
-first carries zeros and no `total`. Which session's reading this is when one
-server holds several — the categorical producer aggregates across them, but two
-live sessions have two windows and one record — is unsettled: `DQ-C10`. `session.compacted` carries `{sessionID}`
+first carries zeros and no `total`, so the producer requires the KEY and never
+reads a missing one as zero. Which session's reading this is when one server
+holds several — the categorical producer aggregates across them, but two live
+sessions have two windows and one record — is unsettled: `DQ-C10`. v1 is
+last-writer-wins over every session on the stream, which matches the categorical
+producer's aggregate rather than inventing the seat-session rule `DQ-C10` exists
+to defer. `session.compacted` carries `{sessionID}`
 and nothing else — no reason, no timestamp, no sizes — so the trigger is
-`unknown` and the count is derived by counting assistant messages with
-`summary === true`. The richer v2 events (`session.next.compaction.started` /
+`unknown` and the count is st2's own, scoped to this incarnation. The richer v2
+events (`session.next.compaction.started` /
 `ended`, which do carry a reason) exist in the OpenAPI document but did not fire
 once on the legacy path in the measured runs; they are schema-only and no
 producer depends on them.
+
+The producer publishes on one condition only: a `message.updated` that carried a
+fresh `tokens.total`. The adjacent facts arrive a frame later on
+`session.updated` and are folded into producer state, then ride out with the next
+numerator that LANDS a write; publishing on them directly would stamp
+`observedAtMs` on a numerator that may be hours old. They can therefore lag
+several turns — a run of readings inside one bucket writes nothing — and that is
+the intended shape: the record is one coherent snapshot of the turn that last
+landed, stamped with that turn's time, rather than a mix of a stale numerator and
+fresh costs.
+
+For the same reason this producer has no heartbeat: its numerator is pushed and
+not pullable, so it never holds a re-taken reading to publish, and a quiet seat's
+record ages visibly instead (HC-R06). A window that takes no turn does not fill,
+so the aging number stays true. One consequence is expected and must not be
+"fixed": an OpenCode seat idle for longer than `HARNESS_CONTEXT_STALE` (60
+minutes) crosses the horizon and Doctor's HC-R17 stale-record line fires beside a
+`running` desired state until the next turn. The other four producers re-pull on
+a cadence and never reach it; this one cannot, because there is nothing to
+re-pull. Closing that advisory by heartbeating the in-memory numerator would
+re-stamp `observedAtMs` on a reading no one re-took, which is exactly what the
+writer's contract forbids — the advisory is the honest report of a seat whose
+last measured occupancy is an hour old.
+
+`model` is written in OpenCode's own `providerID/modelID` spelling
+(`opencode/hy3-free`): `modelID` alone is ambiguous across providers, and this is
+the key the window is cached under, so the record always pairs a numerator with
+its own denominator. `usedPercent` is st2's unrounded, unclamped
+`usedTokens / windowTokens × 100`. Rounding it would move the written value into
+a different 1% bucket than the truth and make `HARNESS_CONTEXT_WARN_PERCENT` fire
+below the threshold it names.
+
+Measured on a live 1.18.25 lab run (two turns plus a forced summarize, 571 SSE
+frames): exactly **one** landed write, the compaction counted once with trigger
+`unknown`, and the summarizer's own message — `summary: true`, `tokens.total`
+1,462, and a *different* model id from the turns' — correctly skipped, where
+taking it would have published 0.7% of the window instead of 4.3%.
 
 ## Compaction accounting (HC-R12)
 
@@ -835,7 +876,7 @@ producer depends on them.
 | codex | `contextCompaction` thread item | none | `unknown` | st2 counts | incarnation |
 | pi | `session_compact` | `reason` | `manual`, `threshold`, `overflow` | `sessionManager.getEntries()` type `compaction` | harness-durable |
 | omp | `session_compact` | none | `unknown` | `sessionManager.getEntries()` type `compaction` | harness-durable |
-| opencode | `session.compacted` | none | `unknown` | assistant messages with `summary === true` | incarnation |
+| opencode | `session.compacted` | none | `unknown` | st2 counts the edge (one per compaction, corroborated 1:1 by the assistant message with `summary === true`) | incarnation |
 
 The vocabulary `manual | auto | threshold | overflow | idle | unknown` is closed
 and additive-tolerant. `idle` is in v1 because omp's internal auto-compaction
@@ -1010,17 +1051,18 @@ each only once a real test proves it (per `CLAUDE.md`):
   (`tests/claude_statusline.rs`).
 - **Per-harness fixture tests** (HC-R13) — one per producer, each decoding a
   payload captured verbatim from the version named in the producer table and
-  asserting the resulting triple, with the version asserted literally. The Codex
-  fixture ships:
-  `src/codex_app_server.rs::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`
-  over `tests/fixtures/codex_token_usage_inbound.jsonl`, asserting
-  `CODEX_CONTEXT_VERIFIED_VERSION` and the baseline literally, and asserting
-  both wrong numerators against the same capture (`total` reads 100, a
-  baseline-free `last.totalTokens / window` reads 36, the truth is 33). It must
-  fail if the 12,000 baseline moves; the omp fixture must fail if
-  `tokens` stops meaning prompt-only input; the OpenCode fixture must include a
-  post-compaction message list so a producer that stops skipping summary
+  asserting the resulting triple, with the version asserted literally. All five
+  ship, and each pins the numerator its harness actually means: the Claude
+  fixture must fail if the numerator's terms or the percent rule move, the Codex
+  fixture if the 12,000 baseline moves, the omp fixture if `tokens` stops
+  meaning prompt-only input, the pi fixture if it stops meaning the last
+  assistant message's `totalTokens`, and the OpenCode fixture carries the
+  post-compaction summarizer frame so a producer that stops skipping summary
   messages fails it.
+
+  **Shipped for claude**, over the 2.1.250 status-line payloads:
+  `src/claude_session.rs::a_mid_session_statusline_payload_yields_claudes_own_triple`,
+  `src/claude_session.rs::a_pre_turn_statusline_payload_withholds_rather_than_reporting_zero`.
 
   **Claude's two fixtures and what each proves.**
   `tests/fixtures/harness-context/claude-statusline-pre-turn.json` is the
@@ -1037,7 +1079,14 @@ each only once a real test proves it (per `CLAUDE.md`):
   none was taken. A bump that moves the numerator's terms or the percent rule
   still fails the fixture, which is what HC-R13 asks of it.
 
-  Shipped for pi and omp:
+  **Shipped for codex**:
+  `src/codex_app_server.rs::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`
+  over `tests/fixtures/codex_token_usage_inbound.jsonl`, asserting
+  `CODEX_CONTEXT_VERIFIED_VERSION` and the baseline literally, and asserting
+  both wrong numerators against the same capture (`total` reads 100, a
+  baseline-free `last.totalTokens / window` reads 36, the truth is 33).
+
+  **Shipped for pi and omp**:
   `src/pi_channel.rs::the_pi_0_84_2_fixture_pins_total_tokens_as_the_numerator`,
   `src/pi_channel.rs::the_omp_18_0_9_fixture_pins_prompt_input_as_the_numerator`,
   `src/pi_channel.rs::a_pi_compaction_withholds_the_reading_it_emptied_in_the_same_write`,
@@ -1047,11 +1096,24 @@ each only once a real test proves it (per `CLAUDE.md`):
   `src/pi_channel.rs::the_measured_pi_release_is_the_one_the_extension_gate_pins`,
   `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`.
 
+  **Shipped for OpenCode**, over verbatim 1.18.25 SSE frames whose own
+  `session.updated.info.version` is the asserted version:
+  `src/opencode_session.rs::captured_opencode_turns_publish_the_assistant_total_over_the_providers_window`
+  (the join, the unrounded percent, and one landed write for a duplicated frame),
+  `src/opencode_session.rs::cumulative_session_tokens_are_the_session_total_and_never_the_occupancy`,
+  `src/opencode_session.rs::neither_summary_shape_is_ever_the_reading`,
+  `src/opencode_session.rs::a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp`,
+  `src/opencode_session.rs::an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands`,
+  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`,
+  `src/opencode_session.rs::the_window_pull_reads_config_providers_through_the_real_client`.
+
   Each fixture carries *both* numbers from its capture — the one the producer
   must publish and the one it must not — because the failure this test exists to
   catch is a change of meaning with no change of shape, which no type gate and no
   round-trip assertion can see. The pi fixture asserts `23425` and not `23300`;
   the omp fixture asserts the prompt figure and not that message's `totalTokens`.
+  The row *Version-pinned producer arithmetic* in
+  [INVARIANTS.md](../../../INVARIANTS.md) names the five.
 
 - **Extension asset runtime smoke** — `checks.pi-extension-types` transpiles both
   shipped assets and drives every registered handler, because the type gate is

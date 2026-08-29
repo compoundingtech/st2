@@ -37,7 +37,7 @@ use crate::driver_diagnostic::{
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
-use crate::{ding, harness_version, message, status};
+use crate::{ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
 /// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
@@ -164,7 +164,19 @@ pub fn run(
                 "opencode",
                 Some(runtime_id.clone()),
             )
-            .with_ownership(session, seq),
+            .with_ownership(session.clone(), seq),
+            // The same incarnation token as the state record beside it, carried as provenance
+            // only (HC-R15): nothing on this record is fenced on it. The claim above already
+            // removed any predecessor's context record, so no second removal belongs here.
+            context: match ContextProducer::new(&agent_dir, &identity, &session) {
+                Ok(producer) => Some(producer),
+                Err(error) => {
+                    tracing::warn!(
+                        "st2 opencode-session: no context record for this seat: {error:#}"
+                    );
+                    None
+                }
+            },
             delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
             diagnostics,
         }
@@ -195,6 +207,9 @@ struct Session {
     version_ok: bool,
     status_path: PathBuf,
     writer: Writer,
+    /// The numeric axis, `None` only where the record has nowhere safe to stage. Its absence is a
+    /// missing advisory number, never a reason to fail a launch that is otherwise healthy.
+    context: Option<ContextProducer>,
     delivery: Delivery,
     diagnostics: DiagnosticPublisher,
 }
@@ -214,6 +229,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
     let mut next_gate_attempt = Instant::now();
     let mut next_presence = Instant::now();
     let mut next_inbox = Instant::now();
+    // The context producer's own handle on the server: `Client` is a port and a password, and a
+    // separate one keeps its pull from borrowing the session while the producer is borrowed
+    // mutably.
+    let context_client = session.client.clone();
 
     let outcome = loop {
         if STOP.load(Ordering::SeqCst) {
@@ -283,6 +302,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             sse_started = true;
         }
 
+        // Accumulated across the whole drain and published once at its end: `message.updated` and
+        // `session.updated` arrive back-to-back, so one publish per batch carries the turn's cost
+        // and cumulative total alongside the numerator that made the reading fresh.
+        let mut fresh_reading = false;
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
@@ -316,7 +339,19 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                         session.delivery.saw_session(sid);
                     }
                     machine.apply(&value);
+                    if let Some(context) = session.context.as_mut() {
+                        fresh_reading |= context.apply(&value);
+                    }
                 }
+            }
+        }
+        // The numeric axis is independent of the categorical one (HC-R07): it is not gated on
+        // `evidence`, not reset by a reconnect, and not interrupted by a poisoned projection. A
+        // token count stays true while its record ages, and the reader returns it with that age.
+        if let Some(context) = session.context.as_mut() {
+            context.refresh_windows(&context_client, api_ok);
+            if fresh_reading {
+                context.publish();
             }
         }
         if machine.poisoned && machine.ended.is_none() && evidence {
@@ -987,6 +1022,284 @@ fn event_session_id(event: &Value) -> Option<&str> {
     event
         .pointer("/properties/sessionID")
         .and_then(Value::as_str)
+}
+
+// ---- harness context (HC-R02, HC-R11, HC-R12) --------------------------------------------------
+
+/// How long a fruitless `GET /config/providers` waits before another attempt. Without a backoff a
+/// model the providers document does not name would re-pull the whole document once per
+/// [`PROVIDER_POLL`] for the life of the session.
+const PROVIDERS_RETRY: Duration = Duration::from_secs(60);
+/// How long a providers document that ANSWERED but does not name the model waits. A custom or
+/// local provider can be absent from the config surface for the life of the session, and re-pulling
+/// the whole document every minute for it would be the same busy loop one step slower. A model
+/// change resets the clock and asks again at once, so nothing is lost by waiting; the horizon
+/// matches the API gate's own terminal arm.
+const PROVIDERS_UNLISTED_RETRY: Duration = Duration::from_secs(3600);
+
+/// The numeric axis for an OpenCode seat (HC-R02, HC-R11): the one producer whose numerator is
+/// pushed and whose denominator has to be pulled.
+///
+/// - **Numerator**: `tokens.total` of the last **non-summary assistant** `message.updated`. Two
+///   measured traps live here. `summary` is overloaded — on user messages it is an object
+///   (`{diffs: []}`) and therefore truthy — so the filter reads it as a boolean and requires the
+///   assistant role. And the compaction summarizer's own message is an assistant message whose
+///   `tokens.total` is the cost of the summarization call (1,511 measured), not the size of the
+///   new context; taking it would report a freshly compacted window as nearly empty.
+/// - **Denominator**: `providers[].models[<modelID>].limit.context` from `GET /config/providers`,
+///   pulled on demand and cached per `providerID/modelID`. While it is unknown both the window and
+///   the percent are withheld (HC-R02), never guessed from a model table.
+/// - **`usedPercent`**: st2's own division, unrounded and unclamped — OpenCode displays no
+///   percentage of its own, so there is no harness number to carry. Rounding would put the written
+///   value in a different 1% bucket than the truth and make
+///   [`harness_context::HARNESS_CONTEXT_WARN_PERCENT`] fire below the threshold it names.
+/// - **`sessionTotalTokens`**: the sum of `session.info.tokens`, which carries no `total` key and
+///   is cumulative over the session's lifetime. It grows without bound and is never the numerator
+///   of the percent — the field's name is that guard.
+///
+/// The state lives here rather than on [`EventMachine`], which is rebuilt from scratch on every SSE
+/// reconnect: a window cache and a numerator hung off it would be discarded by a blip. A reconnect
+/// deliberately does not disturb this producer — a token count stays true while its record ages,
+/// which is the whole of HC-R06.
+///
+/// Which session's reading this is, when one server holds several, is `DQ-C10`: v1 is
+/// last-writer-wins over every session on the stream, matching the categorical producer's
+/// aggregate rather than inventing a seat-session rule the open question exists to defer.
+struct ContextProducer {
+    writer: harness_context::Writer,
+    /// `providerID/modelID` → `limit.context`.
+    windows: BTreeMap<String, u64>,
+    /// The model that produced the current numerator, in OpenCode's own `providerID/modelID`
+    /// spelling — `modelID` alone is ambiguous across providers, and this is the key the window is
+    /// looked up under, so the record always pairs a numerator with its own denominator.
+    model: Option<String>,
+    /// The session's configured model, which can change before any assistant message proves it.
+    /// It only warms the window cache; it never becomes the reading's model.
+    configured_model: Option<String>,
+    used_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    session_total_tokens: Option<u64>,
+    next_providers_attempt: Instant,
+}
+
+impl ContextProducer {
+    fn new(agent_dir: &Path, identity: &str, session: &str) -> Result<Self> {
+        Ok(Self {
+            writer: harness_context::Writer::new(
+                agent_dir,
+                identity,
+                harness_context::Harness::OpenCode,
+            )?
+            .with_session(session),
+            windows: BTreeMap::new(),
+            model: None,
+            configured_model: None,
+            used_tokens: None,
+            cost_usd: None,
+            session_total_tokens: None,
+            next_providers_attempt: Instant::now(),
+        })
+    }
+
+    /// Fold one SSE frame in, returning whether it carried a fresh occupancy numerator.
+    ///
+    /// A compaction edge writes immediately: it is rare, it always lands, and it deliberately
+    /// carries no reading — the numbers already on the record predate the compaction, and
+    /// re-stamping them would hide that. Nothing zeroes the numerator on the edge either
+    /// (HC-R03); the next turn's `message.updated` replaces it with an observation.
+    fn apply(&mut self, event: &Value) -> bool {
+        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        let properties = event.get("properties").unwrap_or(&Value::Null);
+        let info = || properties.get("info").unwrap_or(&Value::Null);
+        match kind {
+            "message.updated" => self.apply_message(info()),
+            "session.updated" => {
+                self.apply_session(info());
+                false
+            }
+            // `{sessionID}` and nothing else — no reason, no timestamp, no before/after sizes — so
+            // the trigger is `unknown` and the count is st2's, scoped to this incarnation. The
+            // richer v2 `session.next.compaction.*` events do carry a reason, but did not fire once
+            // on the measured legacy path; nothing here depends on them.
+            "session.compacted" => {
+                if let Err(error) = self.writer.compacted(harness_context::Compaction::new(
+                    harness_context::CompactionTrigger::Unknown,
+                )) {
+                    tracing::warn!(
+                        "st2 opencode-session: recording a compaction failed: {error:#}"
+                    );
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_message(&mut self, info: &Value) -> bool {
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        // `summary` is a BOOLEAN on assistant messages and an object on user messages; `as_bool`
+        // reads only the former, so `{diffs: []}` can never be mistaken for a compaction summary.
+        if info.get("summary").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        // The key's PRESENCE is the proof, not its value: the first `message.updated` of a message
+        // carries all-zero token fields and no `total` at all, and reading a missing key as zero
+        // would publish an empty window at the start of every turn.
+        let Some(total) = info.pointer("/tokens/total").and_then(Value::as_u64) else {
+            return false;
+        };
+        let (Some(provider), Some(model)) = (
+            info.get("providerID").and_then(Value::as_str),
+            info.get("modelID").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        self.used_tokens = Some(total);
+        self.model = Some(model_key(provider, model));
+        true
+    }
+
+    /// The adjacent facts (HC-R16). None of them is a reading: this frame never publishes, and its
+    /// values ride out on the next numerator instead. Publishing here would stamp `observedAtMs` on
+    /// a numerator that may be hours old — the one thing [`harness_context::Writer::observe`]
+    /// forbids its callers.
+    fn apply_session(&mut self, info: &Value) {
+        if let Some(cost) = info.get("cost").and_then(Value::as_f64) {
+            self.cost_usd = Some(cost);
+        }
+        if let Some(tokens) = info.get("tokens")
+            && let Some(total) = cumulative_tokens(tokens)
+        {
+            self.session_total_tokens = Some(total);
+        }
+        if let (Some(provider), Some(model)) = (
+            info.pointer("/model/providerID").and_then(Value::as_str),
+            info.pointer("/model/id").and_then(Value::as_str),
+        ) {
+            let key = model_key(provider, model);
+            if self.configured_model.as_deref() != Some(key.as_str()) {
+                // A model change re-opens the denominator question before any assistant message
+                // proves the new model, so the cache is warmed now rather than the percent being
+                // withheld for a whole turn.
+                self.configured_model = Some(key);
+                self.next_providers_attempt = Instant::now();
+            }
+        }
+    }
+
+    /// A model whose window is not cached yet, if any.
+    fn window_wanted(&self) -> Option<&str> {
+        [self.model.as_deref(), self.configured_model.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|key| !self.windows.contains_key(*key))
+    }
+
+    /// Pull the denominator when a window this producer needs is missing, at most once per
+    /// [`PROVIDERS_RETRY`]. The only HTTP this producer does.
+    fn refresh_windows(&mut self, client: &Client, api_ok: bool) {
+        if !api_ok || self.window_wanted().is_none() {
+            return;
+        }
+        if Instant::now() < self.next_providers_attempt {
+            return;
+        }
+        self.next_providers_attempt = Instant::now() + PROVIDERS_RETRY;
+        match client.get_json("/config/providers") {
+            Ok(doc) => {
+                self.ingest_providers(&doc);
+                if self.window_wanted().is_some() {
+                    self.next_providers_attempt = Instant::now() + PROVIDERS_UNLISTED_RETRY;
+                }
+            }
+            Err(error) => {
+                tracing::warn!("st2 opencode-session: reading model windows failed: {error:#}");
+            }
+        }
+    }
+
+    /// The pure half of that pull, so the join is provable from a captured document.
+    fn ingest_providers(&mut self, doc: &Value) {
+        let Some(providers) = doc.get("providers").and_then(Value::as_array) else {
+            return;
+        };
+        for provider in providers {
+            let Some(provider_id) = provider.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(models) = provider.get("models").and_then(Value::as_object) else {
+                continue;
+            };
+            for (model_id, model) in models {
+                if let Some(context) = model.pointer("/limit/context").and_then(Value::as_u64) {
+                    self.windows
+                        .insert(model_key(provider_id, model_id), context);
+                }
+            }
+        }
+    }
+
+    fn reading(&self) -> harness_context::Reading {
+        let window = self
+            .model
+            .as_deref()
+            .and_then(|key| self.windows.get(key))
+            .copied();
+        harness_context::Reading {
+            used_tokens: self.used_tokens,
+            window_tokens: window,
+            used_percent: match (self.used_tokens, window) {
+                (Some(used), Some(window)) if window > 0 => {
+                    Some(used as f64 / window as f64 * 100.0)
+                }
+                _ => None,
+            },
+            model: self.model.clone(),
+            cost_usd: self.cost_usd,
+            session_total_tokens: self.session_total_tokens,
+            rate_limits: harness_context::RateLimits::default(),
+        }
+    }
+
+    /// Publish the current reading, returning whether a write landed — the core's quantization is
+    /// what bounds a stream this chatty to one write per 1% of the window.
+    ///
+    /// Called only where a fresh numerator just arrived. This producer's numerator is pushed and
+    /// not pullable, so it never holds a reading to heartbeat with: a quiet seat's record ages
+    /// visibly instead, and a reader gets the numbers it has with their age (HC-R06) — which stay
+    /// true, because a window taking no turn does not fill.
+    fn publish(&mut self) -> bool {
+        match self.writer.observe(self.reading()) {
+            Ok(landed) => landed,
+            Err(error) => {
+                tracing::warn!(
+                    "st2 opencode-session: writing the context record failed: {error:#}"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// OpenCode's own spelling for a model, and the key a window is cached under.
+fn model_key(provider_id: &str, model_id: &str) -> String {
+    format!("{provider_id}/{model_id}")
+}
+
+/// The cumulative session total: `session.info.tokens` carries no `total` key, so the producer sums
+/// the leaves it does carry. Never occupancy — across the measured two-turn run this reached 16,400
+/// while occupancy stayed at 8,200.
+fn cumulative_tokens(tokens: &Value) -> Option<u64> {
+    let leaf = |pointer: &str| tokens.pointer(pointer).and_then(Value::as_u64);
+    let mut total = leaf("/input")?;
+    for pointer in ["/output", "/reasoning", "/cache/read", "/cache/write"] {
+        total = total.saturating_add(leaf(pointer).unwrap_or(0));
+    }
+    Some(total)
 }
 
 // ---- native delivery -------------------------------------------------------------------------
@@ -1734,6 +2047,8 @@ mod tests {
                     }
                 } else if method == "GET" && path == "/session" {
                     200
+                } else if method == "GET" && path == "/config/providers" {
+                    200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
                         500
@@ -1757,6 +2072,8 @@ mod tests {
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
+                } else if method == "GET" && path == "/config/providers" {
+                    OC_PROVIDERS.to_string()
                 } else if method == "GET" && path == "/session/status" {
                     if let Some(body) = status_body_t.lock().unwrap().clone() {
                         body
@@ -2326,5 +2643,327 @@ mod tests {
         }
         stop.store(true, Ordering::SeqCst);
         assert!(saw_disconnect, "silence must surface as a disconnect");
+    }
+
+    // ---- harness context: frames captured verbatim from OpenCode 1.18.25 (HC-R13) -------------
+    //
+    // Every constant below is one `data:` payload of the credential-free lab run recorded in
+    // `docs/vrs/08-harness-context/spec.md` §opencode, unedited. The version the frames were
+    // captured against is asserted from the frames themselves — `session.updated` carries
+    // `info.version` — so a bump that changes the numerator, the denominator, or the shape of the
+    // join fails here rather than silently publishing a differently-meaning number.
+
+    /// Turn 1's FIRST `message.updated` for the assistant message: all-zero token fields and **no**
+    /// `total` key at all.
+    const OC_TURN_1_OPENING: &str = r#"{"id":"evt_04cfa35b9001JZ9d0L9djTMOAJ","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfa35b9001v0KGCf03ofZ2UX","parentID":"msg0000000000000000000000001","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997861305},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM"}}}"#;
+    /// Turn 1's FINAL `message.updated`, the one carrying `tokens.total`. Emitted twice with
+    /// identical content, which is why the second is fed to the producer in the same test.
+    const OC_TURN_1_FINAL: &str = r#"{"id":"evt_04cfa4404001t29p1VUcmmPoRG","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfa35b9001v0KGCf03ofZ2UX","parentID":"msg0000000000000000000000001","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":8200,"input":6455,"output":4,"reasoning":13,"cache":{"write":0,"read":1728}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997861305,"completed":1787997864970},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","finish":"stop"}}}"#;
+    /// The `session.updated` that follows turn 1: cumulative `info.tokens`, no `total` key.
+    const OC_TURN_1_SESSION: &str = r#"{"id":"evt_04cfa4415001vEbJR0Dd0RfwXA","type":"session.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"ses_fb305cb62ffeA6a053WBLMBcRM","slug":"tidy-falcon","projectID":"global","directory":"/tmp/oclab/work","path":"tmp/oclab/work","title":"New session - 2026-08-29T10:04:21.022Z","agent":"build","model":{"id":"hy3-free","providerID":"opencode","variant":"default"},"version":"1.18.25","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":6455,"output":4,"reasoning":13,"cache":{"read":1728,"write":0}},"time":{"created":1787997861022,"updated":1787997864980}}}}"#;
+    /// Turn 2's final `message.updated`: a different message, the SAME occupancy (8,200) — the
+    /// window did not grow because the earlier turn moved into the cache.
+    const OC_TURN_2_FINAL: &str = r#"{"id":"evt_04cfb088c001CyXonjcqRdxBfA","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfb00ba001bh7MmStxmbJ0J3","parentID":"msg0000000000000000000000002","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":8200,"input":133,"output":3,"reasoning":0,"cache":{"write":0,"read":8064}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997913274,"completed":1787997915280},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","finish":"stop"}}}"#;
+    /// The `session.updated` after turn 2: the cumulative total has doubled while occupancy has
+    /// not moved. 6588 + 7 + 13 + 9792 = 16,400 = 2 × 8,200.
+    const OC_TURN_2_SESSION: &str = r#"{"id":"evt_04cfb089b0013nTIMhUVKqyBW6","type":"session.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"ses_fb305cb62ffeA6a053WBLMBcRM","slug":"tidy-falcon","projectID":"global","directory":"/tmp/oclab/work","path":"tmp/oclab/work","title":"Request to say pineapple","agent":"build","model":{"id":"hy3-free","providerID":"opencode","variant":"default"},"version":"1.18.25","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":6588,"output":7,"reasoning":13,"cache":{"read":9792,"write":0}},"time":{"created":1787997861022,"updated":1787997915290}}}}"#;
+    /// A USER message whose `summary` is an OBJECT — truthy, and not a compaction summary.
+    const OC_USER_SUMMARY_OBJECT: &str = r#"{"id":"evt_04cfa360b001CDm6cFnqfAt7cc","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"role":"user","time":{"created":1787997861241},"agent":"build","model":{"providerID":"opencode","modelID":"hy3-free"},"id":"msg0000000000000000000000001","sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","summary":{"diffs":[]}}}}"#;
+    /// The compaction summarizer's own assistant message: `summary: true`, and a `tokens.total` of
+    /// 1,511 that is the cost of the summarization call, not the size of the new context.
+    const OC_SUMMARIZER_MESSAGE: &str = r#"{"id":"evt_04cfc5814001Vn5oChuQ2RQooq","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfc2fce0012p4wkSC7k1IXrQ","role":"assistant","parentID":"msg_04cfc2fc00017s1bHmHcf4uNkQ","sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","mode":"compaction","agent":"compaction","summary":true,"path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":1511,"input":387,"output":103,"reasoning":957,"cache":{"write":0,"read":64}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997990862,"completed":1787998001175},"finish":"stop"}}}"#;
+    /// The whole compaction edge: a session id and nothing else.
+    const OC_SESSION_COMPACTED: &str = r#"{"id":"evt_04cfc5818001PhY4Ho4tMNhoNz","type":"session.compacted","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM"}}"#;
+    /// `GET /config/providers`, verbatim in envelope and in the two model entries kept, which are
+    /// the join's whole surface: `providers[].models[<modelID>].limit.context`.
+    const OC_PROVIDERS: &str = r#"{"providers":[{"id":"opencode","name":"OpenCode Zen","source":"custom","env":["OPENCODE_API_KEY"],"options":{"apiKey":"public"},"models":{"nemotron-3-ultra-free":{"id":"nemotron-3-ultra-free","providerID":"opencode","api":{"id":"nemotron-3-ultra-free","url":"https://opencode.ai/zen/v1","npm":"@ai-sdk/openai-compatible"},"name":"Nemotron 3 Ultra Free","family":"nemotron-free","cost":{"input":0,"output":0,"cache":{"read":0,"write":0}},"limit":{"context":1000000,"output":128000},"status":"active","options":{},"headers":{},"release_date":"2026-06-04","variants":{}},"hy3-free":{"id":"hy3-free","providerID":"opencode","api":{"id":"hy3-free","url":"https://opencode.ai/zen/v1","npm":"@ai-sdk/openai-compatible"},"name":"Hy3 Free","family":"hy3-free","cost":{"input":0,"output":0,"cache":{"read":0,"write":0}},"limit":{"context":190000,"output":64000},"status":"active","options":{},"headers":{},"release_date":"2026-07-06","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}}}],"default":{"opencode":"big-pickle"}}"#;
+
+    /// The window `hy3-free` published, and the occupancy every measured turn settled at.
+    const OC_WINDOW: u64 = 190_000;
+    const OC_OCCUPANCY: u64 = 8_200;
+
+    struct ContextFixture {
+        _tmp: tempfile::TempDir,
+        agent_dir: PathBuf,
+        producer: ContextProducer,
+    }
+
+    impl ContextFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path().join("agents").join("hetz").join("seat");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let producer = ContextProducer::new(&agent_dir, "hetz.seat", "incarnation-1").unwrap();
+            Self {
+                _tmp: tmp,
+                agent_dir,
+                producer,
+            }
+        }
+
+        /// One batch of frames, exactly as the wrapper's drain treats them: fold them all in, then
+        /// publish once if any of them carried a fresh numerator. Returns whether a write landed.
+        /// Batching is what lets a turn's cost and cumulative total ride out with the numerator
+        /// that made the reading fresh — they arrive on `session.updated` a frame later.
+        fn drain(&mut self, frames: &[&str]) -> bool {
+            let mut fresh = false;
+            for raw in frames {
+                fresh |= self.producer.apply(&event(raw));
+            }
+            fresh && self.producer.publish()
+        }
+
+        fn feed(&mut self, raw: &str) -> bool {
+            self.drain(&[raw])
+        }
+
+        fn record(&self) -> Option<harness_context::Observed> {
+            harness_context::read(&harness_context::harness_context_path(&self.agent_dir))
+        }
+    }
+
+    /// The version the fixtures are pinned to, read out of the frames themselves.
+    fn captured_version(raw: &str) -> String {
+        event(raw)
+            .pointer("/properties/info/version")
+            .and_then(Value::as_str)
+            .expect("session.updated carries the server version")
+            .to_string()
+    }
+
+    /// HC-R02, HC-R13: two measured turns become readings — last non-summary assistant
+    /// `tokens.total` over the model's `limit.context` — and the duplicate final frame OpenCode
+    /// emits for every completion lands no second write (the DQ-H2 flood the sibling record hit).
+    #[test]
+    fn captured_opencode_turns_publish_the_assistant_total_over_the_providers_window() {
+        assert_eq!(captured_version(OC_TURN_1_SESSION), "1.18.25");
+        assert_eq!(captured_version(OC_TURN_2_SESSION), "1.18.25");
+
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+
+        // The opening frame of a message carries no `total`: not a reading, and nothing written.
+        assert!(!fixture.feed(OC_TURN_1_OPENING));
+        assert!(
+            fixture.record().is_none(),
+            "an all-zero opening frame must not publish a 0% window"
+        );
+
+        // Turn 1's batch: the final frame OpenCode emits twice, then the session frame carrying
+        // the turn's adjacent facts. One landed write for the whole turn.
+        assert!(
+            fixture.drain(&[OC_TURN_1_FINAL, OC_TURN_1_FINAL, OC_TURN_1_SESSION]),
+            "turn 1 is a reading"
+        );
+        let record = fixture.record().expect("a context record");
+        assert_eq!(record.harness, harness_context::Harness::OpenCode);
+        assert_eq!(record.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(record.window_tokens, Some(OC_WINDOW));
+        let expected = OC_OCCUPANCY as f64 / OC_WINDOW as f64 * 100.0;
+        assert!(
+            (record.used_percent.expect("a percent") - expected).abs() < 1e-9,
+            "the percent is st2's own unrounded division: {:?}",
+            record.used_percent
+        );
+        assert_eq!(record.model.as_deref(), Some("opencode/hy3-free"));
+        assert_eq!(record.cost_usd, Some(0.0));
+        assert_eq!(record.compactions, 0);
+
+        // Turn 2 is a genuinely fresh reading in the same 1% bucket, so nothing is written and the
+        // record stays the coherent turn-1 snapshot it was — its own `observedAtMs` says so. That
+        // is the guard the sibling record's restatement flood (DQ-H2) taught this one to keep.
+        assert!(
+            !fixture.drain(&[OC_TURN_2_FINAL, OC_TURN_2_FINAL, OC_TURN_2_SESSION]),
+            "a reading inside the written bucket must not write again"
+        );
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.observed_at_ms, record.observed_at_ms);
+        assert_eq!(after.session_total_tokens, record.session_total_tokens);
+    }
+
+    /// HC-R16: `session.info.tokens` is cumulative and carries no `total` key. It is the session
+    /// total and never the numerator — after two turns it is twice the occupancy.
+    #[test]
+    fn cumulative_session_tokens_are_the_session_total_and_never_the_occupancy() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+
+        // Adjacent facts alone are not a reading: `session.updated` never publishes, because its
+        // numbers say nothing about occupancy and stamping them would date a numerator that may
+        // be hours old.
+        fixture.feed(OC_TURN_1_SESSION);
+        assert!(
+            fixture.record().is_none(),
+            "a cumulative-token frame must not stamp a reading of its own"
+        );
+
+        fixture.drain(&[OC_TURN_1_FINAL, OC_TURN_1_SESSION]);
+        fixture.drain(&[OC_TURN_2_FINAL, OC_TURN_2_SESSION]);
+        // The reading the producer now holds, whatever the write guard decides to do with it: the
+        // cumulative total has reached twice the occupancy, and the percent divides the occupancy.
+        let reading = fixture.producer.reading();
+        assert_eq!(reading.session_total_tokens, Some(16_400));
+        assert_eq!(reading.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(reading.window_tokens, Some(OC_WINDOW));
+        assert!(
+            (reading.used_percent.expect("a percent") - 4.315_789_473_684_21).abs() < 1e-9,
+            "the cumulative total is never the numerator: {reading:?}"
+        );
+        // 16,400 of a 190,000 window would read 8.6%: twice the truth, and growing every turn.
+        assert!(reading.used_percent.expect("a percent") < 5.0);
+        let record = fixture.record().expect("a context record");
+        assert_eq!(record.used_tokens, Some(OC_OCCUPANCY));
+    }
+
+    /// HC-R02: the two measured `summary` traps. The user message's `summary` is an OBJECT and
+    /// therefore truthy, and the compaction summarizer's own assistant message carries a
+    /// `tokens.total` of 1,511 that would report a freshly compacted window as nearly empty.
+    #[test]
+    fn neither_summary_shape_is_ever_the_reading() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_2_FINAL);
+        let before = fixture.record().expect("a context record");
+
+        assert!(!fixture.feed(OC_USER_SUMMARY_OBJECT));
+        assert!(!fixture.feed(OC_SUMMARIZER_MESSAGE));
+
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.used_tokens, Some(OC_OCCUPANCY));
+        assert_ne!(after.used_tokens, Some(1_511));
+        assert_eq!(after.observed_at_ms, before.observed_at_ms);
+    }
+
+    /// HC-R12: `session.compacted` carries `{sessionID}` and nothing else, so the trigger is
+    /// `unknown` and the count is st2's, scoped to this incarnation. The edge carries no reading,
+    /// so the numbers keep the age they had — they genuinely predate the compaction — and nothing
+    /// zeroes them (HC-R03); the next turn replaces them with an observation.
+    #[test]
+    fn a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_1_FINAL);
+        let before = fixture.record().expect("a context record");
+        assert_eq!(before.compactions, 0);
+
+        fixture.feed(OC_SUMMARIZER_MESSAGE);
+        fixture.feed(OC_SESSION_COMPACTED);
+
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.compactions, 1);
+        assert_eq!(
+            after.last_compaction_trigger,
+            Some(harness_context::CompactionTrigger::Unknown)
+        );
+        assert!(after.last_compaction_ms.is_some());
+        assert_eq!(
+            after.observed_at_ms, before.observed_at_ms,
+            "a compaction edge carries no reading and must not re-stamp one"
+        );
+        assert_eq!(after.used_tokens, Some(OC_OCCUPANCY));
+    }
+
+    /// HC-R02, HC-R03: with no window for the reading's model the percent is withheld rather than
+    /// guessed from a table, and the first successful providers pull is itself a bucket change, so
+    /// the join lands as soon as it is known.
+    #[test]
+    fn an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands() {
+        let mut fixture = ContextFixture::new();
+        assert!(fixture.feed(OC_TURN_1_FINAL));
+        let withheld = fixture.record().expect("a context record");
+        assert_eq!(withheld.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(withheld.window_tokens, None);
+        assert_eq!(withheld.used_percent, None);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/hy3-free"),
+            "an unjoined model is what makes the producers pull due"
+        );
+
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        assert_eq!(fixture.producer.window_wanted(), None);
+        assert!(
+            fixture.feed(OC_TURN_2_FINAL),
+            "withheld-to-known is itself a bucket change"
+        );
+        let joined = fixture.record().expect("a context record");
+        assert_eq!(joined.window_tokens, Some(OC_WINDOW));
+        assert!(joined.used_percent.is_some());
+    }
+
+    /// The denominator's whole live path: the exact endpoint string, through the real `Client`, into
+    /// the cache the reading divides by. The pull is gated on the API gate having passed, and a
+    /// document that answers without naming the model backs off far rather than re-pulling every
+    /// minute for the life of the session.
+    #[test]
+    fn the_window_pull_reads_config_providers_through_the_real_client() {
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let mut fixture = ContextFixture::new();
+        assert!(fixture.feed(OC_TURN_1_FINAL));
+        assert_eq!(fixture.record().expect("a record").window_tokens, None);
+
+        fixture.producer.refresh_windows(&client, false);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/hy3-free"),
+            "the pull waits for the API gate"
+        );
+
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(fixture.producer.window_wanted(), None);
+        assert!(fixture.feed(OC_TURN_2_FINAL));
+        assert_eq!(
+            fixture.record().expect("a record").window_tokens,
+            Some(OC_WINDOW)
+        );
+
+        // A model the answered document does not name: the retry moves out to the long horizon
+        // instead of re-pulling the whole document once a minute forever.
+        let switched = OC_TURN_1_SESSION.replace(
+            r#""model":{"id":"hy3-free","providerID":"opencode","variant":"default"}"#,
+            r#""model":{"id":"big-pickle","providerID":"opencode","variant":"default"}"#,
+        );
+        fixture.feed(&switched);
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/big-pickle")
+        );
+        assert!(
+            fixture.producer.next_providers_attempt
+                > Instant::now() + PROVIDERS_UNLISTED_RETRY - Duration::from_secs(60),
+            "an unlisted model must not keep the pull due every minute"
+        );
+    }
+
+    /// A model change on `session.updated` re-opens the denominator question before any assistant
+    /// message proves the new model, so the pull is due again — and it never becomes the reading's
+    /// own model, which stays the one that produced the numerator.
+    #[test]
+    fn a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_1_FINAL);
+        fixture.feed(OC_TURN_1_SESSION);
+        assert_eq!(fixture.producer.window_wanted(), None);
+
+        let switched = OC_TURN_1_SESSION.replace(
+            r#""model":{"id":"hy3-free","providerID":"opencode","variant":"default"}"#,
+            r#""model":{"id":"big-pickle","providerID":"opencode","variant":"default"}"#,
+        );
+        fixture.feed(&switched);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/big-pickle"),
+            "a model the providers document does not name keeps the pull due"
+        );
+        let record = fixture.record().expect("a context record");
+        assert_eq!(
+            record.model.as_deref(),
+            Some("opencode/hy3-free"),
+            "the record pairs a numerator with the model that produced it"
+        );
+        assert_eq!(record.window_tokens, Some(OC_WINDOW));
     }
 }
