@@ -1031,23 +1031,30 @@ fn main() -> Result<()> {
         command,
     } = Cli::parse();
 
-    let mut telemetry =
+    // Claude's status-line tee is the one subcommand whose cadence a HARNESS sets rather than an
+    // operator or an event: `refreshInterval: 5` makes it ~720 short-lived processes per hour per
+    // seat, and Claude waits for each to exit. Building an OTel pipeline per render — and, at
+    // exit, flushing it — would put a collector round-trip in the render path for a run that is
+    // not an operation worth a span, so the tee never builds one (`DQ-C13`). This is a cadence
+    // rule, not a hook rule: `claude-observe` is event-driven and stays instrumented, exactly as
+    // `06-observability`'s spec names it.
+    let mut telemetry = if matches!(command, Command::Driver(DriverCmd::ClaudeStatusline { .. })) {
+        st2::telemetry::Telemetry::local_only()
+    } else {
         st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
             "supervisor"
         } else if matches!(
             command,
             // Hook executions are their own process unit: `st2 driver claude-observe` runs per
             // Claude hook event and records hook_invocations_total, which the documented
-            // process-unit contract assigns to `st2-hook`, not `st2-cli`. The status-line tee is
-            // the same kind of process — a hook-set script the harness runs, recording the same
-            // metric — and is classified with it rather than as an operator's CLI invocation.
+            // process-unit contract assigns to `st2-hook`, not `st2-cli`.
             Command::Driver(DriverCmd::ClaudeObserve { .. })
-                | Command::Driver(DriverCmd::ClaudeStatusline { .. })
         ) {
             "hook"
         } else {
             "cli"
-        });
+        })
+    };
     let result = dispatch(command, catalog_path.as_deref());
     telemetry.shutdown();
     result

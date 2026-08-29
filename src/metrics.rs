@@ -204,11 +204,6 @@ fn normalize_hook_event(event: &str) -> &'static str {
         "SubagentStop" => "SubagentStop",
         "PreCompact" => "PreCompact",
         "PostCompact" => "PostCompact",
-        // Not a hook event: Claude's status-line slot is a settings key, not a registerable hook.
-        // It is carried on this metric because the tee is a hook-set script running as the same
-        // process unit, and folding it into `other` would make the record's only fill producer
-        // invisible in the one counter that shows hook-set traffic.
-        "StatusLine" => "StatusLine",
         "Notification" => "Notification",
         _ => "other",
     }

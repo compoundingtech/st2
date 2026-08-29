@@ -437,17 +437,23 @@ registerable event list. Routing it through the hook command would have dragged
 `observe_hook_event`'s event classification and the `SessionStart` claim onto a
 payload that is neither.
 
-**The tee is now st2's highest-cadence process, and its telemetry cost is
-unmeasured (`DQ-C13`).** A 5-second refresh interval makes it 720 short-lived
-`st2` invocations per hour per Claude agent — roughly 432,000 per hour across a
-600-agent fleet — where every other st2 process is either long-lived or fires on
-an event. `main` initializes telemetry for every invocation and tears it down on
-exit, and with `OTEL_EXPORTER_OTLP_ENDPOINT` set that teardown performs a final
-collect-and-export. Claude waits for the command to exit, so that flush sits in
-the render path. The process-unit classification is not the lever — it sets
-`service.name` and nothing else; the endpoint variable is the only gate. This is
-recorded rather than pre-emptively engineered around, because no fleet has run
-the tee with an endpoint configured and the cost is arithmetic until one does.
+**The tee builds no telemetry pipeline (`DQ-C13`, resolved).** A 5-second refresh
+interval makes it ~720 short-lived `st2` invocations per hour per seat — the
+highest-cadence process st2 has, where every other one is long-lived or fires on
+an event — and Claude waits for each to exit. `main` therefore constructs
+`Telemetry::local_only()` for this subcommand: stderr diagnostics, no exporters,
+no global providers, and nothing to flush at exit. Measured against a
+bound-but-never-accepting collector, the alternative is not theoretical: a tee
+that initializes telemetry takes 5.009 s on the path that logs a warning, and
+`claude-observe` takes 10.022 s, against 0.010–0.061 s with no pipeline. An
+unreachable collector would have stalled every render past Claude's own refresh
+interval.
+
+The rule is **cadence, not hook class**, and it lives in
+[`06-observability/spec.md`](../06-observability/spec.md): `claude-observe` is
+event-driven, is named there as `st2-hook`, and stays instrumented. The tee also
+records no `hook_invocations_total` — a metric call that provably cannot reach a
+collector reads as instrumentation and is worse than none.
 
 The tee spawns the renderer and writes the payload to its stdin rather than
 `exec`ing it, because st2 has already consumed that stdin to record the reading.
@@ -868,9 +874,10 @@ Tracked with context in [open-questions.md](./open-questions.md): `DQ-C1` write
 policy benchmark (accuracy half settled, wire-cost half open), `DQ-C5`
 unreadable versus absent, `DQ-C6` history, `DQ-C7` fleet transport cost, `DQ-C8`
 supervisor actionability, `DQ-C9` subagent context, `DQ-C10` OpenCode
-multi-session aggregation, `DQ-C13` the status-line tee's telemetry cadence.
+multi-session aggregation.
 
 Resolved, and kept in that file only so their identifiers do not go dangling:
 `DQ-C2` status-line renderer contract, `DQ-C3` status-line settings precedence,
+`DQ-C13` the status-line tee's telemetry cadence,
 `DQ-C4` Doctor exposure and threshold, `DQ-C11` `harness-state`'s placement
 defect, `DQ-C12` a driver record under `resources/` (withdrawn).

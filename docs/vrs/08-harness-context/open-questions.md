@@ -111,17 +111,28 @@ Each entry links a spec `DQ-C*`. Questions leave this file when resolved — int
   to satisfy the include globs. It stays at the agent-directory root, so no
   driver record lives on the Resource-binding realization surface and the
   tension does not arise.
-- **DQ-C13 The status-line tee's telemetry cadence.** Claude's
-  `refreshInterval: 5` makes the tee 720 short-lived `st2` processes per hour per
-  agent — the highest-cadence process st2 has, where every other one is long-lived
-  or event-driven. `main` initializes telemetry for every invocation and tears it
-  down on exit; with `OTEL_EXPORTER_OTLP_ENDPOINT` set, that teardown performs a
-  final collect-and-export, and Claude waits for the command to exit, so the flush
-  is in the render path. Nothing here is measured: the whole suite runs with no
-  endpoint, so the exporting path has never executed under the tee. The
-  process-unit classification is not the lever — it sets `service.name` only.
-  Resolves by: measuring one render's wall clock with an endpoint configured. If
-  it is material, the options are exempting the tee from telemetry
-  initialization, raising `refreshInterval`, or making the flush non-blocking for
-  short-lived units — the first two are cheap and the third is a
-  `06-observability` change.
+- **DQ-C13 The status-line tee's telemetry cadence — resolved 2026-08-29 by
+  measurement and a rule.** Claude's `refreshInterval: 5` makes the tee ~720
+  short-lived `st2` processes per hour per seat, and Claude waits for each to
+  exit. Measured against a bound-but-never-accepting local collector: a tee that
+  initializes telemetry takes **5.009 s** on the path that logs a warning — the
+  logger provider's final `force_flush` — while `st2 driver claude-observe`, on
+  the same endpoint, takes **10.022 s**. With no pipeline built, both paths
+  return in **0.010–0.061 s**. So an unreachable collector would have stalled
+  every render past Claude's own 5-second refresh, permanently.
+
+  The resolution is that `st2 driver claude-statusline` does not initialize the
+  telemetry pipeline at all (`Telemetry::local_only`): stderr diagnostics, no
+  exporters, no global providers, nothing to flush. The rule is stated in
+  [`06-observability/spec.md`](../06-observability/spec.md) as **cadence, not
+  hook class** — `claude-observe` is event-driven and stays instrumented, exactly
+  as that spec names it, so this is an exemption with an argument rather than a
+  blanket carve-out. The tee's own `hook_invocations_total` call was removed with
+  it: a metric that provably cannot record is worse than none, because it reads
+  as instrumentation.
+
+  Proved by `tests/claude_statusline.rs::the_tee_never_reaches_for_a_collector_even_when_it_has_something_to_report`,
+  which drives the recording-FAILURE path on purpose — the happy path emits no
+  `tracing` event, so it has nothing to flush and stays fast even with a pipeline
+  built. A first version of that test drove only the happy path and passed
+  against the unfixed binary; that is the trap this entry exists to record.

@@ -17,6 +17,7 @@
 
 use std::fs;
 use std::io::Write as _;
+use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -324,6 +325,79 @@ fn without_st2_on_path_the_script_itself_falls_back_to_the_payload() {
 
     assert!(output.status.success());
     assert_eq!(output.stdout, PAYLOAD.as_bytes());
+}
+
+/// The bound one render must stay under with an unreachable collector configured.
+///
+/// Grounded in measurement, not guessed (2026-08-29, this worktree, debug build, against a
+/// bound-but-never-accepting local port). With the tee building a pipeline, the recording-failure
+/// path takes **5.009 s** — the logger provider's final `force_flush` waiting on the dead
+/// collector — and `st2 driver claude-observe`, which stays instrumented by design, takes
+/// **10.022 s**. With the tee building none, both paths return in **0.010–0.061 s**. Two seconds
+/// is two orders of magnitude above the real cost and less than half the cheapest regression, so
+/// it neither flakes under a loaded parallel suite nor lets a rebuilt pipeline through.
+const TEE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A collector that accepts the connection and then never answers.
+///
+/// Bound and listening but never `accept`ed: the TCP handshake completes in the kernel backlog,
+/// so an exporter's `connect` SUCCEEDS and it waits for a response that never comes — which is
+/// what makes an exporter pay its full timeout. A closed port would be the weaker trap: it fails
+/// fast, and a process that *did* build a pipeline would still look quick.
+fn unreachable_collector() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    (listener, endpoint)
+}
+
+/// `DQ-C13`. Claude WAITS for the status-line command to exit and re-runs it every 5 seconds, so
+/// a render that blocks on a collector round-trip is a stalled status line — and against an
+/// unreachable collector, a permanently stalled one. The tee therefore builds no telemetry
+/// pipeline at all rather than building one and hoping the flush is quick.
+///
+/// This drives the RECORDING-FAILURE path deliberately. The happy path emits no `tracing` event,
+/// so it has nothing to flush and stays fast even with a pipeline built — a test that only drove
+/// it would pass for the wrong reason, which is exactly what the first version of this test did.
+/// The fail-open path warns, and that warning is what the log bridge would ship.
+#[test]
+fn the_tee_never_reaches_for_a_collector_even_when_it_has_something_to_report() {
+    let seat = Seat::new();
+    let (collector, endpoint) = unreachable_collector();
+
+    let started = std::time::Instant::now();
+    let output = seat.tee_as(
+        "Silber.undeclared",
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)],
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < TEE_BUDGET,
+        "the tee took {elapsed:?} with an unreachable collector configured, \
+         so it is building an OTel pipeline again"
+    );
+    // "No telemetry", not "no tee": the status line is still rendered, verbatim.
+    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+
+    drop(collector);
+}
+
+/// The same, on the path that does write the record — so the guarantee covers a normal render and
+/// not only the failing one.
+#[test]
+fn a_recording_render_is_also_free_of_the_collector() {
+    let seat = Seat::new();
+    let (collector, endpoint) = unreachable_collector();
+
+    let started = std::time::Instant::now();
+    let output = seat.tee(&[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)]);
+    let elapsed = started.elapsed();
+
+    assert!(elapsed < TEE_BUDGET, "the tee took {elapsed:?}");
+    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+    assert!(seat.record().is_some(), "the reading is still recorded");
+
+    drop(collector);
 }
 
 #[test]
