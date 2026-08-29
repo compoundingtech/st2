@@ -2430,8 +2430,10 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
     format!("obs:{column}")
 }
 
-/// The compact harness-context column for human `st2 agents` output. `-` means no record exists,
-/// which is distinct from a reading the harness withheld.
+/// The compact harness-context column for human `st2 agents` output. `-` means no record exists;
+/// `?` means a record exists whose percent the harness withheld — Claude before its session's
+/// first API response, pi across a compaction — and the two must not render alike, or the column
+/// says "nobody is watching" for a producer that is watching and honestly does not know.
 fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
     // Prefixed like the observed column beside it, so neither compact word is mistaken for the
     // other or for declared presence.
@@ -2442,7 +2444,7 @@ fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
     // real overrun and the one an operator most needs to see.
     let mut column = match context.used_percent {
         Some(percent) => format!("{}%", percent.round()),
-        None => "-".to_string(),
+        None => "?".to_string(),
     };
     if context.compactions > 0 {
         column.push_str(&format!(" ⟳{}", context.compactions));

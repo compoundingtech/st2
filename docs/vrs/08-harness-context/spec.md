@@ -658,9 +658,11 @@ a write-policy mechanism a roster consumer has no use for once `ageMs` and
 Human `st2 agents` output carries the same axis compactly as `ctx:92% ⟳1`,
 beside the existing `obs:` column and prefixed for the same reason — two bare
 words in one row is exactly the ambiguity the ontology's collision rules name.
-`ctx:-` is no record; a withheld percent renders as `ctx:-` with its compaction
-count beside it; a stale reading is suffixed `stale`. The percent is rounded for
-width and never clamped.
+`ctx:-` is no record and `ctx:?` is a record whose percent the harness withheld —
+distinct on purpose, since rendering both as `-` would say "nobody is watching"
+for a producer that is watching and honestly does not know, which is Claude's
+state before its first API response. A stale reading is suffixed `stale`. The
+percent is rounded for width and never clamped.
 
 `status`, `desiredState`, `lastActivity`, `observedState`, and
 `driverDiagnostic` keep their exact meanings. `context` is a fourth independent

@@ -156,12 +156,6 @@ pub struct RateLimits {
     pub seven_day: Option<f64>,
 }
 
-impl RateLimits {
-    fn is_empty(&self) -> bool {
-        self.five_hour.is_none() && self.seven_day.is_none()
-    }
-}
-
 /// The durable record. Additive-tolerant on read (no `deny_unknown_fields`): a reader pinned to an
 /// older crate may be older than its writer, and an unknown future enum word decodes as
 /// indeterminate rather than as a definite value.
@@ -193,7 +187,9 @@ struct Record {
     /// distinction. It is never the numerator of any percent.
     #[serde(default)]
     session_total_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "RateLimits::is_empty")]
+    /// Always emitted, its own windows `null` when absent — one absence convention on this
+    /// record, not two (HC-R16). A record predating the field decodes through `default`.
+    #[serde(default)]
     rate_limits: RateLimits,
     #[serde(default)]
     compactions: u64,
@@ -697,6 +693,21 @@ mod tests {
         assert_eq!(observed.used_tokens, None);
         assert_eq!(observed.used_percent, None);
         assert_eq!(observed.window_tokens, Some(200_000));
+        // One absence convention across the whole record: every withheld fact is an emitted
+        // `null`, never an omitted key and never a zero.
+        let wire: serde_json::Value =
+            serde_json::from_slice(&fs::read(harness_context_path(&agent_dir)).unwrap()).unwrap();
+        for withheld in [
+            "usedTokens",
+            "usedPercent",
+            "model",
+            "costUsd",
+            "sessionTotalTokens",
+        ] {
+            assert_eq!(wire[withheld], serde_json::Value::Null, "{withheld}");
+        }
+        assert_eq!(wire["rateLimits"]["fiveHour"], serde_json::Value::Null);
+        assert_eq!(wire["rateLimits"]["sevenDay"], serde_json::Value::Null);
 
         // A later reading that withholds again does not resurrect an earlier known value.
         writer

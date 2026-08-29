@@ -822,10 +822,11 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // A session boundary empties the window, so the numeric sibling is removed with the same
     // act that supersedes this record (HC-R15): the new incarnation reads "no context yet"
     // rather than the previous one's 190k, which is what a crash-looping seat would otherwise
-    // show for the whole hour of that record's horizon. Taken under the SIBLING's own lock,
-    // never while holding it — the claim path's lock order is one-way, so no writer can
-    // deadlock against it. The claim itself stands whether or not the removal succeeds, but
-    // never silently.
+    // show for the whole hour of that record's horizon. This runs while THIS record's lock is
+    // held and takes the sibling's lock inside it, so the order is state → context. That is
+    // the only place the two are ever held together and `harness_context` never takes this
+    // one, so the ordering is acyclic and no writer can deadlock against it. The claim stands
+    // whether or not the removal succeeds, but never silently.
     if let Some(agent_dir) = writer.path.parent()
         && let Err(error) = crate::harness_context::remove(agent_dir)
     {
