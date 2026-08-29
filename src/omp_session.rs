@@ -54,6 +54,16 @@ const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERS
 /// MINOR still costs the five OMP-R05 probes.
 const SUPPORTED_OMP_MINORS: [(u32, u32); 1] = [(18, 0)];
 
+/// The omp builds the harness-context producer's arithmetic was measured against (HC-R13, HC-T03).
+///
+/// This is a different question from the launch gate above and the two must not be collapsed. The
+/// gate admits a MINOR SERIES, because a patch inside an admitted minor costs no new evidence; the
+/// fixture pins the EXACT BUILDS a number's meaning was measured on, because omp's `tokens` being
+/// prompt-only input is a property of a specific build and not of any documented contract. Both
+/// builds were probed on 2026-08-29 and agree, which is what makes the minor gate defensible here.
+/// `the_measured_context_builds_are_admitted_by_this_gate` keeps them from drifting apart.
+pub const MEASURED_CONTEXT_VERSIONS: [&str; 2] = ["18.0.9", "18.0.3"];
+
 /// What the wrapper hands the provider process: the channel environment plus the launch argv with
 /// the channel extension spliced in.
 type PreparedLaunch = (Vec<(String, String)>, Vec<String>);
@@ -314,12 +324,31 @@ mod tests {
     /// drop the evidence the minor was admitted on.
     #[test]
     fn version_gate_admits_every_measured_version() {
-        for version in ["18.0.3", "18.0.9"] {
+        for version in MEASURED_CONTEXT_VERSIONS {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
             verify_supported_version(fake.path().to_str().unwrap())
                 .unwrap_or_else(|error| panic!("{version} must be admitted: {error}"));
+        }
+    }
+
+    /// The launch gate and the harness-context fixture answer different questions — a minor series
+    /// versus the exact builds a number's meaning was measured on — and they are allowed to differ.
+    /// What they may not do is drift apart silently: a build the fixture claims to have measured
+    /// but this gate would refuse to launch is evidence for a version the fleet can never run, and
+    /// that is exactly the shape HC-T03 asks the gate discipline to bound.
+    #[test]
+    fn the_measured_context_builds_are_admitted_by_this_gate() {
+        for version in MEASURED_CONTEXT_VERSIONS {
+            let release = harness_version::parse_release(version)
+                .unwrap_or_else(|| panic!("{version} must be a parseable release"));
+            assert!(
+                SUPPORTED_OMP_MINORS.contains(&release.series()),
+                "the harness-context fixture measured {version}, a build this gate refuses to \
+                 launch (admitted minors: {})",
+                harness_version::series_display(&SUPPORTED_OMP_MINORS)
+            );
         }
     }
 

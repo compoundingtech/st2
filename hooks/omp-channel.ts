@@ -53,7 +53,52 @@ type Stash = {
   session?: string;
   seq?: string;
   child?: childProcess.ChildProcess;
+  /**
+   * The last assistant message's `usage.cost.total`.
+   *
+   * Cost rides only the message-bearing events, but a context frame may be emitted from an event
+   * that carries none (`agent_end`, `session_start`). st2's record replaces a reading's fields
+   * WHOLESALE — deliberately, so a withheld number is never fabricated from a previous one — so a
+   * frame omitting the cost would erase the published one on the very next turn boundary.
+   */
+  lastCostUsd?: number;
 };
+
+/**
+ * Withhold rather than coerce (HC-R03). A non-finite or absent value is not a reading, and
+ * substituting zero, the previous number, or a division st2 could have done itself is exactly the
+ * fabrication HC-R03 forbids.
+ */
+const finiteOrNull = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+/**
+ * Compile-time coupling to the pinned pi declarations for the surfaces the context producer reads.
+ *
+ * Same reasoning as `pi-channel.ts`: the producer reads them through widened, guarded views so a
+ * build whose telemetry surface moved still loads and still delivers mail, and a widened cast alone
+ * would make that tolerance absolute and silent. Erased at runtime.
+ *
+ * Note what this can and cannot prove for omp. It pins the SHAPE against pi 0.84.2's typings, which
+ * is all this asset compiles against — omp ships no typings of its own. It cannot prove omp's
+ * `tokens` still means prompt-only input, because that is a meaning and not a shape; the
+ * version-pinned fixture in `src/pi_channel.rs` is what bounds that (HC-R13, HC-T03).
+ */
+type PinnedContextUsage = NonNullable<ReturnType<ExtensionContext["getContextUsage"]>>;
+const pinnedTelemetrySurface: {
+  usage: (usage: PinnedContextUsage) => {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+  };
+  modelId: (ctx: ExtensionContext) => string | undefined;
+  entries: (ctx: ExtensionContext) => { type: string }[];
+} = {
+  usage: (usage) => usage,
+  modelId: (ctx) => ctx.model?.id,
+  entries: (ctx) => ctx.sessionManager.getEntries(),
+};
+void pinnedTelemetrySurface;
 
 /**
  * Read the channel configuration once and unexport it.
@@ -141,6 +186,10 @@ export default function (pi: ExtensionAPI) {
     const previous = state.child;
     closeChild(previous);
     await awaitExit(previous, 2000);
+    // The predecessor's cost belongs to the predecessor. The stash outlives session replacement
+    // by design, so without this a replacement session's first frames would restate the old
+    // session's cost as their own.
+    state.lastCostUsd = undefined;
 
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
@@ -237,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 
   // Frames are observational — st2 decides what becomes of them — and a closed channel drops
   // them silently.
-  const sendState = (frame: Record<string, unknown>) => {
+  const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
     child.stdin.write(JSON.stringify(frame) + "\n");
@@ -265,13 +314,133 @@ export default function (pi: ExtensionAPI) {
       const idle = idleProof(ctx);
       if (!idle && Date.now() - startedAt < IDLE_POLL_BUDGET_MS) return;
       clearInterval(poller);
-      if (idle) sendState({ type: "state", state: "idle" });
+      if (idle) sendFrame({ type: "state", state: "idle" });
     }, IDLE_POLL_MS);
     poller.unref?.();
   };
 
-  pi.on("agent_start", async () => sendState({ type: "state", state: "active" }));
-  pi.on("agent_end", async (_event, ctx) => watchSettle(ctx));
+  // Harness context, extension side (HC-R02, HC-R03, HC-R11, HC-R12).
+  //
+  // The same one call as pi's, and a DIFFERENT meaning. omp's `getContextUsage().tokens` settles
+  // to the last assistant message's `input` — prompt tokens alone — where pi's settles to
+  // `totalTokens` (input + output + cacheRead + cacheWrite). Measured in a controlled lab whose
+  // fake provider reported prompt tokens of 900, 9,900, and 22,500: `tokens` returned exactly
+  // those, while the same messages' `totalTokens` were larger. So omp under-reports relative to
+  // pi by output plus cache write on an otherwise identical API, and that is why this is a
+  // separate producer with a separate fixture rather than a shared one (HC-T03).
+  //
+  // The call is present and working on 18.0.3 as well as 18.0.9 (35 occurrences in each binary);
+  // the older capture's "ctx exposes {ui} only" was a probe artifact, not a version fact.
+  //
+  // As on pi, this asset holds no cadence policy — st2's write guard quantizes to 1% of the
+  // window — and every pull is guarded, because an observability call must never take a turn down.
+  const modelId = (ctx: ExtensionContext): string | null => {
+    try {
+      const id = (ctx as { model?: { id?: unknown } }).model?.id;
+      return typeof id === "string" && id !== "" ? id : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const usageReading = (ctx: ExtensionContext): Record<string, unknown> | undefined => {
+    const read = (ctx as { getContextUsage?: () => unknown }).getContextUsage;
+    if (typeof read !== "function") return undefined;
+    let usage: unknown;
+    try {
+      usage = read.call(ctx);
+    } catch {
+      return undefined;
+    }
+    if (!usage || typeof usage !== "object") return undefined;
+    const { tokens, contextWindow, percent } = usage as {
+      tokens?: unknown;
+      contextWindow?: unknown;
+      percent?: unknown;
+    };
+    return {
+      // Prompt-only input, NOT `totalTokens`. See the comment above; this is one of the two
+      // version-coupled constants HC-T03 names.
+      usedTokens: finiteOrNull(tokens),
+      windowTokens: finiteOrNull(contextWindow),
+      // Carried raw: omp's percent is a float that runs above 100 on an overrun (562.5% measured),
+      // and clamping here would hide the saturation this record exists to surface.
+      usedPercent: finiteOrNull(percent),
+      model: modelId(ctx),
+      costUsd: state.lastCostUsd ?? null,
+    };
+  };
+
+  /**
+   * The harness-durable compaction count (HC-R12) — omp's own session store, through the same
+   * `getEntries()` path as pi's, measured going 0 → 1 across the event. `null` when the store
+   * cannot be read, which makes st2 count the edge itself: a weaker, incarnation-scoped answer
+   * and never a wrong one.
+   */
+  const durableCompactions = (ctx: ExtensionContext): number | null => {
+    try {
+      const entries = (
+        ctx as { sessionManager?: { getEntries?: () => unknown } }
+      ).sessionManager?.getEntries?.();
+      if (!Array.isArray(entries)) return null;
+      return entries.filter((entry) => (entry as { type?: unknown })?.type === "compaction").length;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * One frame carries the reading and the compaction edge together, because they must land in one
+   * write: a compaction edge always writes, while a reading whose percent is withheld has no
+   * bucket and lands only on an edge or the heartbeat. Either half may be absent; a frame with
+   * neither is not sent.
+   */
+  const sendContext = (ctx: ExtensionContext, compaction?: Record<string, unknown>) => {
+    const reading = usageReading(ctx);
+    if (!reading && !compaction) return;
+    const frame: Record<string, unknown> = { type: "context" };
+    if (reading) frame.reading = reading;
+    if (compaction) frame.compaction = compaction;
+    sendFrame(frame);
+  };
+
+  /** Cost rides the message-bearing events only; hold the last one so no frame erases it. */
+  const captureCost = (event: unknown) => {
+    const total = (event as { message?: { usage?: { cost?: { total?: unknown } } } })?.message
+      ?.usage?.cost?.total;
+    if (typeof total === "number" && Number.isFinite(total)) state.lastCostUsd = total;
+  };
+
+  // Registered only now that every helper above is initialized: a use-before-declaration in this
+  // file is the defect class that once shipped green through the type gate.
+  pi.on("agent_start", async () => sendFrame({ type: "state", state: "active" }));
+  pi.on("agent_end", async (event, ctx) => {
+    captureCost(event);
+    sendContext(ctx);
+    watchSettle(ctx);
+  });
+
+  const onWidened = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) => void;
+  // The finest boundary that carries a fresh reading. Turn-boundary-only observation was measured
+  // at 92% of pre-compaction warnings missed, because the wedge case is a single long turn.
+  for (const name of ["message_end", "turn_end"]) {
+    onWidened(name, async (event, ctx) => {
+      captureCost(event);
+      sendContext(ctx);
+    });
+  }
+  // omp's `session_compact` carries NO `reason` and no `willRetry` — pi 0.84.2 has both — so the
+  // trigger is withheld here and st2 records `unknown`. omp does name its auto-compaction "idle"
+  // and "threshold" internally, but those words are not projected onto the event, and inventing
+  // one would be a claim no capture supports. Unlike pi, omp's `getContextUsage()` still answers
+  // inside this handler (8,100 measured, not null), so the frame carries a real post-compaction
+  // reading alongside the durable count.
+  onWidened("session_compact", async (_event, ctx) => {
+    sendContext(ctx, { trigger: null, count: durableCompactions(ctx) });
+  });
 
   // omp exposes these two events but the pinned pi typings (0.84.2, which this asset imports)
   // do not declare them — measured live on omp v18.0.3. Registered through a widened view of
@@ -284,7 +453,7 @@ export default function (pi: ExtensionAPI) {
   ) => void;
   onApproval("tool_approval_requested", async (event) => {
     const tool = typeof event.toolName === "string" ? event.toolName : "unknown";
-    sendState({
+    sendFrame({
       type: "state",
       state: "active",
       blockedOn: "human",
@@ -294,10 +463,10 @@ export default function (pi: ExtensionAPI) {
   });
   onApproval("tool_approval_resolved", async (_event, ctx) => {
     if (idleProof(ctx)) {
-      sendState({ type: "state", state: "idle" });
+      sendFrame({ type: "state", state: "idle" });
       return;
     }
-    sendState({ type: "state", state: "active" });
+    sendFrame({ type: "state", state: "active" });
     watchSettle(ctx);
   });
 
@@ -309,10 +478,13 @@ export default function (pi: ExtensionAPI) {
     // Seed the observed state with the idle proof's answer at open time, so the record does not
     // wait for the first turn boundary to exist.
     if (opened) {
-      sendState({
+      sendFrame({
         type: "state",
         state: idleProof(ctx) ? "idle" : "active",
       });
+      // And seed the context record, so a resumed session publishes the window it resumed INTO
+      // rather than waiting for its first turn boundary.
+      sendContext(ctx);
     }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own.
