@@ -15,14 +15,16 @@ replicated-record names — `src/harness_context.rs`, with the invariant rows
 *Harness context discipline* and *Replicated-path discipline* naming their
 proofs.
 
-**One producer ships: claude.** The status-line tee (HC-R18), the Claude fill
-arithmetic, its compaction accounting, and its version-pinned fixtures (HC-R13)
-are in the tree as of 2026-08-29 — `hooks/claude-statusline.sh`,
-`st2 driver claude-statusline`, and the `PreCompact`/`PostCompact`
-registrations, with the invariant row *Status-line slot chaining* naming their
-proofs. The remaining four rows of the producer table are unimplemented, so a
-codex, pi, omp, or opencode declaration's `context` still reads `null`. That is
-the honest state, not a defect of the envelope.
+**Two producers ship: claude and codex.** The status-line tee (HC-R18), the
+Claude fill arithmetic, and its compaction accounting are in the tree as of
+2026-08-29 — `hooks/claude-statusline.sh`, `st2 driver claude-statusline`, and
+the `PreCompact`/`PostCompact` registrations, with the invariant row
+*Status-line slot chaining* naming their proofs. The codex app-server pump
+writes the record from `thread/tokenUsage/updated` and counts compactions off
+the `contextCompaction` thread item — `src/codex_app_server.rs`. Both rows are
+version-pinned by HC-R13 fixtures. The pi, omp, and opencode rows of the
+producer table below are unimplemented, so those declarations' `context` still
+reads `null`. That is the honest state, not a defect of the envelope.
 
 The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
@@ -133,12 +135,15 @@ Field rules:
 - `usedPercent` may exceed 100, and readers must handle that rather than assume
   a 0..100 range. pi and omp report a float that runs above 100 when a turn
   overruns the window (585.6% measured in the pi lab against a 4,000-token
-  window). Claude clamps to 0..100 itself, and Codex's displayed percentage is
-  clamped by construction — but Codex's *operands* are not: 2 of 287,010
-  replayed Codex readings give `used / window` up to 1.041, so a producer
-  computing from them can legitimately produce 104. **The record carries the raw
-  value and never clamps it**: a reading above 100 is a real observation of an
-  overrun, and clamping at the producer would hide exactly the saturation this
+  window). Claude clamps to 0..100 itself. Codex's *operands* are not clamped —
+  2 of 287,010 replayed Codex readings give `used / window` up to 1.041 — but
+  the shipped Codex producer mirrors Codex's own function rather than dividing
+  the operands, and that function floors `remaining` at zero, so those readings
+  reach the record as a saturated 100 rather than as 104. The overrun is lost
+  inside the harness's arithmetic, before st2 sees it; the harnesses that can
+  publish above 100 are the ones publishing a float of their own. **The record
+  carries the raw value and never clamps it**: a reading above 100 is a real
+  observation of an overrun, and clamping at the producer would hide exactly the saturation this
   record exists to show. Clamping is a *display* concern — a consumer rendering
   a bar or a percentage clamps for its own layout, and does so knowing it is
   discarding information the record deliberately kept.
@@ -391,7 +396,7 @@ listed is `null`, and no producer computes a fact its channel does not carry:
 | Harness | `model` | `costUsd` | `rateLimits` | `sessionTotalTokens` |
 | --- | --- | --- | --- | --- |
 | claude | `model.id` | `cost.total_cost_usd` | `rate_limits.{five_hour,seven_day}` | `null` — the payload's `total_*` keys describe the last response, not the session |
-| codex | `null` — the thread carries `modelProvider` only | `null` — Codex reports no cost | `account/rateLimits/updated` | `tokenUsage.total.totalTokens` |
+| codex | `null` — the thread carries `modelProvider` only | `null` — Codex reports no cost | `account/rateLimits/updated`, `sevenDay` only — see below | `tokenUsage.total.totalTokens` |
 | pi | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — only obtainable by summing every message's usage, which is a producer-side accumulator, not a free reading |
 | omp | `ctx.model.id` | per-message `usage.cost.total` | `null` | `null` in v1 — same reason as pi |
 | opencode | `session.info.model` | `session.info.cost` | `null` | `session.info.tokens` (cumulative, no `total` key — summed by the producer) |
@@ -564,12 +569,34 @@ describes the top-level window (`DQ-C9`).
 
 ### codex (codex-cli 0.150.1)
 
+st2 does not re-derive the percentage; it **mirrors** Codex's own
+`TokenUsage::percent_of_context_window_remaining` and subtracts the result from
+100, so the published number is exactly `100 −` the "N% context left" the
+operator reads in the footer:
+
 ```text
 window = tokenUsage.modelContextWindow        // absent        -> withhold percent
-used   = max(0, tokenUsage.last.totalTokens - 12000)
-eff    = window - 12000                        // window <= 12000 -> withhold percent
-usedPercent = clamp(round(used / eff * 100), 0, 100)
+                                              // window <= 12000 -> withhold percent
+eff       = window - 12000
+used      = max(0, tokenUsage.last.totalTokens - 12000)
+remaining = max(0, eff - used)
+usedPercent = 100 - clamp(round(remaining / eff * 100), 0, 100)
 ```
+
+**Mirroring is not the same function as rounding the used fraction**, and the
+difference is not cosmetic: at an exact half they disagree. Effective window
+200, used 101 — Codex displays "50% left", so st2 publishes 50, while
+`round(used / eff * 100)` publishes 51. Only the mirrored order satisfies the
+producer table's "equals `100 −` Codex's displayed '% context left'". This
+paragraph and the block above **corrected an earlier draft** of this section
+(2026-08-29, with the producer) that spelled the arithmetic as
+`clamp(round(used / eff * 100), 0, 100)`.
+
+One deliberate divergence from the source: where `window <= 12000` Codex returns
+`0` remaining, which mirrored blindly would publish **100% used** for a window it
+cannot normalize. st2 withholds instead (HC-R02, HC-R03) — a saturation the
+harness never displayed is fabricated, not observed. The operands are still
+published: a window at or below the baseline is a window the harness reported.
 
 The 12,000-token `BASELINE_TOKENS` constant is subtracted from **both** the
 numerator and the denominator; it is hardcoded in two Codex crates with no
@@ -590,14 +617,69 @@ Three traps, all measured:
   connection before any new turn.
 
 `account/rateLimits/updated` is a separate account-scoped notification and
-supplies `rateLimits`. Codex reports no session cost, so `costUsd` is `null`,
-and the app-server `Thread` object carries `modelProvider` but no model
-identifier, so `model` is `null` too — both examples above are Codex readings
-and show those nulls deliberately.
+supplies `rateLimits`. It carries no occupancy, so it never writes on its own:
+the windows are held and ride the next reading. It is also documented as a
+*sparse rolling update* whose absent fields do not clear a previously observed
+value, which is why the producer merges rather than replaces.
+
+**Only `sevenDay` is carried.** Codex names its windows `primary` and
+`secondary` and identifies them by `windowDurationMins` alone, so the join is by
+duration: 10,080 minutes is seven days, and the one captured Codex rate-limit
+snapshot has exactly that window as `primary`. No 300-minute window and no
+`secondary` was ever observed on this harness, so mapping one onto `fiveHour`
+would be inference dressed as a measurement. `fiveHour` is therefore `null` for
+Codex — **a divergence from this section's earlier wording**, which implied the
+notification filled both windows — until a capture shows the window; admitting
+it is then a one-line change beside that capture.
+
+Codex reports no session cost, so `costUsd` is `null`, and the app-server
+`Thread` object carries `modelProvider` but no model identifier, so `model` is
+`null` too — both examples above are Codex readings and show those nulls
+deliberately.
 
 Compaction: the `contextCompaction` thread item is the live edge (the older
 `thread/compacted` notification is deprecated in the protocol). It carries no
-sizes and no reason, so the trigger is `unknown`.
+sizes and no reason, so the trigger is `unknown`. One compaction reaches the
+observer as both an `item/started` and an `item/completed` over the same
+`ContextCompactionThreadItem` id, so the count dedupes on `(turnId, item id)`
+over a short ring; the deprecated notification names only the turn, so its key
+collapses with any item key in the same turn rather than counting beside it. Two
+distinct item ids in one turn are two compactions.
+
+Three limits of the shipped producer, all deliberate:
+
+- **The record is written only where native delivery is configured.** The writer
+  is owned by the app-server delivery pump, beside the harness-state writer, so
+  a Codex seat launched without a delivery config publishes no context record.
+  That matches the harness-state precedent — except that harness-state also has
+  a wrapper-written terminal record and this axis has none, so Codex coverage is
+  exactly "delivery-configured seats".
+- **The compaction counter is incarnation-scoped only when the claim succeeds.**
+  The reset comes from the relaunch claim removing the record (HC-R15), so on the
+  degraded path — a claim that could not be written, which downgrades the *state*
+  writer to token-only and proceeds — no removal happened and the new session's
+  producer continues the predecessor's count. The record still carries the new
+  `incarnation`, so the seam is visible to a reader; nothing else is done about
+  it, because a second removal path would be machinery guarding a case the
+  provenance field already exposes.
+- **A reading replayed on a FRESH binding is dropped; on resume it is not.** The
+  pump skips every frame carrying a `method` while it is still binding. The
+  resume path reads `thread/tokenUsage/updated` out of that skip explicitly,
+  because a resumed thread still holds its context and the claim has just removed
+  the predecessor's record — a seat that resumes and then waits for work would
+  otherwise read `null` against a full window until its next model response. The
+  fresh-binding path needs no equivalent: there is no thread id to match against
+  before the binding candidate names one, and a thread starting now has no
+  history to replay.
+
+Finally, a version note. The arithmetic above was settled by reading codex-cli
+0.150.1's Rust source, and `CODEX_CONTEXT_VERIFIED_VERSION` pins that literal in
+the fixture (HC-R13). It is **ahead of `SUPPORTED_CODEX_CLI_VERSIONS`**, the
+delivery-path launch gate, which admits 0.145.0–0.147.0 — so in the shipped tree
+this arithmetic runs against versions whose source was not read for it. The
+baseline is a long-lived Codex constant, but that is an expectation rather than a
+measurement, and closing the gap means repeating the delivery gate's own
+admission checks for 0.150.1, which is a separate act from this producer.
 
 ### pi (0.84.2)
 
@@ -848,7 +930,13 @@ each only once a real test proves it (per `CLAUDE.md`):
 - **Per-harness fixture tests** (HC-R13) — one per producer, each decoding a
   payload captured verbatim from the version named in the producer table and
   asserting the resulting triple, with the version asserted literally. The Codex
-  fixture must fail if the 12,000 baseline moves; the omp fixture must fail if
+  fixture ships:
+  `src/codex_app_server.rs::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`
+  over `tests/fixtures/codex_token_usage_inbound.jsonl`, asserting
+  `CODEX_CONTEXT_VERIFIED_VERSION` and the baseline literally, and asserting
+  both wrong numerators against the same capture (`total` reads 100, a
+  baseline-free `last.totalTokens / window` reads 36, the truth is 33). It must
+  fail if the 12,000 baseline moves; the omp fixture must fail if
   `tokens` stops meaning prompt-only input; the OpenCode fixture must include a
   post-compaction message list so a producer that stops skipping summary
   messages fails it.

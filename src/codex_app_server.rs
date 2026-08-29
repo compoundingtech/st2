@@ -9,7 +9,7 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, harness_state, message, run, status};
+use crate::{ding, harness_context, harness_state, message, run, status};
 
 /// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
 /// A later version stays rejected until both checks are repeated; semantic-version proximity is
@@ -367,6 +367,288 @@ impl CodexDeliveryState {
     }
 }
 
+/// The exact codex-cli version whose Rust source settled the occupancy arithmetic below, read at
+/// tag `rust-v0.150.1` (tag object `0eb410ad0dd161ea323b05452f978de01cd63430`) because the Nix
+/// package ships a prebuilt musl tarball with no vendored source. HC-T03 calls Codex's baseline a
+/// version-coupled constant — a property of a build, not of a documented contract — and HC-R13
+/// bounds that with a fixture pinned to this literal, in the shape of `omp_session`'s
+/// `admitted_versions_are_exactly_the_measured_set`. A codex bump that moves the numerator, the
+/// denominator, or the baseline has to fail
+/// [`tests::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`] rather
+/// than silently publish a differently-meaning number.
+///
+/// Deliberately NOT a launch gate: this constant refuses nothing, it names what was measured. Note
+/// it is ahead of [`SUPPORTED_CODEX_CLI_VERSIONS`], which admits 0.145.0–0.147.0 — so in the
+/// shipped tree this arithmetic runs against a version whose source was not read for it. The
+/// baseline is a long-lived Codex constant, but that is an expectation, not a measurement; closing
+/// the gap means repeating the delivery-gate admission checks for 0.150.1, which is a separate act.
+pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.150.1";
+
+/// Codex's `BASELINE_TOKENS`, subtracted from BOTH the numerator and the denominator of its
+/// displayed occupancy: `codex-rs/protocol/src/protocol.rs:2242` and
+/// `codex-rs/tui/src/token_usage.rs:9` at `rust-v0.150.1` carry the same literal with an identical
+/// function body, and no configuration override exists. Its doc comment: "should capture tokens
+/// that are always present in the context (e.g. system prompt and fixed tool instructions) so that
+/// the percentage reflects the portion the user can influence."
+const CODEX_BASELINE_TOKENS: i64 = 12_000;
+
+/// The seven-day rate-limit window, identified by its duration because
+/// `account/rateLimits/updated` names its windows `primary`/`secondary` and nothing else. 10,080
+/// minutes = 7 days, and the one captured Codex rate-limit snapshot (rollout, 0.150.1) carries
+/// exactly this window as `primary`. See [`CodexContextProducer::observe_rate_limits`] for why the
+/// five-hour leg stays `null`.
+const CODEX_SEVEN_DAY_WINDOW_MINUTES: i64 = 10_080;
+
+/// How many recent compaction identities the dedupe retains. One compaction reaches this observer
+/// as both `item/started` and `item/completed` — and possibly also as the deprecated
+/// `thread/compacted` — so counting the edge naively counts one compaction twice or three times. A
+/// last-key-only memory would still miscount an interleaving (`started(A)`, `started(B)`,
+/// `completed(A)`), which a small ring closes for the same cost.
+const CODEX_COMPACTION_MEMORY: usize = 4;
+
+/// Codex's own occupancy arithmetic, mirrored rather than re-derived: the published number is
+/// exactly `100 −` the "N% context left" the operator reads in the Codex footer.
+///
+/// `codex-rs/tui/src/token_usage.rs:43` (and its protocol twin):
+///
+/// ```text
+/// if context_window <= BASELINE_TOKENS { return 0; }
+/// effective = context_window - BASELINE_TOKENS
+/// used      = (last.total_tokens - BASELINE_TOKENS).max(0)
+/// remaining = (effective - used).max(0)
+/// ((remaining / effective) * 100).clamp(0,100).round()
+/// ```
+///
+/// Three things this deliberately does NOT do:
+///
+/// - It does not round the *used* percentage. Rounding `used/effective` and rounding
+///   `remaining/effective` disagree on a half — effective 200, used 101 gives 51 one way and 50
+///   the other — and only the mirrored order satisfies the spec's "equals `100 −` Codex's
+///   displayed '% context left'".
+/// - It does not use `total`, which is cumulative session spend. Against the captured window a
+///   `total`-based percent reads 100 where the true occupancy is 33.
+/// - It does not use `last.inputTokens`, which gives ~36 against the same capture — close enough
+///   to look right and wrong by construction.
+///
+/// The one divergence from the source: where Codex returns `0` remaining for a window at or below
+/// the baseline, mirroring blindly would publish "100% used" for a window it cannot normalize. st2
+/// withholds instead (HC-R02, HC-R03) — a saturation the harness never displayed is fabricated,
+/// not observed.
+///
+/// The result cannot exceed 100: Codex's `remaining` is floored at zero, so an occupancy above the
+/// effective window saturates in the harness's own arithmetic before st2 ever sees it. That is a
+/// property of mirroring Codex, not a clamp of st2's — the record still carries what a producer
+/// computes, unclamped (HC-R02), and the harnesses that can report an overrun are the ones
+/// publishing a float of their own.
+fn codex_used_percent(window_tokens: Option<i64>, last_total_tokens: i64) -> Option<f64> {
+    let window = window_tokens?;
+    if window <= CODEX_BASELINE_TOKENS {
+        return None;
+    }
+    let effective = window - CODEX_BASELINE_TOKENS;
+    let used = (last_total_tokens - CODEX_BASELINE_TOKENS).max(0);
+    let remaining = (effective - used).max(0);
+    let remaining_percent = ((remaining as f64 / effective as f64) * 100.0)
+        .clamp(0.0, 100.0)
+        .round();
+    Some(100.0 - remaining_percent)
+}
+
+/// One compaction's identity as this observer can name it. The item events carry a stable item id
+/// alongside the turn; the deprecated `thread/compacted` notification carries only the turn, so its
+/// key collapses with any item key in the same turn rather than counting beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexCompactionKey {
+    turn_id: String,
+    item_id: Option<String>,
+}
+
+impl CodexCompactionKey {
+    /// Whether these two names describe the same compaction. Two distinct item ids in one turn are
+    /// two compactions; a turn-only name in a turn already counted is the same one under its other
+    /// spelling.
+    fn same_compaction(&self, other: &Self) -> bool {
+        self.turn_id == other.turn_id
+            && match (&self.item_id, &other.item_id) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => true,
+            }
+    }
+}
+
+/// The Codex half of the harness-context record (HC-R11).
+///
+/// It owns a [`harness_context::Writer`] beside the harness-state writer, sharing the wrapper's
+/// incarnation so both records name the same session as their provenance. It holds no guard of its
+/// own: `thread/tokenUsage/updated` arrives once per model response — roughly 10–15 per turn, and
+/// replayed to a newly attached connection on resume — and every one of them is handed to
+/// [`harness_context::Writer::observe`], whose quantization is the only thing deciding what lands.
+/// A second guard here would make the write policy per-harness, which HC-R09 exists to prevent.
+///
+/// The only state it carries between notifications is what it cannot recover from the next one:
+/// the account-scoped rate-limit windows (a separate notification with no reading behind it) and
+/// the identities of recently counted compactions.
+struct CodexContextProducer {
+    writer: harness_context::Writer,
+    /// Last-known account-scoped windows. `account/rateLimits/updated` is documented as a *sparse
+    /// rolling update* whose absent fields do not clear a previously observed value, so the last
+    /// known windows ride along with the next reading instead of blanking it.
+    rate_limits: harness_context::RateLimits,
+    counted_compactions: VecDeque<CodexCompactionKey>,
+}
+
+impl CodexContextProducer {
+    fn new(writer: harness_context::Writer) -> Self {
+        Self {
+            writer,
+            rate_limits: harness_context::RateLimits::default(),
+            counted_compactions: VecDeque::new(),
+        }
+    }
+
+    /// Project one inbound control frame onto the context record, returning whether a write landed.
+    ///
+    /// Every unknown method, foreign thread, and malformed payload is ignored rather than failed:
+    /// this is observability riding a delivery socket, and a frame this producer cannot read must
+    /// not disturb the frame the delivery loop can.
+    fn observe(&mut self, message: &Value, thread_id: &str) -> Result<bool> {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        match method {
+            "thread/tokenUsage/updated" => {
+                if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+                    return Ok(false);
+                }
+                let Some(reading) = self.token_usage_reading(message) else {
+                    return Ok(false);
+                };
+                self.writer.observe(reading)
+            }
+            // Account-scoped and thread-free (HC-T06): it repeats across every runtime sharing the
+            // account, carries no occupancy, and therefore never writes on its own. It is held and
+            // published by the next reading.
+            "account/rateLimits/updated" => {
+                self.observe_rate_limits(message);
+                Ok(false)
+            }
+            "item/started" | "item/completed" => {
+                if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id)
+                    || message.pointer("/params/item/type").and_then(Value::as_str)
+                        != Some("contextCompaction")
+                {
+                    return Ok(false);
+                }
+                let (Some(turn_id), Some(item_id)) = (
+                    message.pointer("/params/turnId").and_then(Value::as_str),
+                    message.pointer("/params/item/id").and_then(Value::as_str),
+                ) else {
+                    return Ok(false);
+                };
+                self.compacted(CodexCompactionKey {
+                    turn_id: turn_id.to_string(),
+                    item_id: Some(item_id.to_string()),
+                })
+            }
+            // Deprecated in the protocol in favour of the item ("Deprecated: Use
+            // `ContextCompaction` item type instead") and unobserved on 0.150.1. Handled anyway,
+            // and deduped against the item, because a harness emitting both must still count one
+            // compaction.
+            "thread/compacted" => {
+                if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+                    return Ok(false);
+                }
+                let Some(turn_id) = message.pointer("/params/turnId").and_then(Value::as_str)
+                else {
+                    return Ok(false);
+                };
+                self.compacted(CodexCompactionKey {
+                    turn_id: turn_id.to_string(),
+                    item_id: None,
+                })
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The reading a `thread/tokenUsage/updated` carries, in Codex's own arithmetic.
+    ///
+    /// `usedTokens` and `windowTokens` are the harness's raw operands and are published as they
+    /// arrive — a window at or below the baseline is still a window the harness reported, even
+    /// where it cannot produce a percent. `model` and `costUsd` are `null` because the channel
+    /// carries neither: the app-server `Thread` object has `modelProvider` and no model identifier,
+    /// and Codex reports no session cost anywhere in the protocol (HC-R16).
+    fn token_usage_reading(&self, message: &Value) -> Option<harness_context::Reading> {
+        let last_total = message
+            .pointer("/params/tokenUsage/last/totalTokens")
+            .and_then(Value::as_i64)?;
+        let window = message
+            .pointer("/params/tokenUsage/modelContextWindow")
+            .and_then(Value::as_i64)
+            .filter(|window| *window > 0);
+        Some(harness_context::Reading {
+            used_tokens: u64::try_from(last_total).ok(),
+            window_tokens: window.and_then(|window| u64::try_from(window).ok()),
+            used_percent: codex_used_percent(window, last_total),
+            model: None,
+            cost_usd: None,
+            // Cumulative lifetime spend and never occupancy (HC-R16): the captured session read
+            // 2,235,329 against a 258,400-token window.
+            session_total_tokens: message
+                .pointer("/params/tokenUsage/total/totalTokens")
+                .and_then(Value::as_i64)
+                .and_then(|total| u64::try_from(total).ok()),
+            rate_limits: self.rate_limits,
+        })
+    }
+
+    /// Merge a sparse rate-limit update into the last-known windows.
+    ///
+    /// Codex names its windows `primary` and `secondary` and identifies them only by
+    /// `windowDurationMins`, so the join is by duration. Only the seven-day window is carried: the
+    /// single captured Codex rate-limit snapshot (0.150.1) contains one window, `primary`, at
+    /// 10,080 minutes. No 300-minute window and no `secondary` was ever observed on this harness,
+    /// so mapping one onto `fiveHour` would be inference dressed as a measurement — and this
+    /// record's whole point is that its numbers were seen. `fiveHour` therefore stays `null` for
+    /// Codex until a capture shows the window; admitting it is a one-line change beside the
+    /// capture that justifies it.
+    fn observe_rate_limits(&mut self, message: &Value) {
+        for window in ["primary", "secondary"] {
+            let Some(snapshot) = message.pointer(&format!("/params/rateLimits/{window}")) else {
+                continue;
+            };
+            if snapshot.get("windowDurationMins").and_then(Value::as_i64)
+                == Some(CODEX_SEVEN_DAY_WINDOW_MINUTES)
+                && let Some(used) = snapshot.get("usedPercent").and_then(Value::as_f64)
+            {
+                self.rate_limits.seven_day = Some(used);
+            }
+        }
+    }
+
+    /// Count one compaction edge unless this compaction was already counted under another of its
+    /// spellings. The count is incarnation-scoped: Codex publishes an edge and nothing else, so st2
+    /// does the counting and the relaunch claim's record removal resets it (HC-R12, HC-R15). The
+    /// trigger is `unknown` because `ContextCompactionThreadItem` carries `id` and `type` and no
+    /// reason at all.
+    fn compacted(&mut self, key: CodexCompactionKey) -> Result<bool> {
+        if self
+            .counted_compactions
+            .iter()
+            .any(|counted| counted.same_compaction(&key))
+        {
+            return Ok(false);
+        }
+        self.counted_compactions.push_back(key);
+        while self.counted_compactions.len() > CODEX_COMPACTION_MEMORY {
+            self.counted_compactions.pop_front();
+        }
+        self.writer.compacted(harness_context::Compaction::new(
+            harness_context::CompactionTrigger::Unknown,
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RejectedCodexDelivery {
     filename: String,
@@ -395,6 +677,9 @@ struct CodexInboxDelivery {
     /// A projected transition whose write failed, retried on the next pump pass before any
     /// heartbeat may re-stamp the contradicted on-disk state.
     pending_observation: Option<harness_state::Observation>,
+    /// The numeric axis's producer, beside the categorical one. `None` only where the record has
+    /// nowhere safe to stage — observability never blocks a launch.
+    context: Option<CodexContextProducer>,
 }
 
 impl CodexInboxDelivery {
@@ -446,6 +731,26 @@ impl CodexInboxDelivery {
                 }
             }
         };
+        // The numeric record's writer, owned beside the state record's and carrying the same
+        // incarnation so both name one session as their provenance. It takes no claim and no
+        // sequence: HC-T04 leaves the numbers unfenced on purpose, because the worst a straggler
+        // can publish here is a reading older than the reader thinks — which `observedAtMs`
+        // already says — rather than a live state that is not live.
+        let context = match harness_context::Writer::new(
+            &config.agent_dir,
+            config.identity.clone(),
+            harness_context::Harness::Codex,
+        ) {
+            Ok(writer) => Some(CodexContextProducer::new(
+                writer.with_session(runtime.incarnation()),
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    "st2 codex: harness-context writer unavailable; context stays unpublished: {error:#}"
+                );
+                None
+            }
+        };
         Ok(Self {
             config,
             state_path,
@@ -463,6 +768,7 @@ impl CodexInboxDelivery {
             harness_writer,
             harness_evidence: false,
             pending_observation: None,
+            context,
         })
     }
 
@@ -482,6 +788,19 @@ impl CodexInboxDelivery {
                 self.pending_observation = None;
                 self.harness_writer.interrupt();
             }
+        }
+    }
+
+    /// Hand one inbound control frame to the context producer. Best-effort in the same sense as the
+    /// presence refresh and the state projection: a record write that fails must not disturb
+    /// delivery. Unlike the state record there is nothing to retain and retry — the next model
+    /// response carries another reading, and the record ages visibly through `ageMs` until it
+    /// lands (HC-R06, HC-T05).
+    fn observe_context(&mut self, message: &Value, thread_id: &str) {
+        if let Some(context) = self.context.as_mut()
+            && let Err(error) = context.observe(message, thread_id)
+        {
+            tracing::warn!("st2 codex: harness-context write failed: {error:#}");
         }
     }
 
@@ -2311,6 +2630,24 @@ fn pump_control(
                     if message.get("method").is_some()
                         || message.get("id") != Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
                     {
+                        // The one notification worth reading before the resume response lands. The
+                        // app-server replays `thread/tokenUsage/updated` to a newly attached
+                        // connection, and the resumed thread still holds its context — so dropping
+                        // it here would leave a seat that resumes and then waits for work reading
+                        // `context: null` against a full window, with nothing to correct it until
+                        // the next model response. The claim this construction already made removed
+                        // the predecessor's record, so there is nothing else to fall back on.
+                        //
+                        // Ordering-agnostic on purpose: if the replay arrives after the response
+                        // the loop below already sees it and this call reads nothing. A duplicate
+                        // reading costs nothing — the bucket guard skips it.
+                        //
+                        // The fresh-binding path below needs no such call: there is no thread id
+                        // until `binding_candidate` names one, and a thread starting now has no
+                        // history to replay.
+                        if let Some(delivery) = delivery.as_mut() {
+                            delivery.observe_context(&message, thread_id);
+                        }
                         continue;
                     }
                     anyhow::ensure!(
@@ -2376,6 +2713,18 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
+            // The context record's whole input, taken before the delivery and state branches
+            // because none of them reads a token count and every one of them may `continue`.
+            //
+            // Deliberately after binding: both unbound paths above skip any frame carrying a
+            // `method`, so a `thread/tokenUsage/updated` replayed to a freshly attached connection
+            // ahead of the resume response is dropped. The consequence is bounded — Codex emits
+            // another reading on the next model response, roughly 10-15 per turn — and the record
+            // is honest about the gap through `ageMs` meanwhile, which is cheaper than teaching the
+            // binding handshake to hold observability frames it has no state to attribute yet.
+            if let Some(delivery) = delivery.as_mut() {
+                delivery.observe_context(&message, state.thread_id());
+            }
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
                     delivery
@@ -3046,6 +3395,391 @@ mod tests {
     #[test]
     fn tui_loaded_deadline_precedes_the_outer_binding_deadline() {
         assert!(TUI_LOADED_TIMEOUT < STARTUP_TIMEOUT);
+    }
+
+    /// An agent directory with a parent to stage into, and a producer over it carrying a fixed
+    /// incarnation so the record's provenance is assertable.
+    fn context_producer(root: &Path) -> (PathBuf, CodexContextProducer) {
+        let agent_dir = root.join("agents/h/worker");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let writer =
+            harness_context::Writer::new(&agent_dir, "h.worker", harness_context::Harness::Codex)
+                .unwrap()
+                .with_session("codex-incarnation");
+        (agent_dir, CodexContextProducer::new(writer))
+    }
+
+    fn context_record(agent_dir: &Path) -> Option<harness_context::Observed> {
+        harness_context::read(&harness_context::harness_context_path(agent_dir))
+    }
+
+    fn token_usage_frame(last_total: i64, window: Value) -> Value {
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-main",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "totalTokens": last_total },
+                    "total": { "totalTokens": last_total },
+                    "modelContextWindow": window
+                }
+            }
+        })
+    }
+
+    fn compaction_item_frame(method: &str, turn_id: &str, item_id: &str) -> Value {
+        json!({
+            "method": method,
+            "params": {
+                "threadId": "thread-main",
+                "turnId": turn_id,
+                "item": { "id": item_id, "type": "contextCompaction" }
+            }
+        })
+    }
+
+    /// HC-R13's Codex fixture. The frames are a transposition, and the comment says which half came
+    /// from where: the SHAPE is codex-cli 0.150.1's own app-server schema dump
+    /// (`ThreadTokenUsageUpdatedNotification`, `AccountRateLimitsUpdatedNotification`), and the
+    /// NUMBERS are verbatim from a real rollout captured on 2026-08-29 from a 0.150.1 session
+    /// (`session_meta.payload.cli_version = "0.150.1"`) — its first and last `token_count` events
+    /// and the `rate_limits` snapshot riding them. Fields the capture elided are omitted rather
+    /// than invented; this producer reads three numbers and must not need the rest.
+    ///
+    /// What must fail here when a codex bump moves something: the 12,000 baseline (the percent
+    /// changes), the numerator (`total` reads 100 and `last.inputTokens` without the baseline reads
+    /// 36 against this very capture, both asserted below), and the version literal itself, which is
+    /// the only thing tying this arithmetic to a build whose source was actually read.
+    #[test]
+    fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version() {
+        assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.150.1");
+        assert_eq!(CODEX_BASELINE_TOKENS, 12_000);
+
+        let frames = include_str!("../tests/fixtures/codex_token_usage_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 3);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_dir, mut producer) = context_producer(tmp.path());
+
+        // The session's FIRST reading: 32,237 of 258,400 with the baseline normalized out is 8%,
+        // and no rate-limit notification has arrived yet, so both windows are honestly absent.
+        assert!(producer.observe(&frames[0], "thread-main").unwrap());
+        let first = context_record(&agent_dir).unwrap();
+        assert_eq!(first.used_tokens, Some(32_237));
+        assert_eq!(first.window_tokens, Some(258_400));
+        assert_eq!(first.used_percent, Some(8.0));
+        assert_eq!(first.rate_limits, harness_context::RateLimits::default());
+
+        // The account-scoped snapshot carries no occupancy, so it writes nothing on its own and is
+        // held for the next reading (HC-T06).
+        assert!(!producer.observe(&frames[1], "thread-main").unwrap());
+        let mut unchanged = context_record(&agent_dir).unwrap();
+        // `age_ms` is derived at read time, not stored, so it moves between two reads of one
+        // record. Everything the record itself carries — including `observed_at_ms`, which is what
+        // proves no write happened — must be identical.
+        assert!(unchanged.age_ms >= first.age_ms);
+        unchanged.age_ms = first.age_ms;
+        assert_eq!(unchanged, first);
+
+        assert!(producer.observe(&frames[2], "thread-main").unwrap());
+        let observed = context_record(&agent_dir).unwrap();
+        assert_eq!(observed.harness, harness_context::Harness::Codex);
+        assert_eq!(observed.used_tokens, Some(92_283));
+        assert_eq!(observed.window_tokens, Some(258_400));
+        // 100 − Codex's displayed "67% context left" for this exact capture.
+        assert_eq!(observed.used_percent, Some(33.0));
+        assert_eq!(observed.session_total_tokens, Some(2_235_329));
+        // The channel carries neither: `Thread` has `modelProvider` and no model identifier, and
+        // Codex reports no session cost anywhere in the protocol.
+        assert_eq!(observed.model, None);
+        assert_eq!(observed.cost_usd, None);
+        // Only the seven-day window was ever captured on this harness; the five-hour leg is not
+        // inferred from a field name (see `observe_rate_limits`).
+        assert_eq!(
+            observed.rate_limits,
+            harness_context::RateLimits {
+                five_hour: None,
+                seven_day: Some(44.0),
+            }
+        );
+        assert_eq!(observed.compactions, 0);
+        assert_eq!(observed.last_compaction_ms, None);
+
+        // The trap, asserted rather than described: the cumulative session total is 2,235,329
+        // against a 258,400-token window. A producer that used it as the numerator would publish a
+        // saturated 100 for a window that is a third full.
+        assert_eq!(codex_used_percent(Some(258_400), 2_235_329), Some(100.0));
+        assert_ne!(
+            codex_used_percent(Some(258_400), 2_235_329),
+            observed.used_percent
+        );
+        // And the baseline-free percent over the same operands is 36 — close enough to look right.
+        let baseline_free = (92_283.0_f64 / 258_400.0 * 100.0).round();
+        assert_eq!(baseline_free, 36.0);
+        assert_ne!(Some(baseline_free), observed.used_percent);
+
+        // Mirroring is not the same function as rounding the used percentage: at an exact half
+        // they disagree. Effective window 200, used 101 — Codex displays 50% left, so st2 publishes
+        // 50; rounding `used/effective` would publish 51.
+        assert_eq!(codex_used_percent(Some(12_200), 12_101), Some(50.0));
+        assert_eq!((101.0_f64 / 200.0 * 100.0).round(), 51.0);
+    }
+
+    /// HC-R02/HC-R03: the operands are the harness's and are published as they arrive; only the
+    /// percent is withheld, and only where Codex's own normalization cannot run. A window at or
+    /// below the baseline is the sharp case — Codex itself returns "0% remaining" there, which
+    /// mirrored blindly would publish a fabricated 100% used.
+    #[test]
+    fn a_missing_or_unnormalizable_window_withholds_the_percent_but_not_the_operands() {
+        for (window, expected_window) in [
+            (Value::Null, None),
+            (json!(12_000), Some(12_000)),
+            (json!(0), None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (agent_dir, mut producer) = context_producer(tmp.path());
+            assert!(
+                producer
+                    .observe(&token_usage_frame(92_283, window.clone()), "thread-main")
+                    .unwrap()
+            );
+            let observed = context_record(&agent_dir).unwrap();
+            assert_eq!(observed.used_tokens, Some(92_283), "window {window}");
+            assert_eq!(observed.window_tokens, expected_window, "window {window}");
+            assert_eq!(observed.used_percent, None, "window {window}");
+        }
+
+        // A window key that is absent rather than null reads the same way.
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_dir, mut producer) = context_producer(tmp.path());
+        assert!(
+            producer
+                .observe(
+                    &json!({
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-1",
+                            "tokenUsage": {
+                                "last": { "totalTokens": 92_283 },
+                                "total": { "totalTokens": 92_283 }
+                            }
+                        }
+                    }),
+                    "thread-main",
+                )
+                .unwrap()
+        );
+        let observed = context_record(&agent_dir).unwrap();
+        assert_eq!(observed.window_tokens, None);
+        assert_eq!(observed.used_percent, None);
+    }
+
+    /// Codex speaks once per model response — roughly 10-15 times a turn, and again on resume or
+    /// re-attach. The core's quantization is the ONLY thing deciding what lands (HC-R09): this
+    /// producer holds no reading of its own and imposes no cadence. The shape that catches a second
+    /// guard is the last frame here — a bucket crossing arriving immediately after two suppressed
+    /// readings, which any time floor in the producer would swallow.
+    #[test]
+    fn every_reading_reaches_the_core_guard_and_the_producer_imposes_no_cadence_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_dir, mut producer) = context_producer(tmp.path());
+        let window = json!(258_400);
+
+        assert!(
+            producer
+                .observe(&token_usage_frame(92_283, window.clone()), "thread-main")
+                .unwrap()
+        );
+        assert_eq!(context_record(&agent_dir).unwrap().used_percent, Some(33.0));
+
+        // Both still round to 33% used, so both sit in the written bucket and neither lands.
+        for moved in [93_000, 94_000] {
+            assert_eq!(codex_used_percent(Some(258_400), moved), Some(33.0));
+            assert!(
+                !producer
+                    .observe(&token_usage_frame(moved, window.clone()), "thread-main")
+                    .unwrap()
+            );
+            assert_eq!(
+                context_record(&agent_dir).unwrap().used_tokens,
+                Some(92_283)
+            );
+        }
+
+        // The crossing lands at once, with no elapsed time behind it.
+        assert!(
+            producer
+                .observe(&token_usage_frame(95_000, window.clone()), "thread-main")
+                .unwrap()
+        );
+        let observed = context_record(&agent_dir).unwrap();
+        assert_eq!(observed.used_percent, Some(34.0));
+        assert_eq!(observed.used_tokens, Some(95_000));
+
+        // A reading for another thread is not this seat's.
+        assert!(
+            !producer
+                .observe(&token_usage_frame(200_000, window), "thread-other")
+                .unwrap()
+        );
+        assert_eq!(
+            context_record(&agent_dir).unwrap().used_tokens,
+            Some(95_000)
+        );
+    }
+
+    /// HC-R12: one compaction is one count, however many of its spellings arrive. Codex publishes
+    /// the live edge as an `item/started` AND an `item/completed` over the same
+    /// `ContextCompactionThreadItem` id, and the protocol still carries a deprecated
+    /// `thread/compacted` notification for the same event that names only the turn.
+    #[test]
+    fn one_compaction_is_counted_once_across_every_spelling_of_its_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_dir, mut producer) = context_producer(tmp.path());
+
+        assert!(
+            producer
+                .observe(
+                    &compaction_item_frame("item/started", "turn-1", "item-a"),
+                    "thread-main"
+                )
+                .unwrap()
+        );
+        let first = context_record(&agent_dir).unwrap();
+        assert_eq!(first.compactions, 1);
+        assert_eq!(
+            first.last_compaction_trigger,
+            Some(harness_context::CompactionTrigger::Unknown),
+            "the item carries an id and a type and no reason at all"
+        );
+        assert!(first.last_compaction_ms.is_some());
+
+        // The same compaction's closing edge, and the deprecated notification for the same event.
+        assert!(
+            !producer
+                .observe(
+                    &compaction_item_frame("item/completed", "turn-1", "item-a"),
+                    "thread-main"
+                )
+                .unwrap()
+        );
+        assert!(
+            !producer
+                .observe(
+                    &json!({
+                        "method": "thread/compacted",
+                        "params": { "threadId": "thread-main", "turnId": "turn-1" }
+                    }),
+                    "thread-main",
+                )
+                .unwrap()
+        );
+        assert_eq!(context_record(&agent_dir).unwrap().compactions, 1);
+
+        // A genuinely second compaction inside the same turn is a second count.
+        assert!(
+            producer
+                .observe(
+                    &compaction_item_frame("item/started", "turn-1", "item-b"),
+                    "thread-main"
+                )
+                .unwrap()
+        );
+        assert_eq!(context_record(&agent_dir).unwrap().compactions, 2);
+
+        // Interleaved lifecycles: two starts before either completion still count exactly two, so
+        // the dedupe cannot be a single last-key memory.
+        for (method, item) in [
+            ("item/started", "item-c"),
+            ("item/started", "item-d"),
+            ("item/completed", "item-c"),
+            ("item/completed", "item-d"),
+        ] {
+            producer
+                .observe(
+                    &compaction_item_frame(method, "turn-2", item),
+                    "thread-main",
+                )
+                .unwrap();
+        }
+        assert_eq!(context_record(&agent_dir).unwrap().compactions, 4);
+
+        // The deprecated notification arriving FIRST also claims the compaction, so the item that
+        // follows it does not count a second time.
+        assert!(
+            producer
+                .observe(
+                    &json!({
+                        "method": "thread/compacted",
+                        "params": { "threadId": "thread-main", "turnId": "turn-3" }
+                    }),
+                    "thread-main",
+                )
+                .unwrap()
+        );
+        assert!(
+            !producer
+                .observe(
+                    &compaction_item_frame("item/started", "turn-3", "item-e"),
+                    "thread-main"
+                )
+                .unwrap()
+        );
+        assert_eq!(context_record(&agent_dir).unwrap().compactions, 5);
+
+        // Another thread's compaction is not this seat's, and a non-compaction item is not an edge.
+        assert!(
+            !producer
+                .observe(
+                    &compaction_item_frame("item/started", "turn-9", "item-z"),
+                    "thread-other"
+                )
+                .unwrap()
+        );
+        assert!(
+            !producer
+                .observe(
+                    &json!({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turnId": "turn-4",
+                            "item": { "id": "item-y", "type": "agentMessage" }
+                        }
+                    }),
+                    "thread-main",
+                )
+                .unwrap()
+        );
+        assert_eq!(context_record(&agent_dir).unwrap().compactions, 5);
+    }
+
+    /// The producer runs beside a live delivery loop and sees every frame that loop sees. Replaying
+    /// the captured #263 session — 23 real inbound frames, none of them a token count — must leave
+    /// no record at all: absence here is "never observed", and a producer that manufactured a
+    /// reading from a turn boundary would break exactly the HC-R03 rule the record exists for.
+    #[test]
+    fn captured_delivery_frames_carrying_no_token_count_publish_no_record() {
+        let frames = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 23);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent_dir, mut producer) = context_producer(tmp.path());
+        for frame in &frames {
+            assert!(
+                !producer.observe(frame, "thread-main").unwrap(),
+                "no captured delivery frame carries a context reading: {frame}"
+            );
+        }
+        assert!(context_record(&agent_dir).is_none());
     }
 
     fn delivery_config(root: &Path) -> CodexDeliveryConfig {
@@ -3936,6 +4670,96 @@ mod tests {
         );
     }
 
+    /// The wiring, not the arithmetic: a `thread/tokenUsage/updated` arriving on the real control
+    /// socket reaches the record. Every other context test drives the producer directly, so all of
+    /// them would stay green if the pump stopped handing it frames — which is exactly how a
+    /// producer silently stops producing.
+    #[test]
+    fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
+                }),
+            )
+            .unwrap();
+            write_json_message(&mut websocket, &token_usage_frame(92_283, json!(258_400))).unwrap();
+            // Hold the connection open until the reading has landed: closing here would race the
+            // pump's read of the frame just written. Bounded, so a pump that stopped handing
+            // frames to the producer fails this test instead of hanging it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while harness_context::read(&harness_context::harness_context_path(&agent_dir))
+                .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime,
+                None,
+                Some(config),
+                tx,
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+
+        let observed = context_record(&tmp.path().join("agents/h/worker"))
+            .expect("the pump published nothing");
+        assert_eq!(observed.harness, harness_context::Harness::Codex);
+        assert_eq!(observed.used_tokens, Some(92_283));
+        assert_eq!(observed.window_tokens, Some(258_400));
+        assert_eq!(observed.used_percent, Some(33.0));
+    }
+
     #[test]
     fn subscribed_control_pump_reconciles_an_ambiguous_attempt_without_replay() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4325,6 +5149,135 @@ mod tests {
             .unwrap();
         assert!(state.subscribed());
         assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    /// A resumed thread still holds its context, and the app-server replays
+    /// `thread/tokenUsage/updated` to the newly attached connection — before the resume response,
+    /// which the binding handshake otherwise discards along with every other notification. The
+    /// construction that resumed this seat has already removed the predecessor's record, so a
+    /// dropped replay leaves a resumed-and-idle seat reading `null` against a full window with
+    /// nothing to correct it until its next model response.
+    #[test]
+    fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let agent_dir_for_server = agent_dir.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-prior"] }
+                }),
+            )
+            .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            assert_eq!(subscribe["params"]["threadId"], "thread-prior");
+            // The replay, ahead of the response the handshake is waiting for.
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-prior",
+                        "turnId": "turn-prior",
+                        "tokenUsage": {
+                            "last": { "totalTokens": 92_283 },
+                            "total": { "totalTokens": 2_235_329 },
+                            "modelContextWindow": 258_400
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while harness_context::read(&harness_context::harness_context_path(
+                &agent_dir_for_server,
+            ))
+            .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime,
+                Some(ControlResume {
+                    thread_id: "thread-prior",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                }),
+                Some(config),
+                tx,
+            )
+        });
+        resume_ready_tx.send(()).unwrap();
+        acknowledge_tui_thread_loaded(&rx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+
+        let observed =
+            context_record(&agent_dir).expect("the replayed reading never reached the record");
+        assert_eq!(observed.used_percent, Some(33.0));
+        assert_eq!(observed.used_tokens, Some(92_283));
+        assert_eq!(observed.session_total_tokens, Some(2_235_329));
     }
 
     #[test]
