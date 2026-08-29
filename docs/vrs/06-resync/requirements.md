@@ -129,16 +129,21 @@ root [`R05`](../requirements.md); Resource bindings are defined by
 - **RESYNC-R09 Opt-in supervisor-chain coverage:** When a profile declares
   `notify-chain`, a live agent's watch set also contains every active
   same-profile-scheme carrier declared by each non-retired supervisor ancestor.
-  Traversal continues through a retired middle ancestor without including that
-  ancestor's carrier. Profiles without the flag and native bindings retain
-  agent-local coverage. A missing, cyclic, ambiguous, or otherwise unwalkable
-  supervisor chain is diagnosed; it never becomes a silent guessed chain.
+  A suspended ancestor remains a layer and traversal continues through it, but
+  the suspended seat itself owns no active subscription. A retired ancestor
+  contributes no layer and traversal continues through it. Profiles without the
+  flag and native bindings retain agent-local coverage. A missing, cyclic,
+  ambiguous, or otherwise unwalkable supervisor chain is diagnosed; it never
+  becomes a silent guessed chain.
 - **RESYNC-R10 Launch-boundary completeness:** A canonical seat's complete
   catalog-aware watch set is installed synchronously when reconciliation first
   proves the seat live and before any later launch target may block. Reinstalling
   an already-live seat is idempotent: unchanged own and ancestor subscriptions
   retain their baselines and pending transitions. Full refresh remains the final
-  authority for lifecycle removal and hot profile reload.
+  authority for lifecycle removal and hot profile reload. It selects active
+  subscriptions only from canonical seats proven live in the pass while resolving
+  their topology against every valid discovered declaration, including suspended
+  and retired nodes.
 
 ## Evidence
 

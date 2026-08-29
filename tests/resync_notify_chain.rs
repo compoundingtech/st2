@@ -95,7 +95,16 @@ fn spawn(catalog: &Path) -> st2::resync::ResyncSupervisor {
         "hetz".to_owned(),
         registry,
     );
-    let diagnostics = supervisor.refresh(&st2::discover_strict(catalog).specs, "hetz", &[], &[]);
+    let found = st2::discover_strict(catalog);
+    assert!(found.errors.is_empty(), "clean discovery: {:?}", found.errors);
+    let specs = found.specs;
+    let live_subscription_specs = specs
+        .iter()
+        .filter(|spec| spec.desired_state.is_running())
+        .cloned()
+        .collect::<Vec<_>>();
+    let diagnostics =
+        supervisor.refresh(&specs, &live_subscription_specs, "hetz", &[], &[]);
     assert!(diagnostics.is_empty(), "clean refresh: {diagnostics:?}");
     std::thread::sleep(Duration::from_millis(300));
     supervisor
@@ -217,6 +226,79 @@ fn a_retired_ancestor_is_skipped_and_the_walk_continues_past_it() {
             resync_bodies(&worker)
         );
     }
+}
+
+/// A suspended ancestor remains part of the composed desired-state chain: its layer and the
+/// ancestors beyond it reach a live descendant, while the suspended seat owns no subscription.
+#[test]
+fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() {
+    let catalog = tempfile::tempdir().unwrap();
+    catalog_with_profile(catalog.path(), true);
+    let root = write_agent(catalog.path(), "root", None, None);
+    let lead = write_agent(
+        catalog.path(),
+        "lead",
+        Some("hetz.root"),
+        Some("desired-state \"suspended\" reason=\"waiting for capacity\""),
+    );
+    let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
+    write_layer(&lead, "before\n");
+    let specs = st2::discover_strict(catalog.path()).specs;
+    let worker_spec = specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    let set = st2::resync::watch_set_for_in_catalog(
+        worker_spec,
+        &specs,
+        "hetz",
+        &st2::catalog::declared_profiles(catalog.path()).unwrap(),
+    );
+    assert!(
+        set.carriers
+            .iter()
+            .any(|carrier| carrier.label == "goal@hetz.lead"),
+        "a suspended ancestor remains a layer in the live descendant's watch set"
+    );
+    assert!(
+        set.carriers
+            .iter()
+            .any(|carrier| carrier.label == "goal@hetz.root"),
+        "traversal continues through the suspended ancestor"
+    );
+    let _supervisor = spawn(catalog.path());
+
+    write_layer(&lead, "directive retained by a suspended seat\n");
+    assert!(
+        wait_for(|| resync_bodies(&worker).len(), 1),
+        "the suspended ancestor's layer remains in the live descendant's composed view: {:?}",
+        resync_bodies(&worker)
+    );
+    assert!(
+        resync_bodies(&worker)[0].contains("key: goal@hetz.lead"),
+        "the suspended layer keeps its owner-qualified key"
+    );
+    assert!(
+        resync_bodies(&lead).is_empty(),
+        "the suspended seat itself must own no active subscription"
+    );
+
+    write_layer(&root, "standing safety constraint\n");
+    assert!(
+        wait_for(|| resync_bodies(&worker).len(), 2),
+        "chain traversal must continue through the suspended middle: {:?}",
+        resync_bodies(&worker)
+    );
+    assert!(
+        resync_bodies(&worker)
+            .iter()
+            .any(|body| body.contains("key: goal@hetz.root")),
+        "the root layer beyond the suspended middle must remain subscribed"
+    );
+    assert!(
+        resync_bodies(&lead).is_empty(),
+        "ancestor fan-out must not reactivate the suspended seat"
+    );
 }
 
 #[test]

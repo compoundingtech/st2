@@ -1904,9 +1904,12 @@ fn reconcile_pass(
                 agent_spec::profile::ResourceProfileRegistry::empty()
             }
         };
+        let live_subscription_specs =
+            live_resync_specs(&compiled_specs, this_host, &sessions, &report);
         report.warnings.extend(resync.refresh_with_profiles(
             profiles,
-            &live_resync_specs(&compiled_specs, this_host, &sessions, &report),
+            &found.specs,
+            &live_subscription_specs,
             this_host,
             &sessions,
             &malformed_declarations,
@@ -4026,11 +4029,25 @@ mod tests {
         supervisor: Option<&str>,
         later_task: bool,
     ) -> (PathBuf, PathBuf) {
+        write_notify_chain_agent_with_state(catalog, identity, supervisor, later_task, None)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_agent_with_state(
+        catalog: &Path,
+        identity: &str,
+        supervisor: Option<&str>,
+        later_task: bool,
+        desired_state: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
         let agent_dir = catalog.join("agents/hetz").join(identity);
         let resources = agent_dir.join("resources");
         std::fs::create_dir_all(&resources).unwrap();
         let supervisor = supervisor
             .map(|supervisor| format!("  supervisor {supervisor:?}\n"))
+            .unwrap_or_default();
+        let desired_state = desired_state
+            .map(|desired_state| format!("  {desired_state}\n"))
             .unwrap_or_default();
         let later_task = if later_task {
             "  exec \"later\" { command \"true\" }\n"
@@ -4042,7 +4059,7 @@ mod tests {
             format!(
                 r#"agent "{identity}" {{
   host "hetz"
-{supervisor}  command "agent"
+{supervisor}{desired_state}  command "agent"
 {later_task}  resource "goal" uri="dev.schickling.agent-goal://hetz/{identity}" reason="Layer."
 }}
 "#
@@ -4250,6 +4267,110 @@ mod tests {
             evidence.7.is_some() && evidence.8.is_some(),
             "lead transition must reach lead and worker"
         );
+        assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology();
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
+        for retirement in [
+            "retired #true",
+            "desired-state \"retired\" reason=\"fixture\"",
+        ] {
+            let catalog = tempfile::tempdir().unwrap();
+            write_notify_chain_profile(catalog.path());
+            let (root_dir, root_goal) =
+                write_notify_chain_agent(catalog.path(), "root", None, false);
+            let (middle_dir, _middle_goal) = write_notify_chain_agent_with_state(
+                catalog.path(),
+                "middle",
+                Some("hetz.root"),
+                false,
+                Some(retirement),
+            );
+            let (child_dir, _child_goal) =
+                write_notify_chain_agent(catalog.path(), "child", Some("hetz.middle"), false);
+            let specs = crate::discover_strict(catalog.path()).specs;
+            let sessions = specs
+                .iter()
+                .filter(|spec| spec.desired_state.is_running())
+                .flat_map(|spec| {
+                    spec.tasks.iter().map(|task| {
+                        let id = task
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name));
+                        sess(&id, true)
+                    })
+                })
+                .collect();
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(1);
+            let (_release_tx, release_rx) = mpsc::channel();
+            let runner = SteadyChainRunner {
+                sessions: std::sync::Mutex::new(sessions),
+                block_id: "never-block".to_owned(),
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            };
+            let stop = AtomicBool::new(false);
+            let missing_supervisor = AtomicBool::new(false);
+            let (first_report_tx, first_report_rx) = mpsc::sync_channel(1);
+
+            let evidence = std::thread::scope(|scope| {
+                let observer_stop = &stop;
+                let observer = scope.spawn(move || {
+                    first_report_rx.recv().unwrap();
+                    // Let the asynchronous full refresh replace the synchronous install before
+                    // mutating the root carrier. The child must retain the complete catalog chain.
+                    std::thread::sleep(Duration::from_millis(300));
+                    std::fs::write(&root_goal, "root transition after full refresh\n").unwrap();
+                    let root_event = wait_for_resync_event_for_key(&root_dir, "goal");
+                    let child_event =
+                        wait_for_resync_event_for_key(&child_dir, "goal@hetz.root");
+                    let middle_event = current_resync_event_for_key(&middle_dir, "goal@hetz.root");
+                    observer_stop.store(true, Ordering::SeqCst);
+                    (root_event, child_event, middle_event)
+                });
+                up_loop_until(
+                    catalog.path(),
+                    "hetz",
+                    &runner,
+                    Duration::from_millis(25),
+                    &stop,
+                    |_, _| None,
+                    |report| {
+                        if report
+                            .errors
+                            .iter()
+                            .chain(&report.warnings)
+                            .any(|message| message.contains("MissingSupervisor"))
+                        {
+                            missing_supervisor.store(true, Ordering::SeqCst);
+                        }
+                        let _ = first_report_tx.try_send(());
+                    },
+                )
+                .unwrap();
+                observer.join().unwrap()
+            });
+
+            assert!(
+                evidence.0.is_some(),
+                "root must receive its own event ({retirement})"
+            );
+            assert!(
+                evidence.1.is_some(),
+                "the live child must receive exactly its owner-qualified root event through the \
+                 retired middle after full refresh ({retirement})"
+            );
+            assert!(
+                evidence.2.is_none(),
+                "the retired middle must own no active subscription ({retirement})"
+            );
+            assert!(
+                !missing_supervisor.load(Ordering::SeqCst),
+                "the complete catalog graph must prevent MissingSupervisor ({retirement})"
+            );
+        }
     }
 
     #[test]
@@ -4490,6 +4611,7 @@ mod tests {
         assert!(
             resync
                 .refresh(
+                    specs,
                     &live_resync_specs(specs, "hetz", &[], &report),
                     "hetz",
                     &[],
@@ -4795,6 +4917,7 @@ mod tests {
         assert!(
             resync
                 .refresh(
+                    &specs,
                     &live_resync_specs(&specs, "hetz", &[], &report),
                     "hetz",
                     &[],
