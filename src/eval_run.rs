@@ -1369,20 +1369,15 @@ fn run_eval_inner(
             Some(routes) => admitted_route(routes, &sup).inbox.clone(),
             None => bus.join(&sup).join("inbox"),
         };
-        let requester_before_kickoff = canonical_routes.as_ref().map(|_| {
-            crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|message| message.filename)
-                .collect::<HashSet<_>>()
-        });
+        let requester_before_kickoff = crate::message::list_dir(&bus.join(&msg.from).join("inbox"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<HashSet<_>>();
         let kickoff_receipt =
             crate::message::send_to_inbox(&to_inbox, &msg.from, None, None, &[], &body)
                 .with_context(|| format!("seeding kickoff into {}", to_inbox.display()))?;
-        let kickoff_ts = eval
-            .canonical_agents
-            .then(|| message_timestamp(&kickoff_receipt))
-            .transpose()?;
+        let kickoff_ts = message_timestamp(&kickoff_receipt)?;
         eval_log!("== kickoff → {sup} (from {}) ==", msg.from);
 
         let workers: Vec<String> = participant_ids
@@ -1485,8 +1480,8 @@ fn run_eval_inner(
                 &sup,
                 &msg.from,
                 &workers,
-                kickoff_ts,
-                requester_before_kickoff.as_ref(),
+                Some(kickoff_ts),
+                Some(&requester_before_kickoff),
                 eval.max_timeout,
                 &mut tick,
             )
@@ -2979,7 +2974,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
     }
 
     #[test]
-    fn canonical_singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
+    fn singleton_done_is_new_after_kickoff_and_allows_the_same_millisecond() {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = root.path().join("agents/h/interviewer");
         let routes = BTreeMap::from([(
@@ -3030,6 +3025,28 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             ),
             "a newly appearing same-ms singleton confirmation should complete promptly"
         );
+    }
+
+    #[test]
+    fn compact_singleton_done_accepts_one_new_requester_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let requester = root.path().join("requester/inbox");
+        let kickoff_ts = 1_700_000_002_000;
+        let before = HashSet::new();
+        seed_msg(&requester, kickoff_ts + 1, "aaaaaa", "h.worker");
+
+        let noop = &mut (|| {}) as &mut dyn FnMut();
+        assert!(wait_done(
+            root.path(),
+            None,
+            "h.worker",
+            "requester",
+            &[],
+            Some(kickoff_ts),
+            Some(&before),
+            Duration::from_secs(1),
+            noop,
+        ));
     }
 
     #[test]
