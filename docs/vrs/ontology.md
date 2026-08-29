@@ -158,6 +158,64 @@ observed. The origin timestamp is durable; age is a projection and never file
 mtime.
 
 Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+
+### harness context record
+
+The driver-written numeric record of how full an agent's harness context window
+is, how often that harness has compacted, and the adjacent facts the same
+channel carries. It is the numeric sibling of
+[observed harness state](#observed-harness-state)'s categorical axis: unfenced,
+quantized rather than transition-guarded, and readable with its own age even
+when the state axis reads `unknown`. Advisory: it authorizes nothing.
+
+Its roster key is `context`, but the canonical term is *harness context record*.
+It is not [working state](#working-state) — R09's restored durable context,
+which owns the bare word *context* in st2's language.
+
+Authority: [08-harness-context requirements](08-harness-context/requirements.md);
+[decision 0014](.decisions/0014-harness-context-is-a-sibling-numeric-record.md)
+
+### context fill
+
+How much of a harness's context window its current conversation occupies,
+published as `usedTokens`, `windowTokens`, and `usedPercent`.
+
+`usedPercent` is **harness-native**: the number that harness itself displays to
+its operator, by that harness's own rule — Claude's clamped integer over the
+full window, Codex's percentage over a window with a fixed baseline removed,
+pi's and omp's float, and an st2-computed ratio for OpenCode, which shows none.
+The record's `harness` field is what names the rule. Two agents' `usedPercent`
+values are therefore comparable as operator views, not as one measured quantity,
+and a value above 100 is a real overrun rather than something to clamp.
+
+Authority: [08-harness-context requirements HC-A04, HC-R02](08-harness-context/requirements.md);
+[producer table](08-harness-context/spec.md)
+
+### occupancy
+
+What a context window currently holds — the numerator of
+[context fill](#context-fill). Distinct from **cumulative session total**
+(`sessionTotalTokens`), which is every token a session has ever spent and grows
+without bound: one measured session read 2,235,329 cumulative tokens against a
+258,400-token window. Every harness that publishes both publishes them side by
+side under names easy to confuse; the two are never interchangeable, and only
+occupancy is ever a percent's numerator.
+
+Authority: [08-harness-context requirements HC-R16](08-harness-context/requirements.md);
+[record fields](08-harness-context/spec.md)
+
+### compaction trigger
+
+Why a harness compacted, drawn from the closed union
+`manual | auto | threshold | overflow | idle | unknown`. It is the harness's own
+reason, not st2's inference: only Claude and pi put one on the compaction edge,
+so `unknown` is the honest value for the other three producers rather than an
+error. An unrecognized future word decodes as `unknown`, never as a definite
+trigger.
+
+Authority: [08-harness-context requirements HC-R12](08-harness-context/requirements.md);
+[compaction accounting](08-harness-context/spec.md)
+
 ### Resource
 
 An externally identified thing an agent points at, named by an absolute URI.
@@ -453,6 +511,18 @@ native driver boundary --publishes/clears--> native driver diagnostic
 `diagnostic` is the leitwort for typed driver degradation; `observed` remains
 the leitwort for harness activity evidence.
 
+```text
+harness channel --publishes--> context fill --occupies--> context window
+       |                            |
+       `-- compaction edge          `-- derives context fill age
+              |
+              `-- carries compaction trigger
+```
+
+`harness context` is the leitwort for the numeric axis, `context fill` for
+occupancy, and `compaction` for the edge and its counter. *Working state* stays
+outside this family entirely.
+
 ## Collision rules
 
 - Qualify **root** as [root agent](requirements.md#L51-L54) or
@@ -498,6 +568,24 @@ the leitwort for harness activity evidence.
 - Use [working state](#working-state) for R09's restored durable context. The
   verb is `st2 context` and the directory is `resources/context/`, but the
   canonical term and its scheme are *working state*, not *context*.
+- Bare **context** is therefore already taken. Say
+  [harness context record](#harness-context-record) for the numeric harness
+  axis, even though its roster key is `context`; say *working state* for R09's
+  restored durable context. The two share no field, no file, and no producer,
+  and neither is [observed harness state](#observed-harness-state) — that is the
+  categorical axis. A record's numbers never imply a state, and a state never
+  implies a fill.
+- Use [context fill](#context-fill) for occupancy as a fraction and qualify it
+  as **harness-native** wherever a reader might otherwise assume one formula.
+  Do not call a cross-harness aggregate of `usedPercent` a measurement; it is an
+  aggregate of operator views.
+- Use [occupancy](#occupancy) for what the window currently holds and
+  **cumulative session total** for lifetime spend. Never *total* unqualified:
+  the harnesses themselves spell both `total`, and dividing the wrong one by the
+  window reports several hundred percent.
+- Use [compaction trigger](#compaction-trigger) for the harness's own stated
+  reason. `unknown` is a value, not a failure, and st2 never infers a trigger a
+  harness did not state.
 - Use [message](../../src/message.rs#L26-L46) for the durable record and
   [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable

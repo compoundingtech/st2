@@ -114,3 +114,37 @@ driver-backed seat that wants the wrapper's machinery must declare the
 axe's managed path requires a profile account binding plus a fixed-account
 credential availability probe, which omp satisfies with its install-identity
 file since its native OAuth exposes no projectable credential.
+
+## Correction (2026-08-29): the `ctx` enumeration above is incomplete
+
+The "Context object differences" finding states that the event-handler `ctx`
+exposes `{ ui }` only. That is a **probe artifact of this capture, not a fact
+about 18.0.3**. A re-probe on 2026-08-29 walked
+`Object.getOwnPropertyNames` over the handler `ctx` at every lifecycle event
+against both binaries — `18.0.3` (`/nix/store/zv3xvic38a2gcdpxk3wd5fsk6plsgvbn-omp-18.0.3/bin/omp`)
+and `18.0.9` — and got the **identical** key set from both:
+
+```text
+abort, clearTimer, compact, cwd, getAsyncJobSnapshot, getContextUsage, getSystemPrompt,
+hasPendingMessages, hasUI, invokeTool, isIdle, isProjectTrusted, localProtocolOptions, memory,
+mode, model, modelRegistry, models, sessionManager, setInterval, setTimeout, shutdown, ui
+```
+
+`ctx.getContextUsage()` works on 18.0.3 as it does on 18.0.9 — measured
+`session_start {"tokens":2078,"contextWindow":4000,"percent":51.95}` against a
+fake provider — and the string `getContextUsage` occurs 35 times in each of the
+two binaries. So the call was available the whole time; no omp release added it.
+
+What this capture got right stands: `signal` is genuinely absent from the `ctx`
+of both versions, and `agent_settled` is absent from both (0 occurrences by
+binary scan), so OMP-R03's polling rule remains load-bearing.
+
+The correction matters for OMP-R05's admission checklist, which would otherwise
+inherit a false "omp gained a context API between 18.0.3 and 18.0.9" story from
+this file. The same incomplete enumeration is repeated in
+[`2026-08-28-omp-18-0-9-admission.md`](./2026-08-28-omp-18-0-9-admission.md)
+(Result item 2) and in [`spec.md`](../spec.md) (Channel section, "`ctx = {ui}`");
+both are accurate about `signal` and wrong about the rest of the key set.
+
+Full evidence:
+[`08-harness-context/.experiments/2026-08-29-context-signals-and-write-placement.md`](../../08-harness-context/.experiments/2026-08-29-context-signals-and-write-placement.md).
