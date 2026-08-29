@@ -31,11 +31,12 @@ use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, JudgementRequest,
-    MessageLifecycleRequest, MessageSendRequest, MessageView, PlanRequest, PlanResponse,
-    PlanRevisionRequest, PlanRunRequest, PlanRunView, QuickAgentRequest, QuickAgentResponse,
-    ReplicationBatch, ReplicationQuery, ReplicationResponse, ReviewRequest, SessionControlResponse,
-    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
-    St3Error, StatusResponse, StepRunView, WorkRequest,
+    MessageLifecycleRequest, MessageSendRequest, MessageView, PlanOutputView,
+    PlanProductionRequest, PlanRequest, PlanResponse, PlanRevisionRequest, PlanRunRequest,
+    PlanRunView, QuickAgentRequest, QuickAgentResponse, ReplicationBatch, ReplicationQuery,
+    ReplicationResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error,
+    StatusResponse, StepRunView, WorkRequest,
 };
 use crate::store::Store;
 
@@ -134,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
         .route("/v1/plan-runs/{run}", get(get_plan_run))
         .route("/v1/work", get(list_work))
+        .route("/v1/work/plan/{*subject}", post(publish_work_plan))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/judgements", post(post_judgement))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
@@ -1423,6 +1425,142 @@ async fn list_work(
         .map_err(ApiError::internal)
 }
 
+async fn publish_work_plan(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<PlanProductionRequest>,
+) -> Result<Json<PlanOutputView>, ApiError> {
+    let step = state
+        .store
+        .step_run(&subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("step run `{subject}` does not exist")))?;
+    let actor = if request.actor.contains('/') {
+        request.actor.clone()
+    } else {
+        format!("agent/{}", request.actor)
+    };
+    if !state
+        .store
+        .plan_output_authorized(&step.subject, &actor, request.incarnation.as_deref())
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "work-not-claimed",
+            format!(
+                "`{actor}` does not hold the plan-producing step `{}` or its nested work",
+                step.subject
+            ),
+        )));
+    }
+    let run = state
+        .store
+        .plan_run(&step.run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("plan run `{}` does not exist", step.run)))?;
+    let root = state
+        .store
+        .plan_spec(
+            run.plan.strip_prefix("plan/").unwrap_or(&run.plan),
+            Some(&run.revision),
+        )
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-plan-revision",
+                "the running plan revision is unavailable",
+            ))
+        })?;
+    let definition = crate::plan::find_step(&root, &step.step).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-step-definition",
+            format!("step `{}` is absent from its plan revision", step.step),
+        ))
+    })?;
+    let expected_plan = definition.produces_plan.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "step-does-not-produce-plan",
+            format!("step `{}` does not declare produces-plan", step.step),
+        ))
+    })?;
+
+    let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    if initial.plans.len() != 1 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-plan-output-intent",
+            "a plan output must contain exactly one plan",
+        )));
+    }
+    let initial_plan = initial.plans.values().next().expect("one plan was checked");
+    let allowed_scope = initial_plan.scope_template.as_deref();
+    if initial
+        .subjects
+        .iter()
+        .any(|(name, desired)| Some(name.as_str()) != allowed_scope || desired.kind != "scope")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-plan-output-intent",
+            "a plan output can contain only its plan and enclosing scope",
+        )));
+    }
+    let bindings = state
+        .store
+        .document_bindings_at(&initial.document_refs, None)
+        .map_err(ApiError::internal)?;
+    let resolved_kdl =
+        resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
+    let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
+    let plan = intent.plans.values().next().expect("one plan was checked");
+    if plan.id != expected_plan || plan.state != crate::model::PlanState::Ready {
+        return Err(ApiError::bad(St3Error::new(
+            "wrong-plan-output",
+            format!(
+                "step `{}` must publish ready plan `{expected_plan}`",
+                step.step
+            ),
+        )));
+    }
+    let mut publication = intent.clone();
+    publication.subjects.clear();
+    let planned = state
+        .store
+        .plan(
+            &publication,
+            crate::model::IntentInput {
+                kdl: resolved_kdl,
+                source_name: request.intent.source_name,
+            },
+        )
+        .map_err(ApiError::bad)?;
+    if !planned.blockers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "plan-output-blocked",
+            planned.blockers.join("; "),
+        )));
+    }
+    state
+        .store
+        .apply(
+            &publication,
+            &planned.subject_tokens,
+            &format!("{}:publish", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    let output = state
+        .store
+        .record_plan_output(
+            &step.subject,
+            &actor,
+            request.incarnation.as_deref(),
+            expected_plan,
+            plan,
+            &format!("{}:bind", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(output))
+}
+
 async fn post_work_action(
     State(state): State<AppState>,
     AxumPath((action, subject)): AxumPath<(String, String)>,
@@ -2667,6 +2805,152 @@ subgraph {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_step_publishes_one_attempt_bound_ready_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+subgraph {
+  plan "bootstrap" state="ready" {
+    step "compile" {
+      assigned-to "agent/planner"
+      produces-plan "project/work"
+    }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "publish-bootstrap-output")
+            .unwrap();
+        let run = state
+            .store
+            .create_plan_run(&PlanRunRequest {
+                plan: "bootstrap".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-bootstrap-output".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].clone();
+        state
+            .store
+            .set_step_state(&step.subject, "ready", None)
+            .unwrap();
+        let produced = r#"
+version 2
+subgraph {
+  plan "project/work" state="ready" {
+    step "inspect" { title "Inspect the project" }
+    step "implement" { depends-on { step "inspect" completed } }
+  }
+}
+"#;
+        let app = router(state.clone());
+        let (status, output) = json_request(
+            app.clone(),
+            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(PlanProductionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: produced.into(),
+                    source_name: Some("generated.kdl".into()),
+                },
+                actor: "agent/node.planner".into(),
+                incarnation: Some("test".into()),
+                idempotency_key: "reject-unclaimed-output".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
+        assert_eq!(output["code"], "work-not-claimed");
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "claim",
+                &WorkRequest {
+                    actor: Some("agent/node.planner".into()),
+                    incarnation: Some("test".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-bootstrap-output".into(),
+                },
+            )
+            .unwrap();
+        let wrong = r#"
+version 2
+subgraph {
+  plan "project/other" state="ready" { step "inspect" { } }
+}
+"#;
+        let (status, output) = json_request(
+            app.clone(),
+            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(PlanProductionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: wrong.into(),
+                    source_name: Some("wrong.kdl".into()),
+                },
+                actor: "agent/node.planner".into(),
+                incarnation: Some("test".into()),
+                idempotency_key: "reject-wrong-output".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
+        assert_eq!(output["code"], "wrong-plan-output");
+        let (status, output) = json_request(
+            app,
+            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(PlanProductionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: produced.into(),
+                    source_name: Some("generated.kdl".into()),
+                },
+                actor: "agent/node.planner".into(),
+                incarnation: Some("test".into()),
+                idempotency_key: "publish-produced-work".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["plan"], "plan/project/work");
+        let revision = output["revision"].as_str().unwrap();
+        assert_eq!(revision.len(), 64);
+        assert!(
+            state
+                .store
+                .plan_spec("project/work", Some(revision))
+                .unwrap()
+                .is_some()
+        );
+        let bound = state
+            .store
+            .plan_output(&step.subject, 1, &step.definition_hash)
+            .unwrap()
+            .expect("attempt-bound plan output");
+        assert_eq!(bound.revision, revision);
+        assert_eq!(bound.claim_id, output["claim_id"]);
     }
 
     #[tokio::test]

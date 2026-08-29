@@ -1,6 +1,8 @@
 # Local eval corpus
 
-This repository keeps an st2 and an st3 form of each selected eval.
+This repository keeps an st2 and an st3 form of each migration eval.
+
+An st3-only eval can prove a new runtime feature that st2 does not implement.
 
 The initial st2 corpus came from `compoundingtech/evals` commit `3db48ab56d40ce27dfd94f89d2db9b692d93836a`.
 
@@ -29,6 +31,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | PTY send and peek | `st2/pty-send-peek` | `st3/pty-send-peek` |
 | Network smoke | `st2/network-smoke` | `st3/network-smoke` |
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
+| Plan Document Lift | Not supported | `st3/plan-document-lift` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -64,8 +67,9 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Weird Git Setup | Codex × 1 | None |
 | st2 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
+| st3 | Plan Document Lift | Codex × 1 | None |
 
-The current corpus has 10 Claude seats and 31 Codex seats. It also has three Codex LLM judges.
+The current corpus has 10 Claude seats and 32 Codex seats. It also has three Codex LLM judges.
 
 The ten model-free pairs add no model seats and no LLM judges.
 

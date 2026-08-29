@@ -3,123 +3,123 @@ version 2
 subgraph {
   scope "eval/license-mit/${PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/license-mit" state="ready" {
-    step "team" timeout="1200000ms" {
-      title "The eval team is running"
-      subgraph {
-        agent "lmc.sup" {
-          workspace "${WORKSPACE}/sup"
-          harness "claude" {
-            model "claude-sonnet-5"
-            effort "medium"
-            dev-channels #true
-            prompt "You just cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and coordinate the whole task end-to-end. Report completion or blockers through st3 messages."
-            args "--permission-mode" "bypassPermissions"
+      step "start-team" timeout="10m" {
+        title "The native Claude Sonnet license team is ready"
+        subgraph {
+          agent "lmc.sup" {
+            workspace "${WORKSPACE}/sup"
+            harness "claude" {
+              model "claude-sonnet-5"
+              effort "medium"
+              dev-channels #true
+              prompt "Read CLAUDE.md. Use only st3 message for Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Follow inherited nested steps through st3 work. After each child step, list assigned work and continue the same parent plan. Do not poll or publish routine progress. Send only the planned delegation and final confirmation. End only after the assigned parent step is complete and no message remains."
+              args "--permission-mode" "bypassPermissions"
+            }
+            restart "never"
+            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           }
-          restart "never"
-          env {
-            CATALOG "${WORKSPACE}"
-            ST_ROOT "${WORKSPACE}/.st3-messages"
-            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
-          }
-        }
-        agent "lmc.worker" {
-          workspace "${WORKSPACE}/worker"
-          harness "claude" {
-            model "claude-sonnet-5"
-            effort "medium"
-            dev-channels #true
-            prompt "You just cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk for coordination. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain the inbox once with st3 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and execute it end-to-end. Report completion or blockers through st3 messages."
-            args "--permission-mode" "auto"
-          }
-          restart "never"
-          env {
-            CATALOG "${WORKSPACE}"
-            ST_ROOT "${WORKSPACE}/.st3-messages"
-            ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+          agent "lmc.worker" {
+            workspace "${WORKSPACE}/worker"
+            harness "claude" {
+              model "claude-sonnet-5"
+              effort "medium"
+              dev-channels #true
+              prompt "Read CLAUDE.md. Use only st3 message for Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Follow inherited nested steps through st3 work. After each child step, list assigned work and continue the same parent plan. Work only in this repository. Do not poll or publish routine progress. Send only the planned final report. End only after the assigned parent step is complete and no message remains."
+              args "--permission-mode" "auto"
+            }
+            restart "never"
+            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
           }
         }
-        message "kickoff/${PLAN_RUN}" {
-          from "requester"
-          to "lmc.sup"
-          content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+      }
+
+      step "delegate-license-change" timeout="15m" {
+        title "The worker receives one complete MIT license brief"
+        goal "Read doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21. Delegate the complete repository change to lmc.worker without editing its repository."
+        document "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
+        assigned-to "agent/lmc.sup"
+        depends-on { step "start-team" completed }
+        plan "work" {
+          step "read-request" { title "The exact immutable license request is understood"; goal "Read the referenced task document through st3 doc get. Confirm that the widget library must become MIT licensed." }
+          step "send-worker-brief" {
+            title "The worker receives one bounded license brief"
+            goal "Send lmc.worker exactly one Small Talk message. Require canonical MIT LICENSE text, package.json license MIT, no proprietary text, a commit, and a clean tree. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/license-brief resource.binding --actor agent/lmc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            depends-on { step "read-request" completed }
+            produces { resource "plan-run/${PLAN_RUN}/license-brief" { kind "message.receipt"; state "published" } }
+          }
         }
       }
-      judges {
-        exists "agent/lmc.sup"
-        exists "agent/lmc.worker"
-      }
-    }
-    step "team-completion" timeout="1205000ms" {
-      title "The team reported completion"
-      depends-on { step "team" completed }
-      judges {
-        judge "The worker reported before the supervisor confirmed" {
-          exec "TIMEOUT_SECONDS=1200 bash ./.st3-migration/wait-team-done.sh requester lmc.sup kickoff/${PLAN_RUN} lmc.worker"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1205000ms"
+
+      step "implement-license-change" timeout="20m" {
+        title "The worker commits the complete MIT license change"
+        goal "Apply the delegated MIT license request only in the widget repository. Publish the committed revision and one evidence report."
+        assigned-to "agent/lmc.worker"
+        depends-on { step "delegate-license-change" completed }
+        plan "work" {
+          step "read-license-brief" { title "The supervisor brief is understood"; goal "Drain and archive the one lmc.sup delegation. Identify every required license surface and verification." }
+          step "inspect-license-surface" { title "The current proprietary license surface is identified"; goal "Inspect LICENSE, package.json, README.md, and repository status. Do not change source behavior."; depends-on { step "read-license-brief" completed } }
+          step "apply-mit-license" { title "The repository uses the canonical MIT license"; goal "Replace the proprietary LICENSE with canonical MIT text. Set package.json license to MIT. Remove remaining proprietary license text only where needed."; depends-on { step "inspect-license-surface" completed } }
+          step "verify-license-change" { title "The complete MIT license surface is verified"; goal "Verify the MIT grant and warranty disclaimer, package.json license, absence of proprietary text, and the intended diff."; depends-on { step "apply-mit-license" completed } }
+          step "publish-license-revision" {
+            title "The MIT license revision is published"
+            goal "Commit the license-only change. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/license-revision resource.binding --actor agent/lmc.worker --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+            depends-on { step "verify-license-change" completed }
+            produces { resource "plan-run/${PLAN_RUN}/license-revision" { kind "vcs.revision"; state "published" } }
+          }
+          step "report-worker-result" {
+            title "The supervisor receives the committed license evidence"
+            goal "Send lmc.sup exactly one Small Talk report. Include changed files, commit, MIT checks, and clean-tree evidence. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/worker-report resource.binding --actor agent/lmc.worker --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            depends-on { step "publish-license-revision" completed }
+            produces { resource "plan-run/${PLAN_RUN}/worker-report" { kind "message.receipt"; state "published" } }
+          }
         }
       }
-    }
-    step "held-out-judges" timeout="1200000ms" {
-      title "All held-out judges pass"
-      depends-on { step "team-completion" completed }
-      judges {
-        judge "isolation — supervisor owns no repo; change stays on the license surface" {
-          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1200000ms"
-        }
-        judge "coordination — delegate->report->verified-confirm visible on the bus" {
-          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/coordination.sh"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1200000ms"
-        }
-        judge "LICENSE is real MIT" {
-          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && set -eu; grep -F -- 'Permission is hereby granted, free of charge' 'worker/LICENSE' >/dev/null; grep -F -- 'THE SOFTWARE IS PROVIDED \"AS IS\"' 'worker/LICENSE' >/dev/null; ! grep -F -- 'proprietary' 'worker/LICENSE' >/dev/null"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1200000ms"
-        }
-        judge "package.json declares MIT" {
-          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && set -eu; test \"$(jq -c '.license' 'worker/package.json')\" = '\"MIT\"'"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1200000ms"
-        }
-        judge "the change is committed + the worktree is clean" {
-          exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/committed.sh"
-          host "local"
-          workspace "${WORKSPACE}"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          time-limit "1200000ms"
-        }
-        judge "confirmation is verified, not a rubber-stamp" type="llm" {
-          model "gpt-5.6-sol"
-          host "local"
-          workspace "${WORKSPACE}"
-          tools "shell" "git"
-          env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
-          token-budget 65536
-          time-limit "120000ms"
-          prompt "Run one evidence command before judgement: print .st3-messages/requester/inbox/* and .st3-messages/requester/archive/*, then run git -C worker rev-parse HEAD and git -C worker status --porcelain. Do not run st3 agents, st3 status, help commands, or broad scans. PASS if the supervisor confirmation cites the real commit and verifies the MIT license, committed HEAD, and clean tree. FAIL if it gives no evidence."
+
+      step "verify-and-confirm" timeout="15m" {
+        title "The supervisor verifies the revision and confirms the requester"
+        goal "Verify the worker revision read-only. Send requester one final confirmation only after every MIT and repository check passes."
+        assigned-to "agent/lmc.sup"
+        depends-on { step "implement-license-change" completed }
+        plan "work" {
+          step "read-worker-report" { title "The worker evidence report is understood"; goal "Drain and archive the one lmc.worker report. Record its revision and verification claims." }
+          step "verify-worker-revision-read-only" { title "The supervisor independently verifies the MIT revision"; goal "Without edits, inspect ../worker. Verify canonical MIT LICENSE text, package.json MIT, no proprietary text, the published HEAD, its commit diff, and a clean tree."; depends-on { step "read-worker-report" completed } }
+          step "confirm-requester" {
+            title "The requester receives one verified MIT confirmation"
+            goal "Send requester exactly one Small Talk message. Cite the real commit and each read-only verification. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/final-confirmation resource.binding --actor agent/lmc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            depends-on { step "verify-worker-revision-read-only" completed }
+            produces { resource "plan-run/${PLAN_RUN}/final-confirmation" { kind "message.receipt"; state "published" } }
+          }
         }
       }
-    }
-    step "cleanup" finally=#true {
-      title "The temporary eval scope is empty"
-      subgraph {
-        scope "eval/license-mit/${PLAN_RUN}" { stop }
+
+      step "held-out-judges" timeout="20m" {
+        title "All License MIT judges pass"
+        depends-on { step "verify-and-confirm" completed }
+        judges {
+          judge "isolation — supervisor owns no repo; change stays on the license surface" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+          judge "coordination — delegate, report, and verified confirmation are visible" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/coordination.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+          judge "LICENSE is real MIT" { exec "set -eu; grep -F -- 'Permission is hereby granted, free of charge' worker/LICENSE >/dev/null; grep -F -- 'THE SOFTWARE IS PROVIDED \"AS IS\"' worker/LICENSE >/dev/null; ! grep -Fi -- proprietary worker/LICENSE >/dev/null"; host "local"; workspace "${WORKSPACE}"; time-limit "120000ms" }
+          judge "package.json declares MIT" { exec "test \"$(jq -c '.license' worker/package.json)\" = '\"MIT\"'"; host "local"; workspace "${WORKSPACE}"; time-limit "120000ms" }
+          judge "the change is committed and clean" { exec "bash ./judges/committed.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
+          judge "the graph records the complete license plan and products" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+          judge "confirmation is verified, not a rubber-stamp" type="llm" {
+            model "gpt-5.6-sol"
+            host "local"
+            workspace "${WORKSPACE}"
+            tools "shell" "git"
+            env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }
+            token-budget 65536
+            time-limit "120000ms"
+            prompt "Run one evidence command before judgement: print .st3-messages/requester/inbox/* and .st3-messages/requester/archive/*, then run git -C worker rev-parse HEAD and git -C worker status --porcelain. Do not run st3 agents, st3 status, help commands, or broad scans. PASS if the supervisor confirmation cites the real commit and verifies the MIT license, committed HEAD, and clean tree. FAIL if it gives no evidence."
+          }
+        }
       }
-      judges { empty "scope/eval/license-mit/${PLAN_RUN}" }
-    }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/license-mit/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/license-mit/${PLAN_RUN}" }
+      }
     }
   }
 }

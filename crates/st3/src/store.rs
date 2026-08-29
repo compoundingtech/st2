@@ -13,9 +13,9 @@ use sha2::{Digest as _, Sha256};
 use crate::model::{
     ApplyResponse, Capability, ChangePolicy, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
     DesiredSubject, DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent,
-    PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction, ReplicaBatch,
-    ReplicaRange, ReplicationBatch, ReplicationResponse, St3Error, StatusResponse, StepRunView,
-    SubjectChange, SubjectStatus, WorkRequest,
+    PlanOutputView, PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction,
+    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, St3Error, StatusResponse,
+    StepRunView, SubjectChange, SubjectStatus, WorkRequest,
 };
 
 const SCHEMA: &str = r#"
@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS plan_runs (
     plan_id TEXT NOT NULL,
     revision TEXT NOT NULL,
     root_revision TEXT NOT NULL,
+    root_run_id TEXT NOT NULL,
+    parent_step_run TEXT,
     workspace TEXT NOT NULL,
     requester TEXT NOT NULL,
     run_scope TEXT,
@@ -168,12 +170,19 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 "#;
 
 pub struct Store {
     connection: Mutex<Connection>,
     origin: String,
+}
+
+struct ChildPlanContext {
+    root_revision: String,
+    root_run_id: String,
+    parent_step_run: String,
+    default_assignee: Option<String>,
 }
 
 fn reject_old_schema(connection: &Connection) -> Result<()> {
@@ -184,11 +193,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 3,
+        table_count == 0 || version == 4,
         "this database uses an unsupported pre-plan st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 3,
+        version == 0 || version == 4,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -253,6 +262,36 @@ impl Store {
     }
 
     pub fn create_plan_run(&self, request: &PlanRunRequest) -> Result<PlanRunView, St3Error> {
+        self.create_plan_run_inner(request, None)
+    }
+
+    pub fn create_child_plan_run(
+        &self,
+        request: &PlanRunRequest,
+        parent: &PlanRunView,
+        parent_step_run: &str,
+        default_assignee: Option<&str>,
+    ) -> Result<PlanRunView, St3Error> {
+        self.create_plan_run_inner(
+            request,
+            Some(ChildPlanContext {
+                root_revision: parent.root_revision.clone(),
+                root_run_id: parent
+                    .root_plan_run
+                    .strip_prefix("plan-run/")
+                    .unwrap_or(&parent.root_plan_run)
+                    .to_owned(),
+                parent_step_run: normalize_step_run(parent_step_run),
+                default_assignee: default_assignee.map(|value| normalize_actor(value, "agent")),
+            }),
+        )
+    }
+
+    fn create_plan_run_inner(
+        &self,
+        request: &PlanRunRequest,
+        child: Option<ChildPlanContext>,
+    ) -> Result<PlanRunView, St3Error> {
         let plan_id = request.plan.strip_prefix("plan/").unwrap_or(&request.plan);
         let plan = self
             .plan_spec(plan_id, request.revision.as_deref())
@@ -271,6 +310,19 @@ impl Store {
         ))[..32]
             .to_owned();
         let subject = format!("plan-run/{run_id}");
+        let root_revision = child
+            .as_ref()
+            .map(|child| child.root_revision.clone())
+            .unwrap_or_else(|| plan.revision.clone());
+        let root_run_id = child
+            .as_ref()
+            .map(|child| child.root_run_id.clone())
+            .unwrap_or_else(|| run_id.clone());
+        let root_plan_run = format!("plan-run/{root_run_id}");
+        let parent_step_run = child.as_ref().map(|child| child.parent_step_run.clone());
+        let default_assignee = child
+            .as_ref()
+            .and_then(|child| child.default_assignee.clone());
         let requester = normalize_actor(
             request.requester.as_deref().unwrap_or("person/requester"),
             "person",
@@ -287,7 +339,7 @@ impl Store {
             ("PLAN_REVISION".into(), plan.revision.clone()),
             ("PLAN_RUN".into(), run_id.clone()),
             ("REQUESTER".into(), requester.clone()),
-            ("ROOT_PLAN_RUN".into(), subject.clone()),
+            ("ROOT_PLAN_RUN".into(), root_plan_run.clone()),
         ]);
         let run_scope = plan
             .scope_template
@@ -313,24 +365,46 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO plan_runs(id, plan_id, revision, root_revision, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', 'normal', ?9, ?9)",
-                params![run_id, plan.id, plan.revision, plan.revision, request.workspace, requester, run_scope, mode, now.to_string()],
+                "INSERT INTO plan_runs(id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', 'normal', ?11, ?11)",
+                params![run_id, plan.id, plan.revision, root_revision, root_run_id, parent_step_run, request.workspace, requester, run_scope, mode, now.to_string()],
             )
             .map_err(internal)?;
         let mut flat = Vec::new();
-        flatten_steps(&plan, None, &mut flat);
+        flatten_steps(&plan, default_assignee.clone(), &mut flat);
         for (step, inherited_assignee) in flat {
             let assignee = step.assigned_to.as_ref().or(inherited_assignee.as_ref());
             let assignee = assignee
                 .map(|value| crate::plan::interpolate(value, &variables))
                 .transpose()?;
             let step_subject = format!("step-run/{run_id}/{}", step.path);
+            let mut step_variables = variables.clone();
+            step_variables.insert("STEP".into(), step.path.clone());
+            step_variables.insert("STEP_RUN".into(), step_subject.clone());
+            step_variables.insert("ATTEMPT".into(), "1".into());
+            step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+            step_variables.insert(
+                "PARENT_STEP_RUN".into(),
+                crate::plan::parent_step_path(&plan, &step.path)
+                    .map(|path| format!("step-run/{run_id}/{path}"))
+                    .or_else(|| parent_step_run.clone())
+                    .unwrap_or_default(),
+            );
+            let title = step
+                .title
+                .as_deref()
+                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .transpose()?;
+            let goal = step
+                .goal
+                .as_deref()
+                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .transpose()?;
             transaction
                 .execute(
                     "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, created_at_unix_ms, updated_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                    params![step_subject, run_id, step.path, step.definition_hash, assignee, step.title, step.goal, now.to_string()],
+                    params![step_subject, run_id, step.path, step.definition_hash, assignee, title, goal, now.to_string()],
                 )
                 .map_err(internal)?;
         }
@@ -339,6 +413,10 @@ impl Store {
                 "status": "running",
                 "plan": plan.subject,
                 "revision": plan.revision,
+                "root_revision": root_revision,
+                "root_plan_run": root_plan_run,
+                "parent_step_run": parent_step_run,
+                "default_assignee": default_assignee,
                 "workspace": request.workspace,
                 "requester": requester,
                 "run_scope": run_scope,
@@ -370,6 +448,175 @@ impl Store {
         Ok(view)
     }
 
+    pub fn record_plan_output(
+        &self,
+        subject: &str,
+        actor: &str,
+        incarnation: Option<&str>,
+        expected_plan: &str,
+        plan: &PlanSpec,
+        idempotency_key: &str,
+    ) -> Result<PlanOutputView, St3Error> {
+        let subject = normalize_step_run(subject);
+        let actor = normalize_actor(actor, "agent");
+        let now = now_ms();
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        if let Some(response) = connection
+            .query_row(
+                "SELECT response FROM idempotency WHERE key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let transaction = connection.transaction().map_err(internal)?;
+        let current = transaction
+            .query_row(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
+                 FROM step_runs WHERE subject=?1",
+                [&subject],
+                step_run_from_row,
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-step-run",
+                    format!("step run `{subject}` does not exist"),
+                )
+            })?;
+        if !plan_output_authority(&transaction, &current, &actor, incarnation, now)
+            .map_err(internal)?
+        {
+            return Err(St3Error::new(
+                "work-not-claimed",
+                format!(
+                    "`{actor}` does not hold an active lease for `{subject}` or its nested work"
+                ),
+            ));
+        }
+        if plan.id != expected_plan || plan.state != PlanState::Ready {
+            return Err(St3Error::new(
+                "wrong-plan-output",
+                format!("step run `{subject}` must publish ready plan `{expected_plan}`"),
+            ));
+        }
+        let stored = transaction
+            .query_row(
+                "SELECT state FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+                params![plan.id, plan.revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if stored.as_deref() != Some("ready") {
+            return Err(St3Error::new(
+                "unpublished-plan-output",
+                "the exact ready plan revision is not published",
+            ));
+        }
+        let fields: BTreeMap<String, Value> = BTreeMap::from([
+            ("plan".into(), Value::String(format!("plan/{}", plan.id))),
+            ("revision".into(), Value::String(plan.revision.clone())),
+            (
+                "step_definition".into(),
+                Value::String(current.definition_hash.clone()),
+            ),
+            ("attempt".into(), Value::from(current.attempt)),
+        ]);
+        let body = json!({"fields": fields});
+        let claim = append_claim_tx(
+            &transaction,
+            &self.origin,
+            &subject,
+            "plan.produced",
+            Some(&actor),
+            &body,
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        let output = PlanOutputView {
+            step: subject,
+            plan: format!("plan/{}", plan.id),
+            revision: plan.revision.clone(),
+            claim_id: claim.id,
+        };
+        transaction
+            .execute(
+                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&output).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(output)
+    }
+
+    pub fn plan_output_authorized(
+        &self,
+        subject: &str,
+        actor: &str,
+        incarnation: Option<&str>,
+    ) -> Result<bool> {
+        let subject = normalize_step_run(subject);
+        let actor = normalize_actor(actor, "agent");
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let current = connection
+            .query_row(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
+                 FROM step_runs WHERE subject=?1",
+                [&subject],
+                step_run_from_row,
+            )
+            .optional()
+            .map_err(internal)?;
+        current
+            .as_ref()
+            .map(|current| {
+                plan_output_authority(&connection, current, &actor, incarnation, now_ms())
+            })
+            .transpose()
+            .map(|authorized| authorized.unwrap_or(false))
+    }
+
+    pub fn plan_output(
+        &self,
+        subject: &str,
+        attempt: u32,
+        definition_hash: &str,
+    ) -> Result<Option<PlanOutputView>> {
+        let subject = normalize_step_run(subject);
+        let Some(claim) = self.latest_claim(&subject, Some("plan.produced"))? else {
+            return Ok(None);
+        };
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        if fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(attempt))
+            || fields.get("step_definition").and_then(Value::as_str) != Some(definition_hash)
+        {
+            return Ok(None);
+        }
+        let Some(plan) = fields.get("plan").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(revision) = fields.get("revision").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        Ok(Some(PlanOutputView {
+            step: subject,
+            plan: plan.to_owned(),
+            revision: revision.to_owned(),
+            claim_id: claim.id,
+        }))
+    }
+
     pub fn plan_run(&self, run: &str) -> Result<Option<PlanRunView>> {
         let run = run.strip_prefix("plan-run/").unwrap_or(run);
         let connection = self.connection.lock().expect("store mutex poisoned");
@@ -382,6 +629,22 @@ impl Store {
             .query_row(
                 "SELECT id FROM plan_runs WHERE run_scope=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
                 [scope],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        run_id
+            .map(|run_id| plan_run_view_tx(&connection, &run_id))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn plan_run_for_parent_step(&self, step: &str) -> Result<Option<PlanRunView>> {
+        let step = normalize_step_run(step);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let run_id = connection
+            .query_row(
+                "SELECT id FROM plan_runs WHERE parent_step_run=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [step],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -526,6 +789,28 @@ impl Store {
                 .map(|value| crate::plan::interpolate(value, &variables))
                 .transpose()?;
             let subject = format!("step-run/{run_id}/{}", step.path);
+            let mut step_variables = variables.clone();
+            step_variables.insert("STEP".into(), step.path.clone());
+            step_variables.insert("STEP_RUN".into(), subject.clone());
+            step_variables.insert("ATTEMPT".into(), "1".into());
+            step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+            step_variables.insert(
+                "PARENT_STEP_RUN".into(),
+                crate::plan::parent_step_path(plan, &step.path)
+                    .map(|path| format!("step-run/{run_id}/{path}"))
+                    .or_else(|| current.parent_step_run.clone())
+                    .unwrap_or_default(),
+            );
+            let title = step
+                .title
+                .as_deref()
+                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .transpose()?;
+            let goal = step
+                .goal
+                .as_deref()
+                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .transpose()?;
             if reset.contains(&step.path) {
                 transaction
                     .execute(
@@ -535,7 +820,7 @@ impl Store {
                            assignee=excluded.assignee, title=excluded.title, goal=excluded.goal, worker_reported=0,
                            lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                            blocked_reason=?9, not_before_unix_ms=NULL, activated_at_unix_ms=NULL, updated_at_unix_ms=?8",
-                        params![subject, run_id, step.path, step.definition_hash, assignee, step.title, step.goal, now.to_string(), reason],
+                        params![subject, run_id, step.path, step.definition_hash, assignee, title, goal, now.to_string(), reason],
                     )
                     .map_err(internal)?;
             }
@@ -2830,8 +3115,10 @@ fn registered_client_claim_kind(kind: &str) -> bool {
 }
 
 fn known_replicated_claim_kind(kind: &str) -> bool {
-    matches!(kind, "intent.desired" | "document.bound" | "plan.published")
-        || registered_client_claim_kind(kind)
+    matches!(
+        kind,
+        "intent.desired" | "document.bound" | "plan.published" | "plan.produced"
+    ) || registered_client_claim_kind(kind)
 }
 
 fn has_unknown_claim_at(
@@ -3547,17 +3834,33 @@ fn project_plan_run_created(
         .unwrap_or("person/requester");
     let run_scope = fields.get("run_scope").and_then(Value::as_str);
     let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("run");
+    let root_revision = fields
+        .get("root_revision")
+        .and_then(Value::as_str)
+        .unwrap_or(revision);
+    let root_plan_run = fields
+        .get("root_plan_run")
+        .and_then(Value::as_str)
+        .unwrap_or(&claim.subject);
+    let root_run_id = root_plan_run
+        .strip_prefix("plan-run/")
+        .unwrap_or(root_plan_run);
+    let parent_step_run = fields.get("parent_step_run").and_then(Value::as_str);
+    let default_assignee = fields
+        .get("default_assignee")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     transaction
         .execute(
-            "INSERT OR IGNORE INTO plan_runs(id, plan_id, revision, root_revision, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, 'running', 'normal', ?8, ?8)",
-            params![run_id, plan_id, revision, workspace, requester, run_scope, mode, claim.accepted_at_unix_ms.to_string()],
+            "INSERT OR IGNORE INTO plan_runs(id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', 'normal', ?11, ?11)",
+            params![run_id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
     let view = plan_run_view_tx(transaction, run_id).map_err(internal)?;
     let variables = plan_run_variables(&view, revision);
     let mut steps = Vec::new();
-    flatten_steps(&plan, None, &mut steps);
+    flatten_steps(&plan, default_assignee, &mut steps);
     for (step, inherited_assignee) in steps {
         let assignee = step
             .assigned_to
@@ -3566,11 +3869,33 @@ fn project_plan_run_created(
             .map(|value| crate::plan::interpolate(value, &variables))
             .transpose()?;
         let subject = format!("step-run/{run_id}/{}", step.path);
+        let mut step_variables = variables.clone();
+        step_variables.insert("STEP".into(), step.path.clone());
+        step_variables.insert("STEP_RUN".into(), subject.clone());
+        step_variables.insert("ATTEMPT".into(), "1".into());
+        step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+        step_variables.insert(
+            "PARENT_STEP_RUN".into(),
+            crate::plan::parent_step_path(&plan, &step.path)
+                .map(|path| format!("step-run/{run_id}/{path}"))
+                .or_else(|| parent_step_run.map(str::to_owned))
+                .unwrap_or_default(),
+        );
+        let title = step
+            .title
+            .as_deref()
+            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .transpose()?;
+        let goal = step
+            .goal
+            .as_deref()
+            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .transpose()?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                params![subject, run_id, step.path, step.definition_hash, assignee, step.title, step.goal, claim.accepted_at_unix_ms.to_string()],
+                params![subject, run_id, step.path, step.definition_hash, assignee, title, goal, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
     }
@@ -3981,7 +4306,11 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
         ),
         ("WORKSPACE".into(), run.workspace.clone()),
         ("REQUESTER".into(), run.requester.clone()),
-        ("ROOT_PLAN_RUN".into(), run.subject.clone()),
+        (
+            "PARENT_STEP_RUN".into(),
+            run.parent_step_run.clone().unwrap_or_default(),
+        ),
+        ("ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
     ])
 }
 
@@ -4128,27 +4457,93 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
     })
 }
 
+fn plan_output_authority(
+    connection: &Connection,
+    current: &StepRunView,
+    actor: &str,
+    incarnation: Option<&str>,
+    now: u128,
+) -> Result<bool> {
+    if current.assignee.as_deref() != Some(actor) {
+        return Ok(false);
+    }
+    let lease_matches = |status: &str,
+                         owner: Option<&str>,
+                         lease_incarnation: Option<&str>,
+                         expiry: Option<u128>| {
+        matches!(status, "claimed" | "working")
+            && owner == Some(actor)
+            && expiry.is_some_and(|expiry| expiry > now)
+            && lease_incarnation.is_none_or(|lease| Some(lease) == incarnation)
+    };
+    if lease_matches(
+        &current.status,
+        current.lease_owner.as_deref(),
+        current.lease_incarnation.as_deref(),
+        current.lease_expires_at_unix_ms,
+    ) {
+        return Ok(true);
+    }
+
+    let prefix = format!("{}/", current.step);
+    let mut statement = connection.prepare(
+        "SELECT status, lease_owner, lease_incarnation, lease_expires_at_unix_ms
+         FROM step_runs
+         WHERE run_id=?1 AND substr(step_path, 1, length(?2))=?2",
+    )?;
+    let leases = statement
+        .query_map(
+            params![
+                current
+                    .run
+                    .strip_prefix("plan-run/")
+                    .unwrap_or(&current.run),
+                prefix
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(leases.into_iter().any(|(status, owner, lease, expiry)| {
+        lease_matches(
+            &status,
+            owner.as_deref(),
+            lease.as_deref(),
+            expiry.and_then(|value| value.parse().ok()),
+        )
+    }))
+}
+
 fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<PlanRunView> {
     let mut view = connection.query_row(
-        "SELECT id, plan_id, revision, root_revision, workspace, requester, run_scope, mode, status, phase,
+        "SELECT id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase,
                 created_at_unix_ms, updated_at_unix_ms FROM plan_runs WHERE id=?1",
         [run_id],
         |row| {
             let id: String = row.get(0)?;
-            let created: String = row.get(10)?;
-            let updated: String = row.get(11)?;
+            let root_run_id: String = row.get(4)?;
+            let created: String = row.get(12)?;
+            let updated: String = row.get(13)?;
             Ok(PlanRunView {
                 subject: format!("plan-run/{id}"),
                 id,
                 plan: format!("plan/{}", row.get::<_, String>(1)?),
                 revision: row.get(2)?,
                 root_revision: row.get(3)?,
-                workspace: row.get(4)?,
-                requester: row.get(5)?,
-                run_scope: row.get(6)?,
-                mode: row.get(7)?,
-                status: row.get(8)?,
-                phase: row.get(9)?,
+                root_plan_run: format!("plan-run/{root_run_id}"),
+                parent_step_run: row.get(5)?,
+                workspace: row.get(6)?,
+                requester: row.get(7)?,
+                run_scope: row.get(8)?,
+                mode: row.get(9)?,
+                status: row.get(10)?,
+                phase: row.get(11)?,
                 created_at_unix_ms: created.parse().unwrap_or(0),
                 updated_at_unix_ms: updated.parse().unwrap_or(0),
                 steps: Vec::new(),
@@ -4904,6 +5299,106 @@ subgraph {
         assert!(view.lease_owner.is_none());
         assert!(view.lease_incarnation.is_none());
         assert!(view.lease_expires_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn an_active_nested_lease_can_publish_its_parent_plan_output() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |source: &str, key: &str| {
+            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+        };
+        publish(
+            r#"version 2
+subgraph {
+  plan "bootstrap" state="ready" {
+    step "compile" {
+      assigned-to "agent/planner"
+      produces-plan "project/work"
+      plan "work" { step "publish" { } }
+    }
+  }
+}"#,
+            "nested-output-bootstrap",
+        );
+        publish(
+            r#"version 2
+subgraph { plan "project/work" state="ready" { step "work" { } } }"#,
+            "nested-output-plan",
+        );
+        let plan = store.plan_spec("project/work", None).unwrap().unwrap();
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "bootstrap".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "nested-output-run".into(),
+            })
+            .unwrap();
+        let parent = run
+            .steps
+            .iter()
+            .find(|step| step.step == "compile")
+            .unwrap();
+        let child = run
+            .steps
+            .iter()
+            .find(|step| step.step == "compile/work/publish")
+            .unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.planner".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .set_step_state(&parent.subject, "ready", None)
+            .unwrap();
+        store
+            .work_action(&parent.subject, "claim", &request("claim-parent"))
+            .unwrap();
+        store
+            .work_action(&parent.subject, "complete", &request("complete-parent"))
+            .unwrap();
+        store.set_step_state(&child.subject, "ready", None).unwrap();
+        store
+            .work_action(&child.subject, "claim", &request("claim-child"))
+            .unwrap();
+
+        assert!(
+            store
+                .plan_output_authorized(&parent.subject, "agent/node.planner", Some("current"))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .plan_output_authorized(&parent.subject, "agent/node.planner", Some("stale"))
+                .unwrap()
+        );
+        let output = store
+            .record_plan_output(
+                &parent.subject,
+                "agent/node.planner",
+                Some("current"),
+                "project/work",
+                &plan,
+                "bind-nested-output",
+            )
+            .unwrap();
+        assert_eq!(output.revision, plan.revision);
     }
 
     #[test]

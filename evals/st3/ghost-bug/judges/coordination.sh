@@ -8,7 +8,7 @@
 set -uo pipefail
 ROOT="${CATALOG:-$PWD}"
 SM="${ST_ROOT:?st3 eval must export ST_ROOT}"
-SUP_ID="${SUP_ID:-gbx.sup}"; WORKER_ID="${WORKER_ID:-gbx.fix}"
+SUP_ID="${SUP_ID:-gbx.sup}"; WORKER_ID="${WORKER_ID:-gbx.fix}"; REQUESTER="${REQUESTER:-requester}"
 
 # Resolve an id to its on-disk bus dir, tolerating a leading team/host prefix.
 busdir(){ local id="$1" d; d="$(ls -d "$SM"/*."$id" "$SM/$id" 2>/dev/null | head -1)"; printf '%s\n' "${d:-$SM/$id}"; }
@@ -18,8 +18,11 @@ msgs_from(){ local owner from; owner="$(busdir "$1")"; from="$2"
 fail=0
 deleg=$(msgs_from "$WORKER_ID" "$SUP_ID")   # sup -> worker (lands in the worker's box)
 report=$(msgs_from "$SUP_ID" "$WORKER_ID")  # worker -> sup (lands in the sup's box)
+confirm=$(msgs_from "$REQUESTER" "$SUP_ID") # sup -> requester
 [ -n "$deleg" ]  && echo "PASS: sup -> worker delegation present on the bus" \
                  || { echo "FAIL: no sup -> worker delegation on the bus (delegation not visible)"; fail=1; }
 [ -n "$report" ] && echo "PASS: worker -> sup report present on the bus" \
                  || { echo "FAIL: no worker -> sup report on the bus (execute/report not visible)"; fail=1; }
+[ -n "$confirm" ] && echo "PASS: sup -> requester final confirmation present on the bus" \
+                  || { echo "FAIL: no sup -> requester final confirmation on the bus"; fail=1; }
 exit "$fail"

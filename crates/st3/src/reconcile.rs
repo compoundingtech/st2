@@ -11,7 +11,8 @@ use tokio::sync::Notify;
 
 use crate::model::{
     CheckpointSpec, ClaimInput, DependencySpec, DesiredSubject, JudgeSpec, LaunchSpec, MemberKind,
-    MemberLifecycle, MemberSpec, PlanRunView, PlanSpec, RestartIntensity, RestartType, StepSpec,
+    MemberLifecycle, MemberSpec, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
+    RestartIntensity, RestartType, StepSpec, UsedPlanSpec,
 };
 use crate::store::Store;
 
@@ -1312,6 +1313,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
+            if step.spec.produces_plan.is_some() && !self.produced_plan_holds(step.spec, view)? {
+                continue;
+            }
+            if step.spec.uses_plan.is_some() {
+                let (use_changed, outcome) = self.evaluate_used_plan(run, &step, view, &views)?;
+                changed |= use_changed;
+                match outcome {
+                    UsedPlanOutcome::Pending => continue,
+                    UsedPlanOutcome::Completed => {}
+                    UsedPlanOutcome::Failed(reason) => {
+                        changed |=
+                            self.store
+                                .set_step_state(&view.subject, "failed", Some(&reason))?;
+                        continue;
+                    }
+                }
+            }
             if !self.products_hold(run, &step, view)? {
                 continue;
             }
@@ -1339,6 +1357,127 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(changed)
+    }
+
+    fn produced_plan_holds(
+        &self,
+        step: &StepSpec,
+        view: &crate::model::StepRunView,
+    ) -> Result<bool> {
+        let Some(expected) = &step.produces_plan else {
+            return Ok(true);
+        };
+        let Some(output) =
+            self.store
+                .plan_output(&view.subject, view.attempt, &view.definition_hash)?
+        else {
+            return Ok(false);
+        };
+        if output.plan.strip_prefix("plan/").unwrap_or(&output.plan) != expected {
+            return Ok(false);
+        }
+        Ok(self
+            .store
+            .plan_spec(expected, Some(&output.revision))?
+            .is_some_and(|plan| plan.state == PlanState::Ready))
+    }
+
+    fn evaluate_used_plan(
+        &self,
+        run: &PlanRunView,
+        step: &RuntimeStep<'_>,
+        view: &crate::model::StepRunView,
+        views: &HashMap<&str, &crate::model::StepRunView>,
+    ) -> Result<(bool, UsedPlanOutcome)> {
+        let (plan, revision) = match step
+            .spec
+            .uses_plan
+            .as_ref()
+            .expect("a used plan was checked")
+        {
+            UsedPlanSpec::Revision { plan, revision } => (plan.clone(), revision.clone()),
+            UsedPlanSpec::StepOutput { step: producer } => {
+                let path = if step.dependency_prefix.is_empty() {
+                    producer.clone()
+                } else {
+                    format!("{}/{}", step.dependency_prefix, producer)
+                };
+                let Some(producer) = views.get(path.as_str()).copied() else {
+                    return Ok((false, UsedPlanOutcome::Pending));
+                };
+                let Some(output) = self.store.plan_output(
+                    &producer.subject,
+                    producer.attempt,
+                    &producer.definition_hash,
+                )?
+                else {
+                    return Ok((false, UsedPlanOutcome::Pending));
+                };
+                (
+                    output
+                        .plan
+                        .strip_prefix("plan/")
+                        .unwrap_or(&output.plan)
+                        .to_owned(),
+                    output.revision,
+                )
+            }
+        };
+        let Some(selected) = self.store.plan_spec(&plan, Some(&revision))? else {
+            return Ok((
+                false,
+                UsedPlanOutcome::Failed(format!(
+                    "the exact used plan `plan/{plan}@{revision}` is unavailable"
+                )),
+            ));
+        };
+        if selected.state != PlanState::Ready {
+            return Ok((
+                false,
+                UsedPlanOutcome::Failed(format!(
+                    "the exact used plan `plan/{plan}@{revision}` is not ready"
+                )),
+            ));
+        }
+        let (child, changed) =
+            if let Some(child) = self.store.plan_run_for_parent_step(&view.subject)? {
+                (child, false)
+            } else {
+                let child = self.store.create_child_plan_run(
+                    &PlanRunRequest {
+                        plan: plan.clone(),
+                        revision: Some(revision.clone()),
+                        workspace: run.workspace.clone(),
+                        requester: Some(run.requester.clone()),
+                        mode: Some(run.mode.clone()),
+                        idempotency_key: format!(
+                            "uses-plan:{}:{}:plan/{plan}@{revision}",
+                            view.subject, view.attempt
+                        ),
+                    },
+                    run,
+                    &view.subject,
+                    view.assignee.as_deref(),
+                )?;
+                (child, true)
+            };
+        if child.plan != format!("plan/{plan}") || child.revision != revision {
+            return Ok((
+                changed,
+                UsedPlanOutcome::Failed(
+                    "the step already started a different exact plan revision".into(),
+                ),
+            ));
+        }
+        let outcome = match child.status.as_str() {
+            "completed" => UsedPlanOutcome::Completed,
+            "failed" | "cancelled" => UsedPlanOutcome::Failed(format!(
+                "the used plan run `{}` is {}",
+                child.subject, child.status
+            )),
+            _ => UsedPlanOutcome::Pending,
+        };
+        Ok((changed, outcome))
     }
 
     fn step_dependencies_hold(
@@ -1422,7 +1561,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(source) = &step.spec.subgraph_kdl else {
             return Ok(false);
         };
-        let variables = run_variables(run, step.spec, view);
+        let variables = run_variables(run, step, view);
         let source = crate::plan::interpolate(source, &variables)?;
         let mut intent = crate::graph::parse_intent(&source, &self.host)?;
         let step_scope = format!("scope/{}", view.subject);
@@ -1524,7 +1663,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
-        let variables = run_variables(run, step.spec, view);
+        let variables = run_variables(run, step, view);
         for product in &step.spec.products {
             let subject = crate::plan::interpolate(&product.subject, &variables)?;
             let Some(actual) = self.store.latest_actual_value(&subject)? else {
@@ -1546,7 +1685,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         view: &crate::model::StepRunView,
         judge: &JudgeSpec,
     ) -> Result<JudgeOutcome> {
-        let variables = run_variables(run, step.spec, view);
+        let variables = run_variables(run, step, view);
         let mut judge = judge.clone();
         expand_judge(&mut judge, &variables, &run.workspace)?;
         if let JudgeSpec::Human {
@@ -3102,9 +3241,15 @@ fn flatten_plan_steps(plan: &PlanSpec) -> Vec<RuntimeStep<'_>> {
 
 fn run_variables(
     run: &PlanRunView,
-    step: &StepSpec,
+    step: &RuntimeStep<'_>,
     view: &crate::model::StepRunView,
 ) -> BTreeMap<String, String> {
+    let parent_step_run = step
+        .parent
+        .as_ref()
+        .map(|path| format!("step-run/{}/{}", run.id, path))
+        .or_else(|| run.parent_step_run.clone())
+        .unwrap_or_default();
     BTreeMap::from([
         (
             "PLAN".into(),
@@ -3117,13 +3262,13 @@ fn run_variables(
             run.run_scope.clone().unwrap_or_default(),
         ),
         ("WORKSPACE".into(), run.workspace.clone()),
-        ("STEP".into(), step.path.clone()),
+        ("STEP".into(), step.spec.path.clone()),
         ("STEP_RUN".into(), view.subject.clone()),
         ("ATTEMPT".into(), view.attempt.to_string()),
         ("ASSIGNEE".into(), view.assignee.clone().unwrap_or_default()),
         ("REQUESTER".into(), run.requester.clone()),
-        ("PARENT_STEP_RUN".into(), String::new()),
-        ("ROOT_PLAN_RUN".into(), run.subject.clone()),
+        ("PARENT_STEP_RUN".into(), parent_step_run),
+        ("ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
     ])
 }
 
@@ -3278,6 +3423,12 @@ enum JudgeOutcome {
     Pass,
     Pending,
     Fail(String),
+}
+
+enum UsedPlanOutcome {
+    Pending,
+    Completed,
+    Failed(String),
 }
 
 fn member_fields(
@@ -3657,6 +3808,240 @@ subgraph {
         assert_eq!(
             store.plan_run(&run.id).unwrap().unwrap().status,
             "completed"
+        );
+    }
+
+    #[test]
+    fn a_step_uses_the_exact_plan_revision_produced_by_an_earlier_step() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let bootstrap = r#"
+version 2
+subgraph {
+  agent "planner" { workspace "/tmp"; command "true"; restart "never" }
+  plan "bootstrap" state="ready" {
+    step "compile" {
+      assigned-to "agent/planner"
+      produces-plan "project/work"
+    }
+    step "execute" {
+      assigned-to "agent/planner"
+      depends-on { step "compile" completed }
+      uses-plan output-of="compile"
+    }
+  }
+}
+"#;
+        let first_work = r#"
+version 2
+subgraph {
+  plan "project/work" state="ready" {
+    step "inspect" { title "Inspect the fixture" }
+    step "finish" { depends-on { step "inspect" completed } }
+  }
+}
+"#;
+        apply_source(&store, bootstrap, "publish-bootstrap");
+        apply_source(&store, first_work, "publish-first-work");
+        let first = store
+            .plan_spec("project/work", None)
+            .unwrap()
+            .expect("first work plan");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "bootstrap".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "run-bootstrap".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let compile = store
+            .plan_run(&run.id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.step == "compile")
+            .unwrap();
+        store
+            .work_action(
+                &compile.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some("agent/node.planner".into()),
+                    incarnation: Some("test".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-compile".into(),
+                },
+            )
+            .unwrap();
+        let output = store
+            .record_plan_output(
+                &compile.subject,
+                "agent/node.planner",
+                Some("test"),
+                "project/work",
+                &first,
+                "bind-first-work",
+            )
+            .unwrap();
+        store
+            .work_action(
+                &compile.subject,
+                "complete",
+                &crate::model::WorkRequest {
+                    actor: Some("agent/node.planner".into()),
+                    incarnation: Some("test".into()),
+                    summary: Some("published the complete plan".into()),
+                    reason: None,
+                    evidence: vec![output.claim_id.clone()],
+                    idempotency_key: "complete-compile".into(),
+                },
+            )
+            .unwrap();
+
+        let second_work = r#"
+version 2
+subgraph {
+  plan "project/work" state="ready" {
+    step "replacement" { title "A later plan revision" }
+  }
+}
+"#;
+        apply_source(&store, second_work, "publish-second-work");
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let execute = store
+            .plan_run(&run.id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.step == "execute")
+            .unwrap();
+        assert_eq!(execute.status, "ready");
+        for action in ["claim", "complete"] {
+            store
+                .work_action(
+                    &execute.subject,
+                    action,
+                    &crate::model::WorkRequest {
+                        actor: Some("agent/node.planner".into()),
+                        incarnation: Some("test".into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: format!("{action}-execute"),
+                    },
+                )
+                .unwrap();
+        }
+        reconciler.reconcile_once().unwrap();
+        let child = store
+            .plan_run_for_parent_step(&execute.subject)
+            .unwrap()
+            .expect("the used plan run");
+        assert_eq!(child.revision, first.revision);
+        assert_eq!(child.root_plan_run, run.subject);
+        assert_eq!(
+            child.parent_step_run.as_deref(),
+            Some(execute.subject.as_str())
+        );
+        assert!(
+            child
+                .steps
+                .iter()
+                .all(|step| step.assignee.as_deref() == Some("agent/node.planner"))
+        );
+        assert_eq!(
+            child
+                .steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>(),
+            vec!["finish", "inspect"]
+        );
+
+        for step_name in ["inspect", "finish"] {
+            for _ in 0..3 {
+                reconciler.reconcile_once().unwrap();
+            }
+            let step = store
+                .plan_run(&child.id)
+                .unwrap()
+                .unwrap()
+                .steps
+                .into_iter()
+                .find(|step| step.step == step_name)
+                .unwrap();
+            assert_eq!(step.status, "ready");
+            for action in ["claim", "complete"] {
+                store
+                    .work_action(
+                        &step.subject,
+                        action,
+                        &crate::model::WorkRequest {
+                            actor: Some("agent/node.planner".into()),
+                            incarnation: Some("test".into()),
+                            summary: None,
+                            reason: None,
+                            evidence: Vec::new(),
+                            idempotency_key: format!("{action}-{step_name}"),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            store.plan_run(&child.id).unwrap().unwrap().status,
+            "completed"
+        );
+        let replica = Store::open_memory("replica").unwrap();
+        replica
+            .import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        let replicated_child = replica
+            .plan_run(&child.id)
+            .unwrap()
+            .expect("the replicated child plan run");
+        assert_eq!(replicated_child.root_plan_run, run.subject);
+        assert_eq!(replicated_child.parent_step_run, child.parent_step_run);
+        assert_eq!(replicated_child.revision, first.revision);
+        assert_eq!(
+            replicated_child
+                .steps
+                .iter()
+                .map(|step| step.assignee.as_deref())
+                .collect::<Vec<_>>(),
+            child
+                .steps
+                .iter()
+                .map(|step| step.assignee.as_deref())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            replica
+                .plan_output(&compile.subject, 1, &compile.definition_hash)
+                .unwrap()
+                .is_some()
         );
     }
 

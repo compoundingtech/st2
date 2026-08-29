@@ -20,10 +20,11 @@ use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, IntentInput, JudgementRequest, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, PlanRequest, PlanResponse, PlanRevisionRequest,
-    PlanRunRequest, PlanRunView, PlanState, QuickAgentRequest, QuickAgentResponse, ReviewRequest,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    MessageSendRequest, MessageView, PlanOutputView, PlanProductionRequest, PlanRequest,
+    PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState, QuickAgentRequest,
+    QuickAgentResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
+    StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -433,6 +434,8 @@ enum WorkCommand {
     Complete(WorkActionArgs),
     Fail(WorkActionArgs),
     Release(WorkActionArgs),
+    /// Publish the exact ready plan produced by one claimed step.
+    PublishPlan(WorkPublishPlanArgs),
     Revise(WorkReviseArgs),
 }
 
@@ -459,6 +462,16 @@ struct WorkReviseArgs {
     actor: Option<String>,
     #[arg(long)]
     reason: String,
+}
+
+#[derive(Args)]
+struct WorkPublishPlanArgs {
+    subject: String,
+    file: PathBuf,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -2222,6 +2235,7 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
         WorkCommand::Complete(args) => post_work(client, "complete", args, json_output).await,
         WorkCommand::Fail(args) => post_work(client, "fail", args, json_output).await,
         WorkCommand::Release(args) => post_work(client, "release", args, json_output).await,
+        WorkCommand::PublishPlan(args) => publish_work_plan(client, args, json_output).await,
         WorkCommand::Revise(args) => {
             let actor = args
                 .actor
@@ -2245,6 +2259,43 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 .await?;
             print_value(&response, json_output)
         }
+    }
+}
+
+async fn publish_work_plan(
+    client: &Client,
+    args: WorkPublishPlanArgs,
+    json_output: bool,
+) -> Result<()> {
+    let actor = args
+        .actor
+        .context("publishing a plan output needs --as or ST_AGENT")?;
+    let incarnation = match args.incarnation {
+        Some(incarnation) => Some(incarnation),
+        None => current_agent_incarnation(client, &actor).await?,
+    };
+    let kdl = fs::read_to_string(&args.file)
+        .with_context(|| format!("read KDL {}", args.file.display()))?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let output: PlanOutputView = client
+        .post(
+            &format!("/v1/work/plan/{}", urlencoding::encode(&args.subject)),
+            &PlanProductionRequest {
+                intent: IntentInput {
+                    kdl,
+                    source_name: Some(args.file.display().to_string()),
+                },
+                actor,
+                incarnation,
+                idempotency_key: format!("plan-output:{}:{nonce}", args.subject),
+            },
+        )
+        .await?;
+    if json_output {
+        print_value(&output, true)
+    } else {
+        println!("{}@{}", output.plan, output.revision);
+        Ok(())
     }
 }
 

@@ -1,0 +1,78 @@
+version 2
+
+subgraph {
+  scope "eval/plan-document-lift/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/plan-document-lift" state="ready" {
+      step "start-planner" timeout="10m" {
+        title "The native Codex planner is ready"
+        subgraph {
+          agent "pdl.agent" {
+            workspace "${WORKSPACE}/repo"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Read AGENTS.md. Use only st3 message for Small Talk. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Do not perform inherited nested work before you claim that nested step. Follow inherited child steps through st3 work. After each child step, list assigned work and continue the same parent plan. During plan lifting, do not inspect inventory.json or create RESULT.md before the complete ready plan is published. Claim publish-ready-graph-plan before you run st3 work publish-plan. Use st3 work publish-plan exactly as assigned. Do not poll or publish routine progress. End only after the assigned parent step is complete and no message remains."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+            }
+            restart "never"
+            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
+          }
+        }
+      }
+
+      step "lift-plan-document" timeout="20m" {
+        title "The exact repository plan becomes a complete ready graph plan"
+        goal "Compile doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 into ready plan eval/plan-document-lift/work before doing any project work. Claim each nested step before doing its work. Publish while publish-ready-graph-plan is claimed."
+        document "doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636"
+        assigned-to "agent/pdl.agent"
+        depends-on { step "start-planner" completed }
+        produces-plan "eval/plan-document-lift/work"
+        plan "work" {
+          step "read-exact-plan-document" {
+            title "The exact immutable plan document is loaded"
+            goal "Run st3 doc get doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 --output SOURCE-PLAN.md. Verify its SHA-256 and read it. Do not inspect inventory.json or create RESULT.md."
+          }
+          step "author-complete-graph-plan" {
+            title "The complete execution plan is encoded as KDL"
+            goal "Create lifted-plan.kdl with version 2 and exactly one ready plan named eval/plan-document-lift/work. Translate all source steps, titles, goals, dependencies, and the declared product. Leave its steps unassigned so they inherit this agent when used. Do not execute project work."
+            depends-on { step "read-exact-plan-document" completed }
+          }
+          step "publish-ready-graph-plan" {
+            title "The generated ready plan revision is bound to this attempt"
+            goal "Run st3 work publish-plan ${PARENT_STEP_RUN} lifted-plan.kdl. Record the printed exact plan revision. Do not inspect inventory.json or create RESULT.md."
+            depends-on { step "author-complete-graph-plan" completed }
+          }
+        }
+      }
+
+      step "execute-lifted-plan" timeout="20m" {
+        title "The exact generated plan revision executes as graph work"
+        goal "Claim and complete this wrapper step. st3 will start the exact plan revision produced by lift-plan-document. Follow every resulting assigned child plan step until that plan completes."
+        assigned-to "agent/pdl.agent"
+        depends-on { step "lift-plan-document" completed }
+        uses-plan output-of="lift-plan-document"
+      }
+
+      step "held-out-judges" timeout="10m" {
+        title "All plan-document lifting judges pass"
+        depends-on { step "execute-lifted-plan" completed }
+        judges {
+          judge "the exact pre-published document bytes were used" {
+            exec "set -eu; tmp=$(mktemp); st3 doc get doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 --output \"$tmp\" >/dev/null; cmp repo/PLAN.md \"$tmp\"; rm -f \"$tmp\""
+            host "local"
+            workspace "${WORKSPACE}"
+            time-limit "120000ms"
+          }
+          judge "the generated project result is correct" { exec "cd repo && bash verify.sh"; host "local"; workspace "${WORKSPACE}"; time-limit "120000ms" }
+          judge "the produced plan revision, child run, transitions, and product are exact" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+        }
+      }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/plan-document-lift/${PLAN_RUN}" { stop } }
+        judges { empty "scope/eval/plan-document-lift/${PLAN_RUN}" }
+      }
+    }
+  }
+}

@@ -467,18 +467,12 @@ The graph uses one step to compile the file and another step to execute the prod
 plan "bootstrap-project" state="ready" {
   step "compile-the-repository-plan" {
     assigned-to "agent/planner"
-
-    input {
-      workspace-file "PLAN.md"
-        revision="COMMIT"
-        hash="SHA256"
-    }
-
+    goal "Read doc/project/plan@SHA256 and publish its complete ready graph plan before implementation starts."
     produces-plan "project/work"
   }
 
   step "execute-the-project-plan" {
-    depends-on "compile-the-repository-plan"
+    depends-on { step "compile-the-repository-plan" completed }
     assigned-to "agent/planner"
     uses-plan output-of="compile-the-repository-plan"
   }

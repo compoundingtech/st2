@@ -4,6 +4,8 @@ This st3 eval asks two native Codex agents to find a shared-default mutation bug
 This teaches a bounded delegate-debug-verify loop where a shallow patch or a test that never failed
 cannot pass.
 
+The KDL records delegation, diagnosis, regression-first repair, publication, verification, and products as graph work.
+
 Start the daemon with `st3 up`. Run the eval with `st3 eval ./evals/st3/ghost-bug`.
 
 Held-out judges (identical logic to ghost-bug): isolation (author-gated to `gbx.fix`), suite-green,

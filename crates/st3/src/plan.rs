@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     ChangePolicy, DependencySpec, JudgeSpec, PlanSpec, PlanState, ProductSpec, RetrySpec, St3Error,
-    StepSpec,
+    StepSpec, UsedPlanSpec,
 };
 
 const VARIABLES: &[&str] = &[
@@ -44,6 +44,39 @@ pub fn parse_plans(
         }
     }
     Ok(plans)
+}
+
+pub fn find_step<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a StepSpec> {
+    for id in &plan.display_order {
+        let step = &plan.steps[id];
+        if step.path == path {
+            return Some(step);
+        }
+        if let Some(nested) = &step.nested_plan
+            && let Some(found) = find_step(nested, path)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+pub fn parent_step_path<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a str> {
+    fn find<'a>(plan: &'a PlanSpec, path: &str, parent: Option<&'a str>) -> Option<&'a str> {
+        for id in &plan.display_order {
+            let step = &plan.steps[id];
+            if step.path == path {
+                return parent;
+            }
+            if let Some(nested) = &step.nested_plan
+                && let Some(found) = find(nested, path, Some(&step.path))
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(plan, path, None)
 }
 
 fn parse_scope_plans(
@@ -184,8 +217,11 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     let mut goal = None;
     let mut assigned_to = None;
     let mut dependencies = Vec::new();
+    let mut documents = Vec::new();
     let mut subgraph_kdl = None;
     let mut products = Vec::new();
+    let mut produces_plan = None;
+    let mut uses_plan = None;
     let mut judges = Vec::new();
     let mut nested_plan = None;
     let mut retry = RetrySpec::default();
@@ -193,7 +229,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         let mut names = BTreeSet::new();
         for child in children.nodes() {
             let name = child.name().value();
-            if !matches!(name, "depends-on") && !names.insert(name.to_owned()) {
+            if !matches!(name, "depends-on" | "document") && !names.insert(name.to_owned()) {
                 return Err(St3Error::new(
                     "duplicate-step-field",
                     format!("step `{path}` repeats `{name}`"),
@@ -206,6 +242,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                     assigned_to = Some(normalize_assignee(&first_string(child)?, default_host))
                 }
                 "depends-on" => dependencies.extend(parse_dependencies(child, default_host)?),
+                "document" => documents.push(parse_step_document(child)?),
                 "subgraph" => {
                     ensure_bare(child)?;
                     if child.children().is_none_or(|body| body.nodes().is_empty()) {
@@ -217,6 +254,8 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                     subgraph_kdl = Some(format!("version 2\n{child}\n"));
                 }
                 "produces" => products = parse_products(child)?,
+                "produces-plan" => produces_plan = Some(parse_produced_plan(child)?),
+                "uses-plan" => uses_plan = Some(parse_used_plan(child)?),
                 "judges" => {
                     judges = crate::graph::parse_judges(child, default_host)?;
                     if judges
@@ -254,8 +293,11 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         finally,
         assigned_to,
         dependencies,
+        documents,
         subgraph_kdl,
         products,
+        produces_plan,
+        uses_plan,
         judges,
         nested_plan,
         definition_hash: String::new(),
@@ -263,6 +305,38 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     validate_variables(&serde_json::to_value(&step).map_err(internal)?)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
+}
+
+fn parse_step_document(node: &KdlNode) -> Result<String, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let values = positional_strings(node)?;
+    if values.len() != 1 || node.children().is_some() {
+        return Err(St3Error::new(
+            "invalid-step-document",
+            "document needs exactly one immutable document reference",
+        ));
+    }
+    let reference = &values[0];
+    let Some((name, revision)) = reference.rsplit_once('@') else {
+        return Err(St3Error::new(
+            "unpinned-step-document",
+            "document needs an exact doc/NAME@HASH reference",
+        ));
+    };
+    if !name.starts_with("doc/")
+        || name.len() <= 4
+        || name.contains("..")
+        || name.ends_with('/')
+        || revision.len() != 64
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(St3Error::new(
+            "invalid-step-document",
+            format!("invalid immutable document reference `{reference}`"),
+        ));
+    }
+    Ok(format!("{name}@{}", revision.to_ascii_lowercase()))
 }
 
 fn rewrite_nested_paths(plan: &mut PlanSpec, parent: &str) -> Result<(), St3Error> {
@@ -402,6 +476,67 @@ fn parse_products(node: &KdlNode) -> Result<Vec<ProductSpec>, St3Error> {
     Ok(output)
 }
 
+fn parse_produced_plan(node: &KdlNode) -> Result<String, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let values = positional_strings(node)?;
+    if values.len() != 1 || node.children().is_some() {
+        return Err(St3Error::new(
+            "invalid-produces-plan",
+            "produces-plan needs exactly one plan ID",
+        ));
+    }
+    let id = values[0]
+        .strip_prefix("plan/")
+        .unwrap_or(&values[0])
+        .to_owned();
+    validate_id(&id, "plan")?;
+    Ok(id)
+}
+
+fn parse_used_plan(node: &KdlNode) -> Result<UsedPlanSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["output-of"])?;
+    if node.children().is_some() {
+        return Err(St3Error::new(
+            "invalid-uses-plan",
+            "uses-plan cannot contain a block",
+        ));
+    }
+    let values = positional_strings(node)?;
+    let output = property_string(node, "output-of")?;
+    match (values.as_slice(), output) {
+        ([], Some(step)) => {
+            validate_id(&step, "step")?;
+            Ok(UsedPlanSpec::StepOutput { step })
+        }
+        ([reference], None) => {
+            let reference = reference.strip_prefix("plan/").unwrap_or(reference);
+            let (plan, revision) = reference.rsplit_once('@').ok_or_else(|| {
+                St3Error::new(
+                    "unpinned-plan-reference",
+                    "uses-plan needs an exact PLAN@REVISION reference",
+                )
+            })?;
+            validate_id(plan, "plan")?;
+            if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(St3Error::new(
+                    "invalid-plan-revision",
+                    "a used plan revision must be a 64-character hexadecimal hash",
+                ));
+            }
+            Ok(UsedPlanSpec::Revision {
+                plan: plan.to_owned(),
+                revision: revision.to_ascii_lowercase(),
+            })
+        }
+        _ => Err(St3Error::new(
+            "invalid-uses-plan",
+            "uses-plan needs one exact plan reference or one output-of property",
+        )),
+    }
+}
+
 fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
     ensure_bare(node)?;
     let body = node
@@ -434,6 +569,47 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
                     "unknown-step-dependency",
                     format!(
                         "step `{}` in plan `{plan}` depends on unknown step `{target}`",
+                        step.id
+                    ),
+                ));
+            }
+        }
+        if step.produces_plan.is_some() && step.uses_plan.is_some() {
+            return Err(St3Error::new(
+                "conflicting-plan-step",
+                format!(
+                    "step `{}` in plan `{plan}` cannot produce and use a plan",
+                    step.id
+                ),
+            ));
+        }
+        if let Some(UsedPlanSpec::StepOutput { step: target }) = &step.uses_plan {
+            let Some(producer) = steps.get(target) else {
+                return Err(St3Error::new(
+                    "unknown-plan-output",
+                    format!(
+                        "step `{}` in plan `{plan}` uses unknown step output `{target}`",
+                        step.id
+                    ),
+                ));
+            };
+            if producer.produces_plan.is_none() {
+                return Err(St3Error::new(
+                    "not-a-plan-output",
+                    format!(
+                        "step `{}` in plan `{plan}` does not produce a plan",
+                        producer.id
+                    ),
+                ));
+            }
+            let waits_for_output = step.dependencies.iter().any(|dependency| {
+                matches!(dependency, DependencySpec::Step { step, state } if step == target && state == "completed")
+            });
+            if !waits_for_output {
+                return Err(St3Error::new(
+                    "missing-plan-output-dependency",
+                    format!(
+                        "step `{}` must depend on completed step `{target}` before it uses that plan output",
                         step.id
                     ),
                 ));
@@ -884,5 +1060,89 @@ subgraph {
                 "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]
         );
+    }
+
+    #[test]
+    fn parses_attempt_bound_plan_production_and_exact_plan_use() {
+        let intent = crate::graph::parse_intent(
+            &format!(
+                r#"
+version 2
+subgraph {{
+  plan "bootstrap" state="ready" {{
+    step "compile" {{
+      document "doc/project/plan@{}"
+      produces-plan "project/work"
+    }}
+    step "execute" {{
+      depends-on {{ step "compile" completed }}
+      uses-plan output-of="compile"
+    }}
+    step "reuse" {{
+      uses-plan "project/work@{}"
+    }}
+  }}
+}}
+"#,
+                "b".repeat(64),
+                "a".repeat(64)
+            ),
+            "node",
+        )
+        .unwrap();
+        let plan = &intent.plans["bootstrap"];
+        assert_eq!(
+            plan.steps["compile"].produces_plan.as_deref(),
+            Some("project/work")
+        );
+        assert_eq!(
+            plan.steps["compile"].documents,
+            vec![format!("doc/project/plan@{}", "b".repeat(64))]
+        );
+        assert_eq!(
+            plan.steps["execute"].uses_plan,
+            Some(crate::model::UsedPlanSpec::StepOutput {
+                step: "compile".into()
+            })
+        );
+        assert_eq!(
+            plan.steps["reuse"].uses_plan,
+            Some(crate::model::UsedPlanSpec::Revision {
+                plan: "project/work".into(),
+                revision: "a".repeat(64),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unpinned_or_unordered_plan_use() {
+        let unpinned = crate::graph::parse_intent(
+            r#"version 2
+subgraph { plan "bad" state="ready" { step "use" { uses-plan "work" } } }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(unpinned.code, "unpinned-plan-reference");
+
+        let unpinned_document = crate::graph::parse_intent(
+            r#"version 2
+subgraph { plan "bad" state="ready" { step "use" { document "doc/project/plan" } } }"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(unpinned_document.code, "unpinned-step-document");
+
+        let unordered = crate::graph::parse_intent(
+            r#"version 2
+subgraph {
+  plan "bad" state="ready" {
+    step "compile" { produces-plan "work" }
+    step "use" { uses-plan output-of="compile" }
+  }
+}"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(unordered.code, "missing-plan-output-dependency");
     }
 }

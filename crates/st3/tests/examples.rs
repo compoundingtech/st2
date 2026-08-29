@@ -284,11 +284,108 @@ fn selected_eval_harness_counts_match_the_inventory() {
         assert_eq!(st3_counts, st3_expected, "st3 {name}");
         model_judges.extend(authored_model_judges(&st3_source));
     }
+    let plan_lift = fs::read_to_string(root.join("st3/plan-document-lift/eval.kdl")).unwrap();
+    assert_eq!(
+        authored_harness_counts(&plan_lift, "st3 plan-document-lift"),
+        (0, 1)
+    );
+    model_judges.extend(authored_model_judges(&plan_lift));
     model_judges.sort();
     assert_eq!(
         model_judges,
         ["gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-sol"],
         "the model judge inventory changed; update evals/README.md"
+    );
+}
+
+#[test]
+fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3");
+    let cases = [
+        (
+            "license-mit",
+            "eval/license-mit",
+            [
+                ("delegate-license-change", "agent/lmc.sup"),
+                ("implement-license-change", "agent/lmc.worker"),
+                ("verify-and-confirm", "agent/lmc.sup"),
+            ]
+            .as_slice(),
+            [
+                "resource/plan-run/${PLAN_RUN}/license-brief",
+                "resource/plan-run/${PLAN_RUN}/license-revision",
+                "resource/plan-run/${PLAN_RUN}/worker-report",
+                "resource/plan-run/${PLAN_RUN}/final-confirmation",
+            ]
+            .as_slice(),
+        ),
+        (
+            "ghost-bug",
+            "eval/ghost-bug-codex",
+            [
+                ("delegate-debug-brief", "agent/gbx.sup"),
+                ("diagnose-and-fix", "agent/gbx.fix"),
+                ("verify-and-confirm", "agent/gbx.sup"),
+            ]
+            .as_slice(),
+            [
+                "resource/plan-run/${PLAN_RUN}/debug-brief",
+                "resource/plan-run/${PLAN_RUN}/fix-revision",
+                "resource/plan-run/${PLAN_RUN}/worker-report",
+                "resource/plan-run/${PLAN_RUN}/final-confirmation",
+            ]
+            .as_slice(),
+        ),
+    ];
+
+    for (name, plan_id, assignments, products) in cases {
+        let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
+        assert!(!source.contains("message \"kickoff"));
+        assert!(!source.contains("wait-team-done"));
+        let intent = st3::parse_intent(&source, "local").unwrap();
+        let plan = &intent.plans[plan_id];
+        for (step, assignee) in assignments {
+            assert_eq!(plan.steps[*step].assigned_to.as_deref(), Some(*assignee));
+            assert!(plan.steps[*step].nested_plan.is_some());
+        }
+        let declared = plan
+            .steps
+            .values()
+            .filter_map(|step| step.nested_plan.as_ref())
+            .flat_map(|nested| nested.steps.values())
+            .flat_map(|step| &step.products)
+            .map(|product| product.subject.as_str())
+            .collect::<Vec<_>>();
+        for product in products {
+            assert!(declared.contains(product), "{name} lacks {product}");
+        }
+    }
+}
+
+#[test]
+fn plan_document_lift_produces_and_uses_one_exact_plan_output() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/plan-document-lift");
+    let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
+    let intent = st3::parse_intent(&source, "local").unwrap();
+    let plan = &intent.plans["eval/plan-document-lift"];
+    assert_eq!(
+        plan.steps["lift-plan-document"].produces_plan.as_deref(),
+        Some("eval/plan-document-lift/work")
+    );
+    assert_eq!(
+        plan.steps["execute-lifted-plan"].uses_plan,
+        Some(st3::model::UsedPlanSpec::StepOutput {
+            step: "lift-plan-document".into()
+        })
+    );
+    assert!(
+        intent.document_refs.contains(
+            "doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636"
+        )
     );
 }
 

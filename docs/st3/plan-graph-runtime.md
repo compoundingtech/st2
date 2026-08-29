@@ -151,7 +151,61 @@ A nested plan is part of the submitted revision. Its first eligible steps start 
 
 Nested steps inherit the parent assignment unless a child overrides it. Their state stays in st3, not in harness memory.
 
-The current grammar does not implement `uses-plan` or `produces-plan`. A nested authored plan is supported.
+## Produced and used plans
+
+A step can publish one complete ready plan as its attempt-bound output.
+
+```kdl
+step "compile-the-repository-plan" {
+  assigned-to "agent/planner"
+  document "doc/project/plan@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  produces-plan "project/work"
+}
+```
+
+The `document` field declares immutable source material for the step. It always needs an exact hash.
+
+The worker must hold the producing step or one of its nested steps before it publishes the plan.
+
+The nested lease must have the same assignee and native runtime incarnation. This rule lets a dedicated nested publication step bind its parent output.
+
+```sh
+st3 work claim step-run/RUN/compile-the-repository-plan --as agent/planner
+st3 work publish-plan step-run/RUN/compile-the-repository-plan ./generated.kdl --as agent/planner
+st3 work complete step-run/RUN/compile-the-repository-plan --as agent/planner
+```
+
+`publish-plan` accepts exactly one ready plan. Its ID must match `produces-plan`.
+
+The API publishes the immutable plan revision first. It then binds that exact revision to the current step definition and attempt.
+
+A producing step cannot complete verification until that bound ready revision exists.
+
+A later step can use the produced revision.
+
+```kdl
+step "execute-the-repository-plan" {
+  assigned-to "agent/planner"
+  depends-on { step "compile-the-repository-plan" completed }
+  uses-plan output-of="compile-the-repository-plan"
+}
+```
+
+The `output-of` form requires an explicit completed dependency on the producing step.
+
+The wrapper worker claims and completes the used-plan step. st3 then starts one linked child plan run for the exact output revision.
+
+Unassigned child steps inherit the wrapper assignment. The child run records its root plan run and parent step run.
+
+The wrapper completes only after the child plan completes. A failed or cancelled child plan fails the wrapper.
+
+A step can also use a ready revision that was published earlier.
+
+```kdl
+uses-plan "project/work@REVISION_HASH"
+```
+
+The exact form requires a 64-character revision hash. It never follows the latest plan binding.
 
 ## Meta variables
 

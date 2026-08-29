@@ -178,6 +178,13 @@ pub struct ProductSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum UsedPlanSpec {
+    Revision { plan: String, revision: String },
+    StepOutput { step: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RetrySpec {
     pub attempts: u32,
     pub backoff_ms: u64,
@@ -203,8 +210,14 @@ pub struct StepSpec {
     pub finally: bool,
     pub assigned_to: Option<String>,
     pub dependencies: Vec<DependencySpec>,
+    #[serde(default)]
+    pub documents: Vec<String>,
     pub subgraph_kdl: Option<String>,
     pub products: Vec<ProductSpec>,
+    #[serde(default)]
+    pub produces_plan: Option<String>,
+    #[serde(default)]
+    pub uses_plan: Option<UsedPlanSpec>,
     pub judges: Vec<JudgeSpec>,
     pub nested_plan: Option<Box<PlanSpec>>,
     pub definition_hash: String,
@@ -724,6 +737,9 @@ pub struct PlanRunView {
     pub plan: String,
     pub revision: String,
     pub root_revision: String,
+    pub root_plan_run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_step_run: Option<String>,
     pub workspace: String,
     pub requester: String,
     pub run_scope: Option<String>,
@@ -778,6 +794,23 @@ pub struct PlanRevisionRequest {
     pub actor: String,
     pub reason: String,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanProductionRequest {
+    pub intent: IntentInput,
+    pub actor: String,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanOutputView {
+    pub step: String,
+    pub plan: String,
+    pub revision: String,
+    pub claim_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

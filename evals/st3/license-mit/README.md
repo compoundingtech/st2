@@ -2,11 +2,12 @@
 
 This st3 eval runs the license MIT task with two native Claude Sonnet agents.
 
-- **Task** (`task.md`): one instruction — "the license should be MIT" — into `lmc.sup`'s inbox.
+- **Task** (`task.md`): one immutable instruction referenced by the graph-owned delegation step.
 - **Team/persona mechanism**: the fixture pre-seeds `CLAUDE.md` and `PERSONA.md` in both workspaces.
   The KDL uses native `harness "claude" {}` blocks. `lmc.sup` coordinates and owns no repo;
   `lmc.worker` owns the `widget` repo and makes/commits the change; `lmc.sup` verifies read-only and
-  confirms. Every eval starts from the frozen `worker/_git` snapshot, rehydrated as `.git` only inside
+  confirms. The KDL records delegation, implementation, verification, and products as nested plans.
+  Every eval starts from the frozen `worker/_git` snapshot, rehydrated as `.git` only inside
   the throwaway catalog.
 - **Judges** (all held-out): structural isolation (sup owns no repo), the coordination loop on the bus
   (delegate → report → verified-confirm post-dating the report), `LICENSE` is canonical MIT, `package.json`
