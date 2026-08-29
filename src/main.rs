@@ -1985,6 +1985,44 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "",
                 ),
             }
+            // Harness context is advisory-only too (HC-R17), and on a narrower axis than the
+            // categorical record above: a filling window is worth a human's attention, and it is
+            // never a health failure. Absence says nothing here — no producer has published a
+            // number, which is not a fault — so only a high reading and a stale record beside a
+            // `running` desired state speak.
+            if let Some(context) =
+                st2::harness_context::read(&st2::harness_context::harness_context_path(dir))
+            {
+                // The harness's own percent, never one st2 divided out of the operands beside it,
+                // and never clamped: an overrun above 100 is exactly what this warns about.
+                if context
+                    .used_percent
+                    .is_some_and(|percent| percent >= st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT)
+                {
+                    report_advisory(
+                        &format!(
+                            "{bus_id} harness context at {}%",
+                            context.used_percent.unwrap_or_default().round()
+                        ),
+                        &format!(
+                            "at or above st2's {}% attention threshold, read {} ago — st2's own \
+                             number, not a prediction of where this harness compacts",
+                            st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT.round(),
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+                if context.stale && spec.desired_state.as_str() == "running" {
+                    report_advisory(
+                        &format!("{bus_id} harness context stale"),
+                        &format!(
+                            "the numbers are {} old while desired state is running — is its \
+                             driver still reading the harness?",
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+            }
             if st2::driver_diagnostic::expected_for(spec) {
                 let diagnostic =
                     st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
@@ -2126,6 +2164,16 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
 
 fn report_advisory(label: &str, detail: &str) {
     println!("  ⚠ {label} — {detail}");
+}
+
+/// A coarse age for an advisory line: an operator reads "12m", not "743109ms".
+fn humanize_ms(age_ms: u64) -> String {
+    let seconds = age_ms / 1_000;
+    match seconds {
+        0..=90 => format!("{seconds}s"),
+        91..=5_400 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3_600),
+    }
 }
 
 fn presentation_cmd(
@@ -2348,10 +2396,11 @@ fn agents_cmd(
                 )
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 observed_column(r.observed.as_ref()),
+                context_column(r.context.as_ref()),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
                 lifecycle,
@@ -2379,6 +2428,31 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
         column = format!("unknown({reason})");
     }
     format!("obs:{column}")
+}
+
+/// The compact harness-context column for human `st2 agents` output. `-` means no record exists;
+/// `?` means a record exists whose percent the harness withheld — Claude before its session's
+/// first API response, pi across a compaction — and the two must not render alike, or the column
+/// says "nobody is watching" for a producer that is watching and honestly does not know.
+fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
+    // Prefixed like the observed column beside it, so neither compact word is mistaken for the
+    // other or for declared presence.
+    let Some(context) = context else {
+        return "ctx:-".to_string();
+    };
+    // The harness's own percent, rounded for width and never clamped: a reading above 100 is a
+    // real overrun and the one an operator most needs to see.
+    let mut column = match context.used_percent {
+        Some(percent) => format!("{}%", percent.round()),
+        None => "?".to_string(),
+    };
+    if context.compactions > 0 {
+        column.push_str(&format!(" ⟳{}", context.compactions));
+    }
+    if context.stale {
+        column.push_str(" stale");
+    }
+    format!("ctx:{column}")
 }
 
 fn ding_cmd(

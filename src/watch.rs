@@ -35,8 +35,10 @@ pub(crate) fn watch_recursive_mutations(
 
 /// Watch only the inputs a native delivery pump consumes: the agent's `resources/inbox` subtree
 /// and its `status` file. Runtime records written beside them by the pump's own process group —
-/// the presence refresh's temp siblings, `harness-state`, stream state — must never wake delivery,
-/// or a writer that observes on every turn boundary pumps itself continuously.
+/// the presence refresh's temp siblings, `harness-state`, `harness-context`, stream state — must
+/// never wake delivery, or a writer that observes on every turn boundary pumps itself
+/// continuously. The allowlist is what makes that free: a new sibling record is ignored with no
+/// production change (HC-R08).
 pub(crate) fn watch_delivery_inputs(
     agent_dir: &Path,
     tx: Sender<()>,
@@ -438,6 +440,22 @@ mod tests {
         assert!(!is_declaration_path(root, &root.join("team/rendered.kdl")));
     }
 
+    /// One real harness-context write, through the record's own writer: the guard, the lock, the
+    /// staging outside the agent subtree, and the rename of the canonical name in.
+    #[cfg(target_os = "linux")]
+    fn st2_harness_context_write(agent_dir: &Path) {
+        use crate::harness_context::{Harness, Reading, Writer};
+        Writer::new(agent_dir, "h.worker", Harness::Codex)
+            .unwrap()
+            .observe(Reading {
+                used_tokens: Some(92_283),
+                window_tokens: Some(258_400),
+                used_percent: Some(33.0),
+                ..Reading::default()
+            })
+            .unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn delivery_watcher_ignores_runtime_records_but_wakes_on_inbox_and_status() {
@@ -452,12 +470,18 @@ mod tests {
         let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start inotify watcher");
 
         // Runtime records the pump's own process group writes must stay silent: the observed
-        // harness state, its atomic temp siblings, the presence temp sibling, stream state.
+        // harness state and the harness context beside it, their locks and atomic temp siblings,
+        // the presence temp sibling, stream state.
         std::fs::write(agent_dir.join("harness-state"), "{}").unwrap();
         std::fs::write(agent_dir.join(".harness-state.tmp-1-0"), "{}").unwrap();
+        std::fs::write(agent_dir.join("harness-context"), "{}").unwrap();
+        std::fs::write(agent_dir.join(".harness-context.lock"), "").unwrap();
         std::fs::write(agent_dir.join(".status.tmp-1-0"), "available\n").unwrap();
         std::fs::create_dir_all(agent_dir.join("resources/streams/s")).unwrap();
         std::fs::write(agent_dir.join("resources/streams/s/state.json"), "{}").unwrap();
+        // …and a real harness-context write through its own writer, staging outside the agent
+        // subtree and renaming the record in, which is the shape a producer actually produces.
+        st2_harness_context_write(agent_dir);
         assert!(
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "runtime-record writes must not wake the delivery pump"
@@ -501,7 +525,11 @@ mod tests {
         let before = inotify_watch_count();
         let (tx, _rx) = channel();
         let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start delivery watcher");
-        let delta = inotify_watch_count() - before;
+        // The count is host-wide, so a concurrent process releasing watches can make it fall
+        // between the two reads. That cannot mean this watcher allocated any, so saturate: an
+        // unsigned wrap would panic the assertion below with u64::MAX, blaming the watcher for
+        // another process's teardown.
+        let delta = inotify_watch_count().saturating_sub(before);
         assert!(
             delta < 32,
             "payload depth must not drive watch allocation: {delta} watches for a \
