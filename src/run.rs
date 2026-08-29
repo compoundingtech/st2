@@ -4270,7 +4270,7 @@ mod tests {
         assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology();
     }
 
-    #[cfg(feature = "wasm-resolver")]
+    #[cfg(all(test, feature = "wasm-resolver"))]
     fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
         for retirement in [
             "retired #true",
