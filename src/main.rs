@@ -692,6 +692,9 @@ enum ResourceCmd {
         /// Preserve the binding as no longer active for this agent, and say why.
         #[arg(long = "inactive-reason", value_name = "TEXT")]
         inactive_reason: Option<String>,
+        /// Profile-specific observation selector as JSON.
+        #[arg(long = "selector-json", value_name = "JSON")]
+        selector_json: Option<String>,
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
@@ -3276,6 +3279,9 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             if let Some(inactive_reason) = binding.inactive_reason() {
                 println!("{:<17}{}", "inactive-reason:", inactive_reason);
             }
+            if let Some(selector) = binding.selector() {
+                println!("{:<17}{}", "selector:", serde_json::to_string(selector)?);
+            }
             Ok(())
         }
         ResourceCmd::Add {
@@ -3283,12 +3289,18 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             uri,
             reason,
             inactive_reason,
+            selector_json,
             agent,
             json,
             ctx,
         } => {
+            let selector = selector_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("--selector-json is not valid JSON: {error}"))?;
             let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
-            let receipt = st2::agent_author::add_resource(
+            let receipt = st2::agent_author::add_resource_with_selector(
                 &root,
                 &target,
                 &host,
@@ -3297,6 +3309,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
                 &uri,
                 &reason,
                 inactive_reason.as_deref(),
+                selector.as_ref(),
             )?;
             if json {
                 println!("{}", serde_json::to_string(&receipt)?);

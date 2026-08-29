@@ -413,6 +413,7 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
     let mut uri = None;
     let mut reason = None;
     let mut inactive_reason = None;
+    let mut selector = None;
     for entry in &node.entries {
         let Some(property) = entry.name.as_deref() else {
             if name.is_some() {
@@ -454,6 +455,17 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
                     anyhow::bail!("resource binding needs string `inactive-reason`");
                 }
             }
+            "selector" => {
+                if selector.is_some() {
+                    anyhow::bail!("resource binding has duplicate `selector`");
+                }
+                let encoded = value
+                    .ok_or_else(|| anyhow::anyhow!("resource binding needs string `selector`"))?;
+                selector = Some(
+                    serde_json::from_str(&encoded)
+                        .map_err(|error| anyhow::anyhow!("resource binding `selector` is not valid JSON: {error}"))?,
+                );
+            }
             other => anyhow::bail!("resource binding has unsupported property `{other}`"),
         }
     }
@@ -465,6 +477,7 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
             reason: reason
                 .ok_or_else(|| anyhow::anyhow!("resource binding needs string `reason`"))?,
             inactive_reason,
+            selector,
         },
     ))
 }

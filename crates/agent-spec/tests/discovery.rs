@@ -1010,12 +1010,12 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
     write(
         tmp.path(),
         "agents/h/kdl/agent.kdl",
-        r#"agent "kdl" {
+        r##"agent "kdl" {
   host "h"
   resource "source" uri="worktree://github.com/example/project/main" reason="Primary checkout."
-  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability."
+  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability." selector=#"{"topics":["ci.failure","review.requested"]}"#
   command "true"
-}"#,
+}"##,
     );
     write(
         tmp.path(),
@@ -1024,7 +1024,7 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
   "identity": "json",
   "host": "h",
   "resource": {
-    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability."},
+    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability.", "selector": {"topics": ["ci.failure", "review.requested"]}},
     "source": {"uri": "worktree://github.com/example/project/main", "reason": "Primary checkout."}
   },
   "command": "true"
@@ -1041,6 +1041,7 @@ command = "true"
 uri = "github-issue://example/project/41"
 reason = "Current implementation task."
 inactive_reason = "Merged and retained for traceability."
+selector = { topics = ["ci.failure", "review.requested"] }
 
 [resource.source]
 uri = "worktree://github.com/example/project/main"
@@ -1063,7 +1064,10 @@ reason = "Primary checkout."
             "Current implementation task.".into(),
             "Merged and retained for traceability.".into(),
         )
-        .unwrap(),
+        .unwrap()
+        .with_selector(serde_json::json!({
+            "topics": ["ci.failure", "review.requested"]
+        })),
     ];
     for identity in ["json", "kdl", "toml"] {
         assert_eq!(find(&found.specs, identity).resources, expected);
@@ -1072,12 +1076,23 @@ reason = "Primary checkout."
     let json = serde_json::to_string(&expected).unwrap();
     assert_eq!(
         json,
-        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability."}]"#
+        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability.","selector":{"topics":["ci.failure","review.requested"]}}]"#
     );
     assert_eq!(
         serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
         expected
     );
+
+    let explicit_null = Resource::new(
+        "null-selector".into(),
+        "issue://one".into(),
+        "Null selector probe.".into(),
+    )
+    .unwrap()
+    .with_selector(serde_json::Value::Null);
+    let json = serde_json::to_string(&explicit_null).unwrap();
+    assert!(json.contains(r#""selector":null"#), "{json}");
+    assert_eq!(serde_json::from_str::<Resource>(&json).unwrap(), explicit_null);
 }
 
 #[test]

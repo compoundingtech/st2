@@ -13,7 +13,7 @@
 //!
 //! The registry is injectable so a catalog can extend or override the built-in set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "wasm-resolver")]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ use parking_lot::Mutex;
 
 #[cfg(feature = "wasm-resolver")]
 use sha2::{Digest as _, Sha256};
+use serde::Deserialize;
+use serde_json::Value;
 
 /// Scheme of the standing-seat goal carrier: `dev.schickling.agent-goal://<host>/<identity>`.
 /// The authority names a logical host and identity; a resolver module decides what the URI
@@ -33,6 +35,481 @@ pub const AGENT_GOAL_SCHEME: &str = "dev.schickling.agent-goal";
 
 /// Maximum resolver module bytes admitted by both catalog transactions and the wasm runtime.
 pub const DEFAULT_MODULE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+/// Descriptor ABI implemented by this host.
+pub const PROFILE_DESCRIPTOR_ABI_VERSION: u32 = 2;
+/// Maximum canonical compact JSON bytes accepted for one binding selector.
+pub const DEFAULT_SELECTOR_LIMIT_BYTES: usize = 16 * 1024;
+
+/// Closed capability vocabulary for descriptor ABI v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileCapability {
+    Resolve,
+    Read,
+    Observe,
+}
+
+/// The runtime process topology selected by a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum RuntimeTopology {
+    #[serde(rename = "shared")]
+    Shared,
+    #[serde(rename = "perBinding")]
+    PerBinding,
+}
+
+/// One profile-owned semantic invalidation topic.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileTopic {
+    pub name: String,
+}
+
+/// Process topology portion of a profile descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRuntime {
+    pub topology: RuntimeTopology,
+}
+
+/// Snapshot identity portion of a profile descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileSnapshot {
+    pub media_type: String,
+    pub schema_id: String,
+}
+
+/// The deliberately small JSON-Schema subset accepted for selectors.
+///
+/// It supports recursively composed objects and arrays plus JSON scalar type checks. Object
+/// required-properties and array uniqueness are the only structural assertions needed by the
+/// selector contract. Unknown schema keywords fail descriptor decoding rather than being ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorSchema {
+    Object {
+        properties: BTreeMap<String, SelectorSchema>,
+        required: Vec<String>,
+        additional_properties: bool,
+    },
+    Array {
+        items: Box<SelectorSchema>,
+        unique_items: bool,
+    },
+    String,
+    Boolean,
+    Number,
+    Integer,
+    Null,
+}
+
+/// A validated ABI v2 descriptor returned by `describe`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileDescriptor {
+    pub abi_version: u32,
+    pub capabilities: Vec<ProfileCapability>,
+    pub selector_schema: SelectorSchema,
+    pub default_selector: Value,
+    pub topics: Vec<ProfileTopic>,
+    pub runtime: ProfileRuntime,
+    pub snapshot: ProfileSnapshot,
+}
+
+/// A selector failure with a JSON-path-like location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorValidationError {
+    pub path: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for SelectorValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "selector {}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for SelectorValidationError {}
+
+/// Why a syntactically decoded descriptor is not a valid ABI v2 contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptorValidationError {
+    UnsupportedAbiVersion(u32),
+    MissingResolveCapability,
+    DuplicateCapability(ProfileCapability),
+    EmptyTopic,
+    DuplicateTopic(String),
+    InvalidDefaultSelector(SelectorValidationError),
+    UnknownDefaultTopic(String),
+    InvalidSnapshotMediaType,
+    EmptySnapshotSchemaId,
+    InvalidSelectorSchema(String),
+}
+
+impl std::fmt::Display for DescriptorValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedAbiVersion(version) => {
+                write!(formatter, "unsupported profile descriptor ABI version {version}")
+            }
+            Self::MissingResolveCapability => {
+                formatter.write_str("descriptor does not declare the `resolve` capability")
+            }
+            Self::DuplicateCapability(capability) => {
+                write!(formatter, "descriptor repeats capability {capability:?}")
+            }
+            Self::EmptyTopic => formatter.write_str("descriptor topic names must be non-empty"),
+            Self::DuplicateTopic(topic) => write!(formatter, "descriptor repeats topic `{topic}`"),
+            Self::InvalidDefaultSelector(error) => {
+                write!(formatter, "default {error}")
+            }
+            Self::UnknownDefaultTopic(topic) => {
+                write!(formatter, "default selector names unpublished topic `{topic}`")
+            }
+            Self::InvalidSnapshotMediaType => {
+                formatter.write_str("snapshot mediaType must be a non-empty type/subtype")
+            }
+            Self::EmptySnapshotSchemaId => {
+                formatter.write_str("snapshot schemaId must be non-empty")
+            }
+            Self::InvalidSelectorSchema(message) => {
+                write!(formatter, "invalid selector schema: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DescriptorValidationError {}
+
+impl<'de> Deserialize<'de> for SelectorSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::decode(value).map_err(<D::Error as serde::de::Error>::custom)
+    }
+}
+
+impl SelectorSchema {
+    fn decode(value: Value) -> Result<Self, String> {
+        let Value::Object(mut fields) = value else {
+            return Err("selector schema must be an object".to_owned());
+        };
+        let kind = match fields.remove("type") {
+            Some(Value::String(kind)) => kind,
+            Some(_) => return Err("selector schema `type` must be a string".to_owned()),
+            None => return Err("selector schema is missing `type`".to_owned()),
+        };
+        let schema = match kind.as_str() {
+            "object" => {
+                let properties = match fields.remove("properties") {
+                    None => BTreeMap::new(),
+                    Some(Value::Object(properties)) => properties
+                        .into_iter()
+                        .map(|(name, schema)| Self::decode(schema).map(|schema| (name, schema)))
+                        .collect::<Result<_, _>>()?,
+                    Some(_) => {
+                        return Err("object schema `properties` must be an object".to_owned());
+                    }
+                };
+                let required = match fields.remove("required") {
+                    None => Vec::new(),
+                    Some(Value::Array(required)) => required
+                        .into_iter()
+                        .map(|name| match name {
+                            Value::String(name) => Ok(name),
+                            _ => Err(
+                                "object schema `required` entries must be strings".to_owned(),
+                            ),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    Some(_) => return Err("object schema `required` must be an array".to_owned()),
+                };
+                let additional_properties = match fields.remove("additionalProperties") {
+                    None => true,
+                    Some(Value::Bool(value)) => value,
+                    Some(_) => {
+                        return Err(
+                            "object schema `additionalProperties` must be a boolean".to_owned(),
+                        );
+                    }
+                };
+                Self::Object {
+                    properties,
+                    required,
+                    additional_properties,
+                }
+            }
+            "array" => {
+                let items = fields
+                    .remove("items")
+                    .ok_or_else(|| "array schema is missing `items`".to_owned())
+                    .and_then(Self::decode)?;
+                let unique_items = match fields.remove("uniqueItems") {
+                    None => false,
+                    Some(Value::Bool(value)) => value,
+                    Some(_) => {
+                        return Err("array schema `uniqueItems` must be a boolean".to_owned());
+                    }
+                };
+                Self::Array {
+                    items: Box::new(items),
+                    unique_items,
+                }
+            }
+            "string" => Self::String,
+            "boolean" => Self::Boolean,
+            "number" => Self::Number,
+            "integer" => Self::Integer,
+            "null" => Self::Null,
+            other => return Err(format!("unknown selector schema type `{other}`")),
+        };
+        if let Some(keyword) = fields.keys().next() {
+            return Err(format!("unknown selector schema keyword `{keyword}`"));
+        }
+        Ok(schema)
+    }
+
+    fn validate_definition(&self, path: &str) -> Result<(), DescriptorValidationError> {
+        match self {
+            Self::Object {
+                properties,
+                required,
+                ..
+            } => {
+                let mut seen = BTreeSet::new();
+                for name in required {
+                    if !seen.insert(name) {
+                        return Err(DescriptorValidationError::InvalidSelectorSchema(format!(
+                            "{path}.required repeats `{name}`"
+                        )));
+                    }
+                    if !properties.contains_key(name) {
+                        return Err(DescriptorValidationError::InvalidSelectorSchema(format!(
+                            "{path}.required names unknown property `{name}`"
+                        )));
+                    }
+                }
+                for (name, schema) in properties {
+                    schema.validate_definition(&format!("{path}.properties.{name}"))?;
+                }
+            }
+            Self::Array { items, .. } => {
+                items.validate_definition(&format!("{path}.items"))?;
+            }
+            Self::String
+            | Self::Boolean
+            | Self::Number
+            | Self::Integer
+            | Self::Null => {}
+        }
+        Ok(())
+    }
+
+    fn validate_value(&self, value: &Value, path: &str) -> Result<(), SelectorValidationError> {
+        let fail = |message: String| SelectorValidationError {
+            path: path.to_owned(),
+            message,
+        };
+        match self {
+            Self::Object {
+                properties,
+                required,
+                additional_properties,
+            } => {
+                let object = value
+                    .as_object()
+                    .ok_or_else(|| fail("must be an object".to_owned()))?;
+                for name in required {
+                    if !object.contains_key(name) {
+                        return Err(fail(format!("is missing required property `{name}`")));
+                    }
+                }
+                for (name, child) in object {
+                    match properties.get(name) {
+                        Some(schema) => {
+                            schema.validate_value(child, &format!("{path}.{name}"))?;
+                        }
+                        None if !additional_properties => {
+                            return Err(fail(format!("contains unknown property `{name}`")));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Self::Array {
+                items,
+                unique_items,
+            } => {
+                let array = value
+                    .as_array()
+                    .ok_or_else(|| fail("must be an array".to_owned()))?;
+                for (index, item) in array.iter().enumerate() {
+                    items.validate_value(item, &format!("{path}[{index}]"))?;
+                    if *unique_items && array[..index].contains(item) {
+                        return Err(SelectorValidationError {
+                            path: format!("{path}[{index}]"),
+                            message: "duplicates an earlier array item".to_owned(),
+                        });
+                    }
+                }
+            }
+            Self::String if !value.is_string() => return Err(fail("must be a string".to_owned())),
+            Self::Boolean if !value.is_boolean() => {
+                return Err(fail("must be a boolean".to_owned()));
+            }
+            Self::Number if !value.is_number() => return Err(fail("must be a number".to_owned())),
+            Self::Integer
+                if !(value.as_i64().is_some() || value.as_u64().is_some()) =>
+            {
+                return Err(fail("must be an integer".to_owned()));
+            }
+            Self::Null if !value.is_null() => return Err(fail("must be null".to_owned())),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl ProfileDescriptor {
+    /// Decode and fully validate one bounded descriptor JSON document.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let descriptor: Self =
+            serde_json::from_slice(bytes).map_err(|error| format!("invalid descriptor JSON: {error}"))?;
+        descriptor.validate().map_err(|error| error.to_string())?;
+        Ok(descriptor)
+    }
+
+    /// Validate ABI, closed capabilities, topic vocabulary, defaults, topology, and snapshot
+    /// identity. Closed enum decoding has already rejected unknown capabilities and topology.
+    pub fn validate(&self) -> Result<(), DescriptorValidationError> {
+        if self.abi_version != PROFILE_DESCRIPTOR_ABI_VERSION {
+            return Err(DescriptorValidationError::UnsupportedAbiVersion(
+                self.abi_version,
+            ));
+        }
+        let mut capabilities = BTreeSet::new();
+        for capability in &self.capabilities {
+            if !capabilities.insert(*capability) {
+                return Err(DescriptorValidationError::DuplicateCapability(*capability));
+            }
+        }
+        if !capabilities.contains(&ProfileCapability::Resolve) {
+            return Err(DescriptorValidationError::MissingResolveCapability);
+        }
+        self.selector_schema.validate_definition("$")?;
+
+        let mut topics = BTreeSet::new();
+        for topic in &self.topics {
+            if topic.name.trim().is_empty() {
+                return Err(DescriptorValidationError::EmptyTopic);
+            }
+            if !topics.insert(topic.name.as_str()) {
+                return Err(DescriptorValidationError::DuplicateTopic(
+                    topic.name.clone(),
+                ));
+            }
+        }
+        Self::validate_selector_size(&self.default_selector)
+            .map_err(DescriptorValidationError::InvalidDefaultSelector)?;
+        self.validate_selector_schema_only(&self.default_selector)
+            .map_err(DescriptorValidationError::InvalidDefaultSelector)?;
+        for topic in selector_topics(&self.default_selector)?
+            .iter()
+            .filter_map(Value::as_str)
+        {
+            if !topics.contains(topic) {
+                return Err(DescriptorValidationError::UnknownDefaultTopic(
+                    topic.to_owned(),
+                ));
+            }
+        }
+        if !valid_media_type(&self.snapshot.media_type) {
+            return Err(DescriptorValidationError::InvalidSnapshotMediaType);
+        }
+        if self.snapshot.schema_id.trim().is_empty() {
+            return Err(DescriptorValidationError::EmptySnapshotSchemaId);
+        }
+        Ok(())
+    }
+
+    /// Validate one binding selector against the descriptor schema, topic vocabulary, and 16 KiB
+    /// compact-JSON bound.
+    pub fn validate_selector(&self, selector: &Value) -> Result<(), SelectorValidationError> {
+        Self::validate_selector_size(selector)?;
+        self.validate_selector_schema_only(selector)?;
+        for topic in selector_topics(selector)
+            .map_err(|error| SelectorValidationError {
+                path: "$.topics".to_owned(),
+                message: error.to_string(),
+            })?
+            .iter()
+            .filter_map(Value::as_str)
+        {
+            if !self.topics.iter().any(|published| published.name == topic) {
+                return Err(SelectorValidationError {
+                    path: "$.topics".to_owned(),
+                    message: format!("names unpublished topic `{topic}`"),
+                });
+            }
+        }
+        Ok(())
+    }
+    fn validate_selector_size(selector: &Value) -> Result<(), SelectorValidationError> {
+        let encoded = serde_json::to_vec(selector).map_err(|error| SelectorValidationError {
+            path: "$".to_owned(),
+            message: format!("cannot be encoded as compact JSON: {error}"),
+        })?;
+        if encoded.len() > DEFAULT_SELECTOR_LIMIT_BYTES {
+            return Err(SelectorValidationError {
+                path: "$".to_owned(),
+                message: format!(
+                    "compact JSON is {} bytes; limit is {} bytes",
+                    encoded.len(),
+                    DEFAULT_SELECTOR_LIMIT_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+
+    fn validate_selector_schema_only(
+        &self,
+        selector: &Value,
+    ) -> Result<(), SelectorValidationError> {
+        self.selector_schema.validate_value(selector, "$")
+    }
+}
+
+fn selector_topics(selector: &Value) -> Result<&[Value], DescriptorValidationError> {
+    let Some(topics) = selector.as_object().and_then(|object| object.get("topics")) else {
+        return Ok(&[]);
+    };
+    let topics = topics.as_array().ok_or_else(|| {
+        DescriptorValidationError::InvalidSelectorSchema(
+            "selector `topics` must be an array".to_owned(),
+        )
+    })?;
+    if topics.iter().any(|topic| !topic.is_string()) {
+        return Err(DescriptorValidationError::InvalidSelectorSchema(
+            "selector `topics` entries must be strings".to_owned(),
+        ));
+    }
+    Ok(topics)
+}
+
+fn valid_media_type(media_type: &str) -> bool {
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && !subtype.contains('/')
+        && !media_type.chars().any(char::is_whitespace)
+        && media_type.chars().all(|character| !character.is_control())
+}
 
 /// How carriers resolved through one profile notify (`RESYNC-R04`). Declared alongside the
 /// resolver module instead of sniffed from path basenames.
@@ -304,6 +781,56 @@ impl ResourceProfileRefresh<'_> {
     pub fn get(&self, scheme: &str) -> Option<&ResourceProfile> {
         self.registry.get(scheme)
     }
+    /// Look up and execute the optional descriptor for one exact registered scheme.
+    ///
+    /// `Ok(None)` means either no registration or a passive resolve-only module. An exported
+    /// descriptor is returned only after complete ABI v2 validation.
+    pub fn try_descriptor(&self, scheme: &str) -> Result<Option<ProfileDescriptor>, String> {
+        let Some(profile) = self.registry.profiles.get(scheme) else {
+            return Ok(None);
+        };
+        let ProfileSource::Wasm {
+            module,
+            containment_root,
+            ..
+        } = &profile.source;
+
+        #[cfg(not(feature = "wasm-resolver"))]
+        {
+            let _ = (module, containment_root);
+            Err("profile descriptor unavailable: st2 was built without the `wasm-resolver` feature"
+                .to_owned())
+        }
+        #[cfg(feature = "wasm-resolver")]
+        {
+            self.compiled_resolver(module, containment_root.as_deref())?
+                .describe_once()
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    /// Descriptor lookup that folds an invalid or unavailable descriptor into absence.
+    pub fn descriptor(&self, scheme: &str) -> Option<ProfileDescriptor> {
+        self.try_descriptor(scheme).ok().flatten()
+    }
+
+    #[cfg(feature = "wasm-resolver")]
+    fn compiled_resolver(
+        &self,
+        module: &Path,
+        containment_root: Option<&Path>,
+    ) -> Result<Arc<crate::profile_wasm::WasmResolver>, String> {
+        let key = ModuleCacheKey::new(module, containment_root);
+        let mut modules = self.modules.lock();
+        if let Some(result) = modules.get(&key) {
+            return result.clone();
+        }
+        let result = self
+            .registry
+            .compiled(&key, module, containment_root);
+        modules.insert(key, result.clone());
+        result
+    }
 
     /// Resolve one binding against the registry definitions captured by this refresh.
     pub fn try_resolve(&self, agent_dir: &Path, uri: &str) -> Result<Option<Resolution>, String> {
@@ -330,19 +857,7 @@ impl ResourceProfileRefresh<'_> {
         }
         #[cfg(feature = "wasm-resolver")]
         {
-            let key = ModuleCacheKey::new(module, containment_root.as_deref());
-            let resolver = {
-                let mut modules = self.modules.lock();
-                if let Some(result) = modules.get(&key) {
-                    result.clone()
-                } else {
-                    let result =
-                        self.registry
-                            .compiled(&key, module, containment_root.as_deref());
-                    modules.insert(key, result.clone());
-                    result
-                }
-            }?;
+            let resolver = self.compiled_resolver(module, containment_root.as_deref())?;
             let contained = resolver
                 .resolve_contained(uri, agent_dir)
                 .map_err(|error| error.to_string())?;
@@ -490,6 +1005,17 @@ impl ResourceProfileRegistry {
     pub fn get(&self, scheme: &str) -> Option<&ResourceProfile> {
         self.profiles.get(scheme)
     }
+    /// Execute and validate the optional descriptor for an exact registered scheme.
+    ///
+    /// A missing `describe` export remains a valid passive profile and returns `Ok(None)`.
+    pub fn try_descriptor(&self, scheme: &str) -> Result<Option<ProfileDescriptor>, String> {
+        self.begin_refresh().try_descriptor(scheme)
+    }
+
+    /// Descriptor lookup that folds execution or validation failures into absence.
+    pub fn descriptor(&self, scheme: &str) -> Option<ProfileDescriptor> {
+        self.try_descriptor(scheme).ok().flatten()
+    }
 
     /// Resolve `uri` when its scheme has a registered profile. No scheme or an unregistered
     /// scheme is not this registry's business (`Ok(None)`); the caller's legacy local-path rules
@@ -564,6 +1090,48 @@ fn is_uri_scheme(scheme: &str) -> bool {
 mod tests {
     use super::*;
 
+    const VALID_DESCRIPTOR_JSON: &str = r#"{
+        "abiVersion": 2,
+        "capabilities": ["resolve", "read", "observe"],
+        "selectorSchema": {
+            "type": "object",
+            "properties": {
+                "topics": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "uniqueItems": true
+                },
+                "filter": {
+                    "type": "object",
+                    "properties": {
+                        "draft": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["topics"],
+            "additionalProperties": false
+        },
+        "defaultSelector": {
+            "topics": ["ci.failure", "review.requested"],
+            "filter": { "draft": false }
+        },
+        "topics": [
+            { "name": "ci.failure" },
+            { "name": "ci.success" },
+            { "name": "review.requested" }
+        ],
+        "runtime": { "topology": "shared" },
+        "snapshot": {
+            "mediaType": "application/json",
+            "schemaId": "dev.example.pull.snapshot.v1"
+        }
+    }"#;
+
+    fn valid_descriptor() -> ProfileDescriptor {
+        ProfileDescriptor::from_json(VALID_DESCRIPTOR_JSON.as_bytes())
+            .expect("valid ABI v2 descriptor")
+    }
     fn demo_profile(class: ProfileClass) -> ResourceProfile {
         ResourceProfile::wasm(
             AGENT_GOAL_SCHEME,
@@ -586,6 +1154,160 @@ mod tests {
 )"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn valid_v2_descriptor_and_nested_selector_validate() {
+        let descriptor = valid_descriptor();
+        assert_eq!(descriptor.abi_version, PROFILE_DESCRIPTOR_ABI_VERSION);
+        assert_eq!(descriptor.runtime.topology, RuntimeTopology::Shared);
+        descriptor
+            .validate_selector(&serde_json::json!({
+                "topics": ["ci.success"],
+                "filter": { "draft": true }
+            }))
+            .expect("published topic and nested boolean satisfy the schema");
+    }
+
+    #[test]
+    fn descriptor_rejects_unknown_abi_capability_and_fields() {
+        let unknown_abi = VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 2", "\"abiVersion\": 9");
+        assert!(
+            ProfileDescriptor::from_json(unknown_abi.as_bytes())
+                .unwrap_err()
+                .contains("unsupported profile descriptor ABI version 9")
+        );
+
+        let unknown_capability =
+            VALID_DESCRIPTOR_JSON.replace("\"observe\"", "\"write\"");
+        assert!(
+            ProfileDescriptor::from_json(unknown_capability.as_bytes())
+                .unwrap_err()
+                .contains("unknown variant")
+        );
+
+        let unknown_field =
+            VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 2,", "\"abiVersion\": 2, \"extra\": true,");
+        assert!(
+            ProfileDescriptor::from_json(unknown_field.as_bytes())
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        let unknown_topology =
+            VALID_DESCRIPTOR_JSON.replace(r#""topology": "shared""#, r#""topology": "isolated""#);
+        assert!(
+            ProfileDescriptor::from_json(unknown_topology.as_bytes())
+                .unwrap_err()
+                .contains("unknown variant")
+        );
+
+        let unknown_schema_keyword = VALID_DESCRIPTOR_JSON.replace(
+            r#""draft": { "type": "boolean" }"#,
+            r#""draft": { "type": "boolean", "const": true }"#,
+        );
+        assert!(
+            ProfileDescriptor::from_json(unknown_schema_keyword.as_bytes())
+                .unwrap_err()
+                .contains("unknown selector schema keyword `const`")
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_malformed_json_and_invalid_topic_defaults() {
+        assert!(ProfileDescriptor::from_json(br#"{"abiVersion":"#).is_err());
+
+        let duplicate_topic = VALID_DESCRIPTOR_JSON.replace(
+            r#"{ "name": "ci.success" }"#,
+            r#"{ "name": "ci.failure" }"#,
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProfileDescriptor>(&duplicate_topic)
+                .expect("descriptor shape decodes")
+                .validate(),
+            Err(DescriptorValidationError::DuplicateTopic(topic)) if topic == "ci.failure"
+        ));
+
+        let unknown_default = VALID_DESCRIPTOR_JSON.replace(
+            r#""topics": ["ci.failure", "review.requested"]"#,
+            r#""topics": ["ci.failure", "unpublished"]"#,
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProfileDescriptor>(&unknown_default)
+                .expect("descriptor shape decodes")
+                .validate(),
+            Err(DescriptorValidationError::UnknownDefaultTopic(topic)) if topic == "unpublished"
+        ));
+
+        let empty_topic = VALID_DESCRIPTOR_JSON.replace(
+            r#"{ "name": "ci.success" }"#,
+            r#"{ "name": "" }"#,
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProfileDescriptor>(&empty_topic)
+                .expect("descriptor shape decodes")
+                .validate(),
+            Err(DescriptorValidationError::EmptyTopic)
+        ));
+        let invalid_media_type = VALID_DESCRIPTOR_JSON.replace(
+            r#""mediaType": "application/json""#,
+            r#""mediaType": """#,
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProfileDescriptor>(&invalid_media_type)
+                .expect("descriptor shape decodes")
+                .validate(),
+            Err(DescriptorValidationError::InvalidSnapshotMediaType)
+        ));
+
+        let empty_schema_id = VALID_DESCRIPTOR_JSON.replace(
+            r#""schemaId": "dev.example.pull.snapshot.v1""#,
+            r#""schemaId": " ""#,
+        );
+        assert!(matches!(
+            serde_json::from_str::<ProfileDescriptor>(&empty_schema_id)
+                .expect("descriptor shape decodes")
+                .validate(),
+            Err(DescriptorValidationError::EmptySnapshotSchemaId)
+        ));
+    }
+
+    #[test]
+    fn selector_validation_enforces_schema_topics_uniqueness_and_size() {
+        let descriptor = valid_descriptor();
+        assert!(descriptor
+            .validate_selector(&serde_json::json!({ "topics": ["ci.failure"], "extra": true }))
+            .unwrap_err()
+            .message
+            .contains("unknown property"));
+        assert!(descriptor
+            .validate_selector(&serde_json::json!({ "topics": ["ci.failure", "ci.failure"] }))
+            .unwrap_err()
+            .message
+            .contains("duplicates"));
+        assert!(descriptor
+            .validate_selector(&serde_json::json!({ "topics": ["not.published"] }))
+            .unwrap_err()
+            .message
+            .contains("unpublished topic"));
+        assert!(descriptor
+            .validate_selector(&serde_json::json!({
+                "topics": ["ci.failure"],
+                "filter": { "draft": "yes" }
+            }))
+            .unwrap_err()
+            .message
+            .contains("boolean"));
+
+        let oversized = serde_json::json!({
+            "topics": ["ci.failure"],
+            "filter": { "draft": false },
+            "padding": "x".repeat(DEFAULT_SELECTOR_LIMIT_BYTES)
+        });
+        let error = descriptor
+            .validate_selector(&oversized)
+            .expect_err("oversized selector is rejected before schema activation");
+        assert!(error.message.contains("compact JSON"));
+        assert!(error.message.contains("limit"));
     }
 
     #[test]

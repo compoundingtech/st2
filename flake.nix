@@ -174,6 +174,8 @@
             "resync_notify_chain"
             "--test"
             "profile_wasm"
+            "--test"
+            "resource_profile_supervisor_e2e"
           ];
         });
 

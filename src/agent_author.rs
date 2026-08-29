@@ -144,6 +144,8 @@ pub struct ResourceAddReceipt {
     pub uri: String,
     pub reason: String,
     pub inactive_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<serde_json::Value>,
 }
 
 /// Stable machine-readable receipt from removing one Resource binding.
@@ -359,6 +361,31 @@ pub fn add_resource(
     reason: &str,
     inactive_reason: Option<&str>,
 ) -> Result<ResourceAddReceipt, AuthorError> {
+    add_resource_with_selector(
+        catalog_root,
+        selector,
+        this_host,
+        actor,
+        name,
+        uri,
+        reason,
+        inactive_reason,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_resource_with_selector(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    name: &str,
+    uri: &str,
+    reason: &str,
+    inactive_reason: Option<&str>,
+    resource_selector: Option<&serde_json::Value>,
+) -> Result<ResourceAddReceipt, AuthorError> {
     author_resource(
         catalog_root,
         selector,
@@ -369,6 +396,7 @@ pub fn add_resource(
             uri,
             reason,
             inactive_reason,
+            selector: resource_selector,
         },
     )
     .map(|(result, identity)| ResourceAddReceipt {
@@ -378,6 +406,7 @@ pub fn add_resource(
         uri: uri.to_owned(),
         reason: reason.to_owned(),
         inactive_reason: inactive_reason.map(str::to_owned),
+        selector: resource_selector.cloned(),
     })
 }
 
@@ -438,6 +467,7 @@ enum ResourceIntent<'a> {
         uri: &'a str,
         reason: &'a str,
         inactive_reason: Option<&'a str>,
+        selector: Option<&'a serde_json::Value>,
     },
     Remove {
         name: &'a str,
@@ -1168,8 +1198,9 @@ fn resource_edit(
             uri,
             reason,
             inactive_reason,
+            selector,
         } => {
-            let authored = declared_resource(name, uri, reason, inactive_reason)?;
+            let authored = declared_resource(name, uri, reason, inactive_reason, selector)?;
             let replacement = match declaring(name)? {
                 Some(node) if parsed_resource(node)? == authored => return Ok(None),
                 Some(node) => replace_node(text, node, &render_resource(&authored)?)?,
@@ -1219,6 +1250,7 @@ fn resource_edit(
                 carried.uri(),
                 carried.reason(),
                 carried.inactive_reason(),
+                carried.selector(),
             )?;
             Ok(Some((
                 replace_node(text, node, &render_resource(&renamed)?)?,
@@ -1237,8 +1269,9 @@ fn declared_resource(
     uri: &str,
     reason: &str,
     inactive_reason: Option<&str>,
+    selector: Option<&serde_json::Value>,
 ) -> Result<Resource, AuthorError> {
-    match inactive_reason {
+    let resource = match inactive_reason {
         None => Resource::new(name.to_owned(), uri.to_owned(), reason.to_owned()),
         Some(inactive_reason) => Resource::new_inactive(
             name.to_owned(),
@@ -1247,7 +1280,11 @@ fn declared_resource(
             inactive_reason.to_owned(),
         ),
     }
-    .map_err(|error| AuthorError::new("invalid-resource", error))
+    .map_err(|error| AuthorError::new("invalid-resource", error))?;
+    Ok(match selector {
+        Some(selector) => resource.with_selector(selector.clone()),
+        None => resource,
+    })
 }
 
 fn parsed_resource(node: &KdlNode) -> Result<Resource, AuthorError> {
@@ -1260,26 +1297,48 @@ fn parsed_resource(node: &KdlNode) -> Result<Resource, AuthorError> {
     let mut uri = None;
     let mut reason = None;
     let mut inactive_reason = None;
+    let mut selector = None;
     for entry in node.entries() {
         let value = entry
             .value()
             .as_string()
             .ok_or_else(|| malformed("accepts only string values"))?;
-        let slot = match entry.name().map(|name| name.value()) {
-            None => &mut name,
-            Some("uri") => &mut uri,
-            Some("reason") => &mut reason,
-            Some("inactive-reason") => &mut inactive_reason,
+        match entry.name().map(|name| name.value()) {
+            None => {
+                if name.replace(value).is_some() {
+                    return Err(malformed("declares one of its fields more than once"));
+                }
+            }
+            Some("uri") => {
+                if uri.replace(value).is_some() {
+                    return Err(malformed("declares one of its fields more than once"));
+                }
+            }
+            Some("reason") => {
+                if reason.replace(value).is_some() {
+                    return Err(malformed("declares one of its fields more than once"));
+                }
+            }
+            Some("inactive-reason") => {
+                if inactive_reason.replace(value).is_some() {
+                    return Err(malformed("declares one of its fields more than once"));
+                }
+            }
+            Some("selector") => {
+                if selector.is_some() {
+                    return Err(malformed("declares one of its fields more than once"));
+                }
+                selector = Some(serde_json::from_str(value).map_err(|error| {
+                    malformed(&format!("has invalid JSON `selector`: {error}"))
+                })?);
+            }
             Some(other) => return Err(malformed(&format!("has unsupported property `{other}`"))),
-        };
-        if slot.replace(value).is_some() {
-            return Err(malformed("declares one of its fields more than once"));
         }
     }
     let (Some(name), Some(uri), Some(reason)) = (name, uri, reason) else {
         return Err(malformed("needs a name, a `uri`, and a `reason`"));
     };
-    declared_resource(name, uri, reason, inactive_reason)
+    declared_resource(name, uri, reason, inactive_reason, selector.as_ref())
 }
 
 fn render_resource(resource: &Resource) -> Result<String, AuthorError> {
@@ -1292,7 +1351,27 @@ fn render_resource(resource: &Resource) -> Result<String, AuthorError> {
     if let Some(inactive_reason) = resource.inactive_reason() {
         authored.push_str(&format!(" inactive-reason={}", quoted(inactive_reason)?));
     }
+    if let Some(selector) = resource.selector() {
+        authored.push_str(" selector=");
+        authored.push_str(&raw_json(selector)?);
+    }
     Ok(authored)
+}
+
+fn raw_json(value: &serde_json::Value) -> Result<String, AuthorError> {
+    let json = serde_json::to_string(value).map_err(|error| {
+        AuthorError::new(
+            "invalid-resource",
+            format!("serialize Resource selector as canonical JSON: {error}"),
+        )
+    })?;
+    for hashes in 1..=json.len() + 1 {
+        let fence = "#".repeat(hashes);
+        if !json.contains(&format!("\"{fence}")) {
+            return Ok(format!("{fence}\"{json}\"{fence}"));
+        }
+    }
+    unreachable!("a delimiter longer than the JSON payload cannot occur in the payload")
 }
 
 /// Replace exactly one node's source span. A KDL node span carries neither the leading trivia nor
