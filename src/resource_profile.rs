@@ -1183,6 +1183,8 @@ fn prepare_snapshot<'a>(
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(PublicationError::SnapshotTooLarge { actual: bytes.len() });
     }
+    let parent = target.relative.parent().unwrap_or_else(|| Path::new(""));
+    ensure_absolute_dir_beneath(&target.root, parent).map_err(PublicationError::Io)?;
     let previous = target.current_digest()?;
     let digest = SnapshotDigest::of(bytes);
     let change = match previous {
@@ -1628,6 +1630,27 @@ fn open_absolute_dir_beneath(root: &Path, relative: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+fn ensure_absolute_dir_beneath(root: &Path, relative: &Path) -> io::Result<File> {
+    validate_absolute_path(root).map_err(invalid_input)?;
+    validate_empty_or_relative_path(relative).map_err(invalid_input)?;
+    let mut directory = open_absolute_dir(root)?;
+    for component in relative.components().filter_map(|component| match component {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    }) {
+        let name = c_string(component)?;
+        let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        directory = openat_directory(&directory, component)?;
+    }
+    Ok(directory)
+}
+
 fn validate_empty_or_relative_path(path: &Path) -> Result<(), &'static str> {
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
@@ -1982,6 +2005,21 @@ mod tests {
         assert_eq!(equal.change(), SnapshotChange::Equal);
         assert!(!equal.invalidating());
         assert_eq!(equal.digest(), first.digest());
+    }
+
+    #[test]
+    fn first_publication_creates_missing_contained_parent_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let target = SnapshotTarget::new(&root, "resources/github-pr/owner/repo/389.json").unwrap();
+
+        let outcome = publish_snapshot(&target, b"bytes", vec!["selected".to_owned()]).unwrap();
+
+        assert_eq!(outcome.change(), SnapshotChange::First);
+        assert_eq!(
+            fs::read(root.join("resources/github-pr/owner/repo/389.json")).unwrap(),
+            b"bytes"
+        );
     }
 
     #[test]
