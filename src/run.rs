@@ -4267,11 +4267,11 @@ mod tests {
             evidence.7.is_some() && evidence.8.is_some(),
             "lead transition must reach lead and worker"
         );
+        assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology();
     }
 
     #[cfg(feature = "wasm-resolver")]
-    #[test]
-    fn up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
+    fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
         for retirement in [
             "retired #true",
             "desired-state \"retired\" reason=\"fixture\"",
