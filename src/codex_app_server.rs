@@ -1247,44 +1247,7 @@ fn run_controlled_owned(
         .parent()
         .context("Codex app-server socket has no parent")?;
     secure_dir(socket_dir)?;
-    match fs::symlink_metadata(&socket_path) {
-        Ok(metadata) => {
-            anyhow::ensure!(
-                metadata.file_type().is_socket(),
-                "Codex app-server path already exists and is not a socket: {}",
-                socket_path.display()
-            );
-            match UnixStream::connect(&socket_path) {
-                Ok(_) => anyhow::bail!(
-                    "Codex app-server socket {} is already live; refusing a second control owner",
-                    socket_path.display()
-                ),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    fs::remove_file(&socket_path).with_context(|| {
-                        format!("removing stale Codex socket {}", socket_path.display())
-                    })?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "checking existing Codex socket {} before launch",
-                            socket_path.display()
-                        )
-                    });
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("checking Codex socket path {}", socket_path.display()));
-        }
-    }
+    prepare_socket_for_launch(&socket_path)?;
 
     // Publish a new incarnation only after this process holds the owner lock and has proved that no
     // older daemon is live. A rejected second owner must not invalidate the first owner's binding.
@@ -1325,13 +1288,13 @@ fn run_controlled_owned(
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    let mut server = spawn_process_group(&mut server_command)
+    let mut server = spawn_process_group(&mut server_command, Some(&socket_path))
         .with_context(|| format!("starting {} app-server", codex_argv[0]))?;
     let result = diagnostics
         .record("appServerStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
             run_connected(
-                &mut server,
+                server.child_mut(),
                 &socket_path,
                 &runtime,
                 &codex_argv,
@@ -1340,9 +1303,50 @@ fn run_controlled_owned(
                 diagnostics,
             )
         });
-    terminate_process_group(&mut server);
-    let _ = fs::remove_file(&socket_path);
+    server.terminate();
     result
+}
+
+fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_socket(),
+                "Codex app-server path already exists and is not a socket: {}",
+                socket_path.display()
+            );
+            match UnixStream::connect(socket_path) {
+                Ok(_) => anyhow::bail!(
+                    "Codex app-server socket {} is already live; refusing a second control owner",
+                    socket_path.display()
+                ),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    fs::remove_file(socket_path).with_context(|| {
+                        format!("removing stale Codex socket {}", socket_path.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "checking existing Codex socket {} before launch",
+                            socket_path.display()
+                        )
+                    });
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("checking Codex socket path {}", socket_path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn run_connected(
@@ -1699,12 +1703,13 @@ fn preflight_hook_trust(
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?);
-    let mut server = spawn_process_group(&mut server_command)
+    let mut server = spawn_process_group(&mut server_command, Some(socket_path))
         .with_context(|| format!("starting {codex} hook-trust preflight app-server"))?;
     let result = diagnostics
         .record("hookTrustPreflightStarted", json!({ "pid": server.id() }))
         .and_then(|_| {
-            let Some(control) = connect_control(&mut server, socket_path, STARTUP_TIMEOUT)? else {
+            let Some(control) = connect_control(server.child_mut(), socket_path, STARTUP_TIMEOUT)?
+            else {
                 // Stop requested mid-preflight: skip the projection — the launch proceeds to the
                 // connect stage, whose own stop check exits gracefully before the TUI starts.
                 return Ok(None);
@@ -1714,8 +1719,7 @@ fn preflight_hook_trust(
             };
             query_hook_trust_projection(&mut websocket, cwd)
         });
-    terminate_process_group(&mut server);
-    let _ = fs::remove_file(socket_path);
+    server.terminate();
     let projection = result?;
     diagnostics.record(
         "hookTrustPreflightComplete",
@@ -2905,28 +2909,125 @@ fn poll_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<ControlRea
     }
 }
 
-/// Spawn a non-interactive provider launcher as the leader of an isolated process group.
-/// Its native descendants inherit this group, so cleanup cannot strand a listening process.
-fn spawn_process_group(command: &mut Command) -> std::io::Result<Child> {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    command.spawn()
+/// One app-server process group and the write end of its wrapper-liveness channel.
+///
+/// A watchdog in the dedicated process group owns the read end. The watchdog kills only that
+/// group if this wrapper disappears without running Rust cleanup. Its membership also prevents
+/// the operating system from reusing the group ID before cleanup.
+struct OwnedProcessGroup {
+    child: Child,
+    watchdog: Child,
+    owner_write: Option<UnixStream>,
+    socket_path: Option<PathBuf>,
+    active: bool,
 }
 
-fn terminate_process_group(child: &mut Child) {
-    let process_group = child.id() as i32;
-    unsafe {
-        libc::kill(-process_group, libc::SIGKILL);
+impl OwnedProcessGroup {
+    fn id(&self) -> u32 {
+        self.child.id()
     }
-    let _ = child.kill();
-    let _ = child.wait();
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn terminate(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let process_group = self.watchdog.id() as i32;
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.watchdog.kill();
+        let _ = self.watchdog.wait();
+        if let Some(socket_path) = self.socket_path.as_deref() {
+            let _ = fs::remove_file(socket_path);
+        }
+        self.owner_write.take();
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn set_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
+    let mut flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    flags |= libc::FD_CLOEXEC;
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Spawn a provider launcher in an isolated, wrapper-owned process group.
+///
+/// Explicit cleanup covers normal returns and Rust errors. The in-group watchdog covers wrapper
+/// crashes, SIGKILL, and supervisor teardown. The watchdog holds the group ID until cleanup, so a
+/// stale PID can never identify a process group that belongs to another live owner.
+fn spawn_process_group(
+    command: &mut Command,
+    socket_path: Option<&Path>,
+) -> std::io::Result<OwnedProcessGroup> {
+    let (watchdog_read, owner_write) = UnixStream::pair()?;
+    set_close_on_exec(owner_write.as_raw_fd())?;
+    let owner_write_fd = owner_write.as_raw_fd();
+    let mut watchdog_command = Command::new("/bin/sh");
+    watchdog_command
+        .arg("-c")
+        .arg("IFS= read -r ignored; if [ -n \"$1\" ]; then /bin/rm -f -- \"$1\"; fi; kill -KILL 0")
+        .arg("st2-codex-watchdog")
+        .arg(socket_path.unwrap_or_else(|| Path::new("")))
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(watchdog_read)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        watchdog_command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut watchdog = watchdog_command.spawn()?;
+    let watchdog_process_group = watchdog.id() as i32;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, watchdog_process_group) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(owner_write_fd);
+            Ok(())
+        });
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(owner_write);
+            unsafe {
+                libc::kill(-watchdog_process_group, libc::SIGKILL);
+            }
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+            return Err(error);
+        }
+    };
+    Ok(OwnedProcessGroup {
+        child,
+        watchdog,
+        owner_write: Some(owner_write),
+        socket_path: socket_path.map(Path::to_path_buf),
+        active: true,
+    })
 }
 
 fn terminate_child(child: &mut Child) {
@@ -5354,7 +5455,16 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut launcher = spawn_process_group(&mut command).unwrap();
+        let mut launcher = spawn_process_group(&mut command, None).unwrap();
+        let mut foreign_command = Command::new("/bin/sh");
+        foreign_command
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut foreign_owner = spawn_process_group(&mut foreign_command, None).unwrap();
+        let foreign_pid = foreign_owner.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(1);
         while !descendant_pidfile.is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -5368,7 +5478,12 @@ mod tests {
             "the native descendant was not alive before cleanup"
         );
 
-        terminate_process_group(&mut launcher);
+        launcher.terminate();
+        assert!(
+            process_can_retain_cleanup_resources(foreign_pid),
+            "cleanup killed a different live owner"
+        );
+        foreign_owner.terminate();
         let deadline = Instant::now() + Duration::from_secs(1);
         while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -5382,6 +5497,183 @@ mod tests {
         assert!(
             !survived,
             "native descendant {descendant} survived process-group cleanup"
+        );
+    }
+
+    #[test]
+    fn dropping_a_process_group_owner_reaps_the_group_and_socket() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket_path = temporary.path().join("app-server.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let launcher = spawn_process_group(&mut command, Some(&socket_path)).unwrap();
+        let launcher_pid = launcher.id() as i32;
+        assert!(process_can_retain_cleanup_resources(launcher_pid));
+
+        drop(launcher);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (process_can_retain_cleanup_resources(launcher_pid) || socket_path.exists())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_can_retain_cleanup_resources(launcher_pid),
+            "the app-server survived owner cleanup"
+        );
+        assert!(
+            !socket_path.exists(),
+            "the app-server socket survived owner cleanup"
+        );
+    }
+
+    #[test]
+    fn a_live_socket_refuses_a_second_control_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket_path = temporary.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error = prepare_socket_for_launch(&socket_path).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing a second control owner")
+        );
+        assert!(socket_path.exists(), "the live owner socket was removed");
+        assert!(
+            UnixStream::connect(&socket_path).is_ok(),
+            "the first owner stopped accepting connections"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn a_dead_socket_is_removed_before_launch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket_path = temporary.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+        assert!(socket_path.exists());
+
+        prepare_socket_for_launch(&socket_path).unwrap();
+
+        assert!(!socket_path.exists(), "the dead socket was not removed");
+    }
+
+    #[test]
+    fn an_app_server_group_dies_when_its_wrapper_is_killed() {
+        const TEST_NAME: &str =
+            "codex_app_server::tests::an_app_server_group_dies_when_its_wrapper_is_killed";
+        const ROLE: &str = "ST2_CODEX_ORPHAN_TEST_ROLE";
+        const SOCKET_PATH: &str = "ST2_CODEX_ORPHAN_TEST_SOCKET";
+        const PID_PATH: &str = "ST2_CODEX_ORPHAN_TEST_PID";
+        const READY_PATH: &str = "ST2_CODEX_ORPHAN_TEST_READY";
+
+        match std::env::var(ROLE).as_deref() {
+            Ok("server") => {
+                let socket_path = PathBuf::from(std::env::var_os(SOCKET_PATH).unwrap());
+                let ready_path = PathBuf::from(std::env::var_os(READY_PATH).unwrap());
+                let _listener = UnixListener::bind(socket_path).unwrap();
+                fs::write(ready_path, b"ready").unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            Ok("wrapper") => {
+                let pid_path = PathBuf::from(std::env::var_os(PID_PATH).unwrap());
+                let socket_path = PathBuf::from(std::env::var_os(SOCKET_PATH).unwrap());
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg(TEST_NAME)
+                    .arg("--nocapture")
+                    .env(ROLE, "server")
+                    .env(SOCKET_PATH, std::env::var_os(SOCKET_PATH).unwrap())
+                    .env(READY_PATH, std::env::var_os(READY_PATH).unwrap())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let server = spawn_process_group(&mut command, Some(&socket_path)).unwrap();
+                fs::write(pid_path, server.id().to_string()).unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            Ok(role) => panic!("unknown orphan test role {role}"),
+            Err(_) => {}
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let socket_path = temporary.path().join("app-server.sock");
+        let pid_path = temporary.path().join("app-server.pid");
+        let ready_path = temporary.path().join("app-server.ready");
+        let mut wrapper = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(ROLE, "wrapper")
+            .env(SOCKET_PATH, &socket_path)
+            .env(PID_PATH, &pid_path)
+            .env(READY_PATH, &ready_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (!pid_path.is_file() || !ready_path.is_file()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !pid_path.is_file() || !ready_path.is_file() {
+            let _ = wrapper.kill();
+            let _ = wrapper.wait();
+            panic!("the wrapper did not start its app-server");
+        }
+        let server_pid = fs::read_to_string(&pid_path)
+            .expect("the wrapper did not report its app-server PID")
+            .parse::<i32>()
+            .unwrap();
+        assert!(
+            process_can_retain_cleanup_resources(server_pid),
+            "the app-server was not alive before the wrapper died"
+        );
+        assert!(
+            fs::symlink_metadata(&socket_path)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "the app-server did not bind its socket"
+        );
+
+        unsafe {
+            libc::kill(wrapper.id() as i32, libc::SIGKILL);
+        }
+        let _ = wrapper.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (process_can_retain_cleanup_resources(server_pid) || socket_path.exists())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let server_survived = process_can_retain_cleanup_resources(server_pid);
+        let socket_survived = socket_path.exists();
+        if server_survived {
+            unsafe {
+                libc::kill(server_pid, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_file(&socket_path);
+        assert!(!server_survived, "the app-server survived its wrapper");
+        assert!(
+            !socket_survived,
+            "the app-server socket survived its wrapper"
         );
     }
 
