@@ -5,7 +5,7 @@
 
 use agent_spec::spec::{
     AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, OmpDriver, OpenCodeDriver,
-    PiDriver,
+    PiDriver, TaskKind,
 };
 use anyhow::{Context, Result};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
@@ -20,49 +20,125 @@ const DEV_CHANNELS_FLAG: &str = "--dangerously-load-development-channels";
 ///
 /// Claude Code registers a `server:` channel only when its allowed-channels entry carries
 /// `dev: true`, and that flag is set in exactly one place: the merge of the entries parsed from
-/// `--dangerously-load-development-channels`. A Claude seat is therefore always in one of two
-/// states, neither of which is legible from the declaration and neither of which delivers mail on
-/// its own. Measured admission table: compoundingtech/st2#373.
+/// `--dangerously-load-development-channels`. Measured admission table: compoundingtech/st2#373.
 pub const CHANNEL_NOT_REGISTERED: &str = concat!(
     "the st2 MCP channel server is materialized, but this seat launches without ",
     "`--dangerously-load-development-channels`, so Claude Code skips the channel ",
     "(`server st2 not in --channels list for this session`) and no inbox message reaches ",
-    "the model in-harness; delivery for this seat comes from the DING sidecar only. ",
-    "Adding `--channels server:st2` does not change this: a `server:` entry still needs ",
-    "`dev: true`. See compoundingtech/st2#373",
+    "the model through it. Adding `--channels server:st2` does not change this: a `server:` ",
+    "entry still needs `dev: true`. See compoundingtech/st2#373",
+);
+
+/// The other half of a skipped channel: whether anything else carries this seat's inbox. The
+/// `ding` sidecar is opt-in and is never implied by a driver, so a seat can have no inbox
+/// transport at all — which is worth saying out loud rather than leaving to be discovered.
+pub const CHANNEL_NO_INBOX_TRANSPORT: &str = concat!(
+    "and this seat declares no `ding` sidecar, so nothing else carries its inbox either: ",
+    "messages sent to it reach the model by no path at all",
 );
 
 /// The `dev-channels #true` half of [`CHANNEL_NOT_REGISTERED`].
 pub const CHANNEL_DEV_CONSENT_REQUIRED: &str = concat!(
-    "`dev-channels #true` launches Claude Code with ",
-    "`--dangerously-load-development-channels`, which stops startup at a consent dialog: ",
-    "no MCP server connects and the startup prompt is not read until a human attaches to ",
-    "the pane and accepts. The consent is session state only, so the dialog returns on ",
-    "every launch. See compoundingtech/st2#373",
+    "this seat launches with `--dangerously-load-development-channels`, which stops startup at ",
+    "a consent dialog: no MCP server connects and the startup prompt is not read until a human ",
+    "attaches to the pane and accepts. The consent is session state only, so the dialog returns ",
+    "on every launch. See compoundingtech/st2#373",
 );
+
+/// A shell program can reach the flag through a wrapper, an alias, or a variable, so the absence
+/// of the flag from its source text proves nothing. Saying so beats asserting the wrong state.
+pub const CHANNEL_ROUTE_UNKNOWN: &str = concat!(
+    "the st2 MCP channel server is materialized and this seat launches an opaque shell program, ",
+    "so st2 cannot tell whether Claude Code receives `--dangerously-load-development-channels`. ",
+    "Either the channel is silently skipped or startup stops at the consent dialog; declare the ",
+    "launch as `argv` to make this legible. See compoundingtech/st2#373",
+);
+
+/// What the launch this seat will actually run does about the channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelRoute {
+    /// Nothing on the command line registers a channel.
+    Unregistered,
+    /// The command line carries the development-channels flag.
+    DevConsent,
+    /// The launch is an opaque shell program, so neither can be proven.
+    Opaque,
+}
+
+/// The flag reaches Claude from the typed field or verbatim arguments alike, and `--flag=value`
+/// and a bare `--flag` are both spellings of the same request.
+fn carries_dev_channels(argument: &str) -> bool {
+    argument.starts_with(DEV_CHANNELS_FLAG)
+}
+
+fn claude_channel_route(spec: &AgentSpec) -> Option<ChannelRoute> {
+    match (&spec.driver, spec.delivery) {
+        // `args` are appended to the provider launch verbatim, after the typed flag, so either
+        // source puts the flag on the real command line.
+        (Some(Driver::Claude(driver)), _) => Some(
+            if driver.dev_channels
+                || driver
+                    .args
+                    .iter()
+                    .any(|argument| carries_dev_channels(argument))
+            {
+                ChannelRoute::DevConsent
+            } else {
+                ChannelRoute::Unregistered
+            },
+        ),
+        // The legacy transport renders the same `.mcp.json` from a hand-authored launch, so the
+        // flag is read back from what the operator wrote rather than from a typed field.
+        (None, Some(DeliveryTransport::Mcp)) => {
+            let mut opaque = false;
+            for task in &spec.tasks {
+                if let Some(argv) = task.argv.as_deref()
+                    && argv.iter().any(|argument| carries_dev_channels(argument))
+                {
+                    return Some(ChannelRoute::DevConsent);
+                }
+                if let Some(command) = task.command.as_deref() {
+                    if command.contains(DEV_CHANNELS_FLAG) {
+                        return Some(ChannelRoute::DevConsent);
+                    }
+                    opaque = true;
+                }
+            }
+            Some(if opaque {
+                ChannelRoute::Opaque
+            } else {
+                ChannelRoute::Unregistered
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether this declaration carries the opt-in DING sidecar.
+fn declares_ding_sidecar(spec: &AgentSpec) -> bool {
+    spec.tasks
+        .iter()
+        .any(|task| task.derived && task.kind == TaskKind::Exec && task.name == "ding")
+}
 
 /// The channel advisories that apply to one spec.
 ///
 /// Pure, like the rest of this module: it reads the declaration and nothing else. Callers that
 /// actually create a seat surface these; read-only expansion stays silent.
 pub fn claude_channel_advisories(spec: &AgentSpec) -> Vec<&'static str> {
-    let dev_channels = match (&spec.driver, spec.delivery) {
-        (Some(Driver::Claude(driver)), _) => driver.dev_channels,
-        // The legacy transport renders the same `.mcp.json` from a hand-authored argv, so the
-        // flag is read back from the launch the operator wrote rather than from a typed field.
-        (None, Some(DeliveryTransport::Mcp)) => spec
-            .tasks
-            .iter()
-            .filter_map(|task| task.argv.as_deref())
-            .flatten()
-            .any(|argument| argument.starts_with(DEV_CHANNELS_FLAG)),
-        _ => return Vec::new(),
+    let Some(route) = claude_channel_route(spec) else {
+        return Vec::new();
     };
-    vec![if dev_channels {
-        CHANNEL_DEV_CONSENT_REQUIRED
-    } else {
-        CHANNEL_NOT_REGISTERED
-    }]
+    let mut advisories = vec![match route {
+        ChannelRoute::Unregistered => CHANNEL_NOT_REGISTERED,
+        ChannelRoute::DevConsent => CHANNEL_DEV_CONSENT_REQUIRED,
+        ChannelRoute::Opaque => CHANNEL_ROUTE_UNKNOWN,
+    }];
+    // Only a proven skip justifies the stronger claim; an opaque launch may yet deliver.
+    if route == ChannelRoute::Unregistered && !declares_ding_sidecar(spec) {
+        advisories.push(CHANNEL_NO_INBOX_TRANSPORT);
+    }
+    advisories
 }
 
 /// Reject two launch sources before expansion, task compilation, or workspace writes.
