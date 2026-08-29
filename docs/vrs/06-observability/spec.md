@@ -68,6 +68,21 @@ One module, `src/telemetry.rs`, owns init and teardown via `Telemetry::init(unit
 | Supervisor loop (`st2 up` daemon / systemd unit) | `st2-supervisor` |
 | One-shot CLI invocations | `st2-cli` |
 | Hook executions (`st2 driver claude-observe`; other hook surfaces not instrumented yet) | `st2-hook` |
+| Claude's status-line tee (`st2 driver claude-statusline`) | **none — no pipeline is built** |
+
+**The one deliberate exemption, and the rule behind it.** A subcommand whose cadence is set by a
+harness's refresh timer rather than by an operator or an event does not initialize the telemetry
+pipeline at all (`Telemetry::local_only`). Claude's status-line tee is the only such surface
+today: `refreshInterval: 5` makes it ~720 short-lived processes per hour per seat, and Claude
+waits for each to exit, so the final collect-and-export at shutdown would sit in the render path.
+Measured against a bound-but-never-accepting collector, a tee that builds a pipeline takes 5.0 s
+on the path that logs and `claude-observe` takes 10.0 s, against 0.01–0.06 s with none
+(`08-harness-context`, `DQ-C13`).
+
+The rule is about **cadence, not about being a hook**: `claude-observe` is event-driven, is named
+in the table above, and stays instrumented. Anything added to the exempt list needs the same
+argument — a harness-driven repeat rate and no operation worth a span — not merely being a
+hook-set script.
 
 ## Reconciliation trace hierarchy
 

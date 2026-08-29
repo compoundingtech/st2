@@ -363,6 +363,12 @@ enum DriverCmd {
         #[arg(long)]
         event: String,
     },
+    /// Tee Claude's status-line payload (stdin JSON) into harness context, then chain to the
+    /// operator's own renderer.
+    ClaudeStatusline {
+        #[arg(long)]
+        identity: String,
+    },
     /// Run pi under the session-owned presence wrapper.
     PiSession {
         #[arg(long)]
@@ -1025,8 +1031,17 @@ fn main() -> Result<()> {
         command,
     } = Cli::parse();
 
-    let mut telemetry = st2::telemetry::Telemetry::init(
-        if matches!(command, Command::Up { once: false, .. }) {
+    // Claude's status-line tee is the one subcommand whose cadence a HARNESS sets rather than an
+    // operator or an event: `refreshInterval: 5` makes it ~720 short-lived processes per hour per
+    // seat, and Claude waits for each to exit. Building an OTel pipeline per render — and, at
+    // exit, flushing it — would put a collector round-trip in the render path for a run that is
+    // not an operation worth a span, so the tee never builds one (`DQ-C13`). This is a cadence
+    // rule, not a hook rule: `claude-observe` is event-driven and stays instrumented, exactly as
+    // `06-observability`'s spec names it.
+    let mut telemetry = if matches!(command, Command::Driver(DriverCmd::ClaudeStatusline { .. })) {
+        st2::telemetry::Telemetry::local_only()
+    } else {
+        st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
             "supervisor"
         } else if matches!(
             command,
@@ -1038,8 +1053,8 @@ fn main() -> Result<()> {
             "hook"
         } else {
             "cli"
-        },
-    );
+        })
+    };
     let result = dispatch(command, catalog_path.as_deref());
     telemetry.shutdown();
     result
@@ -1164,6 +1179,11 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run_observe(&catalog, &identity, runtime_id.as_deref(), &event)
+        }
+        Command::Driver(DriverCmd::ClaudeStatusline { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run_statusline(&catalog, &identity)
         }
         Command::Driver(DriverCmd::OpencodeSession {
             identity,

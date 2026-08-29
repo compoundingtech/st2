@@ -56,6 +56,13 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
     }
 }
 
+/// Level filtering for the stderr fmt layer, defaulting to INFO. `RUST_LOG` overrides it on that
+/// layer ONLY (see `install_subscriber`), so stderr verbosity can never silence OTel export.
+fn default_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
 /// Guard holding the tracer, meter, and logger providers for a process lifetime. Explicit
 /// shutdown delivers pending telemetry from short-lived CLI invocations; the process-global
 /// log bridge requires slightly different logger-provider lifetime handling (see [`Self::shutdown`]).
@@ -66,6 +73,30 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    /// Diagnostics on stderr and nothing else: no exporters built, no global providers set, no
+    /// endpoint consulted, and a `shutdown` with nothing to flush.
+    ///
+    /// For a process whose cadence is set by a harness's refresh timer rather than by an operator
+    /// or an event. Claude's status-line tee is the case that motivated it: `refreshInterval: 5`
+    /// makes it ~720 short-lived `st2` processes per hour per seat, and Claude WAITS for each one
+    /// to exit, so the final collect-and-export [`Self::shutdown`] performs would sit in the
+    /// render path — an unreachable collector turning a status line into a stall. A run of the tee
+    /// is not an operation worth a span, so the honest fix is to not build the pipeline rather
+    /// than to build it and hope the flush is quick.
+    ///
+    /// This is deliberately NOT "hook-class subcommands skip telemetry". `06-observability`'s
+    /// spec instruments `st2 driver claude-observe` by name as `st2-hook` and records that other
+    /// hook surfaces are not instrumented yet, so a blanket rule would drop an instrumented
+    /// surface. The rule is about cadence, not about being a hook.
+    pub fn local_only() -> Self {
+        let _ = install_subscriber(tracing_subscriber::registry(), None, None, default_filter());
+        Self {
+            tracer_provider: None,
+            meter_provider: None,
+            logger_provider: None,
+        }
+    }
+
     /// Initialize telemetry for one process unit (`supervisor`, `cli`, ...). The service name
     /// follows the central observability contract's process-unit boundary: `st2-<unit>`.
     pub fn init(unit: &str) -> Self {
@@ -76,16 +107,10 @@ impl Telemetry {
         // bridge"). Level filtering defaults to INFO; `RUST_LOG` overrides it — on the stderr
         // fmt layer ONLY (see `install_subscriber`), so stderr verbosity can never silence
         // OTel span/log export (export-side sampling is a separate decision).
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let filter = default_filter();
 
         if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
-            let _ = install_subscriber(tracing_subscriber::registry(), None, None, filter);
-            return Self {
-                tracer_provider: None,
-                meter_provider: None,
-                logger_provider: None,
-            };
+            return Self::local_only();
         }
 
         let span_exporter = match build_span_exporter() {
@@ -93,12 +118,7 @@ impl Telemetry {
             // Export setup must never take the runner down: telemetry is best-effort.
             Err(err) => {
                 eprintln!("st2: otel exporter unavailable, continuing without telemetry: {err}");
-                let _ = install_subscriber(tracing_subscriber::registry(), None, None, filter);
-                return Self {
-                    tracer_provider: None,
-                    meter_provider: None,
-                    logger_provider: None,
-                };
+                return Self::local_only();
             }
         };
 

@@ -21,6 +21,7 @@ const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-star
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
 const CLAUDE_OBSERVE: &[u8] = include_bytes!("../hooks/claude-observe.sh");
+const CLAUDE_STATUSLINE: &[u8] = include_bytes!("../hooks/claude-statusline.sh");
 // pi has no lifecycle-hook mechanism of its own; an extension is where a pi session exposes the
 // same surface, so it is published and verified as part of the same immutable set. omp is
 // pi-family and takes a forked extension asset (measured divergences: no `agent_settled`, plus
@@ -32,7 +33,7 @@ const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 9] = [
+const HOOKS: [(&str, &[u8]); 10] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
@@ -40,6 +41,7 @@ const HOOKS: [(&str, &[u8]); 9] = [
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
     ("claude-observe.sh", CLAUDE_OBSERVE),
+    ("claude-statusline.sh", CLAUDE_STATUSLINE),
     ("pi-channel.ts", PI_CHANNEL),
     ("omp-channel.ts", OMP_CHANNEL),
 ];
@@ -136,10 +138,23 @@ pub fn claude_settings_registration() -> serde_json::Value {
                     "command": "\"$ST_HOOKS/claude-observe.sh\" SessionStart",
                 },
             ] }],
-            "PreCompact": [{ "hooks": [{
-                "type": "command",
-                "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
-            }] }],
+            // Two commands on one event, deliberately: the stub writes a working-state
+            // reconstruction into the seat's context directory, while the observe hook counts the
+            // compaction on the harness-context record. They do different jobs on the same edge
+            // and both must run, so the registration carries both rather than choosing.
+            "PreCompact": [{ "hooks": [
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
+                },
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" PreCompact",
+                },
+            ] }],
+            // The completion edge. It never increments the count `PreCompact` already made — see
+            // `claude_session::observe_compaction` for why the dedupe is positional.
+            "PostCompact": observe("PostCompact"),
             "StopFailure": [{ "hooks": [{
                 "type": "command",
                 "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
@@ -149,6 +164,23 @@ pub fn claude_settings_registration() -> serde_json::Value {
             "PermissionRequest": observe("PermissionRequest"),
             "PreToolUse": observe("PreToolUse"),
             "PostToolUse": observe("PostToolUse"),
+        },
+        // The status-line payload is the ONLY Claude channel carrying a context window, so st2
+        // occupies the slot to read it — and the slot is single-valued, with the winning
+        // declaration replacing rather than merging. `.claude/settings.local.json` is the
+        // highest-precedence file, so this entry MUST be the chaining tee and never a bare
+        // recorder: anything else silently removes the operator's own status line on every
+        // managed seat (HC-R18).
+        //
+        // All three keys are carried deliberately. `padding: 0` renders the line flush to the
+        // terminal edge, and `refreshInterval: 5` re-runs the command every 5 seconds in addition
+        // to event-driven updates — which is what makes the record a live reading rather than one
+        // frozen between turns, and is well inside the 300-second write heartbeat.
+        "statusLine": {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+            "padding": 0,
+            "refreshInterval": 5,
         }
     })
 }

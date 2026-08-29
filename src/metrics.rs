@@ -203,6 +203,7 @@ fn normalize_hook_event(event: &str) -> &'static str {
         "Stop" => "Stop",
         "SubagentStop" => "SubagentStop",
         "PreCompact" => "PreCompact",
+        "PostCompact" => "PostCompact",
         "Notification" => "Notification",
         _ => "other",
     }
