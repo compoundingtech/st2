@@ -11,7 +11,8 @@ SM="${ST_ROOT:?st2 eval must export ST_ROOT}"
 SUP_ID="${SUP_ID:-gbx.sup}"; WORKER_ID="${WORKER_ID:-gbx.fix}"
 
 # Resolve an id to its on-disk bus dir, tolerating a leading team/host prefix.
-busdir(){ local id="$1" d; d="$(ls -d "$SM"/*."$id" "$SM/$id" 2>/dev/null | head -1)"; printf '%s\n' "${d:-$SM/$id}"; }
+busdir(){ local id="$1" d; d="$(ls -d "$SM"/*."$id" "$SM/$id" 2>/dev/null | head -1)"
+  d="${d:-$SM/$id}"; [ -d "$d/resources/inbox" ] && d="$d/resources"; printf '%s\n' "$d"; }
 msgs_from(){ local owner from; owner="$(busdir "$1")"; from="$2"
   grep -lRE "^from:[[:space:]]*([a-z0-9][a-z0-9._-]*\.)?$from([[:space:]]|\$)" "$owner/inbox" "$owner/archive" 2>/dev/null; }
 
