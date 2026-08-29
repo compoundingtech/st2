@@ -324,7 +324,7 @@ fn context_frame(frame: &Value) -> Option<ContextFrame> {
         return None;
     }
     let reading = frame.get("reading").and_then(Value::as_object).map(|body| {
-        let tokens = |key: &str| body.get(key).and_then(Value::as_u64);
+        let tokens = |key: &str| body.get(key).and_then(token_count);
         harness_context::Reading {
             used_tokens: tokens("usedTokens"),
             window_tokens: tokens("windowTokens"),
@@ -361,6 +361,27 @@ fn context_frame(frame: &Value) -> Option<ContextFrame> {
             }
         });
     (reading.is_some() || compaction.is_some()).then_some((reading, compaction))
+}
+
+/// A token count off the wire, tolerating a fractional one.
+///
+/// Both harnesses round today — pi's fallback estimator is `Math.ceil(chars / 4)` and every
+/// measured reading was integral — so this is deliberately not a decode of anything observed. It
+/// exists because the failure if one ever stops rounding is silent in the worst direction: a plain
+/// integer parse would return `None` for `1234.75`, and the producer would WITHHOLD a reading the
+/// harness actually had. Withholding is reserved for a harness saying it does not know (HC-R03);
+/// spending it on a JSON number shape would make the record lie about which of those happened. The
+/// percent leg already parses as a float because pi and omp genuinely emit one there; this extends
+/// the same tolerance to the operands rather than leaving them stricter for no measured reason.
+///
+/// A negative or non-finite value is not a token count and is withheld.
+fn token_count(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|number| number.is_finite() && *number >= 0.0)
+            .map(|number| number.round() as u64)
+    })
 }
 
 /// The trigger word, over the record's closed vocabulary and additive-tolerant on read: a word
@@ -864,6 +885,28 @@ mod tests {
         let withheld = context_frame(&json!({"type": "context", "reading": {}})).unwrap();
         assert_eq!(withheld.0, Some(harness_context::Reading::default()));
         assert_eq!(withheld.1, None);
+    }
+
+    /// Withholding must mean "the harness said it does not know", never "the number arrived in a
+    /// JSON shape this decoder was strict about". Both harnesses round today — pi's fallback
+    /// estimator is `Math.ceil(chars / 4)` — so a fractional count is not something measured; the
+    /// point is that if one ever stops rounding, a strict integer parse would silently discard a
+    /// real reading and the record would be indistinguishable from an honest withheld one.
+    #[test]
+    fn a_fractional_token_count_is_a_reading_not_a_withheld_value() {
+        assert_eq!(token_count(&json!(23425)), Some(23425));
+        assert_eq!(token_count(&json!(1234.75)), Some(1235));
+        assert_eq!(token_count(&json!(0)), Some(0));
+        // Not counts: a negative, a non-finite, and a non-number are withheld.
+        assert_eq!(token_count(&json!(-1)), None);
+        assert_eq!(token_count(&json!("23425")), None);
+        assert_eq!(token_count(&Value::Null), None);
+
+        let (reading, _) = context_frame(&json!({"type": "context", "reading": {
+            "usedTokens": 1234.75, "windowTokens": 4000, "usedPercent": 30.86
+        }}))
+        .unwrap();
+        assert_eq!(reading.unwrap().used_tokens, Some(1235));
     }
 
     /// A context frame must never be able to take the channel down or stall the inbox, and the two

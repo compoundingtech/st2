@@ -1065,8 +1065,26 @@ each only once a real test proves it (per `CLAUDE.md`):
   pin on pi's own declarations for `getContextUsage`, `model`, and
   `sessionManager` keeps the type gate's teeth where the producer's runtime
   guards deliberately widen the view; what it cannot catch is exactly the change
-  of meaning the fixtures above bound. Note this check does **not** run under
-  `cargo test` — it is a flake check and must be built explicitly.
+  of meaning the fixtures above bound.
+
+  The smoke's channel is a **recorder**, not `true`, and this is the part that
+  makes the check mean something. The extension-to-`pi_channel` frame envelope —
+  `{type: "context", reading: {...}, compaction: {...}}` — has its two halves in
+  different languages in different files, and nothing else couples them: flatten
+  the reading or rename a key and every fixture above stays green while the
+  record is never written for the rest of time. That failure is indistinguishable
+  from the pre-producer state this document describes, which is what makes it
+  silent, and it is the same shape as the replication include list that
+  *Replicated-path discipline* pins names for. So the smoke reads its frames back
+  and asserts the wire: a context frame is emitted at all, the reading carries
+  all five keys, the numerator is each harness's own (23,425 for pi, 22,500 and
+  explicitly not 22,525 for omp), the percent is unclamped, an edge whose session
+  store could not be read still arrives countless, and pi's withheld reading
+  rides the same frame as its edge. Verified non-vacuous by flattening the
+  envelope and watching the check fail.
+
+  Note this check does **not** run under `cargo test` — it is a flake check and
+  must be built explicitly.
 
 ## Open design questions
 

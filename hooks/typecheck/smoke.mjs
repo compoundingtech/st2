@@ -3,8 +3,38 @@
 // classes a type-only gate is provably blind to. The channel binary is `true`, so the open
 // times out its hello and resolves empty; any thrown error fails the smoke.
 import assert from "node:assert";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-process.env.ST2_PI_CHANNEL_BIN = process.env.SMOKE_TRUE_BIN ?? "/bin/true";
+// A recorder standing in for `st2 driver pi-channel`, so this smoke can assert what the extension
+// EMITS and not merely that it loads. With `true` as the channel binary the frames go into a pipe
+// nobody reads, which cannot tell a working producer from one that writes nothing at all — and a
+// producer that silently writes nothing is indistinguishable from the pre-producer state, where
+// every declaration's context reads null. That is the failure this file has to be able to see.
+//
+// It speaks the two things the extension needs: a protocol-1 hello so `open()` settles without
+// waiting out its timeout, and an append of every frame line to a file this smoke reads back.
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st2-pi-smoke-"));
+const framesPath = path.join(dir, "frames.jsonl");
+const recorder = path.join(dir, "recorder");
+fs.writeFileSync(
+  recorder,
+  `#!${process.execPath}
+import fs from "node:fs";
+process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
+`,
+  { mode: 0o755 },
+);
+const readFrames = () =>
+  (fs.existsSync(framesPath) ? fs.readFileSync(framesPath, "utf8") : "")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+
+process.env.ST2_PI_CHANNEL_BIN = recorder;
 process.env.ST2_PI_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
 process.env.ST2_PI_CHANNEL_IDENTITY = "smoke.worker";
 process.env.ST2_PI_CHANNEL_RUNTIME_ID = "smoke.worker";
@@ -97,5 +127,62 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("agent_settled")({}, ctx);
   await handlers.get("session_shutdown")({ reason: "smoke" }, ctx);
 }
+
+// Give the recorder a moment to drain what was written to its stdin, then assert the wire.
+await new Promise((resolve) => setTimeout(resolve, 500));
+const frames = readFrames();
+const context = frames.filter((frame) => frame.type === "context");
+assert.ok(context.length > 0, "the producer must emit context frames, not merely load");
+
+// The exact keys `src/pi_channel.rs::context_frame` decodes. Both halves of this contract live in
+// different languages and different files, so nothing but this assertion couples them: flatten the
+// reading or rename a key and every Rust fixture still passes while the record is never written.
+const reading = context.find((frame) => frame.reading);
+assert.ok(reading, "a context frame must carry a `reading` object");
+// Every leg is always present, `null` where withheld — one absence convention on the wire, so the
+// Rust decoder never has to tell "absent" from "the harness said it does not know".
+for (const key of ["usedTokens", "windowTokens", "usedPercent", "model", "costUsd"]) {
+  assert.ok(key in reading.reading, `reading carries ${key}`);
+}
+
+// Selected by predicate, not by position: the contexts are driven in a fixed order but which one
+// produced a given frame is not what is under test, and asserting on `frames[0]` would make this
+// break whenever the loop gains a case.
+const known = context.find((frame) => typeof frame.reading?.usedTokens === "number");
+assert.ok(known, "a populated context must produce a reading with real numbers");
+assert.strictEqual(known.reading.usedTokens, 23425, "pi's numerator is totalTokens");
+assert.strictEqual(known.reading.windowTokens, 4000);
+assert.strictEqual(known.reading.usedPercent, 585.625, "carried raw, never clamped");
+assert.strictEqual(known.reading.model, "fake-1");
+
+// The cost hold, on the wire. `session_start` legitimately carries `costUsd: null` — the hold is
+// cleared on session replacement, so a fresh session does not restate its predecessor's cost — and
+// a later frame from an event carrying no cost of its own must still restate the held one, or the
+// record's wholesale field replacement would erase it.
+const withCost = context.find((frame) => typeof frame.reading?.costUsd === "number");
+assert.ok(withCost, "the held cost must be restated on frames after a message-bearing event");
+assert.strictEqual(withCost.reading.costUsd, 0.070305);
+
+const edges = context.filter((frame) => frame.compaction);
+assert.ok(edges.length > 0, "a compaction edge must ride a context frame");
+for (const edge of edges) {
+  assert.strictEqual(edge.compaction.trigger, "overflow", "pi names its own trigger");
+}
+// A context whose session store cannot be read still sends the edge, with no count: st2 then
+// counts it itself. The edge is never what gets dropped.
+assert.ok(
+  edges.some((edge) => edge.compaction.count === null),
+  "an unreadable session store must still send the edge, countless",
+);
+const durable = edges.find((edge) => typeof edge.compaction.count === "number");
+assert.ok(durable, "a readable session store must supply the durable count");
+assert.strictEqual(durable.compaction.count, 2, "the count is getEntries() filtered to compactions");
+// The pairing the write guard makes load-bearing: the withheld reading must be in the SAME frame
+// as the edge, or it lands in no write until the heartbeat comes due.
+assert.strictEqual(durable.reading.usedTokens, null, "the withheld reading rides the edge");
+assert.strictEqual(durable.reading.usedPercent, null);
+assert.strictEqual(durable.reading.windowTokens, 4000, "pi still knows its denominator");
+
+fs.rmSync(dir, { recursive: true, force: true });
 console.log("pi extension smoke: ok");
 process.exit(0);
