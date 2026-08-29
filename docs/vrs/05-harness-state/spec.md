@@ -184,12 +184,18 @@ kill that removes the registry entry leaves nothing behind to prove death
 with, and fabricating evidence is the one thing this design never does.
 
 Each controlled Codex startup generates the installed app-server schema. st2
-checks the methods, response fields, blocking flags, and classified item and
-server-request kinds that native delivery uses. A compatible patch or minor
-release starts without a source change. A delivery-critical schema change
-stops before the app-server starts. The wrapper sends one idempotent rejection
-report to the agent's declared supervisor. The version string is diagnostic
-data, not an admission proxy.
+checks the required methods, response fields, blocking flags, and data shapes
+that native delivery uses. A compatible patch or minor release starts without
+a source change. A missing required element or a changed critical shape stops
+before the app-server starts. The wrapper sends one idempotent rejection report
+to the agent's declared supervisor. The version string is diagnostic data, not
+an admission proxy.
+
+Additive item kinds and server-request methods do not stop startup. A listed
+element is reviewed and safe to ignore. An unlisted element creates an
+`UnknownProtocol` delivery hold. The next safe thread status releases the hold.
+This fail-closed runtime rule keeps the agent present and prevents a silent
+delivery into a new hold that st2 does not understand.
 
 ## Codex producer (OHS-R05)
 
@@ -207,6 +213,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { ConflictingTurn }` | `active` | `none` | `none` | `conflictingTurn` — two turns believed live is maximally active |
 | `Held { Review }` | `active` | `none` | `none` | `review` — review's enter and exit are model-emitted items inside a running turn; nothing awaits a human |
 | `Held { Compaction }` | `active` | `none` | `none` | `compaction` |
+| `Held { UnknownProtocol }` | `active` | `none` | `none` | `unknownProtocol` — an additive protocol element blocks delivery until a safe thread status arrives |
 | `Held { WaitingOnApproval }` | `active` | `human` | `permission` | `waitingOnApproval` |
 | `Held { WaitingOnUserInput }` | `active` | `human` | `question` | `waitingOnUserInput` |
 | `Held { NotLoaded }` | *withhold* | — | — | thread not loaded proves nothing about work |

@@ -50,8 +50,8 @@ const REQUIRED_CODEX_SERVER_NOTIFICATIONS: &[&str] = &[
     "turn/completed",
     "turn/started",
 ];
-// The control observer does not answer server requests. A new request class must be reviewed before
-// st2 can prove that the interactive client, and not this observer, owns the response.
+// The control observer does not answer server requests. A listed request is reviewed and safe to
+// ignore. An unlisted request creates a delivery hold until the thread reports a safe status.
 const CLASSIFIED_CODEX_SERVER_REQUESTS: &[&str] = &[
     "account/chatgptAuthTokens/refresh",
     "applyPatchApproval",
@@ -65,8 +65,8 @@ const CLASSIFIED_CODEX_SERVER_REQUESTS: &[&str] = &[
     "item/tool/requestUserInput",
     "mcpServer/elicitation/request",
 ];
-// Unknown item kinds can add a delivery hold that the thread status does not expose. Each item kind
-// must therefore be classified before startup, even when st2 does not otherwise read its fields.
+// A listed item is reviewed and safe to ignore unless `observe` handles it explicitly. An unlisted
+// item creates a delivery hold until the thread reports a safe status.
 const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
     "agentMessage",
     "collabAgentToolCall",
@@ -240,6 +240,7 @@ pub enum CodexHoldReason {
     ConflictingTurn,
     Review,
     Compaction,
+    UnknownProtocol,
     NotLoaded,
     SystemError,
     WaitingOnApproval,
@@ -295,6 +296,9 @@ impl CodexObservedState {
                 CodexHoldReason::Compaction => {
                     Some(observation(Activity::Active, BlockedOn::None).with_reason("compaction"))
                 }
+                CodexHoldReason::UnknownProtocol => Some(
+                    observation(Activity::Active, BlockedOn::None).with_reason("unknownProtocol"),
+                ),
                 // Codex positively reported active; st2 merely cannot name a steerable turn.
                 CodexHoldReason::ActiveWithoutTurn => Some(
                     observation(Activity::Active, BlockedOn::None).with_reason("activeWithoutTurn"),
@@ -1047,7 +1051,8 @@ impl CodexControlState {
                     "enteredReviewMode" => (CodexHoldReason::Review, false),
                     "exitedReviewMode" => (CodexHoldReason::Review, true),
                     "contextCompaction" => (CodexHoldReason::Compaction, false),
-                    _ => return Ok(false),
+                    _ if CLASSIFIED_CODEX_THREAD_ITEMS.contains(&item_type) => return Ok(false),
+                    _ => (CodexHoldReason::UnknownProtocol, false),
                 };
                 let turn_id = required_string(message, "/params/turnId", method)?;
                 if released {
@@ -1055,6 +1060,11 @@ impl CodexControlState {
                 } else {
                     self.observe_non_steerable(turn_id, reason);
                 }
+            }
+            _ if message.get("id").is_some()
+                && !CLASSIFIED_CODEX_SERVER_REQUESTS.contains(&method) =>
+            {
+                self.observe_unknown_protocol();
             }
             _ => return Ok(false),
         }
@@ -1101,6 +1111,7 @@ impl CodexControlState {
                         reason:
                             CodexHoldReason::Review
                             | CodexHoldReason::Compaction
+                            | CodexHoldReason::UnknownProtocol
                             | CodexHoldReason::ConflictingTurn,
                         ..
                     },
@@ -1137,7 +1148,10 @@ impl CodexControlState {
                 self.observed.clone()
             }
             CodexObservedState::Held {
-                reason: reason @ (CodexHoldReason::Review | CodexHoldReason::Compaction),
+                reason:
+                    reason @ (CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::UnknownProtocol),
                 ..
             } => CodexObservedState::Held {
                 reason: *reason,
@@ -1177,6 +1191,7 @@ impl CodexControlState {
                 reason:
                     CodexHoldReason::Review
                     | CodexHoldReason::Compaction
+                    | CodexHoldReason::UnknownProtocol
                     | CodexHoldReason::ConflictingTurn
                     | CodexHoldReason::WaitingOnApproval
                     | CodexHoldReason::WaitingOnUserInput
@@ -1213,14 +1228,18 @@ impl CodexControlState {
             } if current_reason == &reason
                 && matches!(
                     reason,
-                    CodexHoldReason::Review | CodexHoldReason::Compaction
+                    CodexHoldReason::Review
+                        | CodexHoldReason::Compaction
+                        | CodexHoldReason::UnknownProtocol
                 ) =>
             {
                 self.observed.clone()
             }
             _ if matches!(
                 reason,
-                CodexHoldReason::Review | CodexHoldReason::Compaction
+                CodexHoldReason::Review
+                    | CodexHoldReason::Compaction
+                    | CodexHoldReason::UnknownProtocol
             ) =>
             {
                 CodexObservedState::Held {
@@ -1253,6 +1272,24 @@ impl CodexControlState {
         }
         self.observed = CodexObservedState::Active {
             turn_id: turn_id.to_string(),
+        };
+    }
+
+    fn observe_unknown_protocol(&mut self) {
+        if matches!(self.observed, CodexObservedState::TerminalError { .. }) {
+            return;
+        }
+        let turn_id = match &self.observed {
+            CodexObservedState::Active { turn_id }
+            | CodexObservedState::Held {
+                turn_id: Some(turn_id),
+                ..
+            } => Some(turn_id.clone()),
+            _ => None,
+        };
+        self.observed = CodexObservedState::Held {
+            reason: CodexHoldReason::UnknownProtocol,
+            turn_id,
         };
     }
 }
@@ -2864,17 +2901,7 @@ fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> Result<()> {
         REQUIRED_CODEX_SERVER_NOTIFICATIONS,
         "server notification",
     )?;
-    let server_requests = schema_methods(&schemas.server_requests, "server request")?;
-    let classified_server_requests = string_set(CLASSIFIED_CODEX_SERVER_REQUESTS);
-    let unknown_server_requests = server_requests
-        .difference(&classified_server_requests)
-        .cloned()
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        unknown_server_requests.is_empty(),
-        "unclassified server request methods: {}",
-        unknown_server_requests.join(", ")
-    );
+    schema_methods(&schemas.server_requests, "server request")?;
 
     let status_variants = schema_variants(definitions, "ThreadStatus", "type")?;
     for status in ["notLoaded", "idle", "systemError", "active"] {
@@ -2904,17 +2931,6 @@ fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> Result<()> {
     );
 
     let item_variants = schema_variants(definitions, "ThreadItem", "type")?;
-    let classified_items = string_set(CLASSIFIED_CODEX_THREAD_ITEMS);
-    let unknown_items = item_variants
-        .keys()
-        .filter(|item| !classified_items.contains(*item))
-        .cloned()
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        unknown_items.is_empty(),
-        "unclassified ThreadItem variants: {}",
-        unknown_items.join(", ")
-    );
     for item in [
         "contextCompaction",
         "enteredReviewMode",
@@ -4109,7 +4125,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_schema_gate_rejects_an_unclassified_server_request() {
+    fn protocol_schema_gate_accepts_additive_items_and_server_requests() {
         let mut schemas = compatible_protocol_schemas();
         schemas
             .server_requests
@@ -4125,12 +4141,15 @@ mod tests {
                     .unwrap()
                     .remove(0),
             );
-        let error = verify_codex_protocol_schemas(&schemas).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unclassified server request methods: future/request")
-        );
+        schemas
+            .protocol
+            .pointer_mut("/definitions/ThreadItem/oneOf")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(tagged_variant("futureItem", &[], &[]));
+
+        verify_codex_protocol_schemas(&schemas).unwrap();
     }
 
     #[test]
@@ -6163,6 +6182,107 @@ mod tests {
             );
             assert_eq!(state.observed(), &observed);
         }
+    }
+
+    #[test]
+    fn an_unclassified_item_holds_until_the_next_idle_status() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "turnId": "turn-1",
+                        "item": { "type": "futureBlockingItem", "id": "item-1" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownProtocol,
+                turn_id: Some(turn_id),
+            } if turn_id == "turn-1"
+        ));
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "thread/status/changed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "status": { "type": "idle" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    #[test]
+    fn an_unclassified_server_request_holds_until_the_next_idle_status() {
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let mut state = CodexControlState::new(&runtime, "thread-main".into());
+        state
+            .observe(&json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-main", "turn": { "id": "turn-1" } }
+            }))
+            .unwrap();
+
+        assert!(
+            !state
+                .observe(&json!({
+                    "id": 1,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {}
+                }))
+                .unwrap()
+        );
+        assert!(matches!(
+            state.observed(),
+            CodexObservedState::Active { .. }
+        ));
+
+        assert!(
+            state
+                .observe(&json!({
+                    "id": 2,
+                    "method": "future/request",
+                    "params": {}
+                }))
+                .unwrap()
+        );
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownProtocol,
+                turn_id: Some("turn-1".into()),
+            }
+        );
+
+        assert!(
+            state
+                .observe(&json!({
+                    "method": "thread/status/changed",
+                    "params": {
+                        "threadId": "thread-main",
+                        "status": { "type": "idle" }
+                    }
+                }))
+                .unwrap()
+        );
+        assert_eq!(state.observed(), &CodexObservedState::Idle);
     }
 
     #[test]

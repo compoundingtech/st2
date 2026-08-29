@@ -115,7 +115,7 @@ path reads this record.
   nothing there awaits a human (matching the projection's
   `Held { Review }` → `active` / `blockedOn: none` row) — while
   `WaitingOnApproval` and `WaitingOnUserInput` report `active` with
-  `blockedOn: human`. `Compaction` reports `active`, and
+  `blockedOn: human`. `Compaction` and `UnknownProtocol` report `active`, and
   `NotLoaded`/`SystemError`/`AwaitingStatus` withhold rather than write.
   `Held` — a delivery predicate — never appears in the published vocabulary.
 - **OHS-R06 Heartbeat only on evidence:** A writer re-stamps the record on the
