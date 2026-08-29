@@ -15,16 +15,21 @@ replicated-record names — `src/harness_context.rs`, with the invariant rows
 *Harness context discipline* and *Replicated-path discipline* naming their
 proofs.
 
-**Two producers ship: claude and codex.** The status-line tee (HC-R18), the
-Claude fill arithmetic, and its compaction accounting are in the tree as of
-2026-08-29 — `hooks/claude-statusline.sh`, `st2 driver claude-statusline`, and
-the `PreCompact`/`PostCompact` registrations, with the invariant row
-*Status-line slot chaining* naming their proofs. The codex app-server pump
-writes the record from `thread/tokenUsage/updated` and counts compactions off
-the `contextCompaction` thread item — `src/codex_app_server.rs`. Both rows are
-version-pinned by HC-R13 fixtures. The pi, omp, and opencode rows of the
-producer table below are unimplemented, so those declarations' `context` still
-reads `null`. That is the honest state, not a defect of the envelope.
+**Four of the five producers ship: claude, codex, pi, and omp.** The
+status-line tee (HC-R18), the Claude fill arithmetic, and its compaction
+accounting are in the tree as of 2026-08-29 — `hooks/claude-statusline.sh`,
+`st2 driver claude-statusline`, and the `PreCompact`/`PostCompact`
+registrations, with the invariant row *Status-line slot chaining* naming their
+proofs. The codex app-server pump writes the record from
+`thread/tokenUsage/updated` and counts compactions off the `contextCompaction`
+thread item — `src/codex_app_server.rs`. The pi and omp rows share one extension
+path in `hooks/pi-channel.ts` and `hooks/omp-channel.ts`, consumed by
+`src/pi_channel.rs`, which writes through a harness-context `Writer` beside the
+harness-state writer it already owned and with the same incarnation. All four
+rows are fixture-pinned (HC-R13). The opencode row of the producer table below
+is unimplemented, so an OpenCode declaration still reads `context: null`. That
+is the honest state, not a defect of the envelope. HC-R11 is therefore partially
+satisfied; it is not met until all five ship.
 
 The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
@@ -151,9 +156,15 @@ Field rules:
   **never** occupancy. It is named for that distinction (HC-R16): a measured
   Codex session read 2,235,329 cumulative against a 258,400-token window, so a
   consumer dividing it by `windowTokens` reports >800%.
-- `costUsd` is the harness-reported session cost, in the harness's own
-  accounting, and no st2 path recomputes or reconciles it. Codex reports none;
-  the field is `null` there.
+- `costUsd` is the harness-reported cost, in the harness's own accounting and at
+  whatever scope that harness reports it, and no st2 path recomputes or
+  reconciles it. Claude and OpenCode report a session total; pi and omp report a
+  per-message figure and the record carries the last assistant message's — see
+  the producer table and
+  [`DELTA-005`](../.delta/DELTA-005-harness-context-cost-is-per-message-on-pi-and-omp.md),
+  which records that HC-R16 still says "session cost" and needs widening. Codex
+  reports none; the field is `null` there. A consumer comparing this field across
+  harnesses must read the `harness` discriminator first.
 - `rateLimits` is harness-reported and account-scoped (HC-T06). It repeats
   across every agent runtime sharing an account. Absent windows are `null`.
 - `lastCompactionTrigger` is a closed union, additive-tolerant on read: an
@@ -701,6 +712,45 @@ compaction and read back correctly on the next process's `session_start`).
 `ctx.model.id` supplies `model`; the per-message `usage.cost.total` supplies
 `costUsd`.
 
+Three facts settled while implementing, each of which changes the shape of the
+producer rather than only its constants:
+
+- **The nulls are already there inside the handler.** `getContextUsage()` called
+  *within* pi's own `session_compact` handler returns `{tokens: null,
+  contextWindow: 4000, percent: null}` — not the pre-compaction numbers — and
+  `getEntries()` has already counted the new entry there (2 → 3 read in the same
+  handler). So the edge and the withheld reading are available together and are
+  emitted as **one frame that lands as one write**. That pairing is load-bearing,
+  not an optimization: a compaction edge always writes while a withheld percent
+  has no bucket, so an edge written on its own would publish the stale
+  pre-compaction numbers beside it, and the null reading proving the window was
+  emptied would not appear until the heartbeat came due.
+- **`message_end` is the emit boundary, not `turn_end`.** The producer emits on
+  `session_start`, `message_end`, `turn_end`, `agent_end`, and `agent_settled`,
+  and holds no cadence policy of its own — the write guard is what bounds cost,
+  at one write per bucket entered however chatty the harness is. The finest
+  boundary is what matters, for the same reason turn-boundary-only *writing* was
+  disqualified above at 92% of warnings missed: the wedge case is a single long
+  turn, and on pi each tool call and its result form their own assistant
+  message. One consequence is worth stating because it looks like a defect and
+  is not: immediately after a compaction, `message_end` for the next assistant
+  message still reads `null` while that message's own `usage` is already
+  populated, and only `turn_end` reports the new occupancy. The producer
+  forwards both honestly — the null is a real reading of "pi does not know yet".
+- **`costUsd` is restated on every frame, from a producer-side hold.** Cost rides
+  only the message-bearing events, but a frame is emitted from events that carry
+  none. The record replaces a reading's fields wholesale — deliberately, so a
+  withheld value is never fabricated from a previous one — so a frame omitting
+  the cost would *erase* the published one at the next turn boundary. The
+  extension holds the last assistant `usage.cost.total` and restates it, which is
+  exactly what `costUsd` means for pi and omp. This is the one place where the
+  record's general field description ("the harness-reported session cost") and
+  the per-harness rule (a per-message figure) differ, and the per-harness rule
+  wins: summing to a session total would need the producer-side accumulator
+  HC-R16 refuses for `sessionTotalTokens` for the same reason. The hold is
+  cleared on session replacement, so a `/new` session does not restate its
+  predecessor's cost.
+
 ### omp (18.0.9, also verified on 18.0.3)
 
 The same call, the same shape — and a different meaning. omp's `tokens` settles
@@ -717,6 +767,30 @@ trigger is `unknown` even though omp internally calls its auto-compaction with
 `"idle"` and `"threshold"` — those words are not projected onto the event. The
 count is harness-durable through the same `sessionManager.getEntries()` path as
 pi's.
+
+The producer is otherwise the pi one with two divergences, both measured:
+
+- **omp does not null its reading at the edge.** Inside `session_compact`,
+  `getContextUsage()` still answers (8,100 measured against a 4,000-token
+  window), where pi's returns nulls. Both harnesses therefore send the reading
+  and the edge as one frame; only pi's carries a withheld one.
+- **The emit set drops `agent_settled`**, which omp does not have (0 occurrences
+  in either binary), and the idle edge stays the existing `agent_end` poll. omp
+  fires `session_start`, `message_end`, `turn_end`, and `agent_end` with a
+  working `getContextUsage()` on each.
+
+The version pin (HC-R13, HC-T03) extends the existing launch gate rather than
+adding a mechanism beside it, and the two answer deliberately different
+questions. `SUPPORTED_OMP_MINORS` admits a **minor series**, because a patch
+inside an admitted minor costs no new evidence (decision 0007); the fixture pins
+the **exact builds** a number's meaning was measured on, because "`tokens` is
+prompt-only input" is a property of a build and not of any documented contract.
+`src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`
+keeps them from drifting apart: a build the fixture claims to have measured but
+the gate would refuse to launch is evidence for a version the fleet can never
+run. pi has no runtime gate at all, so its fixture pins the flake tarball the
+extension check already type-checks and runtime-smokes against
+(`the_measured_pi_release_is_the_one_the_extension_gate_pins`).
 
 Correction of record: the 18.0.3 capture
 ([`2026-08-25-omp-harness-integration.md`](../06-omp-driver/.experiments/2026-08-25-omp-harness-integration.md))
@@ -768,6 +842,13 @@ and additive-tolerant. `idle` is in v1 because omp's internal auto-compaction
 names it; **no v1 producer emits it**, since omp does not project its reason
 onto the event. A word arriving that a reader does not recognize decodes as
 `unknown`.
+
+A harness-durable row degrades to its incarnation-scoped neighbour rather than
+losing the edge: a producer that cannot read the session store sends the edge
+without a count, and st2 increments its own. That is a weaker answer — the scope
+silently narrows, which is why it is stated here — and never a wrong one, and it
+is the only path by which a "harness-durable" row can produce an
+incarnation-scoped number.
 
 "Incarnation" scope means the counter starts at zero when the session record is
 claimed (HC-R15); "harness-durable" means the harness's own session store
@@ -955,6 +1036,55 @@ each only once a real test proves it (per `CLAUDE.md`):
   exactly these bytes together — a populated live capture needs a paid turn and
   none was taken. A bump that moves the numerator's terms or the percent rule
   still fails the fixture, which is what HC-R13 asks of it.
+
+  Shipped for pi and omp:
+  `src/pi_channel.rs::the_pi_0_84_2_fixture_pins_total_tokens_as_the_numerator`,
+  `src/pi_channel.rs::the_omp_18_0_9_fixture_pins_prompt_input_as_the_numerator`,
+  `src/pi_channel.rs::a_pi_compaction_withholds_the_reading_it_emptied_in_the_same_write`,
+  `src/pi_channel.rs::an_omp_compaction_yields_unknown_because_the_event_names_no_reason`,
+  `src/pi_channel.rs::an_unreadable_durable_count_degrades_to_counting_edges_not_to_losing_them`,
+  `src/pi_channel.rs::context_frames_decode_conservatively_or_not_at_all`,
+  `src/pi_channel.rs::the_measured_pi_release_is_the_one_the_extension_gate_pins`,
+  `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`.
+
+  Each fixture carries *both* numbers from its capture — the one the producer
+  must publish and the one it must not — because the failure this test exists to
+  catch is a change of meaning with no change of shape, which no type gate and no
+  round-trip assertion can see. The pi fixture asserts `23425` and not `23300`;
+  the omp fixture asserts the prompt figure and not that message's `totalTokens`.
+
+- **Extension asset runtime smoke** — `checks.pi-extension-types` transpiles both
+  shipped assets and drives every registered handler, because the type gate is
+  provably blind to execution-order defects (a TDZ shipped green through it).
+  Each handler is now driven with three contexts: a bare one carrying none of the
+  telemetry surface (the fail-open path an unmanaged or older build takes), a
+  fully populated one carrying the measured shapes, and one whose every telemetry
+  pull throws. The bare context alone was the gap — it never executes the
+  producer's body at all, so a use-before-declaration inside it would have
+  shipped green through both the type gate and the previous smoke. A compile-time
+  pin on pi's own declarations for `getContextUsage`, `model`, and
+  `sessionManager` keeps the type gate's teeth where the producer's runtime
+  guards deliberately widen the view; what it cannot catch is exactly the change
+  of meaning the fixtures above bound.
+
+  The smoke's channel is a **recorder**, not `true`, and this is the part that
+  makes the check mean something. The extension-to-`pi_channel` frame envelope —
+  `{type: "context", reading: {...}, compaction: {...}}` — has its two halves in
+  different languages in different files, and nothing else couples them: flatten
+  the reading or rename a key and every fixture above stays green while the
+  record is never written for the rest of time. That failure is indistinguishable
+  from the pre-producer state this document describes, which is what makes it
+  silent, and it is the same shape as the replication include list that
+  *Replicated-path discipline* pins names for. So the smoke reads its frames back
+  and asserts the wire: a context frame is emitted at all, the reading carries
+  all five keys, the numerator is each harness's own (23,425 for pi, 22,500 and
+  explicitly not 22,525 for omp), the percent is unclamped, an edge whose session
+  store could not be read still arrives countless, and pi's withheld reading
+  rides the same frame as its edge. Verified non-vacuous by flattening the
+  envelope and watching the check fail.
+
+  Note this check does **not** run under `cargo test` — it is a flake check and
+  must be built explicitly.
 
 ## Open design questions
 

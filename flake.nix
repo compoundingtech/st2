@@ -380,16 +380,24 @@
             # Runtime smoke: the type gate is provably blind to execution-order defects (a TDZ
             # use-before-declaration shipped green through it), so the asset is transpiled and
             # actually driven through its open path.
+            #
+            # Each handler is driven with three contexts — bare, fully populated, and one whose
+            # every telemetry pull throws — because a bare context takes the fail-open branch and
+            # never executes the harness-context producer's body at all, which is the same blind
+            # spot in a new place. The channel is a recorder rather than `true`, so the smoke reads
+            # the frames back and asserts the wire `src/pi_channel.rs` decodes: with a pipe nobody
+            # reads, a producer that silently emits nothing is indistinguishable from a working
+            # one, and that failure looks exactly like the pre-producer state where every
+            # declaration's context reads null. Nothing else couples the two halves of that wire —
+            # they are different languages in different files.
             ${pkgs.esbuild}/bin/esbuild hooks/pi-channel.ts \
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/pi-channel.mjs
-            SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
-              ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
             ${pkgs.esbuild}/bin/esbuild hooks/omp-channel.ts \
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
-            SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
-              ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
             touch $out
           '';
 

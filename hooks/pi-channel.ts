@@ -58,7 +58,61 @@ type Stash = {
   session?: string;
   seq?: string;
   child?: childProcess.ChildProcess;
+  /**
+   * The last assistant message's `usage.cost.total`.
+   *
+   * Cost rides only the message-bearing events, but a context frame may be emitted from an event
+   * that carries none (`agent_end`, `session_start`). st2's record replaces a reading's fields
+   * WHOLESALE — deliberately, so a withheld number is never fabricated from a previous one — so a
+   * frame omitting the cost would erase the published one on the very next turn boundary. Holding
+   * the last one here and restating it is what keeps `costUsd` meaning "the last assistant
+   * message's cost" instead of flickering to null between messages.
+   */
+  lastCostUsd?: number;
 };
+
+/**
+ * Withhold rather than coerce (HC-R03).
+ *
+ * pi reports `tokens: null` and `percent: null` for real — immediately after a compaction, and
+ * across a process restart until the next assistant usage arrives — while `contextWindow` stays
+ * populated. That is pi positively saying it does not know, and substituting zero, the previous
+ * reading, or a division st2 could have done itself is exactly the fabrication HC-R03 forbids.
+ * A non-finite value is treated the same way: `NaN` and `Infinity` are not readings.
+ */
+const finiteOrNull = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+/**
+ * Compile-time coupling to pi's own declarations for the three surfaces the context producer reads.
+ *
+ * The producer reads all three through widened, guarded views, and it has to: an unmanaged session
+ * or a build whose telemetry surface moved must still load and still deliver mail, so a missing or
+ * throwing pull withholds a number rather than taking a turn down. But a widened cast alone makes
+ * that tolerance absolute AND silent — the surface could vanish from pi entirely and every context
+ * frame would quietly stop carrying numbers, with nothing in this repository noticing.
+ *
+ * These declarations are erased at runtime and exist only so the extension type gate fails when
+ * pi's shape moves. `ContextUsage`'s own doc comment is the contract HC-R03 is written against:
+ * "Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM
+ * response)." What they cannot catch is a change of MEANING with no change of shape — that is what
+ * the version-pinned fixtures in `src/pi_channel.rs` are for (HC-R13, HC-T03).
+ */
+type PinnedContextUsage = NonNullable<ReturnType<ExtensionContext["getContextUsage"]>>;
+const pinnedTelemetrySurface: {
+  usage: (usage: PinnedContextUsage) => {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+  };
+  modelId: (ctx: ExtensionContext) => string | undefined;
+  entries: (ctx: ExtensionContext) => { type: string }[];
+} = {
+  usage: (usage) => usage,
+  modelId: (ctx) => ctx.model?.id,
+  entries: (ctx) => ctx.sessionManager.getEntries(),
+};
+void pinnedTelemetrySurface;
 
 /**
  * Read the channel configuration once and unexport it.
@@ -142,6 +196,10 @@ export default function (pi: ExtensionAPI) {
     const previous = state.child;
     closeChild(previous);
     await awaitExit(previous, 2000);
+    // The predecessor's cost belongs to the predecessor. The stash outlives session replacement
+    // by design, so without this a `/new` session's first frames would restate the old session's
+    // cost as their own.
+    state.lastCostUsd = undefined;
 
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
@@ -246,13 +304,145 @@ export default function (pi: ExtensionAPI) {
   // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
   // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
   // frame here ever claims one.
-  const sendState = (word: "active" | "idle") => {
+  const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
     if (!child || !child.stdin || child.stdin.destroyed) return;
-    child.stdin.write(JSON.stringify({ type: "state", state: word }) + "\n");
+    child.stdin.write(JSON.stringify(frame) + "\n");
   };
+  const sendState = (word: "active" | "idle") => sendFrame({ type: "state", state: word });
+
+  // Harness context, extension side (HC-R02, HC-R03, HC-R11, HC-R12).
+  //
+  // `ctx.getContextUsage()` answers the whole fill triple in one call and rides the ctx of every
+  // lifecycle event, so this producer keeps no accumulator and reads no second source. It also
+  // holds no cadence policy: st2's harness-context write guard quantizes to 1% of the window, so
+  // emitting on every boundary costs at most one write per bucket entered however chatty pi is,
+  // and the record's own heartbeat rule decides the rest. Emitting liberally is therefore correct
+  // — and the finest boundary is the one that matters. Turn-boundary-only observation was
+  // measured at 92% of pre-compaction warnings missed precisely because the wedge case is a
+  // single long turn; `message_end` defeats that, because each tool call and its result form
+  // their own assistant message on pi.
+  //
+  // Every pull is guarded and a throw is not a reading: an observability call must never take a
+  // turn down, and "we could not read it" is withheld, never zero.
+  const modelId = (ctx: ExtensionContext): string | null => {
+    try {
+      const id = (ctx as { model?: { id?: unknown } }).model?.id;
+      return typeof id === "string" && id !== "" ? id : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const usageReading = (ctx: ExtensionContext): Record<string, unknown> | undefined => {
+    const read = (ctx as { getContextUsage?: () => unknown }).getContextUsage;
+    if (typeof read !== "function") return undefined;
+    let usage: unknown;
+    try {
+      usage = read.call(ctx);
+    } catch {
+      return undefined;
+    }
+    if (!usage || typeof usage !== "object") return undefined;
+    const { tokens, contextWindow, percent } = usage as {
+      tokens?: unknown;
+      contextWindow?: unknown;
+      percent?: unknown;
+    };
+    return {
+      // pi's `tokens` is the last assistant message's `totalTokens` — input + output + cacheRead
+      // + cacheWrite. That is NOT what omp's identically-shaped call means (prompt-only input),
+      // which is why the two harnesses are separate producers and separate fixtures.
+      usedTokens: finiteOrNull(tokens),
+      windowTokens: finiteOrNull(contextWindow),
+      // Carried raw. pi's percent is a float that runs well above 100 when a turn overruns the
+      // window (585.625% measured), and clamping here would hide exactly the saturation this
+      // record exists to surface.
+      usedPercent: finiteOrNull(percent),
+      model: modelId(ctx),
+      costUsd: state.lastCostUsd ?? null,
+    };
+  };
+
+  /**
+   * The harness-durable compaction count (HC-R12): pi's own session store answers it, and the
+   * answer survives a process restart — measured 2 → 3 across a compaction and read back
+   * correctly on the next process's `session_start`. `null` when the store cannot be read, which
+   * makes st2 fall back to counting the edge itself; that is a weaker, incarnation-scoped answer
+   * and never a wrong one.
+   */
+  const durableCompactions = (ctx: ExtensionContext): number | null => {
+    try {
+      const entries = (
+        ctx as { sessionManager?: { getEntries?: () => unknown } }
+      ).sessionManager?.getEntries?.();
+      if (!Array.isArray(entries)) return null;
+      return entries.filter((entry) => (entry as { type?: unknown })?.type === "compaction").length;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * One frame carries the reading and the compaction edge together, because they must land in one
+   * write. A compaction edge always writes, while a reading whose percent is withheld has no
+   * bucket and so lands only on an edge or the heartbeat — so an edge sent alone would publish
+   * the STALE pre-compaction numbers beside it, and the null reading proving the window was
+   * emptied would not appear until the heartbeat came due. Either half may be absent; a frame
+   * with neither is not sent.
+   */
+  const sendContext = (ctx: ExtensionContext, compaction?: Record<string, unknown>) => {
+    const reading = usageReading(ctx);
+    if (!reading && !compaction) return;
+    const frame: Record<string, unknown> = { type: "context" };
+    if (reading) frame.reading = reading;
+    if (compaction) frame.compaction = compaction;
+    sendFrame(frame);
+  };
+
+  /** Cost rides the message-bearing events only; hold the last one so no frame erases it. */
+  const captureCost = (event: unknown) => {
+    const total = (event as { message?: { usage?: { cost?: { total?: unknown } } } })?.message
+      ?.usage?.cost?.total;
+    if (typeof total === "number" && Number.isFinite(total)) state.lastCostUsd = total;
+  };
+
+  // Registered only now that every helper above is initialized. A handler body runs long after
+  // module evaluation, so a forward reference would in fact be safe — but a use-before-declaration
+  // in this file is precisely the defect class that once shipped green through the type gate, so
+  // the registrations stay below the definitions they use.
   pi.on("agent_start", async () => sendState("active"));
-  pi.on("agent_settled", async () => sendState("idle"));
+  pi.on("agent_settled", async (_event, ctx) => {
+    sendState("idle");
+    sendContext(ctx);
+  });
+
+  const onContextEvent = (name: "message_end" | "turn_end" | "agent_end") =>
+    (pi.on as unknown as (
+      event: string,
+      handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+    ) => void)(name, async (event, ctx) => {
+      captureCost(event);
+      sendContext(ctx);
+    });
+  onContextEvent("message_end");
+  onContextEvent("turn_end");
+  onContextEvent("agent_end");
+
+  // pi's `session_compact` carries `reason ∈ manual | threshold | overflow` — the only v1 producer
+  // that names its trigger at all. Measured in the handler itself: `getContextUsage()` already
+  // reports `{tokens: null, percent: null}` there, and `getEntries()` already counts the new
+  // entry, so this one frame carries both the honest withheld reading and the durable count.
+  (pi.on as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) => void)("session_compact", async (event, ctx) => {
+    const reason = (event as { reason?: unknown })?.reason;
+    sendContext(ctx, {
+      trigger: typeof reason === "string" ? reason : null,
+      count: durableCompactions(ctx),
+    });
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
@@ -264,6 +454,10 @@ export default function (pi: ExtensionAPI) {
     if (opened && typeof ctx.isIdle === "function") {
       sendState(ctx.isIdle() ? "idle" : "active");
     }
+    // And seed the context record, so a resumed session publishes the window it resumed INTO
+    // rather than waiting for its first turn boundary. A fresh session reads `{tokens: 0}` here
+    // and a post-compaction restart reads `{tokens: null}` — both are honest answers pi gives.
+    if (opened) sendContext(ctx);
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own — the
       // closest pi equivalent to the other harnesses' `additionalContext` hook output.
