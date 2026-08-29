@@ -834,11 +834,25 @@ producer depends on them.
 The producer publishes on one condition only: a `message.updated` that carried a
 fresh `tokens.total`. The adjacent facts arrive a frame later on
 `session.updated` and are folded into producer state, then ride out with the next
-numerator; publishing on them directly would stamp `observedAtMs` on a numerator
-that may be hours old. For the same reason this producer has no heartbeat — its
-numerator is pushed and not pullable, so it never holds a re-taken reading to
-publish, and a quiet seat's record ages visibly instead (HC-R06). A window that
-takes no turn does not fill, so the aging number stays true.
+numerator that LANDS a write; publishing on them directly would stamp
+`observedAtMs` on a numerator that may be hours old. They can therefore lag
+several turns — a run of readings inside one bucket writes nothing — and that is
+the intended shape: the record is one coherent snapshot of the turn that last
+landed, stamped with that turn's time, rather than a mix of a stale numerator and
+fresh costs.
+
+For the same reason this producer has no heartbeat: its numerator is pushed and
+not pullable, so it never holds a re-taken reading to publish, and a quiet seat's
+record ages visibly instead (HC-R06). A window that takes no turn does not fill,
+so the aging number stays true. One consequence is expected and must not be
+"fixed": an OpenCode seat idle for longer than `HARNESS_CONTEXT_STALE` (60
+minutes) crosses the horizon and Doctor's HC-R17 stale-record line fires beside a
+`running` desired state until the next turn. The other four producers re-pull on
+a cadence and never reach it; this one cannot, because there is nothing to
+re-pull. Closing that advisory by heartbeating the in-memory numerator would
+re-stamp `observedAtMs` on a reading no one re-took, which is exactly what the
+writer's contract forbids — the advisory is the honest report of a seat whose
+last measured occupancy is an hour old.
 
 `model` is written in OpenCode's own `providerID/modelID` spelling
 (`opencode/hy3-free`): `modelID` alone is ambiguous across providers, and this is
@@ -1056,7 +1070,8 @@ each only once a real test proves it (per `CLAUDE.md`):
   `src/opencode_session.rs::neither_summary_shape_is_ever_the_reading`,
   `src/opencode_session.rs::a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp`,
   `src/opencode_session.rs::an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands`,
-  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`.
+  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`,
+  `src/opencode_session.rs::the_window_pull_reads_config_providers_through_the_real_client`.
 
   **Claude's two fixtures and what each proves.**
   `tests/fixtures/harness-context/claude-statusline-pre-turn.json` is the

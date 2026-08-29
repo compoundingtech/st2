@@ -1030,6 +1030,12 @@ fn event_session_id(event: &Value) -> Option<&str> {
 /// model the providers document does not name would re-pull the whole document once per
 /// [`PROVIDER_POLL`] for the life of the session.
 const PROVIDERS_RETRY: Duration = Duration::from_secs(60);
+/// How long a providers document that ANSWERED but does not name the model waits. A custom or
+/// local provider can be absent from the config surface for the life of the session, and re-pulling
+/// the whole document every minute for it would be the same busy loop one step slower. A model
+/// change resets the clock and asks again at once, so nothing is lost by waiting; the horizon
+/// matches the API gate's own terminal arm.
+const PROVIDERS_UNLISTED_RETRY: Duration = Duration::from_secs(3600);
 
 /// The numeric axis for an OpenCode seat (HC-R02, HC-R11): the one producer whose numerator is
 /// pushed and whose denominator has to be pulled.
@@ -1204,7 +1210,12 @@ impl ContextProducer {
         }
         self.next_providers_attempt = Instant::now() + PROVIDERS_RETRY;
         match client.get_json("/config/providers") {
-            Ok(doc) => self.ingest_providers(&doc),
+            Ok(doc) => {
+                self.ingest_providers(&doc);
+                if self.window_wanted().is_some() {
+                    self.next_providers_attempt = Instant::now() + PROVIDERS_UNLISTED_RETRY;
+                }
+            }
             Err(error) => {
                 tracing::warn!("st2 opencode-session: reading model windows failed: {error:#}");
             }
@@ -2036,6 +2047,8 @@ mod tests {
                     }
                 } else if method == "GET" && path == "/session" {
                     200
+                } else if method == "GET" && path == "/config/providers" {
+                    200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
                         500
@@ -2059,6 +2072,8 @@ mod tests {
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
+                } else if method == "GET" && path == "/config/providers" {
+                    OC_PROVIDERS.to_string()
                 } else if method == "GET" && path == "/session/status" {
                     if let Some(body) = status_body_t.lock().unwrap().clone() {
                         body
@@ -2874,6 +2889,52 @@ mod tests {
         let joined = fixture.record().expect("a context record");
         assert_eq!(joined.window_tokens, Some(OC_WINDOW));
         assert!(joined.used_percent.is_some());
+    }
+
+    /// The denominator's whole live path: the exact endpoint string, through the real `Client`, into
+    /// the cache the reading divides by. The pull is gated on the API gate having passed, and a
+    /// document that answers without naming the model backs off far rather than re-pulling every
+    /// minute for the life of the session.
+    #[test]
+    fn the_window_pull_reads_config_providers_through_the_real_client() {
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let mut fixture = ContextFixture::new();
+        assert!(fixture.feed(OC_TURN_1_FINAL));
+        assert_eq!(fixture.record().expect("a record").window_tokens, None);
+
+        fixture.producer.refresh_windows(&client, false);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/hy3-free"),
+            "the pull waits for the API gate"
+        );
+
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(fixture.producer.window_wanted(), None);
+        assert!(fixture.feed(OC_TURN_2_FINAL));
+        assert_eq!(
+            fixture.record().expect("a record").window_tokens,
+            Some(OC_WINDOW)
+        );
+
+        // A model the answered document does not name: the retry moves out to the long horizon
+        // instead of re-pulling the whole document once a minute forever.
+        let switched = OC_TURN_1_SESSION.replace(
+            r#""model":{"id":"hy3-free","providerID":"opencode","variant":"default"}"#,
+            r#""model":{"id":"big-pickle","providerID":"opencode","variant":"default"}"#,
+        );
+        fixture.feed(&switched);
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/big-pickle")
+        );
+        assert!(
+            fixture.producer.next_providers_attempt
+                > Instant::now() + PROVIDERS_UNLISTED_RETRY - Duration::from_secs(60),
+            "an unlisted model must not keep the pull due every minute"
+        );
     }
 
     /// A model change on `session.updated` re-opens the denominator question before any assistant
