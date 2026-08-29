@@ -2,6 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use st2::driver::{
+    CHANNEL_DEV_CONSENT_REQUIRED, CHANNEL_NO_INBOX_TRANSPORT, CHANNEL_NOT_REGISTERED,
+    CHANNEL_ROUTE_UNKNOWN, claude_channel_advisories,
+};
 use st2::materialize::materialize_agent;
 use st2::reconcile::{TaskCompileContext, compile_generated_tasks};
 use st2::{discover, driver::expand_driver};
@@ -161,6 +165,10 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
             output.stdout,
             fs::read(fixtures.join(format!("{provider}.out.kdl"))).unwrap()
         );
+        // Expansion is a read of the declaration, so it stays silent; the channel advisories
+        // belong to the command that actually creates the seat.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("channel"), "{provider}: {stderr}");
         assert_eq!(fs::read(&input).unwrap(), before);
     }
 }
@@ -408,4 +416,132 @@ fn ambiguous_driver_source_neither_compiles_nor_materializes() {
             .contains("choose one launch source")
     );
     assert!(!workspace.join(".mcp.json").exists());
+}
+
+fn spec_from(catalog: &Path, body: &str) -> st2::spec::AgentSpec {
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(catalog).unwrap();
+    fs::write(&path, body).unwrap();
+    let (specs, errors) = st2::discover_file(catalog, &path).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    specs.into_iter().next().unwrap()
+}
+
+/// A Claude seat's channel state has to be read off the launch that will actually run, not off
+/// the typed field alone, and the advisory must not claim a fallback the declaration does not
+/// have. Both halves are the same defect this PR exists to fix.
+#[test]
+fn claude_driver_names_the_channel_state_the_seat_is_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let unrouted = spec_from(
+        &temp.path().join("unrouted"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { prompt "boot" }
+}
+"#,
+    );
+    // No channel and no `ding`: this seat has no inbox transport whatsoever, which is a stronger
+    // and more urgent fact than the skipped channel on its own.
+    assert_eq!(
+        claude_channel_advisories(&unrouted),
+        vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT]
+    );
+
+    // With the opt-in sidecar declared, the skipped channel is all there is to say.
+    let with_ding = spec_from(
+        &temp.path().join("with-ding"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  ding
+  claude { prompt "boot" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&with_ding),
+        vec![CHANNEL_NOT_REGISTERED]
+    );
+
+    let dev = spec_from(
+        &temp.path().join("dev"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { dev-channels #true; prompt "boot" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&dev),
+        vec![CHANNEL_DEV_CONSENT_REQUIRED]
+    );
+
+    // `args` reach the provider launch verbatim, so the flag can arrive without the typed field.
+    // Reading only `dev-channels` here would report the exact opposite of what the seat runs.
+    let dev_via_args = spec_from(
+        &temp.path().join("dev-via-args"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { prompt "boot"; args "--dangerously-load-development-channels=server:st2" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&dev_via_args),
+        vec![CHANNEL_DEV_CONSENT_REQUIRED]
+    );
+
+    // A harness that renders no st2 channel server has nothing to say.
+    let codex = spec_from(
+        &temp.path().join("codex"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  codex { prompt "boot" }
+}
+"#,
+    );
+    assert!(claude_channel_advisories(&codex).is_empty());
+}
+
+/// The legacy `deliver "mcp"` transport renders the same `.mcp.json`, so it is in the same states
+/// — read back from the launch the operator hand-authored. A shell program can reach the flag
+/// through a wrapper or a variable, so its absence from the source text proves nothing and must
+/// not be reported as a proven skip.
+#[test]
+fn legacy_mcp_delivery_reads_the_channel_state_off_the_authored_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    for (launch, expected) in [
+        (
+            r#"argv "claude" "boot""#,
+            vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT],
+        ),
+        (
+            r#"argv "claude" "--dangerously-load-development-channels=server:st2" "boot""#,
+            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+        ),
+        (r#"command "exec claude boot""#, vec![CHANNEL_ROUTE_UNKNOWN]),
+        (
+            r#"command "exec claude --dangerously-load-development-channels=server:st2 boot""#,
+            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+        ),
+    ] {
+        let spec = spec_from(
+            &temp.path().join(format!("legacy{}", launch.len())),
+            &format!(
+                r#"agent "worker" {{
+  host "h"
+  workspace "/work"
+  deliver "mcp"
+  {launch}
+}}
+"#
+            ),
+        );
+        assert_eq!(claude_channel_advisories(&spec), expected, "{launch}");
+    }
 }
