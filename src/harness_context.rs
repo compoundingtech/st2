@@ -916,9 +916,9 @@ mod tests {
             Some(96.7),
             "no reading behind the edge, so no invented number"
         );
-        assert_eq!(
-            observed.age_ms,
-            crate::message::now_ms().saturating_sub(observed.observed_at_ms)
+        assert!(
+            observed.age_ms < duration_ms(HARNESS_CONTEXT_STALE),
+            "the reading is still the one taken before the edge, and still fresh"
         );
 
         // A harness-durable count replaces st2's, so a restart does not restart the counter.

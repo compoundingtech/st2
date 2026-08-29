@@ -819,6 +819,21 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // The floor accompanies every act that establishes ownership; its own failure
     // modes must never be quiet ones.
     persist_floor(&writer.path, seq);
+    // A session boundary empties the window, so the numeric sibling is removed with the same
+    // act that supersedes this record (HC-R15): the new incarnation reads "no context yet"
+    // rather than the previous one's 190k, which is what a crash-looping seat would otherwise
+    // show for the whole hour of that record's horizon. Taken under the SIBLING's own lock,
+    // never while holding it — the claim path's lock order is one-way, so no writer can
+    // deadlock against it. The claim itself stands whether or not the removal succeeds, but
+    // never silently.
+    if let Some(agent_dir) = writer.path.parent()
+        && let Err(error) = crate::harness_context::remove(agent_dir)
+    {
+        tracing::warn!(
+            "st2 harness-state: clearing the harness-context record for {} failed: {error}",
+            agent_dir.display()
+        );
+    }
     Ok(seq)
 }
 
@@ -1276,6 +1291,72 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         writer.observe(active()).unwrap();
         assert_eq!(bytes, fs::read(&path).unwrap());
+    }
+
+    /// HC-R15: the written claim that supersedes this record also removes the numeric sibling, so
+    /// a new incarnation reads "no context yet" rather than the previous incarnation's fill. The
+    /// wrapperless claim path shares the same body and therefore the same behaviour.
+    #[test]
+    fn the_relaunch_claim_removes_the_harness_context_record() {
+        use crate::harness_context::{
+            self, Harness, Reading, harness_context_path,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("hetz").join("worker");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let context_path = harness_context_path(&agent_dir);
+
+        let fill = || Reading {
+            used_tokens: Some(190_000),
+            window_tokens: Some(200_000),
+            used_percent: Some(95.0),
+            ..Reading::default()
+        };
+        harness_context::Writer::new(&agent_dir, "hetz.worker", Harness::Claude)
+            .unwrap()
+            .observe(fill())
+            .unwrap();
+        assert!(harness_context::read(&context_path).is_some());
+
+        // A wrapper relaunch: claim the state record, and the sibling goes with it.
+        let token = session_token();
+        claim(&agent_dir, "hetz.worker", "claude", &token).unwrap();
+        assert!(
+            harness_context::read(&context_path).is_none(),
+            "the new incarnation must read `no context yet`"
+        );
+        assert!(!context_path.exists());
+        // The state record's own claim placeholder is untouched by the removal: it still reads
+        // indeterminate-because-`claimed`, the fence the claim just wrote.
+        assert_eq!(
+            read(&harness_state_path(&agent_dir), None)
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("claimed")
+        );
+
+        // Claiming a seat that never had a context record is not an error.
+        claim(&agent_dir, "hetz.worker", "claude", &session_token()).unwrap();
+
+        // …and the wrapperless boundary, which routes through the same body. It is eligible only
+        // over a seat no wrapper holds, so it gets its own.
+        let hooks_dir = tmp.path().join("agents").join("hetz").join("hooked");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hooks_context = harness_context_path(&hooks_dir);
+        harness_context::Writer::new(&hooks_dir, "hetz.hooked", Harness::Claude)
+            .unwrap()
+            .observe(fill())
+            .unwrap();
+        let wrapperless = format!("{WRAPPERLESS_PREFIX}abc");
+        assert!(
+            claim_wrapperless(&hooks_dir, "hetz.hooked", "claude", &wrapperless)
+                .unwrap()
+                .is_some(),
+            "the claim must actually have happened"
+        );
+        assert!(harness_context::read(&hooks_context).is_none());
     }
 
     #[test]
