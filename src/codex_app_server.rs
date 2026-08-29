@@ -4646,6 +4646,96 @@ mod tests {
         );
     }
 
+    /// The wiring, not the arithmetic: a `thread/tokenUsage/updated` arriving on the real control
+    /// socket reaches the record. Every other context test drives the producer directly, so all of
+    /// them would stay green if the pump stopped handing it frames — which is exactly how a
+    /// producer silently stops producing.
+    #[test]
+    fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/started",
+                    "params": { "thread": { "id": "thread-main", "status": { "type": "idle" } } }
+                }),
+            )
+            .unwrap();
+            write_json_message(&mut websocket, &token_usage_frame(92_283, json!(258_400))).unwrap();
+            // Hold the connection open until the reading has landed: closing here would race the
+            // pump's read of the frame just written. Bounded, so a pump that stopped handing
+            // frames to the producer fails this test instead of hanging it.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while harness_context::read(&harness_context::harness_context_path(&agent_dir))
+                .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime,
+                None,
+                Some(config),
+                tx,
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+
+        let observed = context_record(&tmp.path().join("agents/h/worker"))
+            .expect("the pump published nothing");
+        assert_eq!(observed.harness, harness_context::Harness::Codex);
+        assert_eq!(observed.used_tokens, Some(92_283));
+        assert_eq!(observed.window_tokens, Some(258_400));
+        assert_eq!(observed.used_percent, Some(33.0));
+    }
+
     #[test]
     fn subscribed_control_pump_reconciles_an_ambiguous_attempt_without_replay() {
         let tmp = tempfile::tempdir().unwrap();
