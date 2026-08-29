@@ -241,7 +241,10 @@ struct ContextJson<'a> {
     compactions: u64,
     last_compaction_ms: Option<u64>,
     last_compaction_trigger: Option<&'static str>,
-    observed_at: u64,
+    /// Spelled `observedAtMs` on the wire, matching the record's own field and the
+    /// `sinceMs`/`writtenAtMs` convention the driver records already use. `driverDiagnostic`'s
+    /// unsuffixed `observedAt` is a different record's shipped name and is not touched here.
+    observed_at_ms: u64,
     age_ms: u64,
     stale: bool,
 }
@@ -264,7 +267,7 @@ impl<'a> ContextJson<'a> {
             last_compaction_trigger: context
                 .last_compaction_trigger
                 .map(harness_context::CompactionTrigger::as_str),
-            observed_at: context.observed_at_ms,
+            observed_at_ms: context.observed_at_ms,
             age_ms: context.age_ms,
             stale: context.stale,
         })
@@ -597,7 +600,7 @@ mod tests {
                 "compactions": 3,
                 "lastCompactionMs": 1788000097290u64,
                 "lastCompactionTrigger": "unknown",
-                "observedAt": 1788000100000u64,
+                "observedAtMs": 1788000100000u64,
                 "ageMs": 4210,
                 "stale": false
             })

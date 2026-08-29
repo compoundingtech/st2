@@ -26,11 +26,12 @@ The placement, guard, and Claude producer were first built as a throwaway spike
 and the spike's tree is not the shipping tree. The write policy is no longer
 provisional: it was chosen on a replay benchmark over 90 real sessions
 ([`.experiments/2026-08-29-write-policy-benchmark.md`](./.experiments/2026-08-29-write-policy-benchmark.md)),
-which also moved the record's path. The residuals that remain: the Claude
-producer's status-line contract with dotfiles is unsettled (`DQ-C2`), and the
-transport half of `DQ-C1` is unmeasurable until a transport runs. Open questions
-are tracked in [open-questions.md](./open-questions.md); the direction this
-design deliberately does not take yet is in [roadmap.md](./roadmap.md).
+which also moved the record's path. The Claude producer's status-line renderer
+contract with dotfiles closed on 2026-08-29 (`DQ-C2`, dotfiles PR #2160). The
+one residual that remains is the transport half of `DQ-C1`, unmeasurable until a
+transport runs. Open questions are tracked in
+[open-questions.md](./open-questions.md); the direction this design deliberately
+does not take yet is in [roadmap.md](./roadmap.md).
 
 ## Scope
 
@@ -416,9 +417,34 @@ a human's status line keeps working:
   statusLine: { type: "command", command: "<st2 status-line tee>", refreshInterval: 5 }
 
 tee:  stdin JSON --> st2 driver claude-observe (writes harness-context)
-                 --> exec ${ST_CLAUDE_STATUSLINE_RENDERER}              (DQ-C2)
-                 --> if no renderer resolves: pass stdin through unchanged
+                 --> exec the downstream renderer, resolved in order:
+                       1. $ST_CLAUDE_STATUSLINE_RENDERER
+                       2. ~/.claude/statusline-renderer.json  -> .command
+                 --> if neither resolves: pass stdin through unchanged
 ```
+
+**Renderer resolution, settled** (`DQ-C2`, closed 2026-08-29 by dotfiles
+PR #2160). Two sources in strict order, first hit wins:
+
+1. `$ST_CLAUDE_STATUSLINE_RENDERER` — an environment variable holding the
+   command. It comes first so a single agent, a debugging session, or a test can
+   override without editing a file.
+2. `~/.claude/statusline-renderer.json` — a file the operator owns, schema
+   `dotfiles.claude-statusline-renderer.v1`, carrying `{"command": …}`. It is a
+   file rather than a settings key because the settings file st2 wins in is the
+   one st2 rewrites, so a renderer declared there would be the very thing the
+   merge does not preserve (HC-R18's inverse). A user-level file st2 never
+   writes has no such hazard.
+3. Neither resolves: pass stdin through unchanged.
+
+The environment variable is checked first and the file second — not merged, and
+never both — so the resolution has one answer and an operator debugging their
+status line has one place to look for it. The file's schema string follows the
+dotfiles namespace rather than st2's, because dotfiles owns the file and its
+shape; st2 reads `command` and nothing else.
+
+The Claude producer slice implements this; nothing in the shipped tree resolves
+a renderer yet.
 
 **Chaining is mandatory, not a courtesy** (HC-R18). When no downstream renderer
 resolves, the tee passes its stdin through unchanged rather than discarding it —
@@ -442,10 +468,6 @@ human sets in a managed agent's `.claude/settings.local.json` is not preserved
 by st2's materialization of that file, whose merge owns only st2's own hook
 entries. A human renderer therefore belongs in the operator's own settings, with
 st2's tee chaining to it — not in the file st2 rewrites.
-
-What names the downstream renderer — an environment variable or a settings key —
-is still unsettled and shared with the dotfiles change that owns the slot today:
-`DQ-C2`.
 
 Withholding: `current_usage`, `used_percentage`, and `remaining_percentage` are
 `null` until the session's first API response, while `context_window_size` is
@@ -640,7 +662,7 @@ sidecar (HC-T04).
   "compactions": 3,
   "lastCompactionMs": 1788000097290,
   "lastCompactionTrigger": "unknown",
-  "observedAt": 1788000100000,
+  "observedAtMs": 1788000100000,
   "ageMs": 4210,
   "stale": false
 }
@@ -654,6 +676,15 @@ age itself. `incarnation` and `writtenAtMs` are deliberately not exposed: the
 first is provenance for a reader inspecting the record itself, and the second is
 a write-policy mechanism a roster consumer has no use for once `ageMs` and
 `stale` are computed.
+
+The origin stamp is spelled `observedAtMs` on the roster wire, exactly as in the
+record, following the `sinceMs`/`writtenAtMs` convention the driver records
+already use. An earlier draft of this section spelled it `observedAt`; that was
+an inconsistency within this document rather than a decision, corrected
+2026-08-29 while the field had no producer and no consumer depending on the
+short spelling. `driverDiagnostic`'s own unsuffixed `observedAt` is a different
+record's shipped name and is deliberately left alone — this is one record's
+field agreeing with itself, not a rename campaign across the roster.
 
 Human `st2 agents` output carries the same axis compactly as `ctx:92% ⟳1`,
 beside the existing `obs:` column and prefixed for the same reason — two bare
@@ -749,7 +780,12 @@ each only once a real test proves it (per `CLAUDE.md`):
 ## Open design questions
 
 Tracked with context in [open-questions.md](./open-questions.md): `DQ-C1` write
-policy benchmark, `DQ-C2` status-line renderer contract, `DQ-C5` unreadable
-versus absent, `DQ-C6` history, `DQ-C7` fleet transport cost, `DQ-C8` supervisor
-actionability, `DQ-C9` subagent context, `DQ-C10` OpenCode multi-session
-aggregation.
+policy benchmark (accuracy half settled, wire-cost half open), `DQ-C5`
+unreadable versus absent, `DQ-C6` history, `DQ-C7` fleet transport cost, `DQ-C8`
+supervisor actionability, `DQ-C9` subagent context, `DQ-C10` OpenCode
+multi-session aggregation.
+
+Resolved, and kept in that file only so their identifiers do not go dangling:
+`DQ-C2` status-line renderer contract, `DQ-C3` status-line settings precedence,
+`DQ-C4` Doctor exposure and threshold, `DQ-C11` `harness-state`'s placement
+defect, `DQ-C12` a driver record under `resources/` (withdrawn).

@@ -20,14 +20,17 @@ Each entry links a spec `DQ-C*`. Questions leave this file when resolved — int
   Resolves by: that measurement once a transport runs. If it turns out large,
   the documented step is a 2% bucket, at the cost of alarms having to sit on
   even percentages.
-- **DQ-C2 The status-line renderer contract.** st2 owning the `statusLine` slot
-  for driver-declared agents means it must hand the payload on to whatever
-  renderer the operator already had — today a dotfiles-provided script wired in
-  the user-level settings. The mechanism is a tee that execs a downstream
-  command; what names that command is unsettled. The spec writes it as
-  `ST_CLAUDE_STATUSLINE_RENDERER` as a placeholder, and the real name is a joint
-  decision with the dotfiles change. Resolves by: that change landing with one
-  agreed name, or by choosing a settings key over an environment variable.
+- **DQ-C2 The status-line renderer contract — resolved 2026-08-29 by dotfiles
+  PR #2160.** st2's tee resolves the downstream renderer in strict order:
+  `$ST_CLAUDE_STATUSLINE_RENDERER` first, then
+  `~/.claude/statusline-renderer.json` (schema
+  `dotfiles.claude-statusline-renderer.v1`, carrying `{"command": …}`), then —
+  if neither resolves — passing stdin through unchanged. A user-owned file was
+  chosen over a settings key because the settings file st2 wins in is the one
+  st2 rewrites, so a renderer declared there is exactly what the merge does not
+  preserve (HC-R18's inverse). Specified in [spec.md](./spec.md) under the
+  Claude producer; the entry stays here only so the identifier does not go
+  dangling.
 - **DQ-C3 Status-line settings precedence — resolved 2026-08-29 by live
   capture.** Four cases driven through a real pty against Claude Code 2.1.250
   settle the order:
