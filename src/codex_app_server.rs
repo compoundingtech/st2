@@ -2630,6 +2630,24 @@ fn pump_control(
                     if message.get("method").is_some()
                         || message.get("id") != Some(&Value::from(CONTROL_SUBSCRIBE_REQUEST_ID))
                     {
+                        // The one notification worth reading before the resume response lands. The
+                        // app-server replays `thread/tokenUsage/updated` to a newly attached
+                        // connection, and the resumed thread still holds its context — so dropping
+                        // it here would leave a seat that resumes and then waits for work reading
+                        // `context: null` against a full window, with nothing to correct it until
+                        // the next model response. The claim this construction already made removed
+                        // the predecessor's record, so there is nothing else to fall back on.
+                        //
+                        // Ordering-agnostic on purpose: if the replay arrives after the response
+                        // the loop below already sees it and this call reads nothing. A duplicate
+                        // reading costs nothing — the bucket guard skips it.
+                        //
+                        // The fresh-binding path below needs no such call: there is no thread id
+                        // until `binding_candidate` names one, and a thread starting now has no
+                        // history to replay.
+                        if let Some(delivery) = delivery.as_mut() {
+                            delivery.observe_context(&message, thread_id);
+                        }
                         continue;
                     }
                     anyhow::ensure!(
@@ -5125,6 +5143,135 @@ mod tests {
             .unwrap();
         assert!(state.subscribed());
         assert_eq!(state.observed(), &CodexObservedState::Idle);
+    }
+
+    /// A resumed thread still holds its context, and the app-server replays
+    /// `thread/tokenUsage/updated` to the newly attached connection — before the resume response,
+    /// which the binding handshake otherwise discards along with every other notification. The
+    /// construction that resumed this seat has already removed the predecessor's record, so a
+    /// dropped replay leaves a resumed-and-idle seat reading `null` against a full window with
+    /// nothing to correct it until its next model response.
+    #[test]
+    fn a_token_usage_replayed_before_the_resume_response_still_reaches_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _stop_exclusive = stop_flag_tests();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let socket = tmp.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let agent_dir_for_server = agent_dir.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialize"
+            );
+            write_json_message(
+                &mut websocket,
+                &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_json_message(&mut websocket).unwrap().unwrap()["method"],
+                "initialized"
+            );
+            let loaded = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_TUI_LOADED_REQUEST_ID,
+                    "result": { "data": ["thread-prior"] }
+                }),
+            )
+            .unwrap();
+            let subscribe = read_json_message(&mut websocket).unwrap().unwrap();
+            assert_eq!(subscribe["method"], "thread/resume");
+            assert_eq!(subscribe["params"]["threadId"], "thread-prior");
+            // The replay, ahead of the response the handshake is waiting for.
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread-prior",
+                        "turnId": "turn-prior",
+                        "tokenUsage": {
+                            "last": { "totalTokens": 92_283 },
+                            "total": { "totalTokens": 2_235_329 },
+                            "modelContextWindow": 258_400
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            write_json_message(
+                &mut websocket,
+                &json!({
+                    "id": CONTROL_SUBSCRIBE_REQUEST_ID,
+                    "result": {
+                        "thread": { "id": "thread-prior", "status": { "type": "idle" } }
+                    }
+                }),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while harness_context::read(&harness_context::harness_context_path(
+                &agent_dir_for_server,
+            ))
+            .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let websocket = initialize_control(stream)
+            .unwrap()
+            .expect("no stop raised in tests");
+        let binding_path = tmp.path().join("state/binding.json");
+        let control_state_path = tmp.path().join("state/control-state.json");
+        let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (resume_ready_tx, resume_ready_rx) = mpsc::channel();
+        let binding_for_pump = binding_path.clone();
+        let control_state_for_pump = control_state_path.clone();
+        let pump = thread::spawn(move || {
+            pump_control(
+                websocket,
+                &binding_for_pump,
+                &control_state_for_pump,
+                &runtime,
+                Some(ControlResume {
+                    thread_id: "thread-prior",
+                    ready: resume_ready_rx,
+                    tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+                }),
+                Some(config),
+                tx,
+            )
+        });
+        resume_ready_tx.send(()).unwrap();
+        acknowledge_tui_thread_loaded(&rx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ControlEvent::Bound
+        ));
+        server.join().unwrap();
+        let _ = shutdown.shutdown(Shutdown::Both);
+        pump.join().unwrap();
+
+        let observed =
+            context_record(&agent_dir).expect("the replayed reading never reached the record");
+        assert_eq!(observed.used_percent, Some(33.0));
+        assert_eq!(observed.used_tokens, Some(92_283));
+        assert_eq!(observed.session_total_tokens, Some(2_235_329));
     }
 
     #[test]

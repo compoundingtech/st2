@@ -646,7 +646,7 @@ over a short ring; the deprecated notification names only the turn, so its key
 collapses with any item key in the same turn rather than counting beside it. Two
 distinct item ids in one turn are two compactions.
 
-Two limits of the shipped producer, both deliberate:
+Three limits of the shipped producer, all deliberate:
 
 - **The record is written only where native delivery is configured.** The writer
   is owned by the app-server delivery pump, beside the harness-state writer, so
@@ -654,12 +654,23 @@ Two limits of the shipped producer, both deliberate:
   That matches the harness-state precedent — except that harness-state also has
   a wrapper-written terminal record and this axis has none, so Codex coverage is
   exactly "delivery-configured seats".
-- **A reading replayed before the control binding completes is dropped.** The
-  pump skips every frame carrying a `method` while it is still binding, so a
-  `thread/tokenUsage/updated` replayed to a freshly attached connection ahead of
-  the resume response is lost. The consequence is bounded: Codex emits another
-  reading on the next model response, and the record is honest about the gap
-  through `ageMs` meanwhile.
+- **The compaction counter is incarnation-scoped only when the claim succeeds.**
+  The reset comes from the relaunch claim removing the record (HC-R15), so on the
+  degraded path — a claim that could not be written, which downgrades the *state*
+  writer to token-only and proceeds — no removal happened and the new session's
+  producer continues the predecessor's count. The record still carries the new
+  `incarnation`, so the seam is visible to a reader; nothing else is done about
+  it, because a second removal path would be machinery guarding a case the
+  provenance field already exposes.
+- **A reading replayed on a FRESH binding is dropped; on resume it is not.** The
+  pump skips every frame carrying a `method` while it is still binding. The
+  resume path reads `thread/tokenUsage/updated` out of that skip explicitly,
+  because a resumed thread still holds its context and the claim has just removed
+  the predecessor's record — a seat that resumes and then waits for work would
+  otherwise read `null` against a full window until its next model response. The
+  fresh-binding path needs no equivalent: there is no thread id to match against
+  before the binding candidate names one, and a thread starting now has no
+  history to replay.
 
 Finally, a version note. The arithmetic above was settled by reading codex-cli
 0.150.1's Rust source, and `CODEX_CONTEXT_VERIFIED_VERSION` pins that literal in
