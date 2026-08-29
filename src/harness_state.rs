@@ -184,9 +184,14 @@ struct Record {
     transitions: u64,
 }
 
+/// The record's file name inside an agent directory. Named rather than inlined because the
+/// replication transport's include list carries it literally: see
+/// [`crate::harness_context::REPLICATED_DRIVER_RECORDS`].
+pub const RECORD_NAME: &str = "harness-state";
+
 /// The observed-state file: `<agent_dir>/harness-state`.
 pub fn harness_state_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("harness-state")
+    agent_dir.join(RECORD_NAME)
 }
 
 /// One observation as a producer states it: everything except the derived pieces.
@@ -303,16 +308,7 @@ impl Writer {
     /// Hold the record's exclusive cross-process lock for one read→decide→rename cycle. The lock
     /// file is a permanent sibling; the guard releases on drop (close).
     fn locked(&self) -> anyhow::Result<fs::File> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&self.lock_path)?;
-        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-        anyhow::ensure!(rc == 0, "locking {} failed", self.lock_path.display());
-        Ok(lock)
+        lock_exclusive(&self.lock_path)
     }
 
     /// Record an observation. A genuine change writes a new transition with a fresh `since`. An
@@ -687,11 +683,50 @@ fn read_record(path: &Path) -> Option<Record> {
 }
 
 fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
-    let mut bytes = serde_json::to_vec(record)?;
+    // This record stages beside itself, unchanged: the sibling driver record
+    // ([`crate::harness_context`]) stages outside the agent subtree because a replicated
+    // temporary name becomes a durable key, and moving this one's staging is a separate change.
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    write_json_atomic(path, record, &dir, ".harness-state")
+}
+
+/// Take one driver record's exclusive cross-process lock, held for a read→decide→rename cycle.
+/// The lock file is a permanent sibling of the record and the guard releases on drop (close).
+/// Shared with [`crate::harness_context`], which owns a sibling record with its own lock file:
+/// the transport is common, the ownership protocol above it is not.
+pub(crate) fn lock_exclusive(lock_path: &Path) -> anyhow::Result<fs::File> {
+    if let Some(dir) = lock_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(lock_path)?;
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    anyhow::ensure!(rc == 0, "locking {} failed", lock_path.display());
+    Ok(lock)
+}
+
+/// Stage-and-rename one newline-terminated JSON record. Atomic when `staging_dir` is on the
+/// record's filesystem, which every caller must ensure — `staging_dir` is explicit precisely
+/// because the two driver records answer "where may a temporary name live" differently.
+pub(crate) fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+    staging_dir: &Path,
+    tmp_prefix: &str,
+) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(tmp_name());
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::create_dir_all(staging_dir)?;
+    let tmp = staging_dir.join(format!(
+        "{tmp_prefix}.tmp-{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&tmp, &bytes)?;
     // rename over the target — atomic on the same filesystem.
     if let Err(e) = fs::rename(&tmp, path) {
@@ -860,14 +895,6 @@ pub fn session_token() -> String {
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_name() -> String {
-    format!(
-        ".harness-state.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
 
 #[cfg(test)]
 mod tests {
