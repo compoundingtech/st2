@@ -6,6 +6,10 @@ use crate::ding::composer::ComposerState;
 pub(super) struct OpenCode;
 
 impl Harness for OpenCode {
+    fn name(&self) -> &'static str {
+        "opencode"
+    }
+
     fn locate(&self, screen: &Screen<'_>) -> Option<Located> {
         locate_composer(screen.plain).map(|composer| Located {
             row: composer.start,
