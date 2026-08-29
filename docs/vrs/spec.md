@@ -998,9 +998,9 @@ policy, compat field, or API version constant — but it does publish its
 TypeScript declarations, and those govern this coupling.
 `checks.pi-extension-types` type-checks the shipped extension against a pinned
 pi release at build time, which is what makes the asset's otherwise-erased
-`import type` load-bearing. This follows the repo's existing rule that st2 pins
-where skew fails silently (`pty`, `codex-cli`) and not where it fails loudly
-(`claude`); the extension's one silent surface was its idle proof, and using
+`import type` load-bearing. This follows the repo's existing rule that st2 validates
+where skew fails silently (`pty`, the Codex app-server schema) and not where it fails
+loudly (`claude`); the extension's one silent surface was its idle proof, and using
 that proof without calling it is now a build error.
 
 A pi agent never enters the DING path. `deliver` and `ding` are mutually

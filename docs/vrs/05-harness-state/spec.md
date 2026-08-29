@@ -181,10 +181,15 @@ comes first. The cross-check is a narrowing of the ungraceful-death window
 (provably dead sessions: pidfile present, process gone), not its closure —
 OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
 kill that removes the registry entry leaves nothing behind to prove death
-with, and fabricating evidence is the one thing this design never does. And
-hosts running codex-cli at or above 0.148 produce no Codex observed state at
-all: `SUPPORTED_CODEX_CLI_VERSIONS` refuses the launch, correctly, until the
-pin moves (#267).
+with, and fabricating evidence is the one thing this design never does.
+
+Each controlled Codex startup generates the installed app-server schema. st2
+checks the methods, response fields, blocking flags, and classified item and
+server-request kinds that native delivery uses. A compatible patch or minor
+release starts without a source change. A delivery-critical schema change
+stops before the app-server starts. The wrapper sends one idempotent rejection
+report to the agent's declared supervisor. The version string is diagnostic
+data, not an admission proxy.
 
 ## Codex producer (OHS-R05)
 

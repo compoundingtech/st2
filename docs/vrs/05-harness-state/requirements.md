@@ -157,8 +157,9 @@ The measurements are #268's, taken 2026-08-16/17 on one host and carried with
 their original caveats: 1298 presence files all legacy one-line records, 4
 transitions per turn 0.1–0.4 ms apart, Claude hook timelines (blocked entry in
 2 of 9 captures, exit in 1), silent Claude death under SIGTERM/SIGKILL, and
-the Codex `activeFlags` schema present on all supported codex-cli versions
-(#268's first comment). The shipped code evidence is in-repo: the Codex state
+the Codex `activeFlags` schema present in the measured codex-cli versions
+(#268's first comment). The startup gate now checks that generated schema
+directly. The shipped code evidence is in-repo: the Codex state
 machine and its hold reasons, the unfiltered agent-dir watch beside the
 presence refresh that writes into it, and `src/harness_state.rs`, which
 implements the envelope this file ratifies.
