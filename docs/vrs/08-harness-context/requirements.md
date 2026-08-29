@@ -123,7 +123,10 @@ record.
   displays to its operator, computed by that harness's own rule; `usedTokens`
   and `windowTokens` are the harness's own operands. A producer that cannot
   obtain a window withholds `usedPercent` rather than dividing by a table, an
-  estimate, or a default.
+  estimate, or a default. The value is carried raw and is never clamped by a
+  producer or a reader — occupancy above 100% of the window is observed in
+  practice and is precisely the condition worth surfacing; clamping belongs to
+  whatever renders it.
 - **HC-R03 Withheld, never fabricated:** where a harness positively reports that
   it does not know its own occupancy — pi after a compaction, Claude before the
   session's first API response — the producer withholds the value. No path
@@ -241,7 +244,9 @@ record.
   operator's own renderer and pass the payload on. The slot is single-valued and
   the highest-precedence declaration replaces the others outright — nothing
   merges — so occupying it without chaining silently removes whatever the
-  operator had, on every managed agent, with no warning. The inverse also holds
+  operator had, on every managed agent, with no warning. Where no downstream
+  renderer resolves, the tee passes its input through unchanged rather than
+  discarding it, so the degraded case is still a status line. The inverse also holds
   and is not solved by chaining: a renderer a human sets in a file st2
   materializes is not preserved by st2's merge, which owns only its own hook
   entries.

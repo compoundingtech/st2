@@ -120,10 +120,12 @@ Field rules:
   window). Claude clamps to 0..100 itself, and Codex's displayed percentage is
   clamped by construction — but Codex's *operands* are not: 2 of 287,010
   replayed Codex readings give `used / window` up to 1.041, so a producer
-  computing from them can legitimately produce 104. Nothing st2 does re-clamps a
-  harness-native number. st2 does not re-clamp a harness-native number: a reading above
-  100 is a real observation of an overrun, and clamping it would hide exactly
-  the saturation this record exists to show.
+  computing from them can legitimately produce 104. **The record carries the raw
+  value and never clamps it**: a reading above 100 is a real observation of an
+  overrun, and clamping at the producer would hide exactly the saturation this
+  record exists to show. Clamping is a *display* concern — a consumer rendering
+  a bar or a percentage clamps for its own layout, and does so knowing it is
+  discarding information the record deliberately kept.
 - `sessionTotalTokens` is cumulative lifetime spend for the session and is
   **never** occupancy. It is named for that distinction (HC-R16): a measured
   Codex session read 2,235,329 cumulative against a 258,400-token window, so a
@@ -292,8 +294,9 @@ record was chosen over host-local state
 The resolution is to name the driver records in that list —
 `**/harness-state,**/harness-context` — rather than to move them under a
 directory whose meaning is the realization surface for Resource bindings. The
-include list is a fleet-side trait specification, so this is a cross-repository
-change, and it has one property worth stating: it fixes the **already-shipped**
+include list is a fleet-side trait specification —
+`context/fleet/traits/fabric/spec.md` in the dotfiles repository — so this is a
+cross-repository change, and it has one property worth stating: it fixes the **already-shipped**
 `harness-state` record, which has the same defect today, without migrating a
 live record.
 
@@ -368,10 +371,15 @@ a human's status line keeps working:
   statusLine: { type: "command", command: "<st2 status-line tee>", refreshInterval: 5 }
 
 tee:  stdin JSON --> st2 driver claude-observe (writes harness-context)
-                 --> exec ${ST_CLAUDE_STATUSLINE_RENDERER:-<discard>}   (DQ-C2)
+                 --> exec ${ST_CLAUDE_STATUSLINE_RENDERER}              (DQ-C2)
+                 --> if no renderer resolves: pass stdin through unchanged
 ```
 
-**Chaining is mandatory, not a courtesy** (HC-R18). Precedence was captured live
+**Chaining is mandatory, not a courtesy** (HC-R18). When no downstream renderer
+resolves, the tee passes its stdin through unchanged rather than discarding it —
+the fallback is transparency, not silence, so the worst case of st2 occupying
+the slot is the operator's own payload rendered verbatim rather than an empty
+status line. Precedence was captured live
 on 2026-08-29 against Claude Code 2.1.250 in four cases through a real pty
 ([evidence](./.experiments/2026-08-29-context-signals-and-write-placement.md)):
 `.claude/settings.local.json` > `.claude/settings.json` >
