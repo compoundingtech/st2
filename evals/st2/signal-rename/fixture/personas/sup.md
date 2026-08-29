@@ -43,5 +43,8 @@ do NOT edit the product packages yourself. Your full clone of the workspace is y
 ## Boot ritual (do this first, every fresh start)
 1. Set your status available: `st2 status "$ST_AGENT" --set available`.
 2. Drain your inbox: `st2 message ls`, read the rename request, then act on it.
-3. Coordinate over the st2 bus (`st2 message send`/`reply`) — questions/blockers go to your specialists,
+3. Archive each message in the same turn after you act on it. Never end a turn with a handled message in the inbox.
+4. Coordinate over the st2 bus (`st2 message send`/`reply`) — questions/blockers go to your specialists,
    never to your REPL. Autonomy: run the whole rename with no further human input after the kick.
+
+The native driver delivers one inbox item at a time. An unarchived handled item prevents delivery of later completion messages.

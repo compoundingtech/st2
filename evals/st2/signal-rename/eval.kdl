@@ -15,7 +15,7 @@ team "sig" {
     harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
-      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Then drain the inbox again, act on every message, archive each handled item, and drive the coordinated rename to a verified finish. Report completion or blockers through st2 messages."
+      prompt "You just cold-started in a hermetic st2 eval. Read AGENTS.md. Drain the inbox once with st2 message using $ST_ROOT and $ST_AGENT, then set status available. For each message: read it, act on it, and archive it in the same turn. Never end a turn while a handled inbox message remains. If the drain contains no work, end this turn and stay idle. Do not run a blocking wait, trace, poll, or sleep command. The native driver will start a new turn when a message arrives. Drive the coordinated rename to a verified finish. Report completion or blockers through st2 messages."
       args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
     }
   }
