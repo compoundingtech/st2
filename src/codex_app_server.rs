@@ -9,7 +9,7 @@
 //! inbox head and submits typed input only when that state proves an idle or one exact regular
 //! active turn.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write};
 use std::net::Shutdown;
@@ -33,20 +33,60 @@ use tungstenite::{Message as WebSocketMessage, WebSocket};
 
 use crate::{ding, harness_context, harness_state, message, run, status};
 
-/// Every admitted version has a delivery-critical schema comparison and live remote-TUI evidence.
-/// A later version stays rejected until both checks are repeated; semantic-version proximity is
-/// not compatibility evidence for this experimental provider surface.
-///
-/// `codex-cli 0.147.0` is admitted on a completed schema comparison against 0.146.0 and on live
-/// evidence that reached a submitted `turn/start` against the real binary. Its live evidence stops
-/// short of a completed model turn: the account was over its usage limit when the check ran. The
-/// `turn/start` response body, `turn/started`, `turn/completed`, the typed `item/completed`
-/// receipt, `turn/steer`, and the `thread/resume` subscription path are therefore unproven on this
-/// version. See #267.
-pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &[
-    "codex-cli 0.145.0",
-    "codex-cli 0.146.0",
-    "codex-cli 0.147.0",
+const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
+    "hooks/list",
+    "initialize",
+    "thread/loaded/list",
+    "thread/resume",
+    "turn/start",
+    "turn/steer",
+];
+const REQUIRED_CODEX_CLIENT_NOTIFICATIONS: &[&str] = &["initialized"];
+const REQUIRED_CODEX_SERVER_NOTIFICATIONS: &[&str] = &[
+    "item/completed",
+    "item/started",
+    "thread/started",
+    "thread/status/changed",
+    "turn/completed",
+    "turn/started",
+];
+// The control observer does not answer server requests. A new request class must be reviewed before
+// st2 can prove that the interactive client, and not this observer, owns the response.
+const CLASSIFIED_CODEX_SERVER_REQUESTS: &[&str] = &[
+    "account/chatgptAuthTokens/refresh",
+    "applyPatchApproval",
+    "attestation/generate",
+    "currentTime/read",
+    "execCommandApproval",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/call",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+];
+// Unknown item kinds can add a delivery hold that the thread status does not expose. Each item kind
+// must therefore be classified before startup, even when st2 does not otherwise read its fields.
+const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
+    "agentMessage",
+    "collabAgentToolCall",
+    "commandExecution",
+    "contextCompaction",
+    "dynamicToolCall",
+    "enteredReviewMode",
+    "exitedReviewMode",
+    "fileChange",
+    "functionCallOutput",
+    "hookPrompt",
+    "imageGeneration",
+    "imageView",
+    "mcpToolCall",
+    "plan",
+    "reasoning",
+    "sleep",
+    "subAgentActivity",
+    "userMessage",
+    "webSearch",
 ];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
@@ -286,6 +326,7 @@ struct CodexDeliveryConfig {
     inbox: PathBuf,
     identity: String,
     this_host: String,
+    supervisor: Option<String>,
 }
 
 impl CodexDeliveryConfig {
@@ -298,13 +339,56 @@ impl CodexDeliveryConfig {
                     catalog_root.display()
                 )
             })?;
+        let supervisor = crate::discover(catalog_root)
+            .specs
+            .into_iter()
+            .find(|spec| spec.path.parent() == Some(agent_dir.as_path()))
+            .and_then(|spec| spec.supervisor);
         Ok(Self {
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
             identity: identity.to_string(),
             this_host,
+            supervisor,
         })
+    }
+
+    fn report_protocol_rejection(&self, codex: &str, error: &anyhow::Error) {
+        let Some(supervisor) = self.supervisor.as_deref() else {
+            eprintln!(
+                "st2 codex: agent '{}' has no supervisor for a protocol rejection report",
+                self.identity
+            );
+            return;
+        };
+        let subject = format!("Codex protocol rejected: {}", self.identity);
+        let body = format!(
+            "st2 rejected the installed Codex app-server protocol for agent '{}'. Native delivery did not start. Codex executable: '{}'. Error: {error:#}",
+            self.identity, codex
+        );
+        let mut key_hash = Sha256::new();
+        key_hash.update(b"st2.codex-protocol-rejection.v1");
+        key_hash.update(body.as_bytes());
+        let idempotency_key = format!("st2.codex-protocol-rejection.v1:{:x}", key_hash.finalize());
+        let tags = ["codex-protocol".to_string(), "launch-rejected".to_string()];
+        if let Err(report_error) = message::send_to_resolved_inbox(
+            &self.catalog_root,
+            supervisor,
+            &self.this_host,
+            &self.identity,
+            Some(&subject),
+            None,
+            &tags,
+            &body,
+            Some(&idempotency_key),
+            None,
+        ) {
+            eprintln!(
+                "st2 codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
+                self.identity, supervisor
+            );
+        }
     }
 }
 
@@ -1244,12 +1328,12 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let item_type = required_string(message, "/params/item/type", method)?;
-                // Codex 0.146/0.147 `ThreadItem` has eighteen variants; only these three carry
-                // steerability. Every other item reports work inside a turn that the turn and
-                // thread status already model, so it is ignored on purpose — a later protocol
-                // item that gates or releases input has to be added here explicitly, because
-                // silently dropping one is how `exitedReviewMode` stayed unmatched. Review is
-                // also the only hold the protocol ends with a typed item of its own:
+                // The admitted `ThreadItem` schema has only three variants that change
+                // steerability. Every other classified item reports work inside a turn that the
+                // turn and thread status already model, so it is ignored on purpose. A later
+                // protocol item that gates or releases input must be added here explicitly.
+                // Silently dropping one is how `exitedReviewMode` stayed unmatched. Review is
+                // also the only hold that the protocol ends with a typed item of its own:
                 // `contextCompaction` has no exit item, so both of its lifecycle edges keep
                 // holding until the thread proves otherwise.
                 let (reason, released) = match item_type {
@@ -1469,12 +1553,9 @@ impl CodexControlState {
 /// Read the delivery-relevant part of `ThreadStatus.activeFlags`: the first flag that says this
 /// thread is blocked on a human rather than on the model.
 ///
-/// `activeFlags` is a required property of the `active` arm of `ThreadStatus` on both supported
-/// codex-cli versions, and appears on no other arm, so a missing or malformed array reads as no
-/// flag instead of failing the frame - a schema surprise must not kill the control watcher.
-/// Unknown future flag values degrade the same way, to a plain `active` status; admitting a new
-/// codex-cli version already requires a delivery-critical schema comparison, which is where a new
-/// flag value has to be classified.
+/// The startup gate requires `activeFlags` on the `active` arm of `ThreadStatus`. A missing or
+/// malformed runtime array reads as no flag instead of killing the control watcher. The startup
+/// gate rejects an unclassified flag before launch.
 fn human_blocking_flag(status: Option<&Value>) -> Option<CodexHoldReason> {
     status?
         .get("activeFlags")?
@@ -1507,8 +1588,11 @@ pub fn run_controlled(
         !codex_argv.is_empty(),
         "Codex controlled launch argv is empty"
     );
-    ensure_supported_version(&codex_argv[0])?;
     let delivery = CodexDeliveryConfig::resolve(catalog_root, &identity)?;
+    if let Err(error) = ensure_supported_protocol(&codex_argv[0]) {
+        delivery.report_protocol_rejection(&codex_argv[0], &error);
+        return Err(error);
+    }
 
     let state_dir = state_dir(catalog_root, &identity);
     secure_dir(&state_dir)?;
@@ -2924,7 +3008,54 @@ fn completed_tui(status: ExitStatus) -> Result<()> {
     Ok(())
 }
 
-fn ensure_supported_version(codex: &str) -> Result<()> {
+struct CodexProtocolSchemas {
+    protocol: Value,
+    client_requests: Value,
+    client_notifications: Value,
+    server_requests: Value,
+    server_notifications: Value,
+}
+
+fn ensure_supported_protocol(codex: &str) -> Result<()> {
+    let version = codex_version(codex)?;
+    let generated = tempfile::Builder::new()
+        .prefix("st2-codex-protocol-")
+        .tempdir()
+        .context("creating a temporary Codex protocol schema directory")?;
+    let output = Command::new(codex)
+        .args([
+            "app-server",
+            "generate-json-schema",
+            "--experimental",
+            "--out",
+        ])
+        .arg(generated.path())
+        .output()
+        .with_context(|| format!("generating the Codex app-server schema from {codex}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{codex} app-server schema generation failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let read_schema = |name: &str| -> Result<Value> {
+        let path = generated.path().join(name);
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading generated Codex schema {name}"))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing generated Codex schema {name}"))
+    };
+    let schemas = CodexProtocolSchemas {
+        protocol: read_schema("codex_app_server_protocol.v2.schemas.json")?,
+        client_requests: read_schema("ClientRequest.json")?,
+        client_notifications: read_schema("ClientNotification.json")?,
+        server_requests: read_schema("ServerRequest.json")?,
+        server_notifications: read_schema("ServerNotification.json")?,
+    };
+    verify_codex_protocol_schemas(&schemas)
+        .with_context(|| format!("Codex app-server schema from {version} is incompatible"))
+}
+
+fn codex_version(codex: &str) -> Result<String> {
     let output = Command::new(codex)
         .arg("--version")
         .output()
@@ -2938,12 +3069,534 @@ fn ensure_supported_version(codex: &str) -> Result<()> {
         .context("Codex version output is not UTF-8")?
         .trim()
         .to_string();
+    anyhow::ensure!(!actual.is_empty(), "{codex} --version printed nothing");
+    Ok(actual)
+}
+
+fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> Result<()> {
+    let definitions = schemas
+        .protocol
+        .get("definitions")
+        .and_then(Value::as_object)
+        .context("aggregate schema has no definitions object")?;
+
+    require_methods(
+        &schemas.client_requests,
+        REQUIRED_CODEX_CLIENT_REQUESTS,
+        "client request",
+    )?;
+    require_methods(
+        &schemas.client_notifications,
+        REQUIRED_CODEX_CLIENT_NOTIFICATIONS,
+        "client notification",
+    )?;
+    require_methods(
+        &schemas.server_notifications,
+        REQUIRED_CODEX_SERVER_NOTIFICATIONS,
+        "server notification",
+    )?;
+    let server_requests = schema_methods(&schemas.server_requests, "server request")?;
+    let classified_server_requests = string_set(CLASSIFIED_CODEX_SERVER_REQUESTS);
+    let unknown_server_requests = server_requests
+        .difference(&classified_server_requests)
+        .cloned()
+        .collect::<Vec<_>>();
     anyhow::ensure!(
-        SUPPORTED_CODEX_CLI_VERSIONS.contains(&actual.as_str()),
-        "unsupported Codex app-server protocol version '{actual}' (expected one of: {})",
-        SUPPORTED_CODEX_CLI_VERSIONS.join(", ")
+        unknown_server_requests.is_empty(),
+        "unclassified server request methods: {}",
+        unknown_server_requests.join(", ")
+    );
+
+    let status_variants = schema_variants(definitions, "ThreadStatus", "type")?;
+    for status in ["notLoaded", "idle", "systemError", "active"] {
+        anyhow::ensure!(
+            status_variants.contains_key(status),
+            "ThreadStatus has no '{status}' variant"
+        );
+    }
+    let active = status_variants
+        .get("active")
+        .context("ThreadStatus has no active variant")?;
+    let active_flags =
+        required_property(definitions, active, "activeFlags", "ThreadStatus.active")?;
+    let active_flag = require_array(definitions, active_flags, "ThreadStatus.activeFlags")?;
+    anyhow::ensure!(
+        active_flag == schema_definition(definitions, "ThreadActiveFlag")?,
+        "ThreadStatus.activeFlags does not contain ThreadActiveFlag"
+    );
+    let actual_active_flags = schema_enum(definitions, "ThreadActiveFlag")?;
+    anyhow::ensure!(
+        actual_active_flags == string_set(&["waitingOnApproval", "waitingOnUserInput"]),
+        "ThreadActiveFlag changed: {}",
+        actual_active_flags
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let item_variants = schema_variants(definitions, "ThreadItem", "type")?;
+    let classified_items = string_set(CLASSIFIED_CODEX_THREAD_ITEMS);
+    let unknown_items = item_variants
+        .keys()
+        .filter(|item| !classified_items.contains(*item))
+        .cloned()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        unknown_items.is_empty(),
+        "unclassified ThreadItem variants: {}",
+        unknown_items.join(", ")
+    );
+    for item in [
+        "contextCompaction",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "userMessage",
+    ] {
+        anyhow::ensure!(
+            item_variants.contains_key(item),
+            "ThreadItem has no '{item}' variant"
+        );
+    }
+    let user_message = item_variants
+        .get("userMessage")
+        .context("ThreadItem has no userMessage variant")?;
+    require_property_type(
+        definitions,
+        user_message,
+        "clientId",
+        "string",
+        false,
+        "ThreadItem.userMessage",
+    )?;
+
+    let user_input_variants = schema_variants(definitions, "UserInput", "type")?;
+    let text_input = user_input_variants
+        .get("text")
+        .context("UserInput has no text variant")?;
+    require_property_type(
+        definitions,
+        text_input,
+        "text",
+        "string",
+        true,
+        "UserInput.text",
+    )?;
+    let text_elements = property(definitions, text_input, "text_elements", "UserInput.text")?;
+    require_array(definitions, text_elements, "UserInput.text.text_elements")?;
+
+    for (definition, path) in [
+        ("ClientInfo", &["name"][..]),
+        ("ClientInfo", &["version"][..]),
+        ("Thread", &["id"][..]),
+        ("Turn", &["id"][..]),
+        ("ThreadStatusChangedNotification", &["threadId"][..]),
+        ("TurnStartedNotification", &["threadId"][..]),
+        ("TurnStartedNotification", &["turn", "id"][..]),
+        ("TurnCompletedNotification", &["threadId"][..]),
+        ("TurnCompletedNotification", &["turn", "id"][..]),
+        ("ItemStartedNotification", &["threadId"][..]),
+        ("ItemStartedNotification", &["turnId"][..]),
+        ("ItemCompletedNotification", &["threadId"][..]),
+        ("ItemCompletedNotification", &["turnId"][..]),
+        ("ThreadStartedNotification", &["thread", "id"][..]),
+        ("ThreadResumeParams", &["threadId"][..]),
+        ("ThreadResumeResponse", &["thread", "id"][..]),
+        ("TurnStartParams", &["threadId"][..]),
+        ("TurnStartResponse", &["turn", "id"][..]),
+        ("TurnSteerParams", &["threadId"][..]),
+        ("TurnSteerParams", &["expectedTurnId"][..]),
+        ("TurnSteerResponse", &["turnId"][..]),
+    ] {
+        let schema = required_schema_path(definitions, definition, path)?;
+        require_type(
+            definitions,
+            schema,
+            "string",
+            &format!("{definition}.{}", path.join(".")),
+        )?;
+    }
+
+    require_property_type(
+        definitions,
+        schema_definition(definitions, "ClientInfo")?,
+        "title",
+        "string",
+        false,
+        "ClientInfo",
+    )?;
+    require_property_type(
+        definitions,
+        schema_definition(definitions, "InitializeCapabilities")?,
+        "experimentalApi",
+        "boolean",
+        false,
+        "InitializeCapabilities",
+    )?;
+    required_schema_path(definitions, "InitializeParams", &["clientInfo"])?;
+
+    let thread_status = required_schema_path(definitions, "Thread", &["status"])?;
+    anyhow::ensure!(
+        thread_status == schema_definition(definitions, "ThreadStatus")?,
+        "Thread.status does not use ThreadStatus"
+    );
+    let resume_status =
+        required_schema_path(definitions, "ThreadResumeResponse", &["thread", "status"])?;
+    anyhow::ensure!(
+        resume_status == schema_definition(definitions, "ThreadStatus")?,
+        "ThreadResumeResponse.thread.status does not use ThreadStatus"
+    );
+    let started_status = required_schema_path(
+        definitions,
+        "ThreadStartedNotification",
+        &["thread", "status"],
+    )?;
+    anyhow::ensure!(
+        started_status == schema_definition(definitions, "ThreadStatus")?,
+        "ThreadStartedNotification.thread.status does not use ThreadStatus"
+    );
+    let changed_status =
+        required_schema_path(definitions, "ThreadStatusChangedNotification", &["status"])?;
+    anyhow::ensure!(
+        changed_status == schema_definition(definitions, "ThreadStatus")?,
+        "ThreadStatusChangedNotification.status does not use ThreadStatus"
+    );
+
+    let turns = required_schema_path(definitions, "Thread", &["turns"])?;
+    let turn = require_array(definitions, turns, "Thread.turns")?;
+    anyhow::ensure!(
+        turn == schema_definition(definitions, "Turn")?,
+        "Thread.turns does not contain Turn"
+    );
+    let items = required_schema_path(definitions, "Turn", &["items"])?;
+    let item = require_array(definitions, items, "Turn.items")?;
+    anyhow::ensure!(
+        item == schema_definition(definitions, "ThreadItem")?,
+        "Turn.items does not contain ThreadItem"
+    );
+    for notification in ["ItemStartedNotification", "ItemCompletedNotification"] {
+        let item = required_schema_path(definitions, notification, &["item"])?;
+        anyhow::ensure!(
+            item == schema_definition(definitions, "ThreadItem")?,
+            "{notification}.item does not use ThreadItem"
+        );
+    }
+
+    for params in ["TurnStartParams", "TurnSteerParams"] {
+        let input = required_schema_path(definitions, params, &["input"])?;
+        let input_item = require_array(definitions, input, &format!("{params}.input"))?;
+        anyhow::ensure!(
+            input_item == schema_definition(definitions, "UserInput")?,
+            "{params}.input does not contain UserInput"
+        );
+        require_property_type(
+            definitions,
+            schema_definition(definitions, params)?,
+            "clientUserMessageId",
+            "string",
+            false,
+            params,
+        )?;
+    }
+    let loaded = required_schema_path(definitions, "ThreadLoadedListResponse", &["data"])?;
+    let loaded_item = require_array(definitions, loaded, "ThreadLoadedListResponse.data")?;
+    require_type(
+        definitions,
+        loaded_item,
+        "string",
+        "ThreadLoadedListResponse.data item",
+    )?;
+    let hook_cwds = property(
+        definitions,
+        schema_definition(definitions, "HooksListParams")?,
+        "cwds",
+        "HooksListParams",
+    )?;
+    let hook_cwd = require_array(definitions, hook_cwds, "HooksListParams.cwds")?;
+    require_type(definitions, hook_cwd, "string", "HooksListParams.cwds item")?;
+    verify_hook_schema(definitions)?;
+    Ok(())
+}
+
+fn verify_hook_schema(definitions: &serde_json::Map<String, Value>) -> Result<()> {
+    let data = required_schema_path(definitions, "HooksListResponse", &["data"])?;
+    let entry = require_array(definitions, data, "HooksListResponse.data")?;
+    anyhow::ensure!(
+        entry == schema_definition(definitions, "HooksListEntry")?,
+        "HooksListResponse.data does not contain HooksListEntry"
+    );
+    let hooks = required_schema_path(definitions, "HooksListEntry", &["hooks"])?;
+    let hook = require_array(definitions, hooks, "HooksListEntry.hooks")?;
+    anyhow::ensure!(
+        hook == schema_definition(definitions, "HookMetadata")?,
+        "HooksListEntry.hooks does not contain HookMetadata"
+    );
+    for (property, expected_type) in [
+        ("currentHash", "string"),
+        ("isManaged", "boolean"),
+        ("key", "string"),
+    ] {
+        require_property_type(
+            definitions,
+            schema_definition(definitions, "HookMetadata")?,
+            property,
+            expected_type,
+            true,
+            "HookMetadata",
+        )?;
+    }
+    let trust_status = required_schema_path(definitions, "HookMetadata", &["trustStatus"])?;
+    anyhow::ensure!(
+        trust_status == schema_definition(definitions, "HookTrustStatus")?,
+        "HookMetadata.trustStatus does not use HookTrustStatus"
+    );
+    let statuses = schema_enum(definitions, "HookTrustStatus")?;
+    anyhow::ensure!(
+        statuses == string_set(&["managed", "modified", "trusted", "untrusted"]),
+        "HookTrustStatus changed: {}",
+        statuses.into_iter().collect::<Vec<_>>().join(", ")
     );
     Ok(())
+}
+
+fn string_set(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn schema_methods(schema: &Value, label: &str) -> Result<BTreeSet<String>> {
+    let arms = schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} schema has no oneOf array"))?;
+    let mut methods = BTreeSet::new();
+    for arm in arms {
+        let required = arm
+            .get("required")
+            .and_then(Value::as_array)
+            .with_context(|| format!("{label} arm has no required array"))?;
+        anyhow::ensure!(
+            required
+                .iter()
+                .any(|value| value.as_str() == Some("method")),
+            "{label} arm does not require method"
+        );
+        let values = arm
+            .pointer("/properties/method/enum")
+            .and_then(Value::as_array)
+            .with_context(|| format!("{label} arm has no method enum"))?;
+        anyhow::ensure!(values.len() == 1, "{label} arm method enum is not exact");
+        let method = values[0]
+            .as_str()
+            .with_context(|| format!("{label} arm method is not a string"))?;
+        anyhow::ensure!(
+            methods.insert(method.to_string()),
+            "{label} method '{method}' is duplicated"
+        );
+    }
+    Ok(methods)
+}
+
+fn require_methods(schema: &Value, required: &[&str], label: &str) -> Result<()> {
+    let methods = schema_methods(schema, label)?;
+    let missing = string_set(required)
+        .difference(&methods)
+        .cloned()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "missing {label} methods: {}",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+fn schema_definition<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<&'a Value> {
+    definitions
+        .get(name)
+        .with_context(|| format!("aggregate schema has no {name} definition"))
+}
+
+fn resolve_schema<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    mut schema: &'a Value,
+) -> Result<&'a Value> {
+    for _ in 0..16 {
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let name = reference
+                .strip_prefix("#/definitions/")
+                .with_context(|| format!("unsupported schema reference '{reference}'"))?;
+            schema = schema_definition(definitions, name)?;
+            continue;
+        }
+        if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+            anyhow::ensure!(all_of.len() == 1, "schema allOf is not a single reference");
+            schema = &all_of[0];
+            continue;
+        }
+        return Ok(schema);
+    }
+    anyhow::bail!("schema reference depth exceeds 16")
+}
+
+fn schema_variants<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    definition: &str,
+    discriminator: &str,
+) -> Result<BTreeMap<String, &'a Value>> {
+    let schema = schema_definition(definitions, definition)?;
+    let variants = schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{definition} has no oneOf variants"))?;
+    let mut found = BTreeMap::new();
+    for variant in variants {
+        let variant = resolve_schema(definitions, variant)?;
+        let required = variant
+            .get("required")
+            .and_then(Value::as_array)
+            .with_context(|| format!("{definition} variant has no required array"))?;
+        anyhow::ensure!(
+            required
+                .iter()
+                .any(|value| value.as_str() == Some(discriminator)),
+            "{definition} variant does not require {discriminator}"
+        );
+        let values = variant
+            .pointer(&format!("/properties/{discriminator}/enum"))
+            .and_then(Value::as_array)
+            .with_context(|| format!("{definition} variant has no {discriminator} enum"))?;
+        anyhow::ensure!(
+            values.len() == 1,
+            "{definition} variant discriminator is not exact"
+        );
+        let value = values[0]
+            .as_str()
+            .with_context(|| format!("{definition} discriminator is not a string"))?;
+        anyhow::ensure!(
+            found.insert(value.to_string(), variant).is_none(),
+            "{definition} discriminator '{value}' is duplicated"
+        );
+    }
+    Ok(found)
+}
+
+fn schema_enum(
+    definitions: &serde_json::Map<String, Value>,
+    definition: &str,
+) -> Result<BTreeSet<String>> {
+    let values = schema_definition(definitions, definition)?
+        .get("enum")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{definition} has no enum"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("{definition} has a non-string enum value"))
+        })
+        .collect()
+}
+
+fn property<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    schema: &'a Value,
+    name: &str,
+    label: &str,
+) -> Result<&'a Value> {
+    let schema = resolve_schema(definitions, schema)?;
+    let property = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(name))
+        .with_context(|| format!("{label} has no {name} property"))?;
+    resolve_schema(definitions, property)
+}
+
+fn required_property<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    schema: &'a Value,
+    name: &str,
+    label: &str,
+) -> Result<&'a Value> {
+    let schema = resolve_schema(definitions, schema)?;
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} has no required array"))?;
+    anyhow::ensure!(
+        required.iter().any(|value| value.as_str() == Some(name)),
+        "{label} does not require {name}"
+    );
+    property(definitions, schema, name, label)
+}
+
+fn required_schema_path<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    definition: &str,
+    path: &[&str],
+) -> Result<&'a Value> {
+    let mut schema = schema_definition(definitions, definition)?;
+    let mut label = definition.to_string();
+    for component in path {
+        schema = required_property(definitions, schema, component, &label)?;
+        label.push('.');
+        label.push_str(component);
+    }
+    Ok(schema)
+}
+
+fn require_property_type(
+    definitions: &serde_json::Map<String, Value>,
+    schema: &Value,
+    property_name: &str,
+    expected_type: &str,
+    required: bool,
+    label: &str,
+) -> Result<()> {
+    let property = if required {
+        required_property(definitions, schema, property_name, label)?
+    } else {
+        property(definitions, schema, property_name, label)?
+    };
+    require_type(
+        definitions,
+        property,
+        expected_type,
+        &format!("{label}.{property_name}"),
+    )
+}
+
+fn require_type(
+    definitions: &serde_json::Map<String, Value>,
+    schema: &Value,
+    expected: &str,
+    label: &str,
+) -> Result<()> {
+    let schema = resolve_schema(definitions, schema)?;
+    let matches = match schema.get("type") {
+        Some(Value::String(actual)) => actual == expected,
+        Some(Value::Array(actual)) => actual.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    };
+    anyhow::ensure!(matches, "{label} does not accept {expected}");
+    Ok(())
+}
+
+fn require_array<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    schema: &'a Value,
+    label: &str,
+) -> Result<&'a Value> {
+    let schema = resolve_schema(definitions, schema)?;
+    require_type(definitions, schema, "array", label)?;
+    let items = schema
+        .get("items")
+        .with_context(|| format!("{label} has no item schema"))?;
+    resolve_schema(definitions, items)
 }
 
 pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
@@ -3354,42 +4007,425 @@ mod tests {
         crate::host_lock::process_alive(pid)
     }
 
-    #[test]
-    fn protocol_version_gate_accepts_only_the_exact_allowlist() {
-        let tmp = tempfile::tempdir().unwrap();
-        let write_version = |name: &str, version: &str| {
-            let path = tmp.path().join(name);
-            fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        };
-        for (index, version) in SUPPORTED_CODEX_CLI_VERSIONS.iter().enumerate() {
-            ensure_supported_version(
-                write_version(&format!("codex-admitted-{index}"), version)
-                    .to_str()
-                    .unwrap(),
-            )
-            .unwrap();
-        }
-        // An unadmitted release stays rejected until both policy checks are repeated for it, and
-        // an alpha cannot carry live evidence at all.
-        for (index, unadmitted) in ["codex-cli 0.144.0", "codex-cli 0.148.0-alpha.21"]
-            .into_iter()
-            .enumerate()
-        {
-            let error = ensure_supported_version(
-                write_version(&format!("codex-unadmitted-{index}"), unadmitted)
-                    .to_str()
-                    .unwrap(),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains(unadmitted));
-            assert!(
-                error
-                    .to_string()
-                    .contains(&SUPPORTED_CODEX_CLI_VERSIONS.join(", "))
+    fn object_schema(required: &[&str], properties: &[(&str, Value)]) -> Value {
+        json!({
+            "type": "object",
+            "required": required,
+            "properties": properties
+                .iter()
+                .map(|(name, schema)| ((*name).to_string(), schema.clone()))
+                .collect::<serde_json::Map<String, Value>>()
+        })
+    }
+
+    fn reference(name: &str) -> Value {
+        json!({ "$ref": format!("#/definitions/{name}") })
+    }
+
+    fn array_of(items: Value) -> Value {
+        json!({ "type": "array", "items": items })
+    }
+
+    fn tagged_variant(name: &str, required: &[&str], properties: &[(&str, Value)]) -> Value {
+        let mut all_required = vec!["type"];
+        all_required.extend(required);
+        let mut all_properties = vec![("type", json!({ "type": "string", "enum": [name] }))];
+        all_properties.extend(properties.iter().cloned());
+        object_schema(&all_required, &all_properties)
+    }
+
+    fn method_schema(methods: &[&str]) -> Value {
+        json!({
+            "oneOf": methods
+                .iter()
+                .map(|method| object_schema(
+                    &["method"],
+                    &[("method", json!({ "type": "string", "enum": [method] }))],
+                ))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn compatible_protocol_schemas() -> CodexProtocolSchemas {
+        let mut definitions = serde_json::Map::new();
+        definitions.insert(
+            "ThreadActiveFlag".into(),
+            json!({
+                "type": "string",
+                "enum": ["waitingOnApproval", "waitingOnUserInput"]
+            }),
+        );
+        definitions.insert(
+            "ThreadStatus".into(),
+            json!({
+                "oneOf": [
+                    tagged_variant("notLoaded", &[], &[]),
+                    tagged_variant("idle", &[], &[]),
+                    tagged_variant("systemError", &[], &[]),
+                    tagged_variant(
+                        "active",
+                        &["activeFlags"],
+                        &[("activeFlags", array_of(reference("ThreadActiveFlag")))],
+                    )
+                ]
+            }),
+        );
+        definitions.insert(
+            "ThreadItem".into(),
+            json!({
+                "oneOf": [
+                    tagged_variant("contextCompaction", &[], &[]),
+                    tagged_variant("enteredReviewMode", &[], &[]),
+                    tagged_variant("exitedReviewMode", &[], &[]),
+                    tagged_variant(
+                        "userMessage",
+                        &[],
+                        &[("clientId", json!({ "type": ["string", "null"] }))],
+                    )
+                ]
+            }),
+        );
+        definitions.insert("TextElement".into(), object_schema(&[], &[]));
+        definitions.insert(
+            "UserInput".into(),
+            json!({
+                "oneOf": [tagged_variant(
+                    "text",
+                    &["text"],
+                    &[
+                        ("text", json!({ "type": "string" })),
+                        ("text_elements", array_of(reference("TextElement"))),
+                    ],
+                )]
+            }),
+        );
+        definitions.insert(
+            "ClientInfo".into(),
+            object_schema(
+                &["name", "version"],
+                &[
+                    ("name", json!({ "type": "string" })),
+                    ("title", json!({ "type": ["string", "null"] })),
+                    ("version", json!({ "type": "string" })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "InitializeCapabilities".into(),
+            object_schema(&[], &[("experimentalApi", json!({ "type": "boolean" }))]),
+        );
+        definitions.insert(
+            "InitializeParams".into(),
+            object_schema(
+                &["clientInfo"],
+                &[
+                    ("clientInfo", reference("ClientInfo")),
+                    ("capabilities", reference("InitializeCapabilities")),
+                ],
+            ),
+        );
+        definitions.insert(
+            "Thread".into(),
+            object_schema(
+                &["id", "status", "turns"],
+                &[
+                    ("id", json!({ "type": "string" })),
+                    ("status", reference("ThreadStatus")),
+                    ("turns", array_of(reference("Turn"))),
+                ],
+            ),
+        );
+        definitions.insert(
+            "Turn".into(),
+            object_schema(
+                &["id", "items"],
+                &[
+                    ("id", json!({ "type": "string" })),
+                    ("items", array_of(reference("ThreadItem"))),
+                ],
+            ),
+        );
+        for notification in ["TurnStartedNotification", "TurnCompletedNotification"] {
+            definitions.insert(
+                notification.into(),
+                object_schema(
+                    &["threadId", "turn"],
+                    &[
+                        ("threadId", json!({ "type": "string" })),
+                        ("turn", reference("Turn")),
+                    ],
+                ),
             );
         }
+        for notification in ["ItemStartedNotification", "ItemCompletedNotification"] {
+            definitions.insert(
+                notification.into(),
+                object_schema(
+                    &["threadId", "turnId", "item"],
+                    &[
+                        ("threadId", json!({ "type": "string" })),
+                        ("turnId", json!({ "type": "string" })),
+                        ("item", reference("ThreadItem")),
+                    ],
+                ),
+            );
+        }
+        definitions.insert(
+            "ThreadStartedNotification".into(),
+            object_schema(&["thread"], &[("thread", reference("Thread"))]),
+        );
+        definitions.insert(
+            "ThreadStatusChangedNotification".into(),
+            object_schema(
+                &["threadId", "status"],
+                &[
+                    ("threadId", json!({ "type": "string" })),
+                    ("status", reference("ThreadStatus")),
+                ],
+            ),
+        );
+        definitions.insert(
+            "ThreadResumeParams".into(),
+            object_schema(&["threadId"], &[("threadId", json!({ "type": "string" }))]),
+        );
+        definitions.insert(
+            "ThreadResumeResponse".into(),
+            object_schema(&["thread"], &[("thread", reference("Thread"))]),
+        );
+        definitions.insert(
+            "TurnStartParams".into(),
+            object_schema(
+                &["threadId", "input"],
+                &[
+                    ("threadId", json!({ "type": "string" })),
+                    ("input", array_of(reference("UserInput"))),
+                    ("clientUserMessageId", json!({ "type": ["string", "null"] })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "TurnSteerParams".into(),
+            object_schema(
+                &["threadId", "expectedTurnId", "input"],
+                &[
+                    ("threadId", json!({ "type": "string" })),
+                    ("expectedTurnId", json!({ "type": "string" })),
+                    ("input", array_of(reference("UserInput"))),
+                    ("clientUserMessageId", json!({ "type": ["string", "null"] })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "TurnStartResponse".into(),
+            object_schema(&["turn"], &[("turn", reference("Turn"))]),
+        );
+        definitions.insert(
+            "TurnSteerResponse".into(),
+            object_schema(&["turnId"], &[("turnId", json!({ "type": "string" }))]),
+        );
+        definitions.insert(
+            "ThreadLoadedListResponse".into(),
+            object_schema(
+                &["data"],
+                &[("data", array_of(json!({ "type": "string" })))],
+            ),
+        );
+        definitions.insert(
+            "HooksListParams".into(),
+            object_schema(&[], &[("cwds", array_of(json!({ "type": "string" })))]),
+        );
+        definitions.insert(
+            "HooksListResponse".into(),
+            object_schema(
+                &["data"],
+                &[("data", array_of(reference("HooksListEntry")))],
+            ),
+        );
+        definitions.insert(
+            "HooksListEntry".into(),
+            object_schema(
+                &["hooks"],
+                &[("hooks", array_of(reference("HookMetadata")))],
+            ),
+        );
+        definitions.insert(
+            "HookMetadata".into(),
+            object_schema(
+                &["currentHash", "isManaged", "key", "trustStatus"],
+                &[
+                    ("currentHash", json!({ "type": "string" })),
+                    ("isManaged", json!({ "type": "boolean" })),
+                    ("key", json!({ "type": "string" })),
+                    ("trustStatus", reference("HookTrustStatus")),
+                ],
+            ),
+        );
+        definitions.insert(
+            "HookTrustStatus".into(),
+            json!({
+                "type": "string",
+                "enum": ["managed", "modified", "trusted", "untrusted"]
+            }),
+        );
+        CodexProtocolSchemas {
+            protocol: json!({ "definitions": definitions }),
+            client_requests: method_schema(REQUIRED_CODEX_CLIENT_REQUESTS),
+            client_notifications: method_schema(REQUIRED_CODEX_CLIENT_NOTIFICATIONS),
+            server_requests: method_schema(&["currentTime/read"]),
+            server_notifications: method_schema(REQUIRED_CODEX_SERVER_NOTIFICATIONS),
+        }
+    }
+
+    fn write_fake_codex(
+        root: &Path,
+        name: &str,
+        version: &str,
+        schemas: &CodexProtocolSchemas,
+    ) -> PathBuf {
+        let fixture = root.join(format!("{name}-schemas"));
+        fs::create_dir(&fixture).unwrap();
+        for (filename, schema) in [
+            (
+                "codex_app_server_protocol.v2.schemas.json",
+                &schemas.protocol,
+            ),
+            ("ClientRequest.json", &schemas.client_requests),
+            ("ClientNotification.json", &schemas.client_notifications),
+            ("ServerRequest.json", &schemas.server_requests),
+            ("ServerNotification.json", &schemas.server_notifications),
+        ] {
+            fs::write(fixture.join(filename), serde_json::to_vec(schema).unwrap()).unwrap();
+        }
+        let path = root.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\nout=\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = \"--out\" ]; then out=$2; break; fi; shift; done\n[ -n \"$out\" ] || exit 2\ncp '{fixture}/'*.json \"$out/\"\n",
+                fixture = fixture.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn protocol_schema_gate_accepts_a_compatible_release_and_rejects_shape_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compatible = compatible_protocol_schemas();
+        let patch = write_fake_codex(
+            tmp.path(),
+            "codex-compatible-patch",
+            "codex-cli 0.150.0",
+            &compatible,
+        );
+        ensure_supported_protocol(patch.to_str().unwrap()).unwrap();
+
+        let mut incompatible = compatible_protocol_schemas();
+        incompatible
+            .protocol
+            .pointer_mut("/definitions/ThreadActiveFlag/enum")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String("waitingOnFutureInput".into()));
+        let incompatible = write_fake_codex(
+            tmp.path(),
+            "codex-incompatible-schema",
+            "codex-cli 0.150.1",
+            &incompatible,
+        );
+        let error = ensure_supported_protocol(incompatible.to_str().unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("ThreadActiveFlag changed"));
+    }
+
+    #[test]
+    fn protocol_schema_gate_rejects_an_unclassified_server_request() {
+        let mut schemas = compatible_protocol_schemas();
+        schemas
+            .server_requests
+            .get_mut("oneOf")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(
+                method_schema(&["future/request"])
+                    .get_mut("oneOf")
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(0),
+            );
+        let error = verify_codex_protocol_schemas(&schemas).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unclassified server request methods: future/request")
+        );
+    }
+
+    #[test]
+    fn protocol_rejection_reaches_the_declared_supervisor_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = tmp.path().join("agents/h/worker/agent.kdl");
+        let supervisor = tmp.path().join("agents/h/cos/agent.kdl");
+        fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        fs::create_dir_all(supervisor.parent().unwrap()).unwrap();
+        fs::write(
+            &worker,
+            r#"agent "worker" {
+  host "h"
+  supervisor "h.cos"
+  command "true"
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &supervisor,
+            r#"agent "cos" {
+  host "h"
+  command "true"
+}
+"#,
+        )
+        .unwrap();
+        let mut incompatible = compatible_protocol_schemas();
+        incompatible
+            .protocol
+            .pointer_mut("/definitions/ThreadActiveFlag/enum")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String("waitingOnFutureInput".into()));
+        let codex = write_fake_codex(
+            tmp.path(),
+            "codex-rejected",
+            "codex-cli 0.150.1",
+            &incompatible,
+        );
+        let argv = vec![codex.display().to_string()];
+
+        for _ in 0..2 {
+            let error = run_controlled(
+                tmp.path(),
+                "h.worker".into(),
+                "h.worker".into(),
+                argv.clone(),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("ThreadActiveFlag changed"));
+        }
+
+        let inbox = message::list_inbox(&message::inbox_dir(supervisor.parent().unwrap())).unwrap();
+        assert_eq!(inbox.len(), 1, "the rejection report was not idempotent");
+        assert_eq!(inbox[0].from.as_deref(), Some("h.worker"));
+        assert_eq!(
+            inbox[0].subject.as_deref(),
+            Some("Codex protocol rejected: h.worker")
+        );
+        assert!(inbox[0].body.contains("Native delivery did not start"));
+        assert!(inbox[0].body.contains("ThreadActiveFlag changed"));
     }
 
     #[test]
@@ -3790,6 +4826,7 @@ mod tests {
             agent_dir,
             identity: "h.worker".into(),
             this_host: "h".into(),
+            supervisor: None,
         }
     }
 
