@@ -1298,9 +1298,7 @@ mod tests {
     /// wrapperless claim path shares the same body and therefore the same behaviour.
     #[test]
     fn the_relaunch_claim_removes_the_harness_context_record() {
-        use crate::harness_context::{
-            self, Harness, Reading, harness_context_path,
-        };
+        use crate::harness_context::{self, Harness, Reading, harness_context_path};
 
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path().join("agents").join("hetz").join("worker");

@@ -2348,10 +2348,11 @@ fn agents_cmd(
                 )
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 observed_column(r.observed.as_ref()),
+                context_column(r.context.as_ref()),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
                 lifecycle,
@@ -2379,6 +2380,29 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
         column = format!("unknown({reason})");
     }
     format!("obs:{column}")
+}
+
+/// The compact harness-context column for human `st2 agents` output. `-` means no record exists,
+/// which is distinct from a reading the harness withheld.
+fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
+    // Prefixed like the observed column beside it, so neither compact word is mistaken for the
+    // other or for declared presence.
+    let Some(context) = context else {
+        return "ctx:-".to_string();
+    };
+    // The harness's own percent, rounded for width and never clamped: a reading above 100 is a
+    // real overrun and the one an operator most needs to see.
+    let mut column = match context.used_percent {
+        Some(percent) => format!("{}%", percent.round()),
+        None => "-".to_string(),
+    };
+    if context.compactions > 0 {
+        column.push_str(&format!(" ⟳{}", context.compactions));
+    }
+    if context.stale {
+        column.push_str(" stale");
+    }
+    format!("ctx:{column}")
 }
 
 fn ding_cmd(
