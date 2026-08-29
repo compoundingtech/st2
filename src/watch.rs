@@ -525,7 +525,11 @@ mod tests {
         let before = inotify_watch_count();
         let (tx, _rx) = channel();
         let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start delivery watcher");
-        let delta = inotify_watch_count() - before;
+        // The count is host-wide, so a concurrent process releasing watches can make it fall
+        // between the two reads. That cannot mean this watcher allocated any, so saturate: an
+        // unsigned wrap would panic the assertion below with u64::MAX, blaming the watcher for
+        // another process's teardown.
+        let delta = inotify_watch_count().saturating_sub(before);
         assert!(
             delta < 32,
             "payload depth must not drive watch allocation: {delta} watches for a \
