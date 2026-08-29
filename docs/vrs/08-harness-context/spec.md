@@ -1051,27 +1051,18 @@ each only once a real test proves it (per `CLAUDE.md`):
   (`tests/claude_statusline.rs`).
 - **Per-harness fixture tests** (HC-R13) — one per producer, each decoding a
   payload captured verbatim from the version named in the producer table and
-  asserting the resulting triple, with the version asserted literally. The Codex
-  fixture ships:
-  `src/codex_app_server.rs::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`
-  over `tests/fixtures/codex_token_usage_inbound.jsonl`, asserting
-  `CODEX_CONTEXT_VERIFIED_VERSION` and the baseline literally, and asserting
-  both wrong numerators against the same capture (`total` reads 100, a
-  baseline-free `last.totalTokens / window` reads 36, the truth is 33). It must
-  fail if the 12,000 baseline moves; the omp fixture must fail if
-  `tokens` stops meaning prompt-only input; the OpenCode fixture must carry the
+  asserting the resulting triple, with the version asserted literally. All five
+  ship, and each pins the numerator its harness actually means: the Claude
+  fixture must fail if the numerator's terms or the percent rule move, the Codex
+  fixture if the 12,000 baseline moves, the omp fixture if `tokens` stops
+  meaning prompt-only input, the pi fixture if it stops meaning the last
+  assistant message's `totalTokens`, and the OpenCode fixture carries the
   post-compaction summarizer frame so a producer that stops skipping summary
   messages fails it.
-  Shipped for OpenCode, over verbatim 1.18.25 SSE frames whose own
-  `session.updated.info.version` is the asserted version:
-  `src/opencode_session.rs::captured_opencode_turns_publish_the_assistant_total_over_the_providers_window`
-  (the join, the unrounded percent, and one landed write for a duplicated frame),
-  `src/opencode_session.rs::cumulative_session_tokens_are_the_session_total_and_never_the_occupancy`,
-  `src/opencode_session.rs::neither_summary_shape_is_ever_the_reading`,
-  `src/opencode_session.rs::a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp`,
-  `src/opencode_session.rs::an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands`,
-  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`,
-  `src/opencode_session.rs::the_window_pull_reads_config_providers_through_the_real_client`.
+
+  **Shipped for claude**, over the 2.1.250 status-line payloads:
+  `src/claude_session.rs::a_mid_session_statusline_payload_yields_claudes_own_triple`,
+  `src/claude_session.rs::a_pre_turn_statusline_payload_withholds_rather_than_reporting_zero`.
 
   **Claude's two fixtures and what each proves.**
   `tests/fixtures/harness-context/claude-statusline-pre-turn.json` is the
@@ -1088,7 +1079,14 @@ each only once a real test proves it (per `CLAUDE.md`):
   none was taken. A bump that moves the numerator's terms or the percent rule
   still fails the fixture, which is what HC-R13 asks of it.
 
-  Shipped for pi and omp:
+  **Shipped for codex**:
+  `src/codex_app_server.rs::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`
+  over `tests/fixtures/codex_token_usage_inbound.jsonl`, asserting
+  `CODEX_CONTEXT_VERIFIED_VERSION` and the baseline literally, and asserting
+  both wrong numerators against the same capture (`total` reads 100, a
+  baseline-free `last.totalTokens / window` reads 36, the truth is 33).
+
+  **Shipped for pi and omp**:
   `src/pi_channel.rs::the_pi_0_84_2_fixture_pins_total_tokens_as_the_numerator`,
   `src/pi_channel.rs::the_omp_18_0_9_fixture_pins_prompt_input_as_the_numerator`,
   `src/pi_channel.rs::a_pi_compaction_withholds_the_reading_it_emptied_in_the_same_write`,
@@ -1098,11 +1096,24 @@ each only once a real test proves it (per `CLAUDE.md`):
   `src/pi_channel.rs::the_measured_pi_release_is_the_one_the_extension_gate_pins`,
   `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`.
 
+  **Shipped for OpenCode**, over verbatim 1.18.25 SSE frames whose own
+  `session.updated.info.version` is the asserted version:
+  `src/opencode_session.rs::captured_opencode_turns_publish_the_assistant_total_over_the_providers_window`
+  (the join, the unrounded percent, and one landed write for a duplicated frame),
+  `src/opencode_session.rs::cumulative_session_tokens_are_the_session_total_and_never_the_occupancy`,
+  `src/opencode_session.rs::neither_summary_shape_is_ever_the_reading`,
+  `src/opencode_session.rs::a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp`,
+  `src/opencode_session.rs::an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands`,
+  `src/opencode_session.rs::a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading`,
+  `src/opencode_session.rs::the_window_pull_reads_config_providers_through_the_real_client`.
+
   Each fixture carries *both* numbers from its capture — the one the producer
   must publish and the one it must not — because the failure this test exists to
   catch is a change of meaning with no change of shape, which no type gate and no
   round-trip assertion can see. The pi fixture asserts `23425` and not `23300`;
   the omp fixture asserts the prompt figure and not that message's `totalTokens`.
+  The row *Version-pinned producer arithmetic* in
+  [INVARIANTS.md](../../../INVARIANTS.md) names the five.
 
 - **Extension asset runtime smoke** — `checks.pi-extension-types` transpiles both
   shipped assets and drives every registered handler, because the type gate is
