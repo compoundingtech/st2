@@ -1,6 +1,6 @@
 # Harness context requirements
 
-**Status:** Draft — pending principal confirmation
+**Status:** Accepted — confirmed by Johannes on 2026-08-29
 
 ## Context
 

@@ -8,18 +8,29 @@ this; declared presence remains in the root spec's R08 section.
 
 ## Status
 
-Draft. Nothing here is implemented: the placement, guard, and Claude producer
-were built as a throwaway spike
+Partially implemented. The core is in the tree as of 2026-08-29: the record and
+its schema, the quantized write guard, the reading projection, the roster's
+fourth axis, the session-boundary removal, the Doctor advisory, and the pinned
+replicated-record names — `src/harness_context.rs`, with the invariant rows
+*Harness context discipline* and *Replicated-path discipline* naming their
+proofs.
+
+**No producer ships yet.** Every row of the producer table below, the
+per-harness fixtures (HC-R13), and the status-line tee (HC-R18) remain
+unimplemented, so in the shipped tree the record is written by nothing and every
+declaration's `context` reads `null`. That is the honest state, not a defect of
+the envelope.
+
+The placement, guard, and Claude producer were first built as a throwaway spike
 ([`.experiments/2026-08-29-context-signals-and-write-placement.md`](./.experiments/2026-08-29-context-signals-and-write-placement.md)),
 and the spike's tree is not the shipping tree. The write policy is no longer
 provisional: it was chosen on a replay benchmark over 90 real sessions
 ([`.experiments/2026-08-29-write-policy-benchmark.md`](./.experiments/2026-08-29-write-policy-benchmark.md)),
-which also moved the record's path. Draft status covers the residuals that
-remain: the Claude producer's status-line contract with dotfiles is unsettled
-(`DQ-C2`), and the transport half of `DQ-C1` is unmeasurable until a transport
-runs. Open questions are tracked in
-[open-questions.md](./open-questions.md); the direction this design deliberately
-does not take yet is in [roadmap.md](./roadmap.md).
+which also moved the record's path. The residuals that remain: the Claude
+producer's status-line contract with dotfiles is unsettled (`DQ-C2`), and the
+transport half of `DQ-C1` is unmeasurable until a transport runs. Open questions
+are tracked in [open-questions.md](./open-questions.md); the direction this
+design deliberately does not take yet is in [roadmap.md](./roadmap.md).
 
 ## Scope
 
@@ -98,7 +109,8 @@ replicated subtree (see
   "lastCompactionMs": 1788000097290,
   "lastCompactionTrigger": "manual | auto | threshold | overflow | idle | unknown",
   "incarnation": "<the writing session's token>",
-  "observedAtMs": 1788000100000
+  "observedAtMs": 1788000100000,
+  "writtenAtMs": 1788000100000
 }
 ```
 
@@ -147,6 +159,20 @@ Field rules:
   and is never re-stamped without a new reading behind it. A producer holding no
   fresh reading does not write at all, so the record ages rather than looking
   refreshed — see the heartbeat rule in the write policy.
+- `writtenAtMs` is when the record was written, and is strictly monotonic per
+  record. **Added during implementation** (2026-08-29), additively and therefore
+  without a version bump. The two stamps answer different questions and
+  collapsing them is wrong in a way that shows up immediately: the write
+  policy's heartbeat clause asks how old the *record* is, while `ageMs` asks how
+  old the *reading* is, so a producer that writes at T carrying a reading taken
+  at T−4min would look four minutes stale against a five-minute heartbeat and
+  re-publish almost at once. Monotonicity is also what keeps HC-R04's
+  byte-distinctness intact against a same-millisecond predecessor. Readers
+  derive nothing from it: `ageMs` and `stale` come from `observedAtMs` alone.
+- `usedPercent` and the other fractional fields are JSON numbers, so an integral
+  reading may serialize as `33.0` rather than `33`. That is the cost of carrying
+  pi's and omp's floats (585.6 was measured) in one field, and it is
+  numerically identical to a consumer.
 - Deserialization is additive-tolerant (no strict unknown-field rejection).
 
 Constants, deliberately not aliases of the presence or harness-state constants
@@ -312,6 +338,25 @@ Two obligations follow on st2's side:
   atomic-write helper stages on the same filesystem but outside the sync root
   and renames only the canonical path in. Measured free: p50 0.217 ms staged
   outside versus 0.222 ms as a sibling.
+
+  **Where, decided during implementation (2026-08-29): the agent directory's
+  parent** — `<catalog>/agents/<host>/` for the layout st2 publishes. The
+  obvious alternative, walking up for the catalog's control directory and
+  staging in `<catalog>/.st2/staging`, reads better and is wrong: the search has
+  no way to tell *this* catalog's control directory from any unrelated one above
+  the agent, and it was caught doing exactly that in a test — an agent directory
+  under `/tmp` on a host carrying a stray `/tmp/.st2` staged into a foreign
+  tree, and potentially a foreign filesystem, which costs the rename its
+  atomicity. The parent needs no discovery, cannot escape, holds nothing the
+  transport replicates (only agent directories, and a dotted temporary name
+  matches no include entry), and is correct for a flat catalog as well as a
+  published one. An agent directory with no parent is an error rather than a
+  quiet write inside the subtree.
+
+  `harness-state` keeps staging beside itself for now. The two records share the
+  extracted `write_json_atomic` helper, which takes the staging directory as an
+  argument precisely because they answer this question differently; moving the
+  shipped record's staging is a separate change with its own risk.
 
 The delivery watcher is unaffected (HC-R08): its allowlist is
 `starts_with(<agent-dir>/resources/inbox)` or the exact path
@@ -605,7 +650,17 @@ sidecar (HC-T04).
 `observedState`, kept rather than omitting the key, so the wire has one
 convention and not two. The reading projection above is already applied: a
 consumer never re-implements staleness, and never sees a record it would have to
-age itself.
+age itself. `incarnation` and `writtenAtMs` are deliberately not exposed: the
+first is provenance for a reader inspecting the record itself, and the second is
+a write-policy mechanism a roster consumer has no use for once `ageMs` and
+`stale` are computed.
+
+Human `st2 agents` output carries the same axis compactly as `ctx:92% ⟳1`,
+beside the existing `obs:` column and prefixed for the same reason — two bare
+words in one row is exactly the ambiguity the ontology's collision rules name.
+`ctx:-` is no record; a withheld percent renders as `ctx:-` with its compaction
+count beside it; a stale reading is suffixed `stale`. The percent is rounded for
+width and never clamped.
 
 `status`, `desiredState`, `lastActivity`, `observedState`, and
 `driverDiagnostic` keep their exact meanings. `context` is a fourth independent
