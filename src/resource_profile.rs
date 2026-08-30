@@ -739,8 +739,11 @@ impl SnapshotTarget {
             .relative
             .file_name()
             .ok_or_else(|| PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf")))?;
-        let directory =
-            open_absolute_dir_beneath(&self.root, parent).map_err(PublicationError::Io)?;
+        let directory = match open_absolute_dir_beneath(&self.root, parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(PublicationError::Io(error)),
+        };
         read_regular_optional_at(&directory, leaf, MAX_SNAPSHOT_BYTES)
             .map_err(|error| match error {
                 BoundedReadError::TooLarge => PublicationError::ExistingSnapshotTooLarge,
@@ -2012,6 +2015,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         let target = SnapshotTarget::new(&root, "resources/github-pr/owner/repo/389.json").unwrap();
+        assert_eq!(target.current_digest().unwrap(), None);
 
         let outcome = publish_snapshot(&target, b"bytes", vec!["selected".to_owned()]).unwrap();
 
