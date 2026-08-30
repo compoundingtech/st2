@@ -1372,6 +1372,16 @@ fn execute_with_presentation_cursor(
     report: &mut UpReport,
     on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
+    for spec in &plan.settle_retirement {
+        let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(error) = crate::message::archive_inbox(agent_dir) {
+            report.errors.push(format!(
+                "archive retired inbox for {}: {error:#}",
+                spec.identity
+            ));
+        }
+    }
+
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -3217,6 +3227,7 @@ mod tests {
             delivery: None,
             session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -3273,6 +3284,7 @@ mod tests {
             delivery: None,
             session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -3838,6 +3850,7 @@ mod tests {
             delivery: None,
             session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![],

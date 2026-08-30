@@ -49,19 +49,44 @@ fn compact_agent_catalog_is_clean() {
     assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
 }
 #[test]
-fn opaque_session_driver_launch_is_clean_without_ding() {
+fn native_session_driver_is_clean_with_explicit_readiness() {
     let c = catalog(&[(
         "h/worker/agent.kdl",
         r#"agent "worker" {
   host "h"
   argv "axe" "agent" "launch"
   session-driver "claude"
+  delivery-readiness "credential" account-id="tokengate/shared"
 }"#,
     )]);
 
     let report = validate(c.path());
     assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
     assert_eq!(report.agents, 1);
+}
+
+#[test]
+fn native_delivery_requires_explicit_matching_driver_and_readiness() {
+    for (name, declaration, code) in [
+        (
+            "legacy-deliver",
+            r#"agent "legacy-deliver" { host "h"; command "codex"; deliver "app-server" }"#,
+            "native-driver-missing",
+        ),
+        (
+            "missing-readiness",
+            r#"agent "missing-readiness" { host "h"; argv "axe"; session-driver "codex" }"#,
+            "delivery-readiness-missing",
+        ),
+    ] {
+        let c = catalog(&[(&format!("h/{name}/agent.kdl"), declaration)]);
+        let report = validate(c.path());
+        assert!(
+            has(&report, code, Severity::Error),
+            "{name}: {:?}",
+            report.issues
+        );
+    }
 }
 
 #[test]

@@ -240,6 +240,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         delivery: None,
         session_driver: None,
         driver: None,
+        delivery_readiness: None,
         resources: vec![],
         streams: Vec::new(),
         tasks: vec![Task {
@@ -1060,6 +1061,45 @@ command = "st2 ding hetz.demo"
     torn.sort();
     assert_eq!(torn, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(report.launched.is_empty());
+}
+
+#[test]
+fn retired_agent_idempotently_archives_every_inbox_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join("agents/hetz/demo");
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        r#"agent "demo" {
+  host "hetz"
+  desired-state "retired" reason="Work complete"
+  command "true"
+}"#,
+    );
+    let filename = "1784649988123-abc23z.md";
+    let inbox = message::inbox_dir(&agent_dir);
+    let archive = message::archive_dir(&agent_dir);
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(inbox.join(filename), "first receipt").unwrap();
+    let runner = FakeRunner::default();
+
+    let first = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt"
+    );
+    assert!(!inbox.join(filename).exists());
+
+    fs::write(inbox.join(filename), "restored duplicate").unwrap();
+    let second = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt",
+        "the durable archive receipt must never be overwritten"
+    );
+    assert!(!inbox.join(filename).exists());
 }
 
 #[test]

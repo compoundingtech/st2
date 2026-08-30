@@ -130,6 +130,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 delivery: None,
                 session_driver: None,
                 driver: None,
+                delivery_readiness: None,
                 resources: Vec::new(),
                 streams: Vec::new(),
                 tasks,

@@ -183,10 +183,11 @@ comes first. The cross-check is a narrowing of the ungraceful-death window
 (provably dead sessions: pidfile present, process gone), not its closure —
 OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
 kill that removes the registry entry leaves nothing behind to prove death
-with, and fabricating evidence is the one thing this design never does. And
-hosts running a codex-cli version outside the exact
-`SUPPORTED_CODEX_CLI_VERSIONS` allowlist produce no Codex observed state at all:
-the provider launch is refused before the control channel starts.
+with, and fabricating evidence is the one thing this design never does. A Codex
+binary whose delivery-critical schema projection does not match an admitted
+fingerprint produces no Codex observed state at all: provider launch is refused
+before the control channel starts. Fingerprint admission and live behavioral
+evidence remain separate.
 
 ## Codex producer (OHS-R05)
 
@@ -208,6 +209,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { WaitingOnUserInput }` | `active` | `human` | `question` | `waitingOnUserInput` |
 | `Held { NotLoaded }` | *withhold* | — | — | thread not loaded proves nothing about work |
 | `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
+| `Held { UnknownStatus }` | *withhold* | — | — | an unrecognized future status is not a terminal `systemError` and cannot authorize delivery |
 
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass

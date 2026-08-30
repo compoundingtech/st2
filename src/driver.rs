@@ -397,6 +397,7 @@ mod tests {
             delivery: None,
             session_driver: None,
             driver: Some(driver),
+            delivery_readiness: None,
             resources: Vec::new(),
             streams: Vec::new(),
             tasks: Vec::new(),

@@ -77,7 +77,11 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
     assert_eq!(lead["persona"], "worker");
     assert_eq!(lead["workspace"], "./.workspace");
     assert_eq!(lead["resolvedWorkspace"], root.join("agents/h/lead/.workspace").display().to_string());
-    assert_eq!(lead["sessionDriver"], "claude");
+    assert_eq!(lead["effectiveSessionDriver"], "claude");
+    assert!(lead["parentId"].is_null());
+    assert!(lead["rootId"].is_null());
+    assert!(lead["depth"].is_null());
+    assert!(lead["ancestorIds"].is_null());
     assert_eq!(lead["desiredState"], "suspended");
     assert_eq!(lead["desiredStateReason"], "Waiting for capacity");
     assert_eq!(lead["source"]["identityProvenance"], "declaration");
@@ -106,6 +110,129 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
     assert!(issue_codes.contains(&"unknown-task-kind"));
 }
 
+#[test]
+fn graph_exposes_admitted_topology_and_delivery_readiness_facts() {
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path();
+    write(
+        root,
+        "agents/h/root/agent.kdl",
+        r#"agent "root" { host "h"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  supervisor "h.root"
+  argv "axe" "agent" "launch"
+  session-driver "omp"
+  delivery-readiness "anonymous" "zeta" "alpha" "zeta" harness="omp"
+}"#,
+    );
+
+    let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph = json(&output);
+    assert_eq!(graph["complete"], true, "{graph:#}");
+    let rows = graph["agents"].as_array().unwrap();
+    let root_row = rows.iter().find(|row| row["id"] == "h.root").unwrap();
+    assert!(root_row["parentId"].is_null());
+    assert_eq!(root_row["rootId"], "h.root");
+    assert_eq!(root_row["depth"], 0);
+    assert_eq!(root_row["ancestorIds"], serde_json::json!([]));
+
+    let worker = rows.iter().find(|row| row["id"] == "h.worker").unwrap();
+    assert_eq!(worker["effectiveSessionDriver"], "omp");
+    assert_eq!(worker["parentId"], "h.root");
+    assert_eq!(worker["rootId"], "h.root");
+    assert_eq!(worker["depth"], 1);
+    assert_eq!(worker["ancestorIds"], serde_json::json!(["h.root"]));
+    assert_eq!(
+        worker["deliveryReadiness"],
+        serde_json::json!({
+            "kind": "anonymous",
+            "harness": "omp",
+            "models": ["alpha", "zeta"]
+        })
+    );
+}
+
+
+#[test]
+fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
+    let issue_codes = |root: &Path| {
+        let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+        assert_eq!(output.status.code(), Some(1));
+        let graph = json(&output);
+        assert_eq!(graph["complete"], false);
+        graph["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| issue["code"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let missing = tempfile::tempdir().unwrap();
+    write(
+        missing.path(),
+        "agents/h/root/agent.kdl",
+        r#"agent "root" { host "h"; command "true" }"#,
+    );
+    write(
+        missing.path(),
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" { host "h"; supervisor "h.absent"; command "true" }"#,
+    );
+    assert!(issue_codes(missing.path()).contains(&"supervisor-missing".to_owned()));
+
+    let cycle = tempfile::tempdir().unwrap();
+    write(
+        cycle.path(),
+        "agents/h/one/agent.kdl",
+        r#"agent "one" { host "h"; supervisor "h.two"; command "true" }"#,
+    );
+    write(
+        cycle.path(),
+        "agents/h/two/agent.kdl",
+        r#"agent "two" { host "h"; supervisor "h.one"; command "true" }"#,
+    );
+    let cycle_codes = issue_codes(cycle.path());
+    assert!(cycle_codes.contains(&"supervisor-cycle".to_owned()));
+    assert!(cycle_codes.contains(&"root-count".to_owned()));
+
+    let deep = tempfile::tempdir().unwrap();
+    for index in 0..=64 {
+        let supervisor = if index == 0 {
+            String::new()
+        } else {
+            format!(" supervisor \"h.node{}\";", index - 1)
+        };
+        write(
+            deep.path(),
+            &format!("agents/h/node{index}/agent.kdl"),
+            &format!(
+                "agent \"node{index}\" {{ host \"h\";{supervisor} command \"true\" }}\n"
+            ),
+        );
+    }
+    assert!(issue_codes(deep.path()).contains(&"supervisor-depth".to_owned()));
+
+    let roots = tempfile::tempdir().unwrap();
+    for identity in ["one", "two"] {
+        write(
+            roots.path(),
+            &format!("agents/h/{identity}/agent.kdl"),
+            &format!("agent \"{identity}\" {{ host \"h\"; command \"true\" }}\n"),
+        );
+    }
+    assert!(issue_codes(roots.path()).contains(&"root-count".to_owned()));
+}
 #[test]
 fn candidate_overlay_reports_conflict_on_stdout_and_never_publishes() {
     let catalog = tempfile::tempdir().unwrap();

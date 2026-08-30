@@ -68,12 +68,21 @@ impl DeliveryTransport {
             ),
         }
     }
+
+    pub fn session_driver(self) -> SessionDriver {
+        match self {
+            Self::Mcp => SessionDriver::Claude,
+            Self::AppServer => SessionDriver::Codex,
+            Self::PiChannel => SessionDriver::Pi,
+        }
+    }
 }
 /// The native session driver entered by an otherwise opaque launch.
 ///
 /// This is an ownership assertion only. It does not render a provider launch or select a message
 /// delivery transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionDriver {
     Claude,
     Codex,
@@ -105,6 +114,71 @@ impl SessionDriver {
             ),
         }
     }
+
+    /// Parse the canonical driver name carried by `session-driver`.
+    pub fn from_name(value: &str) -> anyhow::Result<Self> {
+        Self::parse(value)
+    }
+}
+
+/// Non-secret facts that prove how a managed session can be admitted for delivery.
+///
+/// This is deliberately separate from activity and runtime health. A credential-backed seat names
+/// only its opaque account identifier; an anonymous seat names the exact harness and model allowlist
+/// it can launch without credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+pub enum DeliveryReadiness {
+    Credential {
+        account_id: Option<String>,
+    },
+    Anonymous {
+        harness: SessionDriver,
+        models: Vec<String>,
+    },
+}
+
+impl DeliveryReadiness {
+    pub fn validate(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Credential { account_id } => {
+                if let Some(account_id) = account_id {
+                    validate_delivery_readiness_value("account-id", account_id)?;
+                }
+            }
+            Self::Anonymous { harness: _, models } => {
+                anyhow::ensure!(
+                    !models.is_empty(),
+                    "anonymous delivery-readiness requires at least one model"
+                );
+                anyhow::ensure!(
+                    models.len() <= 32,
+                    "anonymous delivery-readiness accepts at most 32 models"
+                );
+                for model in models.iter() {
+                    validate_delivery_readiness_value("model", model)?;
+                }
+                models.sort();
+                models.dedup();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_delivery_readiness_value(field: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 200,
+        "delivery-readiness {field} must be 1..=200 UTF-8 bytes"
+    );
+    anyhow::ensure!(
+        value.trim() == value
+            && !value
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')),
+        "delivery-readiness {field} must have no surrounding whitespace, controls, or line separators"
+    );
+    Ok(())
 }
 
 
@@ -128,6 +202,16 @@ impl Driver {
             Self::Pi(_) => "pi",
             Self::OpenCode(_) => "opencode",
             Self::Omp(_) => "omp",
+        }
+    }
+
+    pub fn session_driver(&self) -> SessionDriver {
+        match self {
+            Self::Claude(_) => SessionDriver::Claude,
+            Self::Codex(_) => SessionDriver::Codex,
+            Self::Pi(_) => SessionDriver::Pi,
+            Self::OpenCode(_) => SessionDriver::OpenCode,
+            Self::Omp(_) => SessionDriver::Omp,
         }
     }
 }
@@ -258,6 +342,8 @@ pub struct AgentSpec {
     pub session_driver: Option<SessionDriver>,
     /// Typed harness declaration used by task and render compilation.
     pub driver: Option<Driver>,
+    /// Non-secret admission facts for the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
@@ -268,6 +354,14 @@ pub struct AgentSpec {
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
     pub path: PathBuf,
+}
+
+impl AgentSpec {
+    /// The explicit native session owner after typed-driver normalization.
+    pub fn effective_session_driver(&self) -> Option<SessionDriver> {
+        self.session_driver
+            .or_else(|| self.driver.as_ref().map(Driver::session_driver))
+    }
 }
 
 fn deserialize_optional_selector<'de, D>(
@@ -603,6 +697,8 @@ pub(crate) struct RawSpec {
     /// Native session ownership asserted for an otherwise opaque launch.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub session_driver: Option<Option<String>>,
+    /// Non-secret facts used to admit the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
     /// Direct typed provider driver block.
     #[serde(flatten)]
     pub driver: RawDriver,
@@ -1124,6 +1220,7 @@ impl RawSpec {
             || self.ding
             || self.deliver.is_some()
             || self.session_driver.is_some()
+            || self.delivery_readiness.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
             // pi predates this predicate gaining driver awareness and was silently skipped too:
@@ -1171,26 +1268,43 @@ impl RawSpec {
             .transpose()?;
         let driver = self.driver.lower(&identity)?;
         let has_driver = driver.is_some();
+        let mut delivery_readiness = self.delivery_readiness;
+        if let Some(readiness) = delivery_readiness.as_mut() {
+            readiness.validate()?;
+        }
         anyhow::ensure!(
             !(self.ding && delivery.is_some()),
             "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
         );
         anyhow::ensure!(
-            !(self.ding && has_driver),
-            "agent '{identity}' declares both `ding` and a typed driver; choose one session owner"
+            !(self.ding && (has_driver || session_driver.is_some() || delivery_readiness.is_some())),
+            "agent '{identity}' declares managed native delivery together with `ding`; generic Ding is only for opaque non-harness PTYs"
         );
-        if session_driver.is_some() {
+        anyhow::ensure!(
+            !(session_driver.is_some() && has_driver),
+            "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
+        );
+        let effective_session_driver =
+            session_driver.or_else(|| driver.as_ref().map(Driver::session_driver));
+        if let (Some(delivery), Some(effective)) = (delivery, effective_session_driver) {
             anyhow::ensure!(
-                !self.ding,
-                "agent '{identity}' declares both `session-driver` and `ding`; choose one session owner"
+                delivery.session_driver() == effective,
+                "agent '{identity}' delivery transport '{}' requires session-driver '{}', not '{}'",
+                delivery.as_str(),
+                delivery.session_driver().as_str(),
+                effective.as_str()
             );
+        }
+        if let (
+            Some(DeliveryReadiness::Anonymous { harness, .. }),
+            Some(effective),
+        ) = (delivery_readiness.as_ref(), effective_session_driver)
+        {
             anyhow::ensure!(
-                delivery.is_none(),
-                "agent '{identity}' declares both `session-driver` and `deliver`; choose one session owner"
-            );
-            anyhow::ensure!(
-                !has_driver,
-                "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
+                *harness == effective,
+                "agent '{identity}' anonymous delivery-readiness harness '{}' does not match effective session-driver '{}'",
+                harness.as_str(),
+                effective.as_str()
             );
         }
         validate_launch(
@@ -1345,6 +1459,7 @@ impl RawSpec {
             delivery,
             session_driver,
             driver,
+            delivery_readiness,
             resources,
             streams,
             tasks,

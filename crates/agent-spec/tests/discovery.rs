@@ -13,8 +13,8 @@ use agent_spec::spec::{
     TaskLifecycle,
 };
 use agent_spec::{
-    AgentDesiredState, AgentSpec, JobType, Resource, SessionDriver, Task, discover, discover_file,
-    discover_strict,
+    AgentDesiredState, AgentSpec, DeliveryReadiness, JobType, Resource, SessionDriver, Task,
+    discover, discover_file, discover_strict,
 };
 
 #[test]
@@ -515,6 +515,83 @@ fn session_driver_is_closed_ownership_for_an_opaque_launch() {
 }
 
 #[test]
+fn delivery_readiness_is_tagged_normalized_and_separate_from_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/codex/agent.kdl",
+        r#"agent "codex" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "codex"
+  deliver "app-server"
+  delivery-readiness "credential"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/omp/agent.kdl",
+        r#"agent "omp" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "omp"
+  delivery-readiness "anonymous" "zeta" "alpha" "zeta" harness="omp"
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        find(&found.specs, "codex").delivery_readiness,
+        Some(DeliveryReadiness::Credential { account_id: None })
+    );
+    assert_eq!(
+        find(&found.specs, "omp").delivery_readiness,
+        Some(DeliveryReadiness::Anonymous {
+            harness: SessionDriver::Omp,
+            models: vec!["alpha".into(), "zeta".into()],
+        })
+    );
+}
+
+#[test]
+fn delivery_readiness_rejects_managed_ding_and_mismatched_native_ownership() {
+    for (name, declaration, expected) in [
+        (
+            "ding",
+            r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
+            "generic Ding is only for opaque non-harness PTYs",
+        ),
+        (
+            "transport",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server"; delivery-readiness "credential" }"#,
+            "requires session-driver 'codex', not 'claude'",
+        ),
+        (
+            "anonymous",
+            r#"agent "worker" { argv "axe"; session-driver "omp"; delivery-readiness "anonymous" "model" harness="codex" }"#,
+            "does not match effective session-driver",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
+}
+
+
+#[test]
 fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declarations() {
     for (name, declaration, expected) in [
         (
@@ -554,8 +631,8 @@ fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declaratio
         ),
         (
             "deliver",
-            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "mcp" }"#,
-            "declares both `session-driver` and `deliver`",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server" }"#,
+            "requires session-driver 'codex', not 'claude'",
         ),
         (
             "driver",
