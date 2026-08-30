@@ -3579,6 +3579,9 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         if report.skipped {
             anyhow::bail!("one-shot reconcile pass was skipped");
         }
+        if !report.errors.is_empty() {
+            anyhow::bail!("one-shot reconcile pass reported errors");
+        }
         return Ok(());
     }
 
@@ -3716,6 +3719,9 @@ fn up(
         }
         if targeted && !report.errors.is_empty() {
             anyhow::bail!("targeted one-shot reconcile pass reported errors");
+        }
+        if !report.errors.is_empty() {
+            anyhow::bail!("one-shot reconcile pass reported errors");
         }
         return Ok(());
     }
