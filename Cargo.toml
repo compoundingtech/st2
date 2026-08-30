@@ -2,8 +2,8 @@
 # `package.version` out of this file as the single source of truth for the
 # build, and a virtual root has no `[package]` to read.
 [workspace]
-members = ["crates/agent-spec", "crates/st2-wire", "crates/demo-resolver-wasm"]
-default-members = [".", "crates/agent-spec", "crates/st2-wire"]
+members = ["crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-wire", "crates/demo-resolver-wasm"]
+default-members = [".", "crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-wire"]
 
 [package]
 name = "st2"
@@ -33,6 +33,7 @@ notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+st2-resource-protocol = { path = "crates/st2-resource-protocol" }
 st2-wire = { path = "crates/st2-wire" }
 tempfile = "3"
 toml = "0.9"
