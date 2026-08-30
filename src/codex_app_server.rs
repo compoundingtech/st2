@@ -43,10 +43,19 @@ use crate::{ding, harness_context, harness_state, message, run, status};
 /// `turn/start` response body, `turn/started`, `turn/completed`, the typed `item/completed`
 /// receipt, `turn/steer`, and the `thread/resume` subscription path are therefore unproven on this
 /// version. See #267.
+///
+/// `codex-cli 0.151.0` is admitted after comparing its delivery-critical source and schemas with
+/// 0.147.0. A live native run passed the exact version gate, initialized control, bound a fresh
+/// thread, submitted `turn/start`, and completed the model turn. Restarting the driver then proved
+/// `thread/resume` subscription and reconciled the attempted delivery to `Accepted` from the
+/// matching `clientId` in typed thread history. The live `item/completed` notification did not
+/// independently advance that receipt before restart, so only the durable resume receipt path is
+/// claimed here.
 pub const SUPPORTED_CODEX_CLI_VERSIONS: &[&str] = &[
     "codex-cli 0.145.0",
     "codex-cli 0.146.0",
     "codex-cli 0.147.0",
+    "codex-cli 0.151.0",
 ];
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
@@ -368,7 +377,7 @@ impl CodexDeliveryState {
 }
 
 /// The exact codex-cli version whose Rust source settled the occupancy arithmetic below, read at
-/// tag `rust-v0.150.1` (tag object `0eb410ad0dd161ea323b05452f978de01cd63430`) because the Nix
+/// tag `rust-v0.151.0` (tag object `d8673cb68e349c208659b986697773d3145dbb14`) because the Nix
 /// package ships a prebuilt musl tarball with no vendored source. HC-T03 calls Codex's baseline a
 /// version-coupled constant — a property of a build, not of a documented contract — and HC-R13
 /// bounds that with a fixture pinned to this literal, in the shape of `omp_session`'s
@@ -377,16 +386,15 @@ impl CodexDeliveryState {
 /// [`tests::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`] rather
 /// than silently publish a differently-meaning number.
 ///
-/// Deliberately NOT a launch gate: this constant refuses nothing, it names what was measured. Note
-/// it is ahead of [`SUPPORTED_CODEX_CLI_VERSIONS`], which admits 0.145.0–0.147.0 — so in the
-/// shipped tree this arithmetic runs against a version whose source was not read for it. The
-/// baseline is a long-lived Codex constant, but that is an expectation, not a measurement; closing
-/// the gap means repeating the delivery-gate admission checks for 0.150.1, which is a separate act.
-pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.150.1";
+/// Deliberately NOT a launch gate: this constant refuses nothing, it names what was measured.
+/// Admitting 0.151.0 aligns the newest delivery-gated build with this measurement; a later Codex
+/// admission must still re-read the version-coupled arithmetic rather than infer compatibility
+/// from the unchanged literal.
+pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.151.0";
 
 /// Codex's `BASELINE_TOKENS`, subtracted from BOTH the numerator and the denominator of its
-/// displayed occupancy: `codex-rs/protocol/src/protocol.rs:2242` and
-/// `codex-rs/tui/src/token_usage.rs:9` at `rust-v0.150.1` carry the same literal with an identical
+/// displayed occupancy: `codex-rs/protocol/src/protocol.rs:2332` and
+/// `codex-rs/tui/src/token_usage.rs:9` at `rust-v0.151.0` carry the same literal with an identical
 /// function body, and no configuration override exists. Its doc comment: "should capture tokens
 /// that are always present in the context (e.g. system prompt and fixed tool instructions) so that
 /// the percentage reflects the portion the user can influence."
@@ -1244,7 +1252,7 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let item_type = required_string(message, "/params/item/type", method)?;
-                // Codex 0.146/0.147 `ThreadItem` has eighteen variants; only these three carry
+                // Codex 0.151 `ThreadItem` has nineteen variants; only these three carry
                 // steerability. Every other item reports work inside a turn that the turn and
                 // thread status already model, so it is ignored on purpose — a later protocol
                 // item that gates or releases input has to be added here explicitly, because
@@ -3360,6 +3368,15 @@ mod tests {
 
     #[test]
     fn protocol_version_gate_accepts_only_the_exact_allowlist() {
+        assert_eq!(
+            SUPPORTED_CODEX_CLI_VERSIONS,
+            &[
+                "codex-cli 0.145.0",
+                "codex-cli 0.146.0",
+                "codex-cli 0.147.0",
+                "codex-cli 0.151.0",
+            ]
+        );
         let tmp = tempfile::tempdir().unwrap();
         let write_version = |name: &str, version: &str| {
             let path = tmp.path().join(name);
@@ -3444,8 +3461,8 @@ mod tests {
     }
 
     /// HC-R13's Codex fixture. The frames are a transposition, and the comment says which half came
-    /// from where: the SHAPE is codex-cli 0.150.1's own app-server schema dump
-    /// (`ThreadTokenUsageUpdatedNotification`, `AccountRateLimitsUpdatedNotification`), and the
+    /// from where: the SHAPE is codex-cli 0.151.0's own app-server schema dump
+    /// (`ThreadTokenUsageUpdatedNotification`, `AccountRateLimitsUpdatedNotification`), while the
     /// NUMBERS are verbatim from a real rollout captured on 2026-08-29 from a 0.150.1 session
     /// (`session_meta.payload.cli_version = "0.150.1"`) — its first and last `token_count` events
     /// and the `rate_limits` snapshot riding them. Fields the capture elided are omitted rather
@@ -3457,7 +3474,7 @@ mod tests {
     /// the only thing tying this arithmetic to a build whose source was actually read.
     #[test]
     fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version() {
-        assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.150.1");
+        assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.151.0");
         assert_eq!(CODEX_BASELINE_TOKENS, 12_000);
 
         let frames = include_str!("../tests/fixtures/codex_token_usage_inbound.jsonl")

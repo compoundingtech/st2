@@ -184,9 +184,9 @@ comes first. The cross-check is a narrowing of the ungraceful-death window
 OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
 kill that removes the registry entry leaves nothing behind to prove death
 with, and fabricating evidence is the one thing this design never does. And
-hosts running codex-cli at or above 0.148 produce no Codex observed state at
-all: `SUPPORTED_CODEX_CLI_VERSIONS` refuses the launch, correctly, until the
-pin moves (#267).
+hosts running a codex-cli version outside the exact
+`SUPPORTED_CODEX_CLI_VERSIONS` allowlist produce no Codex observed state at all:
+the provider launch is refused before the control channel starts.
 
 ## Codex producer (OHS-R05)
 

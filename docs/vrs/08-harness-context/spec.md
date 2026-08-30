@@ -389,14 +389,15 @@ never what this subsystem needs to work.
 
 ## Producers (HC-R02, HC-R11, HC-R13)
 
-Every row was measured on 2026-08-29 against the named version. `usedPercent`
-is that harness's own displayed number (HC-R02); where st2 computes it, the row
-says so.
+Every live row was measured on 2026-08-29. The Codex payload was captured on
+0.150.1 and its version-coupled arithmetic and notification shape were reverified
+against 0.151.0 before admission. `usedPercent` is that harness's own displayed
+number (HC-R02); where st2 computes it, the row says so.
 
 | Harness | Version verified | Channel | `usedTokens` | `windowTokens` | `usedPercent` |
 | --- | --- | --- | --- | --- | --- |
 | claude | 2.1.250 | `statusLine` command stdin JSON | `context_window.total_input_tokens` = `input + cache_creation + cache_read` of the last response | `context_window.context_window_size` | `context_window.used_percentage` — Claude's own integer, clamped 0..100 |
-| codex | codex-cli 0.150.1 | app-server `thread/tokenUsage/updated` | `tokenUsage.last.totalTokens` | `tokenUsage.modelContextWindow` | st2 computes with the baseline rule below; equals `100 −` Codex's displayed "% context left" |
+| codex | codex-cli 0.151.0 | app-server `thread/tokenUsage/updated` | `tokenUsage.last.totalTokens` | `tokenUsage.modelContextWindow` | st2 computes with the baseline rule below; equals `100 −` Codex's displayed "% context left" |
 | pi | 0.84.2 | injected extension `ctx.getContextUsage()` | `.tokens` = last assistant `totalTokens` (input + output + cacheRead + cacheWrite) | `.contextWindow` | `.percent` (float) |
 | omp | 18.0.9 (and 18.0.3) | injected extension `ctx.getContextUsage()` | `.tokens` = last assistant **`input`** only | `.contextWindow` | `.percent` (float) |
 | opencode | 1.18.25 | SSE `message.updated` joined with `GET /config/providers` | last **non-summary** assistant `tokens.total` | `providers[].models[<modelID>].limit.context` | st2 computes `usedTokens / windowTokens`; the server displays none |
@@ -596,7 +597,7 @@ A compaction carrying an `agent_id` is a subagent's and never touches the record
 matching the categorical producer's guard for the same reason: this record
 describes the top-level window (`DQ-C9`).
 
-### codex (codex-cli 0.150.1)
+### codex (codex-cli 0.151.0)
 
 st2 does not re-derive the percentage; it **mirrors** Codex's own
 `TokenUsage::percent_of_context_window_remaining` and subtracts the result from
@@ -701,14 +702,13 @@ Three limits of the shipped producer, all deliberate:
   before the binding candidate names one, and a thread starting now has no
   history to replay.
 
-Finally, a version note. The arithmetic above was settled by reading codex-cli
-0.150.1's Rust source, and `CODEX_CONTEXT_VERIFIED_VERSION` pins that literal in
-the fixture (HC-R13). It is **ahead of `SUPPORTED_CODEX_CLI_VERSIONS`**, the
-delivery-path launch gate, which admits 0.145.0–0.147.0 — so in the shipped tree
-this arithmetic runs against versions whose source was not read for it. The
-baseline is a long-lived Codex constant, but that is an expectation rather than a
-measurement, and closing the gap means repeating the delivery gate's own
-admission checks for 0.150.1, which is a separate act from this producer.
+Finally, a version note. The arithmetic and notification shape above were
+reverified against codex-cli 0.151.0's Rust source, and
+`CODEX_CONTEXT_VERIFIED_VERSION` pins that literal in the fixture (HC-R13). That
+matches the newest build admitted by `SUPPORTED_CODEX_CLI_VERSIONS`; it does not
+turn the measurement into a semantic-version promise. Every later Codex release
+still requires its own source comparison and live delivery proof before the exact
+launch gate moves.
 
 ### pi (0.84.2)
 
