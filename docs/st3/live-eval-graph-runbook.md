@@ -11,6 +11,8 @@ Use the demonstration script from an interactive shell on the host:
 
 The script defaults to `weird-git-setup`. It also accepts an eval directory path.
 
+Open the [weird-git-setup map](./weird-git-setup.tldr) or the [signal-rename map](./signal-rename.tldr) in tldraw before the session.
+
 The script checks the host, builds and copies one binary, and starts the daemon in the background. It then runs the graph in the foreground.
 
 The script uses a fresh root for each run. It traps INT, TERM, and HUP.
