@@ -1127,7 +1127,24 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
         "first receipt",
         "the durable archive receipt must never be overwritten"
     );
+    assert_eq!(
+        fs::read_to_string(inbox.join(filename)).unwrap(),
+        "restored duplicate",
+        "failed teardown must leave the inbox available to the still-live agent"
+    );
+
+    let retry_runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
+    let retry = up_once(tmp.path(), "hetz", &retry_runner).unwrap();
+    assert!(retry.errors.is_empty(), "{:?}", retry.errors);
     assert!(!inbox.join(filename).exists());
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt"
+    );
 }
 
 #[test]

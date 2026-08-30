@@ -1500,15 +1500,26 @@ fn execute_with_presentation_cursor(
     // the same safe direction.
     cap.end_pass(Instant::now(), &plan.live);
 
+    let mut failed_retirement_teardowns = HashSet::new();
     for td in &plan.teardown {
+        let mut failed = false;
         for id in &td.pty_ids {
             match runner.kill(id) {
                 Ok(()) => report.torn_down.push(id.clone()),
-                Err(e) => report.errors.push(format!("kill {id}: {e}")),
+                Err(e) => {
+                    failed = true;
+                    report.errors.push(format!("kill {id}: {e}"));
+                }
             }
+        }
+        if failed {
+            failed_retirement_teardowns.insert(td.spec.path.clone());
         }
     }
     for spec in &plan.settle_retirement {
+        if failed_retirement_teardowns.contains(&spec.path) {
+            continue;
+        }
         let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
         if let Err(error) = crate::message::archive_inbox(agent_dir) {
             report.errors.push(format!(

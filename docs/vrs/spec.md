@@ -773,11 +773,14 @@ or a host with other than one root is an error. Every affected topology field
 is null and the graph envelope has `complete: false`; downstream consumers use
 these admitted facts rather than walking supervisor edges themselves.
 
-Retired reconciliation settles the declaration's whole inbox independently of
-task presence. Each canonical inbox filename is linked into `resources/archive`
-and then removed from the inbox. An existing archive file wins byte-for-byte,
-so replay and a sync-restored duplicate converge without overwriting the
-receipt. Suspended reconciliation never performs this settlement.
+Retired reconciliation first attempts every live task teardown for the agent.
+Only when all of those attempts succeed does it settle the declaration's whole
+inbox; one failure leaves every inbox file untouched and the next pass retries
+teardown plus settlement. With no live tasks, settlement proceeds immediately.
+Each canonical inbox filename is linked into `resources/archive` and then
+removed from the inbox. An existing archive file wins byte-for-byte, so replay
+and a sync-restored duplicate converge without overwriting the receipt.
+Suspended reconciliation never performs this settlement.
 
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:

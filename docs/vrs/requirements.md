@@ -350,10 +350,13 @@ accepted.
   names OMP and a non-empty normalized model set. Readiness is declaration
   state, never inferred from activity, argv, process names, or credentials.
 - **R37 Retirement settles the inbox:** Every reconciliation of a retired
-  local agent archives every canonical inbox message. The archive filename is
+  local agent first tears down every live owned task. Only after every teardown
+  attempt for that agent succeeds does the pass archive its canonical inbox
+  messages; any teardown failure leaves the entire inbox in place and retries
+  teardown plus settlement on the next reconciliation. The archive filename is
   the durable receipt: repeated settlement and a sync-restored duplicate remove
-  the inbox copy without overwriting the archived bytes. Suspension retains
-  the inbox and does not settle it.
+  the inbox copy without overwriting the archived bytes. Suspension retains the
+  inbox and does not settle it.
 - **R38 Codex schema admission:** Codex app-server launch is gated by an
   admitted fingerprint of the delivery-critical schema projection. Admission
   proves each emitted or consumed method discriminator is linked to its exact
