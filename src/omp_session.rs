@@ -388,6 +388,24 @@ mod tests {
         );
     }
 
+    /// The refusal must survive omp naming itself with something unreadable. Found by independent
+    /// verification of #370 (mutation S6): deleting the labelled fall-through left the suite
+    /// byte-identical, and driving this gate with `omp/18.1.0-rc1 18.0.9` ADMITTED the launch,
+    /// bound to the stray token rather than to the release omp reported for itself. Latent while
+    /// the shipped binary prints one token, but DQ-OMP-5 is open on precisely the update banner
+    /// that would add a second.
+    #[test]
+    fn an_unreadable_own_label_cannot_be_rescued_by_a_stray_admitted_version() {
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'omp/18.1.0-rc1 18.0.9\\n'\n");
+        let error = verify_supported_version(fake.path().to_str().unwrap())
+            .expect_err("an unreadable own label must not admit on a stray 18.0.9")
+            .to_string();
+        assert!(
+            error.contains("no unambiguous omp release"),
+            "the refusal must say the banner named no release it could read: {error}"
+        );
+    }
+
     /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.0`,
     /// which is how a minor gate would decay into "accept anything that starts with 18".
     #[test]

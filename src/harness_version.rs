@@ -68,10 +68,14 @@ pub fn parse_release(token: &str) -> Option<Release> {
 /// unverified 18.1. So the provider's own label wins, and an unlabelled banner is only trusted
 /// when it is unambiguous:
 ///
-/// 1. a `<provider>/<release>` token is authoritative — it is the provider naming itself;
-/// 2. otherwise every parseable release must agree, since a single release repeated across lines
-///    is still unambiguous;
-/// 3. anything else (no release, or two disagreeing ones) is `None`, and the caller fails closed.
+/// 1. a `<provider>/…` token DECIDES, because it is the provider naming itself. If what it named
+///    parses, that is the answer; if it does not, the answer is `None` — the search stops rather
+///    than falling through, or `omp/18.1.0-rc1 18.0.9` would admit on a release omp never
+///    claimed;
+/// 2. with no own label, every parseable release must agree, since a single release repeated
+///    across lines is still unambiguous;
+/// 3. anything else (no release, an unreadable own label, or two disagreeing ones) is `None`, and
+///    the caller fails closed.
 pub fn find_release<'a>(printed: &'a str, provider: &str) -> Option<(&'a str, Release)> {
     let labelled = format!("{provider}/");
     let mut unlabelled: Option<(&'a str, Release)> = None;
@@ -79,11 +83,10 @@ pub fn find_release<'a>(printed: &'a str, provider: &str) -> Option<(&'a str, Re
 
     for token in printed.split_whitespace() {
         if let Some(rest) = token.strip_prefix(labelled.as_str()) {
-            // The provider naming itself outranks anything else in the banner.
-            if let Some(release) = parse_release(rest) {
-                return Some((rest, release));
-            }
-            continue;
+            // The provider naming itself outranks anything else in the banner — including the
+            // case where what it named cannot be read. Falling through to the rest of the banner
+            // would let a stray token stand in for a release the provider never claimed.
+            return parse_release(rest).map(|release| (rest, release));
         }
         let bare = token.strip_prefix('v').unwrap_or(token);
         let Some(release) = parse_release(bare) else {
@@ -190,6 +193,29 @@ mod tests {
         assert_eq!(
             find_release("18.0.3\n18.0.3\n", "omp").unwrap().1.series(),
             (18, 0)
+        );
+    }
+
+    /// The provider naming itself with something this parser cannot read is a REFUSAL, not a
+    /// reason to keep looking. Falling through to the rest of the banner is how the gate ends up
+    /// bound to a token the provider never claimed: `omp/18.1.0-rc1 18.0.9` would admit on the
+    /// stray `18.0.9` and launch a provider that just said it was `18.1.0-rc1`. DQ-OMP-5 leaves
+    /// open whether omp's update banner adds exactly such a second token.
+    #[test]
+    fn an_unreadable_own_label_fails_closed_instead_of_falling_through() {
+        // The banner from the finding: an own label that does not parse, plus a stray release
+        // whose minor IS admitted. Reading the stray one is the whole bug.
+        assert!(find_release("omp/18.1.0-rc1 18.0.9", "omp").is_none());
+        // Not specific to pre-releases: any unreadable own label ends the search.
+        assert!(find_release("omp/nightly 18.0.9", "omp").is_none());
+        assert!(find_release("omp/ 18.0.9", "omp").is_none());
+        // The same parser backs the opencode gate, so it fails closed the same way.
+        assert!(find_release("opencode/1.18.25-beta 1.18.19", "opencode").is_none());
+        // An own label that DOES parse still decides, so the refusal above is about
+        // unreadability and not about labels in general.
+        assert_eq!(
+            find_release("omp/18.0.11 18.0.9", "omp").unwrap().0,
+            "18.0.11"
         );
     }
 

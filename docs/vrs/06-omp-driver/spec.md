@@ -53,6 +53,12 @@ Shape of `pi_session.rs`:
   from decaying into "starts with 18" — minors are compared numerically (`18.10` is not `18.1`),
   exactly three components are required, and a pre-release or build-metadata suffix
   (`18.0.9-rc1`) does not parse at all, so it is never admitted as its base release.
+  Which token the release is read FROM matters as much as how it parses: an `omp/<release>`
+  token is omp naming itself and decides outright, and if what it named cannot be parsed the
+  gate refuses rather than reading some other token in the banner. Otherwise `omp/18.1.0-rc1
+  18.0.9` would launch an unverified provider on the strength of a version omp never claimed —
+  which is the shape DQ-OMP-5's update banner could produce. With no own label, every parseable
+  release in the banner must agree.
 - Injects the channel extension from the verified hook set (`with_channel_extension` shape —
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
