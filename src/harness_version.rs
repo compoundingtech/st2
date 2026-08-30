@@ -68,10 +68,12 @@ pub fn parse_release(token: &str) -> Option<Release> {
 /// unverified 18.1. So the provider's own label wins, and an unlabelled banner is only trusted
 /// when it is unambiguous:
 ///
-/// 1. a `<provider>/…` token DECIDES, because it is the provider naming itself. If what it named
-///    parses, that is the answer; if it does not, the answer is `None` — the search stops rather
-///    than falling through, or `omp/18.1.0-rc1 18.0.9` would admit on a release omp never
-///    claimed;
+/// 1. the FIRST `<provider>/…` token DECIDES, because it is the provider naming itself. If what
+///    it named parses, that is the answer; if it does not, the answer is `None` — the search
+///    stops rather than falling through, or `omp/18.1.0-rc1 18.0.9` would admit on a release omp
+///    never claimed. Two DISAGREEING own labels are therefore resolved by order, unlike rule 2,
+///    where disagreeing unlabelled releases fail closed. No provider prints two, so that
+///    asymmetry is recorded rather than resolved;
 /// 2. with no own label, every parseable release must agree, since a single release repeated
 ///    across lines is still unambiguous;
 /// 3. anything else (no release, an unreadable own label, or two disagreeing ones) is `None`, and

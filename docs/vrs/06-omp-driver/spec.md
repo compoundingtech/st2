@@ -54,8 +54,8 @@ Shape of `pi_session.rs`:
   exactly three components are required, and a pre-release or build-metadata suffix
   (`18.0.9-rc1`) does not parse at all, so it is never admitted as its base release.
   Which token the release is read FROM matters as much as how it parses: an `omp/<release>`
-  token is omp naming itself and decides outright, and if what it named cannot be parsed the
-  gate refuses rather than reading some other token in the banner. Otherwise `omp/18.1.0-rc1
+  token is omp naming itself and the first one decides outright, and if what it named cannot be
+  parsed the gate refuses rather than reading some other token in the banner. Otherwise `omp/18.1.0-rc1
   18.0.9` would launch an unverified provider on the strength of a version omp never claimed —
   which is the shape DQ-OMP-5's update banner could produce. With no own label, every parseable
   release in the banner must agree.
