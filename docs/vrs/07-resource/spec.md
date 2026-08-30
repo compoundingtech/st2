@@ -11,7 +11,8 @@ Terms are defined in [ontology.md](../ontology.md): [Resource](../ontology.md#re
 
 Decisions: [0011](../.decisions/0011-the-linked-record-plane-is-retired.md),
 [0012](../.decisions/0012-working-state-is-a-declared-carrier.md),
-[0013](../.decisions/0013-resource-is-a-mediated-write-surface.md).
+[0013](../.decisions/0013-resource-is-a-mediated-write-surface.md), and
+[0014](../.decisions/0014-resource-profiles-are-state-first-read-and-observe-capabilities.md).
 
 ## The edge
 
@@ -28,6 +29,20 @@ Resource's identity. `reason` is required prose saying why this agent carries
 it. `inactive-reason`, when present, retains a reference that is no longer
 current and explains why.
 
+`selector`, when present, is profile-specific observation configuration. KDL
+stores normalized compact JSON in a raw string:
+
+```kdl
+resource "work" reason="PR this agent is preparing." \
+  uri="github-pr://github.com/example/project/42" \
+  selector=#"{"topics":["ci.failure","review.requested"]}"#
+```
+
+The canonical renderer chooses the smallest safe raw-string hash fence. JSON
+and TOML Agent Spec forms carry the selector as a native JSON value. A selector
+is not Resource identity or authority, and an observable profile must validate
+it before registration; omission selects the profile default.
+
 The URI is never normalized, and its scheme is the exact lookup key for an
 optional, catalog-declared Resource Profile
 ([`07-resource-profile`](../07-resource-profile/requirements.md), landed in
@@ -43,7 +58,7 @@ healthy work ([R21](../requirements.md)).
 
 The Rust type is
 [`crates/agent-spec/src/spec.rs`](../../../crates/agent-spec/src/spec.rs)
-`Resource { name, uri, reason, inactive_reason }`.
+`Resource { name, uri, reason, inactive_reason, selector }`.
 
 ## Identity and realization
 
@@ -75,7 +90,7 @@ Before it, 605 of 655 declarations on one live catalog had a
 ```text
 st2 resource ls [<identity>] [--json]
 st2 resource read [<identity>] <name> [--json]
-st2 resource add <name> --uri <uri> --reason <text> [--inactive-reason <text>] [--agent <identity>] [--json]
+st2 resource add <name> --uri <uri> --reason <text> [--inactive-reason <text>] [--selector-json <json>] [--agent <identity>] [--json]
 st2 resource remove <name> [--agent <identity>] [--json]
 st2 resource rename <old> <new> [--agent <identity>] [--json]
 ```

@@ -230,6 +230,15 @@ pub struct AgentSpec {
     pub path: PathBuf,
 }
 
+fn deserialize_optional_selector<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// One agent-local semantic binding to an externally identified resource.
 ///
 /// `name` is an agent-local label and `uri` is the exact absolute identity. `reason` explains why
@@ -242,6 +251,8 @@ pub struct Resource {
     reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     inactive_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +262,8 @@ struct ResourceDescriptor {
     uri: String,
     reason: String,
     inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    selector: Option<serde_json::Value>,
 }
 
 impl Resource {
@@ -278,6 +291,7 @@ impl Resource {
             uri,
             reason,
             inactive_reason: None,
+            selector: None,
         })
     }
 
@@ -309,6 +323,15 @@ impl Resource {
     pub fn inactive_reason(&self) -> Option<&str> {
         self.inactive_reason.as_deref()
     }
+
+    pub fn selector(&self) -> Option<&serde_json::Value> {
+        self.selector.as_ref()
+    }
+
+    pub fn with_selector(mut self, selector: serde_json::Value) -> Self {
+        self.selector = Some(selector);
+        self
+    }
 }
 
 impl<'de> Deserialize<'de> for Resource {
@@ -317,6 +340,7 @@ impl<'de> Deserialize<'de> for Resource {
         D: serde::Deserializer<'de>,
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
+        let selector = descriptor.selector;
         let resource = match descriptor.inactive_reason {
             None => Self::new(descriptor.name, descriptor.uri, descriptor.reason),
             Some(inactive_reason) => Self::new_inactive(
@@ -326,7 +350,12 @@ impl<'de> Deserialize<'de> for Resource {
                 inactive_reason,
             ),
         };
-        resource.map_err(de::Error::custom)
+        resource
+            .map(|resource| match selector {
+                Some(selector) => resource.with_selector(selector),
+                None => resource,
+            })
+            .map_err(de::Error::custom)
     }
 }
 
@@ -655,6 +684,8 @@ pub(crate) struct RawResource {
     pub(crate) uri: String,
     pub(crate) reason: String,
     pub(crate) inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    pub(crate) selector: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -714,13 +745,18 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                match resource.inactive_reason {
+                let selector = resource.selector;
+                let resource = match resource.inactive_reason {
                     None => Resource::new(name, resource.uri, resource.reason),
                     Some(inactive_reason) => {
                         Resource::new_inactive(name, resource.uri, resource.reason, inactive_reason)
                     }
                 }
-                .map_err(anyhow::Error::msg)
+                .map_err(anyhow::Error::msg)?;
+                Ok(match selector {
+                    Some(selector) => resource.with_selector(selector),
+                    None => resource,
+                })
             })
             .collect()
     }

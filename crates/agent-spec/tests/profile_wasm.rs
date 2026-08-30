@@ -36,6 +36,66 @@ const HOSTILE_PRELUDE: &str = r#"
       (memory (export "memory") 1)
       (func (export "alloc") (param i32) (result i32) (i32.const 1024))
 "#;
+fn wat_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!(r"\{byte:02x}"))
+        .collect()
+}
+
+fn descriptor_wat(payload: &[u8], reported_len: usize, resolution_path: &str) -> String {
+    const DESCRIPTOR_PTR: usize = 8;
+    const RESOLUTION_PTR: usize = 70_000;
+    let resolution = format!(r#"{{"path":"{resolution_path}"}}"#);
+    let descriptor_packed = ((DESCRIPTOR_PTR as u64) << 32) | reported_len as u64;
+    let resolution_packed = ((RESOLUTION_PTR as u64) << 32) | resolution.len() as u64;
+    format!(
+        r#"(module
+  (memory (export "memory") 2)
+  (func (export "alloc") (param i32) (result i32) (i32.const 120000))
+  (data (i32.const {DESCRIPTOR_PTR}) "{}")
+  (data (i32.const {RESOLUTION_PTR}) "{}")
+  (func (export "describe") (result i64) (i64.const {descriptor_packed}))
+  (func (export "resolve") (param i32 i32 i32 i32) (result i64)
+    (i64.const {resolution_packed}))
+)"#,
+        wat_bytes(payload),
+        wat_bytes(resolution.as_bytes()),
+    )
+}
+
+fn descriptor_module(payload: &[u8], reported_len: usize) -> WasmResolver {
+    WasmResolver::from_wat(&descriptor_wat(
+        payload,
+        reported_len,
+        "resources/current.json",
+    ))
+    .expect("descriptor module compiles")
+}
+
+const VALID_DESCRIPTOR: &str = r#"{
+  "abiVersion": 2,
+  "capabilities": ["resolve", "read", "observe"],
+  "selectorSchema": {
+    "type": "object",
+    "properties": {
+      "topics": {
+        "type": "array",
+        "items": { "type": "string" },
+        "uniqueItems": true
+      }
+    },
+    "required": ["topics"],
+    "additionalProperties": false
+  },
+  "defaultSelector": { "topics": ["state.changed"] },
+  "topics": [{ "name": "state.changed" }],
+  "runtime": { "topology": "perBinding" },
+  "snapshot": {
+    "mediaType": "application/json",
+    "schemaId": "dev.example.state.v1"
+  }
+}"#;
 
 fn current_rss_bytes() -> u64 {
     // /proc/self/status VmRSS is reported in kB.
@@ -49,6 +109,98 @@ fn current_rss_bytes() -> u64 {
         })
         .map(|kb| kb * 1024)
         .unwrap_or(0)
+}
+
+#[test]
+fn valid_v2_descriptor_executes_and_resolve_only_module_stays_passive() {
+    let descriptor = descriptor_module(VALID_DESCRIPTOR.as_bytes(), VALID_DESCRIPTOR.len())
+        .describe_once()
+        .expect("describe call succeeds")
+        .expect("descriptor is present");
+    assert_eq!(descriptor.abi_version, 2);
+
+    assert!(
+        WasmResolver::load(Path::new(DEMO_WASM_PATH))
+            .expect("passive resolver loads")
+            .describe_once()
+            .expect("missing describe is compatible")
+            .is_none()
+    );
+    assert!(
+        demo_registry()
+            .try_descriptor("dev.schickling.agent-goal")
+            .expect("passive registry descriptor lookup succeeds")
+            .is_none()
+    );
+}
+
+#[test]
+fn refresh_descriptor_lookup_and_resolution_share_one_module_snapshot() {
+    let directory = tempfile::tempdir().expect("temporary module directory");
+    let path = directory.path().join("smart.wasm");
+    std::fs::write(
+        &path,
+        descriptor_wat(
+            VALID_DESCRIPTOR.as_bytes(),
+            VALID_DESCRIPTOR.len(),
+            "resources/current.json",
+        ),
+    )
+    .expect("module is written");
+
+    let registry = ResourceProfileRegistry::empty().with_profile(ResourceProfile::wasm(
+        "smart",
+        &path,
+        ProfileClass::Coalesced,
+    ));
+    let refresh = registry.begin_refresh();
+    assert!(refresh
+        .try_descriptor("smart")
+        .expect("descriptor validates")
+        .is_some());
+    std::fs::write(
+        &path,
+        descriptor_wat(
+            VALID_DESCRIPTOR.as_bytes(),
+            VALID_DESCRIPTOR.len(),
+            "resources/replaced.json",
+        ),
+    )
+    .expect("module generation is replaced after descriptor lookup");
+    assert_eq!(
+        refresh
+            .try_resolve(Path::new("/agent"), "smart://resource")
+            .expect("resolution succeeds")
+            .expect("registered URI resolves")
+            .path,
+        PathBuf::from("/agent/resources/current.json")
+    );
+    assert_eq!(
+        registry
+            .try_resolve(Path::new("/agent"), "smart://resource")
+            .expect("a new refresh sees the replacement")
+            .expect("registered URI resolves")
+            .path,
+        PathBuf::from("/agent/resources/replaced.json")
+    );
+}
+
+#[test]
+fn malformed_and_oversized_descriptors_are_contained() {
+    match descriptor_module(b"{not-json", 9).describe_once() {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("key must be a string"), "got: {error}");
+        }
+        other => panic!("expected malformed descriptor rejection, got {other:?}"),
+    }
+
+    match descriptor_module(b"{}", DEFAULT_OUTPUT_LIMIT_BYTES + 1).describe_once() {
+        Err(WasmResolveError::BadReturn(error)) => {
+            assert!(error.contains("return payload"), "got: {error}");
+            assert!(error.contains("limit"), "got: {error}");
+        }
+        other => panic!("expected oversized descriptor rejection, got {other:?}"),
+    }
 }
 
 #[test]

@@ -281,6 +281,8 @@ struct ResourceJson<'a> {
     reason: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     inactive_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<&'a serde_json::Value>,
     resync: &'static str,
 }
 
@@ -293,6 +295,7 @@ fn resource_json(row: &AgentRow) -> Vec<ResourceJson<'_>> {
             uri: resource.uri(),
             reason: resource.reason(),
             inactive_reason: resource.inactive_reason(),
+            selector: resource.selector(),
             resync: coverage.as_str(),
         })
         .collect()

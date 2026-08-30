@@ -2369,12 +2369,10 @@ fn connect_control(
 
 /// `Ok(None)` = a stop was raised mid-initialize; the caller exits gracefully.
 fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>>> {
-    // A short read timeout surfaces the handshake's blocking reads as resumable
-    // `Interrupted` states (a timed-out socket read is `WouldBlock`, which the
-    // handshake machine parks on), so a stop raised while the app-server sits
-    // silent mid-handshake unblocks within a poll interval instead of holding
-    // the launch for the whole startup timeout.
-    stream.set_read_timeout(Some(CONTROL_POLL))?;
+    // Nonblocking handshake reads produce resumable `Interrupted` states. This
+    // avoids treating unrelated process signals as fatal socket I/O while
+    // retaining a bounded stop-check cadence during a silent handshake.
+    stream.set_nonblocking(true)?;
     let handshake_deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut pending = tungstenite::client("ws://localhost/", stream);
     let (mut websocket, response) = loop {
@@ -2388,13 +2386,19 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
                     Instant::now() < handshake_deadline,
                     "Codex WebSocket handshake timed out"
                 );
+                std::thread::sleep(CONTROL_POLL);
                 pending = resumable.handshake();
             }
             Err(tungstenite::HandshakeError::Failure(error)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 anyhow::bail!("Codex WebSocket handshake failed: {error}")
             }
         }
     };
+    websocket.get_mut().set_nonblocking(false)?;
+    websocket.get_mut().set_read_timeout(Some(CONTROL_POLL))?;
     anyhow::ensure!(
         response.status().as_u16() == 101,
         "Codex WebSocket handshake returned {}",
@@ -6320,8 +6324,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let descendant =
-            descendant.expect("the launcher did not create its native descendant");
+        let descendant = descendant.expect("the launcher did not create its native descendant");
         assert!(
             process_can_retain_cleanup_resources(descendant),
             "the native descendant was not alive before cleanup"

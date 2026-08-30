@@ -782,6 +782,17 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
             SemanticType::String,
             resource.inactive_reason(),
         );
+        let selector = resource
+            .selector()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("encode normalized Resource selector")?;
+        insert_optional(
+            &mut fields,
+            &format!("{root}/selector"),
+            SemanticType::Object,
+            selector.as_deref(),
+        );
     }
     for task in &spec.tasks {
         let kind = match task.kind {

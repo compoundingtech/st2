@@ -15,6 +15,14 @@ transactional ownership of catalog-relative modules (decision Q14). The
 accepted rationale is recorded in
 [decision 0009](../.decisions/0009-resource-profiles-use-a-feature-gated-wasm-boundary.md).
 
+On 2026-08-29 Johannes extended the subsystem from passive local resolution to
+a generic read-and-observe lifecycle for remotely changing Resources. Ten
+recorded interview rounds selected state-first authority, profile-defined
+schemas and defaults with binding selectors, one atomic snapshot, thin
+invalidations, implementation-selected observation and runtime topology, and
+one latest-state catch-up. The direction is recorded in
+[decision 0014](../.decisions/0014-resource-profiles-are-state-first-read-and-observe-capabilities.md).
+
 ## Assumptions
 
 - **PROFILE-A01 Downstream scheme ownership:** URI schemes and their semantic
@@ -26,6 +34,17 @@ accepted rationale is recorded in
 - **PROFILE-A03 Local denotation:** A successful profile resolution denotes a
   path inside the bound agent's directory. It does not grant authority over the
   URI, establish remote access, or change agent/task lifecycle semantics.
+- **PROFILE-A04 State-first authority:** For an observable profile, one atomic
+  current snapshot is authoritative. Notifications are invalidations, not a
+  complete event log, and no consumer may require every provider transition.
+- **PROFILE-A05 Downstream observation semantics:** A profile implementation
+  owns provider authentication, observation, reconciliation, semantic topics,
+  snapshot schema, and selector defaults. st2 owns only the generic lifecycle,
+  validation, publication, delivery, health, and containment contracts.
+- **PROFILE-A06 Read-and-observe scope:** The first capability contract does
+  not mutate provider state or standardize actions. Comments, CI reruns, label
+  changes, close, merge, approval, and other provider writes require a separate
+  authority, approval, idempotency, audit, and result-delivery design.
 
 ## Acceptable Tradeoffs
 
@@ -46,6 +65,18 @@ accepted rationale is recorded in
   already fenced by the transaction marker and recovery can remove the
   harmless superset; the catalog declaration must never point to a missing new
   catalog-owned module.
+- **PROFILE-T05 Provider-native observation:** st2 does not require polling,
+  webhooks, or a hybrid. The profile implementation may use the most efficient
+  provider-native mechanism, accepting responsibility for convergence,
+  backpressure, rate limits, and any provider cursor or repair state.
+- **PROFILE-T06 One snapshot rather than facets:** The first contract rewrites
+  one atomic profile-defined snapshot even when provider facets change
+  independently. This avoids generation manifests, facet consistency, and
+  retention machinery until measured payload or read costs justify them.
+- **PROFILE-T07 Schema execution:** Discovering profile capabilities, selector
+  vocabulary, defaults, and validation requires executing the same bounded
+  module chosen by the catalog. This keeps the contract and implementation
+  atomic at the cost of making descriptor execution part of validation.
 
 
 ## Requirements
@@ -129,9 +160,89 @@ accepted rationale is recorded in
   not change path containment or task launch, and an invalid supervisor chain
   is reported rather than silently approximated.
 
+### Must describe and validate observable capabilities
+
+- **PROFILE-R12 Versioned profile descriptor:** A profile module exposes one
+  bounded, versioned descriptor in addition to resolution. The descriptor
+  declares supported capabilities, selector schema, semantic topic vocabulary,
+  default selector value, runtime topology, snapshot media type and schema
+  identity, and ABI version. The host validates the descriptor under the same
+  fuel, memory, output, import, and failure isolation as resolution. Unknown
+  required capabilities or ABI versions fail that profile locally.
+- **PROFILE-R13 Validated binding selectors:** An observable Resource binding
+  may carry profile-specific selector configuration. Absence means the
+  descriptor's default. KDL encodes the value as compact JSON in a `selector`
+  raw-string property whose canonical renderer chooses the smallest safe hash
+  fence; JSON and TOML forms carry a native JSON value. All forms lower to one
+  normalized value that st2 validates against the descriptor before activating
+  observation. A selector may choose only profile-published topics; it changes
+  attention, never Resource URI identity, access authority, snapshot contents,
+  or provider observation.
+
+### Must publish one canonical current snapshot
+
+- **PROFILE-R14 Atomic snapshot authority:** Each active observable binding has
+  at most one profile-defined canonical current snapshot. Publication replaces
+  the snapshot atomically, records its content digest and schema identity, and
+  never exposes partial bytes. Equal-byte publication is a no-op. A first
+  successful publication with at least one selected topic schedules the same
+  superseding invalidation as a later relevant change. The snapshot remains the
+  authority after missed, duplicated, reordered, or coalesced provider
+  observations.
+- **PROFILE-R15 Implementation-owned observation:** A profile implementation
+  chooses polling, push, native subscription, or a hybrid and may retain its own
+  provider cursor. st2 standardizes registration, atomic snapshot publication,
+  backpressure, cancellation, and health outcomes but does not send
+  observation-specific reconcile commands or prescribe the provider mechanism.
+  Provider payloads never bypass snapshot publication to become canonical
+  delivery records.
+- **PROFILE-R16 Declared runtime topology:** The descriptor declares either one
+  shared runtime per catalog and exact scheme or one runtime per active binding.
+  Both modes use one host protocol and per-binding lifecycle state. Each runtime
+  incarnation receives a directional owner claim; each binding registration
+  receives a token. The host rejects output unless both still match current
+  state. EOF and existing supervisor process lifecycle own termination and
+  restart. Shared-runtime failure may affect observation for many bindings but
+  must report health per binding; per-binding failure remains local.
+- **PROFILE-R16A Finite protocol and publication bounds:** A selector's
+  canonical compact JSON is at most 16 KiB. One encoded runtime-protocol line is
+  at most 2 MiB including its newline. Decoded snapshot bytes are at most 1 MiB.
+  Health detail is at most 16 KiB of UTF-8. st2 rejects an oversized value
+  without truncation and contains the failure to the affected runtime or
+  binding.
+
+### Must bound attention and catch up to current state
+
+- **PROFILE-R17 Semantic invalidation:** When snapshot bytes change, including
+  on the first successful publication, the profile classifies the change with
+  zero or more descriptor-published semantic topics. st2 applies the binding
+  selector before delivery. A selected change emits one thin invalidation
+  carrying binding identity, current snapshot digest, and selected topics. It
+  does not copy snapshot bytes or a profile-rendered summary into the event.
+- **PROFILE-R18 Built-in superseding delivery:** Smart Resource invalidations
+  reuse one built-in per-agent delivery stream and the existing inbox, DING,
+  deduplication, and producer-side supersession machinery. The binding name is
+  the supersession key. Profiles do not create one stream per topic or a third
+  delivery plane.
+- **PROFILE-R19 Level-triggered catch-up:** Snapshot reconciliation continues
+  while delivery is unavailable. Per binding, st2 retains the current snapshot
+  digest, the last-delivered digest, and one pending-relevance bit, not a
+  transition backlog or pending historical digest. When delivery becomes
+  available, a pending relevant change emits at most one invalidation for the
+  then-current snapshot digest.
+- **PROFILE-R20 Observable health:** st2 reports descriptor, selector,
+  observation, reconciliation, publication, and delivery health separately.
+  Failure degrades only the affected profile runtime or binding, preserves the
+  last proven snapshot with explicit freshness, and never presents stale bytes
+  as newly observed state.
+
 ## Evidence
 
 The mechanism choice and sandbox bounds are supported by the
 [plugin-boundary comparison](./.experiments/2026-08-26-plugin-boundary-comparison.md).
 Composition against the real Nix-generated standing-seat shape is supported by
 the [real-shape end-to-end experiment](./.experiments/2026-08-26-dotfiles-real-shape-e2e.md).
+The state-first attention boundary is supported by the
+[GitHub attention-filter prototype](./.experiments/2026-08-29-github-attention-filter-prototype.md).
+The minimal catch-up state and topology-independent lifecycle are supported by
+the [smart Resource lifecycle state-space prototype](./.experiments/2026-08-29-smart-resource-lifecycle-prototype.md).
