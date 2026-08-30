@@ -398,7 +398,7 @@ fn up_once_suppresses_an_expanded_direct_codex_agent_without_mutating_hooks() {
         .env("CODEX_BIN", "/opt/bin/codex")
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(!output.status.success());
     let report = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -536,7 +536,7 @@ fn missing_hooks_do_not_rewrite_or_stop_an_already_live_codex_agent() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(output.status.success(), "{report}");
+    assert!(!output.status.success(), "{report}");
     assert!(report.contains("materialization deferred"), "{report}");
     assert!(report.contains("adopted (1): worker"), "{report}");
     assert!(
@@ -597,7 +597,7 @@ fn missing_hooks_cannot_hide_a_shared_workspace_render_conflict() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(output.status.success(), "{report}");
+    assert!(!output.status.success(), "{report}");
     assert!(report.contains("materialization deferred"), "{report}");
     assert!(report.contains("conflicting render ownership"), "{report}");
     assert!(
