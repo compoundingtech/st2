@@ -238,6 +238,9 @@ enum Command {
         /// cover the whole catalog. Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
+        /// Validate this one unpublished canonical Agent Spec as an overlay on the live catalog.
+        #[arg(long, value_name = "FILE")]
+        candidate: Option<PathBuf>,
         /// Fail (non-zero exit) on warnings too, not just errors.
         #[arg(long)]
         strict: bool,
@@ -494,6 +497,15 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CatalogCmd {
+    /// Emit one fail-closed declaration graph plus runtime observation envelope.
+    Graph {
+        /// Host used to resolve declarations with no host and host-local runtime facts.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute the authoritative digest bound by `catalog apply --input-sha256`.
     Digest {
         /// Complete prepared declaration directory. Runtime state and control paths are rejected.
@@ -1267,6 +1279,19 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             }
             Ok(())
         }
+        Command::Catalog(CatalogCmd::Graph { host, json }) => {
+            if !json {
+                anyhow::bail!("`st2 catalog graph` v1 requires --json");
+            }
+            let graph =
+                st2::catalog_graph::snapshot(&catalog_arg(None)?, &host.unwrap_or_else(detect_host))?;
+            let complete = graph.complete;
+            println!("{}", serde_json::to_string_pretty(&graph)?);
+            if !complete {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Catalog(CatalogCmd::Bootstrap {
             prepared,
             input_sha256,
@@ -1433,11 +1458,12 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Validate {
             root,
             host,
+            candidate,
             strict,
             json,
         } => {
             let root = catalog_arg(root)?;
-            validate_cmd(&root, host, strict, json)
+            validate_cmd(&root, host, candidate, strict, json)
         }
         Command::Pty { args } => pty_cmd(&args),
         Command::Shell { args } => shell_cmd(&args),
@@ -1618,12 +1644,26 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
     }
 }
 
-fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
+fn validate_cmd(
+    root: &Path,
+    host: Option<String>,
+    candidate: Option<PathBuf>,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
-    let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
-        .context("acquire shared catalog-authoring lock for validation")?;
-    let report = st2::validate::validate_for_host(&catalog_root, &host);
+    let report = if let Some(candidate) = candidate {
+        st2::agent_publish::validate_candidate_for_host(
+            &catalog_root,
+            st2::agent_publish::PublishSource::Spec(candidate),
+            &host,
+        )
+    } else {
+        let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+            .context("acquire shared catalog-authoring lock for validation")?;
+        st2::validate::validate_for_host(&catalog_root, &host)
+    };
     let (errors, warnings) = (report.errors(), report.warnings());
 
     if json {

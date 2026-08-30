@@ -230,6 +230,46 @@ pub fn digest_source(source: PublishSource) -> Result<SourceDigest> {
         sha256: candidate.input_sha256,
     })
 }
+/// Strictly validate one unpublished candidate as an overlay on the selected live catalog.
+///
+/// The live declaration plane is held under its shared authoring fence and never modified. The
+/// returned report uses the ordinary versioned validation vocabulary so callers do not need to
+/// construct or interpret a shadow catalog themselves.
+pub fn validate_candidate_for_host(
+    catalog: &Path,
+    source: PublishSource,
+    this_host: &str,
+) -> crate::validate::Report {
+    let source_path = match &source {
+        PublishSource::Spec(path) | PublishSource::Bundle(path) => path.display().to_string(),
+    };
+    let attempt = (|| -> Result<crate::validate::Report> {
+        let catalog = catalog
+            .canonicalize()
+            .with_context(|| format!("canonicalize catalog {}", catalog.display()))?;
+        let _lock = CatalogLock::shared(&catalog)?;
+        let staging = tempfile::tempdir().context("create candidate validation staging root")?;
+        let candidate = Candidate::stage_in(staging.path(), source)?;
+        let shadow = build_overlay(&catalog, staging.path(), &candidate)?;
+        Ok(crate::validate::validate_strict_for_host(
+            shadow.path(),
+            this_host,
+        ))
+    })();
+    match attempt {
+        Ok(report) => report,
+        Err(error) => {
+            let mut report = crate::validate::validate_strict_for_host(catalog, this_host);
+            report.issues.push(crate::validate::Issue::error(
+                "candidate-error",
+                source_path,
+                None,
+                format!("{error:#}"),
+            ));
+            report
+        }
+    }
+}
 
 /// Publish one spec under the catalog's exclusive authoring lock.
 pub fn publish(request: PublishRequest) -> Result<PublishResult> {
@@ -483,10 +523,20 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
+    let shadow = build_overlay(catalog, control, candidate)?;
+    crate::catalog_transaction::validate_full_catalog(shadow.path())
+        .context("candidate fails full-catalog validation")
+}
+
+fn build_overlay(
+    catalog: &Path,
+    staging_parent: &Path,
+    candidate: &Candidate,
+) -> Result<tempfile::TempDir> {
     let shadow = tempfile::Builder::new()
         .prefix("catalog-admission-")
-        .tempdir_in(&control)
-        .with_context(|| format!("create validation shadow in {}", control.display()))?;
+        .tempdir_in(staging_parent)
+        .with_context(|| format!("create validation shadow in {}", staging_parent.display()))?;
     let live_target = catalog
         .join("agents")
         .join(&candidate.host)
@@ -504,9 +554,7 @@ fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Re
             .context("write candidate into validation shadow")?,
         CandidateKind::Bundle => overlay_tree(candidate.stage.path(), &target)?,
     }
-
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    Ok(shadow)
 }
 
 fn copy_filtered_catalog(

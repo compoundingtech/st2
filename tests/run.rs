@@ -238,6 +238,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         keep: false,
         restart: None,
         delivery: None,
+        session_driver: None,
         driver: None,
         resources: vec![],
         streams: Vec::new(),

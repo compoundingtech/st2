@@ -136,6 +136,36 @@ fn pi_deliver_wraps_the_authored_launch_without_rendering_anything() {
         "{rendered:?}"
     );
 }
+#[test]
+fn opaque_session_driver_materializes_without_rewriting_or_adding_launch_tasks() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(
+        &path,
+        r#"agent "worker" {
+  host "h"
+  argv "axe" "agent" "launch" "--harness" "claude-code"
+  session-driver "claude"
+}"#,
+    )
+    .unwrap();
+    let (specs, errors) = st2::discover_file(&catalog, &path).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    let mut spec = specs.into_iter().next().unwrap();
+    let original_task = spec.tasks[0].clone();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+    let context = TaskCompileContext::new(catalog.clone(), executable).unwrap();
+
+    compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
+
+    assert_eq!(spec.tasks, [original_task]);
+    assert!(materialize_agent(&catalog, &spec, "h").unwrap().is_empty());
+}
+
 
 #[test]
 fn cli_prints_each_snapshot_without_changing_its_input() {
@@ -449,21 +479,7 @@ fn claude_driver_names_the_channel_state_the_seat_is_in() {
         vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT]
     );
 
-    // With the opt-in sidecar declared, the skipped channel is all there is to say.
-    let with_ding = spec_from(
-        &temp.path().join("with-ding"),
-        r#"agent "worker" {
-  host "h"
-  workspace "/work"
-  ding
-  claude { prompt "boot" }
-}
-"#,
-    );
-    assert_eq!(
-        claude_channel_advisories(&with_ding),
-        vec![CHANNEL_NOT_REGISTERED]
-    );
+
 
     let dev = spec_from(
         &temp.path().join("dev"),
@@ -509,9 +525,9 @@ fn claude_driver_names_the_channel_state_the_seat_is_in() {
 }
 
 /// The legacy `deliver "mcp"` transport renders the same `.mcp.json`, so it is in the same states
-/// — read back from the launch the operator hand-authored. A shell program can reach the flag
-/// through a wrapper or a variable, so its absence from the source text proves nothing and must
-/// not be reported as a proven skip.
+/// — read back from structured argv when the operator provides it. A shell program can reach the
+/// flag through a wrapper or variable, while a source-text occurrence may only be quoted or
+/// commented, so shell source never proves the route and must remain opaque.
 #[test]
 fn legacy_mcp_delivery_reads_the_channel_state_off_the_authored_launch() {
     let temp = tempfile::tempdir().unwrap();
@@ -521,13 +537,17 @@ fn legacy_mcp_delivery_reads_the_channel_state_off_the_authored_launch() {
             vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT],
         ),
         (
+            r#"argv "claude" "--dangerously-load-development-channels" "boot""#,
+            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+        ),
+        (
             r#"argv "claude" "--dangerously-load-development-channels=server:st2" "boot""#,
             vec![CHANNEL_DEV_CONSENT_REQUIRED],
         ),
         (r#"command "exec claude boot""#, vec![CHANNEL_ROUTE_UNKNOWN]),
         (
             r#"command "exec claude --dangerously-load-development-channels=server:st2 boot""#,
-            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+            vec![CHANNEL_ROUTE_UNKNOWN],
         ),
     ] {
         let spec = spec_from(

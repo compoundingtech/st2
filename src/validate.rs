@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_spec::discovery::{discover, path_defaults};
+use agent_spec::discovery::{Discovered, discover, discover_strict, path_defaults};
 use agent_spec::spec::{AgentSpec, JobType};
 use agent_spec::{DeclaredDiagnosticCode, DeclaredParse, DeclaredSeverity, DeclaredValue};
 
@@ -62,7 +62,12 @@ pub struct Issue {
 }
 
 impl Issue {
-    fn error(code: &'static str, path: String, agent: Option<String>, message: String) -> Self {
+    pub(crate) fn error(
+        code: &'static str,
+        path: String,
+        agent: Option<String>,
+        message: String,
+    ) -> Self {
         Issue {
             severity: Severity::Error,
             code,
@@ -107,7 +112,7 @@ impl Report {
 
 /// Validate a catalog. Returns every issue found, in a stable order (files sorted by discovery).
 pub fn validate(root: &Path) -> Report {
-    validate_scoped(root, None)
+    validate_scoped(root, None, false)
 }
 
 /// Validate a whole catalog while checking host-local filesystem facts only for `this_host`.
@@ -115,14 +120,35 @@ pub fn validate(root: &Path) -> Report {
 /// Structural checks remain fleet-wide. This scope only prevents a synced multi-host catalog from
 /// warning that another machine's external workspace or task cwd is absent locally.
 pub fn validate_for_host(root: &Path, this_host: &str) -> Report {
-    validate_scoped(root, Some(this_host))
+    validate_scoped(root, Some(this_host), false)
 }
 
-fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
+/// Validate a catalog from fail-closed discovery. Unreadable entries and directory traversal
+/// failures become attributed issues instead of silently narrowing the validation universe.
+pub fn validate_strict_for_host(root: &Path, this_host: &str) -> Report {
+    validate_scoped(root, Some(this_host), true)
+}
+
+fn validate_scoped(root: &Path, this_host: Option<&str>, strict_discovery: bool) -> Report {
     // Canonicalize so `$CATALOG`-rooted paths expand to absolute paths (a relative root would make
     // every `$CATALOG/...` look relative). Falls back to the given root if it does not exist yet.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let d = discover(root);
+    let discovered = if strict_discovery {
+        discover_strict(root)
+    } else {
+        discover(root)
+    };
+    validate_discovered(root, this_host, &discovered)
+}
+
+/// Validate one caller-held immutable discovery result. Catalog graph readers use this to keep
+/// valid rows, conflicts, and attributed issues on exactly the same declaration observation.
+pub(crate) fn validate_discovered(
+    root: &Path,
+    this_host: Option<&str>,
+    d: &Discovered,
+) -> Report {
+    let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut issues = Vec::new();
     let task_context = match crate::reconcile::TaskCompileContext::current(root.to_path_buf()) {
         Ok(context) => Some(context),
@@ -144,6 +170,11 @@ fn validate_scoped(root: &Path, this_host: Option<&str>) -> Report {
                 "no-identity",
                 "spec has no identity in content or path".to_string(),
             )
+        } else if e.message.contains("catalog directory")
+            || e.message.contains("catalog entry")
+            || e.message.contains("unobservable declaration entry")
+        {
+            ("catalog-incomplete", e.message.clone())
         } else {
             ("parse-error", e.message.clone())
         };

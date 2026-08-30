@@ -48,6 +48,44 @@ fn compact_agent_catalog_is_clean() {
     assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
     assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
 }
+#[test]
+fn opaque_session_driver_launch_is_clean_without_ding() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "claude"
+}"#,
+    )]);
+
+    let report = validate(c.path());
+    assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
+    assert_eq!(report.agents, 1);
+}
+
+#[test]
+fn explicit_and_typed_session_drivers_reject_ding() {
+    for (name, body) in [
+        (
+            "opaque",
+            r#"argv "axe" "agent" "launch"; session-driver "claude"; ding"#,
+        ),
+        ("typed", r#"claude { prompt "Start work." }; ding"#),
+    ] {
+        let c = catalog(&[(
+            &format!("h/{name}/agent.kdl"),
+            &format!(r#"agent "{name}" {{ host "h"; {body} }}"#),
+        )]);
+        let report = validate(c.path());
+        assert!(
+            has(&report, "parse-error", Severity::Error),
+            "{name}: {:?}",
+            report.issues
+        );
+    }
+}
+
 
 #[test]
 fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
