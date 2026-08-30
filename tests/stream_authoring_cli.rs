@@ -127,6 +127,11 @@ fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     output
 }
 
+// The live-root check for this change excluded only direct children matching
+// `$PTY_ROOT/*.events.jsonl`. Running PTY daemons append terminal traffic to these per-session
+// journals. The test runner changes its journal when it prints results. Other live sessions change
+// their journals independently. The regression below excludes no path. It compares every path and
+// byte in each inherited tree after the runtime command.
 #[test]
 fn a_runtime_run_leaves_inherited_production_roots_byte_identical() {
     let production_pty = tempfile::tempdir().unwrap();
