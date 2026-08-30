@@ -210,3 +210,41 @@ enumerates siblings by name, moves.
 - Bare *context* is already taken in st2's language for R09's working state. The
   wire key is `context` while the canonical term is *harness context record*;
   the ontology carries the collision rule.
+
+## Amendment 1 — 2026-08-30: the degraded status-line arm is silent
+
+The chaining obligation (q5, HC-R18) stands unchanged. What is withdrawn is the
+*fallback* the original decision paired with it: that where no downstream
+renderer resolves, the tee passes the payload through unchanged, "transparency
+rather than silence", so the degraded case is still a status line.
+
+That reasoning was wrong for this surface, and observably so. The status-line
+payload is machine JSON, not prose — session id, transcript path, model and
+usage blocks — and the slot repaints every five seconds. A seat that resolves no
+renderer therefore renders a wall of
+`{"session_id":…,"transcript_path":…}` in place of its status line: worse for
+the operator than a blank row, and carrying nothing they can act on.
+Transparency is the right default for a channel a human reads, and the original
+argument applied it to a channel that carries a machine's serialization.
+
+The failure was live rather than theoretical, and was observed on `dev3` on
+2026-08-30. Neither resolution path was present there — the renderer file is managed by the dotfiles
+generation and had not been switched, and the environment variable comes from
+the login-shell session variables while seats launch from a user service — so
+every managed Claude seat on that host displayed raw JSON as its status line.
+
+Amended: where no renderer resolves, and wherever a resolved renderer fails, the
+tee writes nothing to stdout and puts its diagnostic on stderr, which the
+harness routes to its debug log and never to the rendered row. The diagnostic
+names both resolution paths, because absent both is precisely the diagnosis. The
+hook script's own outermost fallback follows the same rule, draining stdin so
+the harness does not take an EPIPE at the refresh cadence.
+
+Recording is untouched by any of this: the reading lands whether or not anything
+is drawn, so the amendment trades no telemetry for the quieter line. Two
+consequences follow. The *Status-line slot chaining* invariant row changes
+wording, and its degraded proofs now assert an empty stdout with the stderr
+diagnostic as their positive evidence — an empty stdout alone is also what a tee
+that crashed instantly would leave. And a blank status line becomes a state an
+operator can reach without an error anywhere; stderr is the only place that says
+why, which is why the diagnostic is required rather than optional.

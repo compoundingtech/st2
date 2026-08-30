@@ -25,7 +25,8 @@ Each entry links a spec `DQ-C*`. Questions leave this file when resolved — int
   `$ST_CLAUDE_STATUSLINE_RENDERER` first, then
   `~/.claude/statusline-renderer.json` (schema
   `dotfiles.claude-statusline-renderer.v1`, carrying `{"command": …}`), then —
-  if neither resolves — passing stdin through unchanged. A user-owned file was
+  if neither resolves — writing nothing to stdout and naming both paths in a
+  stderr diagnostic. A user-owned file was
   chosen over a settings key because the settings file st2 wins in is the one
   st2 rewrites, so a renderer declared there is exactly what the merge does not
   preserve (HC-R18's inverse). Specified in [spec.md](./spec.md) under the
