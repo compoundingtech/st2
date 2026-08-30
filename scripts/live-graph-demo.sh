@@ -8,6 +8,7 @@ readonly SOCKET_WAIT_SECONDS=15
 
 demo_root=""
 daemon_pid=""
+eval_pid=""
 
 say() {
   printf '%s\n' "$*"
@@ -27,39 +28,113 @@ show_daemon_log() {
   fi
 }
 
-cleanup() {
-  local exit_status=$?
+valid_demo_root() {
+  local target_root=$1
+  local target_base=${XDG_RUNTIME_DIR:-/tmp}
+  local target_name=${target_root##*/}
+
+  if [[ -d "$target_base" ]]; then
+    target_base=$(cd -- "$target_base" && pwd -P)
+  fi
+  target_base=${target_base%/}
+  [[ -n "$target_base" ]] || target_base=/
+  [[ "${target_root%/*}" == "$target_base" ]]
+  [[ "$target_name" =~ ^st3-live-demo\.[A-Za-z0-9]{6}$ ]]
+}
+
+process_start_ticks() {
+  local process_pid=$1
+  local process_stat=""
+  local process_fields=""
+
+  IFS= read -r process_stat <"/proc/$process_pid/stat" 2>/dev/null || return 1
+  process_fields=${process_stat##*) }
+  set -- $process_fields
+  printf '%s\n' "${20:-}"
+}
+
+demo_daemon_matches() {
+  local target_root=$1
+  local target_pid=$2
+  local -a daemon_arguments=()
+
+  [[ -r "/proc/$target_pid/cmdline" ]] || return 1
+  mapfile -d '' -t daemon_arguments <"/proc/$target_pid/cmdline"
+  [[ "${daemon_arguments[0]:-}" == "$target_root/st3" ]]
+  [[ "${daemon_arguments[1]:-}" == up ]]
+}
+
+demo_eval_matches() {
+  local target_root=$1
+  local target_pid=$2
+  local -a eval_arguments=()
+
+  [[ -r "/proc/$target_pid/cmdline" ]] || return 1
+  mapfile -d '' -t eval_arguments <"/proc/$target_pid/cmdline"
+  [[ "${eval_arguments[0]:-}" == "$target_root/st3" ]]
+  [[ "${eval_arguments[1]:-}" == --endpoint ]]
+  [[ "${eval_arguments[2]:-}" == "$target_root/st3.sock" ]]
+  [[ "${eval_arguments[3]:-}" == eval ]]
+}
+
+stop_demo_resources() {
+  local target_root=$1
+  local target_daemon_pid=$2
+  local can_wait_for_daemon=$3
+  local attempt=0
+  local cleanup_failed=false
+  local target_eval_pid=""
   local pty_root=""
   local session_json=""
   local session_name=""
-  local watchdog_pid=""
   local -a session_names=()
 
-  trap - EXIT ERR INT TERM
-  set +e
-
-  if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
-    say "Stopping the demo daemon."
-    kill -TERM "$daemon_pid" 2>/dev/null
-    (
-      sleep 5
-      kill -KILL "$daemon_pid" 2>/dev/null
-    ) &
-    watchdog_pid=$!
-    wait "$daemon_pid" 2>/dev/null
-    kill "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null
-  elif [[ -n "$daemon_pid" ]]; then
-    wait "$daemon_pid" 2>/dev/null
+  if [[ -z "$target_root" ]]; then
+    return 0
+  fi
+  if ! valid_demo_root "$target_root"; then
+    printf 'The cleanup refused an invalid demo root: %s\n' "$target_root" >&2
+    return 1
   fi
 
-  if [[ -n "$demo_root" && -d "$demo_root" ]]; then
-    pty_root="$demo_root/state/pty"
+  if [[ -r "$target_root/eval.pid" ]]; then
+    IFS= read -r target_eval_pid <"$target_root/eval.pid" || true
+  fi
+  if [[ "$target_eval_pid" =~ ^[0-9]+$ ]] \
+    && demo_eval_matches "$target_root" "$target_eval_pid"; then
+    say "Stopping the demo graph."
+    kill -TERM "$target_eval_pid" 2>/dev/null
+    for ((attempt = 0; attempt < 20; attempt++)); do
+      demo_eval_matches "$target_root" "$target_eval_pid" || break
+      sleep 0.05
+    done
+    if demo_eval_matches "$target_root" "$target_eval_pid"; then
+      kill -KILL "$target_eval_pid" 2>/dev/null
+    fi
+  fi
+
+  if [[ -n "$target_daemon_pid" ]] && demo_daemon_matches "$target_root" "$target_daemon_pid"; then
+    say "Stopping the demo daemon."
+    kill -TERM "$target_daemon_pid" 2>/dev/null
+    for ((attempt = 0; attempt < 50; attempt++)); do
+      demo_daemon_matches "$target_root" "$target_daemon_pid" || break
+      sleep 0.1
+    done
+    if demo_daemon_matches "$target_root" "$target_daemon_pid"; then
+      kill -KILL "$target_daemon_pid" 2>/dev/null
+    fi
+  fi
+  if [[ "$can_wait_for_daemon" == true && -n "$target_daemon_pid" ]]; then
+    wait "$target_daemon_pid" 2>/dev/null
+  fi
+
+  if [[ -d "$target_root" ]]; then
+    pty_root="$target_root/state/pty"
     for _ in 1 2 3 4 5; do
       if ! session_json=$(pty --root "$pty_root" list --json 2>/dev/null); then
         printf 'The demo could not list its PTY sessions. The demo root remains at %s\n' \
-          "$demo_root" >&2
-        exit_status=1
+          "$target_root" >&2
+        cleanup_failed=true
         break
       fi
       mapfile -t session_names < <(jq -r '.[].name' <<<"$session_json")
@@ -77,15 +152,52 @@ cleanup() {
     if session_json=$(pty --root "$pty_root" list --json 2>/dev/null) \
       && [[ $(jq 'length' <<<"$session_json") == 0 ]]; then
       say "Removing the fresh demo root."
-      rm -rf -- "$demo_root"
+      rm -rf -- "$target_root"
     else
       printf 'The demo root remains because a PTY session did not stop: %s\n' \
-        "$demo_root" >&2
-      exit_status=1
+        "$target_root" >&2
+      cleanup_failed=true
     fi
   fi
 
+  [[ "$cleanup_failed" == false ]]
+}
+
+cleanup() {
+  local exit_status=$?
+
+  trap - EXIT ERR HUP INT TERM
+  set +e
+
+  if ! stop_demo_resources "$demo_root" "$daemon_pid" true; then
+    exit_status=1
+  fi
+  if [[ -n "$eval_pid" ]]; then
+    wait "$eval_pid" 2>/dev/null
+  fi
+
   exit "$exit_status"
+}
+
+run_cleanup_watchdog() {
+  local controller_pid=$1
+  local controller_start=$2
+  local target_daemon_pid=$3
+  local target_root=$4
+
+  trap '' HUP INT TERM
+  if [[ ! "$controller_pid" =~ ^[0-9]+$ || ! "$target_daemon_pid" =~ ^[0-9]+$ ]]; then
+    return 2
+  fi
+  valid_demo_root "$target_root" || return 2
+  printf '%s\n' "$$" >"$target_root/cleanup-watchdog.ready"
+
+  while [[ $(process_start_ticks "$controller_pid" 2>/dev/null || true) == "$controller_start" ]]; do
+    sleep 0.2
+  done
+
+  set +e
+  stop_demo_resources "$target_root" "$target_daemon_pid" false
 }
 
 on_error() {
@@ -95,8 +207,17 @@ on_error() {
   exit "$exit_status"
 }
 
+if [[ "${1:-}" == --cleanup-watchdog ]]; then
+  if (($# != 5)); then
+    exit 2
+  fi
+  run_cleanup_watchdog "$2" "$3" "$4" "$5"
+  exit $?
+fi
+
 trap cleanup EXIT
 trap on_error ERR
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -182,6 +303,7 @@ runtime_base=${XDG_RUNTIME_DIR:-/tmp}
 if [[ ! -d "$runtime_base" || ! -w "$runtime_base" ]]; then
   fail "The runtime directory is not writable: $runtime_base"
 fi
+runtime_base=$(cd -- "$runtime_base" && pwd -P)
 
 say "Building st3 before the demonstration starts."
 cargo build -p st3 --locked
@@ -212,6 +334,33 @@ setsid "$demo_binary" up \
   --socket "$socket_path" \
   >"$daemon_log" 2>&1 &
 daemon_pid=$!
+
+controller_start=$(process_start_ticks "$$") \
+  || fail "The cleanup watchdog cannot identify the demo controller."
+cleanup_watchdog_log="$demo_root/cleanup-watchdog.log"
+setsid "$repo_root/scripts/live-graph-demo.sh" \
+  --cleanup-watchdog "$$" "$controller_start" "$daemon_pid" "$demo_root" \
+  >"$cleanup_watchdog_log" 2>&1 &
+cleanup_watchdog_pid=$!
+cleanup_watchdog_ready=false
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if [[ -s "$demo_root/cleanup-watchdog.ready" ]]; then
+    cleanup_watchdog_ready=true
+    break
+  fi
+  if ! kill -0 "$cleanup_watchdog_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$cleanup_watchdog_ready" != true ]]; then
+  if [[ -s "$cleanup_watchdog_log" ]]; then
+    while IFS= read -r line; do
+      printf '  %s\n' "$line" >&2
+    done <"$cleanup_watchdog_log"
+  fi
+  fail "The cleanup watchdog did not start."
+fi
 
 say "Waiting for the daemon socket to accept a connection."
 socket_ready=false
@@ -246,4 +395,7 @@ say "Starting the $requested_eval graph. This demonstration usually takes three 
 say "Press Control-C once to stop the eval and clean up the demo."
 "$demo_binary" \
   --endpoint "$socket_path" \
-  eval "$eval_dir" --graph
+  eval "$eval_dir" --graph &
+eval_pid=$!
+printf '%s\n' "$eval_pid" >"$demo_root/eval.pid"
+wait "$eval_pid"

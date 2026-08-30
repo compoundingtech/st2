@@ -13,7 +13,11 @@ The script defaults to `weird-git-setup`. It also accepts an eval directory path
 
 The script checks the host, builds and copies one binary, and starts the daemon in the background. It then runs the graph in the foreground.
 
-The script uses a fresh root for each run. It stops the daemon and demo sessions, then removes that root on normal exit or Control-C.
+The script uses a fresh root for each run. It traps INT, TERM, and HUP.
+
+An independent guard cleans the root if the terminal wrapper kills the script before a trap runs.
+
+Cleanup stops the graph, daemon, and demo sessions. It then removes the fresh root.
 
 The manual workflow below explains each action that the script performs.
 
