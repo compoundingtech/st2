@@ -2,13 +2,28 @@
 
 This runbook starts an isolated st3 daemon and watches one eval in a full-screen terminal graph.
 
+Use the demonstration script from an interactive shell on the host:
+
+```sh
+./scripts/live-graph-demo.sh
+./scripts/live-graph-demo.sh weird-git-setup
+```
+
+The script defaults to `weird-git-setup`. It also accepts an eval directory path.
+
+The script checks the host, builds and copies one binary, and starts the daemon in the background. It then runs the graph in the foreground.
+
+The script uses a fresh root for each run. It stops the daemon and demo sessions, then removes that root on normal exit or Control-C.
+
+The manual workflow below explains each action that the script performs.
+
 The daemon must run before the eval starts. The graph command must write to an interactive terminal.
 
 The eval does not need registration or viewer configuration. st3 reads the complete eval directory when the eval command starts.
 
 ## Prerequisites
 
-Use a Linux host with two terminal windows on the same machine.
+Use a Linux host with an interactive terminal.
 
 Use a clean st2 checkout on the `design/st3-engineering` branch. The checkout must contain commit `95ad704` or a descendant.
 
