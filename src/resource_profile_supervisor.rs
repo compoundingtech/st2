@@ -995,7 +995,7 @@ fn emit_pending_at(
         &active.desired.binding_name,
         digest,
     );
-    let subject = format!("resource {} changed", active.desired.binding_name);
+    let subject = publication_subject(&active.desired.binding_name, &topics);
     crate::event::emit_builtin_resync(
         catalog_root,
         this_host,
@@ -1012,6 +1012,14 @@ fn emit_pending_at(
 
 fn publication_event_id(recipient: &str, binding: &str, digest: SnapshotDigest) -> String {
     hash_text(&format!("resource-profile\0{recipient}\0{binding}\0{digest}"))
+}
+
+fn publication_subject(binding: &str, topics: &[String]) -> String {
+    if topics.is_empty() {
+        format!("resource {binding} changed: snapshot updated")
+    } else {
+        format!("resource {binding} changed: {}", topics.join(", "))
+    }
 }
 
 fn binding_state_directory(desired: &DesiredBinding) -> anyhow::Result<PathBuf> {
@@ -1128,6 +1136,21 @@ mod tests {
         assert!(owner_matches(Some(&replacement), &replacement));
         assert!(!owner_matches(Some(&replacement), &old));
         assert!(!owner_matches(None, &old));
+    }
+
+    #[test]
+    fn publication_subject_names_the_semantic_topics_visible_in_ding() {
+        assert_eq!(
+            publication_subject(
+                "st2-resource-profiles-pr",
+                &["ci.failure".to_owned(), "mergeability.conflict".to_owned()]
+            ),
+            "resource st2-resource-profiles-pr changed: ci.failure, mergeability.conflict"
+        );
+        assert_eq!(
+            publication_subject("review", &[]),
+            "resource review changed: snapshot updated"
+        );
     }
 
     #[test]
