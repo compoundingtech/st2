@@ -1111,11 +1111,11 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
 
 impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
-    /// lifecycle intent, a `type`, or task blocks. Random TOML/JSON in the tree has none of these
-    /// and is skipped.
+    /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
+    /// has none of these and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
-            || self.job_type.is_some()
+            || self.job_type.as_deref() == Some("service")
             || self.retired.is_some()
             || self.desired_state.is_some()
             || self.desired_state_reason.is_some()
@@ -1543,6 +1543,19 @@ mod tests {
         }
         let raw: super::RawSpec = toml::from_str("unrelated = true").unwrap();
         assert!(!raw.looks_like_spec());
+    }
+
+    #[test]
+    fn only_service_type_is_a_spec_candidate_by_itself() {
+        let esm_manifest: super::RawSpec = serde_json::from_str(r#"{"type":"module"}"#).unwrap();
+        assert!(!esm_manifest.looks_like_spec());
+
+        let service: super::RawSpec = serde_json::from_str(r#"{"type":"service"}"#).unwrap();
+        assert!(service.looks_like_spec());
+
+        let unknown_type_declaration: super::RawSpec =
+            serde_json::from_str(r#"{"identity":"worker","type":"module"}"#).unwrap();
+        assert!(unknown_type_declaration.looks_like_spec());
     }
     use super::*;
 
