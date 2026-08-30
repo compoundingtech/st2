@@ -2072,6 +2072,9 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
                 pending = resumable.handshake();
             }
             Err(tungstenite::HandshakeError::Failure(error)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 anyhow::bail!("Codex WebSocket handshake failed: {error}")
             }
         }
@@ -5367,8 +5370,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let descendant =
-            descendant.expect("the launcher did not create its native descendant");
+        let descendant = descendant.expect("the launcher did not create its native descendant");
         assert!(
             process_can_retain_cleanup_resources(descendant),
             "the native descendant was not alive before cleanup"
