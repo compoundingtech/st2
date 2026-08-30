@@ -80,6 +80,35 @@ fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn send_rejects_empty_explicit_and_stdin_bodies_without_persisting_a_message() {
+    for body_arg in [Some(""), None] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(tmp.path(), "sender");
+        write_agent(tmp.path(), "recipient");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+        command
+            .args(["message", "send", "recipient", "--root"])
+            .arg(tmp.path())
+            .args(["--host", "h", "--as", "sender"])
+            .stdin(Stdio::null());
+        if let Some(body) = body_arg {
+            command.args(["-m", body]);
+        }
+
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("message body must not be empty"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!tmp.path().join("h/recipient/resources").exists());
+        assert!(!tmp.path().join("h/sender/resources").exists());
+    }
+}
+
+#[test]
 fn event_metadata_is_exposed_by_list_and_read_json() {
     let tmp = tempfile::tempdir().unwrap();
     write_agent(tmp.path(), "bob");

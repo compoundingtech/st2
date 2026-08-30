@@ -2599,17 +2599,21 @@ fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
 
 /// Body from `-m`, else stdin (so `st2 message send x < file` works).
 fn body_or_stdin(body: Option<String>) -> Result<String> {
-    match body {
-        Some(b) => Ok(b),
+    let body = match body {
+        Some(body) => body,
         None => {
             use std::io::Read as _;
-            let mut s = String::new();
+            let mut body = String::new();
             std::io::stdin()
-                .read_to_string(&mut s)
+                .read_to_string(&mut body)
                 .context("reading message body from stdin")?;
-            Ok(s)
+            body
         }
+    };
+    if body.is_empty() {
+        anyhow::bail!("message body must not be empty");
     }
+    Ok(body)
 }
 
 /// `[identity] <filename>` positionals: if `second` is present, `first` is the identity; otherwise
