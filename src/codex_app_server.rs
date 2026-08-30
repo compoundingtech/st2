@@ -1388,7 +1388,7 @@ pub fn run_controlled_paths(
         !codex_argv.is_empty(),
         "Codex controlled launch argv is empty"
     );
-    ensure_supported_version(&codex_argv[0])?;
+    ensure_supported_protocol(&codex_argv[0])?;
     secure_dir(driver_root)?;
     secure_dir(state_dir)?;
     secure_dir(agent_dir)?;
@@ -1401,6 +1401,7 @@ pub fn run_controlled_paths(
         inbox,
         identity: identity.clone(),
         this_host: run::detect_host(),
+        supervisor: None,
     };
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
