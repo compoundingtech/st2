@@ -131,7 +131,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/codex", post(quick_codex))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*scope}", get(get_eval))
-        .route("/v1/plan-runs", post(start_plan_run))
+        .route("/v1/plan-runs", get(list_plan_runs).post(start_plan_run))
         .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
         .route("/v1/plan-runs/{run}", get(get_plan_run))
         .route("/v1/work", get(list_work))
@@ -1272,6 +1272,22 @@ async fn start_plan_run(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+struct PlanRunQuery {
+    root: String,
+}
+
+async fn list_plan_runs(
+    State(state): State<AppState>,
+    Query(query): Query<PlanRunQuery>,
+) -> Result<Json<Vec<PlanRunView>>, ApiError> {
+    state
+        .store
+        .plan_runs_for_root(&query.root)
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn get_plan_run(
@@ -2710,7 +2726,7 @@ subgraph {{
         assert!(body["plan_run"].as_str().unwrap().starts_with("plan-run/"));
         let eval_scope = body["scope"].as_str().unwrap();
         let (status, eval_status) = get_request(
-            app,
+            app.clone(),
             &format!("/v1/evals/{}", urlencoding::encode(eval_scope)),
         )
         .await;
@@ -2718,6 +2734,15 @@ subgraph {{
         assert_eq!(eval_status["plan_run"], body["plan_run"]);
         assert_eq!(eval_status["lifecycle"], "running");
         assert!(eval_status.get("active_checkpoint").is_none());
+        let root = body["plan_run"].as_str().unwrap();
+        let (status, plan_runs) = get_request(
+            app,
+            &format!("/v1/plan-runs?root={}", urlencoding::encode(root)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan_runs}");
+        assert_eq!(plan_runs.as_array().unwrap().len(), 1);
+        assert_eq!(plan_runs[0]["subject"], root);
         assert_eq!(
             store
                 .get_document("doc/evals/demo/task", &hash)

@@ -870,6 +870,20 @@ impl Store {
             .collect()
     }
 
+    pub fn plan_runs_for_root(&self, root: &str) -> Result<Vec<PlanRunView>> {
+        let root = root.strip_prefix("plan-run/").unwrap_or(root);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM plan_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
+        )?;
+        let ids = statement
+            .query_map([root], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
     pub fn work(&self, assignee: Option<&str>, include_terminal: bool) -> Result<Vec<StepRunView>> {
         let assignee = assignee.map(|value| normalize_actor(value, "agent"));
         let connection = self.connection.lock().expect("store mutex poisoned");

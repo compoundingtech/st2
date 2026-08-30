@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
@@ -87,6 +87,8 @@ enum Command {
     },
     /// Run one explicit eval.
     Eval(EvalArgs),
+    /// Show one running eval as a live graph.
+    Graph(GraphArgs),
     /// Show the current claims view.
     Status(StatusArgs),
     /// Show declared agents and their current graph state.
@@ -308,6 +310,14 @@ enum DocCommand {
 #[derive(Args)]
 struct EvalArgs {
     eval: PathBuf,
+    /// Show one live graph screen with semantic state transitions.
+    #[arg(long)]
+    graph: bool,
+}
+
+#[derive(Args)]
+struct GraphArgs {
+    scope: String,
 }
 
 #[derive(Args)]
@@ -683,6 +693,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Service { command } => run_service(command),
         Command::Doc { command } => run_doc(&client, command, cli.json).await,
         Command::Eval(args) => run_eval(&client, args, cli.json).await,
+        Command::Graph(args) => run_graph(&client, args, cli.json).await,
         Command::Status(args) => run_status(&client, args, cli.json).await,
         Command::Agents(args) => run_agents(&client, args, cli.json).await,
         Command::Context { command } => run_context(&client, command, cli.json).await,
@@ -2660,6 +2671,14 @@ async fn run_judgement(client: &Client, args: JudgementArgs, json_output: bool) 
 }
 
 async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(
+        !(args.graph && json_output),
+        "--graph and --json cannot be used together"
+    );
+    anyhow::ensure!(
+        !args.graph || std::io::stdout().is_terminal(),
+        "--graph needs an interactive terminal"
+    );
     let bundle = archive_eval(&args.eval)?;
     let bundle_hash = hex::encode(Sha256::digest(&bundle));
     let name = args
@@ -2689,7 +2708,412 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
     let run: PlanRunView = client
         .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
         .await?;
-    follow_plan_run(client, run, json_output).await
+    if args.graph {
+        follow_eval_graph(client, &started.scope, &run.subject).await
+    } else {
+        follow_plan_run(client, run, json_output).await
+    }
+}
+
+async fn run_graph(client: &Client, args: GraphArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(!json_output, "graph and --json cannot be used together");
+    anyhow::ensure!(
+        std::io::stdout().is_terminal(),
+        "graph needs an interactive terminal"
+    );
+    let eval: EvalStatus = client
+        .get(&format!("/v1/evals/{}", urlencoding::encode(&args.scope)))
+        .await?;
+    follow_eval_graph(client, &eval.scope, &eval.plan_run).await
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GraphNodeState {
+    label: String,
+    state: String,
+    assignee: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GraphTransition {
+    elapsed: Duration,
+    label: String,
+    from: String,
+    to: String,
+    assignee: Option<String>,
+}
+
+struct EvalGraphSnapshot {
+    eval: EvalStatus,
+    runs: Vec<PlanRunView>,
+}
+
+struct TerminalScreen;
+
+impl TerminalScreen {
+    fn open() -> Result<Self> {
+        print!("\x1b[?25l");
+        std::io::stdout().flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalScreen {
+    fn drop(&mut self) {
+        print!("\x1b[?25h");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+async fn follow_eval_graph(client: &Client, scope: &str, root: &str) -> Result<()> {
+    let _screen = TerminalScreen::open()?;
+    let started_at = Instant::now();
+    let mut previous = BTreeMap::new();
+    let mut transitions = Vec::new();
+    let mut prior_signature = String::new();
+    loop {
+        let snapshot = load_eval_graph(client, scope, root).await?;
+        let current = graph_node_states(&snapshot);
+        if !previous.is_empty() {
+            record_graph_transitions(&previous, &current, started_at.elapsed(), &mut transitions);
+        }
+        let signature = format!(
+            "{current:?}|{}|{:?}",
+            snapshot.eval.cleanup, snapshot.eval.verdict
+        );
+        if signature != prior_signature {
+            let frame = render_eval_graph(&snapshot, &transitions, started_at.elapsed());
+            print!("\x1b[2J\x1b[H{frame}");
+            std::io::stdout().flush()?;
+            prior_signature = signature;
+        }
+        previous = current;
+        match snapshot.eval.lifecycle.as_str() {
+            "completed" => return Ok(()),
+            "failed" | "cancelled" => {
+                anyhow::bail!(
+                    "eval {} is {}",
+                    snapshot.eval.scope,
+                    snapshot.eval.lifecycle
+                )
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn load_eval_graph(client: &Client, scope: &str, root: &str) -> Result<EvalGraphSnapshot> {
+    let eval: EvalStatus = client
+        .get(&format!("/v1/evals/{}", urlencoding::encode(scope)))
+        .await?;
+    let runs: Vec<PlanRunView> = client
+        .get(&format!("/v1/plan-runs?root={}", urlencoding::encode(root)))
+        .await?;
+    anyhow::ensure!(!runs.is_empty(), "the eval graph has no plan runs");
+    Ok(EvalGraphSnapshot { eval, runs })
+}
+
+fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNodeState> {
+    let mut states = BTreeMap::new();
+    states.insert(
+        snapshot.eval.scope.clone(),
+        GraphNodeState {
+            label: "eval".into(),
+            state: format!("{} / {}", snapshot.eval.lifecycle, snapshot.eval.phase),
+            assignee: None,
+        },
+    );
+    for run in &snapshot.runs {
+        states.insert(
+            run.subject.clone(),
+            GraphNodeState {
+                label: run
+                    .plan
+                    .strip_prefix("plan/")
+                    .unwrap_or(&run.plan)
+                    .to_owned(),
+                state: format!("{} / {}", run.status, run.phase),
+                assignee: None,
+            },
+        );
+        for step in &run.steps {
+            let attempt = if step.attempt > 1 {
+                format!(" (attempt {})", step.attempt)
+            } else {
+                String::new()
+            };
+            states.insert(
+                step.subject.clone(),
+                GraphNodeState {
+                    label: step.title.clone().unwrap_or_else(|| step.step.clone()),
+                    state: format!("{}{attempt}", step.status),
+                    assignee: step.assignee.as_deref().map(short_actor).map(str::to_owned),
+                },
+            );
+        }
+    }
+    states
+}
+
+fn record_graph_transitions(
+    previous: &BTreeMap<String, GraphNodeState>,
+    current: &BTreeMap<String, GraphNodeState>,
+    elapsed: Duration,
+    transitions: &mut Vec<GraphTransition>,
+) {
+    for (subject, state) in current {
+        let Some(prior) = previous.get(subject) else {
+            transitions.push(GraphTransition {
+                elapsed,
+                label: state.label.clone(),
+                from: "created".into(),
+                to: state.state.clone(),
+                assignee: state.assignee.clone(),
+            });
+            continue;
+        };
+        if prior.state != state.state {
+            transitions.push(GraphTransition {
+                elapsed,
+                label: state.label.clone(),
+                from: prior.state.clone(),
+                to: state.state.clone(),
+                assignee: state.assignee.clone(),
+            });
+        }
+    }
+    for (subject, state) in previous {
+        if !current.contains_key(subject) {
+            transitions.push(GraphTransition {
+                elapsed,
+                label: state.label.clone(),
+                from: state.state.clone(),
+                to: "removed".into(),
+                assignee: state.assignee.clone(),
+            });
+        }
+    }
+    if transitions.len() > 12 {
+        transitions.drain(..transitions.len() - 12);
+    }
+}
+
+fn render_eval_graph(
+    snapshot: &EvalGraphSnapshot,
+    transitions: &[GraphTransition],
+    elapsed: Duration,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let name = snapshot
+        .eval
+        .scope
+        .strip_prefix("scope/eval/")
+        .unwrap_or(&snapshot.eval.scope);
+    let steps = snapshot
+        .runs
+        .iter()
+        .flat_map(|run| run.steps.iter())
+        .collect::<Vec<_>>();
+    let completed = steps
+        .iter()
+        .filter(|step| step.status == "completed")
+        .count();
+    let active = steps
+        .iter()
+        .filter(|step| is_active_graph_state(&step.status))
+        .count();
+    let blocked = steps.iter().filter(|step| step.status == "blocked").count();
+    let verdict = snapshot.eval.verdict.as_deref().unwrap_or("pending");
+    let _ = writeln!(output, "ST3 EVAL GRAPH  {name}");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "STATE      {} · {}",
+        snapshot.eval.lifecycle, snapshot.eval.phase
+    );
+    let _ = writeln!(output, "VERDICT    {verdict}");
+    let _ = writeln!(output, "CLEANUP    {}", snapshot.eval.cleanup);
+    let _ = writeln!(
+        output,
+        "PROGRESS   {completed}/{} completed · {active} active · {blocked} blocked",
+        steps.len()
+    );
+    let _ = writeln!(output, "ELAPSED    {}", format_elapsed(elapsed));
+    let _ = writeln!(output);
+    let _ = writeln!(output, "WORK GRAPH");
+
+    let children = snapshot
+        .runs
+        .iter()
+        .filter_map(|run| run.parent_step_run.as_deref().map(|parent| (parent, run)))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(root) = snapshot
+        .runs
+        .iter()
+        .find(|run| run.subject == snapshot.eval.plan_run)
+    {
+        render_plan_steps(&mut output, root, &children, "  ");
+    } else {
+        let _ = writeln!(output, "  ! the root plan run is not available");
+    }
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "TRANSITIONS");
+    if transitions.is_empty() {
+        let _ = writeln!(output, "  Waiting for a state change.");
+    } else {
+        for transition in transitions {
+            let actor = transition
+                .assignee
+                .as_deref()
+                .map(|actor| format!(" · {actor}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {}  {}: {} → {}{}",
+                format_elapsed(transition.elapsed),
+                transition.label,
+                transition.from,
+                transition.to,
+                actor
+            );
+        }
+    }
+    output
+}
+
+fn render_plan_steps(
+    output: &mut String,
+    run: &PlanRunView,
+    children: &BTreeMap<&str, &PlanRunView>,
+    indent: &str,
+) {
+    use std::fmt::Write as _;
+
+    let base_depth = run
+        .steps
+        .iter()
+        .map(|step| step.step.matches('/').count())
+        .min()
+        .unwrap_or_default();
+    for step in run
+        .steps
+        .iter()
+        .filter(|step| step.step.matches('/').count() == base_depth)
+    {
+        render_graph_step(output, step, indent);
+        let nested_prefix = format!("{}/", step.step);
+        let nested = run
+            .steps
+            .iter()
+            .filter(|candidate| candidate.step.starts_with(&nested_prefix))
+            .collect::<Vec<_>>();
+        if !nested.is_empty() {
+            let nested_completed = nested
+                .iter()
+                .filter(|candidate| candidate.status == "completed")
+                .count();
+            let _ = writeln!(
+                output,
+                "{indent}  ↳ nested work · {nested_completed}/{} completed",
+                nested.len()
+            );
+            if is_active_graph_state(&step.status) || step.status == "failed" {
+                for nested_step in nested {
+                    let relative_depth = nested_step
+                        .step
+                        .matches('/')
+                        .count()
+                        .saturating_sub(base_depth);
+                    render_graph_step(
+                        output,
+                        nested_step,
+                        &format!("{indent}{}", "  ".repeat(relative_depth + 1)),
+                    );
+                }
+            }
+        }
+        let Some(child) = children.get(step.subject.as_str()) else {
+            continue;
+        };
+        let child_completed = child
+            .steps
+            .iter()
+            .filter(|nested| nested.status == "completed")
+            .count();
+        let child_summary = format!(
+            "{indent}  ↳ {} · {} · {child_completed}/{} completed",
+            child.plan.strip_prefix("plan/").unwrap_or(&child.plan),
+            child.status,
+            child.steps.len()
+        );
+        let _ = writeln!(output, "{child_summary}");
+        if !matches!(child.status.as_str(), "completed" | "cancelled") {
+            render_plan_steps(output, child, children, &format!("{indent}    "));
+        }
+    }
+}
+
+fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str) {
+    use std::fmt::Write as _;
+
+    let actor = step
+        .assignee
+        .as_deref()
+        .map(short_actor)
+        .map(|actor| format!(" · {actor}"))
+        .unwrap_or_default();
+    let title = step.title.as_deref().unwrap_or(&step.step);
+    let attempt = if step.attempt > 1 {
+        format!(" · attempt {}", step.attempt)
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        output,
+        "{indent}{} {:<10} {} — {}{}{}",
+        graph_state_mark(&step.status),
+        step.status,
+        step.step.rsplit('/').next().unwrap_or(&step.step),
+        title,
+        actor,
+        attempt
+    );
+    if let Some(reason) = &step.blocked_reason {
+        let _ = writeln!(output, "{indent}  reason: {reason}");
+    }
+}
+
+fn graph_state_mark(status: &str) -> &'static str {
+    match status {
+        "completed" => "✓",
+        "working" | "verifying" => "▶",
+        "claimed" => "◉",
+        "ready" => "●",
+        "blocked" => "!",
+        "failed" => "✗",
+        "cancelled" => "×",
+        _ => "·",
+    }
+}
+
+fn is_active_graph_state(status: &str) -> bool {
+    matches!(
+        status,
+        "ready" | "claimed" | "working" | "verifying" | "blocked"
+    )
+}
+
+fn short_actor(actor: &str) -> &str {
+    actor.strip_prefix("agent/").unwrap_or(actor)
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 async fn run_quick(
@@ -4251,5 +4675,166 @@ mod tests {
         assert!(should_notify_work_message(&parent, &work));
         assert!(!should_notify_work_message(&inherited, &work));
         assert!(should_notify_work_message(&reassigned, &work));
+    }
+
+    #[test]
+    fn eval_graph_renders_nested_state_and_semantic_transitions() {
+        let root_subject = "plan-run/root";
+        let parent_step = graph_step(
+            "step-run/root/rename",
+            root_subject,
+            "rename",
+            "working",
+            Some("agent/base"),
+        );
+        let root = graph_run(
+            root_subject,
+            root_subject,
+            None,
+            vec![
+                parent_step,
+                graph_step(
+                    "step-run/root/rename/work/inspect",
+                    root_subject,
+                    "rename/work/inspect",
+                    "completed",
+                    Some("agent/base"),
+                ),
+                graph_step(
+                    "step-run/root/rename/work/change",
+                    root_subject,
+                    "rename/work/change",
+                    "ready",
+                    Some("agent/base"),
+                ),
+            ],
+        );
+        let snapshot = EvalGraphSnapshot {
+            eval: EvalStatus {
+                scope: "scope/eval/demo/root".into(),
+                plan_run: root_subject.into(),
+                lifecycle: "running".into(),
+                phase: "normal".into(),
+                active_steps: vec!["rename".into()],
+                verdict: None,
+                cleanup: "pending".into(),
+                store_index: 9,
+            },
+            runs: vec![root],
+        };
+        let transitions = vec![GraphTransition {
+            elapsed: Duration::from_secs(7),
+            label: "Change the package".into(),
+            from: "pending".into(),
+            to: "ready".into(),
+            assignee: Some("base".into()),
+        }];
+
+        let rendered = render_eval_graph(&snapshot, &transitions, Duration::from_secs(9));
+
+        assert!(rendered.contains("ST3 EVAL GRAPH  demo/root"));
+        assert!(rendered.contains("STATE      running · normal"));
+        assert!(rendered.contains("1/3 completed · 2 active"));
+        assert!(rendered.contains("rename — Change the package · base"));
+        assert!(rendered.contains("↳ nested work · 1/2 completed"));
+        assert!(rendered.contains("inspect — Inspect the package · base"));
+        assert!(rendered.contains("00:07  Change the package: pending → ready · base"));
+    }
+
+    #[test]
+    fn eval_graph_records_only_changed_node_state() {
+        let previous = BTreeMap::from([(
+            "step-run/root/build".into(),
+            GraphNodeState {
+                label: "Build".into(),
+                state: "ready".into(),
+                assignee: Some("worker".into()),
+            },
+        )]);
+        let current = BTreeMap::from([(
+            "step-run/root/build".into(),
+            GraphNodeState {
+                label: "Build".into(),
+                state: "working".into(),
+                assignee: Some("worker".into()),
+            },
+        )]);
+        let mut transitions = Vec::new();
+
+        record_graph_transitions(
+            &previous,
+            &current,
+            Duration::from_secs(3),
+            &mut transitions,
+        );
+
+        assert_eq!(
+            transitions,
+            [GraphTransition {
+                elapsed: Duration::from_secs(3),
+                label: "Build".into(),
+                from: "ready".into(),
+                to: "working".into(),
+                assignee: Some("worker".into()),
+            }]
+        );
+    }
+
+    fn graph_run(
+        subject: &str,
+        root: &str,
+        parent_step_run: Option<&str>,
+        steps: Vec<StepRunView>,
+    ) -> PlanRunView {
+        PlanRunView {
+            subject: subject.into(),
+            id: subject.strip_prefix("plan-run/").unwrap_or(subject).into(),
+            plan: "plan/work".into(),
+            revision: "revision".into(),
+            root_revision: "root-revision".into(),
+            root_plan_run: root.into(),
+            parent_step_run: parent_step_run.map(str::to_owned),
+            workspace: "/tmp/eval".into(),
+            requester: "person/eval-requester".into(),
+            run_scope: Some("scope/eval/demo/root".into()),
+            mode: "eval".into(),
+            status: "running".into(),
+            phase: "normal".into(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            steps,
+        }
+    }
+
+    fn graph_step(
+        subject: &str,
+        run: &str,
+        step: &str,
+        status: &str,
+        assignee: Option<&str>,
+    ) -> StepRunView {
+        StepRunView {
+            subject: subject.into(),
+            run: run.into(),
+            step: step.into(),
+            definition_hash: "definition".into(),
+            status: status.into(),
+            attempt: 1,
+            assignee: assignee.map(str::to_owned),
+            title: Some(match step.rsplit('/').next().unwrap_or(step) {
+                "rename" | "change" => "Change the package".into(),
+                "inspect" => "Inspect the package".into(),
+                _ => step.into(),
+            }),
+            goal: None,
+            worker_reported: false,
+            lease_owner: None,
+            lease_incarnation: None,
+            lease_expires_at_unix_ms: None,
+            blocked_reason: None,
+            not_before_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
     }
 }

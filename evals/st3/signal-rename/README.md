@@ -46,8 +46,10 @@ The final report remains a message because communication is its product. A resou
 ## Run
 
 ```sh
-st3 eval ./evals/st3/signal-rename
+st3 eval ./evals/st3/signal-rename --graph
 ```
+
+The graph screen shows the current root and nested work state. It also shows recent semantic state transitions without streaming agent logs.
 
 `materialize.sh` creates a bare origin and four authored clones from the frozen synthetic graph.
 
