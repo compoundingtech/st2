@@ -440,7 +440,8 @@ tee:  stdin JSON --> st2 driver claude-statusline (writes harness-context)
                  --> run the downstream renderer, resolved in order:
                        1. $ST_CLAUDE_STATUSLINE_RENDERER
                        2. ~/.claude/statusline-renderer.json  -> .command
-                 --> if neither resolves: pass stdin through unchanged
+                 --> if neither resolves, or the renderer fails:
+                       stdout stays empty; the reason goes to stderr
 ```
 
 **The subcommand, decided during implementation (2026-08-29):
@@ -474,10 +475,12 @@ collector reads as instrumentation and is worse than none.
 The tee spawns the renderer and writes the payload to its stdin rather than
 `exec`ing it, because st2 has already consumed that stdin to record the reading.
 The renderer is run as a shell command line, exactly as Claude runs its own
-`statusLine.command`. Failure is one-directional: a renderer that cannot be
-*started* falls back to the passthrough, while a renderer that started and then
-failed does not — it may already have written a partial line, and appending the
-raw JSON would corrupt the status line rather than restore it. All three settings
+`statusLine.command`. Every renderer failure is the same failure: one that
+cannot be *started* and one that started and exited non-zero both leave stdout
+untouched. The second could not do otherwise — it may already have written a
+partial line, and appending the raw JSON would corrupt the status line rather
+than restore it — and the first matches it so that a permissions bug on the
+renderer file cannot spew JSON where a missing renderer would not. All three settings
 keys are carried: `padding: 0`, and `refreshInterval: 5`, which is what makes the
 record a live reading rather than one frozen between turns and is well inside the
 300-second write heartbeat.
@@ -494,7 +497,8 @@ PR #2160). Two sources in strict order, first hit wins:
    one st2 rewrites, so a renderer declared there would be the very thing the
    merge does not preserve (HC-R18's inverse). A user-level file st2 never
    writes has no such hazard.
-3. Neither resolves: pass stdin through unchanged.
+3. Neither resolves: write nothing to stdout, and name both paths in a
+   diagnostic on stderr.
 
 The environment variable is checked first and the file second — not merged, and
 never both — so the resolution has one answer and an operator debugging their
@@ -508,10 +512,24 @@ second source of truth; an absent `$HOME`, an unreadable file, an unparseable
 one, or an empty `command` each fall through to the next source.
 
 **Chaining is mandatory, not a courtesy** (HC-R18). When no downstream renderer
-resolves, the tee passes its stdin through unchanged rather than discarding it —
-the fallback is transparency, not silence, so the worst case of st2 occupying
-the slot is the operator's own payload rendered verbatim rather than an empty
-status line. Precedence was captured live
+resolves — and whenever a resolved renderer fails — the tee writes nothing to
+stdout, so the worst case of st2 occupying the slot is an empty status line. The
+fallback is silence rather than transparency because the payload is machine
+JSON: a slot echoing it repaints
+`{"session_id":…,"transcript_path":…,"model":{…}}` across the operator's
+terminal every five seconds, which is worse for them than a blank row and
+carries nothing actionable. Transparency is the right default for a channel a
+human reads; the status-line slot is not one. The reason goes to stderr instead,
+which the harness routes to its debug log and never to the rendered row, so a
+blank line is still diagnosable — the diagnostic names
+`$ST_CLAUDE_STATUSLINE_RENDERER` and `~/.claude/statusline-renderer.json`
+explicitly, since a seat where neither resolves is exactly the case that
+produces it. Recording is untouched by which arm runs: the reading lands whether
+or not anything is drawn. The same rule governs the hook script's own outermost
+fallback, where no identity, no catalog root, or no `st2` on `PATH` drains stdin
+and prints nothing — it drains rather than exiting, because the harness writes
+the payload into that process and an unread stdin would earn an EPIPE at the
+refresh cadence. Precedence was captured live
 on 2026-08-29 against Claude Code 2.1.250 in four cases through a real pty
 ([evidence](./.experiments/2026-08-29-context-signals-and-write-placement.md)):
 `.claude/settings.local.json` > `.claude/settings.json` >
@@ -1045,8 +1063,11 @@ each only once a real test proves it (per `CLAUDE.md`):
   winner replaces rather than merges, so a test that only checks st2's command
   is present would pass while the operator's renderer is silently gone. The
   proofs therefore run the tee as a process and assert its exact stdout bytes:
-  the renderer's line and only the renderer's line, the verbatim passthrough
-  where none resolves, and a rendered line still produced when recording fails.
+  the renderer's line and only the renderer's line, an empty stdout in every
+  degraded arm — none resolving, a renderer that exits non-zero, a renderer file
+  that is not executable — and a rendered line still produced when recording
+  fails. The degraded arms take their positive evidence from stderr, since an
+  empty stdout alone is also what a tee that crashed instantly would leave.
   Landed as the invariant row *Status-line slot chaining*
   (`tests/claude_statusline.rs`).
 - **Per-harness fixture tests** (HC-R13) — one per producer, each decoding a

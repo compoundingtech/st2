@@ -245,8 +245,16 @@ record.
   the highest-precedence declaration replaces the others outright — nothing
   merges — so occupying it without chaining silently removes whatever the
   operator had, on every managed agent, with no warning. Where no downstream
-  renderer resolves, the tee passes its input through unchanged rather than
-  discarding it, so the degraded case is still a status line. The inverse also holds
-  and is not solved by chaining: a renderer a human sets in a file st2
-  materializes is not preserved by st2's merge, which owns only its own hook
-  entries.
+  renderer resolves, and wherever a resolved renderer fails, the tee writes
+  nothing to stdout: the degraded case is an EMPTY status line, and its
+  diagnostic goes to stderr, which the harness does not render. Silence is
+  required rather than merely permitted, because the payload on that channel is
+  machine-readable JSON — session id, transcript path, model and usage blocks —
+  and a slot that echoes it paints that JSON across the operator's terminal at
+  the refresh cadence. That is strictly worse for them than a blank row and
+  carries nothing they can act on, so "transparency over silence" is the wrong
+  trade for this surface even though it is the right one for a channel a human
+  reads. Which arm runs never affects recording; only the human-facing line is
+  at stake. The inverse also holds and is not solved by chaining: a renderer a
+  human sets in a file st2 materializes is not preserved by st2's merge, which
+  owns only its own hook entries.
