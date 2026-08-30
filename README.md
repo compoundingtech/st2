@@ -421,6 +421,15 @@ record. It also does not serialize catalog or runtime writers, reconcile tasks, 
 control-plane cutover. Consumers that require a zero-write boundary under concurrent root deletion
 or a transactional declaration boundary need a separate protocol.
 
+For cleanup planners that need the same evidence aggregated by explicit Agent Spec workspace, use:
+
+```sh
+st2 workspace-activity --catalog "$CATALOG" --host <host> --ttl 60 --json
+```
+
+The short-lived `st2.workspace-activity.v1` envelope is read-only and fail-closed. It is not deletion
+authority; see [the workspace activity contract](docs/workspace-activity.md).
+
 ### Staged control-plane replacement gate
 
 `st2 up` is a replaceable control plane, not the lifetime owner of an agent. Stopping it normally

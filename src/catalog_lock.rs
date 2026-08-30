@@ -20,6 +20,14 @@ pub const GENERATION_INTENT_FILE: &str = "catalog-generation-incomplete";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogReadFence(Option<u64>);
 
+impl CatalogReadFence {
+    /// The declaration generation observed by this read fence. `None` means the catalog predates
+    /// generation receipts; read-only consumers must treat that as an unversioned epoch.
+    pub fn generation(self) -> Option<u64> {
+        self.0
+    }
+}
+
 pub fn read_fence(catalog: &Path) -> Result<CatalogReadFence> {
     let first = read_generation(catalog)?;
     ensure_authoring_complete(catalog)?;

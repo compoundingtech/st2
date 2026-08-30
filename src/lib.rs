@@ -53,6 +53,7 @@ pub mod task_inventory;
 pub mod telemetry;
 pub mod validate;
 pub mod version;
+pub mod workspace_activity;
 mod watch;
 
 // The declaration model and the catalog walk live in the `agent-spec` crate, so st2 and any other
