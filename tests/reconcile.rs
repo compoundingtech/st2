@@ -434,6 +434,7 @@ fn spec(
         keep: false,
         restart: None,
         delivery: None,
+        session_driver: None,
         driver: None,
         resources: Vec::new(),
         streams: Vec::new(),

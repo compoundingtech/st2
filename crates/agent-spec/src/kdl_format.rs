@@ -146,6 +146,22 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                     anyhow::anyhow!("agent `deliver` value must be a string")
                 })?));
             }
+            "session-driver" => {
+                anyhow::ensure!(
+                    raw.session_driver.is_none(),
+                    "agent declares `session-driver` more than once"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `session-driver` must contain exactly one positional string"
+                );
+                raw.session_driver = Some(Some(arg_string(child).ok_or_else(|| {
+                    anyhow::anyhow!("agent `session-driver` value must be a string")
+                })?));
+            }
             "claude" => {
                 anyhow::ensure!(
                     raw.driver.claude.is_none(),

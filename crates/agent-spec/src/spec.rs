@@ -5,10 +5,10 @@
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
 //! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, `deliver`, typed harness drivers, task lifecycle, Resource bindings (declaration
-//! metadata), and the tasks. Everything else that is render-only (`harness`, `model`, `persona`,
-//! `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked into the
-//! tasks/commands by the render layer and ignored here.
+//! `restart{}`, `deliver`, `session-driver`, typed harness drivers, task lifecycle, Resource
+//! bindings (declaration metadata), and the tasks. Everything else that is render-only (`harness`,
+//! `model`, `persona`, `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked
+//! into the tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -69,6 +69,44 @@ impl DeliveryTransport {
         }
     }
 }
+/// The native session driver entered by an otherwise opaque launch.
+///
+/// This is an ownership assertion only. It does not render a provider launch or select a message
+/// delivery transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDriver {
+    Claude,
+    Codex,
+    Pi,
+    OpenCode,
+    Omp,
+}
+
+impl SessionDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
+            "opencode" => Ok(Self::OpenCode),
+            "omp" => Ok(Self::Omp),
+            _ => anyhow::bail!(
+                "unsupported `session-driver` value '{value}' (expected `claude`, `codex`, `pi`, `opencode`, or `omp`)"
+            ),
+        }
+    }
+}
+
 
 /// One typed harness driver declaration.
 ///
@@ -216,6 +254,8 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
     pub delivery: Option<DeliveryTransport>,
+    /// Native session ownership asserted for an otherwise opaque launch.
+    pub session_driver: Option<SessionDriver>,
     /// Typed harness declaration used by task and render compilation.
     pub driver: Option<Driver>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
@@ -560,7 +600,10 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: select one provider-native delivery transport.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub deliver: Option<Option<String>>,
-    /// Direct `claude {}` or `codex {}` provider block.
+    /// Native session ownership asserted for an otherwise opaque launch.
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub session_driver: Option<Option<String>>,
+    /// Direct typed provider driver block.
     #[serde(flatten)]
     pub driver: RawDriver,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
@@ -1080,6 +1123,7 @@ impl RawSpec {
             || self.argv.is_some()
             || self.ding
             || self.deliver.is_some()
+            || self.session_driver.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
             // pi predates this predicate gaining driver awareness and was silently skipped too:
@@ -1121,12 +1165,34 @@ impl RawSpec {
             .as_deref()
             .map(DeliveryTransport::parse)
             .transpose()?;
+        let session_driver = reject_explicit_null("session_driver", self.session_driver)?
+            .as_deref()
+            .map(SessionDriver::parse)
+            .transpose()?;
         let driver = self.driver.lower(&identity)?;
         let has_driver = driver.is_some();
         anyhow::ensure!(
             !(self.ding && delivery.is_some()),
             "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
         );
+        anyhow::ensure!(
+            !(self.ding && has_driver),
+            "agent '{identity}' declares both `ding` and a typed driver; choose one session owner"
+        );
+        if session_driver.is_some() {
+            anyhow::ensure!(
+                !self.ding,
+                "agent '{identity}' declares both `session-driver` and `ding`; choose one session owner"
+            );
+            anyhow::ensure!(
+                delivery.is_none(),
+                "agent '{identity}' declares both `session-driver` and `deliver`; choose one session owner"
+            );
+            anyhow::ensure!(
+                !has_driver,
+                "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
+            );
+        }
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -1277,6 +1343,7 @@ impl RawSpec {
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             delivery,
+            session_driver,
             driver,
             resources,
             streams,
