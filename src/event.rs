@@ -168,6 +168,15 @@ pub(crate) fn publish_owner_binding_under_lock(
     host: &str,
     lock: &crate::catalog_lock::CatalogLock,
 ) -> anyhow::Result<()> {
+    let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
+    publish_owner_binding_at_path(host, lock, &path)
+}
+
+fn publish_owner_binding_at_path(
+    host: &str,
+    lock: &crate::catalog_lock::CatalogLock,
+    path: &Path,
+) -> anyhow::Result<()> {
     let metadata = lock.control().metadata()?;
     let binding = StreamOwnerBinding {
         schema: "st2.stream-owner.v1".to_owned(),
@@ -179,7 +188,6 @@ pub(crate) fn publish_owner_binding_under_lock(
             std::process::id() as i32,
         )?,
     };
-    let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
     fs::create_dir_all(path.parent().context("owner binding has no parent")?)?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(&temporary, serde_json::to_vec(&binding)?)?;
@@ -210,6 +218,18 @@ pub(crate) fn clear_owner_binding(root: &Path, host: &str) {
 #[doc(hidden)]
 pub fn publish_owner_binding_for_test(root: &Path, host: &str) -> anyhow::Result<()> {
     publish_owner_binding(root, host)
+}
+
+#[doc(hidden)]
+pub fn publish_owner_binding_in_state_root_for_test(
+    root: &Path,
+    host: &str,
+    state_root: &Path,
+) -> anyhow::Result<()> {
+    let lock = crate::catalog_lock::CatalogLock::shared(root)?;
+    let path = crate::park::SupervisorScope::in_state_root(state_root, root, host)?
+        .stream_owner_binding_path();
+    publish_owner_binding_at_path(host, &lock, &path)
 }
 
 fn read_valid_owner_binding(

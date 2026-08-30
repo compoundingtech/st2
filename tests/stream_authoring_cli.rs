@@ -1,9 +1,8 @@
-use st2::Runner as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 static RUNTIME_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 fn write_agent(root: &Path) {
     let directory = root.join("agents/hetz/worker");
@@ -13,18 +12,163 @@ fn write_agent(root: &Path) {
         "agent \"worker\" {\n  host \"hetz\"\n  command \"agent\"\n}\n",
     )
     .unwrap();
-    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    st2::event::publish_owner_binding_in_state_root_for_test(root, "hetz", &root.join("state"))
+        .unwrap();
+}
+
+fn configure_st2_command(command: &mut Command, root: &Path) {
+    command
+        .arg("--catalog")
+        .arg(root)
+        .env("PTY_ROOT", root.join("pty"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env_remove("ST_AGENT");
+}
+
+fn st2_command(root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    configure_st2_command(&mut command, root);
+    command
 }
 
 fn st2(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_st2"))
-        .arg("--catalog")
-        .arg(root)
-        .args(args)
-        .env("ST2_TEST_EVENT_HOST", "hetz")
-        .env_remove("ST_AGENT")
+    st2_command(root).args(args).output().unwrap()
+}
+
+fn up_once(root: &Path) {
+    let output = st2(root, &["up", "--once", "--host", "hetz"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn pty_ids(root: &Path) -> Vec<(String, String)> {
+    let output = Command::new("pty")
+        .args(["list", "--json"])
+        .env("PTY_ROOT", root.join("pty"))
         .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    rows.as_array()
         .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap().to_owned(),
+                row["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn task_runtime_state(root: &Path, id: &str) -> Option<String> {
+    let output = st2(root, &["tasks", "--host", "hetz", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    inventory["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|task| {
+            (task["runtimeId"] == id).then(|| task["runtime"]["state"].as_str().unwrap().to_owned())
+        })
+}
+
+fn runtime_is_running(root: &Path, id: &str) -> bool {
+    task_runtime_state(root, id).as_deref() == Some("running")
+}
+
+fn assert_runtime_is_running(root: &Path, id: &str) {
+    let state = task_runtime_state(root, id);
+    assert!(
+        state.as_deref() == Some("running"),
+        "{id} is not running: {state:?}"
+    );
+}
+
+fn exec_record_exists(root: &Path, id: &str) -> bool {
+    root.join("state/st2/hetz/exec")
+        .join(format!("{id}.pid"))
+        .exists()
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    fn collect(root: &Path, directory: &Path, output: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        let mut entries = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if path.is_dir() {
+                output.push((relative, None));
+                collect(root, &path, output);
+            } else {
+                output.push((relative, Some(fs::read(&path).unwrap())));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    collect(root, root, &mut output);
+    output
+}
+
+#[test]
+fn a_runtime_run_leaves_inherited_production_roots_byte_identical() {
+    let production_pty = tempfile::tempdir().unwrap();
+    let production_state = tempfile::tempdir().unwrap();
+    fs::create_dir_all(production_pty.path().join("nested")).unwrap();
+    fs::write(
+        production_pty.path().join("nested/sentinel"),
+        b"production pty",
+    )
+    .unwrap();
+    fs::write(
+        production_state.path().join("sentinel"),
+        b"production state",
+    )
+    .unwrap();
+    let pty_before = tree_snapshot(production_pty.path());
+    let state_before = tree_snapshot(production_state.path());
+
+    let catalog = tempfile::tempdir().unwrap();
+    write_agent(catalog.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    command
+        .env("PTY_ROOT", production_pty.path())
+        .env("XDG_STATE_HOME", production_state.path());
+    configure_st2_command(&mut command, catalog.path());
+    let output = command
+        .args(["up", "--once", "--host", "hetz"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        pty_ids(catalog.path())
+            .iter()
+            .any(|(name, _)| name == "hetz.worker")
+    );
+    assert_eq!(tree_snapshot(production_pty.path()), pty_before);
+    assert_eq!(tree_snapshot(production_state.path()), state_before);
 }
 
 #[test]
@@ -154,6 +298,8 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
     let argv = adapter.argv.as_ref().unwrap();
     let output = Command::new(&argv[0])
         .args(&argv[1..])
+        .env("PTY_ROOT", catalog.path().join("pty"))
+        .env("XDG_STATE_HOME", catalog.path().join("state"))
         .env("ST2_TEST_EVENT_HOST", "hetz")
         .output()
         .unwrap();
@@ -275,27 +421,14 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
         "{}",
         String::from_utf8_lossy(&add.stderr)
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
     for _ in 0..3 {
-        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        if runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
-        {
+        up_once(catalog.path());
+        if runtime_is_running(catalog.path(), "hetz.worker.stream-live") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(
-        runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
-    );
+    assert_runtime_is_running(catalog.path(), "hetz.worker.stream-live");
 
     let remove = st2(
         catalog.path(),
@@ -317,11 +450,7 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
     );
     let mut retired = false;
     for _ in 0..100 {
-        retired = runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .all(|session| !session.alive || session.pty_id != "hetz.worker.stream-live");
+        retired = !exec_record_exists(catalog.path(), "hetz.worker.stream-live");
         if retired {
             break;
         }
@@ -362,25 +491,15 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
         "{}",
         String::from_utf8_lossy(&add.stderr)
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
-    assert!(
-        st2::up_once(catalog.path(), "hetz", &runner)
-            .unwrap()
-            .errors
-            .is_empty()
-    );
+    up_once(catalog.path());
     let runtime_id = "hetz.worker.stream-stubborn";
     for _ in 0..100 {
-        if runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .any(|session| session.alive && session.pty_id == runtime_id)
-        {
+        if runtime_is_running(catalog.path(), runtime_id) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert_runtime_is_running(catalog.path(), runtime_id);
 
     let started = std::time::Instant::now();
     let remove = st2(
@@ -402,11 +521,7 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
     );
     assert!(started.elapsed() >= std::time::Duration::from_secs(2));
     assert!(
-        runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .all(|session| session.pty_id != runtime_id),
+        !exec_record_exists(catalog.path(), runtime_id),
         "retirement must not erase the record until the ignoring process group exits"
     );
     assert!(
@@ -439,16 +554,8 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
         .status
         .success()
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
-    assert!(
-        st2::up_once(catalog.path(), "hetz", &runner)
-            .unwrap()
-            .errors
-            .is_empty()
-    );
-    let failed = Command::new(env!("CARGO_BIN_EXE_st2"))
-        .arg("--catalog")
-        .arg(catalog.path())
+    up_once(catalog.path());
+    let failed = st2_command(catalog.path())
         .args([
             "stream",
             "rm",
@@ -469,25 +576,13 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
     );
 
     for _ in 0..3 {
-        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        if runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
-        {
+        up_once(catalog.path());
+        if runtime_is_running(catalog.path(), "hetz.worker.stream-live") {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(
-        runner
-            .list_sessions()
-            .unwrap()
-            .iter()
-            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
-    );
+    assert_runtime_is_running(catalog.path(), "hetz.worker.stream-live");
     assert!(
         st2(
             catalog.path(),
@@ -527,9 +622,7 @@ fn external_stream_removal_performs_no_runtime_operation() {
         .success()
     );
 
-    let remove = Command::new(env!("CARGO_BIN_EXE_st2"))
-        .arg("--catalog")
-        .arg(catalog.path())
+    let remove = st2_command(catalog.path())
         .args([
             "stream",
             "rm",

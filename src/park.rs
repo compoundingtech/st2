@@ -56,7 +56,11 @@ impl SupervisorScope {
         Self::in_state_root(&crate::run::state_root(), catalog_root, host)
     }
 
-    fn in_state_root(state_root: &Path, catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+    pub(crate) fn in_state_root(
+        state_root: &Path,
+        catalog_root: &Path,
+        host: &str,
+    ) -> anyhow::Result<Self> {
         let catalog_root = catalog_root.canonicalize().with_context(|| {
             format!("canonicalize supervisor catalog {}", catalog_root.display())
         })?;
