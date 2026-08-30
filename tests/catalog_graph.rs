@@ -62,7 +62,7 @@ fn graph_preserves_valid_rows_broken_sources_conflicts_and_incompleteness() {
     let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
     assert_eq!(output.status.code(), Some(1));
     let graph = json(&output);
-    assert_eq!(graph["schema"], "st2.catalog-graph.v1");
+    assert_eq!(graph["schema"], "st2.catalog-graph.v2");
     assert_eq!(graph["complete"], false);
     assert_eq!(graph["roots"]["ptyRoot"], root.join("pty").display().to_string());
 
@@ -231,7 +231,22 @@ fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
             &format!("agent \"{identity}\" {{ host \"h\"; command \"true\" }}\n"),
         );
     }
-    assert!(issue_codes(roots.path()).contains(&"root-count".to_owned()));
+    let roots_output = st2(
+        roots.path(),
+        &["catalog", "graph", "--host", "h", "--json"],
+        None,
+    );
+    assert_eq!(roots_output.status.code(), Some(1));
+    let roots_graph = json(&roots_output);
+    assert!(roots_graph["issues"].as_array().unwrap().iter().any(|issue| {
+        issue["code"] == "root-count"
+    }));
+    for row in roots_graph["agents"].as_array().unwrap() {
+        assert!(row["parentId"].is_null());
+        assert!(row["rootId"].is_null());
+        assert!(row["depth"].is_null());
+        assert!(row["ancestorIds"].is_null());
+    }
 }
 #[test]
 fn candidate_overlay_reports_conflict_on_stdout_and_never_publishes() {

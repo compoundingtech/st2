@@ -754,9 +754,9 @@ must match that same explicit driver. No command-basename inference is
 admitted. A managed driver, readiness, or native delivery transport cannot
 coexist with Ding; Ding remains only for opaque non-harness PTYs.
 
-`st2 catalog graph --json` publishes `effectiveSessionDriver` and
-`deliveryReadiness` separately from `runtime`. It also publishes admitted
-topology:
+`st2 catalog graph --json` schema `st2.catalog-graph.v2` publishes
+`effectiveSessionDriver` and `deliveryReadiness` separately from `runtime`. It
+also publishes admitted topology:
 
 ```json
 {

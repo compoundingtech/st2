@@ -1372,15 +1372,6 @@ fn execute_with_presentation_cursor(
     report: &mut UpReport,
     on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
-    for spec in &plan.settle_retirement {
-        let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(error) = crate::message::archive_inbox(agent_dir) {
-            report.errors.push(format!(
-                "archive retired inbox for {}: {error:#}",
-                spec.identity
-            ));
-        }
-    }
 
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
@@ -1515,6 +1506,15 @@ fn execute_with_presentation_cursor(
                 Ok(()) => report.torn_down.push(id.clone()),
                 Err(e) => report.errors.push(format!("kill {id}: {e}")),
             }
+        }
+    }
+    for spec in &plan.settle_retirement {
+        let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(error) = crate::message::archive_inbox(agent_dir) {
+            report.errors.push(format!(
+                "archive retired inbox for {}: {error:#}",
+                spec.identity
+            ));
         }
     }
 

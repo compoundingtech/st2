@@ -9,7 +9,7 @@ use agent_spec::spec::AgentSpec;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-pub const CATALOG_GRAPH_SCHEMA: &str = "st2.catalog-graph.v1";
+pub const CATALOG_GRAPH_SCHEMA: &str = "st2.catalog-graph.v2";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -290,6 +290,17 @@ fn admitted_topology(
     if specs
         .iter()
         .filter(|candidate| candidate.bus_id(this_host) == id)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let host = spec.resolved_host(this_host);
+    if specs
+        .iter()
+        .filter(|candidate| {
+            candidate.resolved_host(this_host) == host && candidate.supervisor.is_none()
+        })
         .count()
         != 1
     {

@@ -482,6 +482,7 @@ struct FakeRunner {
     fail_list: bool,
     fail_spawn: Option<String>,
     fail_reap: Option<String>,
+    fail_kill: Option<String>,
     spawned: RefCell<Vec<String>>,
     spawned_targets: RefCell<Vec<TaskTarget>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
@@ -490,6 +491,7 @@ struct FakeRunner {
     removed: RefCell<Vec<String>>,
     patched: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
+    inbox_expected_during_kill: Option<std::path::PathBuf>,
 }
 
 impl Runner for FakeRunner {
@@ -516,6 +518,15 @@ impl Runner for FakeRunner {
     }
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         self.ops.borrow_mut().push(format!("kill:{pty_id}"));
+        if let Some(inbox) = &self.inbox_expected_during_kill {
+            assert!(
+                inbox.exists(),
+                "retirement must stop live work before archiving the inbox"
+            );
+        }
+        if self.fail_kill.as_deref() == Some(pty_id) {
+            anyhow::bail!("simulated kill failure");
+        }
         self.killed.borrow_mut().push(pty_id.to_string());
         Ok(())
     }
@@ -1081,7 +1092,11 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
     let archive = message::archive_dir(&agent_dir);
     fs::create_dir_all(&inbox).unwrap();
     fs::write(inbox.join(filename), "first receipt").unwrap();
-    let runner = FakeRunner::default();
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
 
     let first = up_once(tmp.path(), "hetz", &runner).unwrap();
     assert!(first.errors.is_empty(), "{:?}", first.errors);
@@ -1092,8 +1107,21 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
     assert!(!inbox.join(filename).exists());
 
     fs::write(inbox.join(filename), "restored duplicate").unwrap();
-    let second = up_once(tmp.path(), "hetz", &runner).unwrap();
-    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    let failing_runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        fail_kill: Some("hetz.demo".into()),
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
+    let second = up_once(tmp.path(), "hetz", &failing_runner).unwrap();
+    assert!(
+        second
+            .errors
+            .iter()
+            .any(|error| error.contains("kill hetz.demo")),
+        "{:?}",
+        second.errors
+    );
     assert_eq!(
         fs::read_to_string(archive.join(filename)).unwrap(),
         "first receipt",
