@@ -768,10 +768,18 @@ also publishes admitted topology:
 ```
 
 A root has null `parentId`, its own `rootId`, depth zero, and an empty ancestor
-array. Duplicate identity, missing or ambiguous parent, cycle, depth beyond 64,
-or a host with other than one root is an error. Every affected topology field
+array. Root counting folds retirement before the graph is built: a retired
+declaration — legacy `retired #true` or `desired-state "retired"` — is outside
+the org chart and never holds the root slot, while a suspended root still
+counts, so a host suspending its only root stays valid and a host whose every
+root is retired reports zero (#402). Duplicate identity, missing or ambiguous
+parent, cycle, depth beyond 64, or a host with other than one counted root is
+an error. Every affected topology field
 is null and the graph envelope has `complete: false`; downstream consumers use
-these admitted facts rather than walking supervisor edges themselves.
+these admitted facts rather than walking supervisor edges themselves. The
+`declarations` view applies the same fold to legacy `retired #true`, publishing
+`desiredState: "retired"`; an absent lifecycle stays null, which lowers to
+running.
 
 Retired reconciliation first attempts every live task teardown for the agent.
 Only when all of those attempts succeed does it settle the declaration's whole

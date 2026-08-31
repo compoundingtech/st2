@@ -35,6 +35,15 @@ pub fn resolve_spec<'a>(
     matches.next().is_none().then_some(first)
 }
 
+/// Whether a declaration occupies its host's root slot in the org chart: no supervisor, and not
+/// retired. Retirement — either spelling; the folded `AgentDesiredState` normalizes legacy
+/// `retired #true` and `desired-state "retired"` — removes a declaration from the org chart, so a
+/// retired root does not hold the slot. Suspension keeps the declaration in the chart, so a
+/// suspended root still counts (#402).
+pub fn is_counted_root(spec: &AgentSpec) -> bool {
+    spec.supervisor.is_none() && !spec.desired_state.is_retired()
+}
+
 /// Every spec from `start` to the root inclusive, `start` first.
 pub fn chain<'a>(
     specs: &'a [AgentSpec],

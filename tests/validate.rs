@@ -159,6 +159,7 @@ fn active_agents_may_share_an_opaque_resource_uri() {
             "h/integrator/agent.kdl",
             r#"agent "integrator" {
   host "h"
+  supervisor "h.reviewer"
   resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef" reason="reviewed example commit"
   command "true"
 }"#,
@@ -242,6 +243,8 @@ fn shared_workspace_render_conflict_is_an_error() {
 
 #[test]
 fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
+    // #399 moved the conflict into the parser: a delivery transport pins its session driver,
+    // so `deliver "app-server"` refuses a `claude` driver block at discovery time.
     let c = catalog(&[(
         "h/worker/agent.kdl",
         r#"agent "worker" {
@@ -256,13 +259,14 @@ fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
     let issue = report
         .issues
         .iter()
-        .find(|issue| issue.code == "driver-deliver-conflict")
+        .find(|issue| issue.code == "parse-error")
         .unwrap();
     assert_eq!(issue.severity, Severity::Error);
     assert_eq!(
         issue.message,
-        "agent 'worker' declares both a driver block and `deliver`; choose one launch source"
+        "agent 'worker' delivery transport 'app-server' requires session-driver 'codex', not 'claude'"
     );
+    assert_eq!(report.agents, 0, "the declaration never lowers to a spec");
 }
 
 #[test]
@@ -487,6 +491,7 @@ fn fleet_validation_compiles_remote_driver_launches() {
   host "Silber"
   workspace "/tmp"
   claude { prompt "boot" }
+  delivery-readiness "credential" account-id="tokengate/shared"
 }"#,
     )]);
     let found = st2::discover(c.path());
@@ -502,7 +507,6 @@ fn fleet_validation_compiles_remote_driver_launches() {
         );
     }
 }
-
 #[test]
 fn validation_reports_shared_task_compiler_errors() {
     let c = catalog(&[(
@@ -647,19 +651,22 @@ fn the_future_schedule_preview_is_explicitly_rejected() {
 // ---- warnings --------------------------------------------------------------------------------
 
 #[test]
-fn a_dangling_supervisor_is_a_warning() {
-    let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
-    )]);
+fn a_dangling_supervisor_is_an_error() {
+    // #399 made the supervisor chain authoritative: a reference to a missing parent is a
+    // structural error, not a warning.
+    let c = catalog(&[
+        (
+            "hetz/base/agent.kdl",
+            r#"agent "base" { host "hetz"; command "x" }"#,
+        ),
+        (
+            "hetz/w/agent.kdl",
+            r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
+        ),
+    ]);
     let r = validate(c.path());
-    assert!(has(&r, "dangling-supervisor", Severity::Warn));
-    assert_eq!(
-        r.errors(),
-        0,
-        "a dangling supervisor must not be an error: {:?}",
-        r.issues
-    );
+    assert!(has(&r, "supervisor-missing", Severity::Error));
+    assert_eq!(r.errors(), 1, "unexpected issues: {:?}", r.issues);
 }
 
 #[test]
@@ -668,6 +675,10 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
         (
             "Silber/cos/agent.kdl",
             r#"agent "cos" { host "Silber"; command "x" }"#,
+        ),
+        (
+            "hetz/base/agent.kdl",
+            r#"agent "base" { host "hetz"; command "x" }"#,
         ),
         (
             "hetz/w/agent.kdl",
@@ -682,6 +693,97 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
         "runtime-routable qualified supervisors must validate: {:?}",
         r.issues
     );
+}
+
+#[test]
+fn retired_roots_do_not_hold_the_root_slot() {
+    // #402: legacy `retired #true` (and new-style retirement) removes a declaration from the org
+    // chart, so root-shaped tombstones must not break the one-root-per-host invariant.
+    let c = catalog(&[
+        (
+            "h/cos/agent.kdl",
+            r#"agent "cos" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/old-legacy/agent.kdl",
+            r#"agent "old-legacy" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/old-explicit/agent.kdl",
+            r#"agent "old-explicit" { host "h"; desired-state "retired" reason="Replaced by cos"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+}
+
+#[test]
+fn a_suspended_root_still_holds_the_root_slot() {
+    // Suspension is a pause inside the org, not an exit: a suspended root keeps the host at
+    // exactly one root, and a second root-shaped declaration is still an error.
+    let suspended_only = catalog(&[(
+        "h/root/agent.kdl",
+        r#"agent "root" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
+    )]);
+    assert_eq!(
+        validate(suspended_only.path()).errors(),
+        0,
+        "a suspended root alone must satisfy the invariant"
+    );
+
+    let with_rival = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
+        ),
+        (
+            "h/rival/agent.kdl",
+            r#"agent "rival" { host "h"; retired #true; command "x" }"#,
+        ),
+    ]);
+    assert_eq!(
+        validate(with_rival.path()).errors(),
+        0,
+        "a retired tombstone must not rival a suspended root"
+    );
+}
+
+#[test]
+fn a_host_without_one_counted_root_still_fails() {
+    // Both zero shapes remain faults: a tombstone-only host, and a headless host whose only
+    // root is retired while workers stay active.
+    for (name, files) in [
+        (
+            "tombstone-only",
+            vec![(
+                "h/ghost/agent.kdl",
+                r#"agent "ghost" { host "h"; retired #true; command "x" }"#,
+            )],
+        ),
+        (
+            "headless",
+            vec![
+                (
+                    "h/root/agent.kdl",
+                    r#"agent "root" { host "h"; retired #true; command "x" }"#,
+                ),
+                (
+                    "h/worker/agent.kdl",
+                    r#"agent "worker" { host "h"; supervisor "h.root"; command "x" }"#,
+                ),
+            ],
+        ),
+    ] {
+        let c = catalog(&files);
+        let r = validate(c.path());
+        assert!(
+            r.issues.iter().any(|i| i.code == "root-count"
+                && i.severity == Severity::Error
+                && i.message.ends_with("found 0")),
+            "{name}: expected root-count found 0, got {:?}",
+            r.issues
+        );
+    }
 }
 
 #[test]
@@ -775,10 +877,12 @@ fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     )]);
     assert!(!run_validate(&[err.path().as_os_str()]).status.success());
 
-    // A warning-only catalog exits 0 normally, 1 under --strict.
+    // A warning-only catalog exits 0 normally, 1 under --strict. Under #399's topology rules a
+    // lone agent with a mismatched folder name is still exactly one root, so the folder/identity
+    // mismatch is the only finding — and it is a warning.
     let warn = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
+        "hetz/folder-name/agent.kdl",
+        r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(run_validate(&[warn.path().as_os_str()]).status.success());
     let strict = std::ffi::OsStr::new("--strict");

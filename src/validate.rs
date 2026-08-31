@@ -451,7 +451,7 @@ pub(crate) fn validate_discovered(
     for spec in &d.specs {
         let host = spec.resolved_host(this_host.unwrap_or_default()).to_owned();
         root_counts.entry(host).or_default();
-        if spec.supervisor.is_none() {
+        if crate::supervisor_chain::is_counted_root(spec) {
             *root_counts
                 .get_mut(spec.resolved_host(this_host.unwrap_or_default()))
                 .expect("root count entry was just inserted") += 1;

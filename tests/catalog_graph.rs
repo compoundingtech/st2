@@ -162,6 +162,69 @@ fn graph_exposes_admitted_topology_and_delivery_readiness_facts() {
     );
 }
 
+#[test]
+fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
+    // #402 regression fixture: one active root plus root-shaped retired declarations — legacy
+    // `retired #true` and new-style — must leave the host with exactly one counted root, admit
+    // the active topology, and expose the fold in the declaration view.
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path();
+    write(
+        root,
+        "agents/h/cos/agent.kdl",
+        r#"agent "cos" { host "h"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/old-legacy/agent.kdl",
+        r#"agent "old-legacy" { host "h"; retired #true; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/old-explicit/agent.kdl",
+        r#"agent "old-explicit" { host "h"; desired-state "retired" reason="Replaced by cos"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" { host "h"; supervisor "h.cos"; command "true" }"#,
+    );
+
+    let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+    assert_eq!(output.status.code(), Some(0));
+    let graph = json(&output);
+    assert_eq!(graph["complete"], true, "{graph:#}");
+    assert!(
+        !graph["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "root-count"),
+        "retired roots must not hold the root slot: {graph:#}"
+    );
+
+    let rows = graph["agents"].as_array().unwrap();
+    let cos = rows.iter().find(|row| row["id"] == "h.cos").unwrap();
+    assert_eq!(cos["rootId"], "h.cos");
+    assert_eq!(cos["depth"], 0);
+    let worker = rows.iter().find(|row| row["id"] == "h.worker").unwrap();
+    assert_eq!(worker["rootId"], "h.cos");
+    assert_eq!(worker["parentId"], "h.cos");
+
+    let declarations = graph["declarations"].as_array().unwrap();
+    let legacy = declarations
+        .iter()
+        .find(|row| row["path"] == "agents/h/old-legacy/agent.kdl")
+        .unwrap();
+    assert_eq!(legacy["agents"][0]["desiredState"], "retired");
+    // A declaration that states no lifecycle still folds to null (→ running), not "retired".
+    let active = declarations
+        .iter()
+        .find(|row| row["path"] == "agents/h/cos/agent.kdl")
+        .unwrap();
+    assert!(active["agents"][0]["desiredState"].is_null());
+}
+
 
 #[test]
 fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
