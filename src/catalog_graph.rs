@@ -299,7 +299,8 @@ fn admitted_topology(
     if specs
         .iter()
         .filter(|candidate| {
-            candidate.resolved_host(this_host) == host && candidate.supervisor.is_none()
+            candidate.resolved_host(this_host) == host
+                && crate::supervisor_chain::is_counted_root(candidate)
         })
         .count()
         != 1
@@ -352,6 +353,14 @@ fn graph_declaration<'a>(
                 .iter()
                 .map(|agent| {
                     let desired = agent.field("desired-state");
+                    // Legacy `retired #true` carries no `desired-state` node; fold it so the
+                    // declaration view matches the folded spec view (#402). `null` keeps one
+                    // meaning: no lifecycle declared, which lowers to running.
+                    let legacy_retired = agent
+                        .field("retired")
+                        .and_then(|node| node.argument(0))
+                        .and_then(DeclaredValue::as_bool)
+                        .unwrap_or(false);
                     PartialAgent {
                         identity: agent.identity().and_then(DeclaredValue::as_str).map(str::to_owned),
                         host: declared_field(agent, "host"),
@@ -362,7 +371,8 @@ fn graph_declaration<'a>(
                         desired_state: desired
                             .and_then(|node| node.argument(0))
                             .and_then(DeclaredValue::as_str)
-                            .map(str::to_owned),
+                            .map(str::to_owned)
+                            .or_else(|| legacy_retired.then(|| "retired".to_owned())),
                         desired_state_reason: desired
                             .and_then(|node| node.property("reason"))
                             .and_then(DeclaredValue::as_str)

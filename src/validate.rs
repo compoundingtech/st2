@@ -403,34 +403,54 @@ pub(crate) fn validate_discovered(
             }
         }
 
-        if let Err(error) =
-            crate::supervisor_chain::chain(&d.specs, s, this_host.unwrap_or_default())
-        {
-            let (code, message) = match error {
-                crate::supervisor_chain::SupervisorChainError::MissingSupervisor => (
-                    "supervisor-missing",
-                    format!(
-                        "supervisor chain from '{}' references a missing or ambiguous parent",
-                        s.bus_id(this_host.unwrap_or_default())
+        match crate::supervisor_chain::chain(&d.specs, s, this_host.unwrap_or_default()) {
+            Err(error) => {
+                let (code, message) = match error {
+                    crate::supervisor_chain::SupervisorChainError::MissingSupervisor => (
+                        "supervisor-missing",
+                        format!(
+                            "supervisor chain from '{}' references a missing or ambiguous parent",
+                            s.bus_id(this_host.unwrap_or_default())
+                        ),
                     ),
-                ),
-                crate::supervisor_chain::SupervisorChainError::Cycle => (
-                    "supervisor-cycle",
-                    format!(
-                        "supervisor chain from '{}' contains a cycle",
-                        s.bus_id(this_host.unwrap_or_default())
+                    crate::supervisor_chain::SupervisorChainError::Cycle => (
+                        "supervisor-cycle",
+                        format!(
+                            "supervisor chain from '{}' contains a cycle",
+                            s.bus_id(this_host.unwrap_or_default())
+                        ),
                     ),
-                ),
-                crate::supervisor_chain::SupervisorChainError::DepthLimit => (
-                    "supervisor-depth",
+                    crate::supervisor_chain::SupervisorChainError::DepthLimit => (
+                        "supervisor-depth",
+                        format!(
+                            "supervisor chain from '{}' exceeds the maximum depth of {}",
+                            s.bus_id(this_host.unwrap_or_default()),
+                            crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT
+                        ),
+                    ),
+                };
+                issues.push(Issue::error(code, rp.clone(), ag.clone(), message));
+            }
+            // Retirement removes a declaration from the org chart, so an active agent's chain
+            // must terminate at a counted root: one active root plus a retired root still
+            // supervising an active worker would otherwise validate while the worker's tree is
+            // headed by a tombstone (#402).
+            Ok(chain)
+                if !s.desired_state.is_retired()
+                    && chain.last().is_some_and(|root| root.desired_state.is_retired()) =>
+            {
+                issues.push(Issue::error(
+                    "retired-root",
+                    rp.clone(),
+                    ag.clone(),
                     format!(
-                        "supervisor chain from '{}' exceeds the maximum depth of {}",
+                        "supervisor chain from '{}' terminates at retired root '{}'; active agents must descend from a counted root",
                         s.bus_id(this_host.unwrap_or_default()),
-                        crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT
+                        chain.last().expect("chain contains at least its start").bus_id(this_host.unwrap_or_default()),
                     ),
-                ),
-            };
-            issues.push(Issue::error(code, rp.clone(), ag.clone(), message));
+                ));
+            }
+            Ok(_) => {}
         }
 
         // Overlay lint: render's persona overlay `@import`s must resolve (WARN — render concern).
@@ -451,7 +471,7 @@ pub(crate) fn validate_discovered(
     for spec in &d.specs {
         let host = spec.resolved_host(this_host.unwrap_or_default()).to_owned();
         root_counts.entry(host).or_default();
-        if spec.supervisor.is_none() {
+        if crate::supervisor_chain::is_counted_root(spec) {
             *root_counts
                 .get_mut(spec.resolved_host(this_host.unwrap_or_default()))
                 .expect("root count entry was just inserted") += 1;
