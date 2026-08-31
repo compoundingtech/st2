@@ -130,6 +130,7 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 delivery: None,
                 session_driver: None,
                 driver: None,
+                delivery_readiness: None,
                 resources: Vec::new(),
                 streams: Vec::new(),
                 tasks,
@@ -1707,6 +1708,7 @@ mod tests {
             r#"agent "worker" {
   identity "worker"
   host "evalhost"
+  supervisor "evalhost.sup"
   workspace "$CATALOG/worker"
   argv "sh" "-c" "sleep 60"
 }
@@ -1749,6 +1751,7 @@ mod tests {
   host "evalhost"
   workspace "$CATALOG/worker"
   claude { prompt "Start the assigned work." }
+  delivery-readiness "credential"
 }
 "#,
         );
@@ -1918,7 +1921,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 )],
             ),
             (
-                "dangling-supervisor",
+                "supervisor-missing",
                 vec![(
                     "agents/evalhost/worker/agent.kdl",
                     r#"agent "worker" {
@@ -1969,6 +1972,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                         r#"agent "two" {
   identity "two"
   host "evalhost"
+  supervisor "evalhost.one"
   pty "agent" { id "two-main"; command "sleep 60" }
   exec "poison" { id "shared"; command "true" }
 }"#,

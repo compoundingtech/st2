@@ -46,10 +46,10 @@ pub use discovery::{
     parse_declared, path_defaults,
 };
 pub use spec::{
-    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX, SessionDriver,
-    Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration, stream_name_of_task,
-    validate_desired_state_reason,
+    AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
+    Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
+    SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
+    stream_name_of_task, validate_desired_state_reason,
 };
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,

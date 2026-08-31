@@ -3,14 +3,14 @@
 //! serde-native) and fills a [`RawSpec`], which then flows through the shared identity/host
 //! resolution. A file may hold more than one `agent` node.
 //!
-//! Only runner-normative fields plus metadata `role` are read; render-only fields (`harness`,
-//! `model`, `persona`, `permissions`, `transport`, `strategy`) and the inert `meta{}` block are
-//! ignored.
+//! Runner-normative fields, managed delivery readiness, and metadata `role` are read. Other
+//! render-only fields (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`) and
+//! the inert `meta{}` block are ignored.
 
 use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
 use crate::spec::{
-    ClaudeDriver, CodexDriver, OmpDriver, OpenCodeDriver, PiDriver, RawResource, RawRestart,
-    RawSpec, RawTask,
+    ClaudeDriver, CodexDriver, DeliveryReadiness, OmpDriver, OpenCodeDriver, PiDriver, RawResource,
+    RawRestart, RawSpec, RawTask, SessionDriver,
 };
 
 /// Lower an already parsed declaration document into the runner's raw representation.
@@ -161,6 +161,13 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
                 raw.session_driver = Some(Some(arg_string(child).ok_or_else(|| {
                     anyhow::anyhow!("agent `session-driver` value must be a string")
                 })?));
+            }
+            "delivery-readiness" => {
+                anyhow::ensure!(
+                    raw.delivery_readiness.is_none(),
+                    "agent declares `delivery-readiness` more than once"
+                );
+                raw.delivery_readiness = Some(delivery_readiness_node_to_raw(child)?);
             }
             "claude" => {
                 anyhow::ensure!(
@@ -510,6 +517,68 @@ fn restart_node_to_raw(node: &DeclaredNode) -> RawRestart {
         }
     }
     r
+}
+
+fn delivery_readiness_node_to_raw(node: &DeclaredNode) -> anyhow::Result<DeliveryReadiness> {
+    anyhow::ensure!(
+        node.type_name.is_none() && node.children.is_empty(),
+        "agent `delivery-readiness` cannot have a type annotation or children"
+    );
+    let kind = node
+        .argument(0)
+        .and_then(DeclaredValue::as_str)
+        .ok_or_else(|| anyhow::anyhow!("agent `delivery-readiness` needs a kind string"))?;
+    match kind {
+        "credential" => {
+            anyhow::ensure!(
+                node.arguments().count() == 1
+                    && node.properties_named("account-id").count() <= 1
+                    && node.entries.len() <= 2,
+                "credential delivery-readiness must be `delivery-readiness \"credential\"` with at most one string `account-id`"
+            );
+            let account_id = node
+                .property("account-id")
+                .map(|value| {
+                    value.as_str().map(String::from).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "credential delivery-readiness `account-id` must be a string"
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(DeliveryReadiness::Credential { account_id })
+        }
+        "anonymous" => {
+            anyhow::ensure!(
+                node.arguments().count() >= 2
+                    && node.properties_named("harness").count() == 1
+                    && node.entries.len() == node.arguments().count() + 1,
+                "anonymous delivery-readiness must be `delivery-readiness \"anonymous\" \"<model>\"… harness=\"<driver>\"`"
+            );
+            let harness = node
+                .property("harness")
+                .and_then(DeclaredValue::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("anonymous delivery-readiness `harness` must be a string")
+                })
+                .and_then(SessionDriver::from_name)?;
+            let models = node
+                .arguments()
+                .skip(1)
+                .map(|value| {
+                    value.as_str().map(String::from).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "anonymous delivery-readiness accepts only string model arguments"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(DeliveryReadiness::Anonymous { harness, models })
+        }
+        other => anyhow::bail!(
+            "unsupported delivery-readiness kind '{other}' (expected `credential` or `anonymous`)"
+        ),
+    }
 }
 
 fn task_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawTask> {

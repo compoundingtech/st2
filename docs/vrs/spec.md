@@ -735,6 +735,61 @@ call site. Eval run steps and agent log dumps stream child output straight to
 their catalog log files without buffering it. Rationale and rejected
 alternatives: [decision 0007](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
 
+## Catalog graph and native delivery admission (R35–R38)
+
+Managed harness ownership is explicit. A declaration uses its typed driver or
+one `session-driver "claude|codex|pi|opencode|omp"` and pairs it with exactly
+one non-secret readiness declaration:
+
+```kdl
+delivery-readiness "credential"
+delivery-readiness "credential" account-id="tokengate/shared"
+delivery-readiness "anonymous" "model-a" "model-b" harness="omp"
+```
+
+Credential omission delegates account choice to the native driver. Anonymous
+readiness has at least one model; lowering sorts and deduplicates the model set,
+and `harness` must equal the effective native driver. A legacy `deliver` value
+must match that same explicit driver. No command-basename inference is
+admitted. A managed driver, readiness, or native delivery transport cannot
+coexist with Ding; Ding remains only for opaque non-harness PTYs.
+
+`st2 catalog graph --json` schema `st2.catalog-graph.v2` publishes
+`effectiveSessionDriver` and `deliveryReadiness` separately from `runtime`. It
+also publishes admitted topology:
+
+```json
+{
+  "parentId": "host.parent",
+  "rootId": "host.root",
+  "depth": 2,
+  "ancestorIds": ["host.parent", "host.root"]
+}
+```
+
+A root has null `parentId`, its own `rootId`, depth zero, and an empty ancestor
+array. Duplicate identity, missing or ambiguous parent, cycle, depth beyond 64,
+or a host with other than one root is an error. Every affected topology field
+is null and the graph envelope has `complete: false`; downstream consumers use
+these admitted facts rather than walking supervisor edges themselves.
+
+Retired reconciliation first attempts every live task teardown for the agent.
+Only when all of those attempts succeed does it settle the declaration's whole
+inbox; one failure leaves every inbox file untouched and the next pass retries
+teardown plus settlement. With no live tasks, settlement proceeds immediately.
+Each canonical inbox filename is linked into `resources/archive` and then
+removed from the inbox. An existing archive file wins byte-for-byte, so replay
+and a sync-restored duplicate converge without overwriting the receipt.
+Suspended reconciliation never performs this settlement.
+
+Before starting a Codex provider, st2 asks that binary to generate its
+app-server JSON schemas and fingerprints only the delivery-critical projection:
+every client request and server notification arm st2 uses, the exact
+method-to-`params` reference for each arm, recursively referenced definitions,
+and response definitions st2 reads. Only reviewed fingerprints are admitted.
+Live turn, resume, and durable-receipt evidence remains a separate behavioral
+check and is not inferred from the fingerprint.
+
 ## Message lifecycle
 
 ```text

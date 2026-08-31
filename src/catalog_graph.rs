@@ -9,7 +9,7 @@ use agent_spec::spec::AgentSpec;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-pub const CATALOG_GRAPH_SCHEMA: &str = "st2.catalog-graph.v1";
+pub const CATALOG_GRAPH_SCHEMA: &str = "st2.catalog-graph.v2";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,7 +45,12 @@ pub struct GraphAgent {
     pub persona: Option<String>,
     pub workspace: Option<String>,
     pub resolved_workspace: Option<PathBuf>,
-    pub session_driver: Option<String>,
+    pub effective_session_driver: Option<String>,
+    pub delivery_readiness: Option<agent_spec::DeliveryReadiness>,
+    pub parent_id: Option<String>,
+    pub root_id: Option<String>,
+    pub depth: Option<usize>,
+    pub ancestor_ids: Option<Vec<String>>,
     pub desired_state: String,
     pub desired_state_reason: Option<String>,
     pub source: GraphSource,
@@ -134,7 +139,16 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
     let mut agents = found
         .specs
         .iter()
-        .map(|spec| graph_agent(&root, this_host, &found.declarations, spec, &mut runtime_by_path))
+        .map(|spec| {
+            graph_agent(
+                &root,
+                this_host,
+                &found.specs,
+                &found.declarations,
+                spec,
+                &mut runtime_by_path,
+            )
+        })
         .collect::<Vec<_>>();
     agents.sort_by(|left, right| left.id.cmp(&right.id).then(left.source.path.cmp(&right.source.path)));
 
@@ -183,6 +197,7 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
 fn graph_agent(
     root: &Path,
     this_host: &str,
+    specs: &[AgentSpec],
     declarations: &[DiscoveredDeclaration],
     spec: &AgentSpec,
     runtime_by_path: &mut BTreeMap<PathBuf, Vec<crate::agents::AgentRow>>,
@@ -204,10 +219,10 @@ fn graph_agent(
         )
         .ok()
     });
-    let session_driver = spec
-        .session_driver
-        .map(|driver| driver.as_str().to_owned())
-        .or_else(|| spec.driver.as_ref().map(|driver| driver.name().to_owned()));
+    let effective_session_driver = spec
+        .effective_session_driver()
+        .map(|driver| driver.as_str().to_owned());
+    let topology = admitted_topology(specs, spec, this_host);
 
     GraphAgent {
         id,
@@ -219,7 +234,12 @@ fn graph_agent(
         persona: spec.role.clone(),
         workspace: spec.workspace.clone(),
         resolved_workspace,
-        session_driver,
+        effective_session_driver,
+        delivery_readiness: spec.delivery_readiness.clone(),
+        parent_id: topology.as_ref().and_then(|facts| facts.parent_id.clone()),
+        root_id: topology.as_ref().map(|facts| facts.root_id.clone()),
+        depth: topology.as_ref().map(|facts| facts.depth),
+        ancestor_ids: topology.map(|facts| facts.ancestor_ids),
         desired_state: spec.desired_state.as_str().to_owned(),
         desired_state_reason: spec.desired_state.reason().map(str::to_owned),
         source: GraphSource {
@@ -252,6 +272,53 @@ fn graph_agent(
             .collect(),
         runtime,
     }
+}
+
+struct AdmittedTopology {
+    parent_id: Option<String>,
+    root_id: String,
+    depth: usize,
+    ancestor_ids: Vec<String>,
+}
+
+fn admitted_topology(
+    specs: &[AgentSpec],
+    spec: &AgentSpec,
+    this_host: &str,
+) -> Option<AdmittedTopology> {
+    let id = spec.bus_id(this_host);
+    if specs
+        .iter()
+        .filter(|candidate| candidate.bus_id(this_host) == id)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let host = spec.resolved_host(this_host);
+    if specs
+        .iter()
+        .filter(|candidate| {
+            candidate.resolved_host(this_host) == host && candidate.supervisor.is_none()
+        })
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let chain = crate::supervisor_chain::chain(specs, spec, this_host).ok()?;
+    let ancestor_ids = chain
+        .iter()
+        .skip(1)
+        .map(|ancestor| ancestor.bus_id(this_host))
+        .collect::<Vec<_>>();
+    let root_id = chain.last()?.bus_id(this_host);
+    Some(AdmittedTopology {
+        parent_id: ancestor_ids.first().cloned(),
+        root_id,
+        depth: ancestor_ids.len(),
+        ancestor_ids,
+    })
 }
 
 fn match_declared<'a>(

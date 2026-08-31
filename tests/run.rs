@@ -240,6 +240,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         delivery: None,
         session_driver: None,
         driver: None,
+        delivery_readiness: None,
         resources: vec![],
         streams: Vec::new(),
         tasks: vec![Task {
@@ -481,6 +482,7 @@ struct FakeRunner {
     fail_list: bool,
     fail_spawn: Option<String>,
     fail_reap: Option<String>,
+    fail_kill: Option<String>,
     spawned: RefCell<Vec<String>>,
     spawned_targets: RefCell<Vec<TaskTarget>>,
     spawn_dirs: RefCell<Vec<(String, String)>>,
@@ -489,6 +491,7 @@ struct FakeRunner {
     removed: RefCell<Vec<String>>,
     patched: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
+    inbox_expected_during_kill: Option<std::path::PathBuf>,
 }
 
 impl Runner for FakeRunner {
@@ -515,6 +518,15 @@ impl Runner for FakeRunner {
     }
     fn kill(&self, pty_id: &str) -> anyhow::Result<()> {
         self.ops.borrow_mut().push(format!("kill:{pty_id}"));
+        if let Some(inbox) = &self.inbox_expected_during_kill {
+            assert!(
+                inbox.exists(),
+                "retirement must stop live work before archiving the inbox"
+            );
+        }
+        if self.fail_kill.as_deref() == Some(pty_id) {
+            anyhow::bail!("simulated kill failure");
+        }
         self.killed.borrow_mut().push(pty_id.to_string());
         Ok(())
     }
@@ -1060,6 +1072,79 @@ command = "st2 ding hetz.demo"
     torn.sort();
     assert_eq!(torn, vec!["hetz.demo-claude", "hetz.demo.ding"]);
     assert!(report.launched.is_empty());
+}
+
+#[test]
+fn retired_agent_idempotently_archives_every_inbox_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_dir = tmp.path().join("agents/hetz/demo");
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.kdl",
+        r#"agent "demo" {
+  host "hetz"
+  desired-state "retired" reason="Work complete"
+  command "true"
+}"#,
+    );
+    let filename = "1784649988123-abc23z.md";
+    let inbox = message::inbox_dir(&agent_dir);
+    let archive = message::archive_dir(&agent_dir);
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(inbox.join(filename), "first receipt").unwrap();
+    let runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
+
+    let first = up_once(tmp.path(), "hetz", &runner).unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt"
+    );
+    assert!(!inbox.join(filename).exists());
+
+    fs::write(inbox.join(filename), "restored duplicate").unwrap();
+    let failing_runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        fail_kill: Some("hetz.demo".into()),
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
+    let second = up_once(tmp.path(), "hetz", &failing_runner).unwrap();
+    assert!(
+        second
+            .errors
+            .iter()
+            .any(|error| error.contains("kill hetz.demo")),
+        "{:?}",
+        second.errors
+    );
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt",
+        "the durable archive receipt must never be overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(inbox.join(filename)).unwrap(),
+        "restored duplicate",
+        "failed teardown must leave the inbox available to the still-live agent"
+    );
+
+    let retry_runner = FakeRunner {
+        sessions: vec![live("hetz.demo")],
+        inbox_expected_during_kill: Some(inbox.join(filename)),
+        ..Default::default()
+    };
+    let retry = up_once(tmp.path(), "hetz", &retry_runner).unwrap();
+    assert!(retry.errors.is_empty(), "{:?}", retry.errors);
+    assert!(!inbox.join(filename).exists());
+    assert_eq!(
+        fs::read_to_string(archive.join(filename)).unwrap(),
+        "first receipt"
+    );
 }
 
 #[test]

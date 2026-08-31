@@ -26,6 +26,10 @@ accepted.
 
 - **T01 Explicit limits:** A documented unsupported case is preferable to a
   hidden distributed guarantee.
+- **T02 Native ownership over heuristic reach:** A managed harness that cannot
+  declare a matching native session driver and non-secret delivery readiness is
+  rejected rather than routed through generic terminal injection. Ding remains
+  available only for opaque non-harness PTYs.
 
 ## Requirements
 
@@ -332,3 +336,30 @@ accepted.
   identity recheck immediately before disruption. Renaming remains
   retire-old/add-new. Every behavior remains complete with an ordinary catalog
   folder and without CAS, captured generations, or replacement journals.
+- **R35 Authoritative admitted graph:** `st2 catalog graph --json` is the sole
+  catalog topology authority. For each uniquely admitted agent it publishes
+  the effective native session driver plus direct parent, root, depth, and
+  nearest-parent-first ancestor facts. Duplicate identity, missing parent,
+  supervisor cycle, bounded-depth overflow, and a per-host root count other
+  than exactly one are errors; affected topology facts are null and the graph
+  is incomplete. Consumers do not reimplement those generic graph rules.
+- **R36 Explicit native delivery readiness:** Managed Claude, Codex, pi,
+  OpenCode, OMP sessions declare their matching native session driver and one
+  tagged delivery-readiness value. Credential readiness may name a non-secret
+  account identifier or leave selection to the driver. Anonymous OMP readiness
+  names OMP and a non-empty normalized model set. Readiness is declaration
+  state, never inferred from activity, argv, process names, or credentials.
+- **R37 Retirement settles the inbox:** Every reconciliation of a retired
+  local agent first tears down every live owned task. Only after every teardown
+  attempt for that agent succeeds does the pass archive its canonical inbox
+  messages; any teardown failure leaves the entire inbox in place and retries
+  teardown plus settlement on the next reconciliation. The archive filename is
+  the durable receipt: repeated settlement and a sync-restored duplicate remove
+  the inbox copy without overwriting the archived bytes. Suspension retains the
+  inbox and does not settle it.
+- **R38 Codex schema admission:** Codex app-server launch is gated by an
+  admitted fingerprint of the delivery-critical schema projection. Admission
+  proves each emitted or consumed method discriminator is linked to its exact
+  payload arm and recursively covers the referenced definitions. Behavioral
+  turn, resume, and receipt evidence is reviewed separately; a schema match
+  alone does not claim it.

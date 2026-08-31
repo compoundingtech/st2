@@ -235,22 +235,10 @@ pub(crate) fn validate_discovered(
     }
 
     // 4. Resolved pass: cross-spec + field checks over each agent.
-    let identities: HashSet<&str> = d.specs.iter().map(|s| s.identity.as_str()).collect();
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
     // makes two unset-host same-identity specs collide (which is the real bug).
     let collision_host = "";
-    let addresses: HashSet<String> = d
-        .specs
-        .iter()
-        .flat_map(|s| {
-            let mut values = vec![s.identity.clone()];
-            if s.host.is_some() {
-                values.push(s.bus_id(collision_host));
-            }
-            values
-        })
-        .collect();
 
     for s in &d.specs {
         let rp = rel(root, &s.path);
@@ -293,6 +281,64 @@ pub(crate) fn validate_discovered(
                 "launch-compile-error"
             };
             issues.push(Issue::error(code, rp.clone(), ag.clone(), error.clone()));
+        }
+
+        let effective_session_driver = s.effective_session_driver();
+        if let Some(delivery) = s.delivery {
+            match effective_session_driver {
+                None => issues.push(Issue::error(
+                    "native-driver-missing",
+                    rp.clone(),
+                    ag.clone(),
+                    format!(
+                        "delivery transport '{}' requires an explicit matching native session driver",
+                        delivery.as_str()
+                    ),
+                )),
+                Some(driver) if driver != delivery.session_driver() => issues.push(Issue::error(
+                    "native-driver-mismatch",
+                    rp.clone(),
+                    ag.clone(),
+                    format!(
+                        "delivery transport '{}' requires native session driver '{}', found '{}'",
+                        delivery.as_str(),
+                        delivery.session_driver().as_str(),
+                        driver.as_str()
+                    ),
+                )),
+                Some(_) => {}
+            }
+        }
+        match (&s.delivery_readiness, effective_session_driver) {
+            (Some(_), None) => issues.push(Issue::error(
+                "native-driver-missing",
+                rp.clone(),
+                ag.clone(),
+                "delivery-readiness requires an explicit native session driver".to_string(),
+            )),
+            (None, Some(driver)) => issues.push(Issue::error(
+                "delivery-readiness-missing",
+                rp.clone(),
+                ag.clone(),
+                format!(
+                    "native session driver '{}' requires an explicit non-secret delivery-readiness declaration",
+                    driver.as_str()
+                ),
+            )),
+            (
+                Some(agent_spec::DeliveryReadiness::Anonymous { harness, .. }),
+                Some(driver),
+            ) if *harness != driver => issues.push(Issue::error(
+                "native-driver-mismatch",
+                rp.clone(),
+                ag.clone(),
+                format!(
+                    "anonymous delivery-readiness harness '{}' does not match native session driver '{}'",
+                    harness.as_str(),
+                    driver.as_str()
+                ),
+            )),
+            _ => {}
         }
 
         // An explicit identity+host pair is authoritative regardless of folder names. When either
@@ -357,18 +403,34 @@ pub(crate) fn validate_discovered(
             }
         }
 
-        // Runtime routing accepts either a bare identity or a fully-qualified <host>.<identity>.
-        // Validation must index the same address set or it rejects declarations the bus can route.
-        if let Some(sup) = &s.supervisor
-            && !identities.contains(sup.as_str())
-            && !addresses.contains(sup)
+        if let Err(error) =
+            crate::supervisor_chain::chain(&d.specs, s, this_host.unwrap_or_default())
         {
-            issues.push(Issue::warn(
-                "dangling-supervisor",
-                rp.clone(),
-                ag.clone(),
-                format!("supervisor '{sup}' is not an agent in this catalog"),
-            ));
+            let (code, message) = match error {
+                crate::supervisor_chain::SupervisorChainError::MissingSupervisor => (
+                    "supervisor-missing",
+                    format!(
+                        "supervisor chain from '{}' references a missing or ambiguous parent",
+                        s.bus_id(this_host.unwrap_or_default())
+                    ),
+                ),
+                crate::supervisor_chain::SupervisorChainError::Cycle => (
+                    "supervisor-cycle",
+                    format!(
+                        "supervisor chain from '{}' contains a cycle",
+                        s.bus_id(this_host.unwrap_or_default())
+                    ),
+                ),
+                crate::supervisor_chain::SupervisorChainError::DepthLimit => (
+                    "supervisor-depth",
+                    format!(
+                        "supervisor chain from '{}' exceeds the maximum depth of {}",
+                        s.bus_id(this_host.unwrap_or_default()),
+                        crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT
+                    ),
+                ),
+            };
+            issues.push(Issue::error(code, rp.clone(), ag.clone(), message));
         }
 
         // Overlay lint: render's persona overlay `@import`s must resolve (WARN — render concern).
@@ -382,6 +444,30 @@ pub(crate) fn validate_discovered(
             crate::materialize::validate_agent(root, s, s.host.as_deref().unwrap_or(""))
         {
             issues.push(Issue::error("render-error", rp, ag, format!("{error:#}")));
+        }
+    }
+
+    let mut root_counts: HashMap<String, usize> = HashMap::new();
+    for spec in &d.specs {
+        let host = spec.resolved_host(this_host.unwrap_or_default()).to_owned();
+        root_counts.entry(host).or_default();
+        if spec.supervisor.is_none() {
+            *root_counts
+                .get_mut(spec.resolved_host(this_host.unwrap_or_default()))
+                .expect("root count entry was just inserted") += 1;
+        }
+    }
+    for (host, count) in root_counts {
+        if count != 1 {
+            issues.push(Issue::error(
+                "root-count",
+                ".".to_string(),
+                None,
+                format!(
+                    "host '{}' must declare exactly one root agent; found {count}",
+                    if host.is_empty() { "<default>" } else { &host }
+                ),
+            ));
         }
     }
 

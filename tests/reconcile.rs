@@ -436,6 +436,7 @@ fn spec(
         delivery: None,
         session_driver: None,
         driver: None,
+        delivery_readiness: None,
         resources: Vec::new(),
         streams: Vec::new(),
         tasks,
