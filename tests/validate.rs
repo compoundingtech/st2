@@ -743,8 +743,61 @@ fn a_suspended_root_still_holds_the_root_slot() {
     ]);
     assert_eq!(
         validate(with_rival.path()).errors(),
+
         0,
         "a retired tombstone must not rival a suspended root"
+    );
+}
+#[test]
+fn an_active_chain_may_not_terminate_at_a_retired_root() {
+    // One counted root satisfies root-count, but the worker's tree is headed by a retired
+    // tombstone: the active org chart must descend from the counted root (#405 review).
+    let c = catalog(&[
+        (
+            "h/live/agent.kdl",
+            r#"agent "live" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/dead/agent.kdl",
+            r#"agent "dead" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; supervisor "h.dead"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "retired-root"
+            && i.severity == Severity::Error
+            && i.message.contains("h.worker")
+            && i.message.contains("h.dead")),
+        "expected retired-root on h.worker, got {:?}",
+        r.issues
+    );
+    assert_eq!(r.errors(), 1, "unexpected issues: {:?}", r.issues);
+
+    // Retired descendants of a retired root stay legal: tombstone trees are outside the
+    // org chart and the check only binds active agents.
+    let tombstones = catalog(&[
+        (
+            "h/live/agent.kdl",
+            r#"agent "live" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/dead/agent.kdl",
+            r#"agent "dead" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/ghost-worker/agent.kdl",
+            r#"agent "ghost-worker" { host "h"; supervisor "h.dead"; retired #true; command "x" }"#,
+        ),
+    ]);
+    assert_eq!(
+        validate(tombstones.path()).errors(),
+        0,
+        "retired chains must not error: {:?}",
+        validate(tombstones.path()).issues
     );
 }
 

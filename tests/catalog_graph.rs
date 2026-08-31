@@ -227,6 +227,50 @@ fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
 
 
 #[test]
+fn graph_is_incomplete_when_an_active_worker_descends_from_a_retired_root() {
+    // #405 review: one counted root satisfies root-count, but a worker supervised by a retired
+    // tombstone forms a second, dead-headed tree — the envelope must say so. The worker's own
+    // row still reports its declared chain fact while the graph is incomplete.
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path();
+    write(
+        root,
+        "agents/h/live/agent.kdl",
+        r#"agent "live" { host "h"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/dead/agent.kdl",
+        r#"agent "dead" { host "h"; retired #true; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" { host "h"; supervisor "h.dead"; command "true" }"#,
+    );
+
+    let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+    assert_eq!(output.status.code(), Some(1));
+    let graph = json(&output);
+    assert_eq!(graph["complete"], false, "{graph:#}");
+    assert!(
+        graph["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "retired-root"),
+        "expected a retired-root issue: {graph:#}"
+    );
+    let worker = graph["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "h.worker")
+        .unwrap();
+    assert_eq!(worker["rootId"], "h.dead");
+}
+
+#[test]
 fn graph_rejects_missing_cycle_depth_and_per_host_root_count() {
     let issue_codes = |root: &Path| {
         let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);

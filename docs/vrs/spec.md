@@ -774,7 +774,10 @@ the org chart and never holds the root slot, while a suspended root still
 counts, so a host suspending its only root stays valid and a host whose every
 root is retired reports zero (#402). Duplicate identity, missing or ambiguous
 parent, cycle, depth beyond 64, or a host with other than one counted root is
-an error. Every affected topology field
+an error. An active agent whose chain terminates at a retired declaration is
+an error too (`retired-root`): the active org chart descends from the counted
+root, so one active root plus a retired root still supervising an active
+worker does not validate. Every affected topology field
 is null and the graph envelope has `complete: false`; downstream consumers use
 these admitted facts rather than walking supervisor edges themselves. The
 `declarations` view applies the same fold to legacy `retired #true`, publishing

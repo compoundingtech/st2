@@ -42,6 +42,16 @@ it. Excluding retired declarations (either spelling) via one shared predicate
 (`supervisor_chain::is_counted_root`) fixes the live catalog while every genuine
 topology fault still errors. Zero-count hosts remain faults by design (headless org).
 
+
+Post-review addendum (#405, Codex P1): the first cut of the predicate opened a
+hole the pre-fix code had closed only by accident — one active root plus a
+retired root still supervising an active worker validated clean (`found 1`,
+`complete: true`) while publishing the tombstone as the worker's `rootId`.
+Reproduced on the PR head, then closed with a `retired-root` validation error:
+an active agent's chain must terminate at a counted root. Retired chains under
+a retired root stay legal; the fixture is
+`an_active_chain_may_not_terminate_at_a_retired_root`.
+
 ## VRS Impact
 
 `docs/vrs/spec.md` (catalog graph / R04–R05 area) now states the counting fold: retired
