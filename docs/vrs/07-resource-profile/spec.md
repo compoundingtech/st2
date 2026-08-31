@@ -50,12 +50,12 @@ closed wasm describe() -> capabilities + selector schema/default + topology
 catalog-trusted host runtime argv ----+
        |
        v provider-native observation
-publish(binding-id, bytes, topics)
+publish(binding-id, bytes, topics, facts)
        |
        v host validation + contained atomic replacement
 canonical snapshot + current digest
        |
-       v selector + pending-relevance reducer
+       v selector + pending-relevance reducer retaining topics + facts
 built-in resync event (key=binding, supersede=true)
        |
        v existing inbox + DING
@@ -309,10 +309,19 @@ For each active Resource binding, resync applies this precedence:
 3. A schemeless path uses the existing agent-directory-relative rule.
 4. Every other unregistered scheme remains opaque and unwatchable.
 
-For a passive resolved carrier, Resource Profiles add no event semantics.
-Parent-directory observation, rename replacement, digest seeding, equal-byte
-deduplication, deterministic transition identity, bounded windows, and built-in
-`resync` delivery remain the [`06-resync`](../06-resync/spec.md) pipeline.
+Passive resolved carriers use the same Resource fact envelope as observable
+publications. A content transition emits topic `content` and one
+`digest=<old-short>→<new-short>` fact. Declaration subscriptions retain a
+bounded summary keyed by binding label whose values digest URI, reason,
+inactive state, and selector. On a declaration flush, one bounded catalog parse
+derives the current summary: added labels transition absent→`declared`, removed
+labels transition `declared`→absent, and changed summary digests publish
+`label=changed`, ordered by label. URIs and reasons never enter the event. A
+parse failure, unchanged Resource summary, or summary outside fact bounds falls
+back to the declaration carrier's digest transition. Parent-directory
+observation, rename replacement, digest seeding, equal-byte deduplication,
+deterministic transition identity, and bounded windows otherwise remain the
+[`06-resync`](../06-resync/spec.md) pipeline.
 
 `notify-chain #true` extends only subscription selection. For each active
 binding through that profile, resync validates the bound agent's supervisor
@@ -341,7 +350,7 @@ fresh-instance policy, fuel budget, and no-import rule as `resolve`:
 
 ```json
 {
-  "abiVersion": 2,
+  "abiVersion": 3,
   "capabilities": ["resolve", "read", "observe"],
   "selectorSchema": {
     "type": "object",
@@ -439,7 +448,7 @@ host -> unregister {
 runtime -> publish {
   owner: { incarnation, claim },
   bindingId, registration,
-  schemaId, mediaType, bytes, topics, observedAt?
+  schemaId, mediaType, bytes, topics, facts?, observedAt?
 }
 runtime -> health {
   owner: { incarnation, claim },
@@ -465,9 +474,12 @@ Each encoded protocol line is at most 2 MiB, including the newline. `publish`
 encodes `bytes` as a padded RFC 4648 base64 string; the decoded snapshot is
 opaque. Selectors are at most 16 KiB when encoded as canonical compact JSON.
 Decoded snapshot bytes are at most 1 MiB. Health `detail` is at most 16 KiB of
-UTF-8. These bounds are checked before allocation or decoding where the
-transport permits and fail only the affected binding or runtime. st2 never
-truncates canonical snapshot bytes or health text to satisfy a bound.
+UTF-8. A publication has at most 32 ordered facts; keys are at most 128 bytes
+and values at most 1 KiB of printable single-line UTF-8. A fact carries
+`key` plus `before`, `after`, or both; explicit JSON null denotes absence.
+These bounds are checked before allocation or decoding where the transport
+permits and fail only the affected binding or runtime. st2 never truncates
+canonical snapshot bytes, facts, or health text to satisfy a bound.
 
 The host rejects unknown bindings, stale owners or registrations, mismatched
 schema or media type, unpublished topics, invalid messages, output after
@@ -484,7 +496,7 @@ The resolver's contained carrier path is the observable snapshot path. A
 successful `publish` follows one host-owned transaction:
 
 ```text
-validate binding + schema + topics + size
+validate binding + schema + topics + facts + size
         |
         v
 write new bytes to contained sibling temporary file
@@ -495,8 +507,7 @@ write new bytes to contained sibling temporary file
 compute/record current sha256 digest and freshness
         |
         `-> equal digest: no invalidation
-            changed digest: apply binding selector
-```
+            changed digest: apply binding selector and retain selected topics + facts
 
 The runtime never writes the carrier directly. Descriptor-relative no-follow
 containment from the existing resolver contract applies to the temporary file,
@@ -516,14 +527,17 @@ manifest, profile event log, or host retention policy.
 ## Semantic invalidation and catch-up (PROFILE-R17..R20)
 
 For every changed digest, including the first successful publication, the host
-intersects `publish.topics` with the normalized binding selector. An empty
-intersection updates the canonical snapshot and freshness without scheduling
-delivery. A non-empty intersection updates this bounded per-binding state:
+validates and preserves the runtime's ordered facts and intersects
+`publish.topics` with the normalized binding selector. An empty intersection
+updates the canonical snapshot and freshness without scheduling delivery. A
+non-empty intersection updates this bounded per-binding state:
 
 ```text
 current_snapshot_digest: Digest?
 last_delivered_digest: Digest?
 pending_relevant_change: bool
+pending_selected_topics: Topic[]
+pending_facts: ResourceFact[]
 deliverable: bool
 ```
 
@@ -534,23 +548,26 @@ If delivery is available, st2 emits one event on the existing built-in
 stream = resync
 key = binding name
 supersede = true
-subject = resource <binding> changed
-body = { binding, snapshotDigest, topics }
+subject = <binding> · <up to three whole facts> [<topics>]
+body = { binding, snapshotDigest, topics, facts }
 ```
 
-The body is a thin invalidation. It contains no snapshot bytes, provider
-payload, rendered summary, credential, or provider cursor. Existing event
+Subjects are at most 96 Unicode scalars. Facts retain publication order and are
+included only whole; topic space is reserved before facts are admitted. If no
+fact fits, a compatible bounded fallback remains. The durable body always
+retains the complete bounded fact list. It contains no snapshot bytes, provider
+payload, credential, URI, reason, or provider cursor. Existing event
 deduplication, inbox storage, DING rendering, and supersession apply unchanged.
-Multiple topics for one atomic publication produce one invalidation, not one
-stream or record per topic.
+Multiple topics for one atomic publication produce one invalidation.
 
-If delivery is unavailable, a relevant publication sets
+If delivery is unavailable, a relevant publication replaces the pending
+selected topics and facts with the latest relevant publication and sets
 `pending_relevant_change = true`. Later irrelevant publications may advance
-`current_snapshot_digest` but do not clear the bit. When delivery becomes
-available, st2 emits at most one invalidation for the then-current digest and
-clears the bit only after event ingress accepts the record. No pending digest
-or transition backlog exists. This is level-triggered current-state catch-up,
-not event replay.
+`current_snapshot_digest` but do not clear that state. When delivery becomes
+available, st2 emits at most one invalidation for the then-current digest with
+the retained latest relevant fact envelope, and clears it only after event
+ingress accepts the record. No transition backlog exists. This is
+level-triggered current-state catch-up, not event replay.
 
 Health has separate descriptor, selector, runtime, observation, publication,
 and delivery stages. Every stage reports affected scheme and binding without

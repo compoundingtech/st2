@@ -1796,6 +1796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "st2-resource-protocol",
  "st2-wire",
  "tempfile",
  "toml",
@@ -1803,6 +1804,15 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tungstenite",
+]
+
+[[package]]
+name = "st2-resource-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

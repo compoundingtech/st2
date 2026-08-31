@@ -74,7 +74,7 @@ fn descriptor_module(payload: &[u8], reported_len: usize) -> WasmResolver {
 }
 
 const VALID_DESCRIPTOR: &str = r#"{
-  "abiVersion": 2,
+  "abiVersion": 3,
   "capabilities": ["resolve", "read", "observe"],
   "selectorSchema": {
     "type": "object",
@@ -112,12 +112,12 @@ fn current_rss_bytes() -> u64 {
 }
 
 #[test]
-fn valid_v2_descriptor_executes_and_resolve_only_module_stays_passive() {
+fn valid_v3_descriptor_executes_and_resolve_only_module_stays_passive() {
     let descriptor = descriptor_module(VALID_DESCRIPTOR.as_bytes(), VALID_DESCRIPTOR.len())
         .describe_once()
         .expect("describe call succeeds")
         .expect("descriptor is present");
-    assert_eq!(descriptor.abi_version, 2);
+    assert_eq!(descriptor.abi_version, 3);
 
     assert!(
         WasmResolver::load(Path::new(DEMO_WASM_PATH))

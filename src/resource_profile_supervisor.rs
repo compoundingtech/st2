@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use crate::catalog::CatalogConfig;
 use crate::resource_profile::{
     AcceptedOutput, BindingId, BindingRegistration, CatchUp, HostMessage, OwnerClaim,
-    PublicationContract, RegistrationToken, RuntimeHealthState, RuntimeIncarnation,
+    PublicationContract, RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation,
     RuntimeLifecycle, RuntimeMessage, RuntimeOwner, SnapshotDigest, SnapshotTarget, TopicSelection,
     MAX_PROTOCOL_LINE_BYTES, decode_runtime_line, encode_host_line,
 };
@@ -982,20 +982,28 @@ fn emit_pending_at(
         binding: &'a str,
         snapshot_digest: String,
         topics: &'a [String],
+        facts: &'a [ResourceFact],
     }
     let digest = delivery.digest();
     let topics = delivery.selected_topics().to_vec();
+    let facts = delivery.facts();
     let body = serde_json::to_string(&Body {
         binding: &active.desired.binding_name,
         snapshot_digest: digest.to_string(),
         topics: &topics,
+        facts,
     })?;
     let event_id = publication_event_id(
         &active.desired.recipient,
         &active.desired.binding_name,
         digest,
     );
-    let subject = format!("resource {} changed", active.desired.binding_name);
+    let subject = resource_change_subject(
+        &active.desired.binding_name,
+        facts,
+        &topics,
+        "snapshot updated",
+    );
     crate::event::emit_builtin_resync(
         catalog_root,
         this_host,
@@ -1012,6 +1020,71 @@ fn emit_pending_at(
 
 fn publication_event_id(recipient: &str, binding: &str, digest: SnapshotDigest) -> String {
     hash_text(&format!("resource-profile\0{recipient}\0{binding}\0{digest}"))
+}
+
+pub(crate) fn resource_change_subject(
+    binding: &str,
+    facts: &[ResourceFact],
+    topics: &[String],
+    fallback: &str,
+) -> String {
+    const SUBJECT_MAX_SCALARS: usize = 96;
+    const MAX_RENDERED_FACTS: usize = 3;
+
+    let topic_suffix = if topics.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", topics.join(", "))
+    };
+    let base = format!("{binding} · ");
+    let mut rendered = Vec::new();
+    for fact in facts.iter().take(MAX_RENDERED_FACTS) {
+        let fact = render_fact(fact);
+        let candidate = format!("{base}{}{topic_suffix}", {
+            let mut candidate_facts = rendered.clone();
+            candidate_facts.push(fact.clone());
+            candidate_facts.join("; ")
+        });
+        if candidate.chars().count() > SUBJECT_MAX_SCALARS {
+            break;
+        }
+        rendered.push(fact);
+    }
+
+    let detail = if rendered.is_empty() {
+        fallback.to_owned()
+    } else {
+        rendered.join("; ")
+    };
+    let subject = format!("{base}{detail}{topic_suffix}");
+    if subject.chars().count() <= SUBJECT_MAX_SCALARS {
+        return subject;
+    }
+
+    // Facts and topic names are never clipped. A pathological oversized binding or topic suffix
+    // falls back to the binding and bounded generic detail; the durable body remains complete.
+    let fallback = format!("{binding} · {fallback}");
+    if fallback.chars().count() <= SUBJECT_MAX_SCALARS {
+        fallback
+    } else {
+        fallback.chars().take(SUBJECT_MAX_SCALARS).collect()
+    }
+}
+
+fn render_fact(fact: &ResourceFact) -> String {
+    match (fact.before(), fact.after()) {
+        (None, Some(Some(after))) => format!("{}={after}", fact.key()),
+        (None, Some(None)) => format!("{}=removed", fact.key()),
+        (Some(None), Some(Some(after))) => format!("{}=+{after}", fact.key()),
+        (Some(Some(before)), Some(None)) => format!("{}=-{before}", fact.key()),
+        (Some(Some(before)), Some(Some(after))) => {
+            format!("{}={before}→{after}", fact.key())
+        }
+        (Some(None), Some(None)) => format!("{}=absent", fact.key()),
+        (Some(Some(before)), None) => format!("{} was {before}", fact.key()),
+        (Some(None), None) => format!("{} was absent", fact.key()),
+        (None, None) => unreachable!("validated facts always carry a value"),
+    }
 }
 
 fn binding_state_directory(desired: &DesiredBinding) -> anyhow::Result<PathBuf> {
@@ -1128,6 +1201,49 @@ mod tests {
         assert!(owner_matches(Some(&replacement), &replacement));
         assert!(!owner_matches(Some(&replacement), &old));
         assert!(!owner_matches(None, &old));
+    }
+
+    #[test]
+    fn publication_subject_renders_ordered_facts_and_reserves_topics() {
+        let facts = vec![
+            ResourceFact::current("state", "ready").unwrap(),
+            ResourceFact::transition("label", None::<String>, Some("bug")).unwrap(),
+            ResourceFact::transition("owner", Some("alice"), Some("bob")).unwrap(),
+            ResourceFact::current("fourth", "omitted").unwrap(),
+        ];
+        assert_eq!(
+            resource_change_subject(
+                "review",
+                &facts,
+                &["ci.failure".to_owned()],
+                "snapshot updated"
+            ),
+            "review · state=ready; label=+bug; owner=alice→bob [ci.failure]"
+        );
+    }
+
+    #[test]
+    fn publication_subject_drops_low_priority_facts_atomically_within_96_scalars() {
+        let facts = vec![
+            ResourceFact::current("priority", "x".repeat(80)).unwrap(),
+            ResourceFact::current("lower", "must-not-leapfrog").unwrap(),
+        ];
+        let subject = resource_change_subject(
+            "review",
+            &facts,
+            &["selected.topic".to_owned()],
+            "snapshot updated",
+        );
+        assert_eq!(subject, "review · snapshot updated [selected.topic]");
+        assert!(subject.chars().count() <= 96);
+    }
+
+    #[test]
+    fn publication_subject_without_facts_has_a_useful_compatible_fallback() {
+        assert_eq!(
+            resource_change_subject("review", &[], &[], "snapshot updated"),
+            "review · snapshot updated"
+        );
     }
 
     #[test]
