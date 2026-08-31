@@ -16,11 +16,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::Watcher as _;
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use agent_spec::profile::{
     ProfileClass, ResourceProfileRefresh, ResourceProfileRegistry,
 };
-use agent_spec::spec::{AgentSpec, decode_percent_path};
+use agent_spec::spec::{AgentSpec, Resource, decode_percent_path};
+
+use crate::resource_profile::{MAX_FACTS, MAX_FACT_KEY_BYTES, ResourceFact};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
 pub const RESYNC_STREAM: &str = "resync";
@@ -85,6 +88,57 @@ pub struct WatchableCarrier {
     pub class: CarrierClass,
     pub containment_root: Option<PathBuf>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclarationSummary {
+    bindings: BTreeMap<String, String>,
+    complete: bool,
+}
+
+fn declaration_summary(spec: &AgentSpec) -> DeclarationSummary {
+    let mut bindings = spec
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.name().to_owned(),
+                declaration_resource_digest(resource),
+            )
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.0.cmp(&right.0));
+    let complete = bindings.len() <= MAX_FACTS
+        && bindings
+            .iter()
+            .all(|(label, _)| label.len() <= MAX_FACT_KEY_BYTES);
+    DeclarationSummary {
+        bindings: bindings.into_iter().take(MAX_FACTS).collect(),
+        complete,
+    }
+}
+
+fn declaration_resource_digest(resource: &Resource) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"st2.resync.resource-declaration.v1\0");
+    update_digest_field(&mut digest, resource.uri().as_bytes());
+    update_digest_field(&mut digest, resource.reason().as_bytes());
+    match resource.inactive_reason() {
+        Some(reason) => {
+            digest.update([1]);
+            update_digest_field(&mut digest, reason.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    let selector = serde_json::to_vec(&resource.selector())
+        .expect("a parsed JSON selector always serializes");
+    update_digest_field(&mut digest, &selector);
+    format!("{:x}", digest.finalize())
+}
+
+fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
+    let length = u64::try_from(value.len()).expect("declaration fields fit in u64");
+    digest.update(length.to_be_bytes());
+    digest.update(value);
+}
 
 /// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +147,7 @@ pub struct AgentWatchSet {
     pub bus_id: String,
     pub seat_id: Option<String>,
     pub carriers: Vec<WatchableCarrier>,
+    declaration_summary: Option<DeclarationSummary>,
 }
 
 /// Resolve one spec's watch set: the declaration file plus every active resource binding whose
@@ -207,6 +262,7 @@ fn resolve_watch_set(
                     .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
             }),
             carriers,
+            declaration_summary: Some(declaration_summary(spec)),
         },
         diagnostics,
     )
@@ -660,13 +716,72 @@ enum CarrierState {
 }
 
 impl CarrierState {
-    fn render(&self) -> &str {
+    fn fact_value(&self) -> String {
         match self {
-            Self::Present(digest) => digest,
-            Self::Missing => "missing",
+            Self::Present(digest) => digest.chars().take(12).collect(),
+            Self::Missing => "missing".to_owned(),
         }
     }
 }
+fn digest_transition_fact(old: &CarrierState, new: &CarrierState) -> Vec<ResourceFact> {
+    vec![
+        ResourceFact::transition("digest", Some(old.fact_value()), Some(new.fact_value()))
+            .expect("short carrier digests are valid facts"),
+    ]
+}
+
+fn declaration_transition_facts(
+    old: Option<&DeclarationSummary>,
+    new: Option<&DeclarationSummary>,
+    old_state: &CarrierState,
+    new_state: &CarrierState,
+) -> Vec<ResourceFact> {
+    let (Some(old), Some(new)) = (old, new) else {
+        return digest_transition_fact(old_state, new_state);
+    };
+    if !old.complete || !new.complete {
+        return digest_transition_fact(old_state, new_state);
+    }
+
+    let labels = old
+        .bindings
+        .keys()
+        .chain(new.bindings.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let facts = labels
+        .into_iter()
+        .filter_map(|label| match (old.bindings.get(&label), new.bindings.get(&label)) {
+            (None, Some(_)) => Some(ResourceFact::transition(
+                label,
+                None::<String>,
+                Some("declared".to_owned()),
+            )),
+            (Some(_), None) => Some(ResourceFact::transition(
+                label,
+                Some("declared".to_owned()),
+                None::<String>,
+            )),
+            (Some(before), Some(after)) if before != after => {
+                Some(ResourceFact::current(label, "changed"))
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>();
+    match facts {
+        Ok(facts) if !facts.is_empty() => facts,
+        Ok(_) | Err(_) => digest_transition_fact(old_state, new_state),
+    }
+}
+
+fn current_declaration_summary(root: &Path, path: &Path) -> Option<DeclarationSummary> {
+    crate::discover_strict(root)
+        .specs
+        .into_iter()
+        .find(|spec| lexical_clean(&spec.path) == path)
+        .map(|spec| declaration_summary(&spec))
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTransition {
@@ -674,8 +789,11 @@ struct PendingTransition {
     path: PathBuf,
     old_state: CarrierState,
     new_state: CarrierState,
+    facts: Vec<ResourceFact>,
+    topics: Vec<String>,
     body: String,
     event_id: String,
+    new_declaration_summary: Option<DeclarationSummary>,
 }
 
 impl PendingTransition {
@@ -687,16 +805,72 @@ impl PendingTransition {
         incarnation: crate::event::StreamOwnerIncarnation,
         sequence: u64,
     ) -> Self {
+        Self::capture(
+            binding,
+            path,
+            old_state,
+            new_state,
+            digest_transition_fact(old_state, new_state),
+            vec!["content".to_owned()],
+            None,
+            incarnation,
+            sequence,
+        )
+    }
+
+    fn declaration(
+        path: &Path,
+        old_state: &CarrierState,
+        new_state: &CarrierState,
+        old_summary: Option<&DeclarationSummary>,
+        new_summary: Option<DeclarationSummary>,
+        incarnation: crate::event::StreamOwnerIncarnation,
+        sequence: u64,
+    ) -> Self {
+        let facts = declaration_transition_facts(
+            old_summary,
+            new_summary.as_ref(),
+            old_state,
+            new_state,
+        );
+        Self::capture(
+            "declaration",
+            path,
+            old_state,
+            new_state,
+            facts,
+            vec!["declaration".to_owned()],
+            new_summary,
+            incarnation,
+            sequence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        binding: &str,
+        path: &Path,
+        old_state: &CarrierState,
+        new_state: &CarrierState,
+        facts: Vec<ResourceFact>,
+        topics: Vec<String>,
+        new_declaration_summary: Option<DeclarationSummary>,
+        incarnation: crate::event::StreamOwnerIncarnation,
+        sequence: u64,
+    ) -> Self {
         let occurrence = incarnation.occurrence_token(sequence);
-        let body = render_body(binding, path, old_state, new_state, &occurrence);
+        let body = render_body(binding, &topics, &facts, &occurrence);
         let event_id = transition_identity(&body);
         Self {
             binding: binding.to_owned(),
             path: path.to_path_buf(),
             old_state: old_state.clone(),
             new_state: new_state.clone(),
+            facts,
+            topics,
             body,
             event_id,
+            new_declaration_summary,
         }
     }
 }
@@ -708,6 +882,7 @@ struct Entry {
     class: CarrierClass,
     containment_root: Option<PathBuf>,
     state: Option<CarrierState>,
+    declaration_summary: Option<DeclarationSummary>,
     /// Last occurrence sequence reserved by this retained subscription. Sequence zero is the
     /// silent seeded state; only capturing a new immutable transition advances it.
     occurrence_sequence: u64,
@@ -843,6 +1018,7 @@ fn rebuild_carriers(
 ) -> BTreeMap<PathBuf, Vec<Entry>> {
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
     for set in refresh.sets {
+        let seeded_declaration_summary = set.declaration_summary.clone();
         for carrier in set.carriers {
             // The canonical recipient and binding label identify one subscription across
             // declaration and carrier relocation. Rebuild every retained entry from the current
@@ -852,32 +1028,37 @@ fn rebuild_carriers(
             // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
-            let (state, occurrence_sequence, pending_transition, dirty) = retained.map_or_else(
-                || {
-                    let (state, dirty) =
-                        match read_state(&carrier.path, carrier.containment_root.as_deref()) {
-                            Ok(state) => (Some(state), false),
-                            Err(error) => {
-                                diagnose_read_error(&carrier.path, &error);
-                                (None, true)
-                            }
-                        };
-                    (
-                        state,
-                        subscription_sequences.get(&identity).copied().unwrap_or(0),
-                        None,
-                        dirty,
-                    )
-                },
-                |entry| {
-                    (
-                        entry.state,
-                        entry.occurrence_sequence,
-                        entry.pending_transition,
-                        entry.dirty,
-                    )
-                },
-            );
+            let (state, declaration_summary, occurrence_sequence, pending_transition, dirty) =
+                retained.map_or_else(
+                    || {
+                        let (state, dirty) =
+                            match read_state(&carrier.path, carrier.containment_root.as_deref()) {
+                                Ok(state) => (Some(state), false),
+                                Err(error) => {
+                                    diagnose_read_error(&carrier.path, &error);
+                                    (None, true)
+                                }
+                            };
+                        (
+                            state,
+                            (carrier.label == "declaration")
+                                .then(|| seeded_declaration_summary.clone())
+                                .flatten(),
+                            subscription_sequences.get(&identity).copied().unwrap_or(0),
+                            None,
+                            dirty,
+                        )
+                    },
+                    |entry| {
+                        (
+                            entry.state,
+                            entry.declaration_summary,
+                            entry.occurrence_sequence,
+                            entry.pending_transition,
+                            entry.dirty,
+                        )
+                    },
+                );
             let entry = Entry {
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
@@ -885,6 +1066,7 @@ fn rebuild_carriers(
                 class: carrier.class,
                 containment_root: carrier.containment_root.clone(),
                 state,
+                declaration_summary,
                 occurrence_sequence,
                 pending_transition,
                 dirty,
@@ -1235,6 +1417,11 @@ impl Worker {
     fn flush_path(&mut self, path: &Path, due_class: Option<CarrierClass>) {
         let occurrence_incarnation =
             crate::event::current_stream_owner_incarnation(&self.root, &self.this_host).ok();
+        let observed_declaration_summary = self
+            .carriers
+            .get(path)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.label == "declaration"))
+            .then(|| current_declaration_summary(&self.root, path));
         let Some(entries) = self.carriers.get_mut(path) else {
             return;
         };
@@ -1253,6 +1440,9 @@ impl Worker {
                         .take()
                         .expect("pending transition was just observed");
                     entry.state = Some(completed.new_state);
+                    if completed.binding == "declaration" {
+                        entry.declaration_summary = completed.new_declaration_summary;
+                    }
                     // The current carrier may have advanced or rebound while the immutable
                     // transition was pending. Complete it first, then schedule current state.
                     match observed {
@@ -1305,17 +1495,32 @@ impl Worker {
                 retries.push(entry.class);
                 continue;
             };
-            let transition = PendingTransition::new(
-                &entry.label,
-                path,
-                old_state,
-                &target_state,
-                incarnation,
-                sequence,
-            );
+            let transition = if entry.label == "declaration" {
+                PendingTransition::declaration(
+                    path,
+                    old_state,
+                    &target_state,
+                    entry.declaration_summary.as_ref(),
+                    observed_declaration_summary.clone().flatten(),
+                    incarnation,
+                    sequence,
+                )
+            } else {
+                PendingTransition::new(
+                    &entry.label,
+                    path,
+                    old_state,
+                    &target_state,
+                    incarnation,
+                    sequence,
+                )
+            };
             entry.occurrence_sequence = sequence;
             if emit_resync(&self.root, &self.this_host, &entry.bus_id, &transition) {
                 entry.state = Some(target_state);
+                if transition.binding == "declaration" {
+                    entry.declaration_summary = transition.new_declaration_summary;
+                }
             } else {
                 entry.pending_transition = Some(transition);
                 entry.dirty = true;
@@ -1346,7 +1551,12 @@ fn emit_resync(
     bus_id: &str,
     transition: &PendingTransition,
 ) -> bool {
-    let subject = resync_subject(&transition.binding);
+    let subject = crate::resource_profile_supervisor::resource_change_subject(
+        &transition.binding,
+        &transition.facts,
+        &transition.topics,
+        "content changed",
+    );
     match crate::event::emit_builtin_resync(
         root,
         this_host,
@@ -1368,13 +1578,6 @@ fn emit_resync(
     }
 }
 
-fn resync_subject(binding: &str) -> String {
-    if binding == "declaration" {
-        "resource bindings changed: re-read agent spec".to_owned()
-    } else {
-        format!("resource {binding} changed: re-read carrier")
-    }
-}
 
 fn read_state(path: &Path, containment_root: Option<&Path>) -> std::io::Result<CarrierState> {
     match containment_root {
@@ -1547,19 +1750,28 @@ fn read_confined(_path: &Path, _root: &Path) -> std::io::Result<CarrierState> {
     ))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResyncBody<'a> {
+    binding: &'a str,
+    topics: &'a [String],
+    facts: &'a [ResourceFact],
+    occurrence: &'a str,
+}
+
 fn render_body(
-    label: &str,
-    path: &Path,
-    old: &CarrierState,
-    new: &CarrierState,
+    binding: &str,
+    topics: &[String],
+    facts: &[ResourceFact],
     occurrence: &str,
 ) -> String {
-    format!(
-        "resource `{label}` changed\n\nbinding: {label}\npath: {}\nold: {}\nnew: {}\noccurrence: {occurrence}\n",
-        path.display(),
-        old.render(),
-        new.render(),
-    )
+    serde_json::to_string(&ResyncBody {
+        binding,
+        topics,
+        facts,
+        occurrence,
+    })
+    .expect("validated resync facts always serialize")
 }
 #[cfg(test)]
 mod tests {
@@ -1574,15 +1786,25 @@ mod tests {
     }
 
     #[test]
-    fn resync_subject_gives_the_agent_a_semantic_next_action() {
-        assert_eq!(
-            resync_subject("declaration"),
-            "resource bindings changed: re-read agent spec"
+    fn resync_subject_uses_the_shared_three_fact_and_96_scalar_renderer() {
+        let facts = vec![
+            ResourceFact::transition("alpha", None::<String>, Some("declared")).unwrap(),
+            ResourceFact::current("beta", "changed").unwrap(),
+            ResourceFact::transition("charlie", Some("declared"), None::<String>).unwrap(),
+            ResourceFact::current("delta", "omitted").unwrap(),
+        ];
+        let subject = crate::resource_profile_supervisor::resource_change_subject(
+            "declaration",
+            &facts,
+            &["declaration".to_owned()],
+            "content changed",
         );
         assert_eq!(
-            resync_subject("goal"),
-            "resource goal changed: re-read carrier"
+            subject,
+            "declaration · alpha=+declared; beta=changed; charlie=-declared [declaration]"
         );
+        assert!(subject.chars().count() <= 96);
+        assert!(!subject.contains("delta"));
     }
 
     fn owner_incarnation(seed: u64) -> crate::event::StreamOwnerIncarnation {
@@ -1612,13 +1834,135 @@ mod tests {
             .collect()
     }
 
+    fn event_body(event: &str) -> serde_json::Value {
+        let body = event
+            .lines()
+            .rev()
+            .find(|line| line.starts_with('{'))
+            .expect("JSON resync body");
+        serde_json::from_str(body).expect("valid JSON resync body")
+    }
+
     fn event_field(event: &str, field: &str) -> String {
-        event
+        if let Some(value) = event
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{field}: ")))
+        {
+            return value.to_owned();
+        }
+        let body = event_body(event);
+        if matches!(field, "old" | "new") {
+            let digest = body["facts"]
+                .as_array()
+                .and_then(|facts| facts.iter().find(|fact| fact["key"] == "digest"))
+                .expect("digest transition fact");
+            let value = if field == "old" {
+                &digest["before"]
+            } else {
+                &digest["after"]
+            };
+            return value.as_str().expect("digest fact value").to_owned();
+        }
+        body[field]
+            .as_str()
             .unwrap_or_else(|| panic!("missing {field} in event"))
             .to_owned()
     }
+    #[test]
+    fn declaration_facts_are_ordered_added_removed_and_semantically_changed_labels() {
+        let root = tempfile::tempdir().unwrap();
+        let declaration = root.path().join("agent.kdl");
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" {
+  host "host"
+  command "true"
+  resource "inactive" uri="file:///inactive" reason="kept"
+  resource "reason" uri="file:///reason" reason="before"
+  resource "removed" uri="file:///removed" reason="gone"
+  resource "uri" uri="file:///before" reason="same"
+}"#,
+        )
+        .unwrap();
+        let before = declaration_summary(&discover(root.path()));
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" {
+  host "host"
+  command "true"
+  resource "added" uri="file:///added" reason="new"
+  resource "inactive" uri="file:///inactive" reason="kept" inactive-reason="paused"
+  resource "reason" uri="file:///reason" reason="after"
+  resource "uri" uri="file:///after" reason="same"
+}"#,
+        )
+        .unwrap();
+        let after = declaration_summary(&discover(root.path()));
+        let facts = declaration_transition_facts(
+            Some(&before),
+            Some(&after),
+            &CarrierState::Present("before-digest".to_owned()),
+            &CarrierState::Present("after-digest".to_owned()),
+        );
+        assert_eq!(
+            facts.iter().map(ResourceFact::key).collect::<Vec<_>>(),
+            vec!["added", "inactive", "reason", "removed", "uri"]
+        );
+        assert_eq!(facts[0].before(), Some(None));
+        assert_eq!(facts[0].after(), Some(Some("declared")));
+        for index in [1, 2, 4] {
+            assert_eq!(facts[index].before(), None);
+            assert_eq!(facts[index].after(), Some(Some("changed")));
+        }
+        assert_eq!(facts[3].before(), Some(Some("declared")));
+        assert_eq!(facts[3].after(), Some(None));
+    }
+
+    #[test]
+    fn declaration_parse_failure_retains_a_digest_fact_for_later_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agents/host/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let declaration = agent_dir.join("agent.kdl");
+        let valid = r#"agent "worker" {
+  host "host"
+  command "true"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#;
+        std::fs::write(&declaration, valid).unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let mut worker = Worker {
+            root: root.path().to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::new(),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+        };
+        worker.apply_watch_sets(refresh_for(vec![set]));
+        std::fs::write(&declaration, "not an Agent Spec").unwrap();
+        worker.flush_path(&declaration, None);
+        let pending = worker.carriers[&declaration][0]
+            .pending_transition
+            .as_ref()
+            .expect("malformed declaration keeps its digest fallback");
+        assert_eq!(pending.facts.len(), 1);
+        assert_eq!(pending.facts[0].key(), "digest");
+        assert_eq!(pending.topics, ["declaration"]);
+        assert_eq!(event_body(&pending.body)["facts"].as_array().unwrap().len(), 1);
+        std::fs::write(&declaration, valid).unwrap();
+        worker.flush_path(&declaration, None);
+        let delivered = resync_inbox_event(&agent_dir);
+        let body = event_body(&delivered);
+        assert_eq!(body["binding"], "declaration");
+        assert_eq!(body["topics"], serde_json::json!(["declaration"]));
+        assert_eq!(body["facts"][0]["key"], "digest");
+        assert!(!delivered.contains("file:///"));
+        assert!(!delivered.contains("Mission."));
+    }
+
 
     #[test]
     fn watch_set_covers_declaration_and_local_bindings_only() {
@@ -1755,6 +2099,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: Some(CarrierState::Present("alpha-before".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 4,
                     pending_transition: None,
                     dirty: true,
@@ -1766,6 +2111,7 @@ mod tests {
                     class: CarrierClass::Coalesced,
                     containment_root: None,
                     state: Some(CarrierState::Present("beta-before".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 9,
                     dirty: true,
                     pending_transition: None,
@@ -1783,6 +2129,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                 }],
+                declaration_summary: None,
             },
             AgentWatchSet {
                 declaration_path: PathBuf::from("/catalog/beta/agent.kdl"),
@@ -1794,6 +2141,7 @@ mod tests {
                     class: CarrierClass::Coalesced,
                     containment_root: None,
                 }],
+                declaration_summary: None,
             },
         ];
 
@@ -1850,6 +2198,7 @@ mod tests {
                 class: CarrierClass::Coalesced,
                 containment_root: None,
                 state: Some(CarrierState::Present("old-digest".to_owned())),
+                declaration_summary: None,
                 occurrence_sequence: 3,
                 pending_transition: None,
                 dirty: true,
@@ -1919,6 +2268,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: Some(CarrierState::Present("old-digest".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -1957,11 +2307,11 @@ mod tests {
             .expect("the retry routes through the refreshed recipient");
         assert!(event.contains(&format!("event-id: {}", pending.event_id)), "{event}");
         assert!(event.contains(&pending.body), "{event}");
-        assert!(pending.body.contains(&format!("path: {}", old_path.display())));
+        let pending_body: serde_json::Value = serde_json::from_str(&pending.body).unwrap();
+        assert_eq!(pending_body["binding"], "goal");
+        assert_eq!(pending_body["facts"][0]["before"], "old-digest");
         assert!(
-            !pending
-                .body
-                .contains(&format!("path: {}", current_path.display())),
+            !pending.body.contains(&current_path.display().to_string()),
             "rebinding must not rewrite bytes reserved under the pending event identity"
         );
         let entry = &worker.carriers[&current_path][0];
@@ -1995,6 +2345,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: read_state(&old_path, None).ok(),
+                    declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -2016,6 +2367,7 @@ mod tests {
                 class: CarrierClass::Immediate,
                 containment_root: None,
             }],
+            declaration_summary: None,
         }]));
 
         assert!(!worker.carriers.contains_key(&old_path));
@@ -2045,6 +2397,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: read_state(&carrier, None).ok(),
+                    declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -2066,6 +2419,7 @@ mod tests {
                     class,
                     containment_root: None,
                 }],
+                declaration_summary: None,
             }])
         };
 
@@ -2099,6 +2453,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: Some(CarrierState::Present("before".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "declaration",
@@ -2183,6 +2538,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: Some(CarrierState::Present("old-digest".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 1,
                     pending_transition: Some(PendingTransition::new(
                         "goal",
@@ -2213,8 +2569,8 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .find(|body| body.contains("stream: resync"))
             .expect("pending transition is replayed");
-        assert!(event.contains("old: old-digest"), "{event}");
-        assert!(event.contains("new: pending-target"), "{event}");
+        assert_eq!(event_field(&event, "old"), "old-digest");
+        assert_eq!(event_field(&event, "new"), "pending-targ");
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(
             entry.state,
@@ -2246,6 +2602,7 @@ mod tests {
                     class: CarrierClass::Coalesced,
                     containment_root: None,
                     state: baseline.clone(),
+                    declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: false,
@@ -2268,6 +2625,7 @@ mod tests {
                 class: CarrierClass::Coalesced,
                 containment_root: None,
             }],
+            declaration_summary: None,
         }]));
 
         worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -2332,7 +2690,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("stream: resync"));
-        assert!(events[0].contains("binding: goal"));
+        assert!(events[0].contains(r#""binding":"goal""#));
     }
 
     #[test]
@@ -2453,6 +2811,7 @@ mod tests {
                 class,
                 containment_root: None,
                 state: state.clone(),
+                declaration_summary: None,
                 occurrence_sequence: 0,
                 pending_transition: None,
                 dirty: true,
@@ -2568,7 +2927,10 @@ mod tests {
         worker.flush_path(&carrier, None);
         let deletion = resync_inbox_events(&agent_dir);
         assert_eq!(deletion.len(), 1);
-        assert_eq!(event_field(&deletion[0], "old"), original_digest);
+        assert_eq!(
+            event_field(&deletion[0], "old"),
+            original_digest.chars().take(12).collect::<String>()
+        );
         assert_eq!(event_field(&deletion[0], "new"), "missing");
         assert!(event_field(&deletion[0], "occurrence").ends_with(":1"));
         assert_eq!(
@@ -2884,6 +3246,7 @@ mod tests {
                 class: CarrierClass::Immediate,
                 containment_root: None,
                 state: Some(CarrierState::Present("old-digest".to_owned())),
+                declaration_summary: None,
                 occurrence_sequence: 0,
                 pending_transition: None,
                 dirty: true,
@@ -2952,6 +3315,7 @@ mod tests {
                     class: CarrierClass::Immediate,
                     containment_root: None,
                     state: Some(CarrierState::Present("old-digest".to_owned())),
+                    declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
                     dirty: true,
@@ -2970,8 +3334,8 @@ mod tests {
             .clone()
             .expect("failed transition snapshot is retained");
         assert_eq!(pending_transition.new_state, CarrierState::Missing);
-        assert!(pending_transition.body.contains("old: old-digest"));
-        assert!(pending_transition.body.contains("new: missing"));
+        assert_eq!(event_field(&pending_transition.body, "old"), "old-digest");
+        assert_eq!(event_field(&pending_transition.body, "new"), "missing");
         assert_eq!(worker.carriers[&carrier][0].occurrence_sequence, 1);
         std::fs::write(&carrier, "old bytes").unwrap();
         worker.flush_path(&carrier, None);
@@ -2992,91 +3356,34 @@ mod tests {
 
     #[test]
     fn transition_identity_covers_every_rendered_transition_dimension() {
-        let old = CarrierState::Present("old-digest".to_owned());
-        let new = CarrierState::Present("new-digest".to_owned());
-        let baseline = render_body(
-            "goal",
-            Path::new("/agent/goal.md"),
-            &old,
-            &new,
-            "v1:1:2:42:3:1",
-        );
+        let topics = vec!["content".to_owned()];
+        let facts =
+            vec![ResourceFact::transition("digest", Some("old"), Some("new")).unwrap()];
+        let baseline = render_body("goal", &topics, &facts, "v1:1:2:42:3:1");
         assert_eq!(
             transition_identity(&baseline),
             transition_identity(&baseline),
             "replaying one canonical body must reproduce its identity"
         );
 
+        let changed_facts =
+            vec![ResourceFact::transition("digest", Some("old"), Some("other")).unwrap()];
         for (dimension, changed) in [
             (
                 "binding",
-                render_body(
-                    "spec",
-                    Path::new("/agent/goal.md"),
-                    &old,
-                    &new,
-                    "v1:1:2:42:3:1",
-                ),
+                render_body("spec", &topics, &facts, "v1:1:2:42:3:1"),
             ),
             (
-                "path",
-                render_body(
-                    "goal",
-                    Path::new("/other/goal.md"),
-                    &old,
-                    &new,
-                    "v1:1:2:42:3:1",
-                ),
+                "topic",
+                render_body("goal", &["other".to_owned()], &facts, "v1:1:2:42:3:1"),
             ),
             (
-                "old state",
-                render_body(
-                    "goal",
-                    Path::new("/agent/goal.md"),
-                    &CarrierState::Present("other-old".to_owned()),
-                    &new,
-                    "v1:1:2:42:3:1",
-                ),
-            ),
-            (
-                "missing old state",
-                render_body(
-                    "goal",
-                    Path::new("/agent/goal.md"),
-                    &CarrierState::Missing,
-                    &new,
-                    "v1:1:2:42:3:1",
-                ),
-            ),
-            (
-                "new state",
-                render_body(
-                    "goal",
-                    Path::new("/agent/goal.md"),
-                    &old,
-                    &CarrierState::Present("other-new".to_owned()),
-                    "v1:1:2:42:3:1",
-                ),
-            ),
-            (
-                "missing new state",
-                render_body(
-                    "goal",
-                    Path::new("/agent/goal.md"),
-                    &old,
-                    &CarrierState::Missing,
-                    "v1:1:2:42:3:1",
-                ),
+                "fact",
+                render_body("goal", &topics, &changed_facts, "v1:1:2:42:3:1"),
             ),
             (
                 "occurrence",
-                render_body(
-                    "goal",
-                    Path::new("/agent/goal.md"),
-                    &old,
-                    &new,
-                    "v1:1:2:42:3:2",
-                ),
+                render_body("goal", &topics, &facts, "v1:1:2:42:3:2"),
             ),
         ] {
             assert_ne!(

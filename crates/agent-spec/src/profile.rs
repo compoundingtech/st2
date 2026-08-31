@@ -36,7 +36,7 @@ pub const AGENT_GOAL_SCHEME: &str = "dev.schickling.agent-goal";
 /// Maximum resolver module bytes admitted by both catalog transactions and the wasm runtime.
 pub const DEFAULT_MODULE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// Descriptor ABI implemented by this host.
-pub const PROFILE_DESCRIPTOR_ABI_VERSION: u32 = 2;
+pub const PROFILE_DESCRIPTOR_ABI_VERSION: u32 = 3;
 /// Maximum canonical compact JSON bytes accepted for one binding selector.
 pub const DEFAULT_SELECTOR_LIMIT_BYTES: usize = 16 * 1024;
 
@@ -1091,7 +1091,7 @@ mod tests {
     use super::*;
 
     const VALID_DESCRIPTOR_JSON: &str = r#"{
-        "abiVersion": 2,
+        "abiVersion": 3,
         "capabilities": ["resolve", "read", "observe"],
         "selectorSchema": {
             "type": "object",
@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_v2_descriptor_and_nested_selector_validate() {
+    fn valid_v3_descriptor_and_nested_selector_validate() {
         let descriptor = valid_descriptor();
         assert_eq!(descriptor.abi_version, PROFILE_DESCRIPTOR_ABI_VERSION);
         assert_eq!(descriptor.runtime.topology, RuntimeTopology::Shared);
@@ -1171,7 +1171,7 @@ mod tests {
 
     #[test]
     fn descriptor_rejects_unknown_abi_capability_and_fields() {
-        let unknown_abi = VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 2", "\"abiVersion\": 9");
+        let unknown_abi = VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 3", "\"abiVersion\": 9");
         assert!(
             ProfileDescriptor::from_json(unknown_abi.as_bytes())
                 .unwrap_err()
@@ -1187,7 +1187,7 @@ mod tests {
         );
 
         let unknown_field =
-            VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 2,", "\"abiVersion\": 2, \"extra\": true,");
+            VALID_DESCRIPTOR_JSON.replace("\"abiVersion\": 3,", "\"abiVersion\": 3, \"extra\": true,");
         assert!(
             ProfileDescriptor::from_json(unknown_field.as_bytes())
                 .unwrap_err()
