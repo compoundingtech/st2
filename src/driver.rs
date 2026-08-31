@@ -12,7 +12,6 @@ use kdl::{KdlDocument, KdlEntry, KdlNode};
 
 const ST2: &str = "st2";
 const CATALOG: &str = "$CATALOG";
-const CLAUDE_SERVER: &str = "st2";
 const DEV_CHANNELS_FLAG: &str = "--dangerously-load-development-channels";
 
 /// What a materialized Claude channel server can actually do, given how Claude Code admits
@@ -22,11 +21,9 @@ const DEV_CHANNELS_FLAG: &str = "--dangerously-load-development-channels";
 /// `dev: true`, and that flag is set in exactly one place: the merge of the entries parsed from
 /// `--dangerously-load-development-channels`. Measured admission table: compoundingtech/st2#373.
 pub const CHANNEL_NOT_REGISTERED: &str = concat!(
-    "the st2 MCP channel server is materialized, but this seat launches without ",
-    "`--dangerously-load-development-channels`, so Claude Code skips the channel ",
-    "(`server st2 not in --channels list for this session`) and no inbox message reaches ",
-    "the model through it. Adding `--channels server:st2` does not change this: a `server:` ",
-    "entry still needs `dev: true`. See compoundingtech/st2#373",
+    "this Claude seat launches without the packaged st2 channel or an admitted development ",
+    "channel, so no inbox message reaches the model through native delivery. See ",
+    "compoundingtech/st2#373",
 );
 
 /// The other half of a skipped channel: whether anything else carries this seat's inbox. The
@@ -37,7 +34,7 @@ pub const CHANNEL_NO_INBOX_TRANSPORT: &str = concat!(
     "messages sent to it reach the model by no path at all",
 );
 
-/// The `dev-channels #true` half of [`CHANNEL_NOT_REGISTERED`].
+/// The explicit development-channel flag bypasses the packaged channel and requires consent.
 pub const CHANNEL_DEV_CONSENT_REQUIRED: &str = concat!(
     "this seat launches with `--dangerously-load-development-channels`, which stops startup at ",
     "a consent dialog: no MCP server connects and the startup prompt is not read until a human ",
@@ -61,6 +58,8 @@ enum ChannelRoute {
     Unregistered,
     /// The command line carries the development-channels flag.
     DevConsent,
+    /// The typed driver selects the approved marketplace plugin.
+    Packaged,
     /// The launch is an opaque shell program, so neither can be proven.
     Opaque,
 }
@@ -76,16 +75,17 @@ fn carries_dev_channels(argument: &str) -> bool {
 
 fn claude_channel_route(spec: &AgentSpec) -> Option<ChannelRoute> {
     match (&spec.driver, spec.delivery) {
-        // `args` are appended to the provider launch verbatim, after the typed flag, so either
-        // source puts the flag on the real command line.
+        // An authored development flag stays explicit. The typed field selects the packaged
+        // plugin and writes no project MCP state.
         (Some(Driver::Claude(driver)), _) => Some(
-            if driver.dev_channels
-                || driver
-                    .args
-                    .iter()
-                    .any(|argument| carries_dev_channels(argument))
+            if driver
+                .args
+                .iter()
+                .any(|argument| carries_dev_channels(argument))
             {
                 ChannelRoute::DevConsent
+            } else if driver.dev_channels {
+                ChannelRoute::Packaged
             } else {
                 ChannelRoute::Unregistered
             },
@@ -133,6 +133,7 @@ pub fn claude_channel_advisories(spec: &AgentSpec) -> Vec<&'static str> {
     let mut advisories = vec![match route {
         ChannelRoute::Unregistered => CHANNEL_NOT_REGISTERED,
         ChannelRoute::DevConsent => CHANNEL_DEV_CONSENT_REQUIRED,
+        ChannelRoute::Packaged => return Vec::new(),
         ChannelRoute::Opaque => CHANNEL_ROUTE_UNKNOWN,
     }];
     // Only a proven skip justifies the stronger claim; an opaque launch may yet deliver.
@@ -293,42 +294,22 @@ fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
 }
 
 fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            CLAUDE_SERVER: {
-                "type": "stdio",
-                "command": ST2,
-                "args": [
-                    "--catalog",
-                    CATALOG,
-                    "driver",
-                    "claude-mcp",
-                    "--identity",
-                    bus_id
-                ]
-            }
-        }
-    });
-    let mcp = serde_json::to_string_pretty(&mcp)?;
     // The same registration a hand-authored seat carries: without it a driver-declared
     // seat has no observed-state producer and no lifecycle hooks at all.
     let settings = serde_json::to_string_pretty(&crate::hooks::claude_settings_registration())?;
     let mut render = KdlNode::new("render");
-    render.set_children(document([
-        node("json-upsert", vec![".mcp.json".to_string(), mcp]),
-        {
-            // Hook arrays join whatever the workspace already declares: replacement would clobber
-            // user-registered hooks on every materialization, and union is idempotent.
-            let mut upsert = node(
-                "json-upsert",
-                vec![".claude/settings.local.json".to_string(), settings],
-            );
-            upsert
-                .entries_mut()
-                .push(KdlEntry::new_prop("arrays", "union"));
-            upsert
-        },
-    ]));
+    render.set_children(document([{
+        // Hook arrays join whatever the workspace already declares: replacement would clobber
+        // user-registered hooks on every materialization, and union is idempotent.
+        let mut upsert = node(
+            "json-upsert",
+            vec![".claude/settings.local.json".to_string(), settings],
+        );
+        upsert
+            .entries_mut()
+            .push(KdlEntry::new_prop("arrays", "union"));
+        upsert
+    }]));
 
     let mut provider = vec!["claude".to_string()];
     if let Some(model) = &driver.model {
@@ -338,7 +319,10 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         provider.extend(["--effort".to_string(), effort.clone()]);
     }
     if driver.dev_channels {
-        provider.push(format!("{DEV_CHANNELS_FLAG}=server:{CLAUDE_SERVER}"));
+        provider.extend([
+            "--channels".to_string(),
+            crate::claude_channel::CHANNEL.to_string(),
+        ]);
     }
     provider.extend(driver.args.iter().cloned());
     provider.push(driver.prompt.clone());
@@ -462,10 +446,7 @@ mod tests {
 
         let lookalike = legacy_launch(
             None,
-            Some(&[
-                "claude",
-                "--dangerously-load-development-channels-extra",
-            ]),
+            Some(&["claude", "--dangerously-load-development-channels-extra"]),
         );
         assert_eq!(
             claude_channel_route(&lookalike),
@@ -571,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_expands_to_a_channel_render_and_session_owned_launch() {
+    fn claude_expands_to_the_packaged_channel_and_session_owned_launch() {
         let output = expand_driver(
             &spec(Driver::Claude(ClaudeDriver {
                 model: Some("opus".into()),
@@ -593,24 +574,8 @@ mod tests {
             .iter()
             .filter(|node| node.name().value() == "json-upsert")
             .collect();
-        assert_eq!(upserts.len(), 2);
-        let upsert = strings(upserts[0]);
-        assert_eq!(upsert[0], ".mcp.json");
-        let mcp: serde_json::Value = serde_json::from_str(upsert[1]).unwrap();
-        assert_eq!(mcp["mcpServers"]["st2"]["type"], "stdio");
-        assert_eq!(mcp["mcpServers"]["st2"]["command"], "st2");
-        assert_eq!(
-            mcp["mcpServers"]["st2"]["args"],
-            serde_json::json!([
-                "--catalog",
-                "$CATALOG",
-                "driver",
-                "claude-mcp",
-                "--identity",
-                "host.worker"
-            ])
-        );
-        let settings = strings(upserts[1]);
+        assert_eq!(upserts.len(), 1);
+        let settings = strings(upserts[0]);
         assert_eq!(settings[0], ".claude/settings.local.json");
         let settings: serde_json::Value = serde_json::from_str(settings[1]).unwrap();
         assert_eq!(settings, crate::hooks::claude_settings_registration());
@@ -632,7 +597,8 @@ mod tests {
                 "opus",
                 "--effort",
                 "xhigh",
-                "--dangerously-load-development-channels=server:st2",
+                "--channels",
+                "plugin:st2-channel@st2",
                 "--model",
                 "override",
                 "Start work."
