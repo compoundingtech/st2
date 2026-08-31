@@ -627,7 +627,7 @@ fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declaratio
         (
             "ding",
             r#"agent "worker" { argv "axe"; session-driver "claude"; ding }"#,
-            "declares both `session-driver` and `ding`",
+            "generic Ding is only for opaque non-harness PTYs",
         ),
         (
             "deliver",
@@ -710,7 +710,7 @@ fn typed_driver_blocks_reject_legacy_ding() {
         assert!(
             found.errors[0]
                 .message
-                .contains("declares both `ding` and a typed driver"),
+                .contains("generic Ding is only for opaque non-harness PTYs"),
             "{name}: {:?}",
             found.errors[0]
         );
