@@ -1346,7 +1346,7 @@ fn emit_resync(
     bus_id: &str,
     transition: &PendingTransition,
 ) -> bool {
-    let subject = format!("resource {} changed", transition.binding);
+    let subject = resync_subject(&transition.binding);
     match crate::event::emit_builtin_resync(
         root,
         this_host,
@@ -1365,6 +1365,14 @@ fn emit_resync(
             );
             false
         }
+    }
+}
+
+fn resync_subject(binding: &str) -> String {
+    if binding == "declaration" {
+        "resource bindings changed: re-read agent spec".to_owned()
+    } else {
+        format!("resource {binding} changed: re-read carrier")
     }
 }
 
@@ -1563,6 +1571,18 @@ mod tests {
             malformed_declarations: BTreeSet::new(),
             live_task_ids: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn resync_subject_gives_the_agent_a_semantic_next_action() {
+        assert_eq!(
+            resync_subject("declaration"),
+            "resource bindings changed: re-read agent spec"
+        );
+        assert_eq!(
+            resync_subject("goal"),
+            "resource goal changed: re-read carrier"
+        );
     }
 
     fn owner_incarnation(seed: u64) -> crate::event::StreamOwnerIncarnation {

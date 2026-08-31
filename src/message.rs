@@ -2202,6 +2202,19 @@ pub fn archive_msg(inbox_dir: &Path, archive_dir: &Path, filename: &str) -> anyh
     }
 }
 
+/// Settle every canonical message still present in an agent's inbox.
+///
+/// Retirement invokes this on every reconciliation pass. The archive receipt remains authoritative,
+/// so replay after an interrupted pass or a sync-restored inbox duplicate is idempotent.
+pub fn archive_inbox(agent_dir: &Path) -> anyhow::Result<()> {
+    let inbox = inbox_dir(agent_dir);
+    let archive = archive_dir(agent_dir);
+    for message in list_inbox(&inbox)? {
+        archive_msg(&inbox, &archive, &message.filename)?;
+    }
+    Ok(())
+}
+
 fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
     match fs::remove_file(source) {
         Ok(()) => Ok(()),

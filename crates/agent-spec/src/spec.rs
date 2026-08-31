@@ -5,10 +5,10 @@
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
 //! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, `deliver`, typed harness drivers, task lifecycle, Resource bindings (declaration
-//! metadata), and the tasks. Everything else that is render-only (`harness`, `model`, `persona`,
-//! `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked into the
-//! tasks/commands by the render layer and ignored here.
+//! `restart{}`, `deliver`, `session-driver`, typed harness drivers, task lifecycle, Resource
+//! bindings (declaration metadata), and the tasks. Everything else that is render-only (`harness`,
+//! `model`, `persona`, `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked
+//! into the tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -68,7 +68,119 @@ impl DeliveryTransport {
             ),
         }
     }
+
+    pub fn session_driver(self) -> SessionDriver {
+        match self {
+            Self::Mcp => SessionDriver::Claude,
+            Self::AppServer => SessionDriver::Codex,
+            Self::PiChannel => SessionDriver::Pi,
+        }
+    }
 }
+/// The native session driver entered by an otherwise opaque launch.
+///
+/// This is an ownership assertion only. It does not render a provider launch or select a message
+/// delivery transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionDriver {
+    Claude,
+    Codex,
+    Pi,
+    OpenCode,
+    Omp,
+}
+
+impl SessionDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
+            "opencode" => Ok(Self::OpenCode),
+            "omp" => Ok(Self::Omp),
+            _ => anyhow::bail!(
+                "unsupported `session-driver` value '{value}' (expected `claude`, `codex`, `pi`, `opencode`, or `omp`)"
+            ),
+        }
+    }
+
+    /// Parse the canonical driver name carried by `session-driver`.
+    pub fn from_name(value: &str) -> anyhow::Result<Self> {
+        Self::parse(value)
+    }
+}
+
+/// Non-secret facts that prove how a managed session can be admitted for delivery.
+///
+/// This is deliberately separate from activity and runtime health. A credential-backed seat names
+/// only its opaque account identifier; an anonymous seat names the exact harness and model allowlist
+/// it can launch without credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+pub enum DeliveryReadiness {
+    Credential {
+        account_id: Option<String>,
+    },
+    Anonymous {
+        harness: SessionDriver,
+        models: Vec<String>,
+    },
+}
+
+impl DeliveryReadiness {
+    pub fn validate(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Credential { account_id } => {
+                if let Some(account_id) = account_id {
+                    validate_delivery_readiness_value("account-id", account_id)?;
+                }
+            }
+            Self::Anonymous { harness: _, models } => {
+                anyhow::ensure!(
+                    !models.is_empty(),
+                    "anonymous delivery-readiness requires at least one model"
+                );
+                anyhow::ensure!(
+                    models.len() <= 32,
+                    "anonymous delivery-readiness accepts at most 32 models"
+                );
+                for model in models.iter() {
+                    validate_delivery_readiness_value("model", model)?;
+                }
+                models.sort();
+                models.dedup();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_delivery_readiness_value(field: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 200,
+        "delivery-readiness {field} must be 1..=200 UTF-8 bytes"
+    );
+    anyhow::ensure!(
+        value.trim() == value
+            && !value
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')),
+        "delivery-readiness {field} must have no surrounding whitespace, controls, or line separators"
+    );
+    Ok(())
+}
+
 
 /// One typed harness driver declaration.
 ///
@@ -90,6 +202,16 @@ impl Driver {
             Self::Pi(_) => "pi",
             Self::OpenCode(_) => "opencode",
             Self::Omp(_) => "omp",
+        }
+    }
+
+    pub fn session_driver(&self) -> SessionDriver {
+        match self {
+            Self::Claude(_) => SessionDriver::Claude,
+            Self::Codex(_) => SessionDriver::Codex,
+            Self::Pi(_) => SessionDriver::Pi,
+            Self::OpenCode(_) => SessionDriver::OpenCode,
+            Self::Omp(_) => SessionDriver::Omp,
         }
     }
 }
@@ -216,8 +338,12 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
     pub delivery: Option<DeliveryTransport>,
+    /// Native session ownership asserted for an otherwise opaque launch.
+    pub session_driver: Option<SessionDriver>,
     /// Typed harness declaration used by task and render compilation.
     pub driver: Option<Driver>,
+    /// Non-secret admission facts for the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
@@ -228,6 +354,23 @@ pub struct AgentSpec {
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
     pub path: PathBuf,
+}
+
+impl AgentSpec {
+    /// The explicit native session owner after typed-driver normalization.
+    pub fn effective_session_driver(&self) -> Option<SessionDriver> {
+        self.session_driver
+            .or_else(|| self.driver.as_ref().map(Driver::session_driver))
+    }
+}
+
+fn deserialize_optional_selector<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// One agent-local semantic binding to an externally identified resource.
@@ -242,6 +385,8 @@ pub struct Resource {
     reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     inactive_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +396,8 @@ struct ResourceDescriptor {
     uri: String,
     reason: String,
     inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    selector: Option<serde_json::Value>,
 }
 
 impl Resource {
@@ -278,6 +425,7 @@ impl Resource {
             uri,
             reason,
             inactive_reason: None,
+            selector: None,
         })
     }
 
@@ -309,6 +457,15 @@ impl Resource {
     pub fn inactive_reason(&self) -> Option<&str> {
         self.inactive_reason.as_deref()
     }
+
+    pub fn selector(&self) -> Option<&serde_json::Value> {
+        self.selector.as_ref()
+    }
+
+    pub fn with_selector(mut self, selector: serde_json::Value) -> Self {
+        self.selector = Some(selector);
+        self
+    }
 }
 
 impl<'de> Deserialize<'de> for Resource {
@@ -317,6 +474,7 @@ impl<'de> Deserialize<'de> for Resource {
         D: serde::Deserializer<'de>,
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
+        let selector = descriptor.selector;
         let resource = match descriptor.inactive_reason {
             None => Self::new(descriptor.name, descriptor.uri, descriptor.reason),
             Some(inactive_reason) => Self::new_inactive(
@@ -326,7 +484,12 @@ impl<'de> Deserialize<'de> for Resource {
                 inactive_reason,
             ),
         };
-        resource.map_err(de::Error::custom)
+        resource
+            .map(|resource| match selector {
+                Some(selector) => resource.with_selector(selector),
+                None => resource,
+            })
+            .map_err(de::Error::custom)
     }
 }
 
@@ -531,7 +694,12 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: select one provider-native delivery transport.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub deliver: Option<Option<String>>,
-    /// Direct `claude {}` or `codex {}` provider block.
+    /// Native session ownership asserted for an otherwise opaque launch.
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub session_driver: Option<Option<String>>,
+    /// Non-secret facts used to admit the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
+    /// Direct typed provider driver block.
     #[serde(flatten)]
     pub driver: RawDriver,
     /// Compact catalog form: reconciliation policy for the generated agent PTY.
@@ -655,6 +823,8 @@ pub(crate) struct RawResource {
     pub(crate) uri: String,
     pub(crate) reason: String,
     pub(crate) inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    pub(crate) selector: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -714,13 +884,18 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                match resource.inactive_reason {
+                let selector = resource.selector;
+                let resource = match resource.inactive_reason {
                     None => Resource::new(name, resource.uri, resource.reason),
                     Some(inactive_reason) => {
                         Resource::new_inactive(name, resource.uri, resource.reason, inactive_reason)
                     }
                 }
-                .map_err(anyhow::Error::msg)
+                .map_err(anyhow::Error::msg)?;
+                Ok(match selector {
+                    Some(selector) => resource.with_selector(selector),
+                    None => resource,
+                })
             })
             .collect()
     }
@@ -1032,11 +1207,11 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
 
 impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
-    /// lifecycle intent, a `type`, or task blocks. Random TOML/JSON in the tree has none of these
-    /// and is skipped.
+    /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
+    /// has none of these and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
-            || self.job_type.is_some()
+            || self.job_type.as_deref() == Some("service")
             || self.retired.is_some()
             || self.desired_state.is_some()
             || self.desired_state_reason.is_some()
@@ -1044,6 +1219,8 @@ impl RawSpec {
             || self.argv.is_some()
             || self.ding
             || self.deliver.is_some()
+            || self.session_driver.is_some()
+            || self.delivery_readiness.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
             // pi predates this predicate gaining driver awareness and was silently skipped too:
@@ -1085,12 +1262,51 @@ impl RawSpec {
             .as_deref()
             .map(DeliveryTransport::parse)
             .transpose()?;
+        let session_driver = reject_explicit_null("session_driver", self.session_driver)?
+            .as_deref()
+            .map(SessionDriver::parse)
+            .transpose()?;
         let driver = self.driver.lower(&identity)?;
         let has_driver = driver.is_some();
+        let mut delivery_readiness = self.delivery_readiness;
+        if let Some(readiness) = delivery_readiness.as_mut() {
+            readiness.validate()?;
+        }
         anyhow::ensure!(
             !(self.ding && delivery.is_some()),
             "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
         );
+        anyhow::ensure!(
+            !(self.ding && (has_driver || session_driver.is_some() || delivery_readiness.is_some())),
+            "agent '{identity}' declares managed native delivery together with `ding`; generic Ding is only for opaque non-harness PTYs"
+        );
+        anyhow::ensure!(
+            !(session_driver.is_some() && has_driver),
+            "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
+        );
+        let effective_session_driver =
+            session_driver.or_else(|| driver.as_ref().map(Driver::session_driver));
+        if let (Some(delivery), Some(effective)) = (delivery, effective_session_driver) {
+            anyhow::ensure!(
+                delivery.session_driver() == effective,
+                "agent '{identity}' delivery transport '{}' requires session-driver '{}', not '{}'",
+                delivery.as_str(),
+                delivery.session_driver().as_str(),
+                effective.as_str()
+            );
+        }
+        if let (
+            Some(DeliveryReadiness::Anonymous { harness, .. }),
+            Some(effective),
+        ) = (delivery_readiness.as_ref(), effective_session_driver)
+        {
+            anyhow::ensure!(
+                *harness == effective,
+                "agent '{identity}' anonymous delivery-readiness harness '{}' does not match effective session-driver '{}'",
+                harness.as_str(),
+                effective.as_str()
+            );
+        }
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -1241,7 +1457,9 @@ impl RawSpec {
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             delivery,
+            session_driver,
             driver,
+            delivery_readiness,
             resources,
             streams,
             tasks,
@@ -1440,6 +1658,19 @@ mod tests {
         }
         let raw: super::RawSpec = toml::from_str("unrelated = true").unwrap();
         assert!(!raw.looks_like_spec());
+    }
+
+    #[test]
+    fn only_service_type_is_a_spec_candidate_by_itself() {
+        let esm_manifest: super::RawSpec = serde_json::from_str(r#"{"type":"module"}"#).unwrap();
+        assert!(!esm_manifest.looks_like_spec());
+
+        let service: super::RawSpec = serde_json::from_str(r#"{"type":"service"}"#).unwrap();
+        assert!(service.looks_like_spec());
+
+        let unknown_type_declaration: super::RawSpec =
+            serde_json::from_str(r#"{"identity":"worker","type":"module"}"#).unwrap();
+        assert!(unknown_type_declaration.looks_like_spec());
     }
     use super::*;
 

@@ -663,6 +663,8 @@ pub struct ReconcilePlan<'a> {
     pub launch: Vec<Launch<'a>>,
     /// This host, retired, with live sessions → kill them.
     pub teardown: Vec<Teardown<'a>>,
+    /// This host, retired → archive every inbox message, even when no session remains.
+    pub settle_retirement: Vec<&'a AgentSpec>,
     /// This host, active service, every declared task already present (live, or dead+`keep` frozen).
     pub adopt: Vec<&'a AgentSpec>,
     /// host != this machine → skipped; another machine's st2 owns it.
@@ -722,6 +724,9 @@ pub fn reconcile_selected<'a>(
     validate_task_identities(specs, this_host)?;
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
+    if owner.desired_state.is_retired() {
+        plan.settle_retirement.push(owner);
+    }
     let actual = sessions.iter().find(|s| s.pty_id == runtime);
     if !owner.desired_state.is_running() {
         if let Some(s) = actual {
@@ -848,6 +853,9 @@ pub fn reconcile<'a>(
         let bus_id = spec.bus_id(this_host);
 
         if !spec.desired_state.is_running() {
+            if spec.desired_state.is_retired() {
+                plan.settle_retirement.push(spec);
+            }
             let mut teardown_ids = Vec::new();
             for t in &spec.tasks {
                 let id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());

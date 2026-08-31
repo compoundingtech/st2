@@ -3,18 +3,19 @@
 //!
 //! ABI (deliberately minimal, no WASI, no component model):
 //!
-//! - guest exports `memory`, `alloc(len: i32) -> i32`, and
-//!   `resolve(uri_ptr: i32, uri_len: i32, dir_ptr: i32, dir_len: i32) -> i64`.
-//! - the host copies `uri` and `agent_dir` into linear memory through `alloc`; the return value
-//!   packs `(ptr << 32) | len` of a UTF-8 JSON document `{"path": "...", "class": "..."}`.
-//! - the agent directory reaches the guest as a second argument (a global would need mutable
-//!   globals + import plumbing for no gain).
+//! - every guest exports `memory`, `alloc(len: i32) -> i32`, and
+//!   `resolve(uri_ptr: i32, uri_len: i32, dir_ptr: i32, dir_len: i32) -> i64`;
+//! - observable ABI v2 guests additionally export `describe() -> i64`;
+//! - both calls return packed `(ptr << 32) | len` ranges containing bounded UTF-8 JSON;
+//! - the host copies the preserved `uri` and `agent_dir` into linear memory through `alloc`.
 //!
 //! Containment story: traps, fuel exhaustion, and memory-limit breaches are caught here and
 //! surfaced as typed errors; they never unwind into the supervisor. Semantic containment
 //! (the guest returning *which* path to watch) stays the host's job — see
 //! [`WasmResolver::resolve_contained`].
 
+use crate::profile::ProfileDescriptor;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use wasmtime::{
     Config, Engine, Instance, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
@@ -164,6 +165,12 @@ impl WasmResolver {
         agent_dir: &str,
     ) -> Result<WasmResolution, WasmResolveError> {
         self.instantiate()?.resolve(uri, agent_dir)
+    }
+
+    /// Read and validate one optional ABI v2 descriptor from a fresh instance. A module without a
+    /// `describe` export is a passive v1 resolver and remains compatible.
+    pub fn describe_once(&self) -> Result<Option<ProfileDescriptor>, WasmResolveError> {
+        self.instantiate()?.describe()
     }
 
     /// Resolve with semantic containment: the returned path must stay inside `agent_dir`.
@@ -400,6 +407,7 @@ fn normalize(path: &std::path::Path) -> std::path::PathBuf {
 struct GuestFuncs {
     alloc: TypedFunc<i32, i32>,
     resolve: TypedFunc<(i32, i32, i32, i32), i64>,
+    describe: Option<TypedFunc<(), i64>>,
     memory: Memory,
 }
 
@@ -438,12 +446,30 @@ impl WasmInstance {
         let resolve = instance
             .get_typed_func::<(i32, i32, i32, i32), i64>(&mut store, "resolve")
             .map_err(|_| WasmResolveError::MissingExport("resolve"))?;
+        let describe = if instance.get_export(&mut store, "describe").is_some() {
+            Some(
+                instance
+                    .get_typed_func::<(), i64>(&mut store, "describe")
+                    .map_err(|_| {
+                        WasmResolveError::BadReturn(
+                            "`describe` export must have type () -> i64".to_owned(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or(WasmResolveError::MissingExport("memory"))?;
         Ok(Self {
             store,
-            funcs: GuestFuncs { alloc, resolve, memory },
+            funcs: GuestFuncs {
+                alloc,
+                resolve,
+                describe,
+                memory,
+            },
             fuel_per_call: resolver.fuel_per_call,
             first_call_uses_start_fuel: true,
         })
@@ -466,11 +492,7 @@ impl WasmInstance {
         uri: &str,
         agent_dir: &str,
     ) -> Result<WasmResolution, WasmResolveError> {
-        if self.first_call_uses_start_fuel {
-            self.first_call_uses_start_fuel = false;
-        } else {
-            self.charge_fuel()?;
-        }
+        self.begin_call()?;
         let uri_ptr = self.write_guest_bytes(uri.as_bytes())?;
         let dir_ptr = self.write_guest_bytes(agent_dir.as_bytes())?;
 
@@ -482,7 +504,39 @@ impl WasmInstance {
                 (uri_ptr, uri.len() as i32, dir_ptr, agent_dir.len() as i32),
             )
             .map_err(|e| self.classify_call_error(e))?;
+        self.decode_packed_json(packed)
+    }
 
+    /// Read and validate the optional descriptor. Missing `describe` denotes a passive profile;
+    /// an exported descriptor must conform completely to ABI v2.
+    pub fn describe(&mut self) -> Result<Option<ProfileDescriptor>, WasmResolveError> {
+        let Some(describe) = self.funcs.describe.clone() else {
+            return Ok(None);
+        };
+        self.begin_call()?;
+        let packed = describe
+            .call(&mut self.store, ())
+            .map_err(|error| self.classify_call_error(error))?;
+        let descriptor: ProfileDescriptor = self.decode_packed_json(packed)?;
+        descriptor
+            .validate()
+            .map_err(|error| WasmResolveError::BadReturn(error.to_string()))?;
+        Ok(Some(descriptor))
+    }
+
+    fn begin_call(&mut self) -> Result<(), WasmResolveError> {
+        if self.first_call_uses_start_fuel {
+            self.first_call_uses_start_fuel = false;
+            Ok(())
+        } else {
+            self.charge_fuel()
+        }
+    }
+
+    fn decode_packed_json<T: DeserializeOwned>(
+        &self,
+        packed: i64,
+    ) -> Result<T, WasmResolveError> {
         let ret_ptr = (packed >> 32) as u32 as usize;
         let ret_len = (packed as u32) as usize;
         if ret_len > DEFAULT_OUTPUT_LIMIT_BYTES {

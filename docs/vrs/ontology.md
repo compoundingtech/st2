@@ -250,6 +250,48 @@ The canonical [Agent Spec Resource bindings](https://github.com/compoundingtech/
 anchor still describes the pre-#307 envelope of name and `uri` only, and would
 reject the required `reason`; it is pending sync (07-resource DQ-R8).
 
+### Resource snapshot
+
+The one atomic profile-defined representation of a Resource binding's current
+observed state. Its bytes, media type, schema identity, content digest, and
+freshness form the state-first read contract. Provider webhooks, polls, and
+native subscriptions are observations used to reconcile the snapshot; none is
+canonical by itself.
+
+Authority: [PROFILE-R14 atomic snapshot authority](07-resource-profile/requirements.md);
+[decision 0014](.decisions/0014-resource-profiles-are-state-first-read-and-observe-capabilities.md)
+
+### Resource invalidation
+
+A thin, superseding notice that a binding's canonical
+[Resource snapshot](#resource-snapshot) changed in a way selected for agent
+attention. It carries the binding identity, current snapshot digest, and
+semantic topics. It does not carry canonical snapshot bytes, a rendered
+summary, or a complete provider transition.
+
+Authority: [PROFILE-R17 semantic invalidation](07-resource-profile/requirements.md);
+[Resource Profile spec](07-resource-profile/spec.md#semantic-invalidation-and-catch-up-profile-r17r20)
+
+### semantic topic
+
+A profile-owned stable identifier that classifies why a Resource snapshot
+changed, such as `ci.failure` or `mergeability.conflict`. The profile descriptor
+publishes the vocabulary and defaults. A Resource binding selector can choose
+from that vocabulary but cannot create topics or change provider authority.
+
+Authority: [PROFILE-R12 versioned profile descriptor](07-resource-profile/requirements.md);
+[PROFILE-R13 validated binding selectors](07-resource-profile/requirements.md)
+
+### pending relevance
+
+The level-triggered fact that at least one selected Resource snapshot change has
+not been delivered while delivery was unavailable. It is one boolean beside
+the current and last-delivered digests, not a pending event, historical digest,
+cursor, or backlog. Resume invalidates the then-current snapshot.
+
+Authority: [PROFILE-R19 level-triggered catch-up](07-resource-profile/requirements.md);
+[lifecycle prototype](07-resource-profile/.experiments/2026-08-29-smart-resource-lifecycle-prototype.md)
+
 ### linked record (retired)
 
 An agent-owned record of something an agent produced, stored as one markdown

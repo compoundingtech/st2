@@ -17,6 +17,8 @@ use crate::{AgentSpec, Discovered, Resource, driver_diagnostic, harness_context,
 pub struct AgentRow {
     /// The bus id — `<host>.<identity>`.
     pub identity: String,
+    /// Declaration source used to attribute this runtime observation.
+    pub source_path: PathBuf,
     /// Effective presence (derived: stale → `unknown`, etc.).
     pub status: State,
     /// Optional display name from the Agent Spec declaration.
@@ -75,6 +77,7 @@ pub fn roster_from_discovered(
             let agent_dir = s.path.parent()?;
             Some(AgentRow {
                 identity: s.bus_id(this_host),
+                source_path: s.path.clone(),
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: s.name.clone(),
                 description: s.description.clone(),
@@ -281,6 +284,8 @@ struct ResourceJson<'a> {
     reason: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     inactive_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<&'a serde_json::Value>,
     resync: &'static str,
 }
 
@@ -293,6 +298,7 @@ fn resource_json(row: &AgentRow) -> Vec<ResourceJson<'_>> {
             uri: resource.uri(),
             reason: resource.reason(),
             inactive_reason: resource.inactive_reason(),
+            selector: resource.selector(),
             resync: coverage.as_str(),
         })
         .collect()
@@ -383,6 +389,18 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
     }
 }
+/// Runtime-only projection used by the versioned catalog graph. Declaration identity, lifecycle,
+/// and topology stay on the graph row rather than being inferred from this observation.
+pub(crate) fn graph_runtime_value(row: &AgentRow) -> serde_json::Value {
+    serde_json::json!({
+        "presence": row.status.as_str(),
+        "lastActivityMs": row.last_activity_ms,
+        "inbox": row.inbox,
+        "observedState": ObservedJson::from_row(row.observed.as_ref()),
+        "driverDiagnostic": DriverDiagnosticJson::from_row(&row.driver_diagnostic),
+        "context": ContextJson::from_row(row.context.as_ref()),
+    })
+}
 
 /// Count logically unread messages in the agent's `resources/inbox`. A same-filename archive receipt
 /// suppresses and cleans a raw inbox duplicate restored by eventually-consistent sync.
@@ -433,6 +451,7 @@ mod tests {
     ) -> AgentRow {
         AgentRow {
             identity: identity.to_string(),
+            source_path: PathBuf::new(),
             status,
             name: name.map(str::to_string),
             description: None,

@@ -220,6 +220,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { WaitingOnUserInput }` | `active` | `human` | `question` | `waitingOnUserInput` |
 | `Held { NotLoaded }` | *withhold* | — | — | thread not loaded proves nothing about work |
 | `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
+| `Held { UnknownStatus }` | *withhold* | — | — | an unrecognized future status is not a terminal `systemError` and cannot authorize delivery |
 
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass

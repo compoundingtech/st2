@@ -355,11 +355,16 @@ pub fn statusline_reading(payload: &serde_json::Value) -> Reading {
 /// seat, an st2 entry that does not chain would silently and unconditionally remove the
 /// operator's status line on every managed agent, with no warning.
 ///
-/// So every failure here degrades to a rendered line, never a blank one: the payload is read
-/// first, recording is best-effort and only warns (on stderr — stdout belongs to the renderer),
-/// and a renderer that cannot be spawned falls back to passing the bytes through. A renderer that
-/// spawns and then fails is NOT followed by a passthrough: it may already have written a partial
-/// line, and appending the raw JSON to it would corrupt the status line rather than restore it.
+/// Every failure here degrades to an EMPTY status line, and stdout carries the renderer's bytes
+/// or nothing at all. The payload is a machine-readable JSON object — session id, transcript
+/// path, model block, usage block — so echoing it where a status line belongs paints a wall of
+/// JSON across the operator's terminal every five seconds, which is strictly worse for them than
+/// a blank line and gives them nothing to act on. The reason to degrade is the same either way;
+/// only the human-facing line is at stake, and recording is unaffected by which arm runs.
+///
+/// Recording is best-effort and only warns; so does each degraded arm. Both warn on stderr,
+/// which Claude routes to its debug log rather than to the status line, so the diagnostic names
+/// what failed without ever touching the rendered row.
 pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
@@ -385,7 +390,7 @@ fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<
 
 /// Two sources in strict order, first hit wins, never merged and never both — so the resolution
 /// has one answer and an operator debugging their status line has one place to look for it.
-/// Neither resolving is the third case, handled by the caller as a verbatim passthrough.
+/// Neither resolving is the third case, handled by the caller as an empty status line.
 fn downstream_renderer() -> Option<String> {
     if let Some(command) = std::env::var(STATUSLINE_RENDERER_ENV)
         .ok()
@@ -404,7 +409,14 @@ fn downstream_renderer() -> Option<String> {
 
 fn chain_statusline(raw: &[u8]) -> Result<()> {
     let Some(command) = downstream_renderer() else {
-        return passthrough(raw);
+        // Both resolution paths named, because "no renderer resolved" is the whole diagnosis and
+        // the operator's next move is to set one of exactly these two.
+        tracing::warn!(
+            "st2 claude-statusline: no downstream renderer resolved from \
+             ${STATUSLINE_RENDERER_ENV} or ~/{STATUSLINE_RENDERER_FILE}; \
+             rendering an empty status line"
+        );
+        return Ok(());
     };
     // The renderer is a shell command line, exactly as Claude's own `statusLine.command` is, so
     // it is run the way Claude would run it.
@@ -419,20 +431,13 @@ fn chain_statusline(raw: &[u8]) -> Result<()> {
             tracing::warn!(
                 "st2 claude-statusline: downstream renderer `{command}` could not start: {error}"
             );
-            return passthrough(raw);
+            return Ok(());
         }
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(raw);
     }
     let _ = child.wait();
-    Ok(())
-}
-
-fn passthrough(raw: &[u8]) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(raw)?;
-    stdout.flush()?;
     Ok(())
 }
 

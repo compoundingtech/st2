@@ -11,9 +11,11 @@
 //! and forgets to chain leaves every managed agent with a blank status line, and a test that only
 //! checked the record would be green throughout.
 //!
-//! Stdout is the renderer's channel. Anything st2 writes there — a warning, a diagnostic, a
-//! passthrough it should not have made — interleaves with the operator's line and corrupts it,
-//! which is why the assertions are on bytes and not on substrings.
+//! Stdout is the renderer's channel and nothing else may reach it. The renderer's bytes, or no
+//! bytes: a warning, a diagnostic, or the raw payload written there interleaves with the
+//! operator's line, which is why the assertions are on exact bytes and not on substrings. The
+//! degraded arms therefore assert stdout is EMPTY and take their positive evidence from stderr,
+//! where the diagnostic goes and where Claude never renders.
 
 use std::fs;
 use std::io::Write as _;
@@ -144,6 +146,16 @@ fn payload_len() -> usize {
     PAYLOAD.len()
 }
 
+/// The diagnostic the tee writes when neither resolution path yields a renderer. Claude routes a
+/// status-line command's stderr to its debug log and never to the rendered row, so this is the
+/// only channel that can tell an operator why their line went blank — and it is what a degraded
+/// test asserts *positively*, since an empty stdout on its own is also what a crashed tee leaves.
+const NO_RENDERER_DIAGNOSTIC: &str = "no downstream renderer resolved";
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 fn which(program: &str, path: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(program))
@@ -172,8 +184,8 @@ fn the_tee_records_the_reading_and_hands_the_same_payload_to_the_env_renderer() 
     let output = seat.tee(&[("ST_CLAUDE_STATUSLINE_RENDERER", renderer.to_str().unwrap())]);
 
     assert!(output.status.success());
-    // The renderer's line, and ONLY the renderer's line: no passthrough beside it, no diagnostic
-    // on the channel the status line is drawn on.
+    // The renderer's line, and ONLY the renderer's line: nothing of st2's beside it, and no
+    // diagnostic on the channel the status line is drawn on.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         format!("ENVMARK {}", payload_len())
@@ -228,18 +240,38 @@ fn the_variable_wins_over_the_file_and_the_file_is_never_also_run() {
 }
 
 #[test]
-fn with_no_renderer_the_tee_passes_its_stdin_through_byte_for_byte() {
+fn with_no_renderer_the_tee_renders_nothing_rather_than_the_raw_payload() {
     let seat = Seat::new();
 
     let output = seat.tee(&[]);
 
     assert!(output.status.success());
-    // HC-R18's fallback is transparency, not silence: the worst case of st2 occupying the slot is
-    // the operator's own payload rendered verbatim, never an empty status line. Byte equality is
-    // the assertion — a passthrough that re-serializes the JSON would still "work" and would
-    // still be wrong.
-    assert_eq!(output.stdout, PAYLOAD.as_bytes());
-    assert!(seat.record().is_some());
+    // HC-R18 as amended: the degraded arm is SILENT, not transparent. The payload is machine
+    // JSON, so echoing it paints `{"session_id":…,"transcript_path":…}` across the operator's
+    // status line every five seconds — strictly worse for them than a blank row, and nothing they
+    // can act on. This is the exact live regression the amendment fixes.
+    assert!(
+        output.stdout.is_empty(),
+        "the degraded arm rendered {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // The reason lands on stderr, which Claude never renders — so a blank line is diagnosable.
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains(NO_RENDERER_DIAGNOSTIC),
+        "stderr was {stderr:?}"
+    );
+    // Both resolution paths are named, because absent both is precisely the failure.
+    assert!(
+        stderr.contains("ST_CLAUDE_STATUSLINE_RENDERER"),
+        "stderr was {stderr:?}"
+    );
+    assert!(
+        stderr.contains(".claude/statusline-renderer.json"),
+        "stderr was {stderr:?}"
+    );
+    // Silence is only the RENDER. The reading is recorded exactly as it would have been.
+    assert!(seat.record().is_some(), "recording is unaffected");
 }
 
 #[test]
@@ -264,40 +296,83 @@ fn a_recording_failure_still_renders_the_status_line() {
 }
 
 #[test]
-fn a_recording_failure_with_no_renderer_still_passes_the_payload_through() {
+fn a_recording_failure_with_no_renderer_still_renders_nothing() {
     let seat = Seat::new();
 
     let output = seat.tee_as("Silber.undeclared", &[]);
 
     assert!(output.status.success());
-    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+    assert!(output.stdout.is_empty());
+    // Both failures are reported, and both on stderr: the tee never converts a failure into
+    // stdout bytes, whichever one it hits.
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("recording failed"), "stderr was {stderr:?}");
+    assert!(
+        stderr.contains(NO_RENDERER_DIAGNOSTIC),
+        "stderr was {stderr:?}"
+    );
 }
 
 #[test]
-fn a_renderer_that_cannot_start_degrades_to_the_payload_rather_than_to_nothing() {
+fn a_renderer_that_exits_non_zero_leaves_stdout_empty() {
     let seat = Seat::new();
 
-    // `sh -c` reports a missing command on stderr and exits non-zero; the tee must not then
-    // append the raw payload to a line the renderer may already have started, so this asserts
-    // the ONE case where a spawned-and-failed renderer leaves stdout empty.
+    // A renderer name nothing on PATH resolves: `sh -c` reports it on stderr and exits 127. The
+    // renderer spawned, so the tee must not write anything after it — it may already have drawn a
+    // partial line, and appending the raw JSON would corrupt the row rather than restore it.
     let output = seat.tee(&[(
         "ST_CLAUDE_STATUSLINE_RENDERER",
         "st2-no-such-renderer-anywhere",
     )]);
 
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert!(
+        output.stdout.is_empty(),
+        "a failed renderer rendered {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(seat.record().is_some(), "recording is unaffected");
 }
 
 #[test]
-fn without_st2_on_path_the_script_itself_falls_back_to_the_payload() {
+fn a_renderer_file_that_is_not_executable_leaves_stdout_empty() {
+    let seat = Seat::new();
+
+    // The sibling of the non-zero exit, and the likelier operator mistake: the renderer file is
+    // there and the path is right, but the mode is not. `sh -c` exits 126. A tee that fell back
+    // to the payload on any renderer failure would spew JSON on a one-character permissions bug,
+    // so this pins that no renderer failure can ever reach stdout.
+    let renderer = seat.renderer("UNREACHABLE");
+    fs::set_permissions(&renderer, fs::Permissions::from_mode(0o644)).unwrap();
+    seat.declare_renderer_file(renderer.to_str().unwrap());
+
+    let output = seat.tee(&[]);
+
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "a non-executable renderer rendered {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // It resolved — this is not the no-renderer arm wearing a different hat.
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains(NO_RENDERER_DIAGNOSTIC),
+        "the renderer should have resolved; stderr was {stderr:?}"
+    );
+    assert!(seat.record().is_some(), "recording is unaffected");
+}
+
+#[test]
+fn without_st2_on_path_the_script_drains_stdin_and_renders_nothing() {
     let seat = Seat::new();
 
     // The outermost fallback, and the one that must not depend on st2 being installable: a seat
-    // whose `st2` vanished mid-upgrade still renders a status line. The PATH keeps the shell's
-    // own utilities and drops only `st2`, which is the shape of that failure — the tee's fallback
-    // is `cat`, so a PATH with nothing on it at all would be testing the harness, not the tee.
+    // whose `st2` vanished mid-upgrade. It degrades the same way every other arm does — a blank
+    // status line, not a wall of JSON — and it DRAINS stdin to get there, because Claude writes
+    // the payload into this process and an exit that never read it would earn an EPIPE every five
+    // seconds. The PATH keeps the shell's own utilities and drops only `st2`, which is the shape
+    // of that failure; a PATH with nothing on it would be testing the harness, not the tee.
     let path = which_dirs(&["bash", "cat"]);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks/claude-statusline.sh");
     assert!(
@@ -323,8 +398,15 @@ fn without_st2_on_path_the_script_itself_falls_back_to_the_payload() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
 
+    // The drain is structural rather than proven here: `exec cat >/dev/null` consumes stdin,
+    // and this fixture fits inside the pipe buffer, so a bare `exit 0` would pass this assertion
+    // too. What it does pin is the rendered output.
     assert!(output.status.success());
-    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+    assert!(
+        output.stdout.is_empty(),
+        "the script fallback rendered {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// The bound one render must stay under with an unreachable collector configured.
@@ -376,8 +458,20 @@ fn the_tee_never_reaches_for_a_collector_even_when_it_has_something_to_report() 
         "the tee took {elapsed:?} with an unreachable collector configured, \
          so it is building an OTel pipeline again"
     );
-    // "No telemetry", not "no tee": the status line is still rendered, verbatim.
-    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+    // "No telemetry", not "no tee". With the degraded arm silent, an empty stdout is no longer
+    // evidence the tee ran at all — a binary that crashed in 5ms would leave the same stdout and
+    // pass the budget. The stderr diagnostic is the positive anchor: it is written on the way
+    // OUT of a render that read stdin, tried to record, and resolved no renderer.
+    assert!(output.stdout.is_empty());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("recording failed"),
+        "the tee did not run; stderr was {stderr:?}"
+    );
+    assert!(
+        stderr.contains(NO_RENDERER_DIAGNOSTIC),
+        "stderr was {stderr:?}"
+    );
 
     drop(collector);
 }
@@ -388,13 +482,22 @@ fn the_tee_never_reaches_for_a_collector_even_when_it_has_something_to_report() 
 fn a_recording_render_is_also_free_of_the_collector() {
     let seat = Seat::new();
     let (collector, endpoint) = unreachable_collector();
+    // A real renderer, so this drives the whole production path — read, record, chain — and its
+    // marker line is what proves the render completed inside the budget rather than aborting.
+    let renderer = seat.renderer("ENVMARK");
 
     let started = std::time::Instant::now();
-    let output = seat.tee(&[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)]);
+    let output = seat.tee(&[
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+        ("ST_CLAUDE_STATUSLINE_RENDERER", renderer.to_str().unwrap()),
+    ]);
     let elapsed = started.elapsed();
 
     assert!(elapsed < TEE_BUDGET, "the tee took {elapsed:?}");
-    assert_eq!(output.stdout, PAYLOAD.as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("ENVMARK {}", payload_len())
+    );
     assert!(seat.record().is_some(), "the reading is still recorded");
 
     drop(collector);

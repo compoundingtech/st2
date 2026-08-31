@@ -8,6 +8,7 @@ pub mod agent_author;
 pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
+pub mod catalog_graph;
 pub mod catalog_lock;
 pub mod catalog_transaction;
 pub mod claude_mcp;
@@ -41,6 +42,8 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
+pub mod resource_profile;
+pub mod resource_profile_supervisor;
 pub mod resync;
 pub mod run;
 pub mod service;
@@ -60,8 +63,8 @@ pub use agent_spec::{discovery, spec};
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, Task, TaskKind,
-    TaskLifecycle, parse_duration,
+    OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, SessionDriver, Task,
+    TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

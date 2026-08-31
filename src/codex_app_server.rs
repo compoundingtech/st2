@@ -242,6 +242,7 @@ pub enum CodexHoldReason {
     UnknownProtocol,
     NotLoaded,
     SystemError,
+    UnknownStatus,
     WaitingOnApproval,
     WaitingOnUserInput,
 }
@@ -305,7 +306,9 @@ impl CodexObservedState {
                 CodexHoldReason::ConflictingTurn => Some(
                     observation(Activity::Active, BlockedOn::None).with_reason("conflictingTurn"),
                 ),
-                CodexHoldReason::NotLoaded | CodexHoldReason::SystemError => None,
+                CodexHoldReason::NotLoaded
+                | CodexHoldReason::SystemError
+                | CodexHoldReason::UnknownStatus => None,
             },
         }
     }
@@ -456,7 +459,7 @@ impl CodexDeliveryState {
 }
 
 /// The exact codex-cli version whose Rust source settled the occupancy arithmetic below, read at
-/// tag `rust-v0.150.1` (tag object `0eb410ad0dd161ea323b05452f978de01cd63430`) because the Nix
+/// tag `rust-v0.151.0` (tag object `d8673cb68e349c208659b986697773d3145dbb14`) because the Nix
 /// package ships a prebuilt musl tarball with no vendored source. HC-T03 calls Codex's baseline a
 /// version-coupled constant — a property of a build, not of a documented contract — and HC-R13
 /// bounds that with a fixture pinned to this literal, in the shape of `omp_session`'s
@@ -465,16 +468,15 @@ impl CodexDeliveryState {
 /// [`tests::codex_context_recomputes_the_captured_reading_and_pins_its_verified_version`] rather
 /// than silently publish a differently-meaning number.
 ///
-/// Deliberately NOT a launch gate: this constant refuses nothing, it names what was measured. Note
-/// it is ahead of [`SUPPORTED_CODEX_CLI_VERSIONS`], which admits 0.145.0–0.147.0 — so in the
-/// shipped tree this arithmetic runs against a version whose source was not read for it. The
-/// baseline is a long-lived Codex constant, but that is an expectation, not a measurement; closing
-/// the gap means repeating the delivery-gate admission checks for 0.150.1, which is a separate act.
-pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.150.1";
+/// Deliberately NOT a launch gate: this constant refuses nothing, it names what was measured.
+/// Admitting 0.151.0 aligns the newest delivery-gated build with this measurement; a later Codex
+/// admission must still re-read the version-coupled arithmetic rather than infer compatibility
+/// from the unchanged literal.
+pub const CODEX_CONTEXT_VERIFIED_VERSION: &str = "0.151.0";
 
 /// Codex's `BASELINE_TOKENS`, subtracted from BOTH the numerator and the denominator of its
-/// displayed occupancy: `codex-rs/protocol/src/protocol.rs:2242` and
-/// `codex-rs/tui/src/token_usage.rs:9` at `rust-v0.150.1` carry the same literal with an identical
+/// displayed occupancy: `codex-rs/protocol/src/protocol.rs:2332` and
+/// `codex-rs/tui/src/token_usage.rs:9` at `rust-v0.151.0` carry the same literal with an identical
 /// function body, and no configuration override exists. Its doc comment: "should capture tokens
 /// that are always present in the context (e.g. system prompt and fixed tool instructions) so that
 /// the percentage reflects the portion the user can influence."
@@ -1429,7 +1431,7 @@ impl CodexControlState {
                 turn_id: None,
             },
             _ => CodexObservedState::Held {
-                reason: CodexHoldReason::SystemError,
+                reason: CodexHoldReason::UnknownStatus,
                 turn_id: None,
             },
         };
@@ -1488,7 +1490,8 @@ impl CodexControlState {
                     | CodexHoldReason::ConflictingTurn
                     | CodexHoldReason::WaitingOnApproval
                     | CodexHoldReason::WaitingOnUserInput
-                    | CodexHoldReason::NotLoaded,
+                    | CodexHoldReason::NotLoaded
+                    | CodexHoldReason::UnknownStatus,
                 ..
             } => self.observed.clone(),
             CodexObservedState::Held {
@@ -2494,12 +2497,10 @@ fn connect_control(
 
 /// `Ok(None)` = a stop was raised mid-initialize; the caller exits gracefully.
 fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>>> {
-    // A short read timeout surfaces the handshake's blocking reads as resumable
-    // `Interrupted` states (a timed-out socket read is `WouldBlock`, which the
-    // handshake machine parks on), so a stop raised while the app-server sits
-    // silent mid-handshake unblocks within a poll interval instead of holding
-    // the launch for the whole startup timeout.
-    stream.set_read_timeout(Some(CONTROL_POLL))?;
+    // Nonblocking handshake reads produce resumable `Interrupted` states. This
+    // avoids treating unrelated process signals as fatal socket I/O while
+    // retaining a bounded stop-check cadence during a silent handshake.
+    stream.set_nonblocking(true)?;
     let handshake_deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut pending = tungstenite::client("ws://localhost/", stream);
     let (mut websocket, response) = loop {
@@ -2513,13 +2514,19 @@ fn initialize_control(stream: UnixStream) -> Result<Option<WebSocket<UnixStream>
                     Instant::now() < handshake_deadline,
                     "Codex WebSocket handshake timed out"
                 );
+                std::thread::sleep(CONTROL_POLL);
                 pending = resumable.handshake();
             }
             Err(tungstenite::HandshakeError::Failure(error)) => {
+                if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 anyhow::bail!("Codex WebSocket handshake failed: {error}")
             }
         }
     };
+    websocket.get_mut().set_nonblocking(false)?;
+    websocket.get_mut().set_read_timeout(Some(CONTROL_POLL))?;
     anyhow::ensure!(
         response.status().as_u16() == 101,
         "Codex WebSocket handshake returned {}",
@@ -4549,6 +4556,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_thread_status_remains_a_hold_not_a_terminal_system_error() {
+        let mut state = subscribed_state(CodexObservedState::Idle);
+        state.observe_thread_status("futureStatus", None);
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                turn_id: None,
+            }
+        );
+        state.observe_turn_completed("turn-future");
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownStatus,
+                turn_id: None,
+            }
+        );
+    }
+
+    #[test]
     fn tui_loaded_deadline_precedes_the_outer_binding_deadline() {
         assert!(TUI_LOADED_TIMEOUT < STARTUP_TIMEOUT);
     }
@@ -4596,8 +4624,8 @@ mod tests {
     }
 
     /// HC-R13's Codex fixture. The frames are a transposition, and the comment says which half came
-    /// from where: the SHAPE is codex-cli 0.150.1's own app-server schema dump
-    /// (`ThreadTokenUsageUpdatedNotification`, `AccountRateLimitsUpdatedNotification`), and the
+    /// from where: the SHAPE is codex-cli 0.151.0's own app-server schema dump
+    /// (`ThreadTokenUsageUpdatedNotification`, `AccountRateLimitsUpdatedNotification`), while the
     /// NUMBERS are verbatim from a real rollout captured on 2026-08-29 from a 0.150.1 session
     /// (`session_meta.payload.cli_version = "0.150.1"`) — its first and last `token_count` events
     /// and the `rate_limits` snapshot riding them. Fields the capture elided are omitted rather
@@ -4609,7 +4637,7 @@ mod tests {
     /// the only thing tying this arithmetic to a build whose source was actually read.
     #[test]
     fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version() {
-        assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.150.1");
+        assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.151.0");
         assert_eq!(CODEX_BASELINE_TOKENS, 12_000);
 
         let frames = include_str!("../tests/fixtures/codex_token_usage_inbound.jsonl")
@@ -7587,8 +7615,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let descendant =
-            descendant.expect("the launcher did not create its native descendant");
+        let descendant = descendant.expect("the launcher did not create its native descendant");
         assert!(
             process_can_retain_cleanup_resources(descendant),
             "the native descendant was not alive before cleanup"
@@ -7786,11 +7813,18 @@ mod tests {
             socket_path.exists(),
             "the app-server did not leave the expected recoverable socket"
         );
-        assert_eq!(
-            UnixStream::connect(&socket_path).unwrap_err().kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "the residual socket still had a live listener"
-        );
+        let refusal_deadline = Instant::now() + Duration::from_secs(2);
+        let refusal = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(stream) if Instant::now() < refusal_deadline => {
+                    drop(stream);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(_) => panic!("the residual socket still had a live listener"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(refusal.kind(), std::io::ErrorKind::ConnectionRefused);
 
         prepare_socket_for_launch(&socket_path)
             .expect("the next launch did not recover the residual socket");

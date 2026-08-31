@@ -26,11 +26,13 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context as _;
 use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
+#[cfg(feature = "wasm-resolver")]
+use agent_spec::profile::ProfileCapability;
 use kdl::KdlDocument;
 
 /// The catalog-level declaration, read from the catalog root.
 pub const CONFIG_FILE: &str = "catalog.kdl";
-/// One declared resource profile: `profile "<scheme>" { wasm "<path>" class "..." }`.
+/// One declared resource profile: `profile "<scheme>" { wasm "<path>" runtime { argv "..." } }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredProfile {
     /// The URI scheme this profile resolves.
@@ -42,6 +44,14 @@ pub struct DeclaredProfile {
     /// Whether a binding through this profile also subscribes to its ancestors' same-scheme
     /// carriers; defaults to off.
     pub notify_chain: bool,
+    /// Trusted direct process invocation for an observable profile.
+    pub runtime: Option<DeclaredProfileRuntime>,
+}
+
+/// The closed host-runtime declaration. `argv[0]` is executed directly; no shell is involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredProfileRuntime {
+    pub argv: Vec<String>,
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -164,16 +174,57 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
     let mut seen_class = false;
     let mut notify_chain = false;
     let mut seen_notify_chain = false;
+    let mut runtime = None;
     for child in children.nodes() {
+        if child.name().value() == "runtime" {
+            if runtime.is_some() {
+                anyhow::bail!("profile '{scheme}' declares runtime more than once");
+            }
+            if !child.entries().is_empty() {
+                anyhow::bail!("profile '{scheme}': runtime takes no values or properties");
+            }
+            let runtime_children = child.children().ok_or_else(|| {
+                anyhow::anyhow!("profile '{scheme}': runtime needs exactly one argv child")
+            })?;
+            if runtime_children.nodes().len() != 1
+                || runtime_children.nodes()[0].name().value() != "argv"
+            {
+                anyhow::bail!(
+                    "profile '{scheme}': runtime accepts exactly one argv child"
+                );
+            }
+            let argv_node = &runtime_children.nodes()[0];
+            if argv_node.children().is_some() || argv_node.entries().is_empty() {
+                anyhow::bail!(
+                    "profile '{scheme}': runtime argv needs one or more non-empty quoted arguments"
+                );
+            }
+            let argv = argv_node
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (entry.name().is_none())
+                        .then(|| entry.value().as_string())
+                        .flatten()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "profile '{scheme}': runtime argv accepts only non-empty quoted arguments"
+                    )
+                })?;
+            runtime = Some(DeclaredProfileRuntime { argv });
+            continue;
+        }
         if child.children().is_some() {
             anyhow::bail!(
                 "profile '{scheme}': '{}' does not accept a child block",
                 child.name().value()
             );
         }
-        // KDL folds `wasm "a.wasm" class "immediate"` written without separators into ONE node
-        // with extra positional entries — reject anything beyond the single expected argument
-        // so a run-on line fails loudly instead of parsing as something else.
+        // KDL folds value fields written without separators into one node. Reject extra entries.
         if child.entries().len() != 1 {
             anyhow::bail!(
                 "profile '{scheme}': '{}' takes exactly one quoted value",
@@ -222,7 +273,7 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
             }
             other => anyhow::bail!(
                 "unknown profile field '{other}' in profile '{scheme}' \
-                 (expected wasm, class, or notify-chain)"
+                 (expected wasm, class, notify-chain, or runtime)"
             ),
         }
     }
@@ -234,6 +285,7 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
         wasm,
         class,
         notify_chain,
+        runtime,
     })
 }
 
@@ -376,27 +428,25 @@ pub fn pty_root(catalog_root: &Path) -> PathBuf {
     }
 }
 
-/// The resource profiles the CATALOG itself declares, as an injectable registry for the resync
-/// supervisor. Relative `wasm` paths anchor at the catalog root; `$CATALOG`/`$VAR` expand like
-/// every catalog-anchored declaration.
-///
-/// Unlike [`pty_root`], a malformed declaration is an ERROR here, not a fallback: profile blocks
-/// gate watchability of agent resources, and silently dropping one would hide the misconfiguration
-/// behind "nothing fires". `st2 up` surfaces this before spawning; `st2 validate` reports it.
-pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileRegistry> {
+/// Load the catalog profile declaration and construct its registry from one coherent caller-held
+/// catalog read fence. Descriptor/runtime compatibility is checked here so `st2 up` cannot silently
+/// start a profile with half of the observable contract.
+pub fn declared_profile_catalog(
+    catalog_root: &Path,
+) -> anyhow::Result<(CatalogConfig, ResourceProfileRegistry)> {
     let config = load(catalog_root)?;
     let absolute_root = if catalog_root.is_absolute() {
         lexical_absolute(catalog_root)?
     } else {
         lexical_absolute(&std::env::current_dir()?.join(catalog_root))?
     };
-    config.profiles.into_iter().try_fold(
+    let registry = config.profiles.iter().try_fold(
         ResourceProfileRegistry::empty(),
         |registry, declared| -> anyhow::Result<ResourceProfileRegistry> {
             let profile = match resolve_profile_module(&absolute_root, &declared.wasm)? {
                 ResolvedProfileModule::CatalogRelative(relative) => {
                     ResourceProfile::wasm_contained(
-                        declared.scheme,
+                        declared.scheme.clone(),
                         &absolute_root,
                         relative,
                         declared.class,
@@ -404,13 +454,112 @@ pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileR
                     .with_notify_chain(declared.notify_chain)
                 }
                 ResolvedProfileModule::External(module) => {
-                    ResourceProfile::wasm(declared.scheme, module, declared.class)
+                    ResourceProfile::wasm(declared.scheme.clone(), module, declared.class)
                         .with_notify_chain(declared.notify_chain)
                 }
             };
             Ok(registry.with_profile(profile))
         },
-    )
+    )?;
+    validate_runtime_contracts(&config, &registry)?;
+    Ok((config, registry))
+}
+
+/// The resource profiles declared by this catalog.
+pub fn declared_profiles(catalog_root: &Path) -> anyhow::Result<ResourceProfileRegistry> {
+    declared_profile_catalog(catalog_root).map(|(_, registry)| registry)
+}
+
+/// Build the registry passed to passive resync. Observable carriers are supervisor-authored
+/// snapshots and must never also be watched as ordinary filesystem carriers.
+pub fn passive_profiles(
+    config: &CatalogConfig,
+    registry: &ResourceProfileRegistry,
+) -> anyhow::Result<ResourceProfileRegistry> {
+    #[cfg(not(feature = "wasm-resolver"))]
+    {
+        let _ = config;
+        return Ok(registry.clone());
+    }
+    #[cfg(feature = "wasm-resolver")]
+    let refresh = registry.begin_refresh();
+    #[cfg(feature = "wasm-resolver")]
+    {
+        config.profiles.iter().try_fold(
+            ResourceProfileRegistry::empty(),
+            |passive, declared| {
+                let observable = refresh
+                    .try_descriptor(&declared.scheme)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|descriptor| {
+                        descriptor.capabilities.contains(&ProfileCapability::Observe)
+                    });
+                if observable {
+                    Ok(passive)
+                } else {
+                    Ok(passive.with_profile(
+                        registry
+                            .get(&declared.scheme)
+                            .expect("registry was built from this declaration")
+                            .clone(),
+                    ))
+                }
+            },
+        )
+    }
+}
+
+fn validate_runtime_contracts(
+    config: &CatalogConfig,
+    registry: &ResourceProfileRegistry,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "wasm-resolver"))]
+    {
+        if let Some(profile) = config.profiles.iter().find(|profile| profile.runtime.is_some()) {
+            anyhow::bail!(
+                "profile '{}': observable runtime unavailable because st2 was built without the `wasm-resolver` feature",
+                profile.scheme
+            );
+        }
+        let _ = registry;
+        return Ok(());
+    }
+    #[cfg(feature = "wasm-resolver")]
+    {
+        let refresh = registry.begin_refresh();
+        for profile in &config.profiles {
+            let descriptor = match refresh.try_descriptor(&profile.scheme) {
+                Ok(descriptor) => descriptor,
+                Err(error) if profile.runtime.is_none() => {
+                    // Passive resolver failures remain binding-local. Requiring every legacy
+                    // module to instantiate during catalog admission would turn one unwatchable
+                    // Resource into a catalog-wide supervisor outage.
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::msg(error))
+                        .with_context(|| format!("profile '{}': describe", profile.scheme));
+                }
+            };
+            let observes = descriptor.as_ref().is_some_and(|descriptor| {
+                descriptor.capabilities.contains(&ProfileCapability::Observe)
+            });
+            match (observes, profile.runtime.is_some()) {
+                (true, false) => anyhow::bail!(
+                    "profile '{}': descriptor declares observe but catalog runtime is missing",
+                    profile.scheme
+                ),
+                (false, true) => anyhow::bail!(
+                    "profile '{}': catalog runtime is forbidden unless descriptor declares observe",
+                    profile.scheme
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -518,15 +667,50 @@ mod tests {
                     wasm: "resolvers/goal.wasm".into(),
                     class: ProfileClass::Coalesced,
                     notify_chain: false,
+                    runtime: None,
                 },
                 DeclaredProfile {
                     scheme: "dev.example.tree".into(),
                     wasm: "/abs/resolvers/tree.wasm".into(),
                     class: ProfileClass::Silent,
                     notify_chain: false,
+                    runtime: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn runtime_grammar_is_closed_and_argv_is_direct() {
+        let config = parse(
+            r#"
+            profile "dev.example.observe" {
+              wasm "observe.wasm"
+              runtime {
+                argv "github-resource-runtime" "pr"
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                argv: vec!["github-resource-runtime".into(), "pr".into()],
+            })
+        );
+        for malformed in [
+            r#"profile "dev.x" { wasm "x.wasm" runtime }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime "shell" { argv "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { argv } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "x" argv "y" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { command "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "x" } runtime { argv "y" } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
     }
 
     #[test]

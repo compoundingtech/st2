@@ -13,8 +13,8 @@ use agent_spec::spec::{
     TaskLifecycle,
 };
 use agent_spec::{
-    AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_file,
-    discover_strict,
+    AgentDesiredState, AgentSpec, DeliveryReadiness, JobType, Resource, SessionDriver, Task,
+    discover, discover_file, discover_strict,
 };
 
 #[test]
@@ -390,6 +390,7 @@ agent "cos" {
         Some("Silber.cos")
     );
     assert!(spec.delivery.is_none());
+    assert!(spec.session_driver.is_none());
     assert!(spec.has_delivery_transport());
 }
 
@@ -480,6 +481,242 @@ fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
         );
     }
 }
+#[test]
+fn session_driver_is_closed_ownership_for_an_opaque_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    for driver in ["claude", "codex", "pi", "opencode", "omp"] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{driver}/agent.kdl"),
+            &format!(
+                r#"agent "{driver}" {{ host "h"; argv "axe" "agent" "launch"; session-driver "{driver}" }}"#
+            ),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    for (name, expected) in [
+        ("claude", SessionDriver::Claude),
+        ("codex", SessionDriver::Codex),
+        ("pi", SessionDriver::Pi),
+        ("opencode", SessionDriver::OpenCode),
+        ("omp", SessionDriver::Omp),
+    ] {
+        let spec = find(&found.specs, name);
+        assert_eq!(spec.session_driver, Some(expected));
+        assert_eq!(spec.session_driver.unwrap().as_str(), name);
+        assert!(spec.driver.is_none());
+        assert!(spec.delivery.is_none());
+        assert_eq!(spec.tasks.len(), 1);
+        assert_eq!(argv(&spec.tasks[0]), ["axe", "agent", "launch"]);
+        assert!(!spec.tasks[0].derived);
+    }
+}
+
+#[test]
+fn delivery_readiness_is_tagged_normalized_and_separate_from_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/codex/agent.kdl",
+        r#"agent "codex" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "codex"
+  deliver "app-server"
+  delivery-readiness "credential"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/omp/agent.kdl",
+        r#"agent "omp" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "omp"
+  delivery-readiness "anonymous" "zeta" "alpha" "zeta" harness="omp"
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        find(&found.specs, "codex").delivery_readiness,
+        Some(DeliveryReadiness::Credential { account_id: None })
+    );
+    assert_eq!(
+        find(&found.specs, "omp").delivery_readiness,
+        Some(DeliveryReadiness::Anonymous {
+            harness: SessionDriver::Omp,
+            models: vec!["alpha".into(), "zeta".into()],
+        })
+    );
+}
+
+#[test]
+fn delivery_readiness_rejects_managed_ding_and_mismatched_native_ownership() {
+    for (name, declaration, expected) in [
+        (
+            "ding",
+            r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
+            "generic Ding is only for opaque non-harness PTYs",
+        ),
+        (
+            "transport",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server"; delivery-readiness "credential" }"#,
+            "requires session-driver 'codex', not 'claude'",
+        ),
+        (
+            "anonymous",
+            r#"agent "worker" { argv "axe"; session-driver "omp"; delivery-readiness "anonymous" "model" harness="codex" }"#,
+            "does not match effective session-driver",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
+}
+
+
+#[test]
+fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declarations() {
+    for (name, declaration, expected) in [
+        (
+            "unknown",
+            r#"agent "worker" { argv "axe"; session-driver "cursor" }"#,
+            "unsupported `session-driver` value 'cursor'",
+        ),
+        (
+            "duplicate",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; session-driver "codex" }"#,
+            "declares `session-driver` more than once",
+        ),
+        (
+            "missing",
+            r#"agent "worker" { argv "axe"; session-driver }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "non-string",
+            r#"agent "worker" { argv "axe"; session-driver #true }"#,
+            "value must be a string",
+        ),
+        (
+            "property",
+            r#"agent "worker" { argv "axe"; session-driver "claude" mode="owner" }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "children",
+            r#"agent "worker" { argv "axe"; session-driver "claude" { prompt "ignored" } }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "ding",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; ding }"#,
+            "generic Ding is only for opaque non-harness PTYs",
+        ),
+        (
+            "deliver",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server" }"#,
+            "requires session-driver 'codex', not 'claude'",
+        ),
+        (
+            "driver",
+            r#"agent "worker" { session-driver "claude"; claude { prompt "go" } }"#,
+            "declares both `session-driver` and a typed driver",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
+}
+
+#[test]
+fn session_driver_lowers_from_toml_and_json_and_rejects_null() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        "identity = \"toml\"\nhost = \"h\"\nargv = [\"axe\"]\nsession_driver = \"codex\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","argv":["axe"],"session_driver":"pi"}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/null/agent.json",
+        r#"{"identity":"null","host":"h","argv":["axe"],"session_driver":null}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert_eq!(find(&found.specs, "toml").session_driver, Some(SessionDriver::Codex));
+    assert_eq!(find(&found.specs, "json").session_driver, Some(SessionDriver::Pi));
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("field `session_driver` must not be null"),
+        "{:?}",
+        found.errors[0]
+    );
+}
+
+#[test]
+fn typed_driver_blocks_reject_legacy_ding() {
+    for (name, driver) in [
+        ("claude", r#"claude { prompt "go" }"#),
+        ("codex", r#"codex { prompt "go" }"#),
+        ("pi", r#"pi { prompt "go" }"#),
+        ("opencode", r#"opencode { prompt "go" }"#),
+        ("omp", r#"omp { prompt "go" }"#),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!(r#"agent "{name}" {{ ding; {driver} }}"#),
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0]
+                .message
+                .contains("generic Ding is only for opaque non-harness PTYs"),
+            "{name}: {:?}",
+            found.errors[0]
+        );
+    }
+}
+
 
 #[test]
 fn compact_adopt_only_lifecycle_lowers_to_the_generated_agent_task() {
@@ -1010,12 +1247,12 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
     write(
         tmp.path(),
         "agents/h/kdl/agent.kdl",
-        r#"agent "kdl" {
+        r##"agent "kdl" {
   host "h"
   resource "source" uri="worktree://github.com/example/project/main" reason="Primary checkout."
-  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability."
+  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability." selector=#"{"topics":["ci.failure","review.requested"]}"#
   command "true"
-}"#,
+}"##,
     );
     write(
         tmp.path(),
@@ -1024,7 +1261,7 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
   "identity": "json",
   "host": "h",
   "resource": {
-    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability."},
+    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability.", "selector": {"topics": ["ci.failure", "review.requested"]}},
     "source": {"uri": "worktree://github.com/example/project/main", "reason": "Primary checkout."}
   },
   "command": "true"
@@ -1041,6 +1278,7 @@ command = "true"
 uri = "github-issue://example/project/41"
 reason = "Current implementation task."
 inactive_reason = "Merged and retained for traceability."
+selector = { topics = ["ci.failure", "review.requested"] }
 
 [resource.source]
 uri = "worktree://github.com/example/project/main"
@@ -1063,7 +1301,10 @@ reason = "Primary checkout."
             "Current implementation task.".into(),
             "Merged and retained for traceability.".into(),
         )
-        .unwrap(),
+        .unwrap()
+        .with_selector(serde_json::json!({
+            "topics": ["ci.failure", "review.requested"]
+        })),
     ];
     for identity in ["json", "kdl", "toml"] {
         assert_eq!(find(&found.specs, identity).resources, expected);
@@ -1072,12 +1313,23 @@ reason = "Primary checkout."
     let json = serde_json::to_string(&expected).unwrap();
     assert_eq!(
         json,
-        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability."}]"#
+        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability.","selector":{"topics":["ci.failure","review.requested"]}}]"#
     );
     assert_eq!(
         serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
         expected
     );
+
+    let explicit_null = Resource::new(
+        "null-selector".into(),
+        "issue://one".into(),
+        "Null selector probe.".into(),
+    )
+    .unwrap()
+    .with_selector(serde_json::Value::Null);
+    let json = serde_json::to_string(&explicit_null).unwrap();
+    assert!(json.contains(r#""selector":null"#), "{json}");
+    assert_eq!(serde_json::from_str::<Resource>(&json).unwrap(), explicit_null);
 }
 
 #[test]

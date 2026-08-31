@@ -1372,6 +1372,7 @@ fn execute_with_presentation_cursor(
     report: &mut UpReport,
     on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
+
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1499,12 +1500,32 @@ fn execute_with_presentation_cursor(
     // the same safe direction.
     cap.end_pass(Instant::now(), &plan.live);
 
+    let mut failed_retirement_teardowns = HashSet::new();
     for td in &plan.teardown {
+        let mut failed = false;
         for id in &td.pty_ids {
             match runner.kill(id) {
                 Ok(()) => report.torn_down.push(id.clone()),
-                Err(e) => report.errors.push(format!("kill {id}: {e}")),
+                Err(e) => {
+                    failed = true;
+                    report.errors.push(format!("kill {id}: {e}"));
+                }
             }
+        }
+        if failed {
+            failed_retirement_teardowns.insert(td.spec.path.clone());
+        }
+    }
+    for spec in &plan.settle_retirement {
+        if failed_retirement_teardowns.contains(&spec.path) {
+            continue;
+        }
+        let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(error) = crate::message::archive_inbox(agent_dir) {
+            report.errors.push(format!(
+                "archive retired inbox for {}: {error:#}",
+                spec.identity
+            ));
         }
     }
 
@@ -1658,6 +1679,7 @@ fn reconcile_pass(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
     resync: Option<&crate::resync::ResyncSupervisor>,
+    resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
 ) -> UpReport {
     let _catalog_lock = {
         let span = catalog_lock_span();
@@ -1853,6 +1875,13 @@ fn reconcile_pass(
             }
         }
     }
+    if let Some(resource_profiles) = resource_profiles {
+        for launch in &plan.launch {
+            if launch.tasks.iter().any(|task| task.name == "agent") {
+                resource_profiles.deactivate(launch.spec);
+            }
+        }
+    }
     gate_harness_launches_on_hooks(&mut plan, root, &mut report, |_| match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
@@ -1883,37 +1912,65 @@ fn reconcile_pass(
         &mut install_new_live_seat,
     );
     report.warnings.extend(boundary_warnings);
-    if let Some(resync) = resync {
-        let profiles = crate::catalog::declared_profiles(root)
+    if resync.is_some() || resource_profiles.is_some() {
+        let loaded = crate::catalog::declared_profile_catalog(root)
             .context("parse resource profiles in catalog.kdl");
-        let catalog_profile_error = profiles.is_err();
+        let catalog_profile_error = loaded.is_err();
         let malformed_declarations = found
             .errors
             .iter()
             .map(|error| error.path.clone())
             .filter(|path| {
-                // An invalid profile envelope must drop profile-resolved carriers rather than
-                // preserve their stale semantics through malformed-declaration retention.
                 !catalog_profile_error || *path != crate::catalog::config_path(root)
             })
             .collect::<Vec<_>>();
-        let profiles = match profiles {
-            Ok(profiles) => profiles,
+        let (config, profiles) = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
                 report.errors.push(format!("{error:#}"));
-                agent_spec::profile::ResourceProfileRegistry::empty()
+                (
+                    crate::catalog::CatalogConfig::default(),
+                    agent_spec::profile::ResourceProfileRegistry::empty(),
+                )
             }
         };
         let live_subscription_specs =
             live_resync_specs(&compiled_specs, this_host, &sessions, &report);
-        report.warnings.extend(resync.refresh_with_profiles(
-            profiles,
-            &found.specs,
-            &live_subscription_specs,
-            this_host,
-            &sessions,
-            &malformed_declarations,
-        ));
+        if let Some(resource_profiles) = resource_profiles {
+            let generation = match crate::catalog_lock::read_generation_token(root) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    report.errors.push(format!(
+                        "read catalog generation for Resource Profiles: {error:#}"
+                    ));
+                    None
+                }
+            };
+            report.warnings.extend(
+                resource_profiles
+                    .refresh(&config, &profiles, generation, &live_subscription_specs)
+                    .warnings,
+            );
+        }
+        if let Some(resync) = resync {
+            let passive = match crate::catalog::passive_profiles(&config, &profiles) {
+                Ok(passive) => passive,
+                Err(error) => {
+                    report.errors.push(format!(
+                        "derive passive Resource Profile registry: {error:#}"
+                    ));
+                    agent_spec::profile::ResourceProfileRegistry::empty()
+                }
+            };
+            report.warnings.extend(resync.refresh_with_profiles(
+                passive,
+                &found.specs,
+                &live_subscription_specs,
+                this_host,
+                &sessions,
+                &malformed_declarations,
+            ));
+        }
     }
     report
 }
@@ -2161,16 +2218,14 @@ pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Res
     let span = reconcile_span(this_host, "catalog");
     let report = {
         let _entered = span.enter();
-        let report = reconcile_pass(
-            root,
-            this_host,
-            &task_context,
-            runner,
-            &mut FlappingCap::default(),
-            &mut debounce,
-            &mut PresentationPatchCursor::default(),
-            None,
-        );
+        let report = reconcile_pass(root,
+        this_host,
+        &task_context,
+        runner,
+        &mut FlappingCap::default(),
+        &mut debounce,
+        &mut PresentationPatchCursor::default(),
+        None, None);
         finish_reconcile_pass(&span, &report);
         report
     };
@@ -2804,6 +2859,7 @@ fn up_loop_until(
     // Once initialized, every reconcile pass reloads profiles and atomically replaces the registry
     // with the watch set; malformed later edits install an empty, fail-closed profile set.
     let mut resync = None;
+    let mut resource_profiles = None;
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2828,31 +2884,38 @@ fn up_loop_until(
                     continue;
                 }
             };
-            let profiles = crate::catalog::declared_profiles(root)
+            let (config, profiles) = crate::catalog::declared_profile_catalog(root)
                 .context("parse resource profiles in catalog.kdl")?;
+            let passive_profiles = crate::catalog::passive_profiles(&config, &profiles)
+                .context("derive passive Resource Profile registry")?;
             crate::event::publish_owner_binding_under_lock(root, this_host, &catalog_lock)
                 .context("publish machine-local stream owner binding")?;
             resync = Some(crate::resync::ResyncSupervisor::with_profiles(
                 root.to_path_buf(),
                 this_host.to_owned(),
-                profiles,
+                passive_profiles,
             ));
+            resource_profiles = Some(
+                crate::resource_profile_supervisor::ResourceProfileSupervisor::new(
+                    root.to_path_buf(),
+                    this_host.to_owned(),
+                )?,
+            );
         }
         let mut report = {
             let started = Instant::now();
             let span = reconcile_span(this_host, "catalog");
             let pass = {
                 let _entered = span.enter();
-                let pass = reconcile_pass(
-                    root,
-                    this_host,
-                    &task_context,
-                    runner,
-                    &mut cap,
-                    &mut debounce,
-                    &mut presentation_cursor,
-                    resync.as_ref(),
-                );
+                let pass = reconcile_pass(root,
+                this_host,
+                &task_context,
+                runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+                resync.as_ref(),
+                resource_profiles.as_ref());
                 finish_reconcile_pass(&span, &pass);
                 pass
             };
@@ -3173,7 +3236,9 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -3228,7 +3293,9 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -3792,7 +3859,9 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![],
@@ -4411,16 +4480,14 @@ mod tests {
         let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
         let mut presentation_cursor = PresentationPatchCursor::default();
 
-        let first = reconcile_pass(
-            catalog.path(),
-            "hetz",
-            &task_context,
-            &runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-            Some(&resync),
-        );
+        let first = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
         assert!(
             first.errors.iter().any(|error| {
                 error.contains("compile generated tasks")
@@ -4458,16 +4525,14 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let corrected = reconcile_pass(
-            catalog.path(),
-            "hetz",
-            &task_context,
-            &runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-            Some(&resync),
-        );
+        let corrected = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
         assert!(
             corrected
                 .errors
@@ -4525,16 +4590,14 @@ mod tests {
         let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
         let mut presentation_cursor = PresentationPatchCursor::default();
 
-        let failed = reconcile_pass(
-            catalog.path(),
-            "hetz",
-            &task_context,
-            &runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-            Some(&resync),
-        );
+        let failed = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
         assert!(
             failed
                 .errors
@@ -4563,16 +4626,14 @@ mod tests {
         std::fs::write(&live_goal, "changed immediately before recovery\n").unwrap();
         std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
         std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
-        let recovered = reconcile_pass(
-            catalog.path(),
-            "hetz",
-            &task_context,
-            &runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-            Some(&resync),
-        );
+        let recovered = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
         assert!(
             recovered
                 .errors
@@ -4818,16 +4879,14 @@ mod tests {
         let mut debounce = LivenessDebounce::new(Duration::ZERO);
         let mut presentation_cursor = PresentationPatchCursor::default();
 
-        let seeded = reconcile_pass(
-            catalog.path(),
-            "hetz",
-            &task_context,
-            &runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-            Some(&resync),
-        );
+        let seeded = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
         assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
         *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
         let blocked_goal = goal.clone();
@@ -4839,16 +4898,14 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(1));
                 release_tx.send(()).unwrap();
             });
-            reconcile_pass(
-                catalog.path(),
-                "hetz",
-                &task_context,
-                &runner,
-                &mut cap,
-                &mut debounce,
-                &mut presentation_cursor,
-                Some(&resync),
-            )
+            reconcile_pass(catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync), None)
         });
         assert_eq!(relaunched.restarted, ["hetz.worker"]);
         std::thread::sleep(Duration::from_millis(750));

@@ -101,7 +101,7 @@ fn ls_json_and_read_expose_every_declared_field() {
         &declaration(
             "worker",
             "catalog",
-            "  resource \"work\" reason=\"PR under preparation.\" uri=\"github-pr://github.com/o/r/pull/42\" inactive-reason=\"Superseded by #43.\"\n",
+            "  resource \"work\" reason=\"PR under preparation.\" uri=\"github-pr://github.com/o/r/pull/42\" inactive-reason=\"Superseded by #43.\" selector=#\"{\"topics\":[\"ci.failure\"]}\"#\n",
         ),
     );
 
@@ -115,6 +115,7 @@ fn ls_json_and_read_expose_every_declared_field() {
     // already emits, and INVARIANTS.md pins that surface to preserve its field names. The
     // snake_case is inconsistent with sibling roster fields but predates this change.
     assert_eq!(row["inactive_reason"], "Superseded by #43.");
+    assert_eq!(row["selector"], serde_json::json!({"topics": ["ci.failure"]}));
 
     let read = ok(root, &["resource", "read", "worker", "work"]);
     assert!(
@@ -123,6 +124,7 @@ fn ls_json_and_read_expose_every_declared_field() {
     );
     assert!(read.contains("PR under preparation."), "got: {read}");
     assert!(read.contains("Superseded by #43."), "got: {read}");
+    assert!(read.contains(r#"{"topics":["ci.failure"]}"#), "got: {read}");
 }
 
 #[test]
@@ -147,14 +149,27 @@ fn add_publishes_one_binding_and_is_idempotent_on_identical_bytes() {
             "github-pr://github.com/o/r/pull/42",
             "--reason",
             "PR under preparation.",
+            "--selector-json",
+            r####"{"literal":"a\"#b\"##c","topics":["ci.failure"]}"####,
             "--json",
         ],
     );
     let receipt: serde_json::Value = serde_json::from_str(&added).unwrap();
     assert_eq!(receipt["result"], "changed");
+    assert_eq!(
+        receipt["selector"],
+        serde_json::json!({
+            "literal": "a\"#b\"##c",
+            "topics": ["ci.failure"]
+        })
+    );
 
     let after = spec(root);
     assert!(after.contains("resource \"work\""), "got:\n{after}");
+    assert!(
+        after.contains(r####"selector=###"{"literal":"a\"#b\"##c","topics":["ci.failure"]}"###"####),
+        "selector must use the smallest safe raw-string fence:\n{after}"
+    );
     assert!(
         after.contains("// unrelated comment"),
         "unrelated bytes must survive:\n{after}"
@@ -176,6 +191,8 @@ fn add_publishes_one_binding_and_is_idempotent_on_identical_bytes() {
             "github-pr://github.com/o/r/pull/42",
             "--reason",
             "PR under preparation.",
+            "--selector-json",
+            r####"{"literal":"a\"#b\"##c","topics":["ci.failure"]}"####,
             "--json",
         ],
     );
@@ -236,7 +253,7 @@ fn remove_is_idempotent_and_rename_refuses_absent_and_colliding_names() {
             "worker",
             "catalog",
             "  resource \"notes\" reason=\"Durable notes.\" uri=\"agent-notes://h/worker\"\n\
-             resource \"work\" reason=\"PR under preparation.\" uri=\"github-pr://github.com/o/r/pull/42\"\n",
+             resource \"work\" reason=\"PR under preparation.\" uri=\"github-pr://github.com/o/r/pull/42\" selector=#\"{\"topics\":[\"ci.failure\"]}\"#\n",
         ),
     );
 
@@ -256,6 +273,10 @@ fn remove_is_idempotent_and_rename_refuses_absent_and_colliding_names() {
     assert_eq!(receipt["result"], "changed");
     assert!(spec(root).contains("resource \"current-work\""));
     assert!(!spec(root).contains("resource \"work\""));
+    assert!(
+        spec(root).contains(r##"selector=#"{"topics":["ci.failure"]}"#"##),
+        "rename must preserve selector configuration"
+    );
 
     let absent = run(
         root,

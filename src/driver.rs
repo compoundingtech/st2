@@ -65,10 +65,13 @@ enum ChannelRoute {
     Opaque,
 }
 
-/// The flag reaches Claude from the typed field or verbatim arguments alike, and `--flag=value`
-/// and a bare `--flag` are both spellings of the same request.
+/// Structured argv carries the flag only as a bare argument or in `--flag=value` form. Prefix
+/// lookalikes are distinct arguments and must not trigger the development-channel diagnostic.
 fn carries_dev_channels(argument: &str) -> bool {
-    argument.starts_with(DEV_CHANNELS_FLAG)
+    argument == DEV_CHANNELS_FLAG
+        || argument
+            .strip_prefix(DEV_CHANNELS_FLAG)
+            .is_some_and(|value| value.starts_with('='))
 }
 
 fn claude_channel_route(spec: &AgentSpec) -> Option<ChannelRoute> {
@@ -87,8 +90,9 @@ fn claude_channel_route(spec: &AgentSpec) -> Option<ChannelRoute> {
                 ChannelRoute::Unregistered
             },
         ),
-        // The legacy transport renders the same `.mcp.json` from a hand-authored launch, so the
-        // flag is read back from what the operator wrote rather than from a typed field.
+        // The legacy transport renders the same `.mcp.json` from a hand-authored launch.
+        // Structured argv is legible, but a shell program can reach or merely mention the flag
+        // through shell syntax, wrappers, aliases, and variables, so its source is always opaque.
         (None, Some(DeliveryTransport::Mcp)) => {
             let mut opaque = false;
             for task in &spec.tasks {
@@ -97,10 +101,7 @@ fn claude_channel_route(spec: &AgentSpec) -> Option<ChannelRoute> {
                 {
                     return Some(ChannelRoute::DevConsent);
                 }
-                if let Some(command) = task.command.as_deref() {
-                    if command.contains(DEV_CHANNELS_FLAG) {
-                        return Some(ChannelRoute::DevConsent);
-                    }
+                if task.command.is_some() {
                     opaque = true;
                 }
             }
@@ -375,7 +376,7 @@ fn document<const N: usize>(nodes: [KdlNode; N]) -> KdlDocument {
 mod tests {
     use std::path::PathBuf;
 
-    use agent_spec::spec::{AgentDesiredState, JobType};
+    use agent_spec::spec::{AgentDesiredState, JobType, Task};
     use kdl::KdlValue;
 
     use super::*;
@@ -394,12 +395,45 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: Some(driver),
+            delivery_readiness: None,
             resources: Vec::new(),
             streams: Vec::new(),
             tasks: Vec::new(),
             path: PathBuf::from("/catalog/agents/host/worker/agent.kdl"),
         }
+    }
+
+    fn legacy_launch(command: Option<&str>, argv: Option<&[&str]>) -> AgentSpec {
+        let mut launch = spec(Driver::Claude(ClaudeDriver {
+            model: None,
+            effort: None,
+            dev_channels: false,
+            prompt: String::new(),
+            args: Vec::new(),
+        }));
+        launch.delivery = Some(DeliveryTransport::Mcp);
+        launch.driver = None;
+        launch.tasks.push(Task {
+            kind: TaskKind::Pty,
+            derived: false,
+            name: "agent".into(),
+            id: None,
+            command: command.map(str::to_owned),
+            argv: argv.map(|arguments| {
+                arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect()
+            }),
+            cwd: None,
+            tags: Default::default(),
+            env: Default::default(),
+            keep: false,
+            lifecycle: Default::default(),
+        });
+        launch
     }
 
     fn strings(node: &KdlNode) -> Vec<&str> {
@@ -410,6 +444,54 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn structured_argv_recognizes_only_exact_dev_channels_flag_spellings() {
+        for argument in [
+            DEV_CHANNELS_FLAG,
+            "--dangerously-load-development-channels=server:st2",
+        ] {
+            let launch = legacy_launch(None, Some(&["claude", argument]));
+            assert_eq!(
+                claude_channel_route(&launch),
+                Some(ChannelRoute::DevConsent),
+                "{argument}"
+            );
+        }
+
+        let lookalike = legacy_launch(
+            None,
+            Some(&[
+                "claude",
+                "--dangerously-load-development-channels-extra",
+            ]),
+        );
+        assert_eq!(
+            claude_channel_route(&lookalike),
+            Some(ChannelRoute::Unregistered)
+        );
+    }
+
+    #[test]
+    fn legacy_shell_commands_are_opaque_even_when_the_flag_is_quoted_or_commented() {
+        for command in [
+            "claude",
+            "printf '%s' '--dangerously-load-development-channels'",
+            "claude # --dangerously-load-development-channels",
+        ] {
+            let launch = legacy_launch(Some(command), None);
+            assert_eq!(
+                claude_channel_route(&launch),
+                Some(ChannelRoute::Opaque),
+                "{command}"
+            );
+            assert_eq!(
+                claude_channel_advisories(&launch),
+                [CHANNEL_ROUTE_UNKNOWN],
+                "{command}"
+            );
+        }
     }
 
     #[test]
