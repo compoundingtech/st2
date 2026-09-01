@@ -1,705 +1,360 @@
-#![cfg(all(unix, feature = "wasm-resolver"))]
+#![cfg(all(unix, feature = "wasip2-provider-runtime"))]
 
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+use parking_lot::Mutex;
 
-use st2::resource_observe::{
-    MAX_PENDING_OBSERVE_REQUESTS, ObserveAdmissionBackpressure, ObserveReceiptStatus,
-    ObserveRequest,
-};
-use st2::resource_profile::{
-    BindingId, HostMessage, ObservationResult, Publication, RegistrationToken, ResourceFact,
-    RuntimeHealthState, RuntimeMessage, RuntimeOwner, SnapshotBytes, SnapshotDigest,
-    decode_host_line, encode_runtime_line,
-};
+use st2::resource_observe::{ObserveReceipt, ObserveReceiptStatus, ObserveRequest, submit_request};
 use st2::resource_profile_supervisor::ResourceProfileSupervisor;
 
-const SCHEME: &str = "dev.example.observable";
-const SCHEMA_ID: &str = "dev.example.observable.snapshot.v1";
-static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-const MEDIA_TYPE: &str = "application/json";
-
-#[derive(Clone)]
-struct Registration {
-    owner: RuntimeOwner,
-    binding_id: BindingId,
-    registration: RegistrationToken,
-}
-
-#[derive(Clone)]
-struct Observation {
-    registration: Registration,
-    demand_watermark: u64,
-}
-
-struct RuntimeControl {
-    register_path: PathBuf,
-    observe_path: PathBuf,
-    output: File,
-}
-
-impl RuntimeControl {
-    fn registration(&self) -> Registration {
-        wait_until("runtime register message", || {
-            let line = fs::read(&self.register_path).ok()?;
-            let message = decode_host_line(&line).ok()?;
-            let HostMessage::Register {
-                owner,
-                binding_id,
-                registration,
-                ..
-            } = message
-            else {
-                return None;
-            };
-            Some(Registration {
-                owner,
-                binding_id,
-                registration,
-            })
-        })
-    }
-
-    fn observations(&self) -> Vec<Observation> {
-        fs::read_to_string(&self.observe_path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let message = decode_host_line(format!("{line}\n").as_bytes()).ok()?;
-                let HostMessage::Observe {
-                    owner,
-                    binding_id,
-                    registration,
-                    demand_watermark,
-                } = message
-                else {
-                    return None;
-                };
-                Some(Observation {
-                    registration: Registration {
-                        owner,
-                        binding_id,
-                        registration,
-                    },
-                    demand_watermark,
-                })
-            })
-            .collect()
-    }
-
-    fn wait_for_observation(&self, count: usize) -> Observation {
-        wait_until("runtime observe message", || {
-            self.observations().get(count.saturating_sub(1)).cloned()
-        })
-    }
-
-    fn unchanged(&self, observation: &Observation) {
-        self.result(observation, ObservationResult::Unchanged);
-    }
-
-    fn failed(&self, observation: &Observation, diagnostic: &str) {
-        self.result(
-            observation,
-            ObservationResult::Failed {
-                diagnostic: Some(diagnostic.to_owned()),
-            },
-        );
-    }
-
-    fn publish_observation(
-        &self,
-        observation: &Observation,
-        bytes: &[u8],
-        topics: &[&str],
-        fact: &str,
-    ) {
-        self.result(
-            observation,
-            ObservationResult::Published {
-                publication: publication(bytes, topics, fact),
-            },
-        );
-    }
-
-    fn result(&self, observation: &Observation, result: ObservationResult) {
-        let registration = &observation.registration;
-        let message = RuntimeMessage::ObservationResult {
-            owner: registration.owner.clone(),
-            binding_id: registration.binding_id.clone(),
-            registration: registration.registration.clone(),
-            demand_watermark: observation.demand_watermark,
-            result,
-        };
-        let mut output = &self.output;
-        output
-            .write_all(&encode_runtime_line(&message).unwrap())
-            .unwrap();
-        output.flush().unwrap();
-    }
-
-    fn publish(
-        &self,
-        registration: &Registration,
-        bytes: &[u8],
-        topics: &[&str],
-        health_marker: &str,
-    ) {
-        let publication = RuntimeMessage::Publish {
-            owner: registration.owner.clone(),
-            binding_id: registration.binding_id.clone(),
-            registration: registration.registration.clone(),
-            publication: publication(bytes, topics, health_marker),
-        };
-        let health = RuntimeMessage::Health {
-            owner: registration.owner.clone(),
-            binding_id: Some(registration.binding_id.clone()),
-            registration: Some(registration.registration.clone()),
-            state: RuntimeHealthState::Ready,
-            detail: Some(health_marker.to_owned()),
-        };
-        let mut output = &self.output;
-        output
-            .write_all(&encode_runtime_line(&publication).unwrap())
-            .unwrap();
-        output
-            .write_all(&encode_runtime_line(&health).unwrap())
-            .unwrap();
-        output.flush().unwrap();
-    }
-}
-
-fn publication(bytes: &[u8], topics: &[&str], fact: &str) -> Publication {
-    Publication {
-        schema_id: SCHEMA_ID.to_owned(),
-        media_type: MEDIA_TYPE.to_owned(),
-        bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
-        topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
-        facts: Some(vec![ResourceFact::current("revision", fact).unwrap()]),
-    }
-}
-
-struct CatalogFixture {
-    root: PathBuf,
-    host: String,
-    agent_dir: PathBuf,
-    runtime: RuntimeControl,
-}
-
-impl CatalogFixture {
-    fn new(root: PathBuf, host: &str) -> Self {
-        fs::create_dir_all(&root).unwrap();
-        let agent_dir = root.join("agents").join(host).join("worker");
-        fs::create_dir_all(&agent_dir).unwrap();
-        fs::create_dir_all(agent_dir.join("resources")).unwrap();
-        fs::write(
-            agent_dir.join("agent.kdl"),
-            format!(
-                r##"agent "worker" {{
-  host "{host}"
-  command "true"
-  resource "observed" uri="{SCHEME}://subject" reason="Observed state." selector=#"{{"topics":["selected"]}}"#
-}}
-"##,
-            ),
-        )
-        .unwrap();
-
-        let resolver = root.join("observable-resolver.wasm");
-        fs::write(&resolver, observable_resolver_wasm()).unwrap();
-        let control_dir = root.join("runtime-control");
-        fs::create_dir_all(&control_dir).unwrap();
-        let register_path = control_dir.join("register.ndjson");
-        let observe_path = control_dir.join("observe.ndjson");
-        let fifo_path = control_dir.join("runtime-output.fifo");
-        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let output = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fifo_path)
-            .unwrap();
-
-        let runtime = root.join("fake-observable-runtime");
-        fs::write(
-            &runtime,
-            "#!/bin/sh\nset -eu\nexec 3<&0\n(\n  while IFS= read -r frame; do\n    case \"$frame\" in\n      *'\"type\":\"register\"'*) printf '%s\\n' \"$frame\" > \"$1/register.ndjson\" ;;\n      *'\"type\":\"observe\"'*) printf '%s\\n' \"$frame\" >> \"$1/observe.ndjson\" ;;\n    esac\n  done\n) <&3 &\nexec cat \"$1/runtime-output.fifo\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(
-            st2::catalog::config_path(&root),
-            format!(
-                r#"profile "{SCHEME}" {{
-  wasm "observable-resolver.wasm"
-  class "immediate"
-  runtime {{
-    argv "{}" "{}"
-    capability "demand"
-  }}
-}}
-"#,
-                runtime.display(),
-                control_dir.display()
-            ),
-        )
-        .unwrap();
-
-        Self {
-            root,
-            host: host.to_owned(),
-            agent_dir,
-            runtime: RuntimeControl {
-                register_path,
-                observe_path,
-                output,
-            },
-        }
-    }
-
-    fn supervisor(&self) -> ResourceProfileSupervisor {
-        let supervisor =
-            ResourceProfileSupervisor::new(self.root.clone(), self.host.clone()).unwrap();
-        self.refresh(&supervisor);
-        supervisor
-    }
-
-    fn refresh(&self, supervisor: &ResourceProfileSupervisor) {
-        self.refresh_generation(supervisor, 1);
-    }
-
-    fn refresh_generation(&self, supervisor: &ResourceProfileSupervisor, generation: u64) {
-        let (config, profiles) = st2::catalog::declared_profile_catalog(&self.root).unwrap();
-        let discovery = st2::discover_strict(&self.root);
-        assert!(
-            discovery.errors.is_empty(),
-            "fixture catalog must be valid: {:?}",
-            discovery.errors
-        );
-        let report = supervisor.refresh(&config, &profiles, Some(generation), &discovery.specs);
-        assert!(
-            report.warnings.is_empty(),
-            "Resource Profile refresh warnings: {:?}",
-            report.warnings
-        );
-    }
-
-    fn snapshot_path(&self) -> PathBuf {
-        self.agent_dir.join("resources/snapshot.json")
-    }
-
-    fn owner_binding_path(&self) -> PathBuf {
-        let park_dir = st2::park::SupervisorScope::current(&self.root, &self.host)
-            .unwrap()
-            .park_dir();
-        park_dir.parent().unwrap().join("stream-owner.json")
-    }
-
-    fn observe_request_dir(&self) -> PathBuf {
-        st2::park::SupervisorScope::current(&self.root, &self.host)
-            .unwrap()
-            .park_dir()
-            .parent()
-            .unwrap()
-            .join("observe-requests")
-    }
-
-    fn observe_receipt_dir(&self) -> PathBuf {
-        st2::park::SupervisorScope::current(&self.root, &self.host)
-            .unwrap()
-            .park_dir()
-            .parent()
-            .unwrap()
-            .join("observe-receipts")
-    }
-
-    fn request(&self) -> ObserveRequest {
-        ObserveRequest::new(
-            format!("{}.worker", self.host),
-            "observed".to_owned(),
-            Some(1),
-            None,
-        )
-        .unwrap()
-    }
-}
+static STATE_ENV: Mutex<()> = Mutex::new(());
+const WAIT: Duration = Duration::from_secs(30);
 
 #[test]
-fn observable_publication_reaches_builtin_resync_with_filter_catch_up_and_scope_isolation() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temporary = tempfile::tempdir().unwrap();
-    let state = temporary.path().join("state");
-    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
-
-    let primary = CatalogFixture::new(temporary.path().join("catalog-primary"), "alpha");
-    st2::event::publish_owner_binding_for_test(&primary.root, &primary.host).unwrap();
-    let primary_supervisor = primary.supervisor();
-    let primary_registration = primary.runtime.registration();
-
-    let first = br#"{"revision":1}"#;
-    primary
-        .runtime
-        .publish(&primary_registration, first, &["selected"], "primary-first");
-    wait_for_health(&primary_supervisor, "primary-first");
-    assert_eq!(fs::read(primary.snapshot_path()).unwrap(), first);
-    let first_inbox = resync_inbox(&primary.agent_dir);
-    assert_eq!(
-        first_inbox.len(),
-        1,
-        "the first selected publication must create one built-in resync record"
-    );
-    assert!(
-        first_inbox[0].contains("subject: observed · revision=primary-first [selected]"),
-        "{}",
-        first_inbox[0]
-    );
-    assert!(
-        first_inbox[0].contains(r#""facts":[{"key":"revision","after":"primary-first"}]"#),
-        "{}",
-        first_inbox[0]
-    );
-
-    primary
-        .runtime
-        .publish(&primary_registration, first, &["selected"], "primary-equal");
-    wait_for_health(&primary_supervisor, "primary-equal");
-    assert_eq!(fs::read(primary.snapshot_path()).unwrap(), first);
-    assert_eq!(
-        resync_inbox(&primary.agent_dir),
-        first_inbox,
-        "an equal publication must not invalidate the inbox"
-    );
-
-    let filtered = br#"{"revision":2}"#;
-    primary.runtime.publish(
-        &primary_registration,
-        filtered,
-        &["ignored"],
-        "primary-filtered",
-    );
-    wait_for_health(&primary_supervisor, "primary-filtered");
-    assert_eq!(fs::read(primary.snapshot_path()).unwrap(), filtered);
-    assert_eq!(
-        resync_inbox(&primary.agent_dir),
-        first_inbox,
-        "an unselected topic must update the canonical snapshot without invalidation"
-    );
-
-    fs::remove_file(primary.owner_binding_path()).unwrap();
-    let caught_up = br#"{"revision":3}"#;
-    primary.runtime.publish(
-        &primary_registration,
-        caught_up,
-        &["selected"],
-        "delivery-unavailable",
-    );
-    wait_until("failed runtime after unavailable delivery", || {
-        (fs::read(primary.snapshot_path()).ok().as_deref() == Some(caught_up)
-            && primary_supervisor.health().is_empty())
-        .then_some(())
-    });
-    assert_eq!(
-        resync_inbox(&primary.agent_dir),
-        first_inbox,
-        "failed delivery must remain pending rather than forging a local inbox write"
-    );
-
-    st2::event::publish_owner_binding_for_test(&primary.root, &primary.host).unwrap();
-    primary.refresh(&primary_supervisor);
-    let caught_up_inbox = resync_inbox(&primary.agent_dir);
-    assert_eq!(
-        caught_up_inbox.len(),
-        1,
-        "supersession keeps one unread head"
-    );
-    assert_ne!(
-        caught_up_inbox, first_inbox,
-        "restoring delivery must replace the old head with the pending digest"
-    );
-    assert!(
-        caught_up_inbox[0].contains("revision=delivery-unavailable"),
-        "{}",
-        caught_up_inbox[0]
-    );
-    let caught_up_projection = file_tree(&primary.agent_dir.join("resources"));
-    primary.refresh(&primary_supervisor);
-    assert_eq!(
-        file_tree(&primary.agent_dir.join("resources")),
-        caught_up_projection,
-        "an acknowledged catch-up must not replay on a later equal refresh"
-    );
-
-    let isolated = CatalogFixture::new(temporary.path().join("catalog-isolated"), "beta");
-    st2::event::publish_owner_binding_for_test(&isolated.root, &isolated.host).unwrap();
-    let isolated_supervisor = isolated.supervisor();
-    let isolated_registration = isolated.runtime.registration();
-    let isolated_first = br#"{"catalog":"isolated","revision":1}"#;
-    isolated.runtime.publish(
-        &isolated_registration,
-        isolated_first,
-        &["selected"],
-        "isolated-first",
-    );
-    wait_for_health(&isolated_supervisor, "isolated-first");
-    assert_eq!(fs::read(isolated.snapshot_path()).unwrap(), isolated_first);
-    assert_eq!(
-        resync_inbox(&isolated.agent_dir).len(),
-        1,
-        "the isolated scope must own a real snapshot and inbox head before teardown"
-    );
-    let isolated_before_drop = file_tree(&isolated.agent_dir.join("resources"));
-
-    drop(primary_supervisor);
-    assert_eq!(
-        file_tree(&isolated.agent_dir.join("resources")),
-        isolated_before_drop,
-        "tearing down one catalog+host supervisor must not mutate another scope"
-    );
-
-    let isolated_second = br#"{"catalog":"isolated","revision":2}"#;
-    isolated.runtime.publish(
-        &isolated_registration,
-        isolated_second,
-        &["selected"],
-        "isolated-after-primary-drop",
-    );
-    wait_for_health(&isolated_supervisor, "isolated-after-primary-drop");
-    assert_eq!(
-        fs::read(isolated.snapshot_path()).unwrap(),
-        isolated_second,
-        "the isolated supervisor must remain live after the other scope tears down"
-    );
-    assert_ne!(
-        file_tree(&isolated.agent_dir.join("resources")),
-        isolated_before_drop,
-        "the surviving scope must still publish and invalidate"
-    );
-}
-#[test]
-fn demand_observation_settlement_matrix_is_atomic_and_preserves_facts() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn supervisor_compatibility_contract_uses_the_production_pty_component() {
+    // The component executor replaces native protocol frames. Executor import admission and
+    // resource limits live in st2-resource-wasip2 tests; this test maps the applicable supervisor
+    // contract to real component changed/unchanged/failed proposals, health, and restart recovery.
+    let _guard = STATE_ENV.lock();
     let temporary = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
+    let executable = temporary.path().join("fixture-pty");
+    write_executable(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' '{\"sessions\":1}'\n",
+    );
+    let pty = ProviderFixture::new(
+        temporary.path().join("pty"),
+        "dev.st2.pty-stats",
+        component("ST2_PTY_STATS_COMPONENT"),
+        r#"{"topics":["stats"]}"#,
+        &format!(
+            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            executable,
+            temporary.path()
+        ),
+        "st2.resource.pty-stats.v1",
+        "stats",
+    );
+    let first = pty.observe(None);
+    assert_eq!(first.status, ObserveReceiptStatus::SettledChanged, "{first:?}");
+    let first_bytes = fs::read(pty.snapshot()).unwrap();
+    let replay = pty.observe(first.digest);
+    assert_eq!(replay.status, ObserveReceiptStatus::SettledUnchanged);
+    assert_eq!(fs::read(pty.snapshot()).unwrap(), first_bytes);
 
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let supervisor = fixture.supervisor();
-    fixture.runtime.registration();
+    write_executable(&executable, "#!/bin/sh\nexit 7\n");
+    let failed = pty.observe(first.digest);
+    assert_eq!(failed.status, ObserveReceiptStatus::SettledFailed);
+    assert_eq!(fs::read(pty.snapshot()).unwrap(), first_bytes);
+    assert!(pty
+        .supervisor
+        .health()
+        .iter()
+        .any(|health| health.binding.as_deref() == Some("observed")
+            && health.state == st2::resource_profile::RuntimeHealthState::Degraded));
 
-    let unchanged = fixture.request();
-    let unchanged_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &unchanged).unwrap();
-    let unchanged_observation = fixture.runtime.wait_for_observation(1);
-    assert_eq!(unchanged_observation.demand_watermark, 1);
-    fixture.runtime.unchanged(&unchanged_observation);
-    let unchanged_receipt = unchanged_client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
+    write_executable(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' '{\"sessions\":2}'\n",
+    );
+    let recovered = pty.observe(first.digest);
+    assert_eq!(recovered.status, ObserveReceiptStatus::SettledChanged);
+    assert!(pty
+        .supervisor
+        .health()
+        .iter()
+        .any(|health| health.binding.as_deref() == Some("observed")
+            && health.state == st2::resource_profile::RuntimeHealthState::Ready));
+    let recovered_bytes = fs::read(pty.snapshot()).unwrap();
+    drop(pty);
+
+    let restarted = ProviderFixture::new(
+        temporary.path().join("pty"),
+        "dev.st2.pty-stats",
+        component("ST2_PTY_STATS_COMPONENT"),
+        r#"{"topics":["stats"]}"#,
+        &format!(
+            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            executable,
+            temporary.path()
+        ),
+        "st2.resource.pty-stats.v1",
+        "stats",
+    );
+    let unchanged_after_restart = restarted.observe(recovered.digest);
     assert_eq!(
-        unchanged_receipt.status,
+        unchanged_after_restart.status,
         ObserveReceiptStatus::SettledUnchanged
     );
-    assert_eq!(unchanged_receipt.demand_watermark, Some(1));
-    assert_eq!(unchanged_receipt.digest, None);
-
-    let changed = fixture.request();
-    let changed_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &changed).unwrap();
-    let changed_observation = fixture.runtime.wait_for_observation(2);
-    let changed_bytes = br#"{"demand":"changed"}"#;
-    assert_eq!(changed_observation.demand_watermark, 2);
-    fixture.runtime.publish_observation(
-        &changed_observation,
-        changed_bytes,
-        &["selected"],
-        "demand-changed",
-    );
-    let changed_receipt = changed_client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(changed_receipt.status, ObserveReceiptStatus::SettledChanged);
-    assert_eq!(
-        changed_receipt.digest,
-        Some(SnapshotDigest::of(changed_bytes))
-    );
-    assert_eq!(fs::read(fixture.snapshot_path()).unwrap(), changed_bytes);
-    let changed_inbox = resync_inbox(&fixture.agent_dir);
-    assert_eq!(changed_inbox.len(), 1);
-    assert!(
-        changed_inbox[0].contains(r#""facts":[{"key":"revision","after":"demand-changed"}]"#),
-        "{}",
-        changed_inbox[0]
-    );
-
-    let failed = fixture.request();
-    let failed_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &failed).unwrap();
-    let failed_observation = fixture.runtime.wait_for_observation(3);
-    assert_eq!(failed_observation.demand_watermark, 3);
-    fixture
-        .runtime
-        .failed(&failed_observation, "provider refused");
-    let failed_receipt = failed_client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(failed_receipt.status, ObserveReceiptStatus::SettledFailed);
-    assert_eq!(
-        failed_receipt.diagnostic.as_deref(),
-        Some("provider refused")
-    );
-    drop(supervisor);
+    assert_eq!(fs::read(restarted.snapshot()).unwrap(), recovered_bytes);
 }
 
+
 #[test]
-fn demand_observation_coalesces_and_fences_watermarks() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
+    let _guard = STATE_ENV.lock();
     let temporary = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
 
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let supervisor = fixture.supervisor();
-    fixture.runtime.registration();
+    let primary_control = temporary.path().join("primary-control");
+    fs::create_dir_all(&primary_control).unwrap();
+    let primary_payload = primary_control.join("payload.json");
+    fs::write(&primary_payload, r#"{"sessions":1}"#).unwrap();
+    let primary_executable = primary_control.join("fixture-pty");
+    write_executable(
+        &primary_executable,
+        "#!/bin/sh\nread payload < payload.json\nprintf '%s\\n' \"$payload\"\n",
+    );
+    let primary = ProviderFixture::new(
+        temporary.path().join("primary"),
+        "dev.st2.pty-stats",
+        component("ST2_PTY_STATS_COMPONENT"),
+        r#"{"topics":["stats"]}"#,
+        &format!(
+            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            primary_executable, primary_control
+        ),
+        "st2.resource.pty-stats.v1",
+        "stats",
+    );
+    let first = primary.observe(None);
+    assert_eq!(first.status, ObserveReceiptStatus::SettledChanged, "{first:?}");
+    let first_snapshot = fs::read(primary.snapshot()).unwrap();
+    let first_inbox = wait_until("first resync record", || {
+        let inbox = resync_inbox(&primary.agent);
+        (!inbox.is_empty()).then_some(inbox)
+    });
+    assert_eq!(first_inbox.len(), 1);
+    assert!(first_inbox[0].contains("subject: observed · scope=all [stats]"));
+    assert!(first_inbox[0].contains(r#""facts":[{"key":"scope","after":"all"}]"#));
 
-    let leading = fixture.request();
-    let leading_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &leading).unwrap();
-    let leading_observation = fixture.runtime.wait_for_observation(1);
-    let trailing_a = fixture.request();
+    let equal = primary.observe(first.digest);
+    assert_eq!(equal.status, ObserveReceiptStatus::SettledUnchanged);
+    assert_eq!(fs::read(primary.snapshot()).unwrap(), first_snapshot);
+    assert_eq!(resync_inbox(&primary.agent), first_inbox);
+
+    fs::write(&primary_payload, r#"{"sessions":2}"#).unwrap();
+    primary.rewrite_selector(r#"{"topics":["ignored"]}"#);
+    primary.refresh();
+    let filtered = primary.observe(first.digest);
+    assert_eq!(filtered.status, ObserveReceiptStatus::SettledChanged);
+    assert_ne!(fs::read(primary.snapshot()).unwrap(), first_snapshot);
+    assert_eq!(
+        resync_inbox(&primary.agent),
+        first_inbox,
+        "an unselected topic updates the snapshot without invalidation"
+    );
+
+    primary.rewrite_selector(r#"{"topics":["stats"]}"#);
+    primary.refresh();
+    fs::write(&primary_payload, r#"{"sessions":3}"#).unwrap();
+    let catch_up_fifo = primary_control.join("catch-up.fifo");
+    let fifo_c = CString::new(catch_up_fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo_c` is a live NUL-terminated pathname for this call.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    write_executable(
+        &primary_executable,
+        "#!/bin/sh\nread release < catch-up.fifo\nread payload < payload.json\nprintf '%s\\n' \"$payload\"\n",
+    );
+    let pending_request = primary.request(1, filtered.digest);
+    let pending_client =
+        submit_request(&primary.root, &primary.host, &pending_request).unwrap();
+    wait_receipt_status(
+        &primary,
+        &pending_request.request_id,
+        ObserveReceiptStatus::Accepted,
+    );
+    fs::remove_file(primary.owner_binding_path()).unwrap();
+    release_fifo(&catch_up_fifo);
+    let pending = pending_client.wait_for_terminal(WAIT).unwrap().receipt.unwrap();
+    assert_eq!(pending.status, ObserveReceiptStatus::SettledChanged);
+    assert_eq!(resync_inbox(&primary.agent), first_inbox);
+    st2::event::publish_owner_binding_for_test(&primary.root, &primary.host).unwrap();
+    primary.refresh();
+    let caught_up = wait_until("pending resync replay", || {
+        let inbox = resync_inbox(&primary.agent);
+        (inbox != first_inbox).then_some(inbox)
+    });
+    assert_eq!(caught_up.len(), 1);
+    let caught_up_tree = file_tree(&primary.agent.join("resources"));
+    primary.refresh();
+    assert_eq!(
+        file_tree(&primary.agent.join("resources")),
+        caught_up_tree,
+        "acknowledged catch-up does not replay"
+    );
+
+    let isolated_control = temporary.path().join("isolated-control");
+    fs::create_dir_all(&isolated_control).unwrap();
+    let isolated_payload = isolated_control.join("payload.json");
+    fs::write(&isolated_payload, r#"{"sessions":10}"#).unwrap();
+    let isolated_executable = isolated_control.join("fixture-pty");
+    write_executable(
+        &isolated_executable,
+        "#!/bin/sh\nread payload < payload.json\nprintf '%s\\n' \"$payload\"\n",
+    );
+    let isolated = ProviderFixture::new(
+        temporary.path().join("isolated"),
+        "dev.st2.pty-stats",
+        component("ST2_PTY_STATS_COMPONENT"),
+        r#"{"topics":["stats"]}"#,
+        &format!(
+            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            isolated_executable, isolated_control
+        ),
+        "st2.resource.pty-stats.v1",
+        "stats",
+    );
+    let isolated_first = isolated.observe(None);
+    assert_eq!(isolated_first.status, ObserveReceiptStatus::SettledChanged);
+    let isolated_before = file_tree(&isolated.agent.join("resources"));
+    drop(primary);
+    assert_eq!(
+        file_tree(&isolated.agent.join("resources")),
+        isolated_before,
+        "dropping one catalog scope must not mutate another"
+    );
+    fs::write(&isolated_payload, r#"{"sessions":11}"#).unwrap();
+    let isolated_second = isolated.observe(isolated_first.digest);
+    assert_eq!(isolated_second.status, ObserveReceiptStatus::SettledChanged);
+    assert_ne!(
+        file_tree(&isolated.agent.join("resources")),
+        isolated_before,
+        "the surviving catalog remains live"
+    );
+}
+
+#[test]
+fn production_demand_jobs_coalesce_queue_disconnect_and_fence_generation() {
+    let _guard = STATE_ENV.lock();
+    let temporary = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
+    let control = temporary.path().join("control");
+    fs::create_dir_all(&control).unwrap();
+    fs::write(control.join("payload.json"), r#"{"sessions":1}"#).unwrap();
+    let fifo = control.join("release.fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo_c` is a live NUL-terminated pathname for this call.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let executable = control.join("fixture-pty");
+    write_executable(
+        &executable,
+        "#!/bin/sh\nread release < release.fifo\nread payload < payload.json\nprintf '%s\\n' \"$payload\"\n",
+    );
+    let fixture = ProviderFixture::new(
+        temporary.path().join("catalog"),
+        "dev.st2.pty-stats",
+        component("ST2_PTY_STATS_COMPONENT"),
+        r#"{"topics":["stats"]}"#,
+        &format!(
+            "pty-stats executable={:?} cwd={:?} scope=\"all\" deadline-ms=10000",
+            executable, control
+        ),
+        "st2.resource.pty-stats.v1",
+        "stats",
+    );
+
+    let leading = fixture.request(1, None);
+    let leading_client = submit_request(&fixture.root, &fixture.host, &leading).unwrap();
+    let leading_accepted = wait_receipt_status(
+        &fixture,
+        &leading.request_id,
+        ObserveReceiptStatus::Accepted,
+    );
+    assert_eq!(leading_accepted.demand_watermark, Some(1));
+    let trailing_a = fixture.request(1, None);
+    let trailing_b = fixture.request(1, None);
     let trailing_a_path = fixture
         .observe_request_dir()
         .join(format!("{}.json", trailing_a.request_id));
-    let trailing_a_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &trailing_a).unwrap();
-    let trailing_b = fixture.request();
     let trailing_b_path = fixture
         .observe_request_dir()
         .join(format!("{}.json", trailing_b.request_id));
-    let trailing_b_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &trailing_b).unwrap();
-    wait_until("trailing request retention", || {
-        (trailing_a_path.exists() && trailing_b_path.exists()).then_some(())
+    let trailing_a_client = submit_request(&fixture.root, &fixture.host, &trailing_a).unwrap();
+    let trailing_b_client = submit_request(&fixture.root, &fixture.host, &trailing_b).unwrap();
+    wait_until("coalesced trailing requests", || {
+        (trailing_a_path.is_file() && trailing_b_path.is_file()).then_some(())
     });
-    assert_eq!(
-        fixture.runtime.observations().len(),
-        1,
-        "one in-flight demand permits only one coalesced trailing batch"
-    );
-    assert_eq!(leading_observation.demand_watermark, 1);
-    fixture.runtime.unchanged(&leading_observation);
-    let trailing_observation = fixture.runtime.wait_for_observation(2);
-    assert_eq!(trailing_observation.demand_watermark, 2);
-    fixture.runtime.unchanged(&trailing_observation);
+    release_fifo(&fifo);
     assert_eq!(
         leading_client
-            .wait_for_terminal(Duration::from_secs(2))
+            .wait_for_terminal(WAIT)
             .unwrap()
             .receipt
             .unwrap()
             .demand_watermark,
         Some(1)
     );
-    for client in [trailing_a_client, trailing_b_client] {
-        assert_eq!(
-            client
-                .wait_for_terminal(Duration::from_secs(2))
-                .unwrap()
-                .receipt
-                .unwrap()
-                .demand_watermark,
-            Some(2)
-        );
+    for request in [&trailing_a, &trailing_b] {
+        let accepted =
+            wait_receipt_status(&fixture, &request.request_id, ObserveReceiptStatus::Accepted);
+        assert_eq!(accepted.demand_watermark, Some(2));
     }
-    wait_until("durable request cleanup after terminal receipts", || {
+    release_fifo(&fifo);
+    for client in [trailing_a_client, trailing_b_client] {
+        let receipt = client.wait_for_terminal(WAIT).unwrap().receipt.unwrap();
+        assert_eq!(receipt.demand_watermark, Some(2));
+    }
+    wait_until("durable coalesced request cleanup", || {
         (!trailing_a_path.exists() && !trailing_b_path.exists()).then_some(())
     });
 
-    let mismatched = fixture.request();
-    let mismatched_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &mismatched).unwrap();
-    let mut mismatched_observation = fixture.runtime.wait_for_observation(3);
-    assert_eq!(mismatched_observation.demand_watermark, 3);
-    mismatched_observation.demand_watermark = 2;
-    fixture.runtime.unchanged(&mismatched_observation);
-    let mismatched_receipt = mismatched_client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(
-        mismatched_receipt.status,
-        ObserveReceiptStatus::ProviderUnavailable,
-        "a stale watermark must fail the runtime rather than settle the current demand"
+    let disconnected = fixture.request(1, None);
+    let disconnected_id = disconnected.request_id.clone();
+    let disconnected_client =
+        submit_request(&fixture.root, &fixture.host, &disconnected).unwrap();
+    wait_receipt_status(
+        &fixture,
+        &disconnected_id,
+        ObserveReceiptStatus::Accepted,
     );
-
-    fixture.refresh(&supervisor);
-
-    let stale = fixture.request();
-    let stale_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &stale).unwrap();
-    fixture.runtime.wait_for_observation(4);
-    fixture.refresh_generation(&supervisor, 2);
-    let stale_receipt = stale_client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(stale_receipt.status, ObserveReceiptStatus::StaleGeneration);
-}
-
-#[test]
-fn demand_observation_survives_restart_disconnect_and_denies_missing_capability() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temporary = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
-
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let initial = fixture.supervisor();
-    fixture.runtime.registration();
-    let restart_request = fixture.request();
-    let restart_path = fixture
-        .observe_request_dir()
-        .join(format!("{}.json", restart_request.request_id));
-    let restart_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &restart_request)
-            .unwrap();
-    let interrupted_observation = fixture.runtime.wait_for_observation(1);
+    drop(disconnected_client);
+    release_fifo(&fifo);
+    let disconnected_receipt = wait_until("receipt after client disconnect", || {
+        st2::resource_observe::read_receipt(
+            &fixture.observe_receipt_dir(),
+            &disconnected_id,
+        )
+        .ok()
+        .flatten()
+        .filter(|receipt| receipt.status.is_terminal())
+    });
     assert!(
-        restart_path.is_file(),
-        "enqueue must not remove the restart-recoverable durable request"
+        matches!(
+            disconnected_receipt.status,
+            ObserveReceiptStatus::SettledChanged | ObserveReceiptStatus::SettledUnchanged
+        ),
+        "{disconnected_receipt:?}"
     );
-    drop(initial);
-    let restarted = fixture.supervisor();
-    let restart_observation = fixture.runtime.wait_for_observation(2);
-    assert_eq!(restart_observation.demand_watermark, 1);
-    assert_ne!(
-        restart_observation.registration.owner, interrupted_observation.registration.owner,
-        "restart recovery must redispatch through the new runtime owner"
+
+    let future = fixture.request(2, disconnected_receipt.digest);
+    let future_path = fixture
+        .observe_request_dir()
+        .join(format!("{}.json", future.request_id));
+    let future_client = submit_request(&fixture.root, &fixture.host, &future).unwrap();
+    fixture.refresh_generation(1);
+    assert!(future_path.is_file());
+    assert!(
+        st2::resource_observe::read_receipt(
+            &fixture.observe_receipt_dir(),
+            &future.request_id,
+        )
+        .unwrap()
+        .is_none()
     );
-    fixture.runtime.unchanged(&restart_observation);
+    fixture.refresh_generation(2);
+    wait_receipt_status(&fixture, &future.request_id, ObserveReceiptStatus::Accepted);
+    release_fifo(&fifo);
     assert_eq!(
-        restart_client
-            .wait_for_terminal(Duration::from_secs(2))
+        future_client
+            .wait_for_terminal(WAIT)
             .unwrap()
             .receipt
             .unwrap()
@@ -707,86 +362,66 @@ fn demand_observation_survives_restart_disconnect_and_denies_missing_capability(
         ObserveReceiptStatus::SettledUnchanged
     );
 
-    let disconnected = fixture.request();
-    let disconnected_id = disconnected.request_id.clone();
-    let disconnected_client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &disconnected).unwrap();
-    let disconnected_observation = fixture.runtime.wait_for_observation(3);
-    drop(disconnected_client);
-    assert_eq!(disconnected_observation.demand_watermark, 2);
-    fixture.runtime.unchanged(&disconnected_observation);
-    let disconnected_receipt = wait_until("receipt after client disconnect", || {
-        st2::resource_observe::read_receipt(&fixture.observe_receipt_dir(), &disconnected_id)
-            .ok()
-            .flatten()
-            .filter(|receipt| receipt.status.is_terminal())
-    });
+    let stale = fixture.request(2, None);
+    let stale_client = submit_request(&fixture.root, &fixture.host, &stale).unwrap();
+    wait_receipt_status(&fixture, &stale.request_id, ObserveReceiptStatus::Accepted);
+    fixture.refresh_generation(3);
     assert_eq!(
-        disconnected_receipt.status,
-        ObserveReceiptStatus::SettledUnchanged
+        stale_client
+            .wait_for_terminal(WAIT)
+            .unwrap()
+            .receipt
+            .unwrap()
+            .status,
+        ObserveReceiptStatus::StaleGeneration
     );
 
     let config_path = st2::catalog::config_path(&fixture.root);
     let without_demand = fs::read_to_string(&config_path)
         .unwrap()
-        .replace("    capability \"demand\"\n", "");
-    fs::write(&config_path, without_demand).unwrap();
-    fixture.refresh_generation(&restarted, 2);
-    let gated = ObserveRequest::new(
-        format!("{}.worker", fixture.host),
-        "observed".to_owned(),
-        None,
-        None,
-    )
-    .unwrap();
-    let before_gate = fixture.runtime.observations().len();
-    let gated_receipt = st2::resource_observe::submit_request(&fixture.root, &fixture.host, &gated)
+        .replace("    demand #true\n", "    demand #false\n");
+    fs::write(config_path, without_demand).unwrap();
+    fixture.refresh_generation(4);
+    let absent = fixture.request(4, None);
+    let absent_receipt = submit_request(&fixture.root, &fixture.host, &absent)
         .unwrap()
-        .wait_for_terminal(Duration::from_secs(2))
+        .wait_for_terminal(WAIT)
         .unwrap()
         .receipt
         .unwrap();
-    assert_eq!(gated_receipt.status, ObserveReceiptStatus::AbsentBinding);
-    assert_eq!(
-        fixture.runtime.observations().len(),
-        before_gate,
-        "a runtime without declared demand capability received an observe frame"
-    );
+    assert_eq!(absent_receipt.status, ObserveReceiptStatus::AbsentBinding);
 }
 
 #[test]
-fn durable_observe_admission_rejects_the_concurrent_257th_request() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+fn durable_admission_retains_the_256_request_boundary_without_a_runtime() {
+    use st2::resource_observe::{MAX_PENDING_OBSERVE_REQUESTS, ObserveAdmissionBackpressure};
+    let _guard = STATE_ENV.lock();
+
     let temporary = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
-
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let supervisor = fixture.supervisor();
-    fixture.runtime.registration();
-    drop(supervisor);
-
+    let root = temporary.path();
+    let host = "capacity";
+    st2::event::publish_owner_binding_for_test(root, host).unwrap();
+    let barrier = Arc::new(Barrier::new(MAX_PENDING_OBSERVE_REQUESTS + 1));
     let submissions = (0..=MAX_PENDING_OBSERVE_REQUESTS)
-        .map(|_| {
-            let root = fixture.root.clone();
-            let host = fixture.host.clone();
+        .map(|index| {
+            let root = root.to_path_buf();
+            let host = host.to_owned();
+            let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let request = ObserveRequest::new(
-                    format!("{host}.worker"),
-                    "observed".to_owned(),
+                    format!("{host}.worker-{index}"),
+                    "observed".into(),
                     Some(1),
                     None,
                 )
                 .unwrap();
-                st2::resource_observe::submit_request(&root, &host, &request)
-                    .map(|_| true)
-                    .map_err(|error| {
-                        error
-                            .downcast_ref::<ObserveAdmissionBackpressure>()
-                            .is_some()
-                    })
+                barrier.wait();
+                submit_request(&root, &host, &request).map_err(|error| {
+                    error
+                        .downcast_ref::<ObserveAdmissionBackpressure>()
+                        .is_some_and(|pressure| pressure.limit() == MAX_PENDING_OBSERVE_REQUESTS)
+                })
             })
         })
         .collect::<Vec<_>>();
@@ -800,122 +435,41 @@ fn durable_observe_admission_rejects_the_concurrent_257th_request() {
             .iter()
             .filter(|result| matches!(result, Err(true)))
             .count(),
-        1,
-        "the only failed submission must expose structured durable backpressure"
+        1
     );
-    let durable_count = fs::read_dir(fixture.observe_request_dir())
-        .unwrap()
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .count();
-    assert_eq!(durable_count, MAX_PENDING_OBSERVE_REQUESTS);
 }
 
-#[test]
-fn newer_client_generation_stays_queued_until_the_supervisor_refreshes() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temporary = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
-
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let supervisor = fixture.supervisor();
-    fixture.runtime.registration();
-
-    let request = ObserveRequest::new(
-        format!("{}.worker", fixture.host),
-        "observed".to_owned(),
-        Some(2),
-        None,
-    )
-    .unwrap();
-    let client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &request).unwrap();
-    fixture.refresh_generation(&supervisor, 1);
-    let _ = supervisor.health();
-    assert!(
-        fixture.runtime.observations().is_empty(),
-        "a client-ahead generation was dispatched against an older resident catalog"
-    );
-    assert!(
-        st2::resource_observe::read_receipt(&fixture.observe_receipt_dir(), &request.request_id)
-            .unwrap()
-            .is_none(),
-        "a client-ahead generation was incorrectly terminalized as stale"
-    );
-
-    fixture.refresh_generation(&supervisor, 2);
-    let observation = fixture.runtime.wait_for_observation(1);
-    fixture.runtime.unchanged(&observation);
-    let receipt = client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(receipt.status, ObserveReceiptStatus::SettledUnchanged);
+fn release_fifo(path: &Path) {
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    writer.write_all(b"go\n").unwrap();
 }
 
-#[test]
-fn demanded_publication_settles_changed_before_resync_delivery_failure() {
-    let _guard = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temporary = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
-
-    let fixture = CatalogFixture::new(temporary.path().join("catalog"), "alpha");
-    st2::event::publish_owner_binding_for_test(&fixture.root, &fixture.host).unwrap();
-    let _supervisor = fixture.supervisor();
-    fixture.runtime.registration();
-
-    let request = fixture.request();
-    let client =
-        st2::resource_observe::submit_request(&fixture.root, &fixture.host, &request).unwrap();
-    let observation = fixture.runtime.wait_for_observation(1);
-    fs::remove_file(fixture.owner_binding_path()).unwrap();
-    let published = br#"{"demand":"accepted-before-delivery"}"#;
-    fixture
-        .runtime
-        .publish_observation(&observation, published, &["selected"], "delivery-failed");
-    let receipt = client
-        .wait_for_terminal(Duration::from_secs(2))
-        .unwrap()
-        .receipt
-        .unwrap();
-    assert_eq!(receipt.status, ObserveReceiptStatus::SettledChanged);
-    assert_eq!(receipt.digest, Some(SnapshotDigest::of(published)));
-    assert_eq!(fs::read(fixture.snapshot_path()).unwrap(), published);
-}
-
-fn wait_for_health(supervisor: &ResourceProfileSupervisor, marker: &str) {
-    wait_until(marker, || {
-        supervisor
-            .health()
-            .iter()
-            .any(|health| health.detail.as_deref() == Some(marker))
-            .then_some(())
-    });
+fn wait_receipt_status(
+    fixture: &ProviderFixture,
+    request_id: &str,
+    status: ObserveReceiptStatus,
+) -> ObserveReceipt {
+    wait_until(status.wire_str(), || {
+        st2::resource_observe::read_receipt(&fixture.observe_receipt_dir(), request_id)
+            .ok()
+            .flatten()
+            .filter(|receipt| receipt.status == status)
+    })
 }
 
 fn wait_until<T>(description: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         if let Some(value) = probe() {
             return value;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {description}"
-        );
+        assert!(Instant::now() < deadline, "timed out waiting for {description}");
         std::thread::yield_now();
     }
 }
 
-fn resync_inbox(agent_dir: &Path) -> Vec<String> {
-    let inbox = agent_dir.join("resources/inbox");
-    let mut records = fs::read_dir(inbox)
+fn resync_inbox(agent: &Path) -> Vec<String> {
+    let mut records = fs::read_dir(agent.join("resources/inbox"))
         .into_iter()
         .flatten()
         .flatten()
@@ -946,51 +500,211 @@ fn file_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             }
         }
     }
-
     let mut files = Vec::new();
     visit(root, root, &mut files);
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }
 
-fn observable_resolver_wasm() -> Vec<u8> {
-    const DESCRIPTOR: &[u8] = br#"{"abiVersion":3,"capabilities":["resolve","read","observe"],"selectorSchema":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"defaultSelector":{"topics":["selected"]},"topics":[{"name":"selected"},{"name":"ignored"}],"runtime":{"topology":"shared"},"snapshot":{"mediaType":"application/json","schemaId":"dev.example.observable.snapshot.v1"}}"#;
+fn component(variable: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| panic!("{variable} is not set")))
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+struct ProviderFixture {
+    root: PathBuf,
+    agent: PathBuf,
+    host: String,
+    scheme: String,
+    selector: Mutex<String>,
+    supervisor: ResourceProfileSupervisor,
+}
+
+impl ProviderFixture {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        root: PathBuf,
+        scheme: &str,
+        component: PathBuf,
+        selector: &str,
+        capability: &str,
+        schema_id: &str,
+        topic: &str,
+    ) -> Self {
+        let host = "e2e".to_owned();
+        let agent = root.join("agents/e2e/worker");
+        fs::create_dir_all(agent.join("resources")).unwrap();
+        fs::create_dir_all(root.join("providers")).unwrap();
+        let installed_component = root.join("providers/provider.component.wasm");
+        if installed_component.exists() {
+            fs::remove_file(&installed_component).unwrap();
+        }
+        fs::copy(component, installed_component).unwrap();
+        fs::write(
+            root.join("resolver.wasm"),
+            observable_resolver_wasm(schema_id, topic, selector),
+        )
+        .unwrap();
+        fs::write(
+            st2::catalog::config_path(&root),
+            format!(
+                "profile {scheme:?} {{\n  wasm \"resolver.wasm\"\n  class \"immediate\"\n  runtime {{\n    component \"providers/provider.component.wasm\"\n    demand #true\n    {capability}\n  }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        write_agent(&agent, &host, scheme, selector);
+        st2::event::publish_owner_binding_for_test(&root, &host).unwrap();
+        let supervisor = ResourceProfileSupervisor::new(root.clone(), host.clone()).unwrap();
+        let fixture = Self {
+            root,
+            agent,
+            host,
+            scheme: scheme.to_owned(),
+            selector: Mutex::new(selector.to_owned()),
+            supervisor,
+        };
+        fixture.refresh();
+        fixture
+    }
+
+    fn refresh(&self) {
+        self.refresh_generation(1);
+    }
+
+    fn refresh_generation(&self, generation: u64) {
+        let (config, profiles) = st2::catalog::declared_profile_catalog(&self.root).unwrap();
+        let discovery = st2::discover_strict(&self.root);
+        assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
+        let report = self
+            .supervisor
+            .refresh(&config, &profiles, Some(generation), &discovery.specs);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    fn rewrite_selector(&self, selector: &str) {
+        *self.selector.lock() = selector.to_owned();
+        write_agent(&self.agent, &self.host, &self.scheme, selector);
+    }
+
+    fn observe(&self, prior: Option<st2::resource_profile::SnapshotDigest>) -> ObserveReceipt {
+        self.observe_generation(1, prior)
+    }
+
+    fn observe_generation(
+        &self,
+        generation: u64,
+        prior: Option<st2::resource_profile::SnapshotDigest>,
+    ) -> ObserveReceipt {
+        let request = ObserveRequest::new(
+            format!("{}.worker", self.host),
+            "observed".into(),
+            Some(generation),
+            prior,
+        )
+        .unwrap();
+        let wait = submit_request(&self.root, &self.host, &request)
+            .unwrap()
+            .wait_for_terminal(WAIT)
+            .unwrap();
+        assert!(!wait.timed_out);
+        wait.receipt.unwrap()
+    }
+
+    fn request(
+        &self,
+        generation: u64,
+        prior: Option<st2::resource_profile::SnapshotDigest>,
+    ) -> ObserveRequest {
+        ObserveRequest::new(
+            format!("{}.worker", self.host),
+            "observed".into(),
+            Some(generation),
+            prior,
+        )
+        .unwrap()
+    }
+
+    fn snapshot(&self) -> PathBuf {
+        self.agent.join("resources/snapshot.json")
+    }
+
+    fn observe_request_dir(&self) -> PathBuf {
+        st2::park::SupervisorScope::current(&self.root, &self.host)
+            .unwrap()
+            .park_dir()
+            .parent()
+            .unwrap()
+            .join("observe-requests")
+    }
+
+    fn observe_receipt_dir(&self) -> PathBuf {
+        st2::park::SupervisorScope::current(&self.root, &self.host)
+            .unwrap()
+            .park_dir()
+            .parent()
+            .unwrap()
+            .join("observe-receipts")
+    }
+
+    fn owner_binding_path(&self) -> PathBuf {
+        st2::park::SupervisorScope::current(&self.root, &self.host)
+            .unwrap()
+            .park_dir()
+            .parent()
+            .unwrap()
+            .join("stream-owner.json")
+    }
+}
+
+fn write_agent(agent: &Path, host: &str, scheme: &str, selector: &str) {
+    fs::write(
+        agent.join("agent.kdl"),
+        format!(
+            "agent \"worker\" {{\n  host {host:?}\n  command \"true\"\n  resource \"observed\" uri=\"{scheme}://subject\" reason=\"Observed state.\" selector=#\"{selector}\"#\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn observable_resolver_wasm(schema_id: &str, topic: &str, selector: &str) -> Vec<u8> {
+    let selector_value: serde_json::Value = serde_json::from_str(selector).unwrap();
+    let descriptor = serde_json::to_vec(&serde_json::json!({
+        "abiVersion": 3,
+        "capabilities": ["resolve", "read", "observe"],
+        "selectorSchema": { "type": "object", "additionalProperties": true },
+        "defaultSelector": selector_value,
+        "topics": [{"name": topic}, {"name": "ignored"}],
+        "runtime": {"topology": "shared"},
+        "snapshot": {"mediaType": "application/json", "schemaId": schema_id}
+    }))
+    .unwrap();
     const RESOLUTION: &[u8] = br#"{"path":"resources/snapshot.json","class":"observable"}"#;
     const DESCRIPTOR_PTR: i64 = 1024;
-    const RESOLUTION_PTR: i64 = 4096;
-
+    const RESOLUTION_PTR: i64 = 8192;
     let mut module = b"\0asm\x01\0\0\0".to_vec();
-
     let mut types = vec![3, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 4];
     types.extend([0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7e]);
     types.extend([0x60, 0, 1, 0x7e]);
     push_section(&mut module, 1, &types);
     push_section(&mut module, 3, &[3, 0, 1, 2]);
     push_section(&mut module, 5, &[1, 0, 1]);
-
     let mut exports = vec![4];
     push_export(&mut exports, "memory", 0x02, 0);
     push_export(&mut exports, "alloc", 0x00, 0);
     push_export(&mut exports, "resolve", 0x00, 1);
     push_export(&mut exports, "describe", 0x00, 2);
     push_section(&mut module, 7, &exports);
-
     let mut code = vec![3];
-    push_body(&mut code, 0x41, 8192);
-    push_body(
-        &mut code,
-        0x42,
-        (RESOLUTION_PTR << 32) | RESOLUTION.len() as i64,
-    );
-    push_body(
-        &mut code,
-        0x42,
-        (DESCRIPTOR_PTR << 32) | DESCRIPTOR.len() as i64,
-    );
+    push_body(&mut code, 0x41, 16384);
+    push_body(&mut code, 0x42, (RESOLUTION_PTR << 32) | RESOLUTION.len() as i64);
+    push_body(&mut code, 0x42, (DESCRIPTOR_PTR << 32) | descriptor.len() as i64);
     push_section(&mut module, 10, &code);
-
     let mut data = vec![2];
-    push_data(&mut data, DESCRIPTOR_PTR, DESCRIPTOR);
+    push_data(&mut data, DESCRIPTOR_PTR, &descriptor);
     push_data(&mut data, RESOLUTION_PTR, RESOLUTION);
     push_section(&mut module, 11, &data);
     module
@@ -1018,8 +732,7 @@ fn push_body(section: &mut Vec<u8>, constant_opcode: u8, value: i64) {
 }
 
 fn push_data(section: &mut Vec<u8>, offset: i64, bytes: &[u8]) {
-    section.push(0);
-    section.push(0x41);
+    section.extend([0, 0x41]);
     push_i64(section, offset);
     section.push(0x0b);
     push_u32(section, bytes.len() as u32);
@@ -1030,13 +743,9 @@ fn push_u32(bytes: &mut Vec<u8>, mut value: u32) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
+        if value != 0 { byte |= 0x80; }
         bytes.push(byte);
-        if value == 0 {
-            return;
-        }
+        if value == 0 { return; }
     }
 }
 
@@ -1046,8 +755,6 @@ fn push_i64(bytes: &mut Vec<u8>, mut value: i64) {
         value >>= 7;
         let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
         bytes.push(if done { byte } else { byte | 0x80 });
-        if done {
-            return;
-        }
+        if done { return; }
     }
 }

@@ -32,7 +32,7 @@ use kdl::KdlDocument;
 
 /// The catalog-level declaration, read from the catalog root.
 pub const CONFIG_FILE: &str = "catalog.kdl";
-/// One declared resource profile with a closed direct runtime and optional `demand` capability.
+/// One declared resource profile with a closed component runtime and optional demand observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredProfile {
     /// The URI scheme this profile resolves.
@@ -44,16 +44,39 @@ pub struct DeclaredProfile {
     /// Whether a binding through this profile also subscribes to its ancestors' same-scheme
     /// carriers; defaults to off.
     pub notify_chain: bool,
-    /// Trusted direct process invocation for an observable profile.
+    /// Immutable provider component and its one typed host capability.
     pub runtime: Option<DeclaredProfileRuntime>,
 }
 
-/// The closed host-runtime declaration. `argv[0]` is executed directly; no shell is involved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredProfileRuntime {
-    pub argv: Vec<String>,
+    pub component: String,
+    pub capability: DeclaredProviderCapability,
     /// Opt in to demand-driven observation through one atomic observation result.
     pub demand: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredProviderCapability {
+    GitHubIssue {
+        owner: String,
+        repo: String,
+        number: u64,
+        connect_timeout_ms: u64,
+        total_timeout_ms: u64,
+    },
+    PtyStats {
+        executable: String,
+        cwd: String,
+        scope: DeclaredPtyStatsScope,
+        deadline_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredPtyStatsScope {
+    All,
+    Session(String),
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -183,71 +206,82 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                 anyhow::bail!("profile '{scheme}': runtime takes no values or properties");
             }
             let runtime_children = child.children().ok_or_else(|| {
-                anyhow::anyhow!("profile '{scheme}': runtime needs exactly one argv child")
+                anyhow::anyhow!(
+                    "profile '{scheme}': runtime needs a component and one typed capability"
+                )
             })?;
-            let mut argv = None;
+            let mut component = None;
+            let mut capability = None;
             let mut demand = false;
+            let mut seen_demand = false;
             for runtime_child in runtime_children.nodes() {
                 match runtime_child.name().value() {
-                    "argv" => {
-                        if argv.is_some()
-                            || runtime_child.children().is_some()
-                            || runtime_child.entries().is_empty()
-                        {
-                            anyhow::bail!(
-                                "profile '{scheme}': runtime needs exactly one argv child with one or more arguments"
-                            );
-                        }
-                        argv = Some(
-                            runtime_child
-                                .entries()
-                                .iter()
-                                .map(|entry| {
-                                    (entry.name().is_none())
-                                        .then(|| entry.value().as_string())
-                                        .flatten()
-                                        .filter(|value| !value.is_empty())
-                                        .map(str::to_owned)
-                                })
-                                .collect::<Option<Vec<_>>>()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "profile '{scheme}': runtime argv accepts only non-empty quoted arguments"
-                                    )
-                                })?,
+                    "component" => {
+                        anyhow::ensure!(
+                            component.is_none()
+                                && runtime_child.children().is_none()
+                                && runtime_child.entries().len() == 1,
+                            "profile '{scheme}': runtime needs exactly one component path"
+                        );
+                        component = runtime_child
+                            .get(0)
+                            .and_then(|value| value.as_string())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                        anyhow::ensure!(
+                            component.is_some(),
+                            "profile '{scheme}': component path must be a non-empty quoted string"
                         );
                     }
-                    "capability" => {
-                        let entries = runtime_child.entries();
-                        let capability = (runtime_child.children().is_none()
-                            && entries.len() == 1
-                            && entries[0].name().is_none())
-                        .then(|| entries[0].value().as_string())
-                        .flatten()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "profile '{scheme}': runtime capability needs exactly one quoted value"
-                            )
-                        })?;
+                    "demand" => {
                         anyhow::ensure!(
-                            capability == "demand",
-                            "profile '{scheme}': unknown runtime capability '{capability}'"
+                            !seen_demand,
+                            "profile '{scheme}': demand is declared more than once"
                         );
                         anyhow::ensure!(
-                            !demand,
-                            "profile '{scheme}': runtime capability 'demand' is declared more than once"
+                            runtime_child.children().is_none()
+                                && runtime_child.entries().len() == 1,
+                            "profile '{scheme}': demand takes one boolean value"
                         );
-                        demand = true;
+                        demand = runtime_child
+                            .get(0)
+                            .and_then(|value| value.as_bool())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "profile '{scheme}': demand takes one boolean value"
+                                )
+                            })?;
+                        seen_demand = true;
+                    }
+                    "github-issue" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_github_issue_capability(scheme, runtime_child)?);
+                    }
+                    "pty-stats" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_pty_stats_capability(scheme, runtime_child)?);
                     }
                     other => anyhow::bail!(
-                        "profile '{scheme}': runtime field '{other}' is unknown (expected argv or capability)"
+                        "profile '{scheme}': runtime field '{other}' is unknown \
+                         (expected component, demand, github-issue, or pty-stats)"
                     ),
                 }
             }
-            let argv = argv.ok_or_else(|| {
-                anyhow::anyhow!("profile '{scheme}': runtime needs exactly one argv child")
-            })?;
-            runtime = Some(DeclaredProfileRuntime { argv, demand });
+            runtime = Some(DeclaredProfileRuntime {
+                component: component.ok_or_else(|| {
+                    anyhow::anyhow!("profile '{scheme}': runtime needs exactly one component path")
+                })?,
+                capability: capability.ok_or_else(|| {
+                    anyhow::anyhow!("profile '{scheme}': runtime needs exactly one typed capability")
+                })?,
+                demand,
+            });
             continue;
         }
         if child.children().is_some() {
@@ -321,6 +355,102 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
     })
 }
 
+fn parse_github_issue_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-issue requires owner, repo, number, \
+         connect-timeout-ms, and total-timeout-ms properties"
+    );
+    let owner = required_string_property(scheme, node, "owner")?;
+    let repo = required_string_property(scheme, node, "repo")?;
+    let number = required_u64_property(scheme, node, "number")?;
+    let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
+    let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
+    anyhow::ensure!(number > 0, "profile '{scheme}': GitHub issue number must be positive");
+    anyhow::ensure!(
+        connect_timeout_ms > 0
+            && connect_timeout_ms <= total_timeout_ms
+            && total_timeout_ms <= 60_000,
+        "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
+    );
+    Ok(DeclaredProviderCapability::GitHubIssue {
+        owner,
+        repo,
+        number,
+        connect_timeout_ms,
+        total_timeout_ms,
+    })
+}
+
+fn parse_pty_stats_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 4 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': pty-stats requires executable, cwd, scope, and deadline-ms properties"
+    );
+    let executable = required_string_property(scheme, node, "executable")?;
+    let cwd = required_string_property(scheme, node, "cwd")?;
+    let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
+    anyhow::ensure!(
+        deadline_ms > 0 && deadline_ms <= 60_000,
+        "profile '{scheme}': PTY deadline must be between 1ms and 60000ms"
+    );
+    let scope = required_string_property(scheme, node, "scope")?;
+    let scope = if scope == "all" {
+        DeclaredPtyStatsScope::All
+    } else if let Some(session) = scope.strip_prefix("session:").filter(|value| !value.is_empty()) {
+        DeclaredPtyStatsScope::Session(session.to_owned())
+    } else {
+        anyhow::bail!(
+            "profile '{scheme}': PTY scope must be 'all' or 'session:<id>'"
+        );
+    };
+    Ok(DeclaredProviderCapability::PtyStats {
+        executable,
+        cwd,
+        scope,
+        deadline_ms,
+    })
+}
+
+fn required_string_property(
+    scheme: &str,
+    node: &kdl::KdlNode,
+    name: &str,
+) -> anyhow::Result<String> {
+    node.get(name)
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile '{scheme}': '{}' property '{name}' must be a non-empty string",
+                node.name().value()
+            )
+        })
+}
+
+fn required_u64_property(
+    scheme: &str,
+    node: &kdl::KdlNode,
+    name: &str,
+) -> anyhow::Result<u64> {
+    node.get(name)
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile '{scheme}': '{}' property '{name}' must be a non-negative integer",
+                node.name().value()
+            )
+        })
+}
+
 /// Read `<catalog>/catalog.kdl`. A missing file is the default declaration, not an error.
 pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
     match std::fs::read_to_string(config_path(catalog_root)) {
@@ -358,6 +488,22 @@ pub(crate) fn resolve_profile_module(
     Ok(ResolvedProfileModule::CatalogRelative(
         relative.to_path_buf(),
     ))
+}
+
+/// Resolve a provider component as a catalog-owned transactional artifact.
+///
+/// Unlike legacy resolver modules, provider components may not be external: the component bytes
+/// and `catalog.kdl` capability declaration must cross apply/generation boundaries together.
+pub(crate) fn resolve_provider_component(
+    catalog_root: &Path,
+    declared: &str,
+) -> anyhow::Result<PathBuf> {
+    match resolve_profile_module(catalog_root, declared)? {
+        ResolvedProfileModule::CatalogRelative(relative) => Ok(relative),
+        ResolvedProfileModule::External(_) => {
+            anyhow::bail!("provider component must be catalog-relative: {declared}")
+        }
+    }
 }
 
 pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> anyhow::Result<()> {
@@ -562,6 +708,18 @@ fn validate_runtime_contracts(
     }
     #[cfg(feature = "wasm-resolver")]
     {
+        #[cfg(not(feature = "wasip2-provider-runtime"))]
+        if let Some(profile) = config
+            .profiles
+            .iter()
+            .find(|profile| profile.runtime.is_some())
+        {
+            anyhow::bail!(
+                "profile '{}': component provider runtime unavailable because st2 was built \
+                 without the `wasip2-provider-runtime` feature",
+                profile.scheme
+            );
+        }
         let refresh = registry.begin_refresh();
         for profile in &config.profiles {
             let descriptor = match refresh.try_descriptor(&profile.scheme) {
@@ -718,14 +876,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_grammar_is_closed_and_argv_is_direct() {
+    fn runtime_grammar_has_one_immutable_component_and_one_typed_capability() {
         let config = parse(
             r#"
             profile "dev.example.observe" {
               wasm "observe.wasm"
               runtime {
-                argv "github-resource-runtime" "pr"
-                capability "demand"
+                component "components/github-issue.wasm"
+                demand #true
+                github-issue owner="rust-lang" repo="rust" number=1 connect-timeout-ms=3000 total-timeout-ms=10000
               }
             }
             "#,
@@ -734,27 +893,31 @@ mod tests {
         assert_eq!(
             config.profiles[0].runtime,
             Some(DeclaredProfileRuntime {
-                argv: vec!["github-resource-runtime".into(), "pr".into()],
+                component: "components/github-issue.wasm".into(),
+                capability: DeclaredProviderCapability::GitHubIssue {
+                    owner: "rust-lang".into(),
+                    repo: "rust".into(),
+                    number: 1,
+                    connect_timeout_ms: 3000,
+                    total_timeout_ms: 10000,
+                },
                 demand: true,
             })
         );
         for malformed in [
             r#"profile "dev.x" { wasm "x.wasm"; runtime }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime "shell" { argv "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime "shell" { component "x.wasm" } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; argv "y" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { command "x" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; capability "unknown" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; capability "demand"; capability "demand" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" }; runtime { argv "y" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x.wasm" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component ""; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; component "y"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000; github-issue owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="shell" deadline-ms=1000 } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }
-        let without_demand =
-            parse(r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" } }"#).unwrap();
-        assert!(!without_demand.profiles[0].runtime.as_ref().unwrap().demand);
     }
 
     #[test]

@@ -1,0 +1,31 @@
+package compoundingtech:st2-pty-stats@0.1.0;
+
+interface pty-stats {
+  variant scope {
+    all,
+    session(string),
+  }
+
+  variant exit-status {
+    code(s32),
+    signal(s32),
+  }
+
+  record outcome {
+    stdout: list<u8>,
+    stderr: list<u8>,
+    stdout-truncated: bool,
+    stderr-truncated: bool,
+    exit: exit-status,
+  }
+
+  variant pty-stats-error {
+    denied,
+    unavailable,
+    resource-exhausted,
+    deadline-exceeded,
+    cancelled,
+  }
+
+  get: func(scope: scope) -> result<outcome, pty-stats-error>;
+}

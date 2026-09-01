@@ -4,6 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    fenix.url = "github:nix-community/fenix";
+    fenix.inputs.nixpkgs.follows = "nixpkgs";
     # Packaged PTY dependency: the merged revision with atomic metadata patching and the
     # fleet-observation guarantees required by st2 reconciliation.
     pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
@@ -22,6 +24,7 @@
       self,
       nixpkgs,
       flake-utils,
+      fenix,
       pty,
       effect-utils,
     }:
@@ -29,6 +32,15 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        providerRustToolchain = fenix.packages.${system}.combine [
+          fenix.packages.${system}.stable.cargo
+          fenix.packages.${system}.stable.rustc
+          fenix.packages.${system}.targets.wasm32-unknown-unknown.stable.rust-std
+        ];
+        providerRustPlatform = pkgs.makeRustPlatform {
+          cargo = providerRustToolchain;
+          rustc = providerRustToolchain;
+        };
 
         # Cargo.toml is the single source of truth for the version, so a release
         # bump needs no matching edit here.
@@ -127,6 +139,12 @@
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
             "--workspace"
+            "--exclude"
+            "st2-resource-providers"
+            "--exclude"
+            "st2-github-issue-component"
+            "--exclude"
+            "st2-pty-stats-component"
             "--lib"
             "--bins"
             "--test"
@@ -169,14 +187,18 @@
           pname = "st2-wasm-resolver-check";
           cargoTestFlags = [
             "--workspace"
+            "--exclude"
+            "st2-resource-providers"
+            "--exclude"
+            "st2-github-issue-component"
+            "--exclude"
+            "st2-pty-stats-component"
             "--test"
             "resync"
             "--test"
             "resync_notify_chain"
             "--test"
             "profile_wasm"
-            "--test"
-            "resource_profile_supervisor_e2e"
           ];
         });
 
@@ -193,6 +215,75 @@
             "--lib"
             "--test"
             "executor"
+          ];
+        });
+
+        buildProviderComponent =
+          {
+            package,
+            wasmName,
+          }:
+          providerRustPlatform.buildRustPackage {
+            pname = package;
+            inherit version;
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildPhase = ''
+              runHook preBuild
+              cargo build --offline --release -p ${package} --target wasm32-unknown-unknown
+              runHook postBuild
+            '';
+            doCheck = false;
+            nativeBuildInputs = [
+              pkgs.lld
+              pkgs.wasm-tools
+            ];
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/share/st2/providers"
+              wasm-tools component new \
+                "target/wasm32-unknown-unknown/release/${wasmName}.wasm" \
+                -o "$out/share/st2/providers/${wasmName}.component.wasm"
+              runHook postInstall
+            '';
+          };
+
+        st2GitHubIssueComponent = buildProviderComponent {
+          package = "st2-github-issue-component";
+          wasmName = "st2_github_issue_component";
+        };
+
+        st2PtyStatsComponent = buildProviderComponent {
+          package = "st2-pty-stats-component";
+          wasmName = "st2_pty_stats_component";
+        };
+
+        st2ProviderRuntime = st2.overrideAttrs (old: {
+          pname = "st2-provider-runtime";
+          cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
+          cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+            pkgs.lld
+            pty.packages.${system}.default
+          ];
+        });
+
+        st2ProviderRuntimeCheck = st2ProviderRuntime.overrideAttrs (_: {
+          pname = "st2-provider-runtime-check";
+          ST2_GITHUB_ISSUE_COMPONENT = "${st2GitHubIssueComponent}/share/st2/providers/st2_github_issue_component.component.wasm";
+          ST2_PTY_STATS_COMPONENT = "${st2PtyStatsComponent}/share/st2/providers/st2_pty_stats_component.component.wasm";
+          cargoTestFlags = [
+            "-p"
+            "st2-resource-providers"
+            "--lib"
+            "-p"
+            "st2"
+            "--features"
+            "st2/wasip2-provider-runtime"
+            "--test"
+            "resource_profile_supervisor_e2e"
+            "--test"
+            "resource_provider_e2e"
           ];
         });
 
@@ -295,6 +386,9 @@
       {
         packages.st2 = st2;
         packages.st2-wasm-resolver = st2WasmResolver;
+        packages.st2-provider-runtime = st2ProviderRuntime;
+        packages.st2-github-issue-component = st2GitHubIssueComponent;
+        packages.st2-pty-stats-component = st2PtyStatsComponent;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -314,6 +408,9 @@
         checks.otel-export = st2OtelExport;
         checks.wasm-resolver-feature = st2WasmResolverCheck;
         checks.wasip2-resource-executor = st2Wasip2ExecutorCheck;
+        checks.wasip2-resource-providers = st2ProviderRuntimeCheck;
+        checks.github-issue-component = st2GitHubIssueComponent;
+        checks.pty-stats-component = st2PtyStatsComponent;
         # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
         # the same artifact strictly admits a catalog carrying a real wasm profile module.
         checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''

@@ -2247,19 +2247,30 @@ fn collect_profile_modules(
     let config = crate::catalog::load(root).context("parse catalog profile modules")?;
     let mut modules = BTreeSet::new();
     for profile in config.profiles {
-        let crate::catalog::ResolvedProfileModule::CatalogRelative(relative) =
+        if let crate::catalog::ResolvedProfileModule::CatalogRelative(relative) =
             crate::catalog::resolve_profile_module(logical_catalog, &profile.wasm)?
-        else {
-            continue;
-        };
-        let normalized = add_profile_module(root, &relative, files).with_context(|| {
-            format!(
-                "admit catalog-relative profile module '{}' for scheme '{}'",
-                relative.display(),
-                profile.scheme
-            )
-        })?;
-        modules.insert(normalized);
+        {
+            let normalized = add_profile_module(root, &relative, files).with_context(|| {
+                format!(
+                    "admit catalog-relative profile module '{}' for scheme '{}'",
+                    relative.display(),
+                    profile.scheme
+                )
+            })?;
+            modules.insert(normalized);
+        }
+        if let Some(runtime) = &profile.runtime {
+            let relative =
+                crate::catalog::resolve_provider_component(logical_catalog, &runtime.component)?;
+            let normalized = add_profile_module(root, &relative, files).with_context(|| {
+                format!(
+                    "admit provider component '{}' for scheme '{}'",
+                    relative.display(),
+                    profile.scheme
+                )
+            })?;
+            modules.insert(normalized);
+        }
     }
     Ok(modules)
 }
@@ -2311,6 +2322,15 @@ fn add_profile_module(
     );
     files.insert(normalized.clone(), ProjectedFile { bytes, executable });
     Ok(normalized)
+}
+
+pub(crate) fn read_provider_component(root: &Path, relative: &Path) -> Result<Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let normalized = add_profile_module(root, relative, &mut files)?;
+    files
+        .remove(&normalized)
+        .map(|file| file.bytes)
+        .context("admitted provider component disappeared")
 }
 
 

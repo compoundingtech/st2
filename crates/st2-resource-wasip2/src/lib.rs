@@ -5,6 +5,8 @@ use st2_resource_protocol::SnapshotDigest;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservationRequest {
+    /// Host-only identity for cancellation ownership; it is never passed to the guest.
+    pub invocation_id: u64,
     pub uri: String,
     pub selector: Value,
     pub prior_digest: Option<SnapshotDigest>,
@@ -53,7 +55,7 @@ mod runtime {
     use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
     use crate::bindings::Provider;
-    use crate::bindings::exports::provider_api as guest;
+    use crate::bindings::exports::st2::resource_provider::provider_api as guest;
     use crate::cache::{self, CacheDisposition, CacheIdentity, CacheLookup, PrivateArtifactCache};
     use crate::limits::InvocationLimits;
     use crate::{ObservationRequest, ProviderDescriptor, SchedulingCapability};
@@ -432,7 +434,7 @@ mod runtime {
                 classify_execution_error(&store, &control.state.reason, error, true).describe()
             })?;
             let result = bindings
-                .provider_api()
+                .st2_resource_provider_provider_api()
                 .call_describe(&mut store)
                 .map_err(|error| {
                     classify_execution_error(&store, &control.state.reason, error, false).describe()
@@ -499,7 +501,7 @@ mod runtime {
                 classify_execution_error(&store, &control.state.reason, error, true).observe()
             })?;
             let result = bindings
-                .provider_api()
+                .st2_resource_provider_provider_api()
                 .call_observe(&mut store, &guest_request)
                 .map_err(|error| {
                     classify_execution_error(&store, &control.state.reason, error, false).observe()
