@@ -95,6 +95,27 @@ static DRIVER_DIAGNOSTICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_unit("1")
         .build()
 });
+static RESOURCE_OBSERVE_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("resource_observe_requests_total")
+        .with_description("Demand-observation request lifecycle transitions by bounded outcome")
+        .with_unit("1")
+        .build()
+});
+static RESOURCE_OBSERVE_DISPATCH: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("resource_observe_dispatch_seconds")
+        .with_description("Latency from request publication to provider-runtime dispatch")
+        .with_unit("s")
+        .build()
+});
+static RESOURCE_OBSERVE_SETTLE: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("resource_observe_settle_seconds")
+        .with_description("Latency from provider-runtime dispatch to durable result receipt")
+        .with_unit("s")
+        .build()
+});
 
 /// One reconcile pass finished. `failed` = the pass collected errors.
 pub fn record_reconcile_pass(duration: Duration, failed: bool) {
@@ -104,7 +125,10 @@ pub fn record_reconcile_pass(duration: Duration, failed: bool) {
     RECONCILE_PASS_DURATION.record(duration.as_secs_f64(), &[]);
     RECONCILE_PASSES.add(
         1,
-        &[opentelemetry::KeyValue::new("result", if failed { "fail" } else { "pass" })],
+        &[opentelemetry::KeyValue::new(
+            "result",
+            if failed { "fail" } else { "pass" },
+        )],
     );
 }
 
@@ -147,7 +171,10 @@ pub fn record_message_delivery(failed: bool) {
     }
     MESSAGE_DELIVERIES.add(
         1,
-        &[opentelemetry::KeyValue::new("result", if failed { "fail" } else { "pass" })],
+        &[opentelemetry::KeyValue::new(
+            "result",
+            if failed { "fail" } else { "pass" },
+        )],
     );
 }
 
@@ -175,6 +202,32 @@ pub fn record_driver_diagnostic(
         &driver_diagnostic_attributes(stage, reason, source, support, recovered),
     );
 }
+pub fn record_resource_observe_request(outcome: &'static str) {
+    if !enabled() {
+        return;
+    }
+    RESOURCE_OBSERVE_REQUESTS.add(
+        1,
+        &[opentelemetry::KeyValue::new(
+            "outcome",
+            normalize_resource_observe_outcome(outcome),
+        )],
+    );
+}
+
+pub fn record_resource_observe_dispatch(duration: Duration) {
+    if !enabled() {
+        return;
+    }
+    RESOURCE_OBSERVE_DISPATCH.record(duration.as_secs_f64(), &[]);
+}
+
+pub fn record_resource_observe_settle(duration: Duration) {
+    if !enabled() {
+        return;
+    }
+    RESOURCE_OBSERVE_SETTLE.record(duration.as_secs_f64(), &[]);
+}
 
 fn driver_diagnostic_attributes(
     stage: Stage,
@@ -190,6 +243,19 @@ fn driver_diagnostic_attributes(
         opentelemetry::KeyValue::new("support", support.as_str()),
         opentelemetry::KeyValue::new("outcome", if recovered { "recovery" } else { "failure" }),
     ]
+}
+fn normalize_resource_observe_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "accepted" => "accepted",
+        "backpressured" => "backpressured",
+        "settledUnchanged" => "settledUnchanged",
+        "settledChanged" => "settledChanged",
+        "settledFailed" => "settledFailed",
+        "absentBinding" => "absentBinding",
+        "staleGeneration" => "staleGeneration",
+        "providerUnavailable" => "providerUnavailable",
+        _ => "other",
+    }
 }
 
 /// The bounded Claude hook-event vocabulary st2 applies; anything else is `other`.
@@ -225,6 +291,9 @@ mod tests {
         record_hook_invocation("claude-observe", "SomethingUnheardOf");
         record_message_delivery(true);
         record_crash_loop();
+        record_resource_observe_request("accepted");
+        record_resource_observe_dispatch(Duration::from_millis(1));
+        record_resource_observe_settle(Duration::from_millis(1));
         assert!(!enabled());
 
         record_driver_diagnostic(
@@ -241,6 +310,18 @@ mod tests {
         assert_eq!(normalize_hook_event("SessionStart"), "SessionStart");
         assert_eq!(normalize_hook_event("TotallyNewEvent"), "other");
     }
+    #[test]
+    fn resource_observe_outcomes_use_the_bounded_wire_vocabulary() {
+        assert_eq!(
+            normalize_resource_observe_outcome("settledUnchanged"),
+            "settledUnchanged"
+        );
+        assert_eq!(
+            normalize_resource_observe_outcome("settled-unchanged"),
+            "other"
+        );
+        assert_eq!(normalize_resource_observe_outcome("h.worker"), "other");
+    }
 
     #[test]
     fn driver_diagnostic_metric_attributes_are_exactly_the_bounded_axes() {
@@ -251,7 +332,10 @@ mod tests {
             Support::Supported,
             true,
         );
-        let keys: Vec<&str> = attributes.iter().map(|attribute| attribute.key.as_str()).collect();
+        let keys: Vec<&str> = attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect();
         assert_eq!(keys, ["stage", "reason", "source", "support", "outcome"]);
         let rendered = format!("{attributes:?}");
         for forbidden in ["1.18.19", "h.worker", "ses_", "msg_"] {

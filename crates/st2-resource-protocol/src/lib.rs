@@ -13,6 +13,7 @@ pub const MAX_PROTOCOL_LINE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 pub const MAX_HEALTH_DETAIL_BYTES: usize = 16 * 1024;
+pub const MAX_OBSERVATION_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_OPAQUE_ID_BYTES: usize = 16 * 1024;
 
 /// Fact bounds are deliberately small relative to the 2 MiB frame: even 32 facts whose strings
@@ -95,10 +96,7 @@ impl ResourceFact {
         Ok(fact)
     }
 
-    pub fn current(
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Result<Self, FactError> {
+    pub fn current(key: impl Into<String>, value: impl Into<String>) -> Result<Self, FactError> {
         Self::new(key, FactValue::Omitted, FactValue::value(value))
     }
 
@@ -167,7 +165,9 @@ fn validate_fact_string(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactError {
-    TooMany { actual: usize },
+    TooMany {
+        actual: usize,
+    },
     Empty {
         field: &'static str,
     },
@@ -186,7 +186,10 @@ impl fmt::Display for FactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooMany { actual } => {
-                write!(formatter, "fact list has {actual} entries; maximum is {MAX_FACTS}")
+                write!(
+                    formatter,
+                    "fact list has {actual} entries; maximum is {MAX_FACTS}"
+                )
             }
             Self::Empty { field } => write!(formatter, "fact {field} must not be empty"),
             Self::TooLarge {
@@ -200,9 +203,7 @@ impl fmt::Display for FactError {
             Self::NotPrintable { field } => {
                 write!(formatter, "fact {field} must be one printable line")
             }
-            Self::MissingValue => {
-                formatter.write_str("fact must include before, after, or both")
-            }
+            Self::MissingValue => formatter.write_str("fact must include before, after, or both"),
         }
     }
 }
@@ -565,6 +566,12 @@ pub enum HostMessage {
         binding_id: BindingId,
         registration: RegistrationToken,
     },
+    Observe {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        demand_watermark: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,25 +584,79 @@ pub enum RuntimeHealthState {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Publication {
+    pub schema_id: String,
+    pub media_type: String,
+    pub bytes: SnapshotBytes,
+    pub topics: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Vec<ResourceFact>>,
+}
+
+impl Publication {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_topics(&self.topics)?;
+        validate_facts(self.facts.as_deref().unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
-    tag = "type",
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ObservationResult {
+    Unchanged,
+    Failed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+    },
+    Published {
+        publication: Publication,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "status",
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
     deny_unknown_fields
+)]
+enum ObservationResultWire {
+    Unchanged {},
+    Failed { diagnostic: Option<String> },
+    Published { publication: Publication },
+}
+
+impl<'de> Deserialize<'de> for ObservationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match ObservationResultWire::deserialize(deserializer)? {
+            ObservationResultWire::Unchanged {} => Self::Unchanged,
+            ObservationResultWire::Failed { diagnostic } => Self::Failed { diagnostic },
+            ObservationResultWire::Published { publication } => Self::Published { publication },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
 )]
 pub enum RuntimeMessage {
     Publish {
         owner: RuntimeOwner,
         binding_id: BindingId,
         registration: RegistrationToken,
-        schema_id: String,
-        media_type: String,
-        bytes: SnapshotBytes,
-        topics: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        facts: Option<Vec<ResourceFact>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        observed_at: Option<String>,
+        #[serde(flatten)]
+        publication: Publication,
     },
     Health {
         owner: RuntimeOwner,
@@ -607,6 +668,98 @@ pub enum RuntimeMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    ObservationResult {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        demand_watermark: u64,
+        result: ObservationResult,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum RuntimeMessageWire {
+    Publish {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        /// ABI-3 runtimes may still send this retired producer timestamp. The host never trusted it,
+        /// so decode it only to preserve that ABI and discard it at this boundary.
+        observed_at: Option<String>,
+        #[serde(flatten)]
+        publication: Publication,
+    },
+    Health {
+        owner: RuntimeOwner,
+        binding_id: Option<BindingId>,
+        registration: Option<RegistrationToken>,
+        state: RuntimeHealthState,
+        detail: Option<String>,
+    },
+    ObservationResult {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        demand_watermark: u64,
+        result: ObservationResult,
+    },
+}
+
+impl<'de> Deserialize<'de> for RuntimeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match RuntimeMessageWire::deserialize(deserializer)? {
+            RuntimeMessageWire::Publish {
+                owner,
+                binding_id,
+                registration,
+                observed_at,
+                publication,
+            } => {
+                drop(observed_at);
+                Self::Publish {
+                    owner,
+                    binding_id,
+                    registration,
+                    publication,
+                }
+            },
+            RuntimeMessageWire::Health {
+                owner,
+                binding_id,
+                registration,
+                state,
+                detail,
+            } => Self::Health {
+                owner,
+                binding_id,
+                registration,
+                state,
+                detail,
+            },
+            RuntimeMessageWire::ObservationResult {
+                owner,
+                binding_id,
+                registration,
+                demand_watermark,
+                result,
+            } => Self::ObservationResult {
+                owner,
+                binding_id,
+                registration,
+                demand_watermark,
+                result,
+            },
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -617,6 +770,8 @@ pub enum ProtocolError {
     LineTooLarge { actual: usize },
     SelectorTooLarge { actual: usize },
     HealthDetailTooLarge { actual: usize },
+    ObservationDiagnosticTooLarge { actual: usize },
+    InvalidDemandWatermark,
     InvalidTopics(&'static str),
     InvalidFacts(FactError),
     InvalidHealthScope,
@@ -641,6 +796,13 @@ impl fmt::Display for ProtocolError {
                 formatter,
                 "health detail is {actual} bytes; maximum is {MAX_HEALTH_DETAIL_BYTES}"
             ),
+            Self::ObservationDiagnosticTooLarge { actual } => write!(
+                formatter,
+                "observation diagnostic is {actual} bytes; maximum is {MAX_OBSERVATION_DIAGNOSTIC_BYTES}"
+            ),
+            Self::InvalidDemandWatermark => {
+                formatter.write_str("observation demand watermark must be positive")
+            }
             Self::InvalidTopics(reason) => write!(formatter, "invalid topics: {reason}"),
             Self::InvalidFacts(error) => write!(formatter, "invalid facts: {error}"),
             Self::InvalidHealthScope => formatter
@@ -710,23 +872,26 @@ fn encode_protocol_line(message: &impl Serialize) -> Result<Vec<u8>, ProtocolErr
 }
 
 fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
-    if let HostMessage::Register { selector, .. } = message {
-        let actual = serde_json::to_vec(selector)
-            .map_err(ProtocolError::Json)?
-            .len();
-        if actual > MAX_SELECTOR_BYTES {
-            return Err(ProtocolError::SelectorTooLarge { actual });
+    match message {
+        HostMessage::Register { selector, .. } => {
+            let actual = serde_json::to_vec(selector)
+                .map_err(ProtocolError::Json)?
+                .len();
+            if actual > MAX_SELECTOR_BYTES {
+                return Err(ProtocolError::SelectorTooLarge { actual });
+            }
+            Ok(())
         }
+        HostMessage::Observe {
+            demand_watermark, ..
+        } if *demand_watermark == 0 => Err(ProtocolError::InvalidDemandWatermark),
+        HostMessage::Observe { .. } | HostMessage::Unregister { .. } => Ok(()),
     }
-    Ok(())
 }
 
 fn validate_runtime_message(message: &RuntimeMessage) -> Result<(), ProtocolError> {
     match message {
-        RuntimeMessage::Publish { topics, facts, .. } => {
-            validate_topics(topics)?;
-            validate_facts(facts.as_deref().unwrap_or_default())
-        }
+        RuntimeMessage::Publish { publication, .. } => publication.validate(),
         RuntimeMessage::Health {
             binding_id,
             registration,
@@ -744,6 +909,29 @@ fn validate_runtime_message(message: &RuntimeMessage) -> Result<(), ProtocolErro
                 });
             }
             Ok(())
+        }
+        RuntimeMessage::ObservationResult {
+            demand_watermark,
+            result,
+            ..
+        } => {
+            if *demand_watermark == 0 {
+                return Err(ProtocolError::InvalidDemandWatermark);
+            }
+            match result {
+                ObservationResult::Unchanged => Ok(()),
+                ObservationResult::Failed { diagnostic } => {
+                    if let Some(diagnostic) = diagnostic
+                        && diagnostic.len() > MAX_OBSERVATION_DIAGNOSTIC_BYTES
+                    {
+                        return Err(ProtocolError::ObservationDiagnosticTooLarge {
+                            actual: diagnostic.len(),
+                        });
+                    }
+                    Ok(())
+                }
+                ObservationResult::Published { publication } => publication.validate(),
+            }
         }
     }
 }
@@ -786,17 +974,22 @@ mod tests {
         )
     }
 
-    fn publish(bytes: &[u8]) -> RuntimeMessage {
-        RuntimeMessage::Publish {
-            owner: owner(),
-            binding_id: BindingId::new("binding").unwrap(),
-            registration: RegistrationToken::new("registration").unwrap(),
+    fn publication(bytes: &[u8]) -> Publication {
+        Publication {
             schema_id: "schema.v1".to_owned(),
             media_type: "application/json".to_owned(),
             bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
             topics: vec!["selected".to_owned()],
             facts: None,
-            observed_at: Some("2026-08-30T00:00:00Z".to_owned()),
+        }
+    }
+
+    fn publish(bytes: &[u8]) -> RuntimeMessage {
+        RuntimeMessage::Publish {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            publication: publication(bytes),
         }
     }
 
@@ -824,13 +1017,23 @@ mod tests {
             encode_host_line(&unregister).unwrap(),
             b"{\"type\":\"unregister\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\"}\n"
         );
+        let observe = HostMessage::Observe {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 7,
+        };
+        assert_eq!(
+            encode_host_line(&observe).unwrap(),
+            b"{\"type\":\"observe\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"demandWatermark\":7}\n"
+        );
     }
 
     #[test]
-    fn runtime_frames_have_exact_json_shape_and_padded_base64() {
+    fn periodic_publish_has_exact_flat_json_shape_and_padded_base64() {
         assert_eq!(
             encode_runtime_line(&publish(b"one byte")).unwrap(),
-            b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"observedAt\":\"2026-08-30T00:00:00Z\"}\n"
+            b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"]}\n"
         );
         let health = RuntimeMessage::Health {
             owner: owner(),
@@ -850,12 +1053,81 @@ mod tests {
     }
 
     #[test]
+    fn abi_3_publish_decodes_with_or_without_deprecated_observed_at_only() {
+        let without_observed_at = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"]}\n";
+        let with_observed_at = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"observedAt\":\"2026-08-30T00:00:00Z\"}\n";
+        let unknown_field = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"extra\":true}\n";
+
+        assert_eq!(
+            decode_runtime_line(without_observed_at).unwrap(),
+            publish(b"one byte")
+        );
+        assert_eq!(
+            decode_runtime_line(with_observed_at).unwrap(),
+            publish(b"one byte")
+        );
+        assert!(matches!(
+            decode_runtime_line(unknown_field),
+            Err(ProtocolError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn observation_results_have_one_atomic_tagged_wire_shape() {
+        let unchanged = RuntimeMessage::ObservationResult {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 7,
+            result: ObservationResult::Unchanged,
+        };
+        assert_eq!(
+            encode_runtime_line(&unchanged).unwrap(),
+            b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"demandWatermark\":7,\"result\":{\"status\":\"unchanged\"}}\n"
+        );
+
+        let failed = RuntimeMessage::ObservationResult {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 8,
+            result: ObservationResult::Failed {
+                diagnostic: Some("provider unavailable".to_owned()),
+            },
+        };
+        assert_eq!(
+            encode_runtime_line(&failed).unwrap(),
+            b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"demandWatermark\":8,\"result\":{\"status\":\"failed\",\"diagnostic\":\"provider unavailable\"}}\n"
+        );
+
+        let mut published = publication(b"one byte");
+        published.facts = Some(vec![ResourceFact::current("state", "ready").unwrap()]);
+        let published = RuntimeMessage::ObservationResult {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 9,
+            result: ObservationResult::Published {
+                publication: published,
+            },
+        };
+        assert_eq!(
+            encode_runtime_line(&published).unwrap(),
+            b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"demandWatermark\":9,\"result\":{\"status\":\"published\",\"publication\":{\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"facts\":[{\"key\":\"state\",\"after\":\"ready\"}]}}}\n"
+        );
+        assert_eq!(
+            decode_runtime_line(&encode_runtime_line(&published).unwrap()).unwrap(),
+            published
+        );
+    }
+
+    #[test]
     fn fact_wire_shape_distinguishes_omission_from_explicit_null() {
         let mut message = publish(b"fact");
-        let RuntimeMessage::Publish { facts, .. } = &mut message else {
+        let RuntimeMessage::Publish { publication, .. } = &mut message else {
             unreachable!();
         };
-        *facts = Some(vec![
+        publication.facts = Some(vec![
             ResourceFact::current("state", "ready").unwrap(),
             ResourceFact::transition("label", None::<String>, Some("added")).unwrap(),
             ResourceFact::transition("removed", Some("old"), None::<String>).unwrap(),
@@ -874,10 +1146,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_fact_shapes_and_bounds_are_rejected() {
+    fn invalid_fact_shapes_and_bounds_are_rejected_for_shared_publications() {
         let missing_values = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"schemaId\":\"s\",\"mediaType\":\"m\",\"bytes\":\"\",\"topics\":[],\"facts\":[{\"key\":\"state\"}]}\n";
         assert!(matches!(
             decode_runtime_line(missing_values),
+            Err(ProtocolError::InvalidFacts(FactError::MissingValue))
+        ));
+        let demanded_missing_values = b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":1,\"result\":{\"status\":\"published\",\"publication\":{\"schemaId\":\"s\",\"mediaType\":\"m\",\"bytes\":\"\",\"topics\":[],\"facts\":[{\"key\":\"state\"}]}}}\n";
+        assert!(matches!(
+            decode_runtime_line(demanded_missing_values),
             Err(ProtocolError::InvalidFacts(FactError::MissingValue))
         ));
         assert!(ResourceFact::current("", "value").is_err());
@@ -885,15 +1162,14 @@ mod tests {
         assert!(ResourceFact::current("x".repeat(MAX_FACT_KEY_BYTES + 1), "value").is_err());
         assert!(ResourceFact::current("state", "x".repeat(MAX_FACT_VALUE_BYTES + 1)).is_err());
 
+        let too_many = (0..=MAX_FACTS)
+            .map(|index| ResourceFact::current(format!("key-{index}"), "value").unwrap())
+            .collect();
         let mut message = publish(b"facts");
-        let RuntimeMessage::Publish { facts, .. } = &mut message else {
+        let RuntimeMessage::Publish { publication, .. } = &mut message else {
             unreachable!();
         };
-        *facts = Some(
-            (0..=MAX_FACTS)
-                .map(|index| ResourceFact::current(format!("key-{index}"), "value").unwrap())
-                .collect(),
-        );
+        publication.facts = Some(too_many);
         assert!(matches!(
             encode_runtime_line(&message),
             Err(ProtocolError::InvalidFacts(FactError::TooMany { .. }))
@@ -901,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn decoding_is_strict_about_fields_ids_and_digest_encoding() {
+    fn decoding_is_strict_about_fields_ids_digest_and_obsolete_protocol() {
         let unknown_message_field = b"{\"type\":\"health\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"state\":\"ready\",\"extra\":true}\n";
         assert!(matches!(
             decode_runtime_line(unknown_message_field),
@@ -921,6 +1197,46 @@ mod tests {
         assert!(matches!(
             decode_host_line(uppercase_digest),
             Err(ProtocolError::Json(_))
+        ));
+        let unknown_result_field = b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":1,\"result\":{\"status\":\"unchanged\",\"extra\":true}}\n";
+        assert!(matches!(
+            decode_runtime_line(unknown_result_field),
+            Err(ProtocolError::Json(_))
+        ));
+        let unknown_publication_field = b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":1,\"result\":{\"status\":\"published\",\"publication\":{\"schemaId\":\"s\",\"mediaType\":\"m\",\"bytes\":\"\",\"topics\":[],\"extra\":true}}}\n";
+        assert!(matches!(
+            decode_runtime_line(unknown_publication_field),
+            Err(ProtocolError::Json(_))
+        ));
+
+        let obsolete_settlement = b"{\"type\":\"observationSettled\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":1,\"outcome\":\"unchanged\"}\n";
+        assert!(matches!(
+            decode_runtime_line(obsolete_settlement),
+            Err(ProtocolError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn observation_watermarks_must_be_positive() {
+        let zero_observe = b"{\"type\":\"observe\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":0}\n";
+        assert!(matches!(
+            decode_host_line(zero_observe),
+            Err(ProtocolError::InvalidDemandWatermark)
+        ));
+        let zero_result = b"{\"type\":\"observationResult\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":0,\"result\":{\"status\":\"unchanged\"}}\n";
+        assert!(matches!(
+            decode_runtime_line(zero_result),
+            Err(ProtocolError::InvalidDemandWatermark)
+        ));
+        let observe = HostMessage::Observe {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 0,
+        };
+        assert!(matches!(
+            encode_host_line(&observe),
+            Err(ProtocolError::InvalidDemandWatermark)
         ));
     }
 
@@ -1022,6 +1338,26 @@ mod tests {
             decode_runtime_line(&health_line),
             Err(ProtocolError::HealthDetailTooLarge { .. })
         ));
+
+        let oversized_diagnostic = RuntimeMessage::ObservationResult {
+            owner: owner(),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+            demand_watermark: 1,
+            result: ObservationResult::Failed {
+                diagnostic: Some("x".repeat(MAX_OBSERVATION_DIAGNOSTIC_BYTES + 1)),
+            },
+        };
+        assert!(matches!(
+            encode_runtime_line(&oversized_diagnostic),
+            Err(ProtocolError::ObservationDiagnosticTooLarge { .. })
+        ));
+        let mut diagnostic_line = serde_json::to_vec(&oversized_diagnostic).unwrap();
+        diagnostic_line.push(b'\n');
+        assert!(matches!(
+            decode_runtime_line(&diagnostic_line),
+            Err(ProtocolError::ObservationDiagnosticTooLarge { .. })
+        ));
         assert!(RuntimeIncarnation::new("x".repeat(MAX_OPAQUE_ID_BYTES + 1)).is_err());
     }
 
@@ -1039,10 +1375,10 @@ mod tests {
             Err(ProtocolError::InvalidHealthScope)
         ));
         let mut duplicate_topics = publish(b"bytes");
-        let RuntimeMessage::Publish { topics, .. } = &mut duplicate_topics else {
+        let RuntimeMessage::Publish { publication, .. } = &mut duplicate_topics else {
             unreachable!();
         };
-        *topics = vec!["same".to_owned(), "same".to_owned()];
+        publication.topics = vec!["same".to_owned(), "same".to_owned()];
         assert!(matches!(
             encode_runtime_line(&duplicate_topics),
             Err(ProtocolError::InvalidTopics(_))

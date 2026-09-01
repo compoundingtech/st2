@@ -724,6 +724,24 @@ enum ResourceCmd {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Ask the resident profile runtime to observe one binding now and wait for exact evidence.
+    Refresh {
+        /// Binding name, or an agent selector when followed by a binding name.
+        first: String,
+        /// Binding name when the first positional selects the agent.
+        second: Option<String>,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long, conflicts_with = "second")]
+        agent: Option<String>,
+        /// Client-only wait bound in seconds. Expiry never cancels or retracts queued demand.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+        /// Emit the stable receipt (or timeout envelope) as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
     /// Declare a Resource binding, or prove the identical binding already exists.
     Add {
         /// The agent-local binding name.
@@ -1314,8 +1332,10 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             if !json {
                 anyhow::bail!("`st2 catalog graph` v1 requires --json");
             }
-            let graph =
-                st2::catalog_graph::snapshot(&catalog_arg(None)?, &host.unwrap_or_else(detect_host))?;
+            let graph = st2::catalog_graph::snapshot(
+                &catalog_arg(None)?,
+                &host.unwrap_or_else(detect_host),
+            )?;
             let complete = graph.complete;
             println!("{}", serde_json::to_string_pretty(&graph)?);
             if !complete {
@@ -2089,10 +2109,9 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             {
                 // The harness's own percent, never one st2 divided out of the operands beside it,
                 // and never clamped: an overrun above 100 is exactly what this warns about.
-                if context
-                    .used_percent
-                    .is_some_and(|percent| percent >= st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT)
-                {
+                if context.used_percent.is_some_and(|percent| {
+                    percent >= st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT
+                }) {
                     report_advisory(
                         &format!(
                             "{bus_id} harness context at {}%",
@@ -2118,8 +2137,7 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 }
             }
             if st2::driver_diagnostic::expected_for(spec) {
-                let diagnostic =
-                    st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
+                let diagnostic = st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
                 match &diagnostic {
                     st2::driver_diagnostic::Observed::Failure(failure) => report_advisory(
                         &format!(
@@ -3361,6 +3379,19 @@ fn resource_bindings(
     selector: &str,
     host: &str,
 ) -> Result<(String, Vec<st2::Resource>)> {
+    with_resource_bindings_snapshot(root, selector, host, |identity, bindings| {
+        Ok((identity, bindings))
+    })
+}
+
+/// Resolve one binding projection and let the caller finish consuming that exact catalog snapshot
+/// before its shared authoring fence is released.
+fn with_resource_bindings_snapshot<T>(
+    root: &Path,
+    selector: &str,
+    host: &str,
+    consume: impl FnOnce(String, Vec<st2::Resource>) -> Result<T>,
+) -> Result<T> {
     let _catalog_lock = st2::CatalogLock::shared(root)
         .context("acquire shared catalog-authoring lock for Resource bindings")?;
     let found = st2::discover_strict(root);
@@ -3385,9 +3416,9 @@ fn resource_bindings(
     } else {
         exact
     };
-    match matches.as_slice() {
+    let (identity, bindings) = match matches.as_slice() {
         [] => anyhow::bail!("no agent '{selector}' found in catalog {}", root.display()),
-        [spec] => Ok((spec.bus_id(host), spec.resources.clone())),
+        [spec] => (spec.bus_id(host), spec.resources.clone()),
         many => {
             let mut candidates = many
                 .iter()
@@ -3399,8 +3430,26 @@ fn resource_bindings(
                 candidates.join(", ")
             )
         }
+    };
+    consume(identity, bindings)
+}
+
+#[cfg(debug_assertions)]
+fn resource_refresh_snapshot_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_READY"),
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = std::fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn resource_refresh_snapshot_checkpoint() {}
 
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
@@ -3462,6 +3511,97 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             }
             if let Some(selector) = binding.selector() {
                 println!("{:<17}{}", "selector:", serde_json::to_string(selector)?);
+            }
+            Ok(())
+        }
+        ResourceCmd::Refresh {
+            first,
+            second,
+            agent,
+            wait,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (selector, name) = match second {
+                Some(name) => (first, name),
+                None => {
+                    let selector = match agent {
+                        Some(agent) => agent,
+                        None => acting_id(&ctx)?,
+                    };
+                    (selector, first)
+                }
+            };
+            let (identity, request) =
+                with_resource_bindings_snapshot(&root, &selector, &host, |identity, bindings| {
+                    bindings
+                        .iter()
+                        .find(|binding| binding.name() == name)
+                        .with_context(|| {
+                            format!("no resource binding '{name}' declared by {identity}")
+                        })?;
+                    resource_refresh_snapshot_checkpoint();
+                    let generation = st2::resource_observe::catalog_generation(&root)?;
+                    let request = st2::resource_observe::ObserveRequest::new(
+                        identity.clone(),
+                        name.clone(),
+                        generation,
+                        None,
+                    )?;
+                    Ok((identity, request))
+                })?;
+            let request_id = request.request_id.clone();
+            let client = st2::resource_observe::submit_request(&root, &host, &request)?;
+            let waited = client.wait_for_terminal(Duration::from_secs(wait))?;
+            if waited.timed_out {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "status": "timeout",
+                            "requestId": request_id,
+                            "queued": true,
+                            "receipt": &waited.receipt,
+                        }))?
+                    );
+                }
+                let last = waited
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.status.as_str())
+                    .unwrap_or("pending");
+                anyhow::bail!(
+                    "resource refresh for {identity} {name} exceeded the {wait}s client wait bound \
+                     (last status: {last}); the request remains queued and may still settle"
+                );
+            }
+            let receipt = waited
+                .receipt
+                .context("Resource observation ended without a receipt")?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            }
+            if !receipt.status.is_success() {
+                anyhow::bail!(
+                    "resource refresh for {identity} {name}: {}{}",
+                    receipt.status.as_str(),
+                    receipt
+                        .diagnostic
+                        .as_deref()
+                        .map(|detail| format!(": {detail}"))
+                        .unwrap_or_default()
+                );
+            }
+            if !json {
+                let digest = receipt
+                    .digest
+                    .map(|digest| format!(" ({digest})"))
+                    .unwrap_or_default();
+                println!(
+                    "resource {name} on {identity}: {}{digest}",
+                    receipt.status.as_str()
+                );
             }
             Ok(())
         }

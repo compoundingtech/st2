@@ -96,8 +96,9 @@ Working state (lossless-restart):
 - `st2 context write [<identity>]` (reads new content from stdin)
 - `st2 context append [<identity>] --decision "<text>" --why "<text>"`
 
-Declared Resource bindings (`resource` nodes in your own declaration; writes republish it under CAS):
+Declared Resource bindings (`resource` nodes in your own declaration; authoring writes republish under CAS):
 - `st2 resource ls [<identity>] [--json]` · `st2 resource read [<identity>] <name> [--json]`
+- `st2 resource refresh <name> [--agent <identity>] [--wait <seconds>] [--json]` · `st2 resource refresh <identity> <name> [--wait <seconds>] [--json]` (one positional targets the caller; use either a leading identity or `--agent`, never both; demand observation never rewrites the declaration)
 - `st2 resource add <name> --uri <uri> --reason <text> [--inactive-reason <text>]`
 - `st2 resource remove <name>` · `st2 resource rename <old> <new>`
 - *writes also take `--agent <identity>` (any declaration you may publish) and `--json`*

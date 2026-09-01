@@ -24,15 +24,15 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Context as _;
-use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
 #[cfg(feature = "wasm-resolver")]
 use agent_spec::profile::ProfileCapability;
+use agent_spec::profile::{ProfileClass, ResourceProfile, ResourceProfileRegistry};
+use anyhow::Context as _;
 use kdl::KdlDocument;
 
 /// The catalog-level declaration, read from the catalog root.
 pub const CONFIG_FILE: &str = "catalog.kdl";
-/// One declared resource profile: `profile "<scheme>" { wasm "<path>" runtime { argv "..." } }`.
+/// One declared resource profile with a closed direct runtime and optional `demand` capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredProfile {
     /// The URI scheme this profile resolves.
@@ -52,6 +52,8 @@ pub struct DeclaredProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredProfileRuntime {
     pub argv: Vec<String>,
+    /// Opt in to demand-driven observation through one atomic observation result.
+    pub demand: bool,
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -124,10 +126,7 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
             "profile" => {
                 let profile = parse_profile(node)?;
                 if !seen_schemes.insert(profile.scheme.clone()) {
-                    anyhow::bail!(
-                        "profile '{}' declared more than once",
-                        profile.scheme
-                    );
+                    anyhow::bail!("profile '{}' declared more than once", profile.scheme);
                 }
                 config.profiles.push(profile);
             }
@@ -186,36 +185,69 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
             let runtime_children = child.children().ok_or_else(|| {
                 anyhow::anyhow!("profile '{scheme}': runtime needs exactly one argv child")
             })?;
-            if runtime_children.nodes().len() != 1
-                || runtime_children.nodes()[0].name().value() != "argv"
-            {
-                anyhow::bail!(
-                    "profile '{scheme}': runtime accepts exactly one argv child"
-                );
-            }
-            let argv_node = &runtime_children.nodes()[0];
-            if argv_node.children().is_some() || argv_node.entries().is_empty() {
-                anyhow::bail!(
-                    "profile '{scheme}': runtime argv needs one or more non-empty quoted arguments"
-                );
-            }
-            let argv = argv_node
-                .entries()
-                .iter()
-                .map(|entry| {
-                    (entry.name().is_none())
-                        .then(|| entry.value().as_string())
+            let mut argv = None;
+            let mut demand = false;
+            for runtime_child in runtime_children.nodes() {
+                match runtime_child.name().value() {
+                    "argv" => {
+                        if argv.is_some()
+                            || runtime_child.children().is_some()
+                            || runtime_child.entries().is_empty()
+                        {
+                            anyhow::bail!(
+                                "profile '{scheme}': runtime needs exactly one argv child with one or more arguments"
+                            );
+                        }
+                        argv = Some(
+                            runtime_child
+                                .entries()
+                                .iter()
+                                .map(|entry| {
+                                    (entry.name().is_none())
+                                        .then(|| entry.value().as_string())
+                                        .flatten()
+                                        .filter(|value| !value.is_empty())
+                                        .map(str::to_owned)
+                                })
+                                .collect::<Option<Vec<_>>>()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "profile '{scheme}': runtime argv accepts only non-empty quoted arguments"
+                                    )
+                                })?,
+                        );
+                    }
+                    "capability" => {
+                        let entries = runtime_child.entries();
+                        let capability = (runtime_child.children().is_none()
+                            && entries.len() == 1
+                            && entries[0].name().is_none())
+                        .then(|| entries[0].value().as_string())
                         .flatten()
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_owned)
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "profile '{scheme}': runtime argv accepts only non-empty quoted arguments"
-                    )
-                })?;
-            runtime = Some(DeclaredProfileRuntime { argv });
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "profile '{scheme}': runtime capability needs exactly one quoted value"
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            capability == "demand",
+                            "profile '{scheme}': unknown runtime capability '{capability}'"
+                        );
+                        anyhow::ensure!(
+                            !demand,
+                            "profile '{scheme}': runtime capability 'demand' is declared more than once"
+                        );
+                        demand = true;
+                    }
+                    other => anyhow::bail!(
+                        "profile '{scheme}': runtime field '{other}' is unknown (expected argv or capability)"
+                    ),
+                }
+            }
+            let argv = argv.ok_or_else(|| {
+                anyhow::anyhow!("profile '{scheme}': runtime needs exactly one argv child")
+            })?;
+            runtime = Some(DeclaredProfileRuntime { argv, demand });
             continue;
         }
         if child.children().is_some() {
@@ -315,9 +347,7 @@ pub(crate) fn resolve_profile_module(
 
     let resolved = lexical_absolute(&catalog_root.join(expanded))?;
     let relative = resolved.strip_prefix(&catalog_root).with_context(|| {
-        format!(
-            "catalog-relative profile module escapes the catalog root: {declared}"
-        )
+        format!("catalog-relative profile module escapes the catalog root: {declared}")
     })?;
     anyhow::ensure!(
         !relative.as_os_str().is_empty(),
@@ -412,7 +442,6 @@ fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(normalized)
 }
 
-
 /// The session registry the CATALOG itself declares: `pty-root` if it declares one, else the native
 /// `<catalog>/pty`. This is what `st2 env`/`st2 pty`/`st2 shell` hand to bus-aware tools, so those
 /// describe the catalog rather than whatever registry the caller happens to be standing in.
@@ -485,15 +514,18 @@ pub fn passive_profiles(
     let refresh = registry.begin_refresh();
     #[cfg(feature = "wasm-resolver")]
     {
-        config.profiles.iter().try_fold(
-            ResourceProfileRegistry::empty(),
-            |passive, declared| {
+        config
+            .profiles
+            .iter()
+            .try_fold(ResourceProfileRegistry::empty(), |passive, declared| {
                 let observable = refresh
                     .try_descriptor(&declared.scheme)
                     .ok()
                     .flatten()
                     .is_some_and(|descriptor| {
-                        descriptor.capabilities.contains(&ProfileCapability::Observe)
+                        descriptor
+                            .capabilities
+                            .contains(&ProfileCapability::Observe)
                     });
                 if observable {
                     Ok(passive)
@@ -505,8 +537,7 @@ pub fn passive_profiles(
                             .clone(),
                     ))
                 }
-            },
-        )
+            })
     }
 }
 
@@ -516,7 +547,11 @@ fn validate_runtime_contracts(
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "wasm-resolver"))]
     {
-        if let Some(profile) = config.profiles.iter().find(|profile| profile.runtime.is_some()) {
+        if let Some(profile) = config
+            .profiles
+            .iter()
+            .find(|profile| profile.runtime.is_some())
+        {
             anyhow::bail!(
                 "profile '{}': observable runtime unavailable because st2 was built without the `wasm-resolver` feature",
                 profile.scheme
@@ -544,7 +579,9 @@ fn validate_runtime_contracts(
                 }
             };
             let observes = descriptor.as_ref().is_some_and(|descriptor| {
-                descriptor.capabilities.contains(&ProfileCapability::Observe)
+                descriptor
+                    .capabilities
+                    .contains(&ProfileCapability::Observe)
             });
             match (observes, profile.runtime.is_some()) {
                 (true, false) => anyhow::bail!(
@@ -688,6 +725,7 @@ mod tests {
               wasm "observe.wasm"
               runtime {
                 argv "github-resource-runtime" "pr"
+                capability "demand"
               }
             }
             "#,
@@ -697,20 +735,26 @@ mod tests {
             config.profiles[0].runtime,
             Some(DeclaredProfileRuntime {
                 argv: vec!["github-resource-runtime".into(), "pr".into()],
+                demand: true,
             })
         );
         for malformed in [
-            r#"profile "dev.x" { wasm "x.wasm" runtime }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime "shell" { argv "x" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { argv } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "x" argv "y" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { command "x" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm" runtime { argv "x" } runtime { argv "y" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime "shell" { argv "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; argv "y" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { command "x" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; capability "unknown" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x"; capability "demand"; capability "demand" } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" }; runtime { argv "y" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }
+        let without_demand =
+            parse(r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" } }"#).unwrap();
+        assert!(!without_demand.profiles[0].runtime.as_ref().unwrap().demand);
     }
 
     #[test]

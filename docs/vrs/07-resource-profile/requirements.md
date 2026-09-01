@@ -9,18 +9,11 @@ that st2 can observe. It refines [`06-resync`](../06-resync/requirements.md)
 without moving scheme ownership into st2 or making successful resolution a
 condition of agent launch.
 
-Johannes selected the registry/SDK shape (decision Q8), a wasm-only resolver
-foundation after the measured three-way comparison (decision Q10), and
-transactional ownership of catalog-relative modules (decision Q14). The
-accepted rationale is recorded in
+The accepted resolver registry, wasm boundary, and transactional ownership are
+recorded in
 [decision 0009](../.decisions/0009-resource-profiles-use-a-feature-gated-wasm-boundary.md).
-
-On 2026-08-29 Johannes extended the subsystem from passive local resolution to
-a generic read-and-observe lifecycle for remotely changing Resources. Ten
-recorded interview rounds selected state-first authority, profile-defined
-schemas and defaults with binding selectors, one atomic snapshot, thin
-invalidations, implementation-selected observation and runtime topology, and
-one latest-state catch-up. The direction is recorded in
+The state-first read-and-observe authority, atomic publication and demand
+result, typed semantic envelope, and latest-state catch-up are recorded in
 [decision 0014](../.decisions/0014-resource-profiles-are-state-first-read-and-observe-capabilities.md).
 
 ## Assumptions
@@ -39,11 +32,12 @@ one latest-state catch-up. The direction is recorded in
   complete event log, and no consumer may require every provider transition.
 - **PROFILE-A05 Downstream observation semantics:** A profile implementation
   owns provider authentication, observation, reconciliation, semantic topics,
-  snapshot schema, and selector defaults. st2 owns only the generic lifecycle,
-  validation, publication, delivery, health, and containment contracts.
-- **PROFILE-A06 Read-and-observe scope:** The first capability contract does
-  not mutate provider state or standardize actions. Comments, CI reruns, label
-  changes, close, merge, approval, and other provider writes require a separate
+  typed-fact meaning, snapshot schema, and selector defaults. st2 owns the
+  generic lifecycle, validation, atomic publication and demand result,
+  coalescing, fencing, delivery, health, and containment contracts.
+- **PROFILE-A06 Read-and-observe scope:** Read and observe do not mutate
+  provider state or standardize actions. Comments, CI reruns, label changes,
+  close, merge, approval, and other provider writes require a separate
   authority, approval, idempotency, audit, and result-delivery design.
 
 ## Acceptable Tradeoffs
@@ -52,9 +46,9 @@ one latest-state catch-up. The direction is recorded in
   and compile-time cost is accepted in builds that enable `wasm-resolver` so
   the sandbox complexity is absorbed once. Default builds retain the baseline
   dependency and binary surface.
-- **PROFILE-T02 Owned guest ABI:** st2 owns a small core-wasm ABI and its future
-  compatibility burden. Avoiding WASI and the component model keeps the initial
-  capability surface closed, but ABI evolution must be explicit.
+- **PROFILE-T02 Owned guest ABI:** st2 owns core-wasm descriptor ABI 3 and its
+  compatibility burden. Avoiding WASI and the component model keeps the
+  capability surface closed, but ABI evolution must remain explicit.
 - **PROFILE-T03 Stateless calls:** Successful compilations and unchanged
   compilation failures share a bounded cache, while each successful resolution
   receives a fresh store and instance. The extra instantiation cost is accepted
@@ -69,8 +63,8 @@ one latest-state catch-up. The direction is recorded in
   webhooks, or a hybrid. The profile implementation may use the most efficient
   provider-native mechanism, accepting responsibility for convergence,
   backpressure, rate limits, and any provider cursor or repair state.
-- **PROFILE-T06 One snapshot rather than facets:** The first contract rewrites
-  one atomic profile-defined snapshot even when provider facets change
+- **PROFILE-T06 One snapshot rather than facets:** The contract rewrites one
+  atomic profile-defined snapshot even when provider facets change
   independently. This avoids generation manifests, facet consistency, and
   retention machinery until measured payload or read costs justify them.
 - **PROFILE-T07 Schema execution:** Discovering profile capabilities, selector
@@ -163,12 +157,12 @@ one latest-state catch-up. The direction is recorded in
 ### Must describe and validate observable capabilities
 
 - **PROFILE-R12 Versioned profile descriptor:** A profile module exposes one
-  bounded, versioned descriptor in addition to resolution. The descriptor
-  declares supported capabilities, selector schema, semantic topic vocabulary,
-  default selector value, runtime topology, snapshot media type and schema
-  identity, and ABI version. The host validates the descriptor under the same
-  fuel, memory, output, import, and failure isolation as resolution. Unknown
-  required capabilities or ABI versions fail that profile locally.
+  bounded descriptor in addition to resolution. Descriptor ABI 3 declares
+  supported capabilities, selector schema, semantic topic vocabulary, default
+  selector value, runtime topology, snapshot media type, and snapshot schema
+  identity. The host validates the descriptor under the same fuel, memory,
+  output, import, and failure isolation as resolution. Unknown required
+  capabilities or ABI versions fail that profile locally.
 - **PROFILE-R13 Validated binding selectors:** An observable Resource binding
   may carry profile-specific selector configuration. Absence means the
   descriptor's default. KDL encodes the value as compact JSON in a `selector`
@@ -182,51 +176,100 @@ one latest-state catch-up. The direction is recorded in
 ### Must publish one canonical current snapshot
 
 - **PROFILE-R14 Atomic snapshot authority:** Each active observable binding has
-  at most one profile-defined canonical current snapshot. Publication replaces
-  the snapshot atomically, records its content digest and schema identity, and
-  never exposes partial bytes. Equal-byte publication is a no-op. A first
-  successful publication with at least one selected topic schedules the same
-  superseding invalidation as a later relevant change. The snapshot remains the
-  authority after missed, duplicated, reordered, or coalesced provider
-  observations.
+  at most one profile-defined canonical current snapshot. `Publication` is the
+  reusable payload for every publication form and contains schema identity,
+  media type, snapshot bytes, semantic topics, and optional ordered typed
+  facts. The host validates one complete `Publication`, computes its content
+  digest from accepted bytes, replaces the snapshot atomically, and never
+  exposes partial bytes. Periodic `Publish` and demand-result `Published`
+  traverse the same acceptance, digest, relevance, and catch-up core. Equal
+  bytes do not create a state transition. The first accepted publication with
+  at least one selected topic schedules the same superseding invalidation as a
+  later relevant change. The snapshot remains authoritative after missed,
+  duplicated, reordered, or coalesced provider observations.
 - **PROFILE-R15 Implementation-owned observation:** A profile implementation
-  chooses polling, push, native subscription, or a hybrid and may retain its own
-  provider cursor. st2 standardizes registration, atomic snapshot publication,
-  backpressure, cancellation, and health outcomes but does not send
-  observation-specific reconcile commands or prescribe the provider mechanism.
-  Provider payloads never bypass snapshot publication to become canonical
-  delivery records.
-- **PROFILE-R16 Declared runtime topology:** The descriptor declares either one
-  shared runtime per catalog and exact scheme or one runtime per active binding.
-  Both modes use one host protocol and per-binding lifecycle state. Each runtime
-  incarnation receives a directional owner claim; each binding registration
-  receives a token. The host rejects output unless both still match current
-  state. EOF and existing supervisor process lifecycle own termination and
-  restart. Shared-runtime failure may affect observation for many bindings but
-  must report health per binding; per-binding failure remains local.
+  chooses polling, push, native subscription, or a hybrid and retains its own
+  provider mechanism, cursor, conditional cache, rate-limit state, backoff, and
+  repair policy. A generic demand may pull an eligible observation forward but
+  never selects the provider mechanism, resets provider state, or becomes a
+  provider-specific reconcile command. Provider payloads never bypass
+  `Publication` to become canonical delivery records, and demand observation
+  never authorizes a provider write.
+- **PROFILE-R16 Declared runtime topology and fencing:** The descriptor declares
+  either one shared runtime per catalog and exact scheme or one runtime per
+  active binding. Both modes use one host protocol and per-binding lifecycle
+  state. Each runtime incarnation receives a directional owner claim; each
+  binding registration receives a token. The host accepts or addresses output
+  only while owner, binding, and registration match current state. EOF and the
+  supervisor process lifecycle own termination and restart. Shared-runtime
+  failure may affect observation for many bindings but reports health per
+  binding; per-binding failure remains local.
 - **PROFILE-R16A Finite protocol and publication bounds:** A selector's
   canonical compact JSON is at most 16 KiB. One encoded runtime-protocol line is
   at most 2 MiB including its newline. Decoded snapshot bytes are at most 1 MiB.
-  Health detail is at most 16 KiB of UTF-8. One publication carries at most 32
-  ordered facts; each fact key is at most 128 bytes and each before/after value
-  is at most 1 KiB of printable single-line UTF-8. st2 rejects an oversized
-  value without truncation and contains the failure to the affected runtime or
-  binding.
+  Health detail and a failed demand diagnostic are each at most 16 KiB of
+  UTF-8. One `Publication` carries at most 32 ordered facts; each fact key is at
+  most 128 bytes and each before/after value is at most 1 KiB of printable
+  single-line UTF-8. st2 rejects an oversized value without truncation and
+  contains the failure to the affected runtime or binding.
+- **PROFILE-R16B Declared atomic demand:** Demand observation is explicitly
+  declared and denied by default. Only a runtime declaration with the `demand`
+  capability may receive `Observe`. Each `Observe` carries a positive demand
+  watermark and current owner, binding, and registration fences. The runtime
+  answers exactly once for that demand with one correspondingly fenced
+  `ObservationResult`: `Unchanged`; `Failed` with an optional bounded
+  diagnostic; or `Published` with one complete `Publication`. There is no
+  separate demand publication and settlement, digest supplied by the runtime,
+  or protocol observation timestamp.
+- **PROFILE-R16C Coalesced, non-cancelling demand:** For one active
+  registration, st2 keeps at most one demand dispatch in flight and one latest
+  trailing watermark. Demand accepted during an in-flight observation survives
+  its result and coalesces into the trailing dispatch. Only an exact atomic
+  result, replacement of its fenced registration, or provider-process failure
+  closes accepted work; no clock participates in correctness. `Published`
+  settles as `settledChanged` with the host-computed accepted-publication
+  digest, including when equal bytes create no state transition or resync
+  delivery emission fails after the snapshot and catch-up transaction commits.
+  A missing active binding maps to `absentBinding`; a binding whose runtime did
+  not declare demand also maps to `absentBinding` with the explicit diagnostic
+  `the profile runtime does not declare the demand capability`. A client
+  generation older than the resident supervisor maps to `staleGeneration`; a
+  newer generation remains queued until supervisor refresh. Provider failure
+  maps to `providerUnavailable`. Client disconnect or wait expiry does not
+  cancel accepted work, retract it, or alter the runtime's observation schedule.
+- **PROFILE-R16D Durable demand intent:** Observe request and receipt records
+  carry the exact schema identities `st2.resource-observe-request.v1` and
+  `st2.resource-observe-receipt.v1`. They are private to one supervisor scope
+  and bounded to 64 KiB each. Durable admission permits at most 256 unresolved
+  requests per scope; an attempt beyond that cap receives submission
+  backpressure before it is admitted, and request scanning remains bounded by
+  the same cap. An admitted request record remains the durable, retryable
+  intent until a terminal receipt is durably committed; only then may the
+  request be removed. In-memory enqueue and nonterminal receipts do not
+  transfer that ownership.
+  A failed terminal receipt commit retains retryable state and
+  leaves the request eligible for restart.
+  Receipt status values use camelCase: `accepted` and `backpressured` are
+  nonterminal;
+  `settledUnchanged`, `settledChanged`, `settledFailed`, `absentBinding`,
+  `staleGeneration`, and `providerUnavailable` are terminal. Only
+  `settledChanged` carries the host-computed digest of accepted publication
+  bytes. Provider diagnostics normalize to an optional bounded receipt value.
 
 ### Must bound attention and catch up to current state
 
 - **PROFILE-R17 Semantic invalidation:** Every Resource invalidation carries the
   same bounded ordered fact envelope in its durable body and renders at most
-  three whole facts into a subject of at most 96 Unicode scalars. Observable
-  profiles may publish facts and semantic topics beside changed snapshot bytes;
-  st2 validates the facts, applies the binding selector to topics, and retains
-  both through catch-up. Passive carrier changes publish one `content` topic
-  and a short digest transition fact. Agent Spec declaration changes publish
-  ordered binding-label facts for added, removed, and semantically changed
-  Resource declarations without exposing URIs or reasons; unavailable
-  declaration parsing falls back to a digest transition fact rather than
-  dropping the invalidation. Snapshot bytes and provider payloads remain out of
-  the event.
+  three whole facts into a subject of at most 96 Unicode scalars. Both periodic
+  and demand publications may supply facts and semantic topics in
+  `Publication`; st2 validates the facts, applies the binding selector to
+  topics, and retains the selected topics and facts through catch-up. Passive
+  carrier changes publish one `content` topic and a short digest-transition
+  fact. Agent Spec declaration changes publish ordered binding-label facts for
+  added, removed, and semantically changed Resource declarations without
+  exposing URIs or reasons; unavailable declaration parsing falls back to a
+  digest-transition fact rather than dropping the invalidation. Snapshot bytes
+  and provider payloads remain in the authoritative carrier, not the event.
 - **PROFILE-R18 Built-in superseding delivery:** Smart Resource invalidations
   reuse one built-in per-agent delivery stream and the existing inbox, DING,
   deduplication, and producer-side supersession machinery. The binding name is
@@ -234,10 +277,11 @@ one latest-state catch-up. The direction is recorded in
   delivery plane.
 - **PROFILE-R19 Level-triggered catch-up:** Snapshot reconciliation continues
   while delivery is unavailable. Per binding, st2 retains the current snapshot
-  digest, the last-delivered digest, and one pending-relevance bit, not a
-  transition backlog or pending historical digest. When delivery becomes
-  available, a pending relevant change emits at most one invalidation for the
-  then-current snapshot digest.
+  digest, the last-delivered digest, one pending-relevance condition, and the
+  latest relevant selected topics and facts, not a transition backlog or
+  pending historical digest. When delivery becomes available, pending relevant
+  state emits at most one invalidation for the then-current snapshot digest
+  with that retained semantic envelope.
 - **PROFILE-R20 Observable health:** st2 reports descriptor, selector,
   observation, reconciliation, publication, and delivery health separately.
   Failure degrades only the affected profile runtime or binding, preserves the

@@ -11,22 +11,30 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_spec::profile::{
     ProfileCapability, ProfileDescriptor, ResourceProfileRegistry, RuntimeTopology,
 };
 use agent_spec::spec::AgentSpec;
 use anyhow::Context as _;
+use notify::RecommendedWatcher;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::catalog::CatalogConfig;
+use crate::resource_observe::{
+    ObservationAuthority, ObserveReceipt, ObserveReceiptStatus, ObserveRequest,
+    PendingRequestRecord, prepare_scope, prune_terminal_receipts, read_receipt, remove_request,
+    scan_requests, write_receipt,
+};
 use crate::resource_profile::{
-    AcceptedOutput, BindingId, BindingRegistration, CatchUp, HostMessage, OwnerClaim,
-    PublicationContract, RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation,
+    AcceptedObservation, AcceptedOutput, AcceptedPublication, BindingId, BindingRegistration,
+    CatchUp, HostMessage, MAX_PROTOCOL_LINE_BYTES, OwnerClaim, PublicationContract,
+    PublicationOutcome, RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation,
     RuntimeLifecycle, RuntimeMessage, RuntimeOwner, SnapshotDigest, SnapshotTarget, TopicSelection,
-    MAX_PROTOCOL_LINE_BYTES, decode_runtime_line, encode_host_line,
+    decode_runtime_line, encode_host_line,
 };
 
 const MAILBOX_CAPACITY: usize = 64;
@@ -51,25 +59,66 @@ pub struct ResourceProfileSupervisor {
     worker: Option<JoinHandle<()>>,
     catalog_root: PathBuf,
     this_host: String,
+    observe_watcher: Option<RecommendedWatcher>,
+    observe_bridge: Option<JoinHandle<()>>,
 }
 
 impl ResourceProfileSupervisor {
     pub fn new(catalog_root: PathBuf, this_host: String) -> anyhow::Result<Self> {
         let catalog_root = lexical_absolute(&catalog_root)?;
+        let scope = crate::park::SupervisorScope::current(&catalog_root, &this_host)?;
+        prepare_scope(&scope)?;
+        let request_dir = scope.observe_request_dir();
+        let receipt_dir = scope.observe_receipt_dir();
+        let (watch_tx, watch_rx) = mpsc::channel();
+        let observe_watcher = crate::watch::watch_recursive_mutations(&request_dir, watch_tx);
+        if observe_watcher.is_none() {
+            tracing::warn!(
+                "Resource observation request watcher is unavailable; \
+                 falling back to supervisor refreshes"
+            );
+        }
         let (tx, rx) = mpsc::sync_channel(MAILBOX_CAPACITY);
         let worker_tx = tx.clone();
         let worker_root = catalog_root.clone();
         let worker_host = this_host.clone();
         let worker = thread::Builder::new()
             .name("st2-resource-profile".to_owned())
-            .spawn(move || Worker::new(worker_root, worker_host, worker_tx).run(rx))
+            .spawn(move || {
+                Worker::new(
+                    worker_root,
+                    worker_host,
+                    worker_tx,
+                    request_dir,
+                    receipt_dir,
+                )
+                .run(rx);
+            })
             .context("spawn Resource Profile supervisor")?;
-        Ok(Self {
+        let bridge_tx = tx.clone();
+        let observe_bridge = thread::Builder::new()
+            .name("st2-resource-observe-watch".to_owned())
+            .spawn(move || {
+                while watch_rx.recv().is_ok() {
+                    if bridge_tx.send(Msg::ObserveRequests).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn Resource observation request watcher")?;
+        let supervisor = Self {
             tx,
             worker: Some(worker),
             catalog_root,
             this_host,
-        })
+            observe_watcher,
+            observe_bridge: Some(observe_bridge),
+        };
+        // Watch-before-scan: when the watcher is available, a final rename racing startup is
+        // either in this scan or queued by the watcher. Without a watcher, later supervisor
+        // refreshes continue to scan the durable request directory.
+        let _ = supervisor.tx.send(Msg::ObserveRequests);
+        Ok(supervisor)
     }
 
     /// Reconcile the exact set of bindings owned by canonical agent seats proven live this pass.
@@ -94,6 +143,7 @@ impl ResourceProfileSupervisor {
             .tx
             .send(Msg::Refresh {
                 desired,
+                catalog_generation: generation,
                 reply: reply_tx,
             })
             .is_err()
@@ -134,12 +184,16 @@ impl ResourceProfileSupervisor {
 
 impl Drop for ResourceProfileSupervisor {
     fn drop(&mut self) {
+        self.observe_watcher.take();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self.tx.send(Msg::Shutdown { reply: reply_tx }).is_ok() {
             let _ = reply_rx.recv();
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(bridge) = self.observe_bridge.take() {
+            let _ = bridge.join();
         }
     }
 }
@@ -148,6 +202,7 @@ impl Drop for ResourceProfileSupervisor {
 enum Msg {
     Refresh {
         desired: BTreeMap<String, DesiredBinding>,
+        catalog_generation: Option<u64>,
         reply: SyncSender<Vec<String>>,
     },
     Deactivate {
@@ -166,11 +221,16 @@ enum Msg {
         key: RuntimeKey,
         owner: RuntimeOwner,
     },
+    WriterDrained {
+        key: RuntimeKey,
+        owner: RuntimeOwner,
+    },
     WriterFailed {
         key: RuntimeKey,
         owner: RuntimeOwner,
         error: String,
     },
+    ObserveRequests,
     Shutdown {
         reply: SyncSender<()>,
     },
@@ -187,6 +247,7 @@ struct DesiredBinding {
     generation: u64,
     topology: RuntimeTopology,
     argv: Vec<String>,
+    demand: bool,
     uri: String,
     selector: Value,
     descriptor: ProfileDescriptor,
@@ -242,7 +303,9 @@ fn desired_bindings(
         };
         match refresh.try_descriptor(&declared.scheme) {
             Ok(Some(descriptor))
-                if descriptor.capabilities.contains(&ProfileCapability::Observe) =>
+                if descriptor
+                    .capabilities
+                    .contains(&ProfileCapability::Observe) =>
             {
                 generations.insert(
                     declared.scheme.clone(),
@@ -314,10 +377,7 @@ fn desired_bindings(
                     continue;
                 }
             };
-            let target = match SnapshotTarget::new(
-                resolution.containment_root,
-                &resolution.path,
-            ) {
+            let target = match SnapshotTarget::new(resolution.containment_root, &resolution.path) {
                 Ok(target) => target,
                 Err(error) => {
                     warnings.push(format!(
@@ -343,6 +403,7 @@ fn desired_bindings(
                     generation: *generation,
                     topology: descriptor.runtime.topology,
                     argv: runtime.argv.clone(),
+                    demand: runtime.demand,
                     uri: resource.uri().to_owned(),
                     selector,
                     descriptor: descriptor.clone(),
@@ -358,28 +419,56 @@ struct Worker {
     catalog_root: PathBuf,
     this_host: String,
     tx: SyncSender<Msg>,
+    request_dir: PathBuf,
+    receipt_dir: PathBuf,
+    initialized: bool,
+    catalog_generation: Option<u64>,
+    desired: BTreeMap<String, DesiredBinding>,
     runtimes: BTreeMap<RuntimeKey, RuntimeProcess>,
 }
 
 impl Worker {
-    fn new(catalog_root: PathBuf, this_host: String, tx: SyncSender<Msg>) -> Self {
+    fn new(
+        catalog_root: PathBuf,
+        this_host: String,
+        tx: SyncSender<Msg>,
+        request_dir: PathBuf,
+        receipt_dir: PathBuf,
+    ) -> Self {
         Self {
             catalog_root,
             this_host,
             tx,
+            request_dir,
+            receipt_dir,
+            initialized: false,
+            catalog_generation: None,
+            desired: BTreeMap::new(),
             runtimes: BTreeMap::new(),
         }
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
         while let Ok(message) = rx.recv() {
+            let mut scan_requests_now = false;
             match message {
-                Msg::Refresh { desired, reply } => {
+                Msg::Refresh {
+                    desired,
+                    catalog_generation,
+                    reply,
+                } => {
+                    self.catalog_generation = catalog_generation;
+                    self.desired = desired.clone();
                     let warnings = self.reconcile(desired);
+                    self.initialized = true;
+                    scan_requests_now = true;
                     let _ = reply.send(warnings);
                 }
                 Msg::Deactivate { recipient, reply } => {
                     self.deactivate_recipient(&recipient);
+                    self.desired
+                        .retain(|_, binding| binding.recipient != recipient);
+                    scan_requests_now = true;
                     let _ = reply.send(());
                 }
                 Msg::Health { reply } => {
@@ -392,18 +481,37 @@ impl Worker {
                 }
                 Msg::RuntimeOutput { key, owner, output } => {
                     self.runtime_output(&key, &owner, output);
+                    scan_requests_now = true;
                 }
                 Msg::RuntimeEof { key, owner } => {
                     self.runtime_failed(&key, &owner, "runtime protocol reached EOF");
+                    scan_requests_now = true;
+                }
+                Msg::WriterDrained { key, owner } => {
+                    if !owner_matches(
+                        self.runtimes.get(&key).map(|runtime| &runtime.owner),
+                        &owner,
+                    ) {
+                        continue;
+                    }
                 }
                 Msg::WriterFailed { key, owner, error } => {
                     self.runtime_failed(&key, &owner, &error);
+                    scan_requests_now = true;
+                }
+                Msg::ObserveRequests => {
+                    scan_requests_now = true;
                 }
                 Msg::Shutdown { reply } => {
                     self.stop_all();
                     let _ = reply.send(());
                     break;
                 }
+            }
+            self.retry_observe_dispatches();
+            if scan_requests_now {
+                self.consume_observe_requests();
+                self.retry_observe_dispatches();
             }
         }
         self.stop_all();
@@ -423,6 +531,10 @@ impl Worker {
             .collect::<Vec<_>>();
         for key in obsolete {
             if let Some(mut runtime) = self.runtimes.remove(&key) {
+                runtime.finalize_all_demand(
+                    ObserveReceiptStatus::StaleGeneration,
+                    Some("binding generation was replaced".to_owned()),
+                );
                 runtime.deactivate_all();
                 runtime.stop();
             }
@@ -430,7 +542,10 @@ impl Worker {
 
         let mut grouped: BTreeMap<RuntimeKey, Vec<DesiredBinding>> = BTreeMap::new();
         for binding in desired.into_values() {
-            grouped.entry(binding.runtime_key()).or_default().push(binding);
+            grouped
+                .entry(binding.runtime_key())
+                .or_default()
+                .push(binding);
         }
         for (key, bindings) in grouped {
             if !self.runtimes.contains_key(&key) {
@@ -462,6 +577,10 @@ impl Worker {
                     runtime.scheme
                 ));
                 if let Some(mut failed) = self.runtimes.remove(&key) {
+                    failed.finalize_all_demand(
+                        ObserveReceiptStatus::ProviderUnavailable,
+                        Some("runtime registration failed".to_owned()),
+                    );
                     failed.stop();
                 }
             }
@@ -482,6 +601,172 @@ impl Worker {
             if let Some(mut runtime) = self.runtimes.remove(&key) {
                 runtime.stop();
             }
+        }
+    }
+    fn retry_observe_dispatches(&mut self) {
+        for runtime in self.runtimes.values_mut() {
+            for error in runtime.retry_observe_dispatches() {
+                eprintln!("st2: Resource Profile '{}': {error}", runtime.scheme);
+            }
+        }
+    }
+
+    fn consume_observe_requests(&mut self) {
+        if !self.initialized {
+            return;
+        }
+        let _span = tracing::info_span!(
+            "resource.observe.consume",
+            catalog = %self.catalog_root.display(),
+            host = %self.this_host
+        )
+        .entered();
+        let (records, errors) = scan_requests(&self.request_dir);
+        for error in errors {
+            eprintln!("st2: {error}");
+        }
+        for record in records {
+            match read_receipt(&self.receipt_dir, &record.request.request_id) {
+                Ok(Some(receipt)) if receipt.status.is_terminal() => {
+                    let _ = remove_request(&record.path);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!(
+                        "st2: reading observe receipt for {:?}: {error:#}",
+                        record.request.request_id
+                    );
+                    continue;
+                }
+            }
+            if self
+                .runtimes
+                .values()
+                .any(|runtime| runtime.contains_request(&record.request.request_id))
+            {
+                continue;
+            }
+            if let Some(expected) = record.request.expected_catalog_generation {
+                match self.catalog_generation {
+                    Some(current) if expected < current => {
+                        self.finish_request_without_dispatch(
+                            &record,
+                            ObserveReceiptStatus::StaleGeneration,
+                            "catalog generation changed before dispatch",
+                        );
+                        continue;
+                    }
+                    Some(current) if expected > current => continue,
+                    None => continue,
+                    Some(_) => {}
+                }
+            }
+            let stable_key = record.request.stable_key();
+            let runtime_key = self.runtimes.iter().find_map(|(key, runtime)| {
+                runtime
+                    .bindings
+                    .contains_key(&stable_key)
+                    .then(|| key.clone())
+            });
+            let Some(runtime_key) = runtime_key else {
+                let (status, detail) = match self.desired.get(&stable_key) {
+                    Some(desired) if desired.demand => (
+                        ObserveReceiptStatus::ProviderUnavailable,
+                        "the declared provider runtime is not available",
+                    ),
+                    Some(_) => (
+                        ObserveReceiptStatus::AbsentBinding,
+                        "the profile runtime does not declare the demand capability",
+                    ),
+                    None => (
+                        ObserveReceiptStatus::AbsentBinding,
+                        "no active observable binding matches the target",
+                    ),
+                };
+                self.finish_request_without_dispatch(&record, status, detail);
+                continue;
+            };
+            let Some(active) = self
+                .runtimes
+                .get(&runtime_key)
+                .and_then(|runtime| runtime.bindings.get(&stable_key))
+            else {
+                continue;
+            };
+            if !active.desired.demand {
+                self.finish_request_without_dispatch(
+                    &record,
+                    ObserveReceiptStatus::AbsentBinding,
+                    "the profile runtime does not declare the demand capability",
+                );
+                continue;
+            }
+            if record.request.expected_snapshot_digest.is_some()
+                && record.request.expected_snapshot_digest
+                    != active.catch_up.state().current_snapshot_digest()
+            {
+                self.finish_request_without_dispatch(
+                    &record,
+                    ObserveReceiptStatus::StaleGeneration,
+                    "snapshot digest changed before dispatch",
+                );
+                continue;
+            }
+            let enqueue = self
+                .runtimes
+                .get_mut(&runtime_key)
+                .context("resolved runtime disappeared before demand enqueue")
+                .and_then(|runtime| {
+                    runtime.enqueue_demand(
+                        stable_key,
+                        record.request.clone(),
+                        record.path.clone(),
+                        record.modified_at,
+                    )
+                });
+            if let Err(error) = enqueue {
+                self.finish_request_without_dispatch(
+                    &record,
+                    ObserveReceiptStatus::ProviderUnavailable,
+                    &error.to_string(),
+                );
+                continue;
+            }
+        }
+        for error in prune_terminal_receipts(&self.receipt_dir) {
+            eprintln!("st2: {error}");
+        }
+    }
+
+    fn finish_request_without_dispatch(
+        &self,
+        record: &PendingRequestRecord,
+        status: ObserveReceiptStatus,
+        diagnostic: &str,
+    ) {
+        let receipt = ObserveReceipt::new(
+            &record.request,
+            status,
+            None,
+            None,
+            None,
+            Some(diagnostic.to_owned()),
+        );
+        match receipt.and_then(|receipt| write_receipt(&self.receipt_dir, &receipt)) {
+            Ok(()) => {
+                crate::metrics::record_resource_observe_request(status.wire_str());
+                if let Err(error) = remove_request(&record.path) {
+                    eprintln!(
+                        "st2: consuming observe request {}: {error:#}",
+                        record.path.display()
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "st2: writing observe receipt for {:?}: {error:#}",
+                record.request.request_id
+            ),
         }
     }
 
@@ -515,13 +800,16 @@ impl Worker {
         }
         if let Some(mut runtime) = self.runtimes.remove(key) {
             eprintln!("st2: Resource Profile '{}': {detail}", runtime.scheme);
+            runtime.finalize_all_demand(
+                ObserveReceiptStatus::ProviderUnavailable,
+                Some(detail.to_owned()),
+            );
             runtime.stop();
         }
     }
 
     fn stop_all(&mut self) {
         for (_, mut runtime) in std::mem::take(&mut self.runtimes) {
-            runtime.deactivate_all();
             runtime.stop();
         }
     }
@@ -536,6 +824,8 @@ struct RuntimeProcess {
     writer_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
     bindings: BTreeMap<String, ActiveBinding>,
+    request_dir: PathBuf,
+    receipt_dir: PathBuf,
     process_health: ResourceProfileHealth,
 }
 
@@ -545,6 +835,80 @@ struct ActiveBinding {
     registration: RegistrationToken,
     catch_up: CatchUp,
     health: ResourceProfileHealth,
+    demand: DemandState,
+}
+
+#[derive(Debug, Default)]
+struct DemandState {
+    next_watermark: u64,
+    in_flight: Option<DemandBatch>,
+    trailing: Option<DemandBatch>,
+    settled: Vec<DemandSettlement>,
+}
+
+#[derive(Debug)]
+struct DemandBatch {
+    watermark: u64,
+    requests: Vec<PendingDemand>,
+    dispatched_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct DemandSettlement {
+    batch: DemandBatch,
+    status: ObserveReceiptStatus,
+    digest: Option<SnapshotDigest>,
+    diagnostic: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingDemand {
+    request: ObserveRequest,
+    request_path: PathBuf,
+    queued_at: SystemTime,
+    last_status: Option<ObserveReceiptStatus>,
+}
+
+impl DemandState {
+    fn push(
+        &mut self,
+        request: ObserveRequest,
+        request_path: PathBuf,
+        queued_at: SystemTime,
+    ) -> anyhow::Result<()> {
+        if self.trailing.is_none() {
+            let watermark = self
+                .next_watermark
+                .checked_add(1)
+                .context("demand watermark exhausted")?;
+            self.next_watermark = watermark;
+            self.trailing = Some(DemandBatch {
+                watermark,
+                requests: Vec::new(),
+                dispatched_at: None,
+            });
+        }
+        self.trailing
+            .as_mut()
+            .context("trailing demand batch is absent after allocation")?
+            .requests
+            .push(PendingDemand {
+                request,
+                request_path,
+                queued_at,
+                last_status: None,
+            });
+        Ok(())
+    }
+
+    fn contains_request(&self, request_id: &str) -> bool {
+        self.in_flight
+            .iter()
+            .chain(self.trailing.iter())
+            .chain(self.settled.iter().map(|settlement| &settlement.batch))
+            .flat_map(|batch| &batch.requests)
+            .any(|pending| pending.request.request_id == request_id)
+    }
 }
 
 impl RuntimeProcess {
@@ -565,7 +929,9 @@ impl RuntimeProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = command.spawn().with_context(|| format!("spawn {executable:?}"))?;
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawn {executable:?}"))?;
         let stdin = child.stdin.take().context("capture runtime stdin")?;
         let stdout = child.stdout.take().context("capture runtime stdout")?;
         let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -587,13 +953,22 @@ impl RuntimeProcess {
         let writer_thread = thread::Builder::new()
             .name("st2-resource-profile-stdin".to_owned())
             .spawn(move || {
-                runtime_writer(stdin, writer_rx, writer_key, writer_owner, writer_supervisor)
+                runtime_writer(
+                    stdin,
+                    writer_rx,
+                    writer_key,
+                    writer_owner,
+                    writer_supervisor,
+                )
             })?;
         let reader_key = key.clone();
         let reader_owner = owner.clone();
         let reader_thread = thread::Builder::new()
             .name("st2-resource-profile-stdout".to_owned())
             .spawn(move || runtime_reader(stdout, reader_key, reader_owner, supervisor_tx))?;
+        let scope = crate::park::SupervisorScope::current(catalog_root, this_host)?;
+        let request_dir = scope.observe_request_dir();
+        let receipt_dir = scope.observe_receipt_dir();
 
         Ok(Self {
             scheme: sample.scheme.clone(),
@@ -604,6 +979,8 @@ impl RuntimeProcess {
             writer_thread: Some(writer_thread),
             reader_thread: Some(reader_thread),
             bindings: BTreeMap::new(),
+            request_dir,
+            receipt_dir,
             process_health: ResourceProfileHealth {
                 scheme: sample.scheme.clone(),
                 binding: None,
@@ -652,7 +1029,8 @@ impl RuntimeProcess {
         )))?;
         let registration = RegistrationToken::new(hash_text(&format!(
             "{}\0{}\0{sequence}",
-            self.owner.claim().as_str(), desired.stable_key
+            self.owner.claim().as_str(),
+            desired.stable_key
         )))?;
         let selection = selector_topics(&desired.selector)?;
         let contract = PublicationContract::new(
@@ -700,6 +1078,7 @@ impl RuntimeProcess {
             binding_id,
             registration,
             catch_up,
+            demand: DemandState::default(),
         };
         if pending.is_some() {
             let _ = emit_pending_for(&mut active);
@@ -713,6 +1092,14 @@ impl RuntimeProcess {
         let Some(mut active) = self.bindings.remove(stable_key) else {
             return;
         };
+        finalize_active_demand(
+            &self.request_dir,
+            &self.receipt_dir,
+            &self.owner,
+            &mut active,
+            ObserveReceiptStatus::StaleGeneration,
+            Some("binding registration was removed or replaced".to_owned()),
+        );
         let _ = active.catch_up.set_deliverable(false);
         let message = HostMessage::Unregister {
             owner: self.owner.clone(),
@@ -720,11 +1107,9 @@ impl RuntimeProcess {
             registration: active.registration.clone(),
         };
         let _ = self.send(message);
-        let _ = self.lifecycle.unregister(
-            &self.owner,
-            &active.binding_id,
-            &active.registration,
-        );
+        let _ = self
+            .lifecycle
+            .unregister(&self.owner, &active.binding_id, &active.registration);
     }
 
     fn deactivate_recipient(&mut self, recipient: &str) {
@@ -747,26 +1132,150 @@ impl RuntimeProcess {
         }
     }
 
+    fn enqueue_demand(
+        &mut self,
+        stable_key: String,
+        request: ObserveRequest,
+        request_path: PathBuf,
+        queued_at: SystemTime,
+    ) -> anyhow::Result<()> {
+        self.bindings
+            .get_mut(&stable_key)
+            .context("active binding disappeared before demand enqueue")?
+            .demand
+            .push(request, request_path, queued_at)
+    }
+
+    fn contains_request(&self, request_id: &str) -> bool {
+        self.bindings
+            .values()
+            .any(|active| active.demand.contains_request(request_id))
+    }
+
+    fn retry_observe_dispatches(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for active in self.bindings.values_mut() {
+            let authority = ObservationAuthority {
+                owner: self.owner.clone(),
+                binding_id: active.binding_id.clone(),
+                registration: active.registration.clone(),
+            };
+            errors.extend(retry_settled_demand(
+                &self.request_dir,
+                &self.receipt_dir,
+                &authority,
+                active,
+            ));
+        }
+        let keys = self
+            .bindings
+            .iter()
+            .filter(|(_, active)| {
+                active.demand.in_flight.is_none() && active.demand.trailing.is_some()
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(active) = self.bindings.get(&key) else {
+                continue;
+            };
+            let authority = ObservationAuthority {
+                owner: self.owner.clone(),
+                binding_id: active.binding_id.clone(),
+                registration: active.registration.clone(),
+            };
+            let demand_watermark = active
+                .demand
+                .trailing
+                .as_ref()
+                .expect("binding was selected with trailing demand")
+                .watermark;
+            let message = HostMessage::Observe {
+                owner: authority.owner.clone(),
+                binding_id: authority.binding_id.clone(),
+                registration: authority.registration.clone(),
+                demand_watermark,
+            };
+            match self.send(message) {
+                Ok(()) => {
+                    let active = self
+                        .bindings
+                        .get_mut(&key)
+                        .expect("binding selected from the same map");
+                    let mut batch = active
+                        .demand
+                        .trailing
+                        .take()
+                        .expect("binding was selected with trailing demand");
+                    batch.dispatched_at = Some(Instant::now());
+                    errors.extend(write_batch_status(
+                        &self.request_dir,
+                        &self.receipt_dir,
+                        &authority,
+                        &mut batch,
+                        ObserveReceiptStatus::Accepted,
+                        None,
+                        None,
+                    ));
+                    for pending in &batch.requests {
+                        crate::metrics::record_resource_observe_dispatch(
+                            SystemTime::now()
+                                .duration_since(pending.queued_at)
+                                .unwrap_or(Duration::ZERO),
+                        );
+                    }
+                    active.demand.in_flight = Some(batch);
+                }
+                Err(error) => {
+                    let active = self
+                        .bindings
+                        .get_mut(&key)
+                        .expect("binding selected from the same map");
+                    let batch = active
+                        .demand
+                        .trailing
+                        .as_mut()
+                        .expect("binding was selected with trailing demand");
+                    errors.extend(write_batch_status(
+                        &self.request_dir,
+                        &self.receipt_dir,
+                        &authority,
+                        batch,
+                        ObserveReceiptStatus::Backpressured,
+                        None,
+                        Some(error.to_string()),
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
+    fn finalize_all_demand(&mut self, status: ObserveReceiptStatus, diagnostic: Option<String>) {
+        for active in self.bindings.values_mut() {
+            finalize_active_demand(
+                &self.request_dir,
+                &self.receipt_dir,
+                &self.owner,
+                active,
+                status,
+                diagnostic.clone(),
+            );
+        }
+    }
+
     fn accept(
         &mut self,
         message: RuntimeMessage,
         catalog_root: &Path,
         this_host: &str,
     ) -> anyhow::Result<()> {
-        let binding_id = match &message {
-            RuntimeMessage::Publish { binding_id, .. } => Some(binding_id.clone()),
-            RuntimeMessage::Health { binding_id, .. } => binding_id.clone(),
-        };
         match self.lifecycle.accept_output(&message)? {
             AcceptedOutput::Publication(publication) => {
-                let active = self
-                    .bindings
-                    .values_mut()
-                    .find(|active| Some(&active.binding_id) == binding_id.as_ref())
-                    .context("accepted publication has no active binding")?;
-                let (_, pending) = active.catch_up.publish(publication)?;
-                if pending.is_some() {
-                    emit_pending(catalog_root, this_host, active)?;
+                let (_, delivery_error) =
+                    process_publication(&mut self.bindings, publication, catalog_root, this_host)?;
+                if let Some(error) = delivery_error {
+                    return Err(error);
                 }
             }
             AcceptedOutput::Health(health) => {
@@ -782,6 +1291,63 @@ impl RuntimeProcess {
                 } else {
                     self.process_health.state = health.state();
                     self.process_health.detail = health.detail().map(str::to_owned);
+                }
+            }
+            AcceptedOutput::ObservationResult(observation) => {
+                let (binding_id, watermark, result) = observation.into_parts();
+                {
+                    let active = self
+                        .bindings
+                        .values()
+                        .find(|active| &active.binding_id == binding_id)
+                        .context("accepted observation result has no active binding")?;
+                    validate_active_demand(active, watermark)?;
+                }
+                let (status, digest, diagnostic, delivery_error) = match result {
+                    AcceptedObservation::Unchanged => {
+                        (ObserveReceiptStatus::SettledUnchanged, None, None, None)
+                    }
+                    AcceptedObservation::Failed { diagnostic } => (
+                        ObserveReceiptStatus::SettledFailed,
+                        None,
+                        diagnostic.map(str::to_owned),
+                        None,
+                    ),
+                    AcceptedObservation::Published(publication) => {
+                        let (outcome, delivery_error) = process_publication(
+                            &mut self.bindings,
+                            publication,
+                            catalog_root,
+                            this_host,
+                        )?;
+                        (
+                            ObserveReceiptStatus::SettledChanged,
+                            Some(outcome.digest()),
+                            None,
+                            delivery_error,
+                        )
+                    }
+                };
+                let active = self
+                    .bindings
+                    .values_mut()
+                    .find(|active| &active.binding_id == binding_id)
+                    .context("accepted observation result has no active binding")?;
+                settle_active_demand(
+                    &self.request_dir,
+                    &self.receipt_dir,
+                    &self.owner,
+                    active,
+                    watermark,
+                    status,
+                    digest,
+                    diagnostic,
+                )?;
+                if let Some(error) = delivery_error {
+                    eprintln!(
+                        "st2: Resource Profile '{}': demanded publication delivery failed: {error:#}",
+                        self.scheme
+                    );
                 }
             }
         }
@@ -817,6 +1383,195 @@ impl RuntimeProcess {
     }
 }
 
+fn process_publication(
+    bindings: &mut BTreeMap<String, ActiveBinding>,
+    publication: AcceptedPublication<'_>,
+    catalog_root: &Path,
+    this_host: &str,
+) -> anyhow::Result<(PublicationOutcome, Option<anyhow::Error>)> {
+    let binding_id = publication.binding_id().clone();
+    let active = bindings
+        .values_mut()
+        .find(|active| active.binding_id == binding_id)
+        .context("accepted publication has no active binding")?;
+    let (outcome, pending) = active.catch_up.publish(publication)?;
+    let delivery_error = if pending.is_some() {
+        emit_pending(catalog_root, this_host, active).err()
+    } else {
+        None
+    };
+    Ok((outcome, delivery_error))
+}
+
+fn validate_active_demand(active: &ActiveBinding, watermark: u64) -> anyhow::Result<()> {
+    let expected_watermark = active
+        .demand
+        .in_flight
+        .as_ref()
+        .context("runtime returned an observation result without an outstanding demand")?
+        .watermark;
+    anyhow::ensure!(
+        expected_watermark == watermark,
+        "runtime returned demand watermark {watermark}, expected {expected_watermark}"
+    );
+    Ok(())
+}
+
+fn write_batch_status(
+    request_dir: &Path,
+    receipt_dir: &Path,
+    authority: &ObservationAuthority,
+    batch: &mut DemandBatch,
+    status: ObserveReceiptStatus,
+    digest: Option<SnapshotDigest>,
+    diagnostic: Option<String>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for pending in &mut batch.requests {
+        if pending.last_status == Some(status) {
+            continue;
+        }
+        let receipt = ObserveReceipt::new(
+            &pending.request,
+            status,
+            Some(authority.clone()),
+            Some(batch.watermark),
+            digest,
+            diagnostic.clone(),
+        );
+        match receipt.and_then(|receipt| write_receipt(receipt_dir, &receipt)) {
+            Ok(()) => {
+                pending.last_status = Some(status);
+                crate::metrics::record_resource_observe_request(status.wire_str());
+                if status.is_terminal()
+                    && let Err(error) = remove_request(&pending.request_path)
+                {
+                    errors.push(format!(
+                        "removing terminal observe request {} from {}: {error:#}",
+                        pending.request.request_id,
+                        request_dir.display()
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "writing observe receipt for {:?}: {error:#}",
+                pending.request.request_id
+            )),
+        }
+    }
+    errors
+}
+
+fn retry_settled_demand(
+    request_dir: &Path,
+    receipt_dir: &Path,
+    authority: &ObservationAuthority,
+    active: &mut ActiveBinding,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for settlement in &mut active.demand.settled {
+        errors.extend(write_batch_status(
+            request_dir,
+            receipt_dir,
+            authority,
+            &mut settlement.batch,
+            settlement.status,
+            settlement.digest,
+            settlement.diagnostic.clone(),
+        ));
+    }
+    active.demand.settled.retain(|settlement| {
+        settlement
+            .batch
+            .requests
+            .iter()
+            .any(|pending| pending.last_status != Some(settlement.status))
+    });
+    errors
+}
+
+fn settle_active_demand(
+    request_dir: &Path,
+    receipt_dir: &Path,
+    owner: &RuntimeOwner,
+    active: &mut ActiveBinding,
+    watermark: u64,
+    status: ObserveReceiptStatus,
+    digest: Option<SnapshotDigest>,
+    diagnostic: Option<String>,
+) -> anyhow::Result<()> {
+    validate_active_demand(active, watermark)?;
+    let batch = active
+        .demand
+        .in_flight
+        .take()
+        .context("validated outstanding demand disappeared before settlement")?;
+    if let Some(dispatched_at) = batch.dispatched_at {
+        for _ in &batch.requests {
+            crate::metrics::record_resource_observe_settle(dispatched_at.elapsed());
+        }
+    }
+    let authority = ObservationAuthority {
+        owner: owner.clone(),
+        binding_id: active.binding_id.clone(),
+        registration: active.registration.clone(),
+    };
+    active.demand.settled.push(DemandSettlement {
+        batch,
+        status,
+        digest,
+        diagnostic,
+    });
+    for error in retry_settled_demand(request_dir, receipt_dir, &authority, active) {
+        eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+    }
+    tracing::info!(
+        recipient = %active.desired.recipient,
+        binding = %active.desired.binding_name,
+        demand_watermark = watermark,
+        result = status.as_str(),
+        "Resource observation settled"
+    );
+    Ok(())
+}
+
+fn finalize_active_demand(
+    request_dir: &Path,
+    receipt_dir: &Path,
+    owner: &RuntimeOwner,
+    active: &mut ActiveBinding,
+    status: ObserveReceiptStatus,
+    diagnostic: Option<String>,
+) {
+    let authority = ObservationAuthority {
+        owner: owner.clone(),
+        binding_id: active.binding_id.clone(),
+        registration: active.registration.clone(),
+    };
+    for error in retry_settled_demand(request_dir, receipt_dir, &authority, active) {
+        eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+    }
+    for mut batch in active
+        .demand
+        .in_flight
+        .take()
+        .into_iter()
+        .chain(active.demand.trailing.take())
+    {
+        for error in write_batch_status(
+            request_dir,
+            receipt_dir,
+            &authority,
+            &mut batch,
+            status,
+            None,
+            diagnostic.clone(),
+        ) {
+            eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+        }
+    }
+}
+
 fn runtime_writer(
     mut stdin: std::process::ChildStdin,
     rx: Receiver<Vec<u8>>,
@@ -832,6 +1587,13 @@ fn runtime_writer(
                 error: format!("runtime stdin failed: {error}"),
             });
             return;
+        }
+        match supervisor.try_send(Msg::WriterDrained {
+            key: key.clone(),
+            owner: owner.clone(),
+        }) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => return,
         }
     }
 }
@@ -879,7 +1641,11 @@ fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return if line.is_empty() { Ok(None) } else { Ok(Some(line)) };
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
         }
         if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
             let consumed = newline + 1;
@@ -951,14 +1717,22 @@ fn profile_generation(
         declared.wasm,
         declared.class,
         declared.notify_chain,
-        declared.runtime.as_ref().map(|runtime| &runtime.argv),
+        declared.runtime.as_ref(),
         descriptor,
     );
     let digest = Sha256::digest(input.as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix is eight bytes"))
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    )
 }
 
-fn emit_pending(catalog_root: &Path, this_host: &str, active: &mut ActiveBinding) -> anyhow::Result<()> {
+fn emit_pending(
+    catalog_root: &Path,
+    this_host: &str,
+    active: &mut ActiveBinding,
+) -> anyhow::Result<()> {
     emit_pending_at(catalog_root, this_host, active)
 }
 
@@ -1019,7 +1793,9 @@ fn emit_pending_at(
 }
 
 fn publication_event_id(recipient: &str, binding: &str, digest: SnapshotDigest) -> String {
-    hash_text(&format!("resource-profile\0{recipient}\0{binding}\0{digest}"))
+    hash_text(&format!(
+        "resource-profile\0{recipient}\0{binding}\0{digest}"
+    ))
 }
 
 pub(crate) fn resource_change_subject(
@@ -1061,8 +1837,6 @@ pub(crate) fn resource_change_subject(
         return subject;
     }
 
-    // Facts and topic names are never clipped. A pathological oversized binding or topic suffix
-    // falls back to the binding and bounded generic detail; the durable body remains complete.
     let fallback = format!("{binding} · {fallback}");
     if fallback.chars().count() <= SUBJECT_MAX_SCALARS {
         fallback
@@ -1136,13 +1910,17 @@ fn hash_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn bounded_reader_accepts_one_maximal_line_and_rejects_overflow() {
         let mut maximal = vec![b'x'; MAX_PROTOCOL_LINE_BYTES - 1];
         maximal.push(b'\n');
         assert_eq!(
-            read_bounded_line(&mut maximal.as_slice()).unwrap().unwrap().len(),
+            read_bounded_line(&mut maximal.as_slice())
+                .unwrap()
+                .unwrap()
+                .len(),
             MAX_PROTOCOL_LINE_BYTES
         );
         let mut overflow = vec![b'x'; MAX_PROTOCOL_LINE_BYTES];
@@ -1186,6 +1964,165 @@ mod tests {
                 generation: 2,
             }
         );
+    }
+
+    #[test]
+    fn demand_batches_coalesce_bursts_and_keep_one_trailing_watermark() {
+        let mut demand = DemandState::default();
+        let first = ObserveRequest::new("h.a".into(), "one".into(), None, None).unwrap();
+        let second = ObserveRequest::new("h.a".into(), "one".into(), None, None).unwrap();
+        demand
+            .push(first, PathBuf::from("first.json"), SystemTime::now())
+            .unwrap();
+        demand
+            .push(second, PathBuf::from("second.json"), SystemTime::now())
+            .unwrap();
+        assert_eq!(demand.trailing.as_ref().unwrap().watermark, 1);
+        assert_eq!(demand.trailing.as_ref().unwrap().requests.len(), 2);
+
+        let mut in_flight = demand.trailing.take().unwrap();
+        in_flight.dispatched_at = Some(Instant::now());
+        demand.in_flight = Some(in_flight);
+        demand
+            .push(
+                ObserveRequest::new("h.a".into(), "one".into(), None, None).unwrap(),
+                PathBuf::from("third.json"),
+                SystemTime::now(),
+            )
+            .unwrap();
+        demand
+            .push(
+                ObserveRequest::new("h.a".into(), "one".into(), None, None).unwrap(),
+                PathBuf::from("fourth.json"),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(demand.in_flight.as_ref().unwrap().watermark, 1);
+        assert_eq!(demand.trailing.as_ref().unwrap().watermark, 2);
+        assert_eq!(demand.trailing.as_ref().unwrap().requests.len(), 2);
+    }
+
+    #[test]
+    fn terminal_receipt_write_failure_preserves_the_batch_for_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let request_dir = temporary.path().join("requests");
+        let receipt_dir = temporary.path().join("receipts");
+        fs::create_dir_all(&request_dir).unwrap();
+        fs::create_dir_all(&receipt_dir).unwrap();
+        let request = ObserveRequest::new("h.a".into(), "one".into(), None, None).unwrap();
+        let request_path = request_dir.join(format!("{}.json", request.request_id));
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let receipt_path = receipt_dir.join(format!("{}.json", request.request_id));
+        fs::create_dir(&receipt_path).unwrap();
+        let mut batch = DemandBatch {
+            watermark: 1,
+            requests: vec![PendingDemand {
+                request: request.clone(),
+                request_path: request_path.clone(),
+                queued_at: SystemTime::now(),
+                last_status: Some(ObserveReceiptStatus::Accepted),
+            }],
+            dispatched_at: Some(Instant::now()),
+        };
+        let authority = ObservationAuthority {
+            owner: RuntimeOwner::new(
+                RuntimeIncarnation::new("incarnation").unwrap(),
+                OwnerClaim::new("claim").unwrap(),
+            ),
+            binding_id: BindingId::new("binding").unwrap(),
+            registration: RegistrationToken::new("registration").unwrap(),
+        };
+
+        let errors = write_batch_status(
+            &request_dir,
+            &receipt_dir,
+            &authority,
+            &mut batch,
+            ObserveReceiptStatus::SettledUnchanged,
+            None,
+            None,
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            batch.requests[0].last_status,
+            Some(ObserveReceiptStatus::Accepted)
+        );
+        assert!(request_path.is_file());
+
+        fs::remove_dir(&receipt_path).unwrap();
+        assert!(
+            write_batch_status(
+                &request_dir,
+                &receipt_dir,
+                &authority,
+                &mut batch,
+                ObserveReceiptStatus::SettledUnchanged,
+                None,
+                None,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            batch.requests[0].last_status,
+            Some(ObserveReceiptStatus::SettledUnchanged)
+        );
+        assert!(!request_path.exists());
+        assert_eq!(
+            read_receipt(&receipt_dir, &request.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ObserveReceiptStatus::SettledUnchanged
+        );
+    }
+
+    #[test]
+    fn full_writer_queue_is_reported_without_consuming_the_frame() {
+        let owner = RuntimeOwner::new(
+            RuntimeIncarnation::new("incarnation").unwrap(),
+            OwnerClaim::new("claim").unwrap(),
+        );
+        let mut lifecycle = RuntimeLifecycle::new();
+        lifecycle.claim(owner.clone());
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (writer, queued) = mpsc::sync_channel(1);
+        writer.try_send(vec![1]).unwrap();
+        let receipt_dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeProcess {
+            scheme: "dev.x".into(),
+            owner: owner.clone(),
+            lifecycle,
+            child,
+            writer: Some(writer),
+            writer_thread: None,
+            reader_thread: None,
+            bindings: BTreeMap::new(),
+            request_dir: receipt_dir.path().join("requests"),
+            receipt_dir: receipt_dir.path().to_path_buf(),
+            process_health: ResourceProfileHealth {
+                scheme: "dev.x".into(),
+                binding: None,
+                state: RuntimeHealthState::Starting,
+                detail: None,
+            },
+        };
+        let error = runtime
+            .send(HostMessage::Observe {
+                owner,
+                binding_id: BindingId::new("binding").unwrap(),
+                registration: RegistrationToken::new("registration").unwrap(),
+                demand_watermark: 1,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("queue is full"));
+        assert_eq!(queued.try_recv().unwrap(), vec![1]);
+        runtime.stop();
     }
 
     #[test]
@@ -1270,7 +2207,14 @@ mod tests {
             generation: 1,
         };
         let (tx, _rx) = mpsc::sync_channel(1);
-        let mut worker = Worker::new(PathBuf::from("/"), "host".into(), tx);
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = Worker::new(
+            temp.path().to_path_buf(),
+            "host".into(),
+            tx,
+            temp.path().join("requests"),
+            temp.path().join("receipts"),
+        );
         worker.runtimes.insert(
             key.clone(),
             RuntimeProcess {
@@ -1282,6 +2226,8 @@ mod tests {
                 writer_thread: None,
                 reader_thread: None,
                 bindings: BTreeMap::new(),
+                request_dir: temp.path().join("requests"),
+                receipt_dir: temp.path().join("receipts"),
                 process_health: ResourceProfileHealth {
                     scheme: "dev.x".into(),
                     binding: None,

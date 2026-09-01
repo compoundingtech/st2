@@ -44,16 +44,25 @@ const DURATION_BUCKET_BOUNDARIES: [f64; 12] = [
 /// View mapping each duration instrument onto seconds-scale explicit buckets (see
 /// [`DURATION_BUCKET_BOUNDARIES`]); every other instrument keeps its default aggregation.
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
-    match instrument.name() {
-        "reconcile_pass_duration_seconds" | "session_start_duration_seconds" => Stream::builder()
+    duration_instrument(instrument.name()).then(|| {
+        Stream::builder()
             .with_aggregation(Aggregation::ExplicitBucketHistogram {
                 boundaries: DURATION_BUCKET_BOUNDARIES.into(),
                 record_min_max: true,
             })
             .build()
-            .ok(),
-        _ => None,
-    }
+            .expect("duration histogram view is valid")
+    })
+}
+
+fn duration_instrument(name: &str) -> bool {
+    matches!(
+        name,
+        "reconcile_pass_duration_seconds"
+            | "session_start_duration_seconds"
+            | "resource_observe_dispatch_seconds"
+            | "resource_observe_settle_seconds"
+    )
 }
 
 /// Level filtering for the stderr fmt layer, defaulting to INFO. `RUST_LOG` overrides it on that
@@ -296,4 +305,22 @@ fn build_log_exporter() -> Result<LogExporter, opentelemetry_otlp::ExporterBuild
         .with_http()
         .with_protocol(opentelemetry_otlp::Protocol::HttpJson)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_view_covers_every_duration_histogram() {
+        for name in [
+            "reconcile_pass_duration_seconds",
+            "session_start_duration_seconds",
+            "resource_observe_dispatch_seconds",
+            "resource_observe_settle_seconds",
+        ] {
+            assert!(duration_instrument(name), "{name}");
+        }
+        assert!(!duration_instrument("resource_observe_requests_total"));
+    }
 }
