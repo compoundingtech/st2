@@ -1,11 +1,12 @@
 use std::fs;
+use std::sync::{Arc, Barrier};
 
 use serde_json::json;
 use st2_resource_protocol::ObservationResult;
 use st2_resource_wasip2::{
-    CacheDisposition, CacheRejection, CapabilityModule, Executor, InvocationStore, LimitKind,
-    LoadError, NoCapabilities, ObservationRequest, ObserveError, PrivateArtifactCache,
-    RuntimeConfig,
+    CacheDisposition, CacheRejection, CapabilityContext, CapabilityModule, Executor,
+    InvocationStore, LimitKind, LoadError, NoCapabilities, ObservationRequest, ObserveError,
+    PrivateArtifactCache, RuntimeConfig, SchedulingCapability,
 };
 use wasmtime::component::{HasSelf, Linker};
 
@@ -16,12 +17,13 @@ mod fixture {
     });
 }
 
-use fixture::compoundingtech::st2_resource_observer::observation::{
-    Fact, FactValue, Host, ObservationError, Proposal, Publication, Request,
+use fixture::st2::resource_provider::provider_api::{
+    DescriptorError, Fact, FactValue, Host, ObservationResult as WitObservationResult,
+    ObserveRequest, ProviderDescriptor as WitProviderDescriptor, Publication,
+    SchedulingCapability as WitSchedulingCapability,
 };
 
-const OBSERVATION_IMPORT: &str =
-    "compoundingtech:st2-resource-observer/observation@0.1.0";
+const PROVIDER_IMPORT: &str = "st2:resource-provider/provider-api@0.1.0";
 const NO_EFFECT: &str = include_str!("fixtures/no-effect-component.wat");
 
 #[derive(Default)]
@@ -29,26 +31,44 @@ struct FixtureInvocation {
     calls: u8,
 }
 
+fn wit_descriptor() -> WitProviderDescriptor {
+    WitProviderDescriptor {
+        capabilities: vec![WitSchedulingCapability::Demand],
+        selector_schema_json: r#"{"type":"object"}"#.to_owned(),
+        default_selector_json: "{}".to_owned(),
+        topics: vec!["fixture".to_owned()],
+        snapshot_media_type: "application/octet-stream".to_owned(),
+        snapshot_schema_id: "dev.compounding.fixture/v1".to_owned(),
+    }
+}
+
 impl Host for InvocationStore<FixtureInvocation> {
-    fn observe(&mut self, request: Request) -> Result<Proposal, ObservationError> {
+    fn describe(&mut self) -> Result<WitProviderDescriptor, DescriptorError> {
+        Ok(wit_descriptor())
+    }
+
+    fn observe(&mut self, request: ObserveRequest) -> WitObservationResult {
         self.capability_mut().calls += 1;
         let calls = self.capability().calls;
+        let publication_byte = request
+            .demand_watermark
+            .map_or(calls, |watermark| u8::try_from(watermark).unwrap());
         let topics = if request.uri == "fixture://invalid" {
             vec!["duplicate".to_owned(), "duplicate".to_owned()]
         } else {
             vec!["fixture".to_owned()]
         };
-        Ok(Proposal::Published(Publication {
+        WitObservationResult::Published(Publication {
             schema_id: "dev.compounding.fixture/v1".to_owned(),
             media_type: "application/octet-stream".to_owned(),
-            bytes: vec![calls],
+            bytes: vec![publication_byte],
             topics,
-            facts: vec![Fact {
+            facts: Some(vec![Fact {
                 key: "calls".to_owned(),
                 before: FactValue::Omitted,
                 after: FactValue::Value(calls.to_string()),
-            }],
-        }))
+            }]),
+        })
     }
 }
 
@@ -58,7 +78,7 @@ impl CapabilityModule for FixtureCapabilities {
     type Invocation = FixtureInvocation;
 
     fn import_names(&self) -> &'static [&'static str] {
-        &[OBSERVATION_IMPORT]
+        &[PROVIDER_IMPORT]
     }
 
     fn add_to_linker(
@@ -68,8 +88,48 @@ impl CapabilityModule for FixtureCapabilities {
         fixture::FixtureHost::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
     }
 
-    fn begin(&self, _request: &ObservationRequest) -> Self::Invocation {
+    fn begin(&self, _context: CapabilityContext<'_>) -> Self::Invocation {
         FixtureInvocation::default()
+    }
+}
+struct BlockingCapabilities {
+    entered: Arc<Barrier>,
+}
+
+struct BlockingInvocation {
+    entered: Arc<Barrier>,
+}
+
+impl Host for InvocationStore<BlockingInvocation> {
+    fn describe(&mut self) -> Result<WitProviderDescriptor, DescriptorError> {
+        Ok(wit_descriptor())
+    }
+
+    fn observe(&mut self, _request: ObserveRequest) -> WitObservationResult {
+        self.capability().entered.wait();
+        let reason = self.control().wait_for_interruption();
+        WitObservationResult::Failed(Some(format!("{reason:?}")))
+    }
+}
+
+impl CapabilityModule for BlockingCapabilities {
+    type Invocation = BlockingInvocation;
+
+    fn import_names(&self) -> &'static [&'static str] {
+        &[PROVIDER_IMPORT]
+    }
+
+    fn add_to_linker(
+        &self,
+        linker: &mut Linker<InvocationStore<Self::Invocation>>,
+    ) -> Result<(), wasmtime::Error> {
+        fixture::FixtureHost::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+    }
+
+    fn begin(&self, _context: CapabilityContext<'_>) -> Self::Invocation {
+        BlockingInvocation {
+            entered: Arc::clone(&self.entered),
+        }
     }
 }
 
@@ -81,7 +141,8 @@ fn request() -> ObservationRequest {
     ObservationRequest {
         uri: "fixture://resource".to_owned(),
         selector: json!({"region": "local"}),
-        previous_digest: None,
+        prior_digest: None,
+        demand_watermark: None,
     }
 }
 
@@ -101,11 +162,23 @@ fn publication_bytes(result: ObservationResult) -> Vec<u8> {
 }
 
 #[test]
-fn executes_one_typed_observation_proposal() {
+fn executes_the_repository_provider_world() {
     let executor = executor(RuntimeConfig::default(), None);
     let loaded = executor.load(&component(NO_EFFECT)).unwrap();
-    let result = executor.observe(&loaded, &request(), None).unwrap();
-    assert_eq!(publication_bytes(result), vec![1]);
+    let descriptor = executor.describe(&loaded, None).unwrap();
+    assert_eq!(descriptor.capabilities, vec![SchedulingCapability::Demand]);
+    assert_eq!(descriptor.default_selector, json!({}));
+    let mut demand = request();
+    demand.demand_watermark = Some(7);
+    let result = executor.observe(&loaded, &demand, None).unwrap();
+    assert_eq!(publication_bytes(result), vec![7]);
+    demand.demand_watermark = Some(0);
+    assert!(matches!(
+        executor.observe(&loaded, &demand, None),
+        Err(ObserveError::InvalidRequest(
+            "demand watermark must be positive"
+        ))
+    ));
 }
 
 #[test]
@@ -213,6 +286,49 @@ fn deterministic_epoch_handle_classifies_timeout_and_cancel() {
         vec![1]
     );
 }
+enum BlockedInterruption {
+    Cancel,
+    TimeOut,
+}
+
+fn interrupt_blocked_import(interruption: BlockedInterruption) -> ObserveError {
+    let entered = Arc::new(Barrier::new(2));
+    let executor = Executor::new(
+        RuntimeConfig::default(),
+        None,
+        BlockingCapabilities {
+            entered: Arc::clone(&entered),
+        },
+    )
+    .unwrap();
+    let loaded = executor.load(&component(NO_EFFECT)).unwrap();
+    let handle = executor.interruption_handle();
+    let trigger = handle.clone();
+    let observing =
+        std::thread::spawn(move || executor.observe(&loaded, &request(), Some(&handle)));
+    entered.wait();
+    match interruption {
+        BlockedInterruption::Cancel => assert!(trigger.cancel()),
+        BlockedInterruption::TimeOut => assert!(trigger.time_out()),
+    }
+    observing.join().unwrap().unwrap_err()
+}
+
+#[test]
+fn cancellation_wakes_a_blocked_capability_import() {
+    assert!(matches!(
+        interrupt_blocked_import(BlockedInterruption::Cancel),
+        ObserveError::Cancelled
+    ));
+}
+
+#[test]
+fn timeout_wakes_a_blocked_capability_import() {
+    assert!(matches!(
+        interrupt_blocked_import(BlockedInterruption::TimeOut),
+        ObserveError::TimedOut
+    ));
+}
 
 #[test]
 fn every_observation_gets_fresh_store_state() {
@@ -234,7 +350,7 @@ fn imports_are_rejected_unless_an_explicit_capability_module_admits_them() {
     let result = executor.load(&component(NO_EFFECT));
     assert!(matches!(
         result,
-        Err(LoadError::ForbiddenImports(imports)) if imports == [OBSERVATION_IMPORT]
+        Err(LoadError::ForbiddenImports(imports)) if imports == [PROVIDER_IMPORT]
     ));
 }
 

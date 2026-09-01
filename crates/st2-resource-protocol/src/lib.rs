@@ -1077,7 +1077,7 @@ fn validate_facts(facts: &[ResourceFact]) -> Result<(), ProtocolError> {
         .map_err(ProtocolError::InvalidFacts)
 }
 
-fn validate_topics(topics: &[String]) -> Result<(), ProtocolError> {
+pub fn validate_topics(topics: &[String]) -> Result<(), ProtocolError> {
     let mut unique = BTreeSet::new();
     for topic in topics {
         if topic.is_empty() {

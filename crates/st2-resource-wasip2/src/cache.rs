@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -32,7 +32,7 @@ impl PrivateArtifactCache {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if metadata.mode() & 0o022 != 0 {
+            if metadata.mode() & 0o022 != 0 || metadata.uid() != effective_uid() {
                 return Err(CacheOpenError::NotPrivateDirectory);
             }
         }
@@ -57,7 +57,7 @@ impl std::fmt::Display for CacheOpenError {
         match self {
             Self::Io(error) => write!(formatter, "cannot open artifact cache: {error}"),
             Self::NotPrivateDirectory => formatter.write_str(
-                "artifact cache must be a real directory not writable by group or other users",
+                "artifact cache must be a real effective-UID-owned directory not writable by group or other users",
             ),
         }
     }
@@ -79,6 +79,7 @@ pub enum CacheRejection {
     ArtifactLength,
     ArtifactDigest,
     ArtifactUnreadable(String),
+    UntrustedOwnership(String),
     Deserialization(String),
 }
 
@@ -126,6 +127,182 @@ pub(crate) enum CacheLookup {
     Miss,
     Hit(Component),
     Rejected(CacheRejection),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecuredEntryKind {
+    Directory,
+    RegularFile,
+    Symlink,
+    Other,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct SecurityMetadata {
+    kind: SecuredEntryKind,
+    uid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+trait SecurityMetadataOracle {
+    fn metadata(&self, path: &Path) -> Result<SecurityMetadata, String>;
+}
+
+#[cfg(unix)]
+struct FilesystemMetadata;
+
+#[cfg(unix)]
+impl SecurityMetadataOracle for FilesystemMetadata {
+    fn metadata(&self, path: &Path) -> Result<SecurityMetadata, String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            SecuredEntryKind::Symlink
+        } else if metadata.is_dir() {
+            SecuredEntryKind::Directory
+        } else if metadata.is_file() {
+            SecuredEntryKind::RegularFile
+        } else {
+            SecuredEntryKind::Other
+        };
+        Ok(SecurityMetadata {
+            kind,
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum OwnershipViolation {
+    OutsideRoot,
+    Metadata { path: PathBuf, error: String },
+    WrongKind {
+        path: PathBuf,
+        expected: SecuredEntryKind,
+        actual: SecuredEntryKind,
+    },
+    WrongOwner {
+        path: PathBuf,
+        expected: u32,
+        actual: u32,
+    },
+    WritableByOther { path: PathBuf },
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for OwnershipViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideRoot => formatter.write_str("cache entry is outside the cache root"),
+            Self::Metadata { path, error } => {
+                write!(formatter, "cannot inspect {}: {error}", path.display())
+            }
+            Self::WrongKind {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{} has kind {actual:?}; expected {expected:?}",
+                path.display(),
+            ),
+            Self::WrongOwner {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{} is owned by UID {actual}; expected effective UID {expected}",
+                path.display(),
+            ),
+            Self::WritableByOther { path } => write!(
+                formatter,
+                "{} is writable by group or other users",
+                path.display(),
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_owned_cache_entry_with(
+    root: &Path,
+    entry: &Path,
+    effective_uid: u32,
+    oracle: &impl SecurityMetadataOracle,
+) -> Result<(), OwnershipViolation> {
+    let relative = entry
+        .strip_prefix(root)
+        .map_err(|_| OwnershipViolation::OutsideRoot)?;
+    validate_secured_entry(
+        root,
+        SecuredEntryKind::Directory,
+        effective_uid,
+        oracle,
+    )?;
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(OwnershipViolation::OutsideRoot);
+        };
+        current.push(component);
+        let expected = if components.peek().is_some() {
+            SecuredEntryKind::Directory
+        } else {
+            SecuredEntryKind::RegularFile
+        };
+        validate_secured_entry(&current, expected, effective_uid, oracle)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_secured_entry(
+    path: &Path,
+    expected: SecuredEntryKind,
+    effective_uid: u32,
+    oracle: &impl SecurityMetadataOracle,
+) -> Result<(), OwnershipViolation> {
+    let metadata = oracle
+        .metadata(path)
+        .map_err(|error| OwnershipViolation::Metadata {
+            path: path.to_path_buf(),
+            error,
+        })?;
+    if metadata.kind != expected {
+        return Err(OwnershipViolation::WrongKind {
+            path: path.to_path_buf(),
+            expected,
+            actual: metadata.kind,
+        });
+    }
+    if metadata.uid != effective_uid {
+        return Err(OwnershipViolation::WrongOwner {
+            path: path.to_path_buf(),
+            expected: effective_uid,
+            actual: metadata.uid,
+        });
+    }
+    if metadata.mode & 0o022 != 0 {
+        return Err(OwnershipViolation::WritableByOther {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and reads process credentials.
+    unsafe { libc::geteuid() }
 }
 
 pub(crate) fn load(
@@ -196,9 +373,23 @@ pub(crate) fn load(
     if sha256_hex(&artifact) != manifest.artifact_digest {
         return CacheLookup::Rejected(CacheRejection::ArtifactDigest);
     }
+    #[cfg(unix)]
+    {
+        let oracle = FilesystemMetadata;
+        for path in [&manifest_path, &artifact_path] {
+            if let Err(error) =
+                validate_owned_cache_entry_with(cache.root(), path, effective_uid(), &oracle)
+            {
+                return CacheLookup::Rejected(CacheRejection::UntrustedOwnership(
+                    error.to_string(),
+                ));
+            }
+        }
+    }
 
-    // The cache root is admitted as a private host-owned directory, and every manifest field plus
-    // the exact artifact bytes has been verified before crossing Wasmtime's unsafe AOT boundary.
+    // The cache root, internal ancestors, manifest and artifact are effective-UID-owned and
+    // non-writable by other users, and every manifest field plus the exact artifact bytes has
+    // been verified before crossing Wasmtime's unsafe AOT boundary.
     let component = unsafe { Component::deserialize(engine, &artifact) };
     match component {
         Ok(component) => CacheLookup::Hit(component),
@@ -405,20 +596,35 @@ enum ReadError {
 }
 
 fn read_regular_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, ReadError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ReadError::Io(error.to_string())),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    let metadata = file
+        .metadata()
+        .map_err(|error| ReadError::Io(error.to_string()))?;
+    if !metadata.is_file() {
         return Err(ReadError::Io("entry is not a regular file".to_owned()));
     }
     if metadata.len() > limit {
         return Err(ReadError::TooLarge);
     }
-    fs::read(path)
-        .map(Some)
-        .map_err(|error| ReadError::Io(error.to_string()))
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ReadError::Io(error.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(ReadError::TooLarge);
+    }
+    Ok(Some(bytes))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -428,6 +634,8 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    #[cfg(unix)]
+    use std::collections::HashMap;
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -441,6 +649,101 @@ mod tests {
             config_identity: "config-a".to_owned(),
         }
     }
+
+    #[cfg(unix)]
+    struct FakeMetadata {
+        entries: HashMap<PathBuf, SecurityMetadata>,
+    }
+
+    #[cfg(unix)]
+    impl SecurityMetadataOracle for FakeMetadata {
+        fn metadata(&self, path: &Path) -> Result<SecurityMetadata, String> {
+            self.entries
+                .get(path)
+                .copied()
+                .ok_or_else(|| "missing fake metadata".to_owned())
+        }
+    }
+
+    #[cfg(unix)]
+    fn owned_manifest_tree(uid: u32) -> (PathBuf, PathBuf, FakeMetadata) {
+        let root = PathBuf::from("/cache");
+        let manifest_directory = root.join("manifests");
+        let digest_directory = manifest_directory.join("digest");
+        let manifest = digest_directory.join("identity.json");
+        let entries = [
+            (
+                root.clone(),
+                SecurityMetadata {
+                    kind: SecuredEntryKind::Directory,
+                    uid,
+                    mode: 0o700,
+                },
+            ),
+            (
+                manifest_directory,
+                SecurityMetadata {
+                    kind: SecuredEntryKind::Directory,
+                    uid,
+                    mode: 0o700,
+                },
+            ),
+            (
+                digest_directory,
+                SecurityMetadata {
+                    kind: SecuredEntryKind::Directory,
+                    uid,
+                    mode: 0o700,
+                },
+            ),
+            (
+                manifest.clone(),
+                SecurityMetadata {
+                    kind: SecuredEntryKind::RegularFile,
+                    uid,
+                    mode: 0o600,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        (root, manifest, FakeMetadata { entries })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_policy_checks_root_ancestors_and_entry() {
+        let effective_uid = 42;
+        let (root, manifest, trusted) = owned_manifest_tree(effective_uid);
+        assert_eq!(
+            validate_owned_cache_entry_with(&root, &manifest, effective_uid, &trusted),
+            Ok(())
+        );
+
+        for path in [
+            root.clone(),
+            root.join("manifests"),
+            root.join("manifests/digest"),
+            manifest.clone(),
+        ] {
+            let (_, _, mut untrusted) = owned_manifest_tree(effective_uid);
+            untrusted.entries.get_mut(&path).unwrap().uid = 7;
+            assert_eq!(
+                validate_owned_cache_entry_with(
+                    &root,
+                    &manifest,
+                    effective_uid,
+                    &untrusted,
+                ),
+                Err(OwnershipViolation::WrongOwner {
+                    path,
+                    expected: effective_uid,
+                    actual: 7,
+                })
+            );
+        }
+    }
+
 
     #[test]
     fn cache_key_covers_every_compatibility_field() {
