@@ -14,6 +14,8 @@
 //! writes interleaved with sibling boots lost-update each other — the multi-spawn trust race. Trusting
 //! every workspace in one write *before* the first agent boots closes it.
 
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -40,6 +42,12 @@ pub fn pretrust(dirs: &[PathBuf]) -> Result<usize> {
     // skip it), stored separately — mark the dirs trusted there too so a codex seat never hangs.
     pretrust_codex_at(&codex_config_path()?, dirs)?;
     Ok(n)
+}
+
+/// Admit workspaces for Claude in the provider runtime's selected config. A typed Claude driver
+/// calls this after task environment selection and before it starts Claude.
+pub fn pretrust_claude(dirs: &[PathBuf]) -> Result<usize> {
+    pretrust_at(&config_path()?, dirs)
 }
 
 /// Pre-trust workspaces for Codex only in the caller's ambient config. This remains available to
@@ -115,6 +123,7 @@ fn toml_key(dir: &str) -> String {
 /// The core, taking the config path explicitly so it is testable without touching the real config or
 /// the process environment. Idempotent: re-trusting an already-trusted dir is a no-op merge.
 pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
+    let _lock = ConfigLock::acquire(config)?;
     // Read the existing config, or start from an empty object if it is absent/blank.
     let mut root: Value = match std::fs::read_to_string(config) {
         Ok(s) if !s.trim().is_empty() => {
@@ -145,6 +154,43 @@ pub fn pretrust_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
 
     write_atomic(config, &root)?;
     Ok(dirs.len())
+}
+
+struct ConfigLock(File);
+
+impl ConfigLock {
+    fn acquire(config: &Path) -> Result<Self> {
+        if let Some(parent) = config.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut path = config.as_os_str().to_owned();
+        path.push(".st2trust.lock");
+        let path = PathBuf::from(path);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        anyhow::ensure!(
+            result == 0,
+            "locking {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 /// The absolute path claude keys a project by: the canonical (symlink-resolved) path when the dir

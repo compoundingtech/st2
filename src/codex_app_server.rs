@@ -3104,10 +3104,22 @@ fn ensure_supported_protocol(codex: &str) -> Result<()> {
 }
 
 fn codex_version(codex: &str) -> Result<String> {
-    let output = Command::new(codex)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("reading Codex version from {codex}"))?;
+    let mut attempt_index = 0;
+    let output = loop {
+        let attempt = Command::new(codex).arg("--version").output();
+        match attempt {
+            Ok(output) => break output,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt_index + 1 < 5 => {
+                // Some Linux filesystems briefly retain writer exclusion after a binary install.
+                // Retry only this transient error and keep every other launch error immediate.
+                attempt_index += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading Codex version from {codex}"));
+            }
+        }
+    };
     anyhow::ensure!(
         output.status.success(),
         "{codex} --version failed: {}",

@@ -34,6 +34,8 @@ st2 --help
 pty --help
 st2 hooks install
 st2 hooks verify
+st2 claude-channel install
+st2 claude-channel status
 ```
 
 When upgrading, deploy and activate the compatible `pty` before this version of
@@ -93,6 +95,18 @@ The hooks have a small operational purpose: session-start restores durable conte
 current inbox; pre-compact preserves a recovery breadcrumb when no context was written; stop and
 failure hooks surface newly arrived work or a harness failure. They fail open so hook trouble does
 not prevent the harness from starting or stopping.
+
+`st2 claude-channel install` publishes the Claude Code marketplace and plugin embedded in the st2
+binary. It registers the plugin for the current user and installs one machine policy fragment with
+`sudo`. The policy approves the stable `st2-channel@st2` identity. The plugin starts the st2 MCP
+server through the managed task's `PATH`, `CATALOG`, and `ST_AGENT`; it writes no `.mcp.json` file
+into a product workspace. Re-running the command updates the marketplace and reinstalls the exact
+embedded plugin. `st2 claude-channel status` verifies all four parts. `uninstall` removes only the
+st2 user state and its policy fragment. Installation is optional. When the plugin is absent, the
+native driver passes an inline MCP declaration and uses Claude's development channel. Claude can
+show a confirmation prompt on that path, so install the plugin for unattended agents. Claude treats
+the managed plugin list as an allowlist. Administrators must include any other approved channel
+plugins in their managed policy.
 
 The same immutable set also carries `pi-channel.ts`. pi has no hook mechanism of its own — an
 extension is where a pi session exposes that surface — so st2 ships one and `st2 driver pi-session`
@@ -604,7 +618,7 @@ st2 service uninstall
 ls, up, down, validate, doctor
 message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
-hooks, service, eval
+hooks, service, claude-channel, eval
 agent digest, agent publish
 catalog bootstrap, catalog snapshot, catalog apply
 completions

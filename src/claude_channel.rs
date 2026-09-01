@@ -1,0 +1,462 @@
+//! Install the Claude Code channel plugin that is embedded in the st2 binary.
+//!
+//! Claude Code admits channels by plugin and marketplace identity. The plugin is user state, while
+//! its allowlist is machine policy. `st2 claude-channel install` owns both steps and elevates only
+//! the small policy write.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+
+pub const MARKETPLACE: &str = "st2";
+pub const PLUGIN: &str = "st2-channel";
+pub const CHANNEL: &str = "plugin:st2-channel@st2";
+
+const MARKETPLACE_MANIFEST: &[u8] =
+    include_bytes!("../claude-channel/.claude-plugin/marketplace.json");
+const PLUGIN_MANIFEST: &[u8] =
+    include_bytes!("../claude-channel/plugins/st2-channel/.claude-plugin/plugin.json");
+const MCP_CONFIG: &[u8] = include_bytes!("../claude-channel/plugins/st2-channel/.mcp.json");
+const POLICY_FILE: &str = "50-st2-channel.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPaths {
+    pub marketplace: PathBuf,
+    pub policy: PathBuf,
+}
+
+pub fn install(no_policy: bool) -> Result<InstallPaths> {
+    let marketplace = marketplace_root()?;
+    install_marketplace_at(&marketplace)?;
+    install_with_claude(&marketplace)?;
+    let policy = policy_path()?;
+    if !no_policy {
+        ensure_policy_with_elevation(&policy)?;
+    }
+    println!("marketplace\t{}", marketplace.display());
+    println!("plugin\t{PLUGIN}@{MARKETPLACE}");
+    if no_policy {
+        println!("policy\tskipped");
+    } else {
+        println!("policy\t{}", policy.display());
+    }
+    Ok(InstallPaths {
+        marketplace,
+        policy,
+    })
+}
+
+pub fn status() -> Result<()> {
+    let marketplace = marketplace_root()?;
+    let policy = policy_path()?;
+    let assets = verify_marketplace_at(&marketplace).is_ok();
+    let policy_ready = policy_is_current_at(&policy);
+    let marketplace_ready = marketplace_registration()
+        .ok()
+        .flatten()
+        .is_some_and(|entry| marketplace_entry_matches(&entry, &marketplace));
+    let plugin_ready = claude_json(["plugin", "list", "--json"])
+        .map(|value| json_contains(&value, &format!("{PLUGIN}@{MARKETPLACE}")))
+        .unwrap_or(false);
+    println!("assets\t{}", state(assets));
+    println!("marketplace\t{}", state(marketplace_ready));
+    println!("plugin\t{}", state(plugin_ready));
+    println!("policy\t{}", state(policy_ready));
+    if assets && marketplace_ready && plugin_ready && policy_ready {
+        Ok(())
+    } else {
+        bail!("the Claude channel installation is incomplete")
+    }
+}
+
+pub fn uninstall(keep_policy: bool) -> Result<()> {
+    let marketplace = marketplace_root()?;
+    let owns_marketplace = marketplace_registration()?
+        .is_some_and(|entry| marketplace_entry_matches(&entry, &marketplace));
+    if plugin_is_installed()? {
+        anyhow::ensure!(
+            owns_marketplace,
+            "refusing to uninstall {PLUGIN}@{MARKETPLACE} from another marketplace source"
+        );
+        run_claude(&[
+            "plugin",
+            "uninstall",
+            &format!("{PLUGIN}@{MARKETPLACE}"),
+            "--scope",
+            "user",
+            "--yes",
+        ])?;
+    }
+    if owns_marketplace {
+        run_claude(&["plugin", "marketplace", "remove", MARKETPLACE])?;
+    }
+    if marketplace.exists() {
+        fs::remove_dir_all(&marketplace)
+            .with_context(|| format!("removing {}", marketplace.display()))?;
+    }
+    let policy = policy_path()?;
+    if !keep_policy && policy.exists() {
+        remove_policy_with_elevation(&policy)?;
+    }
+    println!("uninstalled");
+    Ok(())
+}
+
+/// The elevated half of `install`. This command must not install user-scoped plugin state.
+pub fn install_policy() -> Result<PathBuf> {
+    let path = policy_path()?;
+    install_policy_at(&path)?;
+    println!("policy\t{}", path.display());
+    Ok(path)
+}
+
+/// The elevated half of `uninstall`. This removes only the st2-owned policy fragment.
+pub fn uninstall_policy() -> Result<()> {
+    let path = policy_path()?;
+    remove_policy_at(&path)?;
+    println!("policy removed\t{}", path.display());
+    Ok(())
+}
+
+pub fn verify_installed() -> Result<()> {
+    let marketplace = marketplace_root()?;
+    verify_marketplace_at(&marketplace)?;
+    if !marketplace_is_registered_at(&marketplace)? {
+        bail!("the st2 Claude marketplace is not registered; run `st2 claude-channel install`");
+    }
+    if !plugin_is_installed()? {
+        bail!("the st2 Claude channel plugin is not installed; run `st2 claude-channel install`");
+    }
+    let policy = policy_path()?;
+    if !policy_is_current_at(&policy) {
+        bail!("the st2 Claude channel policy is not installed; run `st2 claude-channel install`");
+    }
+    Ok(())
+}
+
+fn state(ready: bool) -> &'static str {
+    if ready { "ready" } else { "missing" }
+}
+
+fn data_home() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/share"))
+}
+
+fn marketplace_root() -> Result<PathBuf> {
+    Ok(data_home()?.join("st2/claude-channel/marketplace"))
+}
+
+#[cfg(target_os = "linux")]
+fn policy_path() -> Result<PathBuf> {
+    Ok(PathBuf::from("/etc/claude-code/managed-settings.d").join(POLICY_FILE))
+}
+
+#[cfg(target_os = "macos")]
+fn policy_path() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.d")
+            .join(POLICY_FILE),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn policy_path() -> Result<PathBuf> {
+    bail!("the Claude channel policy installer supports Linux and macOS")
+}
+
+fn embedded_files() -> [(&'static str, &'static [u8]); 3] {
+    [
+        (".claude-plugin/marketplace.json", MARKETPLACE_MANIFEST),
+        (
+            "plugins/st2-channel/.claude-plugin/plugin.json",
+            PLUGIN_MANIFEST,
+        ),
+        ("plugins/st2-channel/.mcp.json", MCP_CONFIG),
+    ]
+}
+
+pub fn install_marketplace_at(root: &Path) -> Result<()> {
+    for (relative, bytes) in embedded_files() {
+        let path = root.join(relative);
+        let parent = path.parent().expect("an embedded file has a parent");
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    verify_marketplace_at(root)
+}
+
+pub fn verify_marketplace_at(root: &Path) -> Result<()> {
+    for (relative, expected) in embedded_files() {
+        let path = root.join(relative);
+        let actual = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if actual != expected {
+            bail!("embedded Claude channel file differs at {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn policy_value() -> Value {
+    json!({
+        "channelsEnabled": true,
+        "allowedChannelPlugins": [{"marketplace": MARKETPLACE, "plugin": PLUGIN}]
+    })
+}
+
+fn policy_bytes() -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(&policy_value())
+        .expect("the built-in Claude channel policy is serializable");
+    bytes.push(b'\n');
+    bytes
+}
+
+pub fn install_policy_at(path: &Path) -> Result<()> {
+    let parent = path.parent().context("the policy path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    fs::write(path, policy_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    verify_policy_at(path)
+}
+
+pub fn remove_policy_at(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn policy_is_current_at(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| bytes == policy_bytes())
+}
+
+fn verify_policy_at(path: &Path) -> Result<()> {
+    if policy_is_current_at(path) {
+        Ok(())
+    } else {
+        bail!("Claude channel policy differs at {}", path.display())
+    }
+}
+
+fn ensure_policy_with_elevation(path: &Path) -> Result<()> {
+    if policy_is_current_at(path) {
+        return Ok(());
+    }
+    if is_root() {
+        return install_policy_at(path);
+    }
+    run_elevated("install-policy")
+}
+
+fn remove_policy_with_elevation(path: &Path) -> Result<()> {
+    if is_root() {
+        return remove_policy_at(path);
+    }
+    run_elevated("uninstall-policy")
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
+fn run_elevated(action: &str) -> Result<()> {
+    let exe = env::current_exe().context("resolving the current st2 executable")?;
+    let status = Command::new("sudo")
+        .arg(exe)
+        .args(["claude-channel", action])
+        .status()
+        .with_context(|| format!("running the elevated Claude channel {action}"))?;
+    if !status.success() {
+        bail!("the elevated Claude channel {action} failed with status {status}");
+    }
+    Ok(())
+}
+
+fn install_with_claude(marketplace: &Path) -> Result<()> {
+    match marketplace_registration()? {
+        Some(entry) if marketplace_entry_matches(&entry, marketplace) => {
+            run_claude(&["plugin", "marketplace", "update", MARKETPLACE])?;
+        }
+        Some(entry) => {
+            bail!(
+                "Claude marketplace name '{MARKETPLACE}' already belongs to another source: {entry}"
+            );
+        }
+        None => {
+            let path = marketplace
+                .to_str()
+                .context("the Claude channel marketplace path is not UTF-8")?;
+            run_claude(&["plugin", "marketplace", "add", path, "--scope", "user"])?;
+        }
+    }
+    if plugin_is_installed()? {
+        run_claude(&[
+            "plugin",
+            "uninstall",
+            &format!("{PLUGIN}@{MARKETPLACE}"),
+            "--scope",
+            "user",
+            "--yes",
+            "--keep-data",
+        ])?;
+    }
+    run_claude(&[
+        "plugin",
+        "install",
+        &format!("{PLUGIN}@{MARKETPLACE}"),
+        "--scope",
+        "user",
+        "--yes",
+    ])
+}
+
+fn marketplace_registration() -> Result<Option<Value>> {
+    let value = claude_json(["plugin", "marketplace", "list", "--json"])?;
+    Ok(value.as_array().and_then(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(MARKETPLACE))
+            .cloned()
+    }))
+}
+
+fn marketplace_is_registered_at(root: &Path) -> Result<bool> {
+    Ok(marketplace_registration()?.is_some_and(|entry| marketplace_entry_matches(&entry, root)))
+}
+
+fn marketplace_entry_matches(entry: &Value, root: &Path) -> bool {
+    entry.get("source").and_then(Value::as_str) == Some("directory")
+        && entry.get("path").and_then(Value::as_str) == root.to_str()
+}
+
+fn plugin_is_installed() -> Result<bool> {
+    let value = claude_json(["plugin", "list", "--json"])?;
+    Ok(json_contains(&value, &format!("{PLUGIN}@{MARKETPLACE}")))
+}
+
+fn json_contains(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(value) => value == needle,
+        Value::Array(values) => values.iter().any(|value| json_contains(value, needle)),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key == needle || json_contains(value, needle)),
+        _ => false,
+    }
+}
+
+fn claude_json<const N: usize>(args: [&str; N]) -> Result<Value> {
+    let output = claude_output(&args)?;
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("decoding `claude {}` output", args.join(" ")))
+}
+
+fn claude_output(args: &[&str]) -> Result<Output> {
+    let output = Command::new("claude")
+        .args(args)
+        .output()
+        .with_context(|| format!("running `claude {}`", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "`claude {}` failed with status {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn run_claude(args: &[&str]) -> Result<()> {
+    let status = Command::new("claude")
+        .args(args)
+        .status()
+        .with_context(|| format!("running `claude {}`", args.join(" ")))?;
+    if !status.success() {
+        bail!("`claude {}` failed with status {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_marketplace_is_complete_and_byte_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        install_marketplace_at(temp.path()).unwrap();
+        verify_marketplace_at(temp.path()).unwrap();
+
+        let marketplace: Value = serde_json::from_slice(
+            &fs::read(temp.path().join(".claude-plugin/marketplace.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marketplace["name"], MARKETPLACE);
+        assert_eq!(marketplace["plugins"][0]["name"], PLUGIN);
+
+        let mcp: Value = serde_json::from_slice(
+            &fs::read(temp.path().join("plugins/st2-channel/.mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mcp["mcpServers"]["st2"]["command"], "st2");
+        assert_eq!(
+            mcp["mcpServers"]["st2"]["args"],
+            json!(["driver", "claude-mcp"])
+        );
+        let plugin: Value = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("plugins/st2-channel/.claude-plugin/plugin.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn policy_fragment_approves_only_the_stable_plugin_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(POLICY_FILE);
+        install_policy_at(&path).unwrap();
+        assert!(policy_is_current_at(&path));
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, policy_value());
+        remove_policy_at(&path).unwrap();
+        remove_policy_at(&path).unwrap();
+    }
+
+    #[test]
+    fn recursive_json_lookup_finds_plugin_ids_without_a_cli_schema_dependency() {
+        let value = json!([{"id": "st2-channel@st2", "nested": {"ready": true}}]);
+        assert!(json_contains(&value, "st2-channel@st2"));
+        assert!(!json_contains(&value, "other@st2"));
+    }
+
+    #[test]
+    fn marketplace_registration_must_point_to_the_installed_asset_root() {
+        let root = Path::new("/data/st2/claude-channel/marketplace");
+        assert!(marketplace_entry_matches(
+            &json!({"name":"st2","source":"directory","path":root}),
+            root,
+        ));
+        assert!(!marketplace_entry_matches(
+            &json!({"name":"st2","source":"github","repo":"other/st2"}),
+            root,
+        ));
+    }
+}
