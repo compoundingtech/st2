@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use st2::resource_profile::{
-    BindingId, HostMessage, RegistrationToken, RuntimeHealthState, RuntimeMessage, RuntimeOwner,
-    SnapshotBytes, decode_host_line, encode_runtime_line,
+    BindingId, HostMessage, RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeMessage,
+    RuntimeOwner, SnapshotBytes, decode_host_line, encode_runtime_line,
 };
 use st2::resource_profile_supervisor::ResourceProfileSupervisor;
 
@@ -67,6 +67,9 @@ impl RuntimeControl {
             media_type: MEDIA_TYPE.to_owned(),
             bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
             topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+            facts: Some(vec![
+                ResourceFact::current("revision", health_marker).unwrap(),
+            ]),
             observed_at: None,
         };
         let health = RuntimeMessage::Health {
@@ -220,6 +223,16 @@ fn observable_publication_reaches_builtin_resync_with_filter_catch_up_and_scope_
         1,
         "the first selected publication must create one built-in resync record"
     );
+    assert!(
+        first_inbox[0].contains("subject: observed · revision=primary-first [selected]"),
+        "{}",
+        first_inbox[0]
+    );
+    assert!(
+        first_inbox[0].contains(r#""facts":[{"key":"revision","after":"primary-first"}]"#),
+        "{}",
+        first_inbox[0]
+    );
 
     primary
         .runtime
@@ -273,6 +286,11 @@ fn observable_publication_reaches_builtin_resync_with_filter_catch_up_and_scope_
     assert_ne!(
         caught_up_inbox, first_inbox,
         "restoring delivery must replace the old head with the pending digest"
+    );
+    assert!(
+        caught_up_inbox[0].contains("revision=delivery-unavailable"),
+        "{}",
+        caught_up_inbox[0]
     );
     let caught_up_projection = file_tree(&primary.agent_dir.join("resources"));
     primary.refresh(&primary_supervisor);
@@ -391,7 +409,7 @@ fn file_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 fn observable_resolver_wasm() -> Vec<u8> {
-    const DESCRIPTOR: &[u8] = br#"{"abiVersion":2,"capabilities":["resolve","read","observe"],"selectorSchema":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"defaultSelector":{"topics":["selected"]},"topics":[{"name":"selected"},{"name":"ignored"}],"runtime":{"topology":"shared"},"snapshot":{"mediaType":"application/json","schemaId":"dev.example.observable.snapshot.v1"}}"#;
+    const DESCRIPTOR: &[u8] = br#"{"abiVersion":3,"capabilities":["resolve","read","observe"],"selectorSchema":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"defaultSelector":{"topics":["selected"]},"topics":[{"name":"selected"},{"name":"ignored"}],"runtime":{"topology":"shared"},"snapshot":{"mediaType":"application/json","schemaId":"dev.example.observable.snapshot.v1"}}"#;
     const RESOLUTION: &[u8] = br#"{"path":"resources/snapshot.json","class":"observable"}"#;
     const DESCRIPTOR_PTR: i64 = 1024;
     const RESOLUTION_PTR: i64 = 4096;

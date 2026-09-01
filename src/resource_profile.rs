@@ -17,14 +17,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 pub use st2_resource_protocol::{
-    BindingId, HostMessage, OpaqueIdError, OwnerClaim, ProtocolError, RegistrationToken,
-    RuntimeHealthState, RuntimeIncarnation, RuntimeMessage, RuntimeOwner, SnapshotBytes,
-    SnapshotDigest, SnapshotSizeError, MAX_HEALTH_DETAIL_BYTES, MAX_PROTOCOL_LINE_BYTES,
-    MAX_SELECTOR_BYTES, MAX_SNAPSHOT_BYTES, decode_host_line, decode_runtime_line,
-    encode_host_line, encode_runtime_line,
+    BindingId, FactError, FactValue, HostMessage, OpaqueIdError, OwnerClaim, ProtocolError,
+    RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation, RuntimeMessage,
+    RuntimeOwner, SnapshotBytes, SnapshotDigest, SnapshotSizeError, MAX_FACTS, MAX_FACT_KEY_BYTES,
+    MAX_FACT_VALUE_BYTES, MAX_HEALTH_DETAIL_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_SELECTOR_BYTES,
+    MAX_SNAPSHOT_BYTES, decode_host_line, decode_runtime_line, encode_host_line,
+    encode_runtime_line,
 };
 
-const MAX_CATCH_UP_FILE_BYTES: usize = 16 * 1024;
+// Covers the prior state envelope plus 32 maximally sized facts after worst-case JSON escaping.
+const MAX_CATCH_UP_FILE_BYTES: usize = 256 * 1024;
 const CATCH_UP_FILE: &str = "resource-profile-catch-up.json";
 const PUBLICATION_INTENT_FILE: &str = "resource-profile-publication-intent.json";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -368,6 +370,7 @@ impl RuntimeLifecycle {
                 media_type,
                 bytes,
                 topics,
+                facts,
                 observed_at,
             } => {
                 let binding = self.require_registration(owner, binding_id, registration)?;
@@ -390,6 +393,7 @@ impl RuntimeLifecycle {
                     target: &binding.target,
                     bytes,
                     selected_topics: binding.contract.selection.select(topics),
+                    facts: facts.as_deref().unwrap_or_default(),
                     observed_at: observed_at.as_deref(),
                 }))
             }
@@ -497,6 +501,7 @@ pub struct AcceptedPublication<'a> {
     target: &'a SnapshotTarget,
     bytes: &'a SnapshotBytes,
     selected_topics: Vec<String>,
+    facts: &'a [ResourceFact],
     observed_at: Option<&'a str>,
 }
 
@@ -509,12 +514,20 @@ impl<'a> AcceptedPublication<'a> {
         &self.selected_topics
     }
 
+    pub fn facts(&self) -> &[ResourceFact] {
+        self.facts
+    }
     pub fn observed_at(&self) -> Option<&str> {
         self.observed_at
     }
 
     fn prepare(self) -> Result<PreparedPublication<'a>, PublicationError> {
-        prepare_snapshot(self.target, self.bytes.as_slice(), self.selected_topics)
+        prepare_snapshot(
+            self.target,
+            self.bytes.as_slice(),
+            self.selected_topics,
+            self.facts.to_vec(),
+        )
     }
 }
 
@@ -551,6 +564,7 @@ pub struct PublicationOutcome {
     digest: SnapshotDigest,
     change: SnapshotChange,
     selected_topics: Vec<String>,
+    facts: Vec<ResourceFact>,
 }
 
 impl PublicationOutcome {
@@ -566,6 +580,9 @@ impl PublicationOutcome {
         &self.selected_topics
     }
 
+    pub fn facts(&self) -> &[ResourceFact] {
+        &self.facts
+    }
     pub fn invalidating(&self) -> bool {
         self.change != SnapshotChange::Equal && !self.selected_topics.is_empty()
     }
@@ -637,6 +654,7 @@ fn prepare_snapshot<'a>(
     target: &'a SnapshotTarget,
     bytes: &'a [u8],
     selected_topics: Vec<String>,
+    facts: Vec<ResourceFact>,
 ) -> Result<PreparedPublication<'a>, PublicationError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(PublicationError::SnapshotTooLarge { actual: bytes.len() });
@@ -657,6 +675,7 @@ fn prepare_snapshot<'a>(
             digest,
             change,
             selected_topics,
+            facts,
         },
     })
 }
@@ -665,8 +684,9 @@ fn publish_snapshot(
     target: &SnapshotTarget,
     bytes: &[u8],
     selected_topics: Vec<String>,
+    facts: Vec<ResourceFact>,
 ) -> Result<PublicationOutcome, PublicationError> {
-    let prepared = prepare_snapshot(target, bytes, selected_topics)?;
+    let prepared = prepare_snapshot(target, bytes, selected_topics, facts)?;
     prepared.commit()?;
     Ok(prepared.outcome)
 }
@@ -679,6 +699,8 @@ pub struct CatchUpState {
     pending_relevant_change: bool,
     #[serde(default)]
     pending_selected_topics: Vec<String>,
+    #[serde(default)]
+    pending_facts: Vec<ResourceFact>,
     deliverable: bool,
 }
 
@@ -699,6 +721,9 @@ impl CatchUpState {
         &self.pending_selected_topics
     }
 
+    pub fn pending_facts(&self) -> &[ResourceFact] {
+        &self.pending_facts
+    }
     pub fn deliverable(&self) -> bool {
         self.deliverable
     }
@@ -715,6 +740,12 @@ impl CatchUpState {
             ));
         }
         validate_persisted_topics(&self.pending_selected_topics)?;
+        validate_persisted_facts(&self.pending_facts)?;
+        if !self.pending_relevant_change && !self.pending_facts.is_empty() {
+            return Err(CatchUpError::InvalidState(
+                "pending facts require a pending relevant change",
+            ));
+        }
         Ok(())
     }
 }
@@ -723,6 +754,7 @@ impl CatchUpState {
 pub struct DeliveryRequest {
     digest: SnapshotDigest,
     selected_topics: Vec<String>,
+    facts: Vec<ResourceFact>,
 }
 
 impl DeliveryRequest {
@@ -733,6 +765,10 @@ impl DeliveryRequest {
     pub fn selected_topics(&self) -> &[String] {
         &self.selected_topics
     }
+
+    pub fn facts(&self) -> &[ResourceFact] {
+        &self.facts
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +776,8 @@ impl DeliveryRequest {
 struct PublicationIntent {
     digest: SnapshotDigest,
     selected_topics: Vec<String>,
+    #[serde(default)]
+    facts: Vec<ResourceFact>,
 }
 
 impl PublicationIntent {
@@ -747,11 +785,13 @@ impl PublicationIntent {
         Self {
             digest: outcome.digest,
             selected_topics: outcome.selected_topics.clone(),
+            facts: outcome.facts.clone(),
         }
     }
 
     fn validate(&self) -> Result<(), CatchUpError> {
-        validate_persisted_topics(&self.selected_topics)
+        validate_persisted_topics(&self.selected_topics)?;
+        validate_persisted_facts(&self.facts)
     }
 }
 
@@ -763,6 +803,12 @@ fn validate_persisted_topics(topics: &[String]) -> Result<(), CatchUpError> {
                 "persisted selected topics must be non-empty and unique",
             ));
         }
+    }
+    Ok(())
+}
+fn validate_persisted_facts(facts: &[ResourceFact]) -> Result<(), CatchUpError> {
+    if facts.len() > MAX_FACTS || facts.iter().any(|fact| fact.validate().is_err()) {
+        return Err(CatchUpError::InvalidState("persisted facts are invalid"));
     }
     Ok(())
 }
@@ -850,6 +896,7 @@ impl CatchUp {
                 if !intent.selected_topics.is_empty() {
                     next.pending_relevant_change = true;
                     next.pending_selected_topics = intent.selected_topics.clone();
+                    next.pending_facts = intent.facts.clone();
                 }
             }
             Some(_) | None => {
@@ -890,6 +937,7 @@ impl CatchUp {
         Some(DeliveryRequest {
             digest: self.state.current_snapshot_digest?,
             selected_topics: self.state.pending_selected_topics.clone(),
+            facts: self.state.pending_facts.clone(),
         })
     }
 
@@ -906,6 +954,7 @@ impl CatchUp {
         next.last_delivered_digest = Some(digest);
         next.pending_relevant_change = false;
         next.pending_selected_topics.clear();
+        next.pending_facts.clear();
         self.commit(next)?;
         Ok(true)
     }
@@ -919,6 +968,7 @@ impl CatchUp {
         if outcome.invalidating() {
             next.pending_relevant_change = true;
             next.pending_selected_topics = outcome.selected_topics.clone();
+            next.pending_facts = outcome.facts.clone();
         }
         self.commit(next)?;
         Ok(self.pending_delivery())
@@ -1316,6 +1366,7 @@ mod tests {
             media_type: "application/json".to_owned(),
             bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
             topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+            facts: None,
             observed_at: None,
         }
     }
@@ -1441,7 +1492,8 @@ mod tests {
         let target = SnapshotTarget::new(&root, "resources/github-pr/owner/repo/389.json").unwrap();
         assert_eq!(target.current_digest().unwrap(), None);
 
-        let outcome = publish_snapshot(&target, b"bytes", vec!["selected".to_owned()]).unwrap();
+        let outcome =
+            publish_snapshot(&target, b"bytes", vec!["selected".to_owned()], Vec::new()).unwrap();
 
         assert_eq!(outcome.change(), SnapshotChange::First);
         assert_eq!(
@@ -1491,6 +1543,7 @@ mod tests {
             digest: SnapshotDigest::of(b"relevant"),
             change: SnapshotChange::First,
             selected_topics: vec!["selected".to_owned()],
+            facts: vec![ResourceFact::current("state", "ready").unwrap()],
         };
         let irrelevant = PublicationOutcome {
             digest: SnapshotDigest::of(b"later but irrelevant"),
@@ -1498,6 +1551,7 @@ mod tests {
                 previous: relevant.digest(),
             },
             selected_topics: Vec::new(),
+            facts: Vec::new(),
         };
         let mut catch_up = CatchUp::open(&state_directory).unwrap();
         assert_eq!(catch_up.record_publication(&relevant).unwrap(), None);
@@ -1507,6 +1561,7 @@ mod tests {
         let request = catch_up.set_deliverable(true).unwrap().unwrap();
         assert_eq!(request.digest(), irrelevant.digest());
         assert_eq!(request.selected_topics(), ["selected"]);
+        assert_eq!(request.facts(), relevant.facts());
         assert!(!catch_up.acknowledge_delivery(relevant.digest()).unwrap());
         assert!(catch_up.state().pending_relevant_change());
         assert!(catch_up.acknowledge_delivery(irrelevant.digest()).unwrap());
@@ -1525,6 +1580,7 @@ mod tests {
             digest: SnapshotDigest::of(b"snapshot"),
             change: SnapshotChange::First,
             selected_topics: vec!["selected".to_owned()],
+            facts: vec![ResourceFact::current("state", "ready").unwrap()],
         };
         {
             let mut catch_up = CatchUp::open(&state_directory).unwrap();
@@ -1546,6 +1602,36 @@ mod tests {
             catch_up.state().pending_selected_topics(),
             ["selected"]
         );
+        assert_eq!(catch_up.state().pending_facts(), outcome.facts());
+    }
+
+    #[test]
+    fn catch_up_persists_a_maximal_worst_case_escaped_fact_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = fs::canonicalize(directory.path()).unwrap();
+        let facts = (0..MAX_FACTS)
+            .map(|_| {
+                ResourceFact::new(
+                    "\"".repeat(MAX_FACT_KEY_BYTES),
+                    FactValue::value("\"".repeat(MAX_FACT_VALUE_BYTES)),
+                    FactValue::value("\\".repeat(MAX_FACT_VALUE_BYTES)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let outcome = PublicationOutcome {
+            digest: SnapshotDigest::of(b"snapshot"),
+            change: SnapshotChange::First,
+            selected_topics: vec!["selected".to_owned()],
+            facts,
+        };
+
+        {
+            let mut catch_up = CatchUp::open(&state_directory).unwrap();
+            catch_up.record_publication(&outcome).unwrap();
+        }
+        let catch_up = CatchUp::open(&state_directory).unwrap();
+        assert_eq!(catch_up.state().pending_facts(), outcome.facts());
     }
 
     #[test]
@@ -1606,7 +1692,7 @@ mod tests {
         symlink(outside.path(), root.join("linked-parent")).unwrap();
         let target = SnapshotTarget::new(&root, "linked-parent/snapshot.json").unwrap();
         assert!(matches!(
-            publish_snapshot(&target, b"bytes", vec!["selected".to_owned()]),
+            publish_snapshot(&target, b"bytes", vec!["selected".to_owned()], Vec::new()),
             Err(PublicationError::Io(_))
         ));
 

@@ -207,18 +207,26 @@ one latest-state catch-up. The direction is recorded in
 - **PROFILE-R16A Finite protocol and publication bounds:** A selector's
   canonical compact JSON is at most 16 KiB. One encoded runtime-protocol line is
   at most 2 MiB including its newline. Decoded snapshot bytes are at most 1 MiB.
-  Health detail is at most 16 KiB of UTF-8. st2 rejects an oversized value
-  without truncation and contains the failure to the affected runtime or
+  Health detail is at most 16 KiB of UTF-8. One publication carries at most 32
+  ordered facts; each fact key is at most 128 bytes and each before/after value
+  is at most 1 KiB of printable single-line UTF-8. st2 rejects an oversized
+  value without truncation and contains the failure to the affected runtime or
   binding.
 
 ### Must bound attention and catch up to current state
 
-- **PROFILE-R17 Semantic invalidation:** When snapshot bytes change, including
-  on the first successful publication, the profile classifies the change with
-  zero or more descriptor-published semantic topics. st2 applies the binding
-  selector before delivery. A selected change emits one thin invalidation
-  carrying binding identity, current snapshot digest, and selected topics. It
-  does not copy snapshot bytes or a profile-rendered summary into the event.
+- **PROFILE-R17 Semantic invalidation:** Every Resource invalidation carries the
+  same bounded ordered fact envelope in its durable body and renders at most
+  three whole facts into a subject of at most 96 Unicode scalars. Observable
+  profiles may publish facts and semantic topics beside changed snapshot bytes;
+  st2 validates the facts, applies the binding selector to topics, and retains
+  both through catch-up. Passive carrier changes publish one `content` topic
+  and a short digest transition fact. Agent Spec declaration changes publish
+  ordered binding-label facts for added, removed, and semantically changed
+  Resource declarations without exposing URIs or reasons; unavailable
+  declaration parsing falls back to a digest transition fact rather than
+  dropping the invalidation. Snapshot bytes and provider payloads remain out of
+  the event.
 - **PROFILE-R18 Built-in superseding delivery:** Smart Resource invalidations
   reuse one built-in per-agent delivery stream and the existing inbox, DING,
   deduplication, and producer-side supersession machinery. The binding name is

@@ -4504,7 +4504,7 @@ mod tests {
         std::fs::write(&live_goal, "changed while compile failed\n").unwrap();
         let first_event = wait_for_resync_event(&live_dir)
             .expect("the already-live valid seat must stay watched across the compile error");
-        assert!(first_event.contains("binding: goal"), "{first_event}");
+        assert!(first_event.contains(r#""binding":"goal""#), "{first_event}");
 
         std::fs::write(&broken_goal, "invalid seat changed\n").unwrap();
         std::thread::sleep(Duration::from_millis(750));
@@ -4547,7 +4547,7 @@ mod tests {
         );
         let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
             .expect("correcting another declaration must not reseed and hide the live transition");
-        assert!(corrected_event.contains("binding: goal"), "{corrected_event}");
+        assert!(corrected_event.contains(r#""binding":"goal""#), "{corrected_event}");
     }
 
     #[test]
@@ -4616,7 +4616,7 @@ mod tests {
         std::fs::write(&dormant_goal, "unwatched while materialization failed\n").unwrap();
         let first_event = wait_for_resync_event(&live_dir)
             .expect("the observed live seat must remain watched through materialization failure");
-        assert!(first_event.contains("binding: goal"), "{first_event}");
+        assert!(first_event.contains(r#""binding":"goal""#), "{first_event}");
         std::thread::sleep(Duration::from_millis(750));
         assert!(
             current_resync_event(&dormant_dir).is_none(),
@@ -4645,7 +4645,7 @@ mod tests {
         let recovered_event = wait_for_resync_event_change(&live_dir, &first_event)
             .expect("recovery must preserve the pending transition instead of silently reseeding");
         assert!(
-            recovered_event.contains("binding: goal"),
+            recovered_event.contains(r#""binding":"goal""#),
             "{recovered_event}"
         );
     }
@@ -4798,7 +4798,7 @@ mod tests {
 
         let event = wait_for_resync_event(&first_dir)
             .expect("the first seat must observe a carrier transition during the later launch");
-        assert!(event.contains("binding: goal"), "{event}");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
     }
 
     #[test]
@@ -4917,7 +4917,7 @@ mod tests {
         std::fs::write(&goal, "changed after replacement launch\n").unwrap();
         let event = wait_for_resync_event(&agent_dir)
             .expect("the successful replacement must receive a fresh silent baseline");
-        assert!(event.contains("binding: goal"), "{event}");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
     }
 
     #[test]
@@ -4990,7 +4990,7 @@ mod tests {
         );
         let event = wait_for_resync_event(&agent_dir)
             .expect("the companion launch and final refresh must preserve the canonical baseline");
-        assert!(event.contains("binding: goal"), "{event}");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
     }
 
     #[test]

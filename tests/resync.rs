@@ -95,8 +95,8 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
         "goal change must produce exactly one resync event within the immediate window"
     );
     let body = &resync_events(&agent_dir)[0];
-    assert!(body.contains("resource goal changed"), "{body}");
-    assert!(body.contains("binding: goal"), "{body}");
+    assert!(body.contains("subject: goal · digest="), "{body}");
+    assert!(body.contains(r#""binding":"goal""#), "{body}");
     let legitimate_event_id = body
         .lines()
         .find(|line| line.starts_with("event-id:"))
@@ -153,7 +153,7 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
         || {
             resync_events(&agent_dir)
                 .iter()
-                .filter(|b| !b.contains(&first_event_id) && b.contains("binding: goal"))
+                .filter(|b| !b.contains(&first_event_id) && b.contains(r#""binding":"goal""#))
                 .count()
         },
         1
@@ -189,7 +189,7 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
             || {
                 resync_events(&agent_dir)
                     .iter()
-                    .filter(|b| b.contains("binding: declaration"))
+                    .filter(|b| b.contains(r#""binding":"declaration""#))
                     .count()
             },
             1
@@ -283,7 +283,7 @@ fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change(
         resync_events(&agent_dir)
     );
     let body = &resync_events(&agent_dir)[0];
-    assert!(body.contains("resource goal changed"), "{body}");
+    assert!(body.contains("subject: goal · digest="), "{body}");
 }
 
 #[test]

@@ -363,7 +363,6 @@ impl AgentSpec {
             .or_else(|| self.driver.as_ref().map(Driver::session_driver))
     }
 }
-
 fn deserialize_optional_selector<'de, D>(
     deserializer: D,
 ) -> Result<Option<serde_json::Value>, D::Error>

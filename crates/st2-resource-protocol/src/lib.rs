@@ -15,6 +15,199 @@ pub const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 pub const MAX_HEALTH_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_OPAQUE_ID_BYTES: usize = 16 * 1024;
 
+/// Fact bounds are deliberately small relative to the 2 MiB frame: even 32 facts whose strings
+/// all require JSON escaping leave ample room beside a maximal base64-encoded 1 MiB snapshot.
+pub const MAX_FACTS: usize = 32;
+pub const MAX_FACT_KEY_BYTES: usize = 128;
+pub const MAX_FACT_VALUE_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FactValue {
+    #[default]
+    Omitted,
+    Null,
+    Value(String),
+}
+
+impl FactValue {
+    pub fn value(value: impl Into<String>) -> Self {
+        Self::Value(value.into())
+    }
+
+    pub fn as_option(&self) -> Option<Option<&str>> {
+        match self {
+            Self::Omitted => None,
+            Self::Null => Some(None),
+            Self::Value(value) => Some(Some(value)),
+        }
+    }
+
+    fn is_omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+}
+
+impl Serialize for FactValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Omitted => serializer.serialize_unit(),
+            Self::Null => serializer.serialize_none(),
+            Self::Value(value) => serializer.serialize_str(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FactValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)
+            .map(|value| value.map_or(Self::Null, Self::Value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceFact {
+    key: String,
+    #[serde(default, skip_serializing_if = "FactValue::is_omitted")]
+    before: FactValue,
+    #[serde(default, skip_serializing_if = "FactValue::is_omitted")]
+    after: FactValue,
+}
+
+impl ResourceFact {
+    pub fn new(
+        key: impl Into<String>,
+        before: FactValue,
+        after: FactValue,
+    ) -> Result<Self, FactError> {
+        let fact = Self {
+            key: key.into(),
+            before,
+            after,
+        };
+        fact.validate()?;
+        Ok(fact)
+    }
+
+    pub fn current(
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, FactError> {
+        Self::new(key, FactValue::Omitted, FactValue::value(value))
+    }
+
+    pub fn transition(
+        key: impl Into<String>,
+        before: Option<impl Into<String>>,
+        after: Option<impl Into<String>>,
+    ) -> Result<Self, FactError> {
+        Self::new(
+            key,
+            before.map_or(FactValue::Null, |value| FactValue::value(value)),
+            after.map_or(FactValue::Null, |value| FactValue::value(value)),
+        )
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn before(&self) -> Option<Option<&str>> {
+        self.before.as_option()
+    }
+
+    pub fn after(&self) -> Option<Option<&str>> {
+        self.after.as_option()
+    }
+
+    pub fn validate(&self) -> Result<(), FactError> {
+        validate_fact_string("key", &self.key, MAX_FACT_KEY_BYTES, true)?;
+        if self.before.is_omitted() && self.after.is_omitted() {
+            return Err(FactError::MissingValue);
+        }
+        for (field, value) in [("before", &self.before), ("after", &self.after)] {
+            if let FactValue::Value(value) = value {
+                validate_fact_string(field, value, MAX_FACT_VALUE_BYTES, false)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_fact_string(
+    field: &'static str,
+    value: &str,
+    maximum: usize,
+    nonempty: bool,
+) -> Result<(), FactError> {
+    if nonempty && value.is_empty() {
+        return Err(FactError::Empty { field });
+    }
+    if value.len() > maximum {
+        return Err(FactError::TooLarge {
+            field,
+            actual: value.len(),
+            maximum,
+        });
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(FactError::NotPrintable { field });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactError {
+    TooMany { actual: usize },
+    Empty {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
+    NotPrintable {
+        field: &'static str,
+    },
+    MissingValue,
+}
+
+impl fmt::Display for FactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooMany { actual } => {
+                write!(formatter, "fact list has {actual} entries; maximum is {MAX_FACTS}")
+            }
+            Self::Empty { field } => write!(formatter, "fact {field} must not be empty"),
+            Self::TooLarge {
+                field,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "fact {field} is {actual} bytes; maximum is {maximum}"
+            ),
+            Self::NotPrintable { field } => {
+                write!(formatter, "fact {field} must be one printable line")
+            }
+            Self::MissingValue => {
+                formatter.write_str("fact must include before, after, or both")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FactError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueIdError {
     kind: &'static str,
@@ -400,6 +593,8 @@ pub enum RuntimeMessage {
         bytes: SnapshotBytes,
         topics: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        facts: Option<Vec<ResourceFact>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         observed_at: Option<String>,
     },
     Health {
@@ -423,6 +618,7 @@ pub enum ProtocolError {
     SelectorTooLarge { actual: usize },
     HealthDetailTooLarge { actual: usize },
     InvalidTopics(&'static str),
+    InvalidFacts(FactError),
     InvalidHealthScope,
     Json(serde_json::Error),
 }
@@ -446,6 +642,7 @@ impl fmt::Display for ProtocolError {
                 "health detail is {actual} bytes; maximum is {MAX_HEALTH_DETAIL_BYTES}"
             ),
             Self::InvalidTopics(reason) => write!(formatter, "invalid topics: {reason}"),
+            Self::InvalidFacts(error) => write!(formatter, "invalid facts: {error}"),
             Self::InvalidHealthScope => formatter
                 .write_str("binding-scoped health must carry both bindingId and registration"),
             Self::Json(error) => write!(formatter, "invalid protocol JSON: {error}"),
@@ -457,6 +654,7 @@ impl std::error::Error for ProtocolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
+            Self::InvalidFacts(error) => Some(error),
             _ => None,
         }
     }
@@ -525,7 +723,10 @@ fn validate_host_message(message: &HostMessage) -> Result<(), ProtocolError> {
 
 fn validate_runtime_message(message: &RuntimeMessage) -> Result<(), ProtocolError> {
     match message {
-        RuntimeMessage::Publish { topics, .. } => validate_topics(topics),
+        RuntimeMessage::Publish { topics, facts, .. } => {
+            validate_topics(topics)?;
+            validate_facts(facts.as_deref().unwrap_or_default())
+        }
         RuntimeMessage::Health {
             binding_id,
             registration,
@@ -545,6 +746,17 @@ fn validate_runtime_message(message: &RuntimeMessage) -> Result<(), ProtocolErro
             Ok(())
         }
     }
+}
+fn validate_facts(facts: &[ResourceFact]) -> Result<(), ProtocolError> {
+    if facts.len() > MAX_FACTS {
+        return Err(ProtocolError::InvalidFacts(FactError::TooMany {
+            actual: facts.len(),
+        }));
+    }
+    facts
+        .iter()
+        .try_for_each(ResourceFact::validate)
+        .map_err(ProtocolError::InvalidFacts)
 }
 
 fn validate_topics(topics: &[String]) -> Result<(), ProtocolError> {
@@ -583,6 +795,7 @@ mod tests {
             media_type: "application/json".to_owned(),
             bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
             topics: vec!["selected".to_owned()],
+            facts: None,
             observed_at: Some("2026-08-30T00:00:00Z".to_owned()),
         }
     }
@@ -634,6 +847,57 @@ mod tests {
             decode_runtime_line(&encode_runtime_line(&publish(b"one byte")).unwrap()).unwrap(),
             publish(b"one byte")
         );
+    }
+
+    #[test]
+    fn fact_wire_shape_distinguishes_omission_from_explicit_null() {
+        let mut message = publish(b"fact");
+        let RuntimeMessage::Publish { facts, .. } = &mut message else {
+            unreachable!();
+        };
+        *facts = Some(vec![
+            ResourceFact::current("state", "ready").unwrap(),
+            ResourceFact::transition("label", None::<String>, Some("added")).unwrap(),
+            ResourceFact::transition("removed", Some("old"), None::<String>).unwrap(),
+        ]);
+        let encoded = encode_runtime_line(&message).unwrap();
+        let json: Value = serde_json::from_slice(encoded.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(
+            json["facts"],
+            json!([
+                {"key": "state", "after": "ready"},
+                {"key": "label", "before": null, "after": "added"},
+                {"key": "removed", "before": "old", "after": null}
+            ])
+        );
+        assert_eq!(decode_runtime_line(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn invalid_fact_shapes_and_bounds_are_rejected() {
+        let missing_values = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"schemaId\":\"s\",\"mediaType\":\"m\",\"bytes\":\"\",\"topics\":[],\"facts\":[{\"key\":\"state\"}]}\n";
+        assert!(matches!(
+            decode_runtime_line(missing_values),
+            Err(ProtocolError::InvalidFacts(FactError::MissingValue))
+        ));
+        assert!(ResourceFact::current("", "value").is_err());
+        assert!(ResourceFact::current("state", "two\nlines").is_err());
+        assert!(ResourceFact::current("x".repeat(MAX_FACT_KEY_BYTES + 1), "value").is_err());
+        assert!(ResourceFact::current("state", "x".repeat(MAX_FACT_VALUE_BYTES + 1)).is_err());
+
+        let mut message = publish(b"facts");
+        let RuntimeMessage::Publish { facts, .. } = &mut message else {
+            unreachable!();
+        };
+        *facts = Some(
+            (0..=MAX_FACTS)
+                .map(|index| ResourceFact::current(format!("key-{index}"), "value").unwrap())
+                .collect(),
+        );
+        assert!(matches!(
+            encode_runtime_line(&message),
+            Err(ProtocolError::InvalidFacts(FactError::TooMany { .. }))
+        ));
     }
 
     #[test]
