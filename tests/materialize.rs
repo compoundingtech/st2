@@ -491,6 +491,117 @@ fn every_directive_materializes_in_order_and_is_idempotent() {
 }
 
 #[test]
+fn ensure_line_preserves_contract_files_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write(
+        &workspace.join("CLAUDE.md"),
+        "owner prose without a final newline",
+    );
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    ensure-line "CLAUDE.md" "@.st2/CONTRACT.md"
+    ensure-line "AGENTS.md" "@.st2/CONTRACT.md""#,
+        ),
+    );
+
+    let found = discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+
+    let first = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(first.is_clean(), "{:?}", first.errors);
+    assert_eq!(first.materialized.len(), 2);
+    assert_eq!(
+        fs::read_to_string(workspace.join("CLAUDE.md")).unwrap(),
+        "owner prose without a final newline\n@.st2/CONTRACT.md\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+        "@.st2/CONTRACT.md\n"
+    );
+
+    let second = materialize_catalog(&catalog, &found.specs, "Silber");
+    assert!(second.is_clean(), "{:?}", second.errors);
+    assert!(second.materialized.is_empty(), "{:?}", second.materialized);
+}
+
+#[test]
+fn ensure_line_verifies_tracked_contract_files_without_rewriting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    init_git(&workspace);
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        write(&workspace.join(name), "owner prose\n@.st2/CONTRACT.md\n");
+        fs::set_permissions(workspace.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        track(&workspace, name);
+    }
+    write(
+        &catalog.join("agents/Silber/cos/agent.kdl"),
+        agent_kdl(
+            &workspace,
+            r#"    ensure-line "CLAUDE.md" "@.st2/CONTRACT.md"
+    ensure-line "AGENTS.md" "@.st2/CONTRACT.md""#,
+        ),
+    );
+
+    let found = discover(&catalog);
+    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert!(report.materialized.is_empty(), "{:?}", report.materialized);
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        assert_eq!(
+            fs::read_to_string(workspace.join(name)).unwrap(),
+            "owner prose\n@.st2/CONTRACT.md\n"
+        );
+    }
+}
+
+#[test]
+fn ensure_line_refuses_missing_contract_line_in_a_tracked_file_before_any_write() {
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        init_git(&workspace);
+        write(&workspace.join(name), "owner prose\n");
+        track(&workspace, name);
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            agent_kdl(
+                &workspace,
+                &format!(
+                    "    ensure-line \"{name}\" \"@.st2/CONTRACT.md\"\n    file \"must-not-exist\" \"blocked\""
+                ),
+            ),
+        );
+
+        let found = discover(&catalog);
+        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+
+        assert_eq!(report.errors.len(), 1, "{name}: {:?}", report.errors);
+        assert!(
+            report.errors[0].contains("generated materialization would change Git-tracked target")
+                && report.errors[0].contains(name),
+            "{name}: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(name)).unwrap(),
+            "owner prose\n"
+        );
+        assert!(!workspace.join("must-not-exist").exists());
+    }
+}
+
+#[test]
 fn every_content_directive_refuses_to_change_a_tracked_target_before_any_write() {
     for (name, initial, directive, template) in [
         (
