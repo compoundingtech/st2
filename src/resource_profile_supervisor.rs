@@ -1,15 +1,14 @@
-//! Resident process supervision for observable Resource Profiles.
+//! Resident Component Model supervision for observable Resource Profiles.
 //!
-//! The worker is the sole owner of runtime processes and their protocol state. Reconcile callers
-//! submit complete desired binding sets; removals are acknowledged only after registrations have
-//! been fenced and processes no longer owned by the desired generation have been stopped.
+//! The worker owns component instances and their atomic proposal fences. Reconcile callers submit
+//! complete desired binding sets; removals are acknowledged only after registrations have been
+//! fenced and provider invocations no longer belong to the desired generation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +21,18 @@ use notify::RecommendedWatcher;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+#[cfg(feature = "wasip2-provider-runtime")]
+use st2_resource_protocol::ProposalFence;
+#[cfg(feature = "wasip2-provider-runtime")]
+use st2_resource_providers::{
+    GitHubIssueCancellation, GitHubIssueConfig, GitHubIssueModule, PtyStatsCancellation,
+    PtyStatsConfig, PtyStatsModule, PtyStatsScope,
+};
+#[cfg(feature = "wasip2-provider-runtime")]
+use st2_resource_wasip2::{
+    Executor as Wasip2Executor, LoadedComponent, ObservationRequest as Wasip2ObservationRequest,
+    RuntimeConfig as Wasip2RuntimeConfig,
+};
 
 use crate::catalog::CatalogConfig;
 use crate::resource_observe::{
@@ -31,14 +42,12 @@ use crate::resource_observe::{
 };
 use crate::resource_profile::{
     AcceptedObservation, AcceptedOutput, AcceptedPublication, BindingId, BindingRegistration,
-    CatchUp, HostMessage, MAX_PROTOCOL_LINE_BYTES, OwnerClaim, PublicationContract,
-    PublicationOutcome, RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation,
-    RuntimeLifecycle, RuntimeMessage, RuntimeOwner, SnapshotDigest, SnapshotTarget, TopicSelection,
-    decode_runtime_line, encode_host_line,
+    CatchUp, OwnerClaim, PublicationContract, PublicationOutcome, RegistrationToken, ResourceFact,
+    RuntimeHealthState, RuntimeIncarnation, RuntimeLifecycle, RuntimeMessage, RuntimeOwner,
+    SnapshotDigest, SnapshotTarget, TopicSelection,
 };
 
 const MAILBOX_CAPACITY: usize = 64;
-const WRITER_CAPACITY: usize = 64;
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +69,7 @@ pub struct ResourceProfileSupervisor {
     catalog_root: PathBuf,
     this_host: String,
     observe_watcher: Option<RecommendedWatcher>,
+    component_cache: Mutex<ComponentSnapshotCache>,
     observe_bridge: Option<JoinHandle<()>>,
 }
 
@@ -79,18 +89,18 @@ impl ResourceProfileSupervisor {
             );
         }
         let (tx, rx) = mpsc::sync_channel(MAILBOX_CAPACITY);
-        let worker_tx = tx.clone();
         let worker_root = catalog_root.clone();
         let worker_host = this_host.clone();
+        let completion_tx = tx.clone();
         let worker = thread::Builder::new()
             .name("st2-resource-profile".to_owned())
             .spawn(move || {
                 Worker::new(
                     worker_root,
                     worker_host,
-                    worker_tx,
                     request_dir,
                     receipt_dir,
+                    completion_tx,
                 )
                 .run(rx);
             })
@@ -109,6 +119,7 @@ impl ResourceProfileSupervisor {
         let supervisor = Self {
             tx,
             worker: Some(worker),
+            component_cache: Mutex::new(ComponentSnapshotCache::default()),
             catalog_root,
             this_host,
             observe_watcher,
@@ -137,6 +148,7 @@ impl ResourceProfileSupervisor {
             profiles,
             generation,
             live_specs,
+            &self.component_cache,
         );
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
@@ -212,29 +224,127 @@ enum Msg {
     Health {
         reply: SyncSender<Vec<ResourceProfileHealth>>,
     },
-    RuntimeOutput {
-        key: RuntimeKey,
-        owner: RuntimeOwner,
-        output: Result<RuntimeMessage, String>,
-    },
-    RuntimeEof {
-        key: RuntimeKey,
-        owner: RuntimeOwner,
-    },
-    WriterDrained {
-        key: RuntimeKey,
-        owner: RuntimeOwner,
-    },
-    WriterFailed {
-        key: RuntimeKey,
-        owner: RuntimeOwner,
-        error: String,
-    },
     ObserveRequests,
+    #[cfg(feature = "wasip2-provider-runtime")]
+    ObservationCompleted(ObservationCompletion),
     Shutdown {
         reply: SyncSender<()>,
     },
 }
+#[cfg(feature = "wasip2-provider-runtime")]
+#[derive(Debug)]
+struct ObservationCompletion {
+    job_id: u64,
+    runtime_key: RuntimeKey,
+    stable_key: String,
+    authority: ObservationAuthority,
+    watermark: u64,
+    fence: ProposalFence,
+    result: Result<st2_resource_protocol::ObservationResult, String>,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+struct ObservationJob {
+    runtime_key: RuntimeKey,
+    stable_key: String,
+    cancellation: ObservationCancellation,
+    join: JoinHandle<()>,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+struct ObservationLaunch {
+    job_id: u64,
+    runtime_key: RuntimeKey,
+    stable_key: String,
+    authority: ObservationAuthority,
+    watermark: u64,
+    fence: ProposalFence,
+    request: Wasip2ObservationRequest,
+    provider: Arc<ProviderRuntime>,
+    cancellation: ObservationCancellation,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+#[derive(Clone)]
+struct ObservationCancellation {
+    interruption: st2_resource_wasip2::InterruptionHandle,
+    pty: Option<PtyStatsCancellation>,
+    github: Option<GitHubIssueCancellation>,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+impl ObservationCancellation {
+    fn cancel(&self) {
+        if let Some(pty) = &self.pty {
+            pty.cancel();
+        }
+        if let Some(github) = &self.github {
+            github.cancel();
+        }
+        self.interruption.cancel();
+    }
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+fn catch_observation(
+    observe: impl FnOnce(
+    ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError>,
+) -> Result<st2_resource_protocol::ObservationResult, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe))
+        .map_err(|_| "provider observation panicked".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+struct ProviderComponentSnapshot {
+    relative: PathBuf,
+    identity: String,
+    bytes: Arc<[u8]>,
+}
+
+impl PartialEq for ProviderComponentSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.relative == other.relative && self.identity == other.identity
+    }
+}
+
+#[derive(Default)]
+struct ComponentSnapshotCache {
+    catalog_generation: Option<u64>,
+    snapshots: BTreeMap<String, Arc<ProviderComponentSnapshot>>,
+}
+
+impl ComponentSnapshotCache {
+    fn begin_refresh(&mut self, catalog_generation: Option<u64>) {
+        if catalog_generation.is_none() || self.catalog_generation != catalog_generation {
+            self.snapshots.clear();
+            self.catalog_generation = catalog_generation;
+        }
+    }
+
+    fn load(
+        &mut self,
+        catalog_root: &Path,
+        component: &str,
+    ) -> anyhow::Result<Arc<ProviderComponentSnapshot>> {
+        if let Some(snapshot) = self.snapshots.get(component) {
+            return Ok(Arc::clone(snapshot));
+        }
+        let relative = crate::catalog::resolve_provider_component(catalog_root, component)?;
+        let bytes = crate::catalog_transaction::read_provider_component(catalog_root, &relative)
+            .with_context(|| format!("read provider component '{}'", relative.display()))?;
+        let snapshot = Arc::new(ProviderComponentSnapshot {
+            relative,
+            identity: format!("{:x}", Sha256::digest(&bytes)),
+            bytes: Arc::from(bytes),
+        });
+        self.snapshots
+            .insert(component.to_owned(), Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+}
+
+
 
 #[derive(Debug, Clone, PartialEq)]
 struct DesiredBinding {
@@ -246,8 +356,8 @@ struct DesiredBinding {
     scheme: String,
     generation: u64,
     topology: RuntimeTopology,
-    argv: Vec<String>,
-    demand: bool,
+    runtime: crate::catalog::DeclaredProfileRuntime,
+    component: Arc<ProviderComponentSnapshot>,
     uri: String,
     selector: Value,
     descriptor: ProfileDescriptor,
@@ -290,12 +400,18 @@ fn desired_bindings(
     profiles: &ResourceProfileRegistry,
     generation: Option<u64>,
     live_specs: &[AgentSpec],
+    component_cache: &Mutex<ComponentSnapshotCache>,
 ) -> (BTreeMap<String, DesiredBinding>, Vec<String>) {
     let catalog_generation = generation.unwrap_or(0);
     let refresh = profiles.begin_refresh();
+    let mut component_cache = component_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    component_cache.begin_refresh(generation);
     let mut descriptors = BTreeMap::new();
     let mut runtimes = BTreeMap::new();
     let mut generations = BTreeMap::new();
+    let mut components = BTreeMap::new();
     let mut warnings = Vec::new();
     for declared in &config.profiles {
         let Some(runtime) = declared.runtime.as_ref() else {
@@ -307,12 +423,29 @@ fn desired_bindings(
                     .capabilities
                     .contains(&ProfileCapability::Observe) =>
             {
+                let component = match component_cache.load(catalog_root, &runtime.component) {
+                    Ok(component) => component,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "Resource Profile '{}': provider component unavailable: {error:#}",
+                            declared.scheme
+                        ));
+                        continue;
+                    }
+                };
                 generations.insert(
                     declared.scheme.clone(),
-                    profile_generation(catalog_generation, declared, &descriptor, profiles),
+                    profile_generation(
+                        catalog_generation,
+                        declared,
+                        &descriptor,
+                        profiles,
+                        &component.identity,
+                    ),
                 );
                 descriptors.insert(declared.scheme.clone(), descriptor);
                 runtimes.insert(declared.scheme.clone(), runtime.clone());
+                components.insert(declared.scheme.clone(), component);
             }
             Ok(_) => warnings.push(format!(
                 "Resource Profile '{}': runtime has no observable descriptor",
@@ -336,9 +469,10 @@ fn desired_bindings(
             let Some((scheme, _)) = resource.uri().split_once(':') else {
                 continue;
             };
-            let (Some(descriptor), Some(runtime), Some(generation)) = (
+            let (Some(descriptor), Some(runtime), Some(component), Some(generation)) = (
                 descriptors.get(scheme),
                 runtimes.get(scheme),
+                components.get(scheme),
                 generations.get(scheme),
             ) else {
                 continue;
@@ -402,8 +536,8 @@ fn desired_bindings(
                     scheme: scheme.to_owned(),
                     generation: *generation,
                     topology: descriptor.runtime.topology,
-                    argv: runtime.argv.clone(),
-                    demand: runtime.demand,
+                    runtime: runtime.clone(),
+                    component: Arc::clone(component),
                     uri: resource.uri().to_owned(),
                     selector,
                     descriptor: descriptor.clone(),
@@ -418,33 +552,39 @@ fn desired_bindings(
 struct Worker {
     catalog_root: PathBuf,
     this_host: String,
-    tx: SyncSender<Msg>,
     request_dir: PathBuf,
     receipt_dir: PathBuf,
     initialized: bool,
     catalog_generation: Option<u64>,
     desired: BTreeMap<String, DesiredBinding>,
     runtimes: BTreeMap<RuntimeKey, RuntimeProcess>,
+    #[cfg(feature = "wasip2-provider-runtime")]
+    completion_tx: SyncSender<Msg>,
+    #[cfg(feature = "wasip2-provider-runtime")]
+    jobs: BTreeMap<u64, ObservationJob>,
 }
 
 impl Worker {
     fn new(
         catalog_root: PathBuf,
         this_host: String,
-        tx: SyncSender<Msg>,
         request_dir: PathBuf,
         receipt_dir: PathBuf,
+        completion_tx: SyncSender<Msg>,
     ) -> Self {
         Self {
             catalog_root,
             this_host,
-            tx,
             request_dir,
             receipt_dir,
             initialized: false,
             catalog_generation: None,
             desired: BTreeMap::new(),
             runtimes: BTreeMap::new(),
+            #[cfg(feature = "wasip2-provider-runtime")]
+            completion_tx,
+            #[cfg(feature = "wasip2-provider-runtime")]
+            jobs: BTreeMap::new(),
         }
     }
 
@@ -479,30 +619,15 @@ impl Worker {
                         .collect();
                     let _ = reply.send(health);
                 }
-                Msg::RuntimeOutput { key, owner, output } => {
-                    self.runtime_output(&key, &owner, output);
-                    scan_requests_now = true;
-                }
-                Msg::RuntimeEof { key, owner } => {
-                    self.runtime_failed(&key, &owner, "runtime protocol reached EOF");
-                    scan_requests_now = true;
-                }
-                Msg::WriterDrained { key, owner } => {
-                    if !owner_matches(
-                        self.runtimes.get(&key).map(|runtime| &runtime.owner),
-                        &owner,
-                    ) {
-                        continue;
-                    }
-                }
-                Msg::WriterFailed { key, owner, error } => {
-                    self.runtime_failed(&key, &owner, &error);
-                    scan_requests_now = true;
-                }
                 Msg::ObserveRequests => {
                     scan_requests_now = true;
                 }
+                #[cfg(feature = "wasip2-provider-runtime")]
+                Msg::ObservationCompleted(completion) => {
+                    self.complete_observation(completion);
+                }
                 Msg::Shutdown { reply } => {
+                    self.shutdown_jobs(&rx);
                     self.stop_all();
                     let _ = reply.send(());
                     break;
@@ -518,6 +643,8 @@ impl Worker {
     }
 
     fn reconcile(&mut self, desired: BTreeMap<String, DesiredBinding>) -> Vec<String> {
+        #[cfg(feature = "wasip2-provider-runtime")]
+        self.cancel_replaced_jobs(&desired);
         let mut warnings = Vec::new();
         let desired_runtime_keys = desired
             .values()
@@ -552,7 +679,6 @@ impl Worker {
                 match RuntimeProcess::spawn(
                     key.clone(),
                     &bindings[0],
-                    self.tx.clone(),
                     &self.catalog_root,
                     &self.this_host,
                 ) {
@@ -588,7 +714,35 @@ impl Worker {
         warnings
     }
 
+    #[cfg(feature = "wasip2-provider-runtime")]
+    fn cancel_replaced_jobs(&self, desired: &BTreeMap<String, DesiredBinding>) {
+        for job in self.jobs.values() {
+            let remains_current = desired.get(&job.stable_key).is_some_and(|next| {
+                next.runtime_key() == job.runtime_key
+                    && self
+                        .runtimes
+                        .get(&job.runtime_key)
+                        .and_then(|runtime| runtime.bindings.get(&job.stable_key))
+                        .is_some_and(|active| active.desired == *next)
+            });
+            if !remains_current {
+                job.cancellation.cancel();
+            }
+        }
+    }
+
     fn deactivate_recipient(&mut self, recipient: &str) {
+        #[cfg(feature = "wasip2-provider-runtime")]
+        for job in self.jobs.values() {
+            let belongs_to_recipient = self
+                .runtimes
+                .get(&job.runtime_key)
+                .and_then(|runtime| runtime.bindings.get(&job.stable_key))
+                .is_some_and(|active| active.desired.recipient == recipient);
+            if belongs_to_recipient {
+                job.cancellation.cancel();
+            }
+        }
         for runtime in self.runtimes.values_mut() {
             runtime.deactivate_recipient(recipient);
         }
@@ -604,12 +758,242 @@ impl Worker {
         }
     }
     fn retry_observe_dispatches(&mut self) {
+        #[cfg(feature = "wasip2-provider-runtime")]
+        {
+            let keys = self.runtimes.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let (launches, errors, scheme) = {
+                    let runtime = self
+                        .runtimes
+                        .get_mut(&key)
+                        .expect("runtime selected from the same map");
+                    let (launches, errors) = runtime.prepare_observe_dispatches(&key);
+                    (launches, errors, runtime.scheme.clone())
+                };
+                for error in errors {
+                    eprintln!("st2: Resource Profile '{scheme}': {error}");
+                }
+                for launch in launches {
+                    self.spawn_observation(launch);
+                }
+            }
+        }
+        #[cfg(not(feature = "wasip2-provider-runtime"))]
         for runtime in self.runtimes.values_mut() {
             for error in runtime.retry_observe_dispatches() {
                 eprintln!("st2: Resource Profile '{}': {error}", runtime.scheme);
             }
         }
     }
+
+    #[cfg(feature = "wasip2-provider-runtime")]
+    fn spawn_observation(&mut self, launch: ObservationLaunch) {
+        let ObservationLaunch {
+            job_id,
+            runtime_key,
+            stable_key,
+            authority,
+            watermark,
+            fence,
+            request,
+            provider,
+            cancellation,
+        } = launch;
+        let completion_tx = self.completion_tx.clone();
+        let thread_runtime_key = runtime_key.clone();
+        let thread_stable_key = stable_key.clone();
+        let thread_authority = authority.clone();
+        let thread_cancellation = cancellation.clone();
+        let thread_fence = fence;
+        let spawn_failure_provider = Arc::clone(&provider);
+        let spawn = thread::Builder::new()
+            .name(format!("st2-resource-observe-{job_id}"))
+            .spawn(move || {
+                let result =
+                    catch_observation(|| provider.observe(&request, &thread_cancellation));
+                let _ = completion_tx.send(Msg::ObservationCompleted(ObservationCompletion {
+                    job_id,
+                    runtime_key: thread_runtime_key,
+                    stable_key: thread_stable_key,
+                    authority: thread_authority,
+                    watermark,
+                    fence: thread_fence,
+                    result,
+                }));
+            });
+        match spawn {
+            Ok(join) => {
+                self.jobs.insert(
+                    job_id,
+                    ObservationJob {
+                        runtime_key,
+                        stable_key,
+                        cancellation,
+                        join,
+                    },
+                );
+            }
+            Err(error) => {
+                cancellation.cancel();
+                spawn_failure_provider.discard_prepared(job_id);
+                if let Some(runtime) = self.runtimes.get_mut(&runtime_key)
+                    && let Some(active) = runtime.bindings.get_mut(&stable_key)
+                {
+                    active.health.state = RuntimeHealthState::Degraded;
+                    active.health.detail =
+                        Some(format!("observation worker could not start: {error}"));
+                    let _ = settle_active_demand(
+                        &runtime.request_dir,
+                        &runtime.receipt_dir,
+                        &runtime.owner,
+                        active,
+                        watermark,
+                        ObserveReceiptStatus::SettledFailed,
+                        None,
+                        Some("provider observation worker could not start".to_owned()),
+                    );
+                    runtime.refresh_process_health();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "wasip2-provider-runtime")]
+    fn complete_observation(&mut self, completion: ObservationCompletion) {
+        let Some(job) = self.jobs.remove(&completion.job_id) else {
+            return;
+        };
+        let _ = job.join.join();
+        if job.runtime_key != completion.runtime_key || job.stable_key != completion.stable_key {
+            return;
+        }
+        let Some(runtime) = self.runtimes.get_mut(&completion.runtime_key) else {
+            return;
+        };
+        let Some(active) = runtime.bindings.get(&completion.stable_key) else {
+            return;
+        };
+        let fence_is_current = active.binding_id == completion.authority.binding_id
+            && active.registration == completion.authority.registration
+            && active.desired.generation == completion.fence.generation()
+            && active.revision == completion.fence.revision()
+            && active.catch_up.state().current_snapshot_digest()
+                == completion.fence.prior_digest()
+            && active
+                .demand
+                .in_flight
+                .as_ref()
+                .is_some_and(|batch| batch.watermark == completion.watermark);
+        if !fence_is_current {
+            return;
+        }
+        match completion.result {
+            Ok(result) => {
+                let failure_detail = match &result {
+                    st2_resource_protocol::ObservationResult::Failed { diagnostic } => {
+                        Some(diagnostic.clone().unwrap_or_else(|| {
+                            "provider returned a failed observation".to_owned()
+                        }))
+                    }
+                    _ => None,
+                };
+                let message = RuntimeMessage::ObservationResult {
+                    owner: completion.authority.owner,
+                    binding_id: completion.authority.binding_id,
+                    registration: completion.authority.registration,
+                    demand_watermark: completion.watermark,
+                    result,
+                };
+                let catalog_root = active.desired.catalog_root.clone();
+                let this_host = active.desired.this_host.clone();
+                if let Err(error) = runtime.accept(message, &catalog_root, &this_host) {
+                    if let Some(active) = runtime.bindings.get_mut(&completion.stable_key) {
+                        active.health.state = RuntimeHealthState::Degraded;
+                        active.health.detail = Some(format!("provider proposal rejected: {error:#}"));
+                        let _ = settle_active_demand(
+                            &runtime.request_dir,
+                            &runtime.receipt_dir,
+                            &runtime.owner,
+                            active,
+                            completion.watermark,
+                            ObserveReceiptStatus::SettledFailed,
+                            None,
+                            Some("provider proposal was rejected".to_owned()),
+                        );
+                    }
+                } else if let Some(active) = runtime.bindings.get_mut(&completion.stable_key) {
+                    if let Some(detail) = failure_detail {
+                        active.health.state = RuntimeHealthState::Degraded;
+                        active.health.detail = Some(detail);
+                    } else {
+                        active.health.state = RuntimeHealthState::Ready;
+                        active.health.detail = None;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    scheme = %runtime.scheme,
+                    error = %error,
+                    "resource provider observation failed"
+                );
+                if let Some(active) = runtime.bindings.get_mut(&completion.stable_key) {
+                    active.health.state = RuntimeHealthState::Degraded;
+                    active.health.detail = Some(error);
+                    let _ = settle_active_demand(
+                        &runtime.request_dir,
+                        &runtime.receipt_dir,
+                        &runtime.owner,
+                        active,
+                        completion.watermark,
+                        ObserveReceiptStatus::SettledFailed,
+                        None,
+                        Some("provider observation failed".to_owned()),
+                    );
+                }
+            }
+        }
+        runtime.refresh_process_health();
+    }
+
+    #[cfg(feature = "wasip2-provider-runtime")]
+    fn shutdown_jobs(&mut self, rx: &Receiver<Msg>) {
+        for job in self.jobs.values() {
+            job.cancellation.cancel();
+        }
+        for runtime in self.runtimes.values_mut() {
+            runtime.finalize_all_demand(
+                ObserveReceiptStatus::ProviderUnavailable,
+                Some("Resource Profile supervisor shut down".to_owned()),
+            );
+        }
+        while !self.jobs.is_empty() {
+            match rx.recv() {
+                Ok(Msg::ObservationCompleted(completion)) => {
+                    self.complete_observation(completion);
+                }
+                Ok(Msg::Refresh { reply, .. }) => {
+                    let _ = reply.send(vec![
+                        "Resource Profile supervisor is shutting down".to_owned(),
+                    ]);
+                }
+                Ok(Msg::Deactivate { reply, .. }) | Ok(Msg::Shutdown { reply }) => {
+                    let _ = reply.send(());
+                }
+                Ok(Msg::Health { reply }) => {
+                    let _ = reply.send(Vec::new());
+                }
+                Ok(Msg::ObserveRequests) => {}
+                Err(_) => break,
+            }
+        }
+        for (_, job) in std::mem::take(&mut self.jobs) {
+            let _ = job.join.join();
+        }
+    }
+
+    #[cfg(not(feature = "wasip2-provider-runtime"))]
+    fn shutdown_jobs(&mut self, _rx: &Receiver<Msg>) {}
 
     fn consume_observe_requests(&mut self) {
         if !self.initialized {
@@ -671,7 +1055,7 @@ impl Worker {
             });
             let Some(runtime_key) = runtime_key else {
                 let (status, detail) = match self.desired.get(&stable_key) {
-                    Some(desired) if desired.demand => (
+                    Some(desired) if desired.runtime.demand => (
                         ObserveReceiptStatus::ProviderUnavailable,
                         "the declared provider runtime is not available",
                     ),
@@ -694,7 +1078,7 @@ impl Worker {
             else {
                 continue;
             };
-            if !active.desired.demand {
+            if !active.desired.runtime.demand {
                 self.finish_request_without_dispatch(
                     &record,
                     ObserveReceiptStatus::AbsentBinding,
@@ -770,43 +1154,6 @@ impl Worker {
         }
     }
 
-    fn runtime_output(
-        &mut self,
-        key: &RuntimeKey,
-        owner: &RuntimeOwner,
-        output: Result<RuntimeMessage, String>,
-    ) {
-        let Some(runtime) = self.runtimes.get_mut(key) else {
-            return;
-        };
-        if !owner_matches(Some(&runtime.owner), owner) {
-            return;
-        }
-        let failure = match output {
-            Ok(message) => runtime
-                .accept(message, &self.catalog_root, &self.this_host)
-                .err()
-                .map(|error| format!("runtime output rejected: {error:#}")),
-            Err(error) => Some(format!("runtime protocol error: {error}")),
-        };
-        if let Some(detail) = failure {
-            self.runtime_failed(key, owner, &detail);
-        }
-    }
-
-    fn runtime_failed(&mut self, key: &RuntimeKey, owner: &RuntimeOwner, detail: &str) {
-        if !owner_matches(self.runtimes.get(key).map(|runtime| &runtime.owner), owner) {
-            return;
-        }
-        if let Some(mut runtime) = self.runtimes.remove(key) {
-            eprintln!("st2: Resource Profile '{}': {detail}", runtime.scheme);
-            runtime.finalize_all_demand(
-                ObserveReceiptStatus::ProviderUnavailable,
-                Some(detail.to_owned()),
-            );
-            runtime.stop();
-        }
-    }
 
     fn stop_all(&mut self) {
         for (_, mut runtime) in std::mem::take(&mut self.runtimes) {
@@ -819,14 +1166,78 @@ struct RuntimeProcess {
     scheme: String,
     owner: RuntimeOwner,
     lifecycle: RuntimeLifecycle,
-    child: Child,
-    writer: Option<SyncSender<Vec<u8>>>,
-    writer_thread: Option<JoinHandle<()>>,
-    reader_thread: Option<JoinHandle<()>>,
+    #[cfg(feature = "wasip2-provider-runtime")]
+    provider: Arc<ProviderRuntime>,
     bindings: BTreeMap<String, ActiveBinding>,
     request_dir: PathBuf,
     receipt_dir: PathBuf,
     process_health: ResourceProfileHealth,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+enum ProviderRuntime {
+    GitHubIssue {
+        executor: Wasip2Executor<GitHubIssueModule>,
+        component: LoadedComponent,
+        module: GitHubIssueModule,
+    },
+    PtyStats {
+        executor: Wasip2Executor<PtyStatsModule>,
+        component: LoadedComponent,
+        module: PtyStatsModule,
+    },
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+impl ProviderRuntime {
+    fn prepare(&self, invocation_id: u64) -> ObservationCancellation {
+        match self {
+            Self::GitHubIssue {
+                executor, module, ..
+            } => ObservationCancellation {
+                interruption: executor.interruption_handle(),
+                pty: None,
+                github: Some(module.prepare(invocation_id)),
+            },
+            Self::PtyStats {
+                executor, module, ..
+            } => ObservationCancellation {
+                interruption: executor.interruption_handle(),
+                pty: Some(module.prepare(invocation_id)),
+                github: None,
+            },
+        }
+    }
+
+    fn discard_prepared(&self, invocation_id: u64) {
+        match self {
+            Self::GitHubIssue { module, .. } => {
+                module.discard_prepared(invocation_id);
+            }
+            Self::PtyStats { module, .. } => {
+                module.discard_prepared(invocation_id);
+            }
+        }
+    }
+
+    fn observe(
+        &self,
+        request: &Wasip2ObservationRequest,
+        cancellation: &ObservationCancellation,
+    ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError> {
+        match self {
+            Self::GitHubIssue {
+                executor,
+                component,
+                ..
+            } => executor.observe(component, request, Some(&cancellation.interruption)),
+            Self::PtyStats {
+                executor,
+                component,
+                ..
+            } => executor.observe(component, request, Some(&cancellation.interruption)),
+        }
+    }
 }
 
 struct ActiveBinding {
@@ -836,6 +1247,7 @@ struct ActiveBinding {
     catch_up: CatchUp,
     health: ResourceProfileHealth,
     demand: DemandState,
+    revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -913,81 +1325,114 @@ impl DemandState {
 
 impl RuntimeProcess {
     fn spawn(
-        key: RuntimeKey,
+        _key: RuntimeKey,
         sample: &DesiredBinding,
-        supervisor_tx: SyncSender<Msg>,
         catalog_root: &Path,
         this_host: &str,
     ) -> anyhow::Result<Self> {
-        let executable = sample
-            .argv
-            .first()
-            .context("runtime argv is unexpectedly empty")?;
-        let mut command = Command::new(executable);
-        command
-            .args(&sample.argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawn {executable:?}"))?;
-        let stdin = child.stdin.take().context("capture runtime stdin")?;
-        let stdout = child.stdout.take().context("capture runtime stdout")?;
-        let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let incarnation = RuntimeIncarnation::new(format!("{}-{sequence}", sample.generation))?;
-        let claim = OwnerClaim::new(hash_text(&format!(
-            "{}\0{}\0{}\0{sequence}",
-            catalog_root.display(),
-            this_host,
-            sample.scheme
-        )))?;
-        let owner = RuntimeOwner::new(incarnation, claim);
-        let mut lifecycle = RuntimeLifecycle::new();
-        lifecycle.claim(owner.clone());
-
-        let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(WRITER_CAPACITY);
-        let writer_key = key.clone();
-        let writer_owner = owner.clone();
-        let writer_supervisor = supervisor_tx.clone();
-        let writer_thread = thread::Builder::new()
-            .name("st2-resource-profile-stdin".to_owned())
-            .spawn(move || {
-                runtime_writer(
-                    stdin,
-                    writer_rx,
-                    writer_key,
-                    writer_owner,
-                    writer_supervisor,
-                )
-            })?;
-        let reader_key = key.clone();
-        let reader_owner = owner.clone();
-        let reader_thread = thread::Builder::new()
-            .name("st2-resource-profile-stdout".to_owned())
-            .spawn(move || runtime_reader(stdout, reader_key, reader_owner, supervisor_tx))?;
-        let scope = crate::park::SupervisorScope::current(catalog_root, this_host)?;
-        let request_dir = scope.observe_request_dir();
-        let receipt_dir = scope.observe_receipt_dir();
-
-        Ok(Self {
-            scheme: sample.scheme.clone(),
-            owner,
-            lifecycle,
-            child,
-            writer: Some(writer_tx),
-            writer_thread: Some(writer_thread),
-            reader_thread: Some(reader_thread),
-            bindings: BTreeMap::new(),
-            request_dir,
-            receipt_dir,
-            process_health: ResourceProfileHealth {
+        #[cfg(not(feature = "wasip2-provider-runtime"))]
+        {
+            let _ = (sample, catalog_root, this_host);
+            anyhow::bail!(
+                "component provider runtime unavailable because st2 was built without \
+                 `wasip2-provider-runtime`"
+            );
+        }
+        #[cfg(feature = "wasip2-provider-runtime")]
+        {
+            let provider = match &sample.runtime.capability {
+                crate::catalog::DeclaredProviderCapability::GitHubIssue {
+                    owner,
+                    repo,
+                    number,
+                    connect_timeout_ms,
+                    total_timeout_ms,
+                } => {
+                    let module = GitHubIssueModule::new(GitHubIssueConfig {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                        number: *number,
+                        connect_timeout: Duration::from_millis(*connect_timeout_ms),
+                        total_timeout: Duration::from_millis(*total_timeout_ms),
+                    })
+                    .map_err(anyhow::Error::msg)?;
+                    let executor = Wasip2Executor::new(
+                        Wasip2RuntimeConfig::default(),
+                        None,
+                        module.clone(),
+                    )?;
+                    let component = executor.load(&sample.component.bytes)?;
+                    ProviderRuntime::GitHubIssue {
+                        executor,
+                        component,
+                        module,
+                    }
+                }
+                crate::catalog::DeclaredProviderCapability::PtyStats {
+                    executable,
+                    cwd,
+                    scope,
+                    deadline_ms,
+                } => {
+                    let executable =
+                        crate::expand::expand_catalog(executable, catalog_root);
+                    let cwd = crate::expand::expand_catalog(cwd, catalog_root);
+                    let scope = match scope {
+                        crate::catalog::DeclaredPtyStatsScope::All => PtyStatsScope::All,
+                        crate::catalog::DeclaredPtyStatsScope::Session(session) => {
+                            PtyStatsScope::Session(session.clone())
+                        }
+                    };
+                    let config = PtyStatsConfig::resolve(
+                        executable,
+                        PathBuf::from(cwd),
+                        scope,
+                        Duration::from_millis(*deadline_ms),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    let module = PtyStatsModule::new(config);
+                    let executor = Wasip2Executor::new(
+                        Wasip2RuntimeConfig::default(),
+                        None,
+                        module.clone(),
+                    )?;
+                    let component = executor.load(&sample.component.bytes)?;
+                    ProviderRuntime::PtyStats {
+                        executor,
+                        component,
+                        module,
+                    }
+                }
+            };
+            let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let incarnation =
+                RuntimeIncarnation::new(format!("{}-{sequence}", sample.generation))?;
+            let claim = OwnerClaim::new(hash_text(&format!(
+                "{}\0{}\0{}\0{sequence}",
+                catalog_root.display(),
+                this_host,
+                sample.scheme
+            )))?;
+            let owner = RuntimeOwner::new(incarnation, claim);
+            let mut lifecycle = RuntimeLifecycle::new();
+            lifecycle.claim(owner.clone());
+            let scope = crate::park::SupervisorScope::current(catalog_root, this_host)?;
+            Ok(Self {
                 scheme: sample.scheme.clone(),
-                binding: None,
-                state: RuntimeHealthState::Starting,
-                detail: None,
-            },
-        })
+                owner,
+                lifecycle,
+                provider: Arc::new(provider),
+                bindings: BTreeMap::new(),
+                request_dir: scope.observe_request_dir(),
+                receipt_dir: scope.observe_receipt_dir(),
+                process_health: ResourceProfileHealth {
+                    scheme: sample.scheme.clone(),
+                    binding: None,
+                    state: RuntimeHealthState::Ready,
+                    detail: None,
+                },
+            })
+        }
     }
 
     fn reconcile_bindings(&mut self, desired: Vec<DesiredBinding>) -> anyhow::Result<()> {
@@ -1056,22 +1501,11 @@ impl RuntimeProcess {
             .with_context(|| format!("create {}", state_directory.display()))?;
         let mut catch_up = CatchUp::open_for_snapshot(&state_directory, &desired.target)?;
         let pending = catch_up.set_deliverable(true)?;
-        let previous_digest = catch_up.state().current_snapshot_digest();
-        let message = HostMessage::Register {
-            owner: self.owner.clone(),
-            binding_id: binding_id.clone(),
-            registration: registration.clone(),
-            uri: desired.uri.clone(),
-            selector: desired.selector.clone(),
-            carrier_path: desired.target.path(),
-            previous_digest,
-        };
-        self.send(message)?;
         let mut active = ActiveBinding {
             health: ResourceProfileHealth {
                 scheme: desired.scheme.clone(),
                 binding: Some(desired.binding_name.clone()),
-                state: RuntimeHealthState::Starting,
+                state: RuntimeHealthState::Ready,
                 detail: None,
             },
             desired,
@@ -1079,12 +1513,14 @@ impl RuntimeProcess {
             registration,
             catch_up,
             demand: DemandState::default(),
+            revision: 0,
         };
         if pending.is_some() {
             let _ = emit_pending_for(&mut active);
         }
         self.bindings
             .insert(active.desired.stable_key.clone(), active);
+        self.refresh_process_health();
         Ok(())
     }
 
@@ -1101,15 +1537,10 @@ impl RuntimeProcess {
             Some("binding registration was removed or replaced".to_owned()),
         );
         let _ = active.catch_up.set_deliverable(false);
-        let message = HostMessage::Unregister {
-            owner: self.owner.clone(),
-            binding_id: active.binding_id.clone(),
-            registration: active.registration.clone(),
-        };
-        let _ = self.send(message);
         let _ = self
             .lifecycle
             .unregister(&self.owner, &active.binding_id, &active.registration);
+        self.refresh_process_health();
     }
 
     fn deactivate_recipient(&mut self, recipient: &str) {
@@ -1152,6 +1583,96 @@ impl RuntimeProcess {
             .any(|active| active.demand.contains_request(request_id))
     }
 
+    #[cfg(feature = "wasip2-provider-runtime")]
+    fn prepare_observe_dispatches(
+        &mut self,
+        runtime_key: &RuntimeKey,
+    ) -> (Vec<ObservationLaunch>, Vec<String>) {
+        let mut launches = Vec::new();
+        let mut errors = Vec::new();
+        for active in self.bindings.values_mut() {
+            let authority = ObservationAuthority {
+                owner: self.owner.clone(),
+                binding_id: active.binding_id.clone(),
+                registration: active.registration.clone(),
+            };
+            errors.extend(retry_settled_demand(
+                &self.request_dir,
+                &self.receipt_dir,
+                &authority,
+                active,
+            ));
+        }
+        let keys = self
+            .bindings
+            .iter()
+            .filter(|(_, active)| {
+                active.demand.in_flight.is_none() && active.demand.trailing.is_some()
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for stable_key in keys {
+            let active = self
+                .bindings
+                .get_mut(&stable_key)
+                .expect("binding selected from the same map");
+            let authority = ObservationAuthority {
+                owner: self.owner.clone(),
+                binding_id: active.binding_id.clone(),
+                registration: active.registration.clone(),
+            };
+            let mut batch = active
+                .demand
+                .trailing
+                .take()
+                .expect("binding was selected with trailing demand");
+            batch.dispatched_at = Some(Instant::now());
+            errors.extend(write_batch_status(
+                &self.request_dir,
+                &self.receipt_dir,
+                &authority,
+                &mut batch,
+                ObserveReceiptStatus::Accepted,
+                None,
+                None,
+            ));
+            for pending in &batch.requests {
+                crate::metrics::record_resource_observe_dispatch(
+                    SystemTime::now()
+                        .duration_since(pending.queued_at)
+                        .unwrap_or(Duration::ZERO),
+                );
+            }
+            let watermark = batch.watermark;
+            active.demand.in_flight = Some(batch);
+            let fence = ProposalFence::new(
+                active.desired.generation,
+                active.revision,
+                active.catch_up.state().current_snapshot_digest(),
+            );
+            let job_id = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let cancellation = self.provider.prepare(job_id);
+            launches.push(ObservationLaunch {
+                job_id,
+                runtime_key: runtime_key.clone(),
+                stable_key,
+                authority,
+                watermark,
+                fence,
+                request: Wasip2ObservationRequest {
+                    invocation_id: job_id,
+                    uri: active.desired.uri.clone(),
+                    selector: active.desired.selector.clone(),
+                    previous_digest: fence.prior_digest(),
+                },
+                provider: Arc::clone(&self.provider),
+                cancellation,
+            });
+        }
+        (launches, errors)
+    }
+
+    #[cfg(not(feature = "wasip2-provider-runtime"))]
     fn retry_observe_dispatches(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
         for active in self.bindings.values_mut() {
@@ -1176,76 +1697,43 @@ impl RuntimeProcess {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in keys {
-            let Some(active) = self.bindings.get(&key) else {
-                continue;
-            };
+            let active = self
+                .bindings
+                .get_mut(&key)
+                .expect("binding selected from the same map");
             let authority = ObservationAuthority {
                 owner: self.owner.clone(),
                 binding_id: active.binding_id.clone(),
                 registration: active.registration.clone(),
             };
-            let demand_watermark = active
+            let mut batch = active
                 .demand
                 .trailing
-                .as_ref()
-                .expect("binding was selected with trailing demand")
-                .watermark;
-            let message = HostMessage::Observe {
-                owner: authority.owner.clone(),
-                binding_id: authority.binding_id.clone(),
-                registration: authority.registration.clone(),
-                demand_watermark,
-            };
-            match self.send(message) {
-                Ok(()) => {
-                    let active = self
-                        .bindings
-                        .get_mut(&key)
-                        .expect("binding selected from the same map");
-                    let mut batch = active
-                        .demand
-                        .trailing
-                        .take()
-                        .expect("binding was selected with trailing demand");
-                    batch.dispatched_at = Some(Instant::now());
-                    errors.extend(write_batch_status(
-                        &self.request_dir,
-                        &self.receipt_dir,
-                        &authority,
-                        &mut batch,
-                        ObserveReceiptStatus::Accepted,
-                        None,
-                        None,
-                    ));
-                    for pending in &batch.requests {
-                        crate::metrics::record_resource_observe_dispatch(
-                            SystemTime::now()
-                                .duration_since(pending.queued_at)
-                                .unwrap_or(Duration::ZERO),
-                        );
-                    }
-                    active.demand.in_flight = Some(batch);
-                }
-                Err(error) => {
-                    let active = self
-                        .bindings
-                        .get_mut(&key)
-                        .expect("binding selected from the same map");
-                    let batch = active
-                        .demand
-                        .trailing
-                        .as_mut()
-                        .expect("binding was selected with trailing demand");
-                    errors.extend(write_batch_status(
-                        &self.request_dir,
-                        &self.receipt_dir,
-                        &authority,
-                        batch,
-                        ObserveReceiptStatus::Backpressured,
-                        None,
-                        Some(error.to_string()),
-                    ));
-                }
+                .take()
+                .expect("binding was selected with trailing demand");
+            batch.dispatched_at = Some(Instant::now());
+            errors.extend(write_batch_status(
+                &self.request_dir,
+                &self.receipt_dir,
+                &authority,
+                &mut batch,
+                ObserveReceiptStatus::Accepted,
+                None,
+                None,
+            ));
+            let watermark = batch.watermark;
+            active.demand.in_flight = Some(batch);
+            if let Err(error) = settle_active_demand(
+                &self.request_dir,
+                &self.receipt_dir,
+                &self.owner,
+                active,
+                watermark,
+                ObserveReceiptStatus::ProviderUnavailable,
+                None,
+                Some("component provider runtime is unavailable".to_owned()),
+            ) {
+                errors.push(error.to_string());
             }
         }
         errors
@@ -1351,16 +1839,25 @@ impl RuntimeProcess {
                 }
             }
         }
+        self.refresh_process_health();
         Ok(())
     }
 
-    fn send(&self, message: HostMessage) -> anyhow::Result<()> {
-        let line = encode_host_line(&message)?;
-        let writer = self.writer.as_ref().context("runtime stdin is closed")?;
-        match writer.try_send(line) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => anyhow::bail!("runtime stdin queue is full"),
-            Err(TrySendError::Disconnected(_)) => anyhow::bail!("runtime stdin is disconnected"),
+
+    fn refresh_process_health(&mut self) {
+        let degraded = self
+            .bindings
+            .values()
+            .filter(|active| active.health.state == RuntimeHealthState::Degraded)
+            .map(|active| active.desired.binding_name.as_str())
+            .collect::<Vec<_>>();
+        if degraded.is_empty() {
+            self.process_health.state = RuntimeHealthState::Ready;
+            self.process_health.detail = None;
+        } else {
+            self.process_health.state = RuntimeHealthState::Degraded;
+            self.process_health.detail =
+                Some(format!("degraded bindings: {}", degraded.join(", ")));
         }
     }
 
@@ -1370,17 +1867,7 @@ impl RuntimeProcess {
             .collect()
     }
 
-    fn stop(&mut self) {
-        self.writer.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(thread) = self.writer_thread.take() {
-            let _ = thread.join();
-        }
-        if let Some(thread) = self.reader_thread.take() {
-            let _ = thread.join();
-        }
-    }
+    fn stop(&mut self) {}
 }
 
 fn process_publication(
@@ -1394,7 +1881,12 @@ fn process_publication(
         .values_mut()
         .find(|active| active.binding_id == binding_id)
         .context("accepted publication has no active binding")?;
+    let next_revision = active
+        .revision
+        .checked_add(1)
+        .context("provider publication revision exhausted")?;
     let (outcome, pending) = active.catch_up.publish(publication)?;
+    active.revision = next_revision;
     let delivery_error = if pending.is_some() {
         emit_pending(catalog_root, this_host, active).err()
     } else {
@@ -1572,104 +2064,6 @@ fn finalize_active_demand(
     }
 }
 
-fn runtime_writer(
-    mut stdin: std::process::ChildStdin,
-    rx: Receiver<Vec<u8>>,
-    key: RuntimeKey,
-    owner: RuntimeOwner,
-    supervisor: SyncSender<Msg>,
-) {
-    while let Ok(line) = rx.recv() {
-        if let Err(error) = stdin.write_all(&line).and_then(|_| stdin.flush()) {
-            let _ = supervisor.send(Msg::WriterFailed {
-                key,
-                owner,
-                error: format!("runtime stdin failed: {error}"),
-            });
-            return;
-        }
-        match supervisor.try_send(Msg::WriterDrained {
-            key: key.clone(),
-            owner: owner.clone(),
-        }) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => return,
-        }
-    }
-}
-
-fn runtime_reader(
-    stdout: std::process::ChildStdout,
-    key: RuntimeKey,
-    owner: RuntimeOwner,
-    supervisor: SyncSender<Msg>,
-) {
-    let mut reader = BufReader::new(stdout);
-    loop {
-        match read_bounded_line(&mut reader) {
-            Ok(Some(line)) => {
-                let output = decode_runtime_line(&line).map_err(|error| error.to_string());
-                if supervisor
-                    .send(Msg::RuntimeOutput {
-                        key: key.clone(),
-                        owner: owner.clone(),
-                        output,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Ok(None) => {
-                let _ = supervisor.send(Msg::RuntimeEof { key, owner });
-                return;
-            }
-            Err(error) => {
-                let _ = supervisor.send(Msg::RuntimeOutput {
-                    key,
-                    owner,
-                    output: Err(error.to_string()),
-                });
-                return;
-            }
-        }
-    }
-}
-
-fn read_bounded_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(line))
-            };
-        }
-        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-            let consumed = newline + 1;
-            if line.len() + consumed > MAX_PROTOCOL_LINE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "runtime protocol line exceeds 2 MiB",
-                ));
-            }
-            line.extend_from_slice(&available[..consumed]);
-            reader.consume(consumed);
-            return Ok(Some(line));
-        }
-        if line.len() + available.len() >= MAX_PROTOCOL_LINE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime protocol line exceeds 2 MiB",
-            ));
-        }
-        let consumed = available.len();
-        line.extend_from_slice(available);
-        reader.consume(consumed);
-    }
-}
 
 fn selector_topics(selector: &Value) -> anyhow::Result<TopicSelection> {
     let topics = selector
@@ -1697,6 +2091,7 @@ fn profile_generation(
     declared: &crate::catalog::DeclaredProfile,
     descriptor: &ProfileDescriptor,
     profiles: &ResourceProfileRegistry,
+    component_identity: &str,
 ) -> u64 {
     let module_identity = profiles
         .get(&declared.scheme)
@@ -1712,7 +2107,7 @@ fn profile_generation(
         })
         .unwrap_or_default();
     let input = format!(
-        "{catalog_generation}\0{}\0{}\0{}\0{}\0{:?}\0{:?}\0{module_identity}",
+        "{catalog_generation}\0{}\0{}\0{}\0{}\0{:?}\0{:?}\0{module_identity}\0{component_identity}",
         declared.scheme,
         declared.wasm,
         declared.class,
@@ -1899,9 +2294,6 @@ fn hash_path(path: &Path) -> String {
     hash_text(&path.to_string_lossy())
 }
 
-fn owner_matches(current: Option<&RuntimeOwner>, message: &RuntimeOwner) -> bool {
-    current == Some(message)
-}
 
 fn hash_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -1912,21 +2304,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn bounded_reader_accepts_one_maximal_line_and_rejects_overflow() {
-        let mut maximal = vec![b'x'; MAX_PROTOCOL_LINE_BYTES - 1];
-        maximal.push(b'\n');
-        assert_eq!(
-            read_bounded_line(&mut maximal.as_slice())
-                .unwrap()
-                .unwrap()
-                .len(),
-            MAX_PROTOCOL_LINE_BYTES
-        );
-        let mut overflow = vec![b'x'; MAX_PROTOCOL_LINE_BYTES];
-        overflow.push(b'\n');
-        assert!(read_bounded_line(&mut overflow.as_slice()).is_err());
-    }
 
     #[test]
     fn runtime_keys_enforce_shared_and_per_binding_topology() {
@@ -2076,69 +2453,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn full_writer_queue_is_reported_without_consuming_the_frame() {
-        let owner = RuntimeOwner::new(
-            RuntimeIncarnation::new("incarnation").unwrap(),
-            OwnerClaim::new("claim").unwrap(),
-        );
-        let mut lifecycle = RuntimeLifecycle::new();
-        lifecycle.claim(owner.clone());
-        let child = Command::new(std::env::current_exe().unwrap())
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let (writer, queued) = mpsc::sync_channel(1);
-        writer.try_send(vec![1]).unwrap();
-        let receipt_dir = tempfile::tempdir().unwrap();
-        let mut runtime = RuntimeProcess {
-            scheme: "dev.x".into(),
-            owner: owner.clone(),
-            lifecycle,
-            child,
-            writer: Some(writer),
-            writer_thread: None,
-            reader_thread: None,
-            bindings: BTreeMap::new(),
-            request_dir: receipt_dir.path().join("requests"),
-            receipt_dir: receipt_dir.path().to_path_buf(),
-            process_health: ResourceProfileHealth {
-                scheme: "dev.x".into(),
-                binding: None,
-                state: RuntimeHealthState::Starting,
-                detail: None,
-            },
-        };
-        let error = runtime
-            .send(HostMessage::Observe {
-                owner,
-                binding_id: BindingId::new("binding").unwrap(),
-                registration: RegistrationToken::new("registration").unwrap(),
-                demand_watermark: 1,
-            })
-            .unwrap_err();
-        assert!(error.to_string().contains("queue is full"));
-        assert_eq!(queued.try_recv().unwrap(), vec![1]);
-        runtime.stop();
-    }
-
-    #[test]
-    fn stale_owner_envelopes_cannot_target_a_replacement_with_the_same_runtime_key() {
-        let old = RuntimeOwner::new(
-            RuntimeIncarnation::new("incarnation-1").unwrap(),
-            OwnerClaim::new("claim-1").unwrap(),
-        );
-        let replacement = RuntimeOwner::new(
-            RuntimeIncarnation::new("incarnation-2").unwrap(),
-            OwnerClaim::new("claim-2").unwrap(),
-        );
-        assert!(owner_matches(Some(&replacement), &replacement));
-        assert!(!owner_matches(Some(&replacement), &old));
-        assert!(!owner_matches(None, &old));
-    }
 
     #[test]
     fn publication_subject_renders_ordered_facts_and_reserves_topics() {
@@ -2183,62 +2497,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wasip2-provider-runtime")]
     #[test]
-    fn stale_protocol_failure_does_not_remove_the_replacement_process() {
-        let old = RuntimeOwner::new(
-            RuntimeIncarnation::new("incarnation-1").unwrap(),
-            OwnerClaim::new("claim-1").unwrap(),
-        );
-        let replacement = RuntimeOwner::new(
-            RuntimeIncarnation::new("incarnation-2").unwrap(),
-            OwnerClaim::new("claim-2").unwrap(),
-        );
-        let mut lifecycle = RuntimeLifecycle::new();
-        lifecycle.claim(replacement.clone());
-        let child = Command::new(std::env::current_exe().unwrap())
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let key = RuntimeKey::Shared {
-            scheme: "dev.x".into(),
-            generation: 1,
-        };
-        let (tx, _rx) = mpsc::sync_channel(1);
-        let temp = tempfile::tempdir().unwrap();
-        let mut worker = Worker::new(
-            temp.path().to_path_buf(),
-            "host".into(),
-            tx,
-            temp.path().join("requests"),
-            temp.path().join("receipts"),
-        );
-        worker.runtimes.insert(
-            key.clone(),
-            RuntimeProcess {
-                scheme: "dev.x".into(),
-                owner: replacement,
-                lifecycle,
-                child,
-                writer: None,
-                writer_thread: None,
-                reader_thread: None,
-                bindings: BTreeMap::new(),
-                request_dir: temp.path().join("requests"),
-                receipt_dir: temp.path().join("receipts"),
-                process_health: ResourceProfileHealth {
-                    scheme: "dev.x".into(),
-                    binding: None,
-                    state: RuntimeHealthState::Starting,
-                    detail: None,
-                },
-            },
-        );
-
-        worker.runtime_output(&key, &old, Err("stale malformed output".into()));
-        assert!(worker.runtimes.contains_key(&key));
-        worker.stop_all();
+    fn observation_panic_becomes_a_typed_failed_completion() {
+        let result = catch_observation(|| panic!("synthetic provider panic"));
+        assert_eq!(result.unwrap_err(), "provider observation panicked");
     }
+
 }

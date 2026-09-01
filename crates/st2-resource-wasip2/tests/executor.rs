@@ -139,6 +139,7 @@ fn executor(config: RuntimeConfig, cache: Option<PrivateArtifactCache>) -> Execu
 
 fn request() -> ObservationRequest {
     ObservationRequest {
+        invocation_id: 1,
         uri: "fixture://resource".to_owned(),
         selector: json!({"region": "local"}),
         prior_digest: None,

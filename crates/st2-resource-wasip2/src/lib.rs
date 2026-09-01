@@ -5,6 +5,8 @@ use st2_resource_protocol::SnapshotDigest;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObservationRequest {
+    /// Host-only identity for cancellation ownership; it is never passed to the guest.
+    pub invocation_id: u64,
     pub uri: String,
     pub selector: Value,
     pub prior_digest: Option<SnapshotDigest>,

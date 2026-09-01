@@ -2,7 +2,16 @@
 # `package.version` out of this file as the single source of truth for the
 # build, and a virtual root has no `[package]` to read.
 [workspace]
-members = ["crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-resource-wasip2", "crates/st2-wire", "crates/demo-resolver-wasm"]
+members = [
+  "components/github-issue",
+  "components/pty-stats",
+  "crates/agent-spec",
+  "crates/demo-resolver-wasm",
+  "crates/st2-resource-protocol",
+  "crates/st2-resource-providers",
+  "crates/st2-resource-wasip2",
+  "crates/st2-wire",
+]
 default-members = [".", "crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-wire"]
 
 [package]
@@ -34,6 +43,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 st2-resource-protocol = { path = "crates/st2-resource-protocol" }
+st2-resource-providers = { path = "crates/st2-resource-providers", optional = true }
+st2-resource-wasip2 = { path = "crates/st2-resource-wasip2", optional = true, features = ["runtime"] }
 st2-wire = { path = "crates/st2-wire" }
 tempfile = "3"
 toml = "0.9"
@@ -50,9 +61,17 @@ tungstenite = "0.30"
 
 [dev-dependencies]
 libc = "0.2"
+parking_lot = "0.12"
 toml = "0.9"
 
 [features]
 # Sandbox wasm resource-profile resolvers (`agent-spec/profile_wasm`). Off by default: the
 # runner binary carries no wasmtime unless a build opts in.
 wasm-resolver = ["agent-spec/wasm-resolver"]
+# Typed Component Model resource providers. This is the sole feature that admits Wasmtime for
+# observation; default members and the default st2 binary remain Wasmtime-free.
+wasip2-provider-runtime = [
+  "wasm-resolver",
+  "dep:st2-resource-providers",
+  "dep:st2-resource-wasip2",
+]
