@@ -79,6 +79,7 @@
           # env var, captured at compile time by `option_env!` (see
           # src/version.rs). A derivation env var change rebuilds the crate.
           CLI_BUILD_STAMP = buildStamp;
+          ST2_EXECUTOR_BUILD_IDENTITY = buildStamp;
           AGENT_SPEC_REVISION = agentSpecRevision;
 
           # The hook integration test executes the shipped Bash scripts with
@@ -176,6 +177,22 @@
             "profile_wasm"
             "--test"
             "resource_profile_supervisor_e2e"
+          ];
+        });
+
+        # The default workspace remains Wasmtime-free; this focused gate opts the Component Model
+        # executor into its runtime feature and drives its fixture and cache trust boundary.
+        st2Wasip2ExecutorCheck = st2.overrideAttrs (old: {
+          pname = "st2-resource-wasip2-check";
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
+          cargoTestFlags = [
+            "-p"
+            "st2-resource-wasip2"
+            "--features"
+            "runtime"
+            "--lib"
+            "--test"
+            "executor"
           ];
         });
 
@@ -296,6 +313,7 @@
         checks.parked-recovery = st2ParkedRecovery;
         checks.otel-export = st2OtelExport;
         checks.wasm-resolver-feature = st2WasmResolverCheck;
+        checks.wasip2-resource-executor = st2Wasip2ExecutorCheck;
         # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
         # the same artifact strictly admits a catalog carrying a real wasm profile module.
         checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''

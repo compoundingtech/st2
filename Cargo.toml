@@ -2,7 +2,7 @@
 # `package.version` out of this file as the single source of truth for the
 # build, and a virtual root has no `[package]` to read.
 [workspace]
-members = ["crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-wire", "crates/demo-resolver-wasm"]
+members = ["crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-resource-wasip2", "crates/st2-wire", "crates/demo-resolver-wasm"]
 default-members = [".", "crates/agent-spec", "crates/st2-resource-protocol", "crates/st2-wire"]
 
 [package]
