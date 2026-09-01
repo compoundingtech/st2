@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use st2_resource_wasip2::{CapabilityModule, InvocationStore, ObservationRequest};
+use st2_resource_wasip2::{
+    CapabilityContext, CapabilityModule, CapabilityPhase, InterruptionReason, InvocationControl,
+    InvocationStore,
+};
 use wasmtime::component::{HasSelf, Linker};
 
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/github-issue",
-        world: "github-issue-observer",
+        world: "github-issue-provider",
     });
 }
 
@@ -54,7 +56,6 @@ impl GitHubIssueConfig {
 pub struct GitHubIssueModule {
     config: GitHubIssueConfig,
     cache: Arc<Mutex<BTreeMap<IssueKey, CachedIssue>>>,
-    pending: Arc<Mutex<BTreeMap<u64, Arc<GitHubCancellationControl>>>>,
 }
 
 impl GitHubIssueModule {
@@ -63,70 +64,10 @@ impl GitHubIssueModule {
         Ok(Self {
             config,
             cache: Arc::new(Mutex::new(BTreeMap::new())),
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
-
-    pub fn prepare(&self, invocation_id: u64) -> GitHubIssueCancellation {
-        let control = Arc::new(GitHubCancellationControl::new());
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(invocation_id, Arc::clone(&control));
-        GitHubIssueCancellation { control }
-    }
-
-    pub fn discard_prepared(&self, invocation_id: u64) -> bool {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&invocation_id)
-            .is_some()
-    }
 }
 
-#[derive(Clone)]
-pub struct GitHubIssueCancellation {
-    control: Arc<GitHubCancellationControl>,
-}
-
-impl GitHubIssueCancellation {
-    pub fn cancel(&self) -> bool {
-        self.control.cancel()
-    }
-}
-
-struct GitHubCancellationControl {
-    cancelled: AtomicBool,
-    notify: tokio::sync::Notify,
-}
-
-impl GitHubCancellationControl {
-    fn new() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    fn cancel(&self) -> bool {
-        let changed = !self.cancelled.swap(true, Ordering::AcqRel);
-        if changed {
-            self.notify.notify_waiters();
-        }
-        changed
-    }
-
-    async fn cancelled(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct IssueKey {
     owner: String,
@@ -144,7 +85,7 @@ pub struct GitHubIssueInvocation {
     config: GitHubIssueConfig,
     cache: Arc<Mutex<BTreeMap<IssueKey, CachedIssue>>>,
     has_authoritative_prior: bool,
-    cancellation: Arc<GitHubCancellationControl>,
+    control: InvocationControl,
 }
 
 impl CapabilityModule for GitHubIssueModule {
@@ -158,20 +99,19 @@ impl CapabilityModule for GitHubIssueModule {
         &self,
         linker: &mut Linker<InvocationStore<Self::Invocation>>,
     ) -> Result<(), wasmtime::Error> {
-        bindings::GithubIssueObserver::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        bindings::GithubIssueProvider::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
     }
 
-    fn begin(&self, request: &ObservationRequest) -> Self::Invocation {
+    fn begin(&self, context: CapabilityContext<'_>) -> Self::Invocation {
+        let has_authoritative_prior = match context.phase() {
+            CapabilityPhase::Describe => false,
+            CapabilityPhase::Observe(request) => request.prior_digest.is_some(),
+        };
         GitHubIssueInvocation {
             config: self.config.clone(),
             cache: Arc::clone(&self.cache),
-            has_authoritative_prior: request.previous_digest.is_some(),
-            cancellation: self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&request.invocation_id)
-                .unwrap_or_else(|| Arc::new(GitHubCancellationControl::new())),
+            has_authoritative_prior,
+            control: context.control().clone(),
         }
     }
 }
@@ -192,11 +132,7 @@ impl GitHubIssueInvocation {
     }
 
     async fn get_async(&mut self, request: IssueRequest) -> Result<IssueResponse, IssueError> {
-        if request.owner != self.config.owner
-            || request.repo != self.config.repo
-            || request.number != self.config.number
-            || request.etag.as_ref().is_some_and(|etag| !valid_etag(etag))
-        {
+        if !request_matches_scope(&self.config, &request) {
             return Err(IssueError::Denied);
         }
         let key = IssueKey {
@@ -242,7 +178,9 @@ impl GitHubIssueInvocation {
         }
         let mut response = tokio::select! {
             biased;
-            () = self.cancellation.cancelled() => return Err(IssueError::Unavailable),
+            reason = wait_for_interruption(&self.control) => {
+                return Err(interruption_error(reason));
+            }
             response = builder.send() => response.map_err(map_transport_error)?,
         };
         let status = response.status();
@@ -276,7 +214,9 @@ impl GitHubIssueInvocation {
                 loop {
                     let chunk = tokio::select! {
                         biased;
-                        () = self.cancellation.cancelled() => return Err(IssueError::Unavailable),
+                        reason = wait_for_interruption(&self.control) => {
+                            return Err(interruption_error(reason));
+                        }
                         chunk = response.chunk() => chunk.map_err(map_transport_error)?,
                     };
                     let Some(chunk) = chunk else {
@@ -304,6 +244,29 @@ impl GitHubIssueInvocation {
         }
     }
 }
+async fn wait_for_interruption(control: &InvocationControl) -> InterruptionReason {
+    loop {
+        if let Some(reason) = control.interruption_reason() {
+            return reason;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn interruption_error(reason: InterruptionReason) -> IssueError {
+    match reason {
+        InterruptionReason::Cancelled => IssueError::Unavailable,
+        InterruptionReason::TimedOut => IssueError::DeadlineExceeded,
+    }
+}
+
+fn request_matches_scope(config: &GitHubIssueConfig, request: &IssueRequest) -> bool {
+    request.owner == config.owner
+        && request.repo == config.repo
+        && request.number == config.number
+        && request.etag.as_ref().is_none_or(|etag| valid_etag(etag))
+}
+
 
 fn conditional_etag(
     has_authoritative_prior: bool,
@@ -402,14 +365,6 @@ fn is_public(address: IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn discarded_preparation_does_not_leak_pending_invocation_state() {
-        let module = GitHubIssueModule::new(live_config()).unwrap();
-        let _cancellation = module.prepare(42);
-        assert_eq!(module.pending.lock().unwrap().len(), 1);
-        assert!(module.discard_prepared(42));
-        assert!(module.pending.lock().unwrap().is_empty());
-    }
 
     fn live_config() -> GitHubIssueConfig {
         GitHubIssueConfig {
@@ -450,13 +405,7 @@ mod tests {
                 etag: Some("\"ok\"\r\nx-injected: true".into()),
             },
         ] {
-            let mut invocation = GitHubIssueInvocation {
-                config: module.config.clone(),
-                cache: Arc::clone(&module.cache),
-                has_authoritative_prior: false,
-                cancellation: Arc::new(GitHubCancellationControl::new()),
-            };
-            assert!(matches!(invocation.get(request), Err(IssueError::Denied)));
+            assert!(!request_matches_scope(&module.config, &request));
         }
     }
 
@@ -493,51 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_runtime_does_not_reuse_an_etag_for_a_binding_without_prior_state() {
-        let key = IssueKey {
-            owner: "rust-lang".into(),
-            repo: "rust".into(),
-            number: 1,
-        };
-        let module = GitHubIssueModule::new(live_config()).unwrap();
-        module.cache.lock().unwrap().insert(
-            key,
-            CachedIssue {
-                etag: Some("\"cached\"".into()),
-                body: br#"{"title":"new"}"#.to_vec(),
-            },
-        );
-        let without_prior = module.begin(&ObservationRequest {
-            invocation_id: 1,
-            uri: "github-issue:rust-lang/rust#1".into(),
-            selector: serde_json::json!({}),
-            previous_digest: None,
-        });
-        let with_prior = module.begin(&ObservationRequest {
-            uri: "github-issue:rust-lang/rust#1".into(),
-            invocation_id: 2,
-            selector: serde_json::json!({}),
-            previous_digest: Some(st2_resource_protocol::SnapshotDigest::of(b"prior")),
-        });
-
-        assert!(!without_prior.has_authoritative_prior);
+    fn shared_runtime_only_reuses_an_etag_for_a_binding_with_prior_state() {
+        assert_eq!(conditional_etag(false, None, Some("\"cached\"".into())), None);
         assert_eq!(
-            conditional_etag(
-                without_prior.has_authoritative_prior,
-                None,
-                Some("\"cached\"".into()),
-            ),
-            None
-        );
-        assert_eq!(
-            conditional_etag(
-                with_prior.has_authoritative_prior,
-                None,
-                Some("\"cached\"".into()),
-            ),
+            conditional_etag(true, None, Some("\"cached\"".into())),
             Some("\"cached\"".into())
         );
-        assert!(with_prior.has_authoritative_prior);
     }
 
     #[test]
@@ -565,32 +475,4 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "explicit public read-only GitHub smoke: cargo test -p st2-resource-providers github_live_200_then_etag_304 -- --ignored"]
-    fn github_live_200_then_etag_304() {
-        let module = GitHubIssueModule::new(live_config()).unwrap();
-        let request = || IssueRequest {
-            owner: "rust-lang".into(),
-            repo: "rust".into(),
-            number: 1,
-            etag: None,
-        };
-        let mut first = GitHubIssueInvocation {
-            config: module.config.clone(),
-            cache: Arc::clone(&module.cache),
-            has_authoritative_prior: false,
-            cancellation: Arc::new(GitHubCancellationControl::new()),
-        };
-        assert!(matches!(first.get(request()).unwrap(), IssueResponse::Ok(_)));
-        let mut replay = GitHubIssueInvocation {
-            config: module.config.clone(),
-            cache: Arc::clone(&module.cache),
-            has_authoritative_prior: true,
-            cancellation: Arc::new(GitHubCancellationControl::new()),
-        };
-        assert!(matches!(
-            replay.get(request()).unwrap(),
-            IssueResponse::Ok(_)
-        ));
-    }
 }

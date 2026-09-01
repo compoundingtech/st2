@@ -33,6 +33,11 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
     let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
     let component_bytes = fs::read(component("ST2_PTY_STATS_COMPONENT")).unwrap();
     let loaded = executor.load(&component_bytes).unwrap();
+    let descriptor = executor.describe(&loaded, None).unwrap();
+    assert_eq!(descriptor.topics, ["stats"]);
+    assert_eq!(descriptor.snapshot_schema_id, "st2.resource.pty-stats.v1");
+    assert_eq!(descriptor.snapshot_media_type, "application/json");
+
 
     let first = executor
         .observe(
@@ -41,7 +46,8 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
                 invocation_id: 1,
                 uri: "dev.st2.pty-stats://all".into(),
                 selector: json!({ "topics": ["stats"] }),
-                previous_digest: None,
+                prior_digest: None,
+                demand_watermark: Some(1),
             },
             None,
         )
@@ -71,7 +77,8 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
                 invocation_id: 2,
                 uri: "dev.st2.pty-stats://all".into(),
                 selector: json!({ "topics": ["stats"] }),
-                previous_digest: Some(prior),
+                prior_digest: Some(prior),
+                demand_watermark: Some(2),
             },
             None,
         )
@@ -85,15 +92,18 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
                 invocation_id: 3,
                 uri: "dev.st2.pty-stats://session/other".into(),
                 selector: json!({ "session": "other", "topics": ["stats"] }),
-                previous_digest: None,
+                prior_digest: None,
+                demand_watermark: Some(3),
             },
             None,
         )
-        .unwrap_err();
-    assert!(
-        denied.to_string().contains("PTY stats scope denied"),
-        "unexpected denial: {denied}"
-    );
+        .unwrap();
+    assert!(matches!(
+        &denied,
+        ObservationResult::Failed {
+            diagnostic: Some(diagnostic)
+        } if diagnostic.contains("PTY stats scope denied")
+    ));
 }
 
 #[test]
@@ -110,6 +120,14 @@ fn github_component_public_read_only_smoke() {
     let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
     let component_bytes = fs::read(component("ST2_GITHUB_ISSUE_COMPONENT")).unwrap();
     let loaded = executor.load(&component_bytes).unwrap();
+    let descriptor = executor.describe(&loaded, None).unwrap();
+    assert_eq!(descriptor.topics, ["issue"]);
+    assert_eq!(
+        descriptor.snapshot_schema_id,
+        "st2.resource.github-issue.v1"
+    );
+    assert_eq!(descriptor.snapshot_media_type, "application/json");
+
     let observed = executor
         .observe(
             &loaded,
@@ -122,7 +140,8 @@ fn github_component_public_read_only_smoke() {
                     "number": 1,
                     "topics": ["issue"]
                 }),
-                previous_digest: None,
+                prior_digest: None,
+                demand_watermark: Some(1),
             },
             None,
         )

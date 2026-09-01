@@ -1,36 +1,6 @@
-package compoundingtech:st2-pty-stats@0.1.0;
+package st2:resource-provider@0.1.0;
 
-interface pty-stats {
-  variant scope {
-    all,
-    session(string),
-  }
-
-  variant exit-status {
-    code(s32),
-    signal(s32),
-  }
-
-  record outcome {
-    stdout: list<u8>,
-    stderr: list<u8>,
-    stdout-truncated: bool,
-    stderr-truncated: bool,
-    exit: exit-status,
-  }
-
-  variant pty-stats-error {
-    denied,
-    unavailable,
-    resource-exhausted,
-    deadline-exceeded,
-    cancelled,
-  }
-
-  get: func(scope: scope) -> result<outcome, pty-stats-error>;
-}
-
-world pty-stats-observer {
-  import pty-stats;
-  export compoundingtech:st2-resource-observer/observation@0.1.0;
+world pty-stats-provider {
+  import compoundingtech:st2-pty-stats/pty-stats@0.1.0;
+  export provider-api;
 }

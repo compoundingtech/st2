@@ -25,13 +25,13 @@ use sha2::{Digest as _, Sha256};
 use st2_resource_protocol::ProposalFence;
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_providers::{
-    GitHubIssueCancellation, GitHubIssueConfig, GitHubIssueModule, PtyStatsCancellation,
-    PtyStatsConfig, PtyStatsModule, PtyStatsScope,
+    GitHubIssueConfig, GitHubIssueModule, PtyStatsConfig, PtyStatsModule, PtyStatsScope,
 };
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_wasip2::{
     Executor as Wasip2Executor, LoadedComponent, ObservationRequest as Wasip2ObservationRequest,
-    RuntimeConfig as Wasip2RuntimeConfig,
+    ProviderDescriptor as Wasip2ProviderDescriptor, RuntimeConfig as Wasip2RuntimeConfig,
+    SchedulingCapability as Wasip2SchedulingCapability,
 };
 
 use crate::catalog::CatalogConfig;
@@ -268,19 +268,11 @@ struct ObservationLaunch {
 #[derive(Clone)]
 struct ObservationCancellation {
     interruption: st2_resource_wasip2::InterruptionHandle,
-    pty: Option<PtyStatsCancellation>,
-    github: Option<GitHubIssueCancellation>,
 }
 
 #[cfg(feature = "wasip2-provider-runtime")]
 impl ObservationCancellation {
     fn cancel(&self) {
-        if let Some(pty) = &self.pty {
-            pty.cancel();
-        }
-        if let Some(github) = &self.github {
-            github.cancel();
-        }
         self.interruption.cancel();
     }
 }
@@ -805,7 +797,6 @@ impl Worker {
         let thread_authority = authority.clone();
         let thread_cancellation = cancellation.clone();
         let thread_fence = fence;
-        let spawn_failure_provider = Arc::clone(&provider);
         let spawn = thread::Builder::new()
             .name(format!("st2-resource-observe-{job_id}"))
             .spawn(move || {
@@ -835,7 +826,6 @@ impl Worker {
             }
             Err(error) => {
                 cancellation.cancel();
-                spawn_failure_provider.discard_prepared(job_id);
                 if let Some(runtime) = self.runtimes.get_mut(&runtime_key)
                     && let Some(active) = runtime.bindings.get_mut(&stable_key)
                 {
@@ -1179,58 +1169,58 @@ enum ProviderRuntime {
     GitHubIssue {
         executor: Wasip2Executor<GitHubIssueModule>,
         component: LoadedComponent,
-        module: GitHubIssueModule,
     },
     PtyStats {
         executor: Wasip2Executor<PtyStatsModule>,
         component: LoadedComponent,
-        module: PtyStatsModule,
     },
 }
-
 #[cfg(feature = "wasip2-provider-runtime")]
-struct PreparedInvocationGuard<'a> {
-    provider: &'a ProviderRuntime,
-    invocation_id: u64,
+fn validate_provider_descriptor(
+    provider: &Wasip2ProviderDescriptor,
+    profile: &ProfileDescriptor,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        provider.capabilities == [Wasip2SchedulingCapability::Demand],
+        "provider descriptor must declare exactly the demand scheduling capability"
+    );
+    anyhow::ensure!(
+        provider.snapshot_media_type == profile.snapshot.media_type,
+        "provider snapshot media type '{}' does not match profile contract '{}'",
+        provider.snapshot_media_type,
+        profile.snapshot.media_type
+    );
+    anyhow::ensure!(
+        provider.snapshot_schema_id == profile.snapshot.schema_id,
+        "provider snapshot schema '{}' does not match profile contract '{}'",
+        provider.snapshot_schema_id,
+        profile.snapshot.schema_id
+    );
+    let profile_topics = profile
+        .topics
+        .iter()
+        .map(|topic| topic.name.as_str())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        provider
+            .topics
+            .iter()
+            .all(|topic| profile_topics.contains(topic.as_str())),
+        "provider descriptor declares a topic outside the profile contract"
+    );
+    Ok(())
 }
 
-#[cfg(feature = "wasip2-provider-runtime")]
-impl Drop for PreparedInvocationGuard<'_> {
-    fn drop(&mut self) {
-        self.provider.discard_prepared(self.invocation_id);
-    }
-}
+
 
 #[cfg(feature = "wasip2-provider-runtime")]
 impl ProviderRuntime {
-    fn prepare(&self, invocation_id: u64) -> ObservationCancellation {
-        match self {
-            Self::GitHubIssue {
-                executor, module, ..
-            } => ObservationCancellation {
-                interruption: executor.interruption_handle(),
-                pty: None,
-                github: Some(module.prepare(invocation_id)),
-            },
-            Self::PtyStats {
-                executor, module, ..
-            } => ObservationCancellation {
-                interruption: executor.interruption_handle(),
-                pty: Some(module.prepare(invocation_id)),
-                github: None,
-            },
-        }
-    }
-
-    fn discard_prepared(&self, invocation_id: u64) {
-        match self {
-            Self::GitHubIssue { module, .. } => {
-                module.discard_prepared(invocation_id);
-            }
-            Self::PtyStats { module, .. } => {
-                module.discard_prepared(invocation_id);
-            }
-        }
+    fn cancellation(&self) -> ObservationCancellation {
+        let interruption = match self {
+            Self::GitHubIssue { executor, .. } => executor.interruption_handle(),
+            Self::PtyStats { executor, .. } => executor.interruption_handle(),
+        };
+        ObservationCancellation { interruption }
     }
 
     fn observe(
@@ -1238,10 +1228,6 @@ impl ProviderRuntime {
         request: &Wasip2ObservationRequest,
         cancellation: &ObservationCancellation,
     ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError> {
-        let _prepared = PreparedInvocationGuard {
-            provider: self,
-            invocation_id: request.invocation_id,
-        };
         match self {
             Self::GitHubIssue {
                 executor,
@@ -1376,13 +1362,14 @@ impl RuntimeProcess {
                     let executor = Wasip2Executor::new(
                         Wasip2RuntimeConfig::default(),
                         None,
-                        module.clone(),
+                        module,
                     )?;
                     let component = executor.load(&sample.component.bytes)?;
+                    let descriptor = executor.describe(&component, None)?;
+                    validate_provider_descriptor(&descriptor, &sample.descriptor)?;
                     ProviderRuntime::GitHubIssue {
                         executor,
                         component,
-                        module,
                     }
                 }
                 crate::catalog::DeclaredProviderCapability::PtyStats {
@@ -1411,13 +1398,14 @@ impl RuntimeProcess {
                     let executor = Wasip2Executor::new(
                         Wasip2RuntimeConfig::default(),
                         None,
-                        module.clone(),
+                        module,
                     )?;
                     let component = executor.load(&sample.component.bytes)?;
+                    let descriptor = executor.describe(&component, None)?;
+                    validate_provider_descriptor(&descriptor, &sample.descriptor)?;
                     ProviderRuntime::PtyStats {
                         executor,
                         component,
-                        module,
                     }
                 }
             };
@@ -1668,7 +1656,7 @@ impl RuntimeProcess {
                 active.catch_up.state().current_snapshot_digest(),
             );
             let job_id = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let cancellation = self.provider.prepare(job_id);
+            let cancellation = self.provider.cancellation();
             launches.push(ObservationLaunch {
                 job_id,
                 runtime_key: runtime_key.clone(),
@@ -1680,7 +1668,8 @@ impl RuntimeProcess {
                     invocation_id: job_id,
                     uri: active.desired.uri.clone(),
                     selector: active.desired.selector.clone(),
-                    previous_digest: fence.prior_digest(),
+                    prior_digest: fence.prior_digest(),
+                    demand_watermark: Some(watermark),
                 },
                 provider: Arc::clone(&self.provider),
                 cancellation,
@@ -2514,58 +2503,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wasip2-provider-runtime")]
-    #[test]
-    fn overlong_uri_validation_discards_prepared_invocation() {
-        let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("pty-stats");
-        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
-        let module = PtyStatsModule::new(
-            PtyStatsConfig::resolve(
-                &executable,
-                temporary.path().to_path_buf(),
-                PtyStatsScope::All,
-                Duration::from_secs(1),
-            )
-            .unwrap(),
-        );
-        let executor =
-            Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module.clone()).unwrap();
-        let component_bytes = wat::parse_str("(component)").unwrap();
-        let component = executor.load(&component_bytes).unwrap();
-        let provider = ProviderRuntime::PtyStats {
-            executor,
-            component,
-            module: module.clone(),
-        };
-        let uri = "x".repeat(64 * 1024 + 1);
-
-        for invocation_id in 1..=64 {
-            let cancellation = provider.prepare(invocation_id);
-            let error = provider
-                .observe(
-                    &Wasip2ObservationRequest {
-                        invocation_id,
-                        uri: uri.clone(),
-                        selector: Value::Null,
-                        previous_digest: None,
-                    },
-                    &cancellation,
-                )
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                st2_resource_wasip2::ObserveError::InvalidRequest("URI exceeds 64 KiB")
-            ));
-            assert!(
-                !module.discard_prepared(invocation_id),
-                "invocation {invocation_id} remained pending after observe returned"
-            );
-        }
-    }
 
     #[cfg(feature = "wasip2-provider-runtime")]
     #[test]

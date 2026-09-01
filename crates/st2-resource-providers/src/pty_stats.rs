@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -7,17 +6,20 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use st2_resource_wasip2::{CapabilityModule, InvocationStore, ObservationRequest};
+use st2_resource_wasip2::{
+    CapabilityContext, CapabilityModule, InterruptionReason,
+    InvocationControl as ExecutorInvocationControl, InvocationStore,
+};
 use wasmtime::component::{HasSelf, Linker};
 
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/pty-stats",
-        world: "pty-stats-observer",
+        world: "pty-stats-provider",
     });
 }
 
@@ -76,46 +78,18 @@ impl PtyStatsConfig {
 #[derive(Clone)]
 pub struct PtyStatsModule {
     config: PtyStatsConfig,
-    pending: Arc<Mutex<BTreeMap<u64, Arc<InvocationControl>>>>,
 }
 
 impl PtyStatsModule {
     pub fn new(config: PtyStatsConfig) -> Self {
-        Self {
-            config,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    /// Reserve the exact cancellation identity that the executor will hand to `begin`.
-    pub fn prepare(&self, invocation_id: u64) -> PtyStatsCancellation {
-        let control = Arc::new(InvocationControl::new());
-        self.pending
-            .lock()
-            .insert(invocation_id, Arc::clone(&control));
-        PtyStatsCancellation { control }
-    }
-
-    pub fn discard_prepared(&self, invocation_id: u64) -> bool {
-        self.pending.lock().remove(&invocation_id).is_some()
+        Self { config }
     }
 }
 
-
-#[derive(Clone)]
-pub struct PtyStatsCancellation {
-    control: Arc<InvocationControl>,
-}
-
-impl PtyStatsCancellation {
-    pub fn cancel(&self) -> bool {
-        self.control.terminate(Termination::Cancelled)
-    }
-}
 
 pub struct PtyStatsInvocation {
     config: PtyStatsConfig,
-    control: Arc<InvocationControl>,
+    control: Arc<ProcessControl>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -125,9 +99,13 @@ enum Termination {
     TimedOut = 2,
 }
 
-struct InvocationControl {
+struct ProcessControl {
     termination: AtomicU8,
     child: Mutex<ChildOwnership>,
+    #[cfg(not(test))]
+    invocation: ExecutorInvocationControl,
+    #[cfg(test)]
+    invocation: Option<ExecutorInvocationControl>,
 }
 
 enum ChildOwnership {
@@ -137,11 +115,24 @@ enum ChildOwnership {
     Reaped,
 }
 
-impl InvocationControl {
-    fn new() -> Self {
+impl ProcessControl {
+    fn new(invocation: ExecutorInvocationControl) -> Self {
         Self {
             termination: AtomicU8::new(Termination::None as u8),
             child: Mutex::new(ChildOwnership::Pending),
+            #[cfg(not(test))]
+            invocation,
+            #[cfg(test)]
+            invocation: Some(invocation),
+        }
+    }
+
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            termination: AtomicU8::new(Termination::None as u8),
+            child: Mutex::new(ChildOwnership::Pending),
+            invocation: None,
         }
     }
 
@@ -149,7 +140,24 @@ impl InvocationControl {
         match self.termination.load(Ordering::Acquire) {
             1 => Termination::Cancelled,
             2 => Termination::TimedOut,
-            _ => Termination::None,
+            _ => match self.executor_interruption() {
+                Some(InterruptionReason::Cancelled) => Termination::Cancelled,
+                Some(InterruptionReason::TimedOut) => Termination::TimedOut,
+                None => Termination::None,
+            },
+        }
+    }
+
+    fn executor_interruption(&self) -> Option<InterruptionReason> {
+        #[cfg(not(test))]
+        {
+            self.invocation.interruption_reason()
+        }
+        #[cfg(test)]
+        {
+            self.invocation
+                .as_ref()
+                .and_then(ExecutorInvocationControl::interruption_reason)
         }
     }
 
@@ -179,6 +187,14 @@ impl InvocationControl {
         }
         changed
     }
+    fn synchronize_interruption(&self) -> Termination {
+        let reason = self.termination();
+        if reason != Termination::None {
+            self.terminate(reason);
+        }
+        reason
+    }
+
 
     fn wait_and_reap(
         &self,
@@ -216,18 +232,13 @@ impl CapabilityModule for PtyStatsModule {
         &self,
         linker: &mut Linker<InvocationStore<Self::Invocation>>,
     ) -> Result<(), wasmtime::Error> {
-        bindings::PtyStatsObserver::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        bindings::PtyStatsProvider::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
     }
 
-    fn begin(&self, request: &ObservationRequest) -> Self::Invocation {
-        let control = self
-            .pending
-            .lock()
-            .remove(&request.invocation_id)
-            .unwrap_or_else(|| Arc::new(InvocationControl::new()));
+    fn begin(&self, context: CapabilityContext<'_>) -> Self::Invocation {
         PtyStatsInvocation {
             config: self.config.clone(),
-            control,
+            control: Arc::new(ProcessControl::new(context.control().clone())),
         }
     }
 }
@@ -301,13 +312,22 @@ impl PtyStatsInvocation {
             }
         };
         let (completed_tx, completed_rx) = mpsc::sync_channel(1);
-        let deadline = self.config.deadline;
+        let deadline = Instant::now() + self.config.deadline;
         let deadline_control = Arc::clone(&self.control);
         let timer = match thread::Builder::new()
             .name("st2-pty-stats-deadline".into())
-            .spawn(move || {
-                if completed_rx.recv_timeout(deadline).is_err() {
+            .spawn(move || loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     deadline_control.terminate(Termination::TimedOut);
+                    return;
+                }
+                match completed_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if deadline_control.synchronize_interruption() != Termination::None {
+                    return;
                 }
             })
         {
@@ -464,25 +484,6 @@ mod tests {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
 
-    #[test]
-    fn discarded_preparation_does_not_leak_pending_invocation_state() {
-        let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("pty-fixture");
-        write_executable(&executable, "#!/bin/sh\nexit 0\n");
-        let module = PtyStatsModule::new(
-            PtyStatsConfig::resolve(
-                &executable,
-                temporary.path().to_path_buf(),
-                PtyStatsScope::All,
-                Duration::from_secs(1),
-            )
-            .unwrap(),
-        );
-        let _cancellation = module.prepare(42);
-        assert_eq!(module.pending.lock().len(), 1);
-        assert!(module.discard_prepared(42));
-        assert!(module.pending.lock().is_empty());
-    }
 
     use super::*;
 
@@ -496,7 +497,7 @@ mod tests {
     fn invoke(config: PtyStatsConfig) -> Outcome {
         PtyStatsInvocation {
             config,
-            control: Arc::new(InvocationControl::new()),
+            control: Arc::new(ProcessControl::detached()),
         }
         .get(Scope::All)
         .unwrap()
@@ -589,7 +590,7 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
-        let control = Arc::new(InvocationControl::new());
+        let control = Arc::new(ProcessControl::detached());
         let mut invocation = PtyStatsInvocation {
             config,
             control: Arc::clone(&control),
@@ -613,7 +614,7 @@ mod tests {
         .unwrap();
         let mut invocation = PtyStatsInvocation {
             config,
-            control: Arc::new(InvocationControl::new()),
+            control: Arc::new(ProcessControl::detached()),
         };
         let outcome = invocation.get(Scope::All).unwrap();
         assert!(matches!(outcome.exit, ExitStatus::Code(0)));

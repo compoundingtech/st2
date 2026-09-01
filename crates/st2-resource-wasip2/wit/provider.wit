@@ -56,10 +56,3 @@ interface provider-api {
   observe: func(request: observe-request) -> observation-result;
 }
 
-world provider {
-  export provider-api: provider-api;
-}
-
-world fixture-host {
-  import provider-api;
-}

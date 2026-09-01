@@ -141,5 +141,5 @@
     (export "describe" (func $implemented-describe))
     (export "observe" (func $implemented-observe))
   )
-  (export "provider-api" (instance $api))
+  (export "st2:resource-provider/provider-api@0.1.0" (instance $api))
 )

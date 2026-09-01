@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 use serde_json::json;
@@ -92,6 +93,29 @@ impl CapabilityModule for FixtureCapabilities {
         FixtureInvocation::default()
     }
 }
+struct CountingCapabilities {
+    begins: Arc<AtomicUsize>,
+}
+
+impl CapabilityModule for CountingCapabilities {
+    type Invocation = ();
+
+    fn import_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn add_to_linker(
+        &self,
+        _linker: &mut Linker<InvocationStore<Self::Invocation>>,
+    ) -> Result<(), wasmtime::Error> {
+        Ok(())
+    }
+
+    fn begin(&self, _context: CapabilityContext<'_>) -> Self::Invocation {
+        self.begins.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct BlockingCapabilities {
     entered: Arc<Barrier>,
 }
@@ -181,6 +205,31 @@ fn executes_the_repository_provider_world() {
         ))
     ));
 }
+#[test]
+fn request_validation_precedes_capability_begin_and_leaves_no_host_state() {
+    let begins = Arc::new(AtomicUsize::new(0));
+    let executor = Executor::new(
+        RuntimeConfig::default(),
+        None,
+        CountingCapabilities {
+            begins: Arc::clone(&begins),
+        },
+    )
+    .unwrap();
+    let loaded = executor.load(&component("(component)")).unwrap();
+    let mut invalid = request();
+    invalid.uri = "x".repeat(64 * 1024 + 1);
+
+    for invocation_id in 1..=64 {
+        invalid.invocation_id = invocation_id;
+        assert!(matches!(
+            executor.observe(&loaded, &invalid, None),
+            Err(ObserveError::InvalidRequest("URI exceeds 64 KiB"))
+        ));
+    }
+    assert_eq!(begins.load(Ordering::Relaxed), 0);
+}
+
 
 #[test]
 fn host_rejects_a_semantically_invalid_guest_proposal() {
