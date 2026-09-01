@@ -1,0 +1,50 @@
+package compoundingtech:st2-resource-observer@0.1.0;
+
+interface observation {
+  record request {
+    uri: string,
+    selector-json: string,
+    previous-digest: option<list<u8>>,
+  }
+
+  variant fact-value {
+    omitted,
+    null,
+    value(string),
+  }
+
+  record fact {
+    key: string,
+    before: fact-value,
+    after: fact-value,
+  }
+
+  record publication {
+    schema-id: string,
+    media-type: string,
+    bytes: list<u8>,
+    topics: list<string>,
+    facts: list<fact>,
+  }
+
+  variant proposal {
+    unchanged,
+    failed(option<string>),
+    published(publication),
+  }
+
+  variant observation-error {
+    invalid-request(string),
+    unavailable(string),
+  }
+
+  observe: func(request: request) -> result<proposal, observation-error>;
+}
+
+world resource-observer-v1 {
+  export observation-api: observation;
+}
+
+world fixture-host {
+  import observation;
+}

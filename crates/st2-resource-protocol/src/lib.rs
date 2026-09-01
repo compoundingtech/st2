@@ -719,7 +719,7 @@ pub struct Publication {
 }
 
 impl Publication {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_topics(&self.topics)?;
         validate_facts(self.facts.as_deref().unwrap_or_default())
     }
@@ -740,6 +740,25 @@ pub enum ObservationResult {
     Published {
         publication: Publication,
     },
+}
+
+impl ObservationResult {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Unchanged => Ok(()),
+            Self::Failed { diagnostic } => {
+                if let Some(diagnostic) = diagnostic
+                    && diagnostic.len() > MAX_OBSERVATION_DIAGNOSTIC_BYTES
+                {
+                    return Err(ProtocolError::ObservationDiagnosticTooLarge {
+                        actual: diagnostic.len(),
+                    });
+                }
+                Ok(())
+            }
+            Self::Published { publication } => publication.validate(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1042,20 +1061,7 @@ fn validate_runtime_message(message: &RuntimeMessage) -> Result<(), ProtocolErro
             if *demand_watermark == 0 {
                 return Err(ProtocolError::InvalidDemandWatermark);
             }
-            match result {
-                ObservationResult::Unchanged => Ok(()),
-                ObservationResult::Failed { diagnostic } => {
-                    if let Some(diagnostic) = diagnostic
-                        && diagnostic.len() > MAX_OBSERVATION_DIAGNOSTIC_BYTES
-                    {
-                        return Err(ProtocolError::ObservationDiagnosticTooLarge {
-                            actual: diagnostic.len(),
-                        });
-                    }
-                    Ok(())
-                }
-                ObservationResult::Published { publication } => publication.validate(),
-            }
+            result.validate()
         }
     }
 }
@@ -1270,6 +1276,27 @@ mod tests {
             decode_runtime_line(&encode_runtime_line(&published).unwrap()).unwrap(),
             published
         );
+    }
+
+    #[test]
+    fn observation_result_validation_is_reusable_outside_line_framing() {
+        assert!(ObservationResult::Unchanged.validate().is_ok());
+        assert!(matches!(
+            ObservationResult::Failed {
+                diagnostic: Some("x".repeat(MAX_OBSERVATION_DIAGNOSTIC_BYTES + 1)),
+            }
+            .validate(),
+            Err(ProtocolError::ObservationDiagnosticTooLarge { .. })
+        ));
+        let mut invalid = publication(b"duplicate topic");
+        invalid.topics = vec!["same".to_owned(), "same".to_owned()];
+        assert!(matches!(
+            ObservationResult::Published {
+                publication: invalid,
+            }
+            .validate(),
+            Err(ProtocolError::InvalidTopics(_))
+        ));
     }
 
     #[test]
