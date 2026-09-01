@@ -3379,6 +3379,19 @@ fn resource_bindings(
     selector: &str,
     host: &str,
 ) -> Result<(String, Vec<st2::Resource>)> {
+    with_resource_bindings_snapshot(root, selector, host, |identity, bindings| {
+        Ok((identity, bindings))
+    })
+}
+
+/// Resolve one binding projection and let the caller finish consuming that exact catalog snapshot
+/// before its shared authoring fence is released.
+fn with_resource_bindings_snapshot<T>(
+    root: &Path,
+    selector: &str,
+    host: &str,
+    consume: impl FnOnce(String, Vec<st2::Resource>) -> Result<T>,
+) -> Result<T> {
     let _catalog_lock = st2::CatalogLock::shared(root)
         .context("acquire shared catalog-authoring lock for Resource bindings")?;
     let found = st2::discover_strict(root);
@@ -3403,9 +3416,9 @@ fn resource_bindings(
     } else {
         exact
     };
-    match matches.as_slice() {
+    let (identity, bindings) = match matches.as_slice() {
         [] => anyhow::bail!("no agent '{selector}' found in catalog {}", root.display()),
-        [spec] => Ok((spec.bus_id(host), spec.resources.clone())),
+        [spec] => (spec.bus_id(host), spec.resources.clone()),
         many => {
             let mut candidates = many
                 .iter()
@@ -3417,8 +3430,26 @@ fn resource_bindings(
                 candidates.join(", ")
             )
         }
+    };
+    consume(identity, bindings)
+}
+
+#[cfg(debug_assertions)]
+fn resource_refresh_snapshot_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_READY"),
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = std::fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn resource_refresh_snapshot_checkpoint() {}
 
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
@@ -3502,17 +3533,24 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
                     (selector, first)
                 }
             };
-            let (identity, bindings) = resource_bindings(&root, &selector, &host)?;
-            bindings
-                .iter()
-                .find(|binding| binding.name() == name)
-                .with_context(|| format!("no resource binding '{name}' declared by {identity}"))?;
-            let request = st2::resource_observe::ObserveRequest::new(
-                identity.clone(),
-                name.clone(),
-                st2::resource_observe::catalog_generation(&root)?,
-                None,
-            )?;
+            let (identity, request) =
+                with_resource_bindings_snapshot(&root, &selector, &host, |identity, bindings| {
+                    bindings
+                        .iter()
+                        .find(|binding| binding.name() == name)
+                        .with_context(|| {
+                            format!("no resource binding '{name}' declared by {identity}")
+                        })?;
+                    resource_refresh_snapshot_checkpoint();
+                    let generation = st2::resource_observe::catalog_generation(&root)?;
+                    let request = st2::resource_observe::ObserveRequest::new(
+                        identity.clone(),
+                        name.clone(),
+                        generation,
+                        None,
+                    )?;
+                    Ok((identity, request))
+                })?;
             let request_id = request.request_id.clone();
             let client = st2::resource_observe::submit_request(&root, &host, &request)?;
             let waited = client.wait_for_terminal(Duration::from_secs(wait))?;

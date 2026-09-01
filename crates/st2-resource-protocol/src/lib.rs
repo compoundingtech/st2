@@ -644,12 +644,11 @@ impl<'de> Deserialize<'de> for ObservationResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub enum RuntimeMessage {
     Publish {
@@ -676,6 +675,91 @@ pub enum RuntimeMessage {
         demand_watermark: u64,
         result: ObservationResult,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum RuntimeMessageWire {
+    Publish {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        /// ABI-3 runtimes may still send this retired producer timestamp. The host never trusted it,
+        /// so decode it only to preserve that ABI and discard it at this boundary.
+        observed_at: Option<String>,
+        #[serde(flatten)]
+        publication: Publication,
+    },
+    Health {
+        owner: RuntimeOwner,
+        binding_id: Option<BindingId>,
+        registration: Option<RegistrationToken>,
+        state: RuntimeHealthState,
+        detail: Option<String>,
+    },
+    ObservationResult {
+        owner: RuntimeOwner,
+        binding_id: BindingId,
+        registration: RegistrationToken,
+        demand_watermark: u64,
+        result: ObservationResult,
+    },
+}
+
+impl<'de> Deserialize<'de> for RuntimeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match RuntimeMessageWire::deserialize(deserializer)? {
+            RuntimeMessageWire::Publish {
+                owner,
+                binding_id,
+                registration,
+                observed_at,
+                publication,
+            } => {
+                drop(observed_at);
+                Self::Publish {
+                    owner,
+                    binding_id,
+                    registration,
+                    publication,
+                }
+            },
+            RuntimeMessageWire::Health {
+                owner,
+                binding_id,
+                registration,
+                state,
+                detail,
+            } => Self::Health {
+                owner,
+                binding_id,
+                registration,
+                state,
+                detail,
+            },
+            RuntimeMessageWire::ObservationResult {
+                owner,
+                binding_id,
+                registration,
+                demand_watermark,
+                result,
+            } => Self::ObservationResult {
+                owner,
+                binding_id,
+                registration,
+                demand_watermark,
+                result,
+            },
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -969,6 +1053,26 @@ mod tests {
     }
 
     #[test]
+    fn abi_3_publish_decodes_with_or_without_deprecated_observed_at_only() {
+        let without_observed_at = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"]}\n";
+        let with_observed_at = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"observedAt\":\"2026-08-30T00:00:00Z\"}\n";
+        let unknown_field = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"incarnation\",\"claim\":\"claim\"},\"bindingId\":\"binding\",\"registration\":\"registration\",\"schemaId\":\"schema.v1\",\"mediaType\":\"application/json\",\"bytes\":\"b25lIGJ5dGU=\",\"topics\":[\"selected\"],\"extra\":true}\n";
+
+        assert_eq!(
+            decode_runtime_line(without_observed_at).unwrap(),
+            publish(b"one byte")
+        );
+        assert_eq!(
+            decode_runtime_line(with_observed_at).unwrap(),
+            publish(b"one byte")
+        );
+        assert!(matches!(
+            decode_runtime_line(unknown_field),
+            Err(ProtocolError::Json(_))
+        ));
+    }
+
+    #[test]
     fn observation_results_have_one_atomic_tagged_wire_shape() {
         let unchanged = RuntimeMessage::ObservationResult {
             owner: owner(),
@@ -1104,11 +1208,7 @@ mod tests {
             decode_runtime_line(unknown_publication_field),
             Err(ProtocolError::Json(_))
         ));
-        let obsolete_observed_at = b"{\"type\":\"publish\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"schemaId\":\"s\",\"mediaType\":\"m\",\"bytes\":\"\",\"topics\":[],\"observedAt\":\"2026-08-30T00:00:00Z\"}\n";
-        assert!(matches!(
-            decode_runtime_line(obsolete_observed_at),
-            Err(ProtocolError::Json(_))
-        ));
+
         let obsolete_settlement = b"{\"type\":\"observationSettled\",\"owner\":{\"incarnation\":\"i\",\"claim\":\"c\"},\"bindingId\":\"b\",\"registration\":\"r\",\"demandWatermark\":1,\"outcome\":\"unchanged\"}\n";
         assert!(matches!(
             decode_runtime_line(obsolete_settlement),

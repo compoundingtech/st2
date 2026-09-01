@@ -508,6 +508,135 @@ fn a_binding_with_a_trailing_line_comment_is_removable_and_updatable() {
 }
 
 #[test]
+fn refresh_binding_validation_and_generation_share_one_catalog_snapshot() {
+    let _guard = OBSERVE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("catalog");
+    let state = temporary.path().join("state");
+    write(
+        &root,
+        "h/worker/agent.kdl",
+        &declaration(
+            "worker",
+            "catalog",
+            "  resource \"work\" reason=\"Old binding.\" uri=\"https://example.test/old\"\n",
+        ),
+    );
+    ok(
+        &root,
+        &[
+            "resource",
+            "add",
+            "anchor",
+            "--agent",
+            "worker",
+            "--uri",
+            "https://example.test/anchor",
+            "--reason",
+            "Initialize the catalog generation.",
+        ],
+    );
+    let old_generation = st2::resource_observe::catalog_generation(&root)
+        .unwrap()
+        .expect("mediated edit initialized catalog generation");
+
+    let previous_state = std::env::var_os("XDG_STATE_HOME");
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    st2::event::publish_owner_binding_for_test(&root, "h").unwrap();
+    let scope = st2::park::SupervisorScope::current(&root, "h").unwrap();
+    let request_dir = scope
+        .park_dir()
+        .parent()
+        .unwrap()
+        .join("observe-requests");
+    match previous_state {
+        Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+    }
+
+    let snapshot_ready = temporary.path().join("snapshot-ready");
+    let snapshot_release = temporary.path().join("snapshot-release");
+    let replacement_attempt = temporary.path().join("replacement-attempt");
+    let refresh = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["--catalog", root.to_str().unwrap()])
+        .args([
+            "resource", "refresh", "worker", "work", "--wait", "0", "--host", "h",
+        ])
+        .env("XDG_STATE_HOME", &state)
+        .env("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_READY", &snapshot_ready)
+        .env(
+            "ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_RELEASE",
+            &snapshot_release,
+        )
+        .env_remove("ST_AGENT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&snapshot_ready);
+
+    let mut replacement = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["--catalog", root.to_str().unwrap()])
+        .args([
+            "resource",
+            "add",
+            "work",
+            "--agent",
+            "worker",
+            "--uri",
+            "https://example.test/replacement",
+            "--reason",
+            "Replacement binding.",
+        ])
+        .env("ST2_TEST_CATALOG_LOCK_ATTEMPT", &replacement_attempt)
+        .env_remove("ST_AGENT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&replacement_attempt);
+    assert!(
+        replacement.try_wait().unwrap().is_none(),
+        "replacement crossed the shared snapshot lock before generation capture"
+    );
+    assert!(
+        spec(&root).contains("https://example.test/old"),
+        "replacement landed while refresh held its snapshot"
+    );
+
+    fs::write(&snapshot_release, b"release").unwrap();
+    let refresh = refresh.wait_with_output().unwrap();
+    assert!(
+        !refresh.status.success(),
+        "zero client wait should leave the request queued"
+    );
+    let replacement = replacement.wait_with_output().unwrap();
+    assert!(
+        replacement.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&replacement),
+        stderr(&replacement)
+    );
+
+    let request = wait_for_refresh_request(&request_dir);
+    assert_eq!(
+        request["expectedCatalogGeneration"],
+        serde_json::json!(old_generation),
+        "request generation must come from the validated old binding snapshot"
+    );
+    let replacement_generation = st2::resource_observe::catalog_generation(&root)
+        .unwrap()
+        .unwrap();
+    assert!(
+        replacement_generation > old_generation,
+        "replacement did not advance catalog generation"
+    );
+    assert!(spec(&root).contains("https://example.test/replacement"));
+}
+
+#[test]
 fn refresh_cli_reports_exact_receipts_and_wait_expiry_keeps_the_request() {
     let _guard = OBSERVE_ENV_LOCK
         .lock()
