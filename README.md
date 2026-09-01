@@ -352,6 +352,29 @@ printf 'ready\n'
 }
 ```
 
+Use `ensure-line` when a workspace-owned text file must import a catalog-owned contract:
+
+```kdl
+copy "_templates/CONTRACT.md" ".st2/CONTRACT.md"
+ensure-line "CLAUDE.md" "@.st2/CONTRACT.md"
+ensure-line "AGENTS.md" "@.st2/CONTRACT.md"
+```
+
+Each harness loads the import from its native contract file. A later boot-prompt rewrite cannot
+silently remove the contract-loading instruction. On 2026-09-01, Nathan stated that Codex supports
+`@` imports in `AGENTS.md`. This Codex behavior is undocumented and was not source-verified for this
+change.
+
+`ensure-line` searches a UTF-8 file for one exact full line. An existing match causes no write.
+If the line is absent, st2 preserves all existing bytes, adds a separator newline when necessary,
+and appends the declared line with a final newline. st2 creates a missing target in a non-Git
+workspace or when Git does not track that path.
+
+For a Git-tracked target, `ensure-line` is a verifier. st2 accepts an exact existing line but refuses
+to add a missing line. The refusal occurs before any render operation writes to the workspace. The
+repository owner must add and commit the line outside st2. This rule prevents materialization from
+leaving a customer repository dirty or changing a repository that assistants can only read.
+
 `git-exclude` is advisory. `copy`, `file`, `json-upsert`, and `ensure-line` are boot-gating.
 
 ## Run
