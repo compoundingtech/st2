@@ -126,3 +126,96 @@ unprojected inputs, and load a relative module from the applied live catalog.
   missing newly introduced module.
 - Resolver observability and same-path module-cache invalidation remain explicit
   design questions; neither weakens the containment and feature-gating contract.
+
+## Amendment — 2026-09-01 (Q39)
+
+Johannes approved Q39 to make WASIp2 Component Model components the universal
+execution envelope for observable Resource providers. This amendment preserves
+the original decision's closed core-wasm resolver and replaces only the
+observable host-process mechanism described later by
+[decision 0014](./0014-resource-profiles-are-state-first-read-and-observe-capabilities.md).
+Decision 0014's state-first authority, demand semantics, typed `Publication`,
+semantic filtering, and catch-up model remain in force.
+
+### Context
+
+The closed resolver has one pure job: map an opaque Resource URI to a contained
+carrier path. It needs neither provider I/O nor the Component Model. Observable
+providers have a different job: call a remote or local provider, normalize its
+domain state, and propose a canonical publication. A catalog-trusted native
+process can perform that job, but it carries ambient host authority and creates
+a second long-lived lifecycle and JSON protocol beside Wasmtime.
+
+Five disposable prototypes tested a narrower boundary with Wasmtime 48.0.1.
+Typed GitHub and PTY observations proved real domain I/O without exposing raw
+HTTP, caller-selected executable/arguments, environment, filesystem, or socket
+access. Fresh-Store cancellation tests ended with zero active tasks or
+capabilities. Verified compiled-code reuse kept a small provider's AOT disk-hit
+p50 at 0.482 ms and fresh Store plus instance observation p50 at 47.751 µs. An
+independent multiprocess oracle passed three 30-process runs covering
+one-winner compare-and-swap, stale generation, process-crash boundaries,
+acknowledgement loss, deterministic outbox identity, and restart catch-up.
+
+### Decision
+
+1. The core-wasm resolver ABI, its no-import sandbox, fresh resolution Store,
+   path containment, registry behavior, feature gate, and transactional module
+   ownership remain the only resolution mechanism.
+2. Every observable provider executes through one versioned WASIp2 Component
+   Model envelope. st2 does not maintain a parallel native or host-process
+   provider framework.
+3. A provider component may import only explicit provider-domain capabilities
+   linked by the host. The host owns credentials, allowlists, limits,
+   deadlines, cancellation, and redacted typed failures. No ambient WASI
+   command, environment, clock, random, process, raw HTTP, filesystem, or
+   socket authority is linked.
+4. Every descriptor call and observation receives a fresh Store and component
+   instance. Engine, Linker, compiled Component, and compatible host-produced
+   AOT bytes may be reused; Store and instance state may not be pooled or reset.
+5. The component returns `Unchanged`, a typed failure, or the existing
+   `Publication` payload. It never writes the carrier, state record, receipt, or
+   outbox. The host pairs a publication with
+   `ProposalFence { generation, revision, prior_digest }`, validates it, and
+   owns the only atomic commit.
+6. One durable transition makes the carrier, resulting digest and revision,
+   freshness and catch-up state, and deterministic `PublicationIntent` visible
+   together. A crash before publication leaves the old state. A crash after
+   publication but before acknowledgement leaves the intent retryable;
+   delivery remains separate and idempotent.
+7. WASIp3 production execution, Store pooling, generic exec/raw
+   HTTP/filesystem/socket authority, a parallel native provider framework, and
+   runtime WAC graphs are explicit non-goals. Each requires new evidence and a
+   further accepted decision rather than an alternate dormant path.
+
+### Evidence and argument
+
+The durable record is the
+[WASIp2 component and atomic publication experiment](../07-resource-profile/.experiments/2026-09-01-wasip2-component-and-atomic-publication-prototypes.md).
+The disposable harnesses prove the boundary; their local source, result, cache,
+and state paths are not production interfaces or scaffolding.
+
+The Component Model is selected for observable providers because its typed
+imports make authority reviewable at link time and its typed export preserves
+one observation result. Fresh Stores remove the need for an incomplete reset
+protocol across guest memory, resources, host state, traps, and cancellation.
+Host-only commit prevents a network- or command-capable guest from bypassing
+validation or racing publication against settlement. The deterministic durable
+outbox makes publication and delivery intent one crash-consistent fact without
+claiming exactly-once effects across an external sink.
+
+### Consequences
+
+- A profile may carry two wasm artifacts with deliberately disjoint jobs: a
+  closed core module for resolution and, only when observable, a WASIp2
+  component for provider observation.
+- Provider support requires a reviewed typed host capability; adding a generic
+  authority under a domain-flavored name is non-conforming.
+- Domain acquisition state such as ETags, cursors, rate limits, and webhook
+  repair cannot rely on guest Store lifetime. It belongs in bounded host-owned
+  capability state or explicit durable provider state.
+- Compiled-code caching is an optimization, not an authority transfer. Any AOT
+  deserialize path must authenticate exact host-produced bytes and the complete
+  engine-compatibility key before crossing Wasmtime's unsafe boundary.
+- Decision 0014's host-process topology and newline-delimited JSON mechanism
+  are superseded. Its publication, demand, delivery, and state-first semantics
+  apply to direct component invocations.

@@ -543,6 +543,130 @@ impl<'de> Deserialize<'de> for SnapshotDigest {
     }
 }
 
+/// Content-derived identity of one host-validated publication proposal.
+///
+/// The host derives this after validating the publication. It is deliberately distinct from the
+/// snapshot digest: the same bytes proposed against a different binding, generation, revision,
+/// prior digest, selected-topic set, or ordered fact envelope are a different proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProposalId(SnapshotDigest);
+
+impl ProposalId {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(SnapshotDigest::of(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Display for ProposalId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Compare-and-swap fence captured before a provider computes a publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposalFence {
+    generation: u64,
+    revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_digest: Option<SnapshotDigest>,
+}
+
+impl ProposalFence {
+    pub fn new(
+        generation: u64,
+        revision: u64,
+        prior_digest: Option<SnapshotDigest>,
+    ) -> Self {
+        Self {
+            generation,
+            revision,
+            prior_digest,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn prior_digest(&self) -> Option<SnapshotDigest> {
+        self.prior_digest
+    }
+}
+
+/// Durable receipt for one changed publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationCommit {
+    proposal_id: ProposalId,
+    generation: u64,
+    revision: u64,
+    digest: SnapshotDigest,
+}
+
+impl PublicationCommit {
+    pub fn new(
+        proposal_id: ProposalId,
+        generation: u64,
+        revision: u64,
+        digest: SnapshotDigest,
+    ) -> Self {
+        Self {
+            proposal_id,
+            generation,
+            revision,
+            digest,
+        }
+    }
+
+    pub fn proposal_id(&self) -> ProposalId {
+        self.proposal_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn digest(&self) -> SnapshotDigest {
+        self.digest
+    }
+}
+
+/// Result of the host's one authoritative compare-and-swap transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalCommit {
+    Committed(PublicationCommit),
+    AlreadyCommitted(PublicationCommit),
+    Unchanged {
+        generation: u64,
+        revision: u64,
+        digest: SnapshotDigest,
+    },
+    StaleGeneration {
+        actual_generation: u64,
+        actual_revision: u64,
+    },
+    StalePrior {
+        actual_generation: u64,
+        actual_revision: u64,
+        actual_digest: Option<SnapshotDigest>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -991,6 +1115,33 @@ mod tests {
             registration: RegistrationToken::new("registration").unwrap(),
             publication: publication(bytes),
         }
+    }
+
+    #[test]
+    fn proposal_fence_and_commit_receipt_are_domain_typed() {
+        let prior = SnapshotDigest::of(b"prior");
+        let fence = ProposalFence::new(7, 11, Some(prior));
+        assert_eq!(
+            serde_json::to_value(fence).unwrap(),
+            json!({
+                "generation": 7,
+                "revision": 11,
+                "priorDigest": prior.to_string(),
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProposalFence>(serde_json::to_value(fence).unwrap()).unwrap(),
+            fence
+        );
+
+        let proposal_id = ProposalId::of(b"proposal identity");
+        let digest = SnapshotDigest::of(b"carrier");
+        let commit = PublicationCommit::new(proposal_id, 7, 12, digest);
+        assert_eq!(commit.proposal_id(), proposal_id);
+        assert_eq!(commit.generation(), 7);
+        assert_eq!(commit.revision(), 12);
+        assert_eq!(commit.digest(), digest);
+        assert_ne!(proposal_id.as_bytes(), digest.as_bytes());
     }
 
     #[test]

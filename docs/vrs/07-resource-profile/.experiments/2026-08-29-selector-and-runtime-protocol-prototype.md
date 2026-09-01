@@ -65,3 +65,13 @@ Two complexity reductions survive the prototypes:
 - Remove `reconcile` and `shutdown` from the normative runtime protocol.
 - Specify EOF as runtime termination and supervisor lifecycle as the only shutdown authority.
 - Keep restart/backoff policy in existing task lifecycle machinery rather than the profile protocol.
+
+## Subsequent evidence
+
+Q39 retains the selector round-trip and directional-fencing findings as
+evidence, but supersedes the executable JSON-line runtime, including its
+process-EOF lifecycle, as the observable-provider mechanism. The
+[WASIp2 component and atomic publication prototypes](./2026-09-01-wasip2-component-and-atomic-publication-prototypes.md)
+proved a narrower universal envelope: one fresh Store and component invocation,
+domain-typed host capabilities, and a generation/revision/prior-digest proposal
+fence. No production path or protocol depends on the disposable runtime driver.

@@ -61,3 +61,12 @@ The same lifecycle reducer is independent of shared versus per-binding runtime t
 - Reuse existing event supersession and DING transport for thin invalidations.
 - Keep provider cursors, webhook delivery identifiers, polling intervals, and observation repair inside the profile implementation.
 - Specify shared and per-binding runtimes behind one normalized host protocol; do not duplicate delivery state machines.
+
+## Subsequent evidence
+
+Q39 preserves the topology-independent catch-up reducer but supersedes the
+shared/per-binding host-process mechanism in the original VRS impact. All
+observable providers now use one fresh-Store WASIp2 component invocation.
+Provider cursors and repair state remain outside the guest Store in host-owned
+domain capability state or explicit durable provider state. The delivery
+reducer remains independent of how those typed capabilities acquire input.
