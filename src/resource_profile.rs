@@ -20,16 +20,20 @@ pub use st2_resource_protocol::{
     BindingId, FactError, FactValue, HostMessage, MAX_FACT_KEY_BYTES, MAX_FACT_VALUE_BYTES,
     MAX_FACTS, MAX_HEALTH_DETAIL_BYTES, MAX_OBSERVATION_DIAGNOSTIC_BYTES, MAX_PROTOCOL_LINE_BYTES,
     MAX_SELECTOR_BYTES, MAX_SNAPSHOT_BYTES, ObservationResult, OpaqueIdError, OwnerClaim,
-    ProtocolError, Publication, RegistrationToken, ResourceFact, RuntimeHealthState,
-    RuntimeIncarnation, RuntimeMessage, RuntimeOwner, SnapshotBytes, SnapshotDigest,
+    ProposalCommit, ProposalFence, ProposalId, ProtocolError, Publication, PublicationCommit,
+    RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation, RuntimeMessage,
+    RuntimeOwner, SnapshotBytes, SnapshotDigest,
     SnapshotSizeError, decode_host_line, decode_runtime_line, encode_host_line,
     encode_runtime_line,
 };
 
-// Covers the prior state envelope plus 32 maximally sized facts after worst-case JSON escaping.
-const MAX_CATCH_UP_FILE_BYTES: usize = 256 * 1024;
+// Covers distinct latest-transition and retained-delivery envelopes with 32 maximally sized facts
+// each after worst-case JSON escaping.
+const MAX_CATCH_UP_FILE_BYTES: usize = 512 * 1024;
 const CATCH_UP_FILE: &str = "resource-profile-catch-up.json";
 const PUBLICATION_INTENT_FILE: &str = "resource-profile-publication-intent.json";
+const PUBLICATION_LOCK_FILE: &str = "resource-profile-publication.lock";
+const PROPOSAL_ID_DOMAIN: &[u8] = b"st2.resource-publication-proposal.v1\0";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -773,10 +777,18 @@ pub struct CatchUpState {
     last_delivered_digest: Option<SnapshotDigest>,
     pending_relevant_change: bool,
     #[serde(default)]
+    pending_from_last_intent: bool,
+    #[serde(default)]
     pending_selected_topics: Vec<String>,
     #[serde(default)]
     pending_facts: Vec<ResourceFact>,
     deliverable: bool,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    last_intent: Option<PublicationIntent>,
 }
 
 impl CatchUpState {
@@ -793,14 +805,48 @@ impl CatchUpState {
     }
 
     pub fn pending_selected_topics(&self) -> &[String] {
-        &self.pending_selected_topics
+        if self.pending_from_last_intent {
+            self.last_intent
+                .as_ref()
+                .map_or(&[], |intent| intent.selected_topics.as_slice())
+        } else {
+            &self.pending_selected_topics
+        }
     }
 
     pub fn pending_facts(&self) -> &[ResourceFact] {
-        &self.pending_facts
+        if self.pending_from_last_intent {
+            self.last_intent
+                .as_ref()
+                .map_or(&[], |intent| intent.facts.as_slice())
+        } else {
+            &self.pending_facts
+        }
     }
     pub fn deliverable(&self) -> bool {
         self.deliverable
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn proposal_fence(&self) -> ProposalFence {
+        ProposalFence::new(
+            self.generation,
+            self.revision,
+            self.current_snapshot_digest,
+        )
+    }
+
+    pub fn last_commit(&self) -> Option<PublicationCommit> {
+        self.last_intent
+            .as_ref()
+            .and_then(|intent| intent.commit().ok())
     }
 
     fn validate(&self) -> Result<(), CatchUpError> {
@@ -809,17 +855,60 @@ impl CatchUpState {
                 "pending relevance requires a current snapshot digest",
             ));
         }
-        if self.pending_relevant_change != !self.pending_selected_topics.is_empty() {
+        if self.pending_from_last_intent {
+            if !self.pending_relevant_change {
+                return Err(CatchUpError::InvalidState(
+                    "pending last intent requires pending relevance",
+                ));
+            }
+            if !self.pending_selected_topics.is_empty() || !self.pending_facts.is_empty() {
+                return Err(CatchUpError::InvalidState(
+                    "pending last intent must not duplicate its semantic envelope",
+                ));
+            }
+            if self
+                .last_intent
+                .as_ref()
+                .is_none_or(|intent| intent.selected_topics.is_empty())
+            {
+                return Err(CatchUpError::InvalidState(
+                    "pending last intent requires a relevant durable intent",
+                ));
+            }
+        } else if self.pending_relevant_change != !self.pending_selected_topics.is_empty() {
             return Err(CatchUpError::InvalidState(
                 "pending relevance and selected topics disagree",
             ));
         }
-        validate_persisted_topics(&self.pending_selected_topics)?;
-        validate_persisted_facts(&self.pending_facts)?;
-        if !self.pending_relevant_change && !self.pending_facts.is_empty() {
+        validate_persisted_topics(self.pending_selected_topics())?;
+        validate_persisted_facts(self.pending_facts())?;
+        if !self.pending_relevant_change
+            && (!self.pending_selected_topics.is_empty() || !self.pending_facts.is_empty())
+        {
             return Err(CatchUpError::InvalidState(
-                "pending facts require a pending relevant change",
+                "pending semantic envelope requires a pending relevant change",
             ));
+        }
+        if let Some(intent) = self.last_intent.as_ref() {
+            intent.validate()?;
+            let commit = intent.commit()?;
+            if commit.generation() > self.generation {
+                return Err(CatchUpError::InvalidState(
+                    "last intent generation is newer than catch-up state",
+                ));
+            }
+            if commit.revision() > self.revision {
+                return Err(CatchUpError::InvalidState(
+                    "last intent revision is newer than catch-up state",
+                ));
+            }
+            if commit.revision() == self.revision
+                && self.current_snapshot_digest != Some(commit.digest())
+            {
+                return Err(CatchUpError::InvalidState(
+                    "last intent digest differs from current snapshot",
+                ));
+            }
         }
         Ok(())
     }
@@ -849,25 +938,96 @@ impl DeliveryRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PublicationIntent {
+    proposal_id: ProposalId,
+    binding_id: BindingId,
+    generation: u64,
+    expected_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_digest: Option<SnapshotDigest>,
     digest: SnapshotDigest,
     selected_topics: Vec<String>,
     #[serde(default)]
     facts: Vec<ResourceFact>,
 }
 
-impl PublicationIntent {
-    fn from_outcome(outcome: &PublicationOutcome) -> Self {
-        Self {
-            digest: outcome.digest,
-            selected_topics: outcome.selected_topics.clone(),
-            facts: outcome.facts.clone(),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyPublicationIntent {
+    digest: SnapshotDigest,
+    selected_topics: Vec<String>,
+    #[serde(default)]
+    facts: Vec<ResourceFact>,
+}
 
+impl LegacyPublicationIntent {
     fn validate(&self) -> Result<(), CatchUpError> {
         validate_persisted_topics(&self.selected_topics)?;
         validate_persisted_facts(&self.facts)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredPublicationIntent {
+    Current(PublicationIntent),
+    Legacy(LegacyPublicationIntent),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProposalIdentity<'a> {
+    binding_id: &'a BindingId,
+    generation: u64,
+    expected_revision: u64,
+    prior_digest: Option<SnapshotDigest>,
+    digest: SnapshotDigest,
+    selected_topics: &'a [String],
+    facts: &'a [ResourceFact],
+}
+
+impl PublicationIntent {
+
+    fn commit(&self) -> Result<PublicationCommit, CatchUpError> {
+        let revision = self
+            .expected_revision
+            .checked_add(1)
+            .ok_or(CatchUpError::InvalidState(
+                "publication revision counter exhausted",
+            ))?;
+        Ok(PublicationCommit::new(
+            self.proposal_id,
+            self.generation,
+            revision,
+            self.digest,
+        ))
+    }
+
+    fn validate(&self) -> Result<(), CatchUpError> {
+        let identity = ProposalIdentity {
+            binding_id: &self.binding_id,
+            generation: self.generation,
+            expected_revision: self.expected_revision,
+            prior_digest: self.prior_digest,
+            digest: self.digest,
+            selected_topics: &self.selected_topics,
+            facts: &self.facts,
+        };
+        if self.proposal_id != proposal_id(&identity) {
+            return Err(CatchUpError::InvalidState(
+                "publication intent proposal id is not deterministic",
+            ));
+        }
+        validate_persisted_topics(&self.selected_topics)?;
+        validate_persisted_facts(&self.facts)
+    }
+}
+
+fn proposal_id(identity: &ProposalIdentity<'_>) -> ProposalId {
+    let encoded = serde_json::to_vec(identity)
+        .expect("proposal identity contains only infallibly serializable values");
+    let mut bytes = Vec::with_capacity(PROPOSAL_ID_DOMAIN.len() + encoded.len());
+    bytes.extend_from_slice(PROPOSAL_ID_DOMAIN);
+    bytes.extend_from_slice(&encoded);
+    ProposalId::of(&bytes)
 }
 
 fn validate_persisted_topics(topics: &[String]) -> Result<(), CatchUpError> {
@@ -898,20 +1058,7 @@ impl CatchUp {
     pub fn open(state_directory: &Path) -> Result<Self, CatchUpError> {
         validate_absolute_path(state_directory).map_err(CatchUpError::UnsafeStateDirectory)?;
         let directory = open_absolute_dir(state_directory).map_err(CatchUpError::Io)?;
-        let state = match read_regular_optional_at(
-            &directory,
-            OsStr::new(CATCH_UP_FILE),
-            MAX_CATCH_UP_FILE_BYTES,
-        ) {
-            Ok(Some(bytes)) => {
-                serde_json::from_slice::<CatchUpState>(&bytes).map_err(CatchUpError::Json)?
-            }
-            Ok(None) => CatchUpState::default(),
-            Err(BoundedReadError::TooLarge) => return Err(CatchUpError::StateTooLarge),
-            Err(BoundedReadError::NotRegular) => return Err(CatchUpError::StateNotRegular),
-            Err(BoundedReadError::Io(error)) => return Err(CatchUpError::Io(error)),
-        };
-        state.validate()?;
+        let state = read_catch_up_state(&directory)?;
         Ok(Self { directory, state })
     }
 
@@ -924,82 +1071,321 @@ impl CatchUp {
         Ok(catch_up)
     }
 
+    /// Open for an explicit binding replacement without first reconciling the previous generation.
+    ///
+    /// This is the supervisor hot-replacement entrypoint: it can recover a carrier that diverged
+    /// out of band even when ordinary [`Self::open_for_snapshot`] correctly fails closed.
+    pub fn open_for_generation_advance(
+        state_directory: &Path,
+        target: &SnapshotTarget,
+    ) -> Result<Self, CatchUpError> {
+        let mut catch_up = Self::open(state_directory)?;
+        catch_up.advance_generation(target)?;
+        Ok(catch_up)
+    }
+
     pub fn state(&self) -> &CatchUpState {
         &self.state
     }
 
+    /// Capture the compare-and-swap fence for provider work computed outside the host lock.
+    pub fn proposal_fence(&self) -> ProposalFence {
+        self.state.proposal_fence()
+    }
+
+    /// Advance the binding generation, fencing every proposal captured by the replaced binding.
+    ///
+    /// Unlike ordinary reconciliation, this explicit recovery transition treats the canonical
+    /// carrier as authoritative: it adopts its current digest (or absence), clears delivery state
+    /// whose semantic intent can no longer be proven, and invalidates the prior generation's
+    /// durable intent. Call it on [`Self::open`] or use [`Self::open_for_generation_advance`] so a
+    /// divergence cannot prevent the replacement that recovers it.
+    pub fn advance_generation(
+        &mut self,
+        target: &SnapshotTarget,
+    ) -> Result<ProposalFence, CatchUpError> {
+        let _lock = lock_publication(&self.directory)?;
+        self.reload()?;
+        let observed = target.current_digest().map_err(CatchUpError::Publication)?;
+        let intent = self.read_publication_intent()?;
+        let mut next = self.state.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(CatchUpError::InvalidState(
+                "binding generation counter exhausted",
+            ))?;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(CatchUpError::InvalidState(
+                "publication revision counter exhausted",
+            ))?;
+        next.current_snapshot_digest = observed;
+        next.last_intent = None;
+        next.pending_relevant_change = false;
+        next.pending_from_last_intent = false;
+        next.pending_selected_topics.clear();
+        next.pending_facts.clear();
+        self.commit_state(next)?;
+        if intent.is_some() {
+            self.clear_publication_intent()?;
+        }
+        Ok(self.state.proposal_fence())
+    }
+
+    /// Preserve the PR #404 single-writer publication API.
+    ///
+    /// New provider boundaries should capture [`Self::proposal_fence`] before computing and use
+    /// [`Self::commit_proposal`]. This method captures under the same lock for existing runtimes,
+    /// which never claimed a provider-side compare-and-swap contract.
     pub fn publish(
         &mut self,
         publication: AcceptedPublication<'_>,
     ) -> Result<(PublicationOutcome, Option<DeliveryRequest>), PublicationTransactionError> {
-        let target = publication.target;
-        self.reconcile_snapshot(target)
+        let _lock = lock_publication(&self.directory)
             .map_err(PublicationTransactionError::CatchUp)?;
+        self.reload()
+            .map_err(PublicationTransactionError::CatchUp)?;
+        self.reconcile_snapshot_locked(publication.target)
+            .map_err(PublicationTransactionError::CatchUp)?;
+        let fence = self.state.proposal_fence();
+        let (_, outcome) = self.commit_proposal_locked(fence, publication)?;
+        let outcome = outcome.expect("a current fence cannot reject its own publication");
+        Ok((outcome, self.pending_delivery()))
+    }
+
+    /// Validate and commit one provider proposal against its captured generation, revision, and
+    /// prior digest.
+    /// Delivery remains level-triggered and separate through [`Self::pending_delivery`] and
+    /// [`Self::acknowledge_delivery`].
+    ///
+    /// The state directory uses one persistent advisory lock shared by every cooperating writer.
+    /// Publication relies on same-directory rename atomicity and file-plus-parent-directory
+    /// `fsync`. The durable intent is written first but is eligible only when its digest matches
+    /// the canonical carrier; therefore a crash before the carrier rename exposes the old state,
+    /// while a crash after it is replayed on restart. Filesystems that do not honor those POSIX
+    /// rename, `fsync`, and `flock` semantics are unsupported.
+    pub fn commit_proposal(
+        &mut self,
+        fence: ProposalFence,
+        publication: AcceptedPublication<'_>,
+    ) -> Result<ProposalCommit, PublicationTransactionError> {
+        let _lock = lock_publication(&self.directory)
+            .map_err(PublicationTransactionError::CatchUp)?;
+        self.reload()
+            .map_err(PublicationTransactionError::CatchUp)?;
+        self.reconcile_snapshot_locked(publication.target)
+            .map_err(PublicationTransactionError::CatchUp)?;
+        self.commit_proposal_locked(fence, publication)
+            .map(|(commit, _)| commit)
+    }
+
+    fn commit_proposal_locked(
+        &mut self,
+        fence: ProposalFence,
+        publication: AcceptedPublication<'_>,
+    ) -> Result<(ProposalCommit, Option<PublicationOutcome>), PublicationTransactionError> {
+        let binding_id = publication.binding_id;
+        let digest = SnapshotDigest::of(publication.bytes.as_slice());
+        let identity = ProposalIdentity {
+            binding_id,
+            generation: fence.generation(),
+            expected_revision: fence.revision(),
+            prior_digest: fence.prior_digest(),
+            digest,
+            selected_topics: &publication.selected_topics,
+            facts: publication.facts,
+        };
+        let proposal_id = proposal_id(&identity);
+
+        if let Some(previous) = self.state.last_intent.as_ref()
+            && previous.proposal_id == proposal_id
+        {
+            let commit = previous.commit().map_err(PublicationTransactionError::CatchUp)?;
+            return Ok((ProposalCommit::AlreadyCommitted(commit), None));
+        }
+        if fence.generation() != self.state.generation {
+            return Ok((
+                ProposalCommit::StaleGeneration {
+                    actual_generation: self.state.generation,
+                    actual_revision: self.state.revision,
+                },
+                None,
+            ));
+        }
+        if fence.revision() != self.state.revision
+            || fence.prior_digest() != self.state.current_snapshot_digest
+        {
+            return Ok((
+                ProposalCommit::StalePrior {
+                    actual_generation: self.state.generation,
+                    actual_revision: self.state.revision,
+                    actual_digest: self.state.current_snapshot_digest,
+                },
+                None,
+            ));
+        }
+
         let prepared = publication
             .prepare()
             .map_err(PublicationTransactionError::Publication)?;
         let outcome = prepared.outcome.clone();
-        if outcome.change != SnapshotChange::Equal {
-            self.write_publication_intent(&PublicationIntent::from_outcome(&outcome))
-                .map_err(PublicationTransactionError::CatchUp)?;
+        debug_assert_eq!(digest, outcome.digest);
+
+        if outcome.change == SnapshotChange::Equal {
+            return Ok((
+                ProposalCommit::Unchanged {
+                    generation: self.state.generation,
+                    revision: self.state.revision,
+                    digest: outcome.digest,
+                },
+                Some(outcome),
+            ));
         }
+        let intent = PublicationIntent {
+            proposal_id,
+            binding_id: binding_id.clone(),
+            generation: fence.generation(),
+            expected_revision: fence.revision(),
+            prior_digest: fence.prior_digest(),
+            digest,
+            selected_topics: outcome.selected_topics.clone(),
+            facts: outcome.facts.clone(),
+        };
+        intent
+            .commit()
+            .map_err(PublicationTransactionError::CatchUp)?;
+
+        self.write_publication_intent(&intent)
+            .map_err(PublicationTransactionError::CatchUp)?;
+        publication_checkpoint("after-intent-before-carrier");
         prepared
             .commit()
             .map_err(PublicationTransactionError::Publication)?;
-        let delivery = self
-            .record_publication(&outcome)
+        publication_checkpoint("after-carrier-before-state");
+        let commit = self
+            .record_intent(&intent)
             .map_err(PublicationTransactionError::CatchUp)?;
-        if outcome.change != SnapshotChange::Equal {
-            self.clear_publication_intent()
-                .map_err(PublicationTransactionError::CatchUp)?;
-        }
-        Ok((outcome, delivery))
+        self.clear_publication_intent()
+            .map_err(PublicationTransactionError::CatchUp)?;
+        publication_checkpoint("after-state-before-ack");
+        Ok((ProposalCommit::Committed(commit), Some(outcome)))
     }
 
     pub fn reconcile_snapshot(
         &mut self,
         target: &SnapshotTarget,
     ) -> Result<Option<DeliveryRequest>, CatchUpError> {
+        let _lock = lock_publication(&self.directory)?;
+        self.reload()?;
+        self.reconcile_snapshot_locked(target)?;
+        Ok(self.pending_delivery())
+    }
+
+    fn reconcile_snapshot_locked(&mut self, target: &SnapshotTarget) -> Result<(), CatchUpError> {
         let observed = target.current_digest().map_err(CatchUpError::Publication)?;
         let intent = self.read_publication_intent()?;
-        let mut next = self.state.clone();
 
         match intent.as_ref() {
-            Some(intent) if observed == Some(intent.digest) => {
-                next.current_snapshot_digest = observed;
-                if !intent.selected_topics.is_empty() {
-                    next.pending_relevant_change = true;
-                    next.pending_selected_topics = intent.selected_topics.clone();
-                    next.pending_facts = intent.facts.clone();
+            Some(StoredPublicationIntent::Current(intent)) => {
+                if observed == Some(intent.digest) {
+                    if self
+                        .state
+                        .last_intent
+                        .as_ref()
+                        .is_none_or(|committed| committed.proposal_id != intent.proposal_id)
+                    {
+                        if self.state.generation != intent.generation
+                            || self.state.revision != intent.expected_revision
+                            || self.state.current_snapshot_digest != intent.prior_digest
+                        {
+                            return Err(CatchUpError::InvalidState(
+                                "published intent does not follow the authoritative fence",
+                            ));
+                        }
+                        self.record_intent(intent)?;
+                    }
+                } else {
+                    if self.state.revision > 0
+                        && observed != self.state.current_snapshot_digest
+                    {
+                        return Err(CatchUpError::InvalidState(
+                            "canonical snapshot differs from the authoritative committed digest",
+                        ));
+                    }
+                    if observed.is_none() && self.state.pending_relevant_change {
+                        return Err(CatchUpError::InvalidState(
+                            "a pending invalidation has no readable canonical snapshot",
+                        ));
+                    }
+                    if observed != self.state.current_snapshot_digest {
+                        let mut next = self.state.clone();
+                        next.current_snapshot_digest = observed;
+                        self.commit_state(next)?;
+                    }
                 }
+                self.clear_publication_intent()?;
             }
-            Some(_) | None => {
-                if observed.is_none() && next.pending_relevant_change {
+            Some(StoredPublicationIntent::Legacy(intent)) => {
+                if self.state.revision > 0 {
                     return Err(CatchUpError::InvalidState(
-                        "a pending invalidation has no readable canonical snapshot",
+                        "legacy publication intent conflicts with current authoritative state",
                     ));
                 }
-                next.current_snapshot_digest = observed;
+                let mut next = self.state.clone();
+                if observed == Some(intent.digest) {
+                    next.current_snapshot_digest = observed;
+                    if !intent.selected_topics.is_empty() {
+                        next.pending_relevant_change = true;
+                        next.pending_from_last_intent = false;
+                        next.pending_selected_topics = intent.selected_topics.clone();
+                        next.pending_facts = intent.facts.clone();
+                    }
+                } else {
+                    if observed.is_none() && next.pending_relevant_change {
+                        return Err(CatchUpError::InvalidState(
+                            "a pending invalidation has no readable canonical snapshot",
+                        ));
+                    }
+                    next.current_snapshot_digest = observed;
+                }
+                if next != self.state {
+                    self.commit_state(next)?;
+                }
+                self.clear_publication_intent()?;
+            }
+            None => {
+                if observed != self.state.current_snapshot_digest {
+                    if self.state.revision > 0 {
+                        return Err(CatchUpError::InvalidState(
+                            "canonical snapshot differs from the authoritative committed digest",
+                        ));
+                    }
+                    if observed.is_none() && self.state.pending_relevant_change {
+                        return Err(CatchUpError::InvalidState(
+                            "a pending invalidation has no readable canonical snapshot",
+                        ));
+                    }
+                    let mut next = self.state.clone();
+                    next.current_snapshot_digest = observed;
+                    self.commit_state(next)?;
+                }
             }
         }
-
-        if next != self.state {
-            self.commit(next)?;
-        }
-        if intent.is_some() {
-            self.clear_publication_intent()?;
-        }
-        Ok(self.pending_delivery())
+        Ok(())
     }
 
     pub fn set_deliverable(
         &mut self,
         deliverable: bool,
     ) -> Result<Option<DeliveryRequest>, CatchUpError> {
+        let _lock = lock_publication(&self.directory)?;
+        self.reload()?;
         if self.state.deliverable != deliverable {
             let mut next = self.state.clone();
             next.deliverable = deliverable;
-            self.commit(next)?;
+            self.commit_state(next)?;
         }
         Ok(self.pending_delivery())
     }
@@ -1010,12 +1396,14 @@ impl CatchUp {
         }
         Some(DeliveryRequest {
             digest: self.state.current_snapshot_digest?,
-            selected_topics: self.state.pending_selected_topics.clone(),
-            facts: self.state.pending_facts.clone(),
+            selected_topics: self.state.pending_selected_topics().to_vec(),
+            facts: self.state.pending_facts().to_vec(),
         })
     }
 
     pub fn acknowledge_delivery(&mut self, digest: SnapshotDigest) -> Result<bool, CatchUpError> {
+        let _lock = lock_publication(&self.directory)?;
+        self.reload()?;
         if !self.state.pending_relevant_change || self.state.current_snapshot_digest != Some(digest)
         {
             return Ok(false);
@@ -1023,12 +1411,43 @@ impl CatchUp {
         let mut next = self.state.clone();
         next.last_delivered_digest = Some(digest);
         next.pending_relevant_change = false;
+        next.pending_from_last_intent = false;
         next.pending_selected_topics.clear();
         next.pending_facts.clear();
-        self.commit(next)?;
+        self.commit_state(next)?;
         Ok(true)
     }
 
+    fn record_intent(
+        &mut self,
+        intent: &PublicationIntent,
+    ) -> Result<PublicationCommit, CatchUpError> {
+        let commit = intent.commit()?;
+        let mut next = self.state.clone();
+        next.current_snapshot_digest = Some(intent.digest);
+        next.revision = commit.revision();
+        if intent.selected_topics.is_empty() && next.pending_from_last_intent {
+            let previous = next.last_intent.as_ref().ok_or(CatchUpError::InvalidState(
+                "pending last intent is absent",
+            ))?;
+            let selected_topics = previous.selected_topics.clone();
+            let facts = previous.facts.clone();
+            next.pending_selected_topics = selected_topics;
+            next.pending_facts = facts;
+            next.pending_from_last_intent = false;
+        }
+        next.last_intent = Some(intent.clone());
+        if !intent.selected_topics.is_empty() {
+            next.pending_relevant_change = true;
+            next.pending_from_last_intent = true;
+            next.pending_selected_topics.clear();
+            next.pending_facts.clear();
+        }
+        self.commit_state(next)?;
+        Ok(commit)
+    }
+
+    #[cfg(test)]
     fn record_publication(
         &mut self,
         outcome: &PublicationOutcome,
@@ -1040,22 +1459,28 @@ impl CatchUp {
             next.pending_selected_topics = outcome.selected_topics.clone();
             next.pending_facts = outcome.facts.clone();
         }
-        self.commit(next)?;
+        self.commit_state(next)?;
         Ok(self.pending_delivery())
     }
 
-    fn read_publication_intent(&self) -> Result<Option<PublicationIntent>, CatchUpError> {
+    fn read_publication_intent(&self) -> Result<Option<StoredPublicationIntent>, CatchUpError> {
         match read_regular_optional_at(
             &self.directory,
             OsStr::new(PUBLICATION_INTENT_FILE),
             MAX_CATCH_UP_FILE_BYTES,
         ) {
-            Ok(Some(bytes)) => {
-                let intent = serde_json::from_slice::<PublicationIntent>(&bytes)
-                    .map_err(CatchUpError::Json)?;
-                intent.validate()?;
-                Ok(Some(intent))
-            }
+            Ok(Some(bytes)) => match serde_json::from_slice::<PublicationIntent>(&bytes) {
+                Ok(intent) => {
+                    intent.validate()?;
+                    Ok(Some(StoredPublicationIntent::Current(intent)))
+                }
+                Err(current_error) => {
+                    let legacy = serde_json::from_slice::<LegacyPublicationIntent>(&bytes)
+                        .map_err(|_| CatchUpError::Json(current_error))?;
+                    legacy.validate()?;
+                    Ok(Some(StoredPublicationIntent::Legacy(legacy)))
+                }
+            },
             Ok(None) => Ok(None),
             Err(BoundedReadError::TooLarge) => Err(CatchUpError::IntentTooLarge),
             Err(BoundedReadError::NotRegular) => Err(CatchUpError::IntentNotRegular),
@@ -1079,7 +1504,12 @@ impl CatchUp {
             .map_err(CatchUpError::Io)
     }
 
-    fn commit(&mut self, state: CatchUpState) -> Result<(), CatchUpError> {
+    fn reload(&mut self) -> Result<(), CatchUpError> {
+        self.state = read_catch_up_state(&self.directory)?;
+        Ok(())
+    }
+
+    fn commit_state(&mut self, state: CatchUpState) -> Result<(), CatchUpError> {
         state.validate()?;
         let mut bytes = serde_json::to_vec(&state).map_err(CatchUpError::Json)?;
         bytes.push(b'\n');
@@ -1090,6 +1520,66 @@ impl CatchUp {
             .map_err(CatchUpError::Io)?;
         self.state = state;
         Ok(())
+    }
+}
+
+fn read_catch_up_state(directory: &File) -> Result<CatchUpState, CatchUpError> {
+    let state = match read_regular_optional_at(
+        directory,
+        OsStr::new(CATCH_UP_FILE),
+        MAX_CATCH_UP_FILE_BYTES,
+    ) {
+        Ok(Some(bytes)) => {
+            serde_json::from_slice::<CatchUpState>(&bytes).map_err(CatchUpError::Json)?
+        }
+        Ok(None) => CatchUpState::default(),
+        Err(BoundedReadError::TooLarge) => return Err(CatchUpError::StateTooLarge),
+        Err(BoundedReadError::NotRegular) => return Err(CatchUpError::StateNotRegular),
+        Err(BoundedReadError::Io(error)) => return Err(CatchUpError::Io(error)),
+    };
+    state.validate()?;
+    Ok(state)
+}
+
+fn lock_publication(directory: &File) -> Result<File, CatchUpError> {
+    let leaf = CString::new(PUBLICATION_LOCK_FILE).expect("lock filename contains no NUL");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(CatchUpError::Io(io::Error::last_os_error()));
+    }
+    let lock = unsafe { File::from_raw_fd(descriptor) };
+    if !lock.metadata().map_err(CatchUpError::Io)?.is_file() {
+        return Err(CatchUpError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publication lock is not a regular file",
+        )));
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } < 0 {
+        return Err(CatchUpError::Io(io::Error::last_os_error()));
+    }
+    Ok(lock)
+}
+
+fn publication_checkpoint(stage: &str) {
+    #[cfg(not(test))]
+    let _ = stage;
+    #[cfg(test)]
+    if std::env::var_os("ST2_RESOURCE_PUBLICATION_CRASH_STAGE").as_deref()
+        == Some(OsStr::new(stage))
+    {
+        std::process::exit(match stage {
+            "after-intent-before-carrier" => 71,
+            "after-carrier-before-state" => 72,
+            "after-state-before-ack" => 73,
+            _ => 74,
+        });
     }
 }
 
@@ -1372,6 +1862,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
     fn id<T>(value: &str, make: impl FnOnce(String) -> Result<T, OpaqueIdError>) -> T {
         make(value.to_owned()).unwrap()
@@ -1721,41 +2213,417 @@ mod tests {
         assert_eq!(catch_up.state().pending_facts(), outcome.facts());
     }
 
-    #[test]
-    fn durable_intent_recovers_relevance_before_an_equal_republish() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = fs::canonicalize(directory.path()).unwrap();
+    fn commit_candidate(
+        root: &Path,
+        fence: ProposalFence,
+        bytes: &[u8],
+    ) -> ProposalCommit {
         let current = owner("current");
         let mut lifecycle = RuntimeLifecycle::new();
         lifecycle.claim(current.clone());
         lifecycle
-            .register(&current, registration(directory.path(), "token"))
+            .register(&current, registration(root, "token"))
             .unwrap();
-        let message = publication(current, "token", b"committed", &["selected"]);
-        let accepted = accepted_publication(&lifecycle, &message);
+        let message = publication(current, "token", bytes, &["selected"]);
+        let state_directory = fs::canonicalize(root).unwrap();
+        let snapshot_target = target(root);
+        let mut catch_up =
+            CatchUp::open_for_snapshot(&state_directory, &snapshot_target).unwrap();
+        catch_up
+            .commit_proposal(fence, accepted_publication(&lifecycle, &message))
+            .unwrap()
+    }
 
-        {
-            let catch_up = CatchUp::open(&state_directory).unwrap();
-            let prepared = accepted.prepare().unwrap();
-            catch_up
-                .write_publication_intent(&PublicationIntent::from_outcome(&prepared.outcome))
-                .unwrap();
-            prepared.commit().unwrap();
+    fn seed(root: &Path, bytes: &[u8]) -> PublicationCommit {
+        let state_directory = fs::canonicalize(root).unwrap();
+        let catch_up = CatchUp::open_for_snapshot(&state_directory, &target(root)).unwrap();
+        match commit_candidate(root, catch_up.proposal_fence(), bytes) {
+            ProposalCommit::Committed(commit) => commit,
+            other => panic!("seed publication did not commit: {other:?}"),
+        }
+    }
+
+    struct PublicationWorker {
+        child: Child,
+        input: Option<ChildStdin>,
+        output: BufReader<ChildStdout>,
+        transcript: String,
+    }
+
+    impl PublicationWorker {
+        fn start(root: &Path, bytes: &str, crash_stage: Option<&str>) -> Self {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "resource_profile::tests::atomic_publication_process_worker",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ST2_RESOURCE_PUBLICATION_WORKER_ROOT", root)
+                .env("ST2_RESOURCE_PUBLICATION_WORKER_BYTES", bytes)
+                .env_remove("ST2_RESOURCE_PUBLICATION_CRASH_STAGE")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if let Some(stage) = crash_stage {
+                command.env("ST2_RESOURCE_PUBLICATION_CRASH_STAGE", stage);
+            }
+            let mut child = command.spawn().unwrap();
+            let input = child.stdin.take().unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut transcript = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0, "{transcript}");
+                transcript.push_str(&line);
+                if line.contains("PUBLICATION-WORKER-READY") {
+                    break;
+                }
+            }
+            Self {
+                child,
+                input: Some(input),
+                output,
+                transcript,
+            }
         }
 
-        let snapshot_target = target(directory.path());
-        let mut catch_up = CatchUp::open_for_snapshot(&state_directory, &snapshot_target).unwrap();
-        assert!(catch_up.state().pending_relevant_change());
-        assert_eq!(catch_up.state().pending_selected_topics(), ["selected"]);
+        fn release(&mut self) {
+            let mut input = self.input.take().unwrap();
+            input.write_all(b"x").unwrap();
+            drop(input);
+        }
 
-        let (equal, _) = catch_up
-            .publish(accepted_publication(&lifecycle, &message))
-            .unwrap();
-        assert_eq!(equal.change(), SnapshotChange::Equal);
-        assert!(catch_up.state().pending_relevant_change());
-        let request = catch_up.set_deliverable(true).unwrap().unwrap();
-        assert_eq!(request.digest(), equal.digest());
-        assert_eq!(request.selected_topics(), ["selected"]);
+        fn finish(mut self) -> (std::process::ExitStatus, String) {
+            if self.input.is_some() {
+                self.release();
+            }
+            let status = self.child.wait().unwrap();
+            self.output.read_to_string(&mut self.transcript).unwrap();
+            (status, self.transcript)
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess entrypoint for atomic publication tests"]
+    fn atomic_publication_process_worker() {
+        let Some(root) = std::env::var_os("ST2_RESOURCE_PUBLICATION_WORKER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let bytes = std::env::var("ST2_RESOURCE_PUBLICATION_WORKER_BYTES").unwrap();
+        let state_directory = fs::canonicalize(&root).unwrap();
+        let snapshot_target = target(&root);
+        let catch_up = CatchUp::open_for_snapshot(&state_directory, &snapshot_target).unwrap();
+        let fence = catch_up.proposal_fence();
+        println!(
+            "PUBLICATION-WORKER-READY {} {}",
+            fence.generation(),
+            fence.revision()
+        );
+        std::io::stdout().flush().unwrap();
+        let mut release = [0_u8; 1];
+        std::io::stdin().read_exact(&mut release).unwrap();
+        assert_eq!(release, *b"x");
+        let result = commit_candidate(&root, fence, bytes.as_bytes());
+        println!("PUBLICATION-WORKER-RESULT {result:?}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    fn atomic_publication_fences_races_and_survives_crash_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // POSIX advisory locks are process-scoped, so real child processes (not threads) prove that
+        // two proposals captured from one prior cannot both pass the host CAS.
+        let race = directory.path().join("same-prior-race");
+        fs::create_dir(&race).unwrap();
+        let mut racer_a = PublicationWorker::start(&race, "candidate-a", None);
+        let mut racer_b = PublicationWorker::start(&race, "candidate-b", None);
+        racer_a.release();
+        racer_b.release();
+        let (status_a, output_a) = racer_a.finish();
+        let (status_b, output_b) = racer_b.finish();
+        assert!(status_a.success(), "{output_a}");
+        assert!(status_b.success(), "{output_b}");
+        let outputs = format!("{output_a}\n{output_b}");
+        assert_eq!(
+            outputs
+                .matches("PUBLICATION-WORKER-RESULT Committed(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outputs
+                .matches("PUBLICATION-WORKER-RESULT StalePrior")
+                .count(),
+            1
+        );
+        let raced = CatchUp::open_for_snapshot(
+            &fs::canonicalize(&race).unwrap(),
+            &target(&race),
+        )
+        .unwrap();
+        assert_eq!(raced.state().revision(), 1);
+        let raced_bytes = fs::read(race.join("snapshot.json")).unwrap();
+        assert!(
+            raced_bytes.as_slice() == b"candidate-a"
+                || raced_bytes.as_slice() == b"candidate-b"
+        );
+
+        // Replacement advances the durable generation while the child is held at an explicit
+        // pipe barrier; releasing it cannot revive the replaced binding.
+        let replacement = directory.path().join("stale-generation");
+        fs::create_dir(&replacement).unwrap();
+        let stale = PublicationWorker::start(&replacement, "stale", None);
+        let state_directory = fs::canonicalize(&replacement).unwrap();
+        let mut host =
+            CatchUp::open_for_snapshot(&state_directory, &target(&replacement)).unwrap();
+        let replacement_fence = host.advance_generation(&target(&replacement)).unwrap();
+        assert_eq!(replacement_fence.generation(), 1);
+        let (status, output) = stale.finish();
+        assert!(status.success(), "{output}");
+        assert!(output.contains("StaleGeneration"), "{output}");
+        assert!(!replacement.join("snapshot.json").exists());
+
+        // A crash after the durable intent but before carrier rename leaves the old publication
+        // visible. Restart discards the ineligible intent without manufacturing an outbox item.
+        let before = directory.path().join("crash-before");
+        fs::create_dir(&before).unwrap();
+        let seed_commit = seed(&before, b"old");
+        let before_revision = seed_commit.revision();
+        let worker = PublicationWorker::start(
+            &before,
+            "must-not-appear",
+            Some("after-intent-before-carrier"),
+        );
+        let (status, output) = worker.finish();
+        assert_eq!(status.code(), Some(71), "{output}");
+        let restarted =
+            CatchUp::open_for_snapshot(&fs::canonicalize(&before).unwrap(), &target(&before))
+                .unwrap();
+        assert_eq!(fs::read(before.join("snapshot.json")).unwrap(), b"old");
+        assert_eq!(restarted.state().revision(), before_revision);
+        assert!(!before.join(PUBLICATION_INTENT_FILE).exists());
+
+        // A crash after carrier rename is caught up from the exact matching intent on restart.
+        // Current digest, deterministic commit receipt, and delivery envelope then coexist in the
+        // one authoritative catch-up state; the WAL is no longer a second source of truth.
+        let catch_up = directory.path().join("restart-catch-up");
+        fs::create_dir(&catch_up).unwrap();
+        seed(&catch_up, b"old");
+        let worker = PublicationWorker::start(
+            &catch_up,
+            "recovered",
+            Some("after-carrier-before-state"),
+        );
+        let (status, output) = worker.finish();
+        assert_eq!(status.code(), Some(72), "{output}");
+        let recovered = CatchUp::open_for_snapshot(
+            &fs::canonicalize(&catch_up).unwrap(),
+            &target(&catch_up),
+        )
+        .unwrap();
+        let recovered_digest = SnapshotDigest::of(b"recovered");
+        assert_eq!(
+            recovered.state().current_snapshot_digest(),
+            Some(recovered_digest)
+        );
+        let receipt = recovered.state().last_commit().unwrap();
+        assert_eq!(receipt.digest(), recovered_digest);
+        let durable_intent = recovered.state().last_intent.as_ref().unwrap();
+        assert_eq!(durable_intent.proposal_id, receipt.proposal_id());
+        assert_eq!(durable_intent.digest, recovered_digest);
+        assert_eq!(durable_intent.selected_topics, ["selected"]);
+        assert!(recovered.state().pending_from_last_intent);
+        assert!(recovered.state().pending_selected_topics.is_empty());
+        assert!(recovered.state().pending_facts.is_empty());
+        assert_eq!(recovered.state().pending_selected_topics(), ["selected"]);
+        assert!(!catch_up.join(PUBLICATION_INTENT_FILE).exists());
+        let restarted = CatchUp::open_for_snapshot(
+            &fs::canonicalize(&catch_up).unwrap(),
+            &target(&catch_up),
+        )
+        .unwrap();
+        assert_eq!(restarted.state(), recovered.state());
+
+        // The state rename can land even when the acknowledgement is lost. Replaying the exact
+        // proposal returns its durable receipt and does not advance revision or duplicate intent.
+        let lost_ack = directory.path().join("lost-ack");
+        fs::create_dir(&lost_ack).unwrap();
+        seed(&lost_ack, b"old");
+        let state_directory = fs::canonicalize(&lost_ack).unwrap();
+        let prior =
+            CatchUp::open_for_snapshot(&state_directory, &target(&lost_ack)).unwrap();
+        let retry_fence = prior.proposal_fence();
+        let worker = PublicationWorker::start(
+            &lost_ack,
+            "committed",
+            Some("after-state-before-ack"),
+        );
+        let (status, output) = worker.finish();
+        assert_eq!(status.code(), Some(73), "{output}");
+        let committed =
+            CatchUp::open_for_snapshot(&state_directory, &target(&lost_ack)).unwrap();
+        let committed_revision = committed.state().revision();
+        let committed_receipt = committed.state().last_commit().unwrap();
+        drop(committed);
+        assert_eq!(
+            commit_candidate(&lost_ack, retry_fence, b"committed"),
+            ProposalCommit::AlreadyCommitted(committed_receipt)
+        );
+        let after_retry =
+            CatchUp::open_for_snapshot(&state_directory, &target(&lost_ack)).unwrap();
+        assert_eq!(after_retry.state().revision(), committed_revision);
+        assert_eq!(fs::read(lost_ack.join("snapshot.json")).unwrap(), b"committed");
+    }
+
+    #[test]
+    fn generation_advance_explicitly_recovers_diverged_or_missing_carrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = fs::canonicalize(directory.path()).unwrap();
+        seed(directory.path(), b"committed");
+        let before =
+            CatchUp::open_for_snapshot(&state_directory, &target(directory.path())).unwrap();
+        let stale_fence = before.proposal_fence();
+        drop(before);
+
+        let worker = PublicationWorker::start(
+            directory.path(),
+            "interrupted",
+            Some("after-intent-before-carrier"),
+        );
+        let (status, output) = worker.finish();
+        assert_eq!(status.code(), Some(71), "{output}");
+        fs::write(directory.path().join("snapshot.json"), b"operator-recovery").unwrap();
+        assert!(matches!(
+            CatchUp::open_for_snapshot(&state_directory, &target(directory.path())),
+            Err(CatchUpError::InvalidState(
+                "canonical snapshot differs from the authoritative committed digest"
+            ))
+        ));
+        assert!(directory.path().join(PUBLICATION_INTENT_FILE).exists());
+
+        let recovered = CatchUp::open_for_generation_advance(
+            &state_directory,
+            &target(directory.path()),
+        )
+        .unwrap();
+        assert_eq!(recovered.state().generation(), stale_fence.generation() + 1);
+        assert_eq!(recovered.state().revision(), stale_fence.revision() + 1);
+        assert_eq!(
+            recovered.state().current_snapshot_digest(),
+            Some(SnapshotDigest::of(b"operator-recovery"))
+        );
+        assert!(recovered.state().last_commit().is_none());
+        assert!(!recovered.state().pending_relevant_change());
+        assert!(!directory.path().join(PUBLICATION_INTENT_FILE).exists());
+        drop(recovered);
+        assert!(matches!(
+            commit_candidate(directory.path(), stale_fence, b"late"),
+            ProposalCommit::StaleGeneration { .. }
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("snapshot.json")).unwrap(),
+            b"operator-recovery"
+        );
+        fs::write(directory.path().join("snapshot.json"), b"second-divergence").unwrap();
+        assert!(matches!(
+            CatchUp::open_for_snapshot(&state_directory, &target(directory.path())),
+            Err(CatchUpError::InvalidState(
+                "canonical snapshot differs from the authoritative committed digest"
+            ))
+        ));
+
+        let missing = tempfile::tempdir().unwrap();
+        let missing_state = fs::canonicalize(missing.path()).unwrap();
+        seed(missing.path(), b"present");
+        fs::remove_file(missing.path().join("snapshot.json")).unwrap();
+        assert!(matches!(
+            CatchUp::open_for_snapshot(&missing_state, &target(missing.path())),
+            Err(CatchUpError::InvalidState(
+                "canonical snapshot differs from the authoritative committed digest"
+            ))
+        ));
+        let recovered_missing =
+            CatchUp::open_for_generation_advance(&missing_state, &target(missing.path())).unwrap();
+        assert_eq!(recovered_missing.state().current_snapshot_digest(), None);
+        assert!(recovered_missing.state().last_commit().is_none());
+        assert!(!recovered_missing.state().pending_relevant_change());
+    }
+
+    #[test]
+    fn predecessor_publication_intent_migrates_by_digest_and_unknown_shapes_fail_closed() {
+        let matching = tempfile::tempdir().unwrap();
+        let matching_state = fs::canonicalize(matching.path()).unwrap();
+        fs::write(matching.path().join("snapshot.json"), b"legacy-carrier").unwrap();
+        let legacy = serde_json::json!({
+            "digest": SnapshotDigest::of(b"legacy-carrier").to_string(),
+            "selectedTopics": ["selected"],
+            "facts": [{"key": "state", "after": "ready"}],
+        });
+        fs::write(
+            matching.path().join(PUBLICATION_INTENT_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let migrated =
+            CatchUp::open_for_snapshot(&matching_state, &target(matching.path())).unwrap();
+        assert_eq!(
+            migrated.state().current_snapshot_digest(),
+            Some(SnapshotDigest::of(b"legacy-carrier"))
+        );
+        assert_eq!(migrated.state().pending_selected_topics(), ["selected"]);
+        assert_eq!(
+            migrated.state().pending_facts(),
+            [ResourceFact::current("state", "ready").unwrap()]
+        );
+        assert!(migrated.state().last_commit().is_none());
+        assert!(!matching.path().join(PUBLICATION_INTENT_FILE).exists());
+
+        let mismatched = tempfile::tempdir().unwrap();
+        let mismatched_state = fs::canonicalize(mismatched.path()).unwrap();
+        fs::write(mismatched.path().join("snapshot.json"), b"old-carrier").unwrap();
+        let legacy = serde_json::json!({
+            "digest": SnapshotDigest::of(b"never-published").to_string(),
+            "selectedTopics": ["selected"],
+            "facts": [],
+        });
+        fs::write(
+            mismatched.path().join(PUBLICATION_INTENT_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let migrated =
+            CatchUp::open_for_snapshot(&mismatched_state, &target(mismatched.path())).unwrap();
+        assert_eq!(
+            migrated.state().current_snapshot_digest(),
+            Some(SnapshotDigest::of(b"old-carrier"))
+        );
+        assert!(!migrated.state().pending_relevant_change());
+        assert!(!mismatched.path().join(PUBLICATION_INTENT_FILE).exists());
+
+        let malformed = tempfile::tempdir().unwrap();
+        let malformed_state = fs::canonicalize(malformed.path()).unwrap();
+        fs::write(malformed.path().join("snapshot.json"), b"carrier").unwrap();
+        let unknown = serde_json::json!({
+            "digest": SnapshotDigest::of(b"carrier").to_string(),
+            "selectedTopics": [],
+            "facts": [],
+            "unknown": true,
+        });
+        fs::write(
+            malformed.path().join(PUBLICATION_INTENT_FILE),
+            serde_json::to_vec(&unknown).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CatchUp::open_for_snapshot(&malformed_state, &target(malformed.path())),
+            Err(CatchUpError::Json(_))
+        ));
+        assert!(malformed.path().join(PUBLICATION_INTENT_FILE).exists());
     }
 
     #[test]
