@@ -1189,6 +1189,19 @@ enum ProviderRuntime {
 }
 
 #[cfg(feature = "wasip2-provider-runtime")]
+struct PreparedInvocationGuard<'a> {
+    provider: &'a ProviderRuntime,
+    invocation_id: u64,
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
+impl Drop for PreparedInvocationGuard<'_> {
+    fn drop(&mut self) {
+        self.provider.discard_prepared(self.invocation_id);
+    }
+}
+
+#[cfg(feature = "wasip2-provider-runtime")]
 impl ProviderRuntime {
     fn prepare(&self, invocation_id: u64) -> ObservationCancellation {
         match self {
@@ -1225,6 +1238,10 @@ impl ProviderRuntime {
         request: &Wasip2ObservationRequest,
         cancellation: &ObservationCancellation,
     ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError> {
+        let _prepared = PreparedInvocationGuard {
+            provider: self,
+            invocation_id: request.invocation_id,
+        };
         match self {
             Self::GitHubIssue {
                 executor,
@@ -2495,6 +2512,59 @@ mod tests {
             resource_change_subject("review", &[], &[], "snapshot updated"),
             "review · snapshot updated"
         );
+    }
+
+    #[cfg(feature = "wasip2-provider-runtime")]
+    #[test]
+    fn overlong_uri_validation_discards_prepared_invocation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("pty-stats");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let module = PtyStatsModule::new(
+            PtyStatsConfig::resolve(
+                &executable,
+                temporary.path().to_path_buf(),
+                PtyStatsScope::All,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let executor =
+            Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module.clone()).unwrap();
+        let component_bytes = wat::parse_str("(component)").unwrap();
+        let component = executor.load(&component_bytes).unwrap();
+        let provider = ProviderRuntime::PtyStats {
+            executor,
+            component,
+            module: module.clone(),
+        };
+        let uri = "x".repeat(64 * 1024 + 1);
+
+        for invocation_id in 1..=64 {
+            let cancellation = provider.prepare(invocation_id);
+            let error = provider
+                .observe(
+                    &Wasip2ObservationRequest {
+                        invocation_id,
+                        uri: uri.clone(),
+                        selector: Value::Null,
+                        previous_digest: None,
+                    },
+                    &cancellation,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                st2_resource_wasip2::ObserveError::InvalidRequest("URI exceeds 64 KiB")
+            ));
+            assert!(
+                !module.discard_prepared(invocation_id),
+                "invocation {invocation_id} remained pending after observe returned"
+            );
+        }
     }
 
     #[cfg(feature = "wasip2-provider-runtime")]

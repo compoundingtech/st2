@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -54,7 +53,8 @@ impl PtyStatsConfig {
         if deadline.is_zero() || deadline > Duration::from_secs(60) {
             return Err("PTY stats deadline is invalid");
         }
-        let executable = resolve_executable(executable.as_ref()).ok_or("PTY executable is unavailable")?;
+        let executable =
+            resolve_executable(executable.as_ref()).ok_or("PTY executable is unavailable")?;
         let cwd = cwd.into();
         if !cwd.is_absolute() {
             return Err("PTY stats cwd must be absolute");
@@ -418,12 +418,38 @@ fn wait_without_reaping(pid: u32) -> std::io::Result<()> {
     }
 }
 fn resolve_executable(executable: &Path) -> Option<PathBuf> {
-    if executable.components().count() > 1 || executable.is_absolute() {
+    if executable.is_absolute() {
         return executable_is_runnable(executable).then(|| executable.to_path_buf());
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(OsString::from(executable.as_os_str())))
+    let validation_cwd = std::env::current_dir().ok()?;
+    let search_path = std::env::var_os("PATH");
+    resolve_executable_at(
+        executable,
+        &validation_cwd,
+        search_path.as_deref(),
+    )
+}
+
+fn resolve_executable_at(
+    executable: &Path,
+    validation_cwd: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    debug_assert!(validation_cwd.is_absolute());
+    if executable.components().count() > 1 {
+        let candidate = validation_cwd.join(executable);
+        return executable_is_runnable(&candidate).then_some(candidate);
+    }
+    let search_path = search_path?;
+    std::env::split_paths(search_path)
+        .map(|directory| {
+            let directory = if directory.is_absolute() {
+                directory
+            } else {
+                validation_cwd.join(directory)
+            };
+            directory.join(executable)
+        })
         .find(|candidate| executable_is_runnable(candidate))
 }
 
@@ -465,6 +491,79 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn invoke(config: PtyStatsConfig) -> Outcome {
+        PtyStatsInvocation {
+            config,
+            control: Arc::new(InvocationControl::new()),
+        }
+        .get(Scope::All)
+        .unwrap()
+    }
+
+    #[test]
+    fn slash_relative_executable_stays_bound_to_validation_cwd() {
+        let validation_cwd = std::env::current_dir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("st2-pty-resolution-")
+            .tempdir_in(&validation_cwd)
+            .unwrap();
+        let configured_cwd = temporary.path().join("configured");
+        std::fs::create_dir_all(temporary.path().join("tools")).unwrap();
+        let validated_executable = temporary.path().join("tools/pty-stats");
+        write_executable(
+            &validated_executable,
+            "#!/bin/sh\nprintf 'validated\\n'\n",
+        );
+        let relative_executable = validated_executable.strip_prefix(&validation_cwd).unwrap();
+        let rebound_executable = configured_cwd.join(relative_executable);
+        std::fs::create_dir_all(rebound_executable.parent().unwrap()).unwrap();
+        write_executable(&rebound_executable, "#!/bin/sh\nprintf 'rebound\\n'\n");
+
+        let config = PtyStatsConfig::resolve(
+            relative_executable,
+            configured_cwd,
+            PtyStatsScope::All,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(config.executable.is_absolute());
+        assert_eq!(config.executable, validated_executable);
+        assert_eq!(invoke(config).stdout, b"validated\n");
+    }
+
+    #[test]
+    fn relative_path_entry_stays_bound_to_validation_cwd() {
+        let temporary = tempfile::tempdir().unwrap();
+        let validation_cwd = temporary.path().join("validation");
+        let configured_cwd = temporary.path().join("configured");
+        std::fs::create_dir_all(validation_cwd.join("bin")).unwrap();
+        std::fs::create_dir_all(configured_cwd.join("bin")).unwrap();
+        write_executable(
+            &validation_cwd.join("bin/pty-stats"),
+            "#!/bin/sh\nprintf 'validated-path\\n'\n",
+        );
+        write_executable(
+            &configured_cwd.join("bin/pty-stats"),
+            "#!/bin/sh\nprintf 'rebound-path\\n'\n",
+        );
+
+        let executable = resolve_executable_at(
+            Path::new("pty-stats"),
+            &validation_cwd,
+            Some(std::ffi::OsStr::new("bin")),
+        )
+        .unwrap();
+        assert!(executable.is_absolute());
+        assert_eq!(executable, validation_cwd.join("bin/pty-stats"));
+        let outcome = invoke(PtyStatsConfig {
+            executable,
+            cwd: configured_cwd,
+            scope: PtyStatsScope::All,
+            deadline: Duration::from_secs(1),
+        });
+        assert_eq!(outcome.stdout, b"validated-path\n");
     }
 
     #[test]
