@@ -334,6 +334,7 @@ pub fn submit_request(
     let receipt_path = receipt_path(&receipt_dir, &request.request_id)?;
     let request_path = request_path(&request_dir, &request.request_id)?;
     let _lock = lock_request_scope(&request_dir)?;
+    prune_request_temp_files(&request_dir)?;
     if !request_path.exists() && durable_request_capacity_is_full(&request_dir)? {
         return Err(ObserveAdmissionBackpressure {
             limit: MAX_PENDING_OBSERVE_REQUESTS,
@@ -351,7 +352,10 @@ pub fn submit_request(
 pub(crate) fn prepare_scope(scope: &SupervisorScope) -> anyhow::Result<()> {
     ensure_private_directory(scope.root())?;
     ensure_private_directory(&scope.observe_request_dir())?;
-    ensure_private_directory(&scope.observe_receipt_dir())
+    ensure_private_directory(&scope.observe_receipt_dir())?;
+    let request_dir = scope.observe_request_dir();
+    let _lock = lock_request_scope(&request_dir)?;
+    prune_request_temp_files(&request_dir)
 }
 
 #[derive(Debug)]
@@ -364,6 +368,25 @@ pub(crate) struct PendingRequestRecord {
 pub(crate) fn scan_requests(dir: &Path) -> (Vec<PendingRequestRecord>, Vec<String>) {
     let mut records = Vec::new();
     let mut errors = Vec::new();
+    {
+        let _lock = match lock_request_scope(dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                errors.push(format!(
+                    "locking observe requests {}: {error:#}",
+                    dir.display()
+                ));
+                return (records, errors);
+            }
+        };
+        if let Err(error) = prune_request_temp_files(dir) {
+            errors.push(format!(
+                "pruning observe request temps {}: {error:#}",
+                dir.display()
+            ));
+            return (records, errors);
+        }
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (records, errors),
@@ -375,12 +398,17 @@ pub(crate) fn scan_requests(dir: &Path) -> (Vec<PendingRequestRecord>, Vec<Strin
             return (records, errors);
         }
     };
-    for entry in entries.take(MAX_PENDING_OBSERVE_REQUESTS).flatten() {
+    for (entry, request_id) in entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let request_id = final_request_id(name.to_str()?)?.to_owned();
+            Some((entry, request_id))
+        })
+        .take(MAX_PENDING_OBSERVE_REQUESTS)
+    {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(request_id) = final_request_id(name) else {
-            continue;
-        };
+        let name = name.to_string_lossy();
         let path = entry.path();
         let parsed = (|| -> anyhow::Result<PendingRequestRecord> {
             let metadata = entry.metadata()?;
@@ -552,7 +580,31 @@ fn normalize_diagnostic(diagnostic: Option<String>) -> Option<String> {
 
 fn durable_request_capacity_is_full(dir: &Path) -> anyhow::Result<bool> {
     let entries = fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))?;
-    Ok(entries.take(MAX_PENDING_OBSERVE_REQUESTS).count() >= MAX_PENDING_OBSERVE_REQUESTS)
+    Ok(entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(final_request_id)
+                .is_some()
+        })
+        .take(MAX_PENDING_OBSERVE_REQUESTS)
+        .count()
+        >= MAX_PENDING_OBSERVE_REQUESTS)
+}
+
+fn prune_request_temp_files(dir: &Path) -> anyhow::Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(".observe-") {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove stale observe request temp {name:?}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn lock_request_scope(request_dir: &Path) -> anyhow::Result<fs::File> {
@@ -696,12 +748,32 @@ mod tests {
     }
 
     #[test]
-    fn final_basename_filter_ignores_temps_and_rejects_traversal() {
+    fn final_basename_filter_prunes_crash_temps_without_starving_requests() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join(".observe-temp"), b"not json").unwrap();
+        let request = ObserveRequest::new("h.worker".into(), "queue".into(), None, None).unwrap();
+        let path = request_path(temp.path(), &request.request_id).unwrap();
+        write_json_atomically_no_fsync(&path, &request).unwrap();
+        for index in 0..MAX_PENDING_OBSERVE_REQUESTS {
+            fs::write(
+                temp.path().join(format!(".observe-crash-{index}")),
+                b"incomplete",
+            )
+            .unwrap();
+        }
         fs::write(temp.path().join("sibling"), b"not json").unwrap();
+
         let (records, errors) = scan_requests(temp.path());
-        assert!(records.is_empty() && errors.is_empty());
+
+        assert!(errors.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request, request);
+        assert!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".observe-"))
+        );
+        assert!(!durable_request_capacity_is_full(temp.path()).unwrap());
         for invalid in ["../escape", "a/b", ".hidden", "x.json", "with space"] {
             assert!(
                 request_path(temp.path(), invalid).is_err(),
