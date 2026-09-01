@@ -90,6 +90,7 @@ Before it, 605 of 655 declarations on one live catalog had a
 ```text
 st2 resource ls [<identity>] [--json]
 st2 resource read [<identity>] <name> [--json]
+st2 resource refresh [<identity>] <name> [--agent <identity>] [--wait <seconds>] [--json]
 st2 resource add <name> --uri <uri> --reason <text> [--inactive-reason <text>] [--selector-json <json>] [--agent <identity>] [--json]
 st2 resource remove <name> [--agent <identity>] [--json]
 st2 resource rename <old> <new> [--agent <identity>] [--json]
@@ -112,15 +113,25 @@ above is elided at `…`; the command prints it in full.
 The name column is aligned to the widest name; the checkout URI is elided in this
 document, not by `ls`, which prints every URI verbatim.
 
-The read verbs project one agent's declared bindings; before them, bindings were
-visible only through `st2 agents --json`. A read takes a leading identity and a
-write takes `--agent <identity>`, both defaulting to the caller
-(`--as` / `$ST_AGENT`); every verb inherits `--catalog`, `--root`, `--as`, and
-`--host`. The write verbs perform read-modify-CAS-publish internally and emit a
-stable `--json` receipt, so the caller never renders KDL. Full-catalog
-validation, exact-target selection, compare-and-swap, and fail-closed
-concurrent-change behavior are preserved, and a
-binding-only change does not stop, replace, or relaunch healthy work
+The read surfaces project one agent's declared bindings; before them, bindings
+were visible only through `st2 agents --json`. `ls` takes an optional leading
+identity. `read` and `refresh` treat one positional argument as a binding on the
+caller and two as `<identity> <name>`; `refresh --agent <identity> <name>` is
+the equivalent explicit-target form and cannot be combined with a leading
+identity. Every form defaults through `--as` / `$ST_AGENT`, and every verb
+inherits `--catalog`, `--root`, `--as`, and `--host`.
+
+`refresh` asks the resident observable profile runtime for one atomic current
+observation. It never rewrites the Resource declaration. `--wait` bounds only
+the client wait; timeout or disconnect leaves admitted demand queued. JSON and
+durable receipt status values are camelCase; human CLI status text is
+kebab-case.
+
+The writes take `--agent <identity>`, perform read-modify-CAS-publish
+internally, and emit a stable `--json` receipt, so the caller never renders KDL.
+Full-catalog validation, exact-target selection, compare-and-swap, and
+fail-closed concurrent-change behavior are preserved, and a binding-only
+change does not stop, replace, or relaunch healthy work
 ([R21](../requirements.md)). This is the fourth instance of the pattern in
 [`src/agent_author.rs`](../../../src/agent_author.rs), after streams, desired
 state, and presentation

@@ -173,12 +173,19 @@ the instruments; every record call early-outs unless a meter provider is install
 | `message_deliveries_total` | counter | `result` = `pass` \| `fail` |
 | `crash_loops_total` | counter | — |
 | `driver_diagnostic_transitions_total` | counter | `stage`, `reason`, `source`, `support`, `outcome = failure | recovery` (all closed enums) |
+| `resource_observe_requests_total` | counter | `outcome` = `accepted` \| `backpressured` \| `settledUnchanged` \| `settledChanged` \| `settledFailed` \| `absentBinding` \| `staleGeneration` \| `providerUnavailable` \| `other` |
+| `resource_observe_dispatch_seconds` | histogram | — |
+| `resource_observe_settle_seconds` | histogram | — |
 | `reconcile_pass_duration_seconds` | histogram | — |
 | `session_start_duration_seconds` | histogram | — |
 
-The duration histograms use seconds-scale explicit buckets (`1ms … 10s`, see
-`DURATION_BUCKET_BOUNDARIES` in `src/telemetry.rs`) instead of the SDK's millisecond-tuned
-defaults, so sub-second passes and spawns stay distinguishable.
+All duration histograms share seconds-scale explicit bucket boundaries
+`0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`,
+`2.5`, `5`, and `10` (`DURATION_BUCKET_BOUNDARIES` in `src/telemetry.rs`)
+instead of the SDK's millisecond-tuned defaults. This keeps sub-second
+reconcile passes, spawns, observe dispatches, and settlements distinguishable.
+Observe metric statuses use the same camelCase durable-wire spelling; kebab-case
+is reserved for human CLI text.
 
 Scope notes: passes are counted at all three `st2.reconcile_pass` sites (catalog loop pass,
 one-shot up, and the single-file spec path — `reconcile_pass_specs_with_sessions`, which now

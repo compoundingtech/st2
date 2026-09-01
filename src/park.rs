@@ -56,7 +56,11 @@ impl SupervisorScope {
         Self::in_state_root(&crate::run::state_root(), catalog_root, host)
     }
 
-    fn in_state_root(state_root: &Path, catalog_root: &Path, host: &str) -> anyhow::Result<Self> {
+    pub(crate) fn in_state_root(
+        state_root: &Path,
+        catalog_root: &Path,
+        host: &str,
+    ) -> anyhow::Result<Self> {
         let catalog_root = catalog_root.canonicalize().with_context(|| {
             format!("canonicalize supervisor catalog {}", catalog_root.display())
         })?;
@@ -69,6 +73,9 @@ impl SupervisorScope {
             root: state_root.join("st2/supervisors").join(scope_id),
         })
     }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
 
     pub fn park_dir(&self) -> PathBuf {
         self.root.join("parked")
@@ -76,6 +83,13 @@ impl SupervisorScope {
 
     pub fn unpark_request_dir(&self) -> PathBuf {
         self.root.join("unpark")
+    }
+    pub(crate) fn observe_request_dir(&self) -> PathBuf {
+        self.root.join("observe-requests")
+    }
+
+    pub(crate) fn observe_receipt_dir(&self) -> PathBuf {
+        self.root.join("observe-receipts")
     }
 
     pub(crate) fn stream_owner_binding_path(&self) -> PathBuf {

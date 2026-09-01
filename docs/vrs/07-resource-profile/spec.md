@@ -1,20 +1,19 @@
 # Resource Profile spec
 
-This document specifies the Resource Profile registry, resolver SDK boundary, and
-wasm execution contract. It builds on
-[`requirements.md`](./requirements.md).
+This document specifies the Resource Profile registry, resolver SDK boundary,
+wasm execution contract, observable runtime protocol, and state-first
+publication authority. It builds on [`requirements.md`](./requirements.md).
 
-**Status:** Active
-
-## Scope
+## Ownership and flow
 
 This subsystem owns scheme-to-profile registration, the guest ABI, descriptor
 and selector validation, sandbox budgets, host path containment, observable
-runtime lifecycle, atomic snapshot publication, and the handoff of passive and
-observable carriers to [`06-resync`](../06-resync/spec.md). It does not own
-Resource URI semantics, provider authentication, provider observation strategy,
-provider mutation, task launch, or a canonical provider event log. Those remain
-downstream profile concerns or explicit non-goals.
+runtime lifecycle, atomic periodic publication and demand results, and the
+handoff of passive and observable carriers to
+[`06-resync`](../06-resync/spec.md). It does not own Resource URI semantics,
+provider authentication, provider observation strategy, provider mutation,
+task launch, or a canonical provider event log. Those remain downstream
+profile concerns or explicit non-goals.
 
 ## Architecture (PROFILE-R01..R20)
 
@@ -50,9 +49,9 @@ closed wasm describe() -> capabilities + selector schema/default + topology
 catalog-trusted host runtime argv ----+
        |
        v provider-native observation
-publish(binding-id, bytes, topics, facts)
+periodic Publish(Publication) or demanded ObservationResult
        |
-       v host validation + contained atomic replacement
+       v one host validation + digest + atomic publication authority
 canonical snapshot + current digest
        |
        v selector + pending-relevance reducer retaining topics + facts
@@ -381,8 +380,8 @@ fresh-instance policy, fuel budget, and no-import rule as `resolve`:
 ```
 
 `abiVersion` governs the complete descriptor and host protocol. Capabilities
-are closed strings known by that ABI version; v2 accepts `resolve`, `read`, and
-`observe`. `topics[].name` values are unique, non-empty profile-owned semantic
+are closed strings known by that ABI version; ABI 3 accepts `resolve`, `read`,
+and `observe`. `topics[].name` values are unique, non-empty profile-owned
 identifiers. `defaultSelector` must validate against `selectorSchema` and name
 only published topics. A binding selector is validated against the same schema
 and topic set before registration. Selector configuration is observation
@@ -403,7 +402,7 @@ payload. JSON and TOML Agent Spec forms carry the selector as a native JSON
 value. All forms lower to the same `serde_json::Value`; KDL spelling is not
 preserved and cannot change selector semantics.
 
-## Observable runtime declaration and protocol (PROFILE-R15..R16)
+## Observable runtime declaration and protocol (PROFILE-R15..R16D)
 
 The closed wasm module never receives network, credential, filesystem, process,
 or clock imports. A profile with `observe` therefore also has one
@@ -415,16 +414,20 @@ profile "github-pr" {
   class "coalesced"
   runtime {
     argv "github-resource-runtime" "pr"
+    capability "demand"
   }
 }
 ```
 
 `runtime` is forbidden unless the descriptor declares `observe`, and
 `observe` is unusable without `runtime`. The block accepts exactly one
-non-empty `argv` child and never invokes a shell. The executable is an external
-operator-trusted input; the guest cannot choose or rewrite it. Environment,
-credentials, egress, and provider permissions belong to the downstream runtime
-deployment and are not inferred from URI possession.
+non-empty `argv` child and an optional unique `capability "demand"` child; it
+never invokes a shell. Demand is denied by default, so a runtime that has not
+declared the capability receives neither `Observe` nor an expectation to emit
+`ObservationResult`. The executable is an external operator-trusted input; the
+guest cannot choose or rewrite it. Environment, credentials, egress, and
+provider permissions belong to the downstream runtime deployment and are not
+inferred from URI possession.
 
 The descriptor selects `shared` or `perBinding` topology. `shared` starts one
 runtime for the exact `(catalog, scheme, profile generation)` and multiplexes
@@ -432,105 +435,185 @@ bindings. `perBinding` starts one instance for each active binding. A
 per-binding runtime is the same protocol with one registration; topology does
 not select another lifecycle model.
 
-Both modes speak the same versioned, newline-delimited JSON protocol over
-supervisor-owned stdin/stdout:
+Both modes speak the same ABI-3, newline-delimited JSON protocol over
+supervisor-owned stdin/stdout. The following notation shows the normalized
+messages. Message types and fields lower to camel case; the nested result is
+tagged by `status`:
 
 ```text
-host -> register {
+Publication {
+  schemaId, mediaType, bytes, topics, facts?
+}
+
+host -> Register {
   owner: { incarnation, claim },
   bindingId, registration, uri, selector, carrierPath, previousDigest?
 }
-host -> unregister {
+host -> Unregister {
   owner: { incarnation, claim },
   bindingId, registration
 }
+host -> Observe {
+  owner: { incarnation, claim },
+  bindingId, registration, demandWatermark
+}
 
-runtime -> publish {
+runtime -> Publish {
   owner: { incarnation, claim },
   bindingId, registration,
-  schemaId, mediaType, bytes, topics, facts?, observedAt?
+  ...Publication
 }
-runtime -> health {
+runtime -> Health {
   owner: { incarnation, claim },
   bindingId?, registration?,
   state: starting|ready|degraded|failed, detail?
 }
+runtime -> ObservationResult {
+  owner: { incarnation, claim },
+  bindingId, registration, demandWatermark,
+  result:
+    { status: unchanged }
+    | { status: failed, diagnostic? }
+    | { status: published, publication: Publication }
+}
 ```
 
+`Publication` is one reusable typed payload, not two similar publication
+shapes. Periodic `Publish` flattens it into the existing ABI-3 base wire shape;
+the published demand result carries the same value atomically with the outcome.
+Neither message contains a host timestamp or runtime-computed digest.
+
 The supervisor assigns a fresh directional owner claim to every runtime
-incarnation. A new claim atomically fences the prior process and clears its
-binding registrations. Every `publish` and binding-scoped `health` is accepted
-only when both the owner claim and the host-generated registration token match
-current state. `bindingId` is an opaque incarnation-scoped address, never the
-binding name or URI.
+incarnation. A new claim fences the prior process and clears its binding
+registrations. Every `Publish`, `ObservationResult`, binding-scoped `Health`,
+and `Observe` dispatch is accepted or addressed only when owner claim,
+`bindingId`, and host-generated registration token all match current state.
+`bindingId` is an opaque incarnation-scoped address, never the binding name or
+URI.
 
-EOF ends the runtime protocol. The supervisor's existing process lifecycle is
-the only shutdown and restart authority; there is no protocol `shutdown`
-message. Observation belongs to the implementation, so there is no host
-`reconcile` message. The runtime begins or resumes provider-native observation
-after `register` and may use `previousDigest` to avoid redundant publication.
+EOF ends the runtime protocol. The supervisor's process lifecycle is the only
+shutdown and restart authority; there is no protocol `Shutdown` message. The
+runtime begins or resumes provider-native observation after `Register` and may
+use `previousDigest` to avoid redundant periodic publication. `Observe` is a
+level-triggered scheduling hint: it may pull an eligible observation forward,
+but it is not provider reconciliation and cannot choose a provider mechanism,
+reset polling cadence, backoff, cache, cursor, or rate-limit state, or authorize
+a provider write.
 
-Each encoded protocol line is at most 2 MiB, including the newline. `publish`
-encodes `bytes` as a padded RFC 4648 base64 string; the decoded snapshot is
-opaque. Selectors are at most 16 KiB when encoded as canonical compact JSON.
-Decoded snapshot bytes are at most 1 MiB. Health `detail` is at most 16 KiB of
-UTF-8. A publication has at most 32 ordered facts; keys are at most 128 bytes
-and values at most 1 KiB of printable single-line UTF-8. A fact carries
-`key` plus `before`, `after`, or both; explicit JSON null denotes absence.
-These bounds are checked before allocation or decoding where the transport
-permits and fail only the affected binding or runtime. st2 never truncates
-canonical snapshot bytes, facts, or health text to satisfy a bound.
+Each encoded protocol line is at most 2 MiB, including the newline. Snapshot
+`bytes` use padded RFC 4648 base64 and decode to at most 1 MiB of opaque bytes.
+Selectors are at most 16 KiB as canonical compact JSON. Health `detail` and a
+failed-result `diagnostic` are each at most 16 KiB of UTF-8. A `Publication`
+has at most 32 ordered facts; keys are at most 128 bytes and before/after
+values are at most 1 KiB of printable single-line UTF-8. A fact carries `key`
+plus `before`, `after`, or both; explicit JSON null denotes absence. Bounds are
+checked before allocation or decoding where the transport permits and fail
+only the affected binding or runtime. st2 does not truncate snapshot bytes,
+facts, health text, or diagnostics to satisfy a bound.
 
-The host rejects unknown bindings, stale owners or registrations, mismatched
-schema or media type, unpublished topics, invalid messages, output after
-unregister, and messages exceeding protocol bounds. A shared-runtime protocol
-failure degrades every registered binding honestly but cannot publish across
-schemes, profile generations, runtime incarnations, or binding registrations.
+The host rejects unknown bindings, stale owners or registrations, zero demand
+watermarks, mismatched schema or media type, unpublished topics, invalid facts
+or messages, output after `Unregister`, and messages exceeding protocol bounds.
+A shared-runtime protocol failure degrades every registered binding honestly
+but cannot publish or settle demand across schemes, profile generations,
+runtime incarnations, or binding registrations.
+
+For each exact active registration the supervisor has at most one `Observe`
+dispatch in flight and one latest trailing demand watermark. Watermarks are
+positive and monotonically increase within that registration. A matching
+`ObservationResult` closes exactly the in-flight batch. Demand accepted while
+that observation is in flight survives its result and coalesces into one
+trailing dispatch. A registration replacement fences the old batch, and
+provider-process or transport failure supplies failure evidence for it.
+Backpressure leaves admitted, undispatched demand pending. No timeout, wall
+clock, or normal polling cycle completes demand.
+
+The private durable request and receipt records are bounded to 64 KiB and carry
+exact schema identities `st2.resource-observe-request.v1` and
+`st2.resource-observe-receipt.v1`. One supervisor scope admits at most 256
+unresolved requests. Submission beyond that cap returns backpressure before
+creating another request, and the supervisor scans no more than the cap. An
+admitted request remains the durable retryable intent until a terminal receipt
+is durably committed; in-memory enqueue and a nonterminal receipt are not
+ownership transfer.
+Terminal receipt failure keeps retryable state and leaves the request
+available to a restarted supervisor. A terminal receipt is the durable
+successor and only then permits request cleanup.
+
+Durable JSON receipt status values are camelCase. `accepted` and `backpressured`
+are nonterminal. The terminal set is exactly `settledUnchanged`,
+`settledChanged`, `settledFailed`, `absentBinding`, `staleGeneration`, and
+`providerUnavailable`. Human CLI text renders multiword statuses in kebab-case.
+`Unchanged` maps to `settledUnchanged`; `Failed` maps to `settledFailed` after
+its provider diagnostic is normalized to a receipt-safe optional bounded value;
+and an accepted `Published` maps to `settledChanged` with the host-computed
+digest of its accepted bytes. No other receipt status carries a digest.
+
+A missing active binding reports `absentBinding`. An active observable binding
+whose runtime did not declare `demand` also reports `absentBinding`, with the
+explicit diagnostic `the profile runtime does not declare the demand
+capability`. Only a client generation older than the resident supervisor is
+`staleGeneration`; a newer client generation remains queued until supervisor
+refresh. Provider failure reports `providerUnavailable`. A client wait bound
+controls only how long that client waits and performs a final receipt read at
+the deadline. Expiry or disconnect leaves admitted demand and any trailing
+dispatch obligation intact.
 
 Any provider cursor, webhook delivery identity, redelivery, polling interval,
-rate-limit state, and repair strategy remain runtime-private.
+rate-limit state, conditional cache, backoff, and repair strategy remain
+runtime-private.
 
 ## Snapshot publication (PROFILE-R14)
 
-The resolver's contained carrier path is the observable snapshot path. A
-successful `publish` follows one host-owned transaction:
+The resolver's contained carrier is the observable snapshot authority.
+Periodic `Publish` and demand-result `Published` enter one host-owned acceptance
+transaction:
 
 ```text
-validate binding + schema + topics + facts + size
+validate current fences + Publication schema + topics + facts + bounds
         |
         v
-write new bytes to contained sibling temporary file
-        |
-        v fsync file + atomic rename + parent sync
+compute SHA-256 digest from accepted snapshot bytes
         |
         v
-compute/record current sha256 digest and freshness
+atomically replace the contained carrier and record current digest + freshness
         |
-        `-> equal digest: no invalidation
-            changed digest: apply binding selector and retain selected topics + facts
+        `-> equal digest: no state transition
+            changed digest: apply selector and retain selected topics + facts
+```
 
-The runtime never writes the carrier directly. Descriptor-relative no-follow
-containment from the existing resolver contract applies to the temporary file,
-final file, and replacement. Publication failure preserves the last proven
-snapshot and marks freshness/health degraded. The first successful publication
-is a state transition from unavailable to readable. If the publication carries
-at least one selected topic, st2 schedules the same superseding invalidation as
-for every later changed digest. This explicit first-publication wake prevents a
+The runtime never writes the carrier directly and never supplies its
+authoritative digest. Existing descriptor-relative no-follow containment
+applies to publication. Failure before acceptance preserves the last proven
+snapshot and marks publication health degraded.
+
+The initial accepted publication changes the binding from unavailable to
+readable. If it carries at least one selected topic, st2 schedules the same
+superseding invalidation as for a later changed digest. This wake prevents a
 live agent from retaining an unreadable view after delayed startup or recovery.
 Equal publications and publications without selected topics remain silent.
 
+`ObservationResult.Unchanged` closes demand without changing the carrier or
+freshness. `ObservationResult.Failed` closes demand as failed and preserves the
+last proven carrier. `ObservationResult.Published` is not settled until its
+embedded `Publication` passes the same acceptance transaction as periodic
+`Publish`. Once the snapshot and catch-up transaction commits, it settles as
+`settledChanged` with the host-computed accepted digest even if subsequent
+resync delivery emission fails. Its bytes, topics, and typed facts cannot
+disagree with a separate settlement frame because no such frame exists.
+
 Snapshot bytes are profile-defined and opaque to st2. `schemaId` and
 `mediaType` make the bytes interpretable without making st2 own their semantics.
-The first contract has one snapshot per binding: no named facets, generation
-manifest, profile event log, or host retention policy.
+Each binding has one snapshot, not named facets, a generation manifest, a
+profile event log, or a host retention history.
 
 ## Semantic invalidation and catch-up (PROFILE-R17..R20)
 
-For every changed digest, including the first successful publication, the host
-validates and preserves the runtime's ordered facts and intersects
-`publish.topics` with the normalized binding selector. An empty intersection
-updates the canonical snapshot and freshness without scheduling delivery. A
-non-empty intersection updates this bounded per-binding state:
+For every changed digest, including the initial accepted publication, the
+common acceptance core preserves the `Publication`'s ordered facts and
+intersects its topics with the normalized binding selector. An empty
+intersection updates canonical state and freshness without scheduling delivery.
+A non-empty intersection updates this bounded per-binding state:
 
 ```text
 current_snapshot_digest: Digest?
@@ -554,26 +637,26 @@ body = { binding, snapshotDigest, topics, facts }
 
 Subjects are at most 96 Unicode scalars. Facts retain publication order and are
 included only whole; topic space is reserved before facts are admitted. If no
-fact fits, a compatible bounded fallback remains. The durable body always
-retains the complete bounded fact list. It contains no snapshot bytes, provider
-payload, credential, URI, reason, or provider cursor. Existing event
-deduplication, inbox storage, DING rendering, and supersession apply unchanged.
-Multiple topics for one atomic publication produce one invalidation.
+fact fits, a compatible bounded fallback remains. The durable body retains the
+complete bounded fact list. It contains no snapshot bytes, provider payload,
+credential, URI, reason, or provider cursor. Existing event deduplication,
+inbox storage, DING rendering, and supersession apply unchanged. Multiple
+topics for one atomic publication produce one invalidation.
 
 If delivery is unavailable, a relevant publication replaces the pending
-selected topics and facts with the latest relevant publication and sets
-`pending_relevant_change = true`. Later irrelevant publications may advance
-`current_snapshot_digest` but do not clear that state. When delivery becomes
-available, st2 emits at most one invalidation for the then-current digest with
-the retained latest relevant fact envelope, and clears it only after event
-ingress accepts the record. No transition backlog exists. This is
-level-triggered current-state catch-up, not event replay.
+selected topics and facts with that latest relevant semantic envelope and sets
+`pending_relevant_change = true`. A later irrelevant publication may advance
+`current_snapshot_digest` but does not clear the pending envelope. When
+delivery becomes available, st2 emits at most one invalidation for the
+then-current digest with the retained latest relevant topics and facts, and
+clears pending state only after event ingress accepts the record. No transition
+backlog exists. This is level-triggered current-state catch-up, not event replay.
 
 Health has separate descriptor, selector, runtime, observation, publication,
 and delivery stages. Every stage reports affected scheme and binding without
 including URI credentials or provider payloads. The last proven snapshot stays
 readable with explicit freshness when observation fails; failure never relabels
-old bytes as a newly observed snapshot.
+old bytes as newly observed state.
 
 ## Design questions
 

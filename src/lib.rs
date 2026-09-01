@@ -43,6 +43,7 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
+pub mod resource_observe;
 pub mod resource_profile;
 pub mod resource_profile_supervisor;
 pub mod resync;

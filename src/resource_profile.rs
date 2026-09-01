@@ -17,11 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 pub use st2_resource_protocol::{
-    BindingId, FactError, FactValue, HostMessage, OpaqueIdError, OwnerClaim, ProtocolError,
-    RegistrationToken, ResourceFact, RuntimeHealthState, RuntimeIncarnation, RuntimeMessage,
-    RuntimeOwner, SnapshotBytes, SnapshotDigest, SnapshotSizeError, MAX_FACTS, MAX_FACT_KEY_BYTES,
-    MAX_FACT_VALUE_BYTES, MAX_HEALTH_DETAIL_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_SELECTOR_BYTES,
-    MAX_SNAPSHOT_BYTES, decode_host_line, decode_runtime_line, encode_host_line,
+    BindingId, FactError, FactValue, HostMessage, MAX_FACT_KEY_BYTES, MAX_FACT_VALUE_BYTES,
+    MAX_FACTS, MAX_HEALTH_DETAIL_BYTES, MAX_OBSERVATION_DIAGNOSTIC_BYTES, MAX_PROTOCOL_LINE_BYTES,
+    MAX_SELECTOR_BYTES, MAX_SNAPSHOT_BYTES, ObservationResult, OpaqueIdError, OwnerClaim,
+    ProtocolError, Publication, RegistrationToken, ResourceFact, RuntimeHealthState,
+    RuntimeIncarnation, RuntimeMessage, RuntimeOwner, SnapshotBytes, SnapshotDigest,
+    SnapshotSizeError, decode_host_line, decode_runtime_line, encode_host_line,
     encode_runtime_line,
 };
 
@@ -161,7 +162,10 @@ pub struct SnapshotTarget {
 }
 
 impl SnapshotTarget {
-    pub fn new(root: impl Into<PathBuf>, carrier_path: impl AsRef<Path>) -> Result<Self, PathError> {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        carrier_path: impl AsRef<Path>,
+    ) -> Result<Self, PathError> {
         let root = root.into();
         validate_absolute_path(&root).map_err(PathError::UnsafeRoot)?;
         let carrier_path = carrier_path.as_ref();
@@ -192,10 +196,9 @@ impl SnapshotTarget {
     /// Digest the currently published contained snapshot, if present.
     pub fn current_digest(&self) -> Result<Option<SnapshotDigest>, PublicationError> {
         let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
-        let leaf = self
-            .relative
-            .file_name()
-            .ok_or_else(|| PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf")))?;
+        let leaf = self.relative.file_name().ok_or_else(|| {
+            PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf"))
+        })?;
         let directory = match open_absolute_dir_beneath(&self.root, parent) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -366,36 +369,12 @@ impl RuntimeLifecycle {
                 owner,
                 binding_id,
                 registration,
-                schema_id,
-                media_type,
-                bytes,
-                topics,
-                facts,
-                observed_at,
+                publication,
             } => {
                 let binding = self.require_registration(owner, binding_id, registration)?;
-                if schema_id != binding.contract.schema_id() {
-                    return Err(FenceError::ContractMismatch { field: "schemaId" });
-                }
-                if media_type != binding.contract.media_type() {
-                    return Err(FenceError::ContractMismatch { field: "mediaType" });
-                }
-                let mut unique = BTreeSet::new();
-                for topic in topics {
-                    if topic.is_empty() || !unique.insert(topic.as_str()) {
-                        return Err(FenceError::InvalidTopics);
-                    }
-                    if !binding.contract.published_topics.contains(topic) {
-                        return Err(FenceError::UnpublishedTopic(topic.clone()));
-                    }
-                }
-                Ok(AcceptedOutput::Publication(AcceptedPublication {
-                    target: &binding.target,
-                    bytes,
-                    selected_topics: binding.contract.selection.select(topics),
-                    facts: facts.as_deref().unwrap_or_default(),
-                    observed_at: observed_at.as_deref(),
-                }))
+                Ok(AcceptedOutput::Publication(
+                    self.accept_publication(binding, publication)?,
+                ))
             }
             RuntimeMessage::Health {
                 owner,
@@ -424,7 +403,71 @@ impl RuntimeLifecycle {
                     detail: detail.as_deref(),
                 }))
             }
+            RuntimeMessage::ObservationResult {
+                owner,
+                binding_id,
+                registration,
+                demand_watermark,
+                result,
+            } => {
+                let binding = self.require_registration(owner, binding_id, registration)?;
+                if *demand_watermark == 0 {
+                    return Err(FenceError::InvalidDemandWatermark);
+                }
+                let result = match result {
+                    ObservationResult::Unchanged => AcceptedObservation::Unchanged,
+                    ObservationResult::Failed { diagnostic } => {
+                        if diagnostic.as_ref().is_some_and(|diagnostic| {
+                            diagnostic.len() > MAX_OBSERVATION_DIAGNOSTIC_BYTES
+                        }) {
+                            return Err(FenceError::ObservationDiagnosticTooLarge);
+                        }
+                        AcceptedObservation::Failed {
+                            diagnostic: diagnostic.as_deref(),
+                        }
+                    }
+                    ObservationResult::Published { publication } => AcceptedObservation::Published(
+                        self.accept_publication(binding, publication)?,
+                    ),
+                };
+                Ok(AcceptedOutput::ObservationResult(
+                    AcceptedObservationResult {
+                        binding_id,
+                        demand_watermark: *demand_watermark,
+                        result,
+                    },
+                ))
+            }
         }
+    }
+
+    fn accept_publication<'a>(
+        &'a self,
+        binding: &'a BindingRegistration,
+        publication: &'a Publication,
+    ) -> Result<AcceptedPublication<'a>, FenceError> {
+        if publication.schema_id != binding.contract.schema_id() {
+            return Err(FenceError::ContractMismatch { field: "schemaId" });
+        }
+        if publication.media_type != binding.contract.media_type() {
+            return Err(FenceError::ContractMismatch { field: "mediaType" });
+        }
+        let mut unique = BTreeSet::new();
+        for topic in &publication.topics {
+            if topic.is_empty() || !unique.insert(topic.as_str()) {
+                return Err(FenceError::InvalidTopics);
+            }
+            if !binding.contract.published_topics.contains(topic) {
+                return Err(FenceError::UnpublishedTopic(topic.clone()));
+            }
+        }
+        Ok(AcceptedPublication {
+            binding_id: &binding.binding_id,
+            target: &binding.target,
+            bytes: &publication.bytes,
+            selected_topics: binding.contract.selection.select(&publication.topics),
+            facts: publication.facts.as_deref().unwrap_or_default(),
+        })
     }
 
     fn require_owner(&self, owner: &RuntimeOwner) -> Result<(), FenceError> {
@@ -463,7 +506,9 @@ pub enum FenceError {
     UnpublishedTopic(String),
     InvalidTopics,
     InvalidHealthScope,
+    InvalidDemandWatermark,
     HealthDetailTooLarge,
+    ObservationDiagnosticTooLarge,
 }
 
 impl fmt::Display for FenceError {
@@ -483,7 +528,13 @@ impl fmt::Display for FenceError {
             }
             Self::InvalidTopics => formatter.write_str("runtime output has invalid topics"),
             Self::InvalidHealthScope => formatter.write_str("runtime health has an invalid scope"),
+            Self::InvalidDemandWatermark => {
+                formatter.write_str("runtime observation result has an invalid demand watermark")
+            }
             Self::HealthDetailTooLarge => formatter.write_str("runtime health detail is too large"),
+            Self::ObservationDiagnosticTooLarge => {
+                formatter.write_str("runtime observation diagnostic is too large")
+            }
         }
     }
 }
@@ -494,18 +545,23 @@ impl std::error::Error for FenceError {}
 pub enum AcceptedOutput<'a> {
     Publication(AcceptedPublication<'a>),
     Health(AcceptedHealth<'a>),
+    ObservationResult(AcceptedObservationResult<'a>),
 }
 
 #[derive(Debug)]
 pub struct AcceptedPublication<'a> {
+    binding_id: &'a BindingId,
     target: &'a SnapshotTarget,
     bytes: &'a SnapshotBytes,
     selected_topics: Vec<String>,
     facts: &'a [ResourceFact],
-    observed_at: Option<&'a str>,
 }
 
 impl<'a> AcceptedPublication<'a> {
+    pub fn binding_id(&self) -> &BindingId {
+        self.binding_id
+    }
+
     pub fn target(&self) -> &SnapshotTarget {
         self.target
     }
@@ -517,9 +573,6 @@ impl<'a> AcceptedPublication<'a> {
     pub fn facts(&self) -> &[ResourceFact] {
         self.facts
     }
-    pub fn observed_at(&self) -> Option<&str> {
-        self.observed_at
-    }
 
     fn prepare(self) -> Result<PreparedPublication<'a>, PublicationError> {
         prepare_snapshot(
@@ -529,6 +582,26 @@ impl<'a> AcceptedPublication<'a> {
             self.facts.to_vec(),
         )
     }
+}
+
+#[derive(Debug)]
+pub struct AcceptedObservationResult<'a> {
+    binding_id: &'a BindingId,
+    demand_watermark: u64,
+    result: AcceptedObservation<'a>,
+}
+
+impl<'a> AcceptedObservationResult<'a> {
+    pub fn into_parts(self) -> (&'a BindingId, u64, AcceptedObservation<'a>) {
+        (self.binding_id, self.demand_watermark, self.result)
+    }
+}
+
+#[derive(Debug)]
+pub enum AcceptedObservation<'a> {
+    Unchanged,
+    Failed { diagnostic: Option<&'a str> },
+    Published(AcceptedPublication<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,8 +717,8 @@ impl PreparedPublication<'_> {
         let leaf = self.target.relative.file_name().ok_or_else(|| {
             PublicationError::UnsafeTarget(PathError::UnsafeCarrier("missing leaf"))
         })?;
-        let directory = open_absolute_dir_beneath(&self.target.root, parent)
-            .map_err(PublicationError::Io)?;
+        let directory =
+            open_absolute_dir_beneath(&self.target.root, parent).map_err(PublicationError::Io)?;
         atomic_replace_at(&directory, leaf, self.bytes).map_err(PublicationError::Io)
     }
 }
@@ -657,7 +730,9 @@ fn prepare_snapshot<'a>(
     facts: Vec<ResourceFact>,
 ) -> Result<PreparedPublication<'a>, PublicationError> {
     if bytes.len() > MAX_SNAPSHOT_BYTES {
-        return Err(PublicationError::SnapshotTooLarge { actual: bytes.len() });
+        return Err(PublicationError::SnapshotTooLarge {
+            actual: bytes.len(),
+        });
     }
     let parent = target.relative.parent().unwrap_or_else(|| Path::new(""));
     ensure_absolute_dir_beneath(&target.root, parent).map_err(PublicationError::Io)?;
@@ -679,7 +754,7 @@ fn prepare_snapshot<'a>(
         },
     })
 }
-
+#[cfg(test)]
 fn publish_snapshot(
     target: &SnapshotTarget,
     bytes: &[u8],
@@ -821,8 +896,7 @@ pub struct CatchUp {
 
 impl CatchUp {
     pub fn open(state_directory: &Path) -> Result<Self, CatchUpError> {
-        validate_absolute_path(state_directory)
-            .map_err(CatchUpError::UnsafeStateDirectory)?;
+        validate_absolute_path(state_directory).map_err(CatchUpError::UnsafeStateDirectory)?;
         let directory = open_absolute_dir(state_directory).map_err(CatchUpError::Io)?;
         let state = match read_regular_optional_at(
             &directory,
@@ -941,12 +1015,8 @@ impl CatchUp {
         })
     }
 
-    pub fn acknowledge_delivery(
-        &mut self,
-        digest: SnapshotDigest,
-    ) -> Result<bool, CatchUpError> {
-        if !self.state.pending_relevant_change
-            || self.state.current_snapshot_digest != Some(digest)
+    pub fn acknowledge_delivery(&mut self, digest: SnapshotDigest) -> Result<bool, CatchUpError> {
+        if !self.state.pending_relevant_change || self.state.current_snapshot_digest != Some(digest)
         {
             return Ok(false);
         }
@@ -993,22 +1063,15 @@ impl CatchUp {
         }
     }
 
-    fn write_publication_intent(
-        &self,
-        intent: &PublicationIntent,
-    ) -> Result<(), CatchUpError> {
+    fn write_publication_intent(&self, intent: &PublicationIntent) -> Result<(), CatchUpError> {
         intent.validate()?;
         let mut bytes = serde_json::to_vec(intent).map_err(CatchUpError::Json)?;
         bytes.push(b'\n');
         if bytes.len() > MAX_CATCH_UP_FILE_BYTES {
             return Err(CatchUpError::IntentTooLarge);
         }
-        atomic_replace_at(
-            &self.directory,
-            OsStr::new(PUBLICATION_INTENT_FILE),
-            &bytes,
-        )
-        .map_err(CatchUpError::Io)
+        atomic_replace_at(&self.directory, OsStr::new(PUBLICATION_INTENT_FILE), &bytes)
+            .map_err(CatchUpError::Io)
     }
 
     fn clear_publication_intent(&self) -> Result<(), CatchUpError> {
@@ -1082,7 +1145,9 @@ impl fmt::Display for CatchUpError {
                 formatter.write_str("publication intent path is not a real regular file")
             }
             Self::InvalidState(reason) => write!(formatter, "invalid catch-up state: {reason}"),
-            Self::Publication(error) => write!(formatter, "snapshot reconciliation failed: {error}"),
+            Self::Publication(error) => {
+                write!(formatter, "snapshot reconciliation failed: {error}")
+            }
             Self::Json(error) => write!(formatter, "invalid catch-up state JSON: {error}"),
             Self::Io(error) => write!(formatter, "catch-up state I/O failed: {error}"),
         }
@@ -1142,10 +1207,13 @@ fn ensure_absolute_dir_beneath(root: &Path, relative: &Path) -> io::Result<File>
     validate_absolute_path(root).map_err(invalid_input)?;
     validate_empty_or_relative_path(relative).map_err(invalid_input)?;
     let mut directory = open_absolute_dir(root)?;
-    for component in relative.components().filter_map(|component| match component {
-        Component::Normal(name) => Some(name),
-        _ => None,
-    }) {
+    for component in relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+    {
         let name = c_string(component)?;
         let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
         if result < 0 {
@@ -1239,11 +1307,7 @@ fn atomic_replace_at(directory: &File, leaf: &OsStr, bytes: &[u8]) -> io::Result
         libc::openat(
             directory.as_raw_fd(),
             temporary.as_ptr(),
-            libc::O_WRONLY
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
     };
@@ -1286,7 +1350,6 @@ fn remove_optional_at(directory: &File, leaf: &OsStr) -> io::Result<()> {
     }
     directory.sync_all()
 }
-
 
 fn ensure_regular_or_absent_at(directory: &File, leaf: &OsStr) -> io::Result<()> {
     match read_regular_optional_at(directory, leaf, 0) {
@@ -1362,12 +1425,17 @@ mod tests {
             owner,
             binding_id: binding_id("binding"),
             registration: token(registration),
+            publication: publication_payload(bytes, topics),
+        }
+    }
+
+    fn publication_payload(bytes: &[u8], topics: &[&str]) -> Publication {
+        Publication {
             schema_id: "schema.v1".to_owned(),
             media_type: "application/json".to_owned(),
             bytes: SnapshotBytes::new(bytes.to_vec()).unwrap(),
             topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
             facts: None,
-            observed_at: None,
         }
     }
 
@@ -1378,9 +1446,9 @@ mod tests {
         match lifecycle.accept_output(message).unwrap() {
             AcceptedOutput::Publication(publication) => publication,
             AcceptedOutput::Health(_) => panic!("expected publication"),
+            AcceptedOutput::ObservationResult(_) => panic!("expected publication"),
         }
     }
-
 
     #[test]
     fn stale_owner_and_registration_are_fenced() {
@@ -1398,9 +1466,33 @@ mod tests {
             lifecycle.accept_output(&stale_owner),
             Err(FenceError::StaleOwner)
         ));
-        let stale_token = publication(current, "stale-token", b"bytes", &["selected"]);
+        let stale_token = publication(current.clone(), "stale-token", b"bytes", &["selected"]);
         assert!(matches!(
             lifecycle.accept_output(&stale_token),
+            Err(FenceError::StaleRegistration)
+        ));
+        let stale_owner_result = RuntimeMessage::ObservationResult {
+            owner: owner("stale"),
+            binding_id: binding_id("binding"),
+            registration: token("current-token"),
+            demand_watermark: 1,
+            result: ObservationResult::Unchanged,
+        };
+        assert!(matches!(
+            lifecycle.accept_output(&stale_owner_result),
+            Err(FenceError::StaleOwner)
+        ));
+        let stale_registration_result = RuntimeMessage::ObservationResult {
+            owner: current,
+            binding_id: binding_id("binding"),
+            registration: token("stale-token"),
+            demand_watermark: 1,
+            result: ObservationResult::Published {
+                publication: publication_payload(b"demand", &["selected"]),
+            },
+        };
+        assert!(matches!(
+            lifecycle.accept_output(&stale_registration_result),
             Err(FenceError::StaleRegistration)
         ));
         assert!(!directory.path().join("snapshot.json").exists());
@@ -1475,7 +1567,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.change(), SnapshotChange::First);
         assert!(first.invalidating());
-        assert_eq!(fs::read(directory.path().join("snapshot.json")).unwrap(), br#"{"state":1}"#);
+        assert_eq!(
+            fs::read(directory.path().join("snapshot.json")).unwrap(),
+            br#"{"state":1}"#
+        );
 
         let (equal, _) = catch_up
             .publish(accepted_publication(&lifecycle, &message))
@@ -1521,12 +1616,7 @@ mod tests {
         assert!(outcome.selected_topics().is_empty());
         assert!(!outcome.invalidating());
 
-        let selected = publication(
-            current,
-            "token",
-            b"selected",
-            &["ignored", "selected"],
-        );
+        let selected = publication(current, "token", b"selected", &["ignored", "selected"]);
         let (outcome, _) = catch_up
             .publish(accepted_publication(&lifecycle, &selected))
             .unwrap();
@@ -1598,10 +1688,7 @@ mod tests {
             Some(outcome.digest())
         );
         assert!(catch_up.state().pending_relevant_change());
-        assert_eq!(
-            catch_up.state().pending_selected_topics(),
-            ["selected"]
-        );
+        assert_eq!(catch_up.state().pending_selected_topics(), ["selected"]);
         assert_eq!(catch_up.state().pending_facts(), outcome.facts());
     }
 
@@ -1657,13 +1744,9 @@ mod tests {
         }
 
         let snapshot_target = target(directory.path());
-        let mut catch_up =
-            CatchUp::open_for_snapshot(&state_directory, &snapshot_target).unwrap();
+        let mut catch_up = CatchUp::open_for_snapshot(&state_directory, &snapshot_target).unwrap();
         assert!(catch_up.state().pending_relevant_change());
-        assert_eq!(
-            catch_up.state().pending_selected_topics(),
-            ["selected"]
-        );
+        assert_eq!(catch_up.state().pending_selected_topics(), ["selected"]);
 
         let (equal, _) = catch_up
             .publish(accepted_publication(&lifecycle, &message))
