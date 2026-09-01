@@ -1,34 +1,43 @@
 # Resource Profile spec
 
-This document specifies the Resource Profile registry, resolver SDK boundary,
-wasm execution contract, observable runtime protocol, and state-first
-publication authority. It builds on [`requirements.md`](./requirements.md).
+This document specifies the Resource Profile registry, closed core-wasm
+resolver, universal WASIp2 observable-provider envelope, and state-first
+atomic publication authority. It builds on
+[`requirements.md`](./requirements.md).
+
+## Status
+
+Draft. The runtime-neutral fenced proposal, atomic publication, and durable
+outbox contract is the foundation shared by passive and component-produced
+publications. Component-enabled conformance additionally requires the execution
+and capability boundary below; a native runtime is not a fallback.
 
 ## Ownership and flow
 
-This subsystem owns scheme-to-profile registration, the guest ABI, descriptor
-and selector validation, sandbox budgets, host path containment, observable
-runtime lifecycle, atomic periodic publication and demand results, and the
-handoff of passive and observable carriers to
-[`06-resync`](../06-resync/spec.md). It does not own Resource URI semantics,
-provider authentication, provider observation strategy, provider mutation,
-task launch, or a canonical provider event log. Those remain downstream
-profile concerns or explicit non-goals.
+This subsystem owns scheme-to-profile registration, both guest ABIs, descriptor
+and selector validation, sandbox budgets, host path containment, provider
+component lifecycle, host-only atomic proposal commit, and the handoff of
+passive and observable carriers to [`06-resync`](../06-resync/spec.md). It does
+not own Resource URI semantics, provider credentials, provider mutation, task
+launch, a canonical provider event log, or ambient host access. Those remain
+downstream semantics or explicit non-goals.
 
-## Architecture (PROFILE-R01..R20)
+## Architecture (PROFILE-R01..R25)
+
+Resolution remains a closed core-wasm operation:
 
 ```text
 Agent Spec resource URI (opaque, byte-preserved)
              |
              v exact RFC 3986 scheme
 <catalog>/catalog.kdl
-  profile "<scheme>" { wasm "<module>"; class "<class>"; notify-chain #true; }
+  profile "<scheme>" { wasm "<resolver>"; class "<class>"; ... }
              |
-             +--> catalog-relative module -- normalized no-follow projection
-             |                              + catalog root hash / transaction
+             +--> catalog-relative resolver -- normalized no-follow projection
+             |                                + catalog root hash / transaction
              |
              v ResourceProfileRegistry (injectable; built-ins empty)
-      bounded outcome cache keyed by normalized module path + admission policy + file identity
+      bounded compiled-module cache
              |
              v fresh Store + Instance per resolution
    closed core-wasm guest (no imports / no WASI)
@@ -40,25 +49,29 @@ Agent Spec resource URI (opaque, byte-preserved)
       resync watch set and existing event pipeline
 ```
 
-An observable profile extends the same contained carrier without changing URI
-identity or introducing another delivery plane:
+An observable profile adds one component artifact; it does not replace or
+enlarge the resolver:
 
 ```text
-closed wasm describe() -> capabilities + selector schema/default + topology
-                                      |
-catalog-trusted host runtime argv ----+
-       |
-       v provider-native observation
-periodic Publish(Publication) or demanded ObservationResult
-       |
-       v one host validation + digest + atomic publication authority
-canonical snapshot + current digest
-       |
-       v selector + pending-relevance reducer retaining topics + facts
+WASIp2 provider component
+  export describe()
+  export observe(request)
+  import only reviewed domain capability interfaces
+             |
+             v fresh Store + Instance for one call
+Unchanged | typed failure | Publication
+             |
+             v host pairs Publication with ProposalFence
+validate generation + revision + prior digest + payload bounds
+             |
+             v one host-owned atomic transition
+carrier + current digest/revision + freshness/catch-up + PublicationIntent
+             |
+             v separate idempotent delivery from durable outbox
 built-in resync event (key=binding, supersede=true)
-       |
-       v existing inbox + DING
-agent rereads canonical snapshot
+             |
+             v existing inbox + DING
+agent rereads canonical carrier
 ```
 
 The SDK is a typed, trait-shaped boundary rather than a set of scheme-specific
@@ -91,14 +104,19 @@ ProfileSource::Wasm {
 }
 ```
 
-`containment_root` is the trusted descriptor-traversal root for catalog-relative
-modules and is absent for explicitly external absolute modules.
+`containment_root` is the trusted descriptor-traversal root for
+catalog-relative resolver modules and is absent for explicitly external
+absolute modules. Observable component configuration is separate from
+`ProfileSource`: it cannot participate in path resolution or change
+`ProfileClass`.
 
 There is no template or exec variant. `ResourceProfileRegistry::builtin()` is
 empty. `with_profile` and `with_profiles` inject catalog-owned registrations;
 a later programmatic insertion for the same exact scheme replaces the prior
 entry, while duplicate schemes in one catalog declaration are rejected before
-registry construction.
+registry construction. Observable execution is present only when the same
+profile also declares one component and its exact allowed WIT capability
+interfaces.
 
 ## Catalog declaration (PROFILE-R02..R03)
 
@@ -115,13 +133,22 @@ profile "dev.schickling.agent-goal" {
   class "immediate"
   notify-chain #true
 }
+
+profile "github-issue" {
+  wasm "resolvers/github-issue.wasm"
+  component "providers/github-issue.component.wasm"
+  capability "st2:github-issue/source@1.0.0"
+  class "coalesced"
+}
 ```
 
 Grammar:
 
 ```text
 profile <non-empty-scheme> {        # exactly one positional value; no properties
-  wasm <non-empty-path>              # exactly once
+  wasm <non-empty-path>              # exactly once; closed resolver
+  component <non-empty-path>         # zero or one; observable provider
+  capability <wit-interface-id>      # zero or more; requires component
   class immediate|coalesced|silent  # zero or one; default coalesced
   notify-chain <boolean>             # zero or one; default false
 }
@@ -129,21 +156,27 @@ profile <non-empty-scheme> {        # exactly one positional value; no propertie
 
 The profile scheme follows RFC 3986: it begins with an ASCII letter, then
 accepts ASCII alphanumeric characters plus `+`, `-`, and `.`, and rejects `/`;
-lookup remains exact and case-sensitive. The profile
-node takes exactly one quoted positional scheme and no properties. `wasm` and
-`class` each take one quoted positional value; `notify-chain` takes one boolean.
-Unknown or extra entries, unknown children, duplicate children, a missing
-`wasm`, unsupported class values, and duplicate profile schemes fail parsing.
-A literal absolute module path remains an external runtime input. Every other
-declaration expands `$CATALOG` and environment variables, resolves lexically
-against the catalog root, and must remain strictly beneath that root; internal
-`.`/`..` components normalize away, while traversal outside the root fails
-validation.
+lookup remains exact and case-sensitive. The profile node takes exactly one
+quoted positional scheme and no properties. `wasm`, `component`, and `class`
+each take one quoted positional value; `notify-chain` takes one boolean and
+each `capability` takes one exact versioned WIT interface ID. Capability IDs
+are owned by their WIT package namespace; the host compares the canonical
+package, interface, and complete semantic version, not a display alias.
+Duplicate capability IDs, capability without component, unknown or extra
+entries, duplicate singleton children, missing `wasm`, unsupported class
+values, and duplicate profile schemes fail parsing.
 
-`st2 validate` reports malformed declarations and missing or unsafe
-catalog-relative modules. `st2 up` loads declared profiles before it spawns
-tasks, so a malformed profile block fails loudly rather than silently removing
-watch coverage.
+A literal absolute wasm artifact path remains an external runtime input. Every
+other resolver or component declaration expands `$CATALOG` and environment
+variables, resolves lexically against the catalog root, and must remain
+strictly beneath that root; internal `.`/`..` components normalize away, while
+traversal outside the root fails validation.
+
+`st2 validate` reports malformed declarations, missing or unsafe
+catalog-relative artifacts, provider-world mismatches, and component imports
+outside the profile's exact capability set. `st2 up` loads declared profiles
+before it spawns tasks, so an invalid profile fails loudly rather than silently
+removing watch or observation coverage.
 
 The scheme namespace remains downstream-owned. A private profile uses its
 owner's reverse-domain scheme (for example `dev.schickling.agent-goal`); st2
@@ -163,34 +196,34 @@ path. Representative behavior:
 ```text
 exact root catalog.kdl
           |
-          v parse + expand each non-absolute wasm path
+          v parse + expand each non-absolute wasm/component path
 lexically normalized path strictly below catalog root
           |
           v descriptor-relative O_NOFOLLOW open
-regular module <= 16 MiB
+regular bounded artifact
           |
           v deduplicate by normalized relative path
 catalog transaction projection + declaration-root hash
           |
           v snapshot / digest / diff / bootstrap / apply / recovery
-prepared bundle and live catalog contain the same catalog.kdl + module bytes
+prepared bundle and live catalog contain the same declaration + artifact bytes
 ```
 
 The whole-catalog projector parses only the exact `catalog.kdl` at its
-projection root. Each catalog-relative module is opened from a retained root
-capability: every ancestor is a no-follow directory and the final no-follow,
-nonblocking descriptor must be a regular file no larger than the runtime's
-16 MiB module cap. Missing files, symlinked ancestors or leaves, FIFOs and
-other special files, paths escaping the root, and oversized modules reject the
-transaction and `st2 validate`. Two profiles whose paths normalize to the same
-relative path contribute one projected entry. Any file present in a prepared
-catalog but absent from this closed projection remains an unprojected-input
-error.
+projection root. Each catalog-relative resolver module and provider component
+is opened from a retained root capability: every ancestor is a no-follow
+directory and the final no-follow, nonblocking descriptor must be a regular
+file within its admission bound. Missing files, symlinked ancestors or leaves,
+FIFOs and other special files, paths escaping the root, and oversized artifacts
+reject the transaction and `st2 validate`. References whose paths normalize to
+the same relative path contribute one projected entry. Any file present in a
+prepared catalog but absent from this closed projection remains an
+unprojected-input error.
 
-A literal absolute `wasm` path is external and immutable from the catalog
-transaction's perspective. Its bytes are neither copied nor hashed, even when
-the literal happens to name a file physically below the live catalog. A
-non-absolute declaration that expands through `$CATALOG` or an environment
+A literal absolute `wasm` or `component` path is external and immutable from
+the catalog transaction's perspective. Its bytes are neither copied nor hashed,
+even when the literal happens to name a file physically below the live catalog.
+A non-absolute declaration that expands through `$CATALOG` or an environment
 variable is catalog-owned and must still normalize beneath the logical catalog
 root; expansion cannot turn a relative declaration into an escape hatch.
 
@@ -198,10 +231,10 @@ Apply publishes new or changed projected inputs before atomically replacing
 `catalog.kdl`, then removes stale projected inputs after the declaration no
 longer names them. The incomplete-apply marker fences cooperating catalog
 readers throughout this sequence. The crash bias is a safe superset: failure
-before the declaration replacement may leave an unreferenced new module, and
-failure after it may leave an unreferenced old module, but the live
-`catalog.kdl` never names a missing newly published module. Durable-stage
-recovery repeats the same ordering and removes the superset.
+before declaration replacement may leave an unreferenced new artifact, and
+failure after it may leave an unreferenced old artifact, but live `catalog.kdl`
+never names a missing newly published artifact. Durable-stage recovery repeats
+the same ordering and removes the superset.
 
 ## Core wasm ABI (PROFILE-R04..R05)
 
@@ -261,15 +294,14 @@ authorize a contained declaration. Registry clones and concurrent subscribers
 coalesce one compilation attempt only for an unchanged identity under the same
 policy. Byte replacement or metadata identity change invalidates that entry.
 Each resolution of a successfully compiled module creates a fresh `Store` and
-`Instance`. One fuel allowance
-covers the module start function and the first resolution call; a reused
-instance receives one fresh allowance before each later call:
+`Instance`. One fuel allowance covers the module start function and its single
+resolution call; the instance is then discarded.
 
 | Boundary | Contract |
 | --- | --- |
 | Module file | regular, nonblocking; catalog-relative paths use descriptor-relative no-follow traversal for every component; 16 MiB maximum before Wasmtime compilation |
 | Imports | none; import-requiring modules fail instantiation |
-| Fuel | 5,000,000 fuel units for start + first call; same budget per later call |
+| Fuel | 5,000,000 fuel units for start + the single resolution call |
 | Linear memory | 64 MiB maximum |
 | Resolver return | memory range must be valid and at most 64 KiB before UTF-8/JSON decoding |
 | Memories | at most 1 |
@@ -335,302 +367,329 @@ agent-local behavior above.
 Profile resolution is observation metadata only and never enters task launch
 targets.
 
-## Observable profile descriptor (PROFILE-R12..R13)
+## Observable provider world (PROFILE-R12..R13)
 
-An observable profile retains the resolver ABI and adds one bounded descriptor
-export. The descriptor is the single source of truth for the profile contract:
+An observable profile retains the closed resolver and adds one component that
+conforms to the repository-owned
+`st2:resource-provider/provider@0.1.0` WASIp2 world. The package and interface
+names are lowercase ASCII WIT identifiers and the complete semantic version is
+part of compatibility. A host accepts only an exact supported world; it does
+not guess across unknown major, minor, or patch versions.
+
+The world has two host-called exports:
 
 ```text
-describe() -> packed(ptr, len)
-```
+describe() -> result<ProviderDescriptor, DescriptorError>
 
-The returned UTF-8 JSON uses the same 64 KiB output bound, pointer checks,
-fresh-instance policy, fuel budget, and no-import rule as `resolve`:
+observe(ObserveRequest {
+  uri,
+  selector,
+  prior_digest?,
+  demand_watermark?
+}) -> ObservationResult {
+  Unchanged
+  | Failed { diagnostic? }
+  | Published { publication: Publication }
+}
 
-```json
-{
-  "abiVersion": 3,
-  "capabilities": ["resolve", "read", "observe"],
-  "selectorSchema": {
-    "type": "object",
-    "properties": {
-      "topics": {
-        "type": "array",
-        "items": { "type": "string" },
-        "uniqueItems": true
-      }
-    },
-    "additionalProperties": false
-  },
-  "defaultSelector": {
-    "topics": ["ci.failure", "mergeability.conflict", "review.requested"]
-  },
-  "topics": [
-    { "name": "ci.failure" },
-    { "name": "ci.success" },
-    { "name": "mergeability.conflict" },
-    { "name": "review.requested" }
-  ],
-  "runtime": { "topology": "shared" },
-  "snapshot": {
-    "mediaType": "application/json",
-    "schemaId": "dev.example.github-pr.snapshot.v1"
-  }
+Publication {
+  schema_id,
+  media_type,
+  bytes,
+  topics,
+  facts?
 }
 ```
 
-`abiVersion` governs the complete descriptor and host protocol. Capabilities
-are closed strings known by that ABI version; ABI 3 accepts `resolve`, `read`,
-and `observe`. `topics[].name` values are unique, non-empty profile-owned
-identifiers. `defaultSelector` must validate against `selectorSchema` and name
-only published topics. A binding selector is validated against the same schema
-and topic set before registration. Selector configuration is observation
-metadata: it is not part of the Resource URI and cannot change resolution,
-snapshot bytes, credentials, or provider access.
+`ProviderDescriptor` declares supported scheduling capabilities, selector
+schema, default selector, published semantic topics, snapshot media type, and
+snapshot schema identity. The typed provider world replaces descriptor ABI 3's
+packed core-wasm JSON export and the host-process JSON protocol. It does not
+replace the resolver ABI.
 
-Agent Spec KDL carries the normalized selector JSON as a `selector` raw-string
-property on the Resource node:
+The host calls `describe` in a fresh Store under descriptor phase policy.
+Operational domain capabilities return a typed phase denial if the component
+attempts to call them while describing itself. The descriptor is bounded and
+fully validated before any binding is activated. Unknown required
+capabilities, duplicate or empty topic names, an invalid selector schema or
+default, mismatched snapshot identity, and an unsupported world version fail
+only that profile.
+
+Agent Spec KDL carries normalized selector JSON as a `selector` raw-string
+property:
 
 ```kdl
 resource "pr" uri="github-pr://example/1" reason="Review." \
   selector=#"{"topics":["ci.failure","review.requested"]}"#
 ```
 
-The canonical renderer serializes normalized compact JSON and chooses the
+The canonical renderer serializes compact normalized JSON and chooses the
 smallest raw-string hash fence whose closing delimiter does not occur in the
 payload. JSON and TOML Agent Spec forms carry the selector as a native JSON
 value. All forms lower to the same `serde_json::Value`; KDL spelling is not
-preserved and cannot change selector semantics.
+preserved. The selected value must validate against the descriptor schema and
+may name only published topics. It cannot change resolution, snapshot bytes,
+credentials, linked capabilities, or provider authority.
 
-## Observable runtime declaration and protocol (PROFILE-R15..R16D)
-
-The closed wasm module never receives network, credential, filesystem, process,
-or clock imports. A profile with `observe` therefore also has one
-catalog-trusted host runtime declaration:
-
-```kdl
-profile "github-pr" {
-  wasm "resolvers/github-pr.wasm"
-  class "coalesced"
-  runtime {
-    argv "github-resource-runtime" "pr"
-    capability "demand"
-  }
-}
-```
-
-`runtime` is forbidden unless the descriptor declares `observe`, and
-`observe` is unusable without `runtime`. The block accepts exactly one
-non-empty `argv` child and an optional unique `capability "demand"` child; it
-never invokes a shell. Demand is denied by default, so a runtime that has not
-declared the capability receives neither `Observe` nor an expectation to emit
-`ObservationResult`. The executable is an external operator-trusted input; the
-guest cannot choose or rewrite it. Environment, credentials, egress, and
-provider permissions belong to the downstream runtime deployment and are not
-inferred from URI possession.
-
-The descriptor selects `shared` or `perBinding` topology. `shared` starts one
-runtime for the exact `(catalog, scheme, profile generation)` and multiplexes
-bindings. `perBinding` starts one instance for each active binding. A
-per-binding runtime is the same protocol with one registration; topology does
-not select another lifecycle model.
-
-Both modes speak the same ABI-3, newline-delimited JSON protocol over
-supervisor-owned stdin/stdout. The following notation shows the normalized
-messages. Message types and fields lower to camel case; the nested result is
-tagged by `status`:
+## Component execution and capabilities (PROFILE-R15..R16A, R21..R25)
 
 ```text
-Publication {
-  schemaId, mediaType, bytes, topics, facts?
-}
-
-host -> Register {
-  owner: { incarnation, claim },
-  bindingId, registration, uri, selector, carrierPath, previousDigest?
-}
-host -> Unregister {
-  owner: { incarnation, claim },
-  bindingId, registration
-}
-host -> Observe {
-  owner: { incarnation, claim },
-  bindingId, registration, demandWatermark
-}
-
-runtime -> Publish {
-  owner: { incarnation, claim },
-  bindingId, registration,
-  ...Publication
-}
-runtime -> Health {
-  owner: { incarnation, claim },
-  bindingId?, registration?,
-  state: starting|ready|degraded|failed, detail?
-}
-runtime -> ObservationResult {
-  owner: { incarnation, claim },
-  bindingId, registration, demandWatermark,
-  result:
-    { status: unchanged }
-    | { status: failed, diagnostic? }
-    | { status: published, publication: Publication }
-}
+host scheduler
+     |
+     v load exact catalog-selected Component
+reuse Engine + Linker + compiled Component when cache identity matches
+     |
+     v create fresh Store<ProviderHost>
+link only catalog-approved domain WIT interfaces
+     |
+     v instantiate once; describe or observe once
+     |
+     v validate typed result; cancel outstanding capability work
+drop instance + Store
 ```
 
-`Publication` is one reusable typed payload, not two similar publication
-shapes. Periodic `Publish` flattens it into the existing ABI-3 base wire shape;
-the published demand result carries the same value atomically with the outcome.
-Neither message contains a host timestamp or runtime-computed digest.
+The host creates a new `Store<ProviderHost>` and component instance for every
+descriptor call and observation. No Store, instance, guest memory, table,
+resource handle, host call counter, deadline state, fuel state, or cancellation
+state survives the call. An observation invokes `observe` exactly once.
 
-The supervisor assigns a fresh directional owner claim to every runtime
-incarnation. A new claim fences the prior process and clears its binding
-registrations. Every `Publish`, `ObservationResult`, binding-scoped `Health`,
-and `Observe` dispatch is accepted or addressed only when owner claim,
-`bindingId`, and host-generated registration token all match current state.
-`bindingId` is an opaque incarnation-scoped address, never the binding name or
-URI.
+One process may retain an Engine, Linker, and compiled Component. Cache identity
+includes the exact component SHA-256, Wasmtime/runtime build identity, target
+triple, and a fingerprint of every compilation-relevant Engine setting. A
+host-produced AOT artifact is deserialized only after its length and SHA-256
+match an authenticated host-owned manifest and that complete compatibility key.
+Any mismatch is a cache miss. Guest-supplied precompiled bytes never cross the
+unsafe deserialization boundary.
 
-EOF ends the runtime protocol. The supervisor's process lifecycle is the only
-shutdown and restart authority; there is no protocol `Shutdown` message. The
-runtime begins or resumes provider-native observation after `Register` and may
-use `previousDigest` to avoid redundant periodic publication. `Observe` is a
-level-triggered scheduling hint: it may pull an eligible observation forward,
-but it is not provider reconciliation and cannot choose a provider mechanism,
-reset polling cadence, backoff, cache, cursor, or rate-limit state, or authorize
-a provider write.
+Provider components are WASIp2 components but are not WASI command programs.
+The Linker supplies neither `wasi:cli`, inherited environment, ambient clocks
+or random, filesystem preopens, sockets, raw HTTP, nor a caller-controlled
+process API. Every non-foundation import must:
 
-Each encoded protocol line is at most 2 MiB, including the newline. Snapshot
-`bytes` use padded RFC 4648 base64 and decode to at most 1 MiB of opaque bytes.
-Selectors are at most 16 KiB as canonical compact JSON. Health `detail` and a
-failed-result `diagnostic` are each at most 16 KiB of UTF-8. A `Publication`
-has at most 32 ordered facts; keys are at most 128 bytes and before/after
-values are at most 1 KiB of printable single-line UTF-8. A fact carries `key`
-plus `before`, `after`, or both; explicit JSON null denotes absence. Bounds are
-checked before allocation or decoding where the transport permits and fail
-only the affected binding or runtime. st2 does not truncate snapshot bytes,
-facts, health text, or diagnostics to satisfy a bound.
+1. be an exact versioned WIT interface listed by the profile's `capability`
+   declarations;
+2. represent one provider-domain operation with typed inputs, outputs, policy
+   denials, and operational failures;
+3. keep credentials, endpoint selection, allowlists, and authoritative
+   resource handles in host state rather than guest-selected strings;
+4. define request, response, retained-output, concurrency, and deadline bounds;
+5. redact secrets and provider payloads from errors, health, and receipts; and
+6. be async and cancellation-safe when it can block.
 
-The host rejects unknown bindings, stale owners or registrations, zero demand
-watermarks, mismatched schema or media type, unpublished topics, invalid facts
-or messages, output after `Unregister`, and messages exceeding protocol bounds.
-A shared-runtime protocol failure degrades every registered binding honestly
-but cannot publish or settle demand across schemes, profile generations,
-runtime incarnations, or binding registrations.
+For example, a GitHub Issue source capability may accept a typed
+`{ owner, repository, number }` and return a bounded typed issue response while
+the host fixes HTTPS endpoint policy, authentication, redirects, and deadlines.
+A local PTY statistics capability may accept a closed `scope` variant while the
+host fixes the executable, argument shape, empty environment, working
+directory, output caps, deadline, and process containment. An interface that
+accepts a URL, executable path, arbitrary argument vector, environment, cwd,
+filesystem path, socket address, or shell text is generic authority even if its
+package name sounds domain-specific and is non-conforming.
 
-For each exact active registration the supervisor has at most one `Observe`
-dispatch in flight and one latest trailing demand watermark. Watermarks are
-positive and monotonically increase within that registration. A matching
-`ObservationResult` closes exactly the in-flight batch. Demand accepted while
-that observation is in flight survives its result and coalesces into one
-trailing dispatch. A registration replacement fences the old batch, and
-provider-process or transport failure supplies failure evidence for it.
-Backpressure leaves admitted, undispatched demand pending. No timeout, wall
-clock, or normal polling cycle completes demand.
+Cancellation owns both sides of the boundary. Epoch interruption bounds
+non-yielding guest CPU; cancellation or drop of the invocation future must
+cancel blocking host imports; capability implementations must reap owned work;
+and Store drop occurs only after the in-flight call no longer borrows it. A
+cancelled observation cannot commit even if the component already returned a
+value.
 
-The private durable request and receipt records are bounded to 64 KiB and carry
-exact schema identities `st2.resource-observe-request.v1` and
+The executor enforces finite component-byte, memory, table, fuel, result, and
+deadline bounds as one versioned Engine policy. Snapshot bytes decode to at
+most 1 MiB; canonical selector JSON is at most 16 KiB; health and failed-result
+diagnostics are at most 16 KiB UTF-8; and one `Publication` carries at most 32
+ordered facts with the key and value limits in
+[`PROFILE-R16A`](./requirements.md). Bounds are checked before allocation or
+decoding where the typed transport permits. Values are rejected, never
+truncated.
+
+Observation uses one directly linked provider component. There is no
+long-lived runtime topology, stdin/stdout protocol, runtime-selected WAC graph,
+or parallel native-provider lifecycle. Provider ETags, cursors, conditional
+caches, rate limits, webhook repair, and backoff therefore live in bounded
+host-owned domain capability state or explicit durable provider state, never
+in Store lifetime.
+
+## Demand invocation (PROFILE-R16B..R16D)
+
+Demand remains deny-by-default. A descriptor must declare `demand` before the
+host supplies a positive demand watermark in `ObserveRequest`. A missing
+watermark is an ordinary scheduled observation; a present watermark identifies
+host work but is not provider history, a provider-specific reconcile command,
+or authority to mutate provider state.
+
+For each active binding generation the host keeps at most one observation in
+flight and one latest trailing demand watermark. Demand admitted during the
+in-flight invocation survives its result and coalesces into the trailing
+invocation. Replacement of the binding generation fences the old invocation.
+Executor failure provides failure evidence. A client wait deadline limits only
+that client's wait and never cancels admitted demand.
+
+The private durable request and receipt records remain bounded to 64 KiB and
+use schema identities `st2.resource-observe-request.v1` and
 `st2.resource-observe-receipt.v1`. One supervisor scope admits at most 256
-unresolved requests. Submission beyond that cap returns backpressure before
-creating another request, and the supervisor scans no more than the cap. An
-admitted request remains the durable retryable intent until a terminal receipt
-is durably committed; in-memory enqueue and a nonterminal receipt are not
-ownership transfer.
-Terminal receipt failure keeps retryable state and leaves the request
-available to a restarted supervisor. A terminal receipt is the durable
-successor and only then permits request cleanup.
+unresolved requests and scans at most that cap. An admitted request remains the
+durable retryable intent until a terminal receipt commits; in-memory enqueue,
+client disconnect, wait expiry, and nonterminal receipts do not transfer or
+cancel ownership.
 
-Durable JSON receipt status values are camelCase. `accepted` and `backpressured`
-are nonterminal. The terminal set is exactly `settledUnchanged`,
-`settledChanged`, `settledFailed`, `absentBinding`, `staleGeneration`, and
-`providerUnavailable`. Human CLI text renders multiword statuses in kebab-case.
-`Unchanged` maps to `settledUnchanged`; `Failed` maps to `settledFailed` after
-its provider diagnostic is normalized to a receipt-safe optional bounded value;
-and an accepted `Published` maps to `settledChanged` with the host-computed
-digest of its accepted bytes. No other receipt status carries a digest.
+Receipt statuses are camelCase. `accepted` and `backpressured` are nonterminal.
+The terminal set is exactly `settledUnchanged`, `settledChanged`,
+`settledFailed`, `absentBinding`, `staleGeneration`, and
+`providerUnavailable`. Only `settledChanged` carries the host-computed digest.
+An active provider without `demand` maps to `absentBinding` with diagnostic
+`the profile component does not declare the demand capability`. A client
+generation older than the resident generation is `staleGeneration`; a newer
+generation remains queued until supervisor refresh.
 
-A missing active binding reports `absentBinding`. An active observable binding
-whose runtime did not declare `demand` also reports `absentBinding`, with the
-explicit diagnostic `the profile runtime does not declare the demand
-capability`. Only a client generation older than the resident supervisor is
-`staleGeneration`; a newer client generation remains queued until supervisor
-refresh. Provider failure reports `providerUnavailable`. A client wait bound
-controls only how long that client waits and performs a final receipt read at
-the deadline. Expiry or disconnect leaves admitted demand and any trailing
-dispatch obligation intact.
+## Fenced atomic publication (PROFILE-R14, R16)
 
-Any provider cursor, webhook delivery identity, redelivery, polling interval,
-rate-limit state, conditional cache, backoff, and repair strategy remain
-runtime-private.
+Before invocation the host reads the binding's current state and creates:
 
-## Snapshot publication (PROFILE-R14)
-
-The resolver's contained carrier is the observable snapshot authority.
-Periodic `Publish` and demand-result `Published` enter one host-owned acceptance
-transaction:
-
-```text
-validate current fences + Publication schema + topics + facts + bounds
-        |
-        v
-compute SHA-256 digest from accepted snapshot bytes
-        |
-        v
-atomically replace the contained carrier and record current digest + freshness
-        |
-        `-> equal digest: no state transition
-            changed digest: apply selector and retain selected topics + facts
+```rust
+ProposalFence {
+    generation,
+    revision,
+    prior_digest,
+}
 ```
 
-The runtime never writes the carrier directly and never supplies its
-authoritative digest. Existing descriptor-relative no-follow containment
-applies to publication. Failure before acceptance preserves the last proven
-snapshot and marks publication health degraded.
+`generation` changes when the binding is replaced. `revision` advances only on
+a committed publication in that generation. `prior_digest` is the current
+carrier digest or absence. The fence belongs to the host invocation; the
+component cannot choose it or refresh it after observation.
 
-The initial accepted publication changes the binding from unavailable to
-readable. If it carries at least one selected topic, st2 schedules the same
-superseding invalidation as for a later changed digest. This wake prevents a
-live agent from retaining an unreadable view after delayed startup or recovery.
-Equal publications and publications without selected topics remain silent.
+`Unchanged` closes the observation without mutation. `Failed` records bounded
+health and preserves the last proven carrier. For `Published`, the host pairs
+the returned `Publication` with the invocation fence, validates current binding
+identity, schema and media type, byte and fact bounds, published topics,
+selector relevance, and path containment, then computes the authoritative
+snapshot digest and deterministic proposal identity.
 
-`ObservationResult.Unchanged` closes demand without changing the carrier or
-freshness. `ObservationResult.Failed` closes demand as failed and preserves the
-last proven carrier. `ObservationResult.Published` is not settled until its
-embedded `Publication` passes the same acceptance transaction as periodic
-`Publish`. Once the snapshot and catch-up transaction commits, it settles as
-`settledChanged` with the host-computed accepted digest even if subsequent
-resync delivery emission fails. Its bytes, topics, and typed facts cannot
-disagree with a separate settlement frame because no such frame exists.
+The validated internal `PublicationIntent` carries binding identity, the
+deterministic `proposal_id`, generation, expected revision and prior digest,
+resulting digest, selected topics, and ordered facts. It contains delivery
+intent and semantic metadata, not snapshot bytes or provider credentials.
 
-Snapshot bytes are profile-defined and opaque to st2. `schemaId` and
-`mediaType` make the bytes interpretable without making st2 own their semantics.
-Each binding has one snapshot, not named facets, a generation manifest, a
-profile event log, or a host retention history.
+The proposal ID is:
+
+```text
+SHA-256(
+  "st2.resource-publication-proposal.v1\0" ||
+  serde_json::to_vec(ProposalIdentity {
+    bindingId,
+    generation,
+    expectedRevision,
+    priorDigest,
+    digest,
+    selectedTopics,
+    facts
+  })
+)
+```
+
+`ProposalIdentity` is serialized as camelCase JSON with fields in exactly the
+displayed order. `digest` is the host-computed accepted snapshot digest;
+`selectedTopics` and ordered `facts` are the post-validation semantic envelope.
+Including that envelope prevents equal carrier bytes with conflicting delivery
+meaning from sharing an identity.
+
+```rust
+ProposalCommit::Committed(PublicationCommit)
+ProposalCommit::AlreadyCommitted(PublicationCommit)
+ProposalCommit::Unchanged { generation, revision, digest }
+ProposalCommit::StaleGeneration { actual_generation, actual_revision }
+ProposalCommit::StalePrior {
+    actual_generation,
+    actual_revision,
+    actual_digest,
+}
+
+PublicationCommit {
+    proposal_id,
+    generation,
+    resulting_revision,
+    digest,
+}
+```
+
+`Committed` is the single state transition. `AlreadyCommitted` is an
+idempotent retry of the same deterministic proposal and returns the original
+commit identity. `Unchanged` reports equal accepted bytes without advancing
+revision or creating an outbox intent. `StaleGeneration` fences replacement.
+`StalePrior` rejects a competing proposal whose expected revision or digest is
+no longer current. Concurrent proposals from one prior state therefore have at
+most one winner.
+
+The storage transaction makes these values visible together:
+
+```text
+contained carrier bytes
+current generation + resulting revision + digest + freshness
+lastIntent: complete deterministic PublicationIntent
+pending delivery reducer state
+```
+
+Before that publication point, readers observe the complete prior state and no
+new intent. After it, readers observe the complete successor and its intent.
+A process crash before publication leaves the prior state authoritative. A
+crash after publication but before acknowledgement leaves the successor and
+intent durable. Retrying the same proposal returns `AlreadyCommitted`; an
+outbox worker may retry delivery by `proposal_id` until its durable
+acknowledgement exists.
+
+Equal snapshot bytes return `Unchanged`; they do not advance revision or create
+an intent. The initial accepted publication changes the binding from
+unavailable to readable; when it has selected topics, its atomic intent
+schedules the same superseding invalidation as a later relevant change.
+
+Atomic publication is runtime-neutral: passive observation and the component
+executor submit the same fenced `Publication` to one host API. The foundation
+is conforming without an enabled executor, but observable provider execution is
+conforming only through the component world; there is no native fallback.
 
 ## Semantic invalidation and catch-up (PROFILE-R17..R20)
 
-For every changed digest, including the initial accepted publication, the
-common acceptance core preserves the `Publication`'s ordered facts and
-intersects its topics with the normalized binding selector. An empty
-intersection updates canonical state and freshness without scheduling delivery.
-A non-empty intersection updates this bounded per-binding state:
+For every changed digest, including the initial accepted publication, proposal
+validation preserves the `Publication`'s ordered facts and intersects its topics
+with the normalized binding selector before commit. The resulting
+`PublicationIntent` retains selected topics and facts with the committed
+snapshot digest. An empty intersection updates canonical state and freshness
+but requires no agent wake.
+
+The durable binding and catch-up state is:
 
 ```text
+generation: u64
+revision: u64
 current_snapshot_digest: Digest?
+last_intent: PublicationIntent?
 last_delivered_digest: Digest?
 pending_relevant_change: bool
+pending_from_last_intent: bool
 pending_selected_topics: Topic[]
 pending_facts: ResourceFact[]
 deliverable: bool
 ```
 
-If delivery is available, st2 emits one event on the existing built-in
-`resync` stream:
+`last_intent` is the full deterministic intent: proposal and binding IDs,
+generation, expected revision, prior and resulting digests, selected topics,
+and ordered facts. `last_commit()` derives its receipt from that authority
+rather than storing a second commit record. When pending delivery refers to
+`last_intent`, `pending_from_last_intent` is true and the pending topic/fact
+fields stay empty; readers derive that envelope from the intent.
+
+Publication never calls the event sink inside the commit transaction. Recovery
+folds an eligible staged WAL intent into this durable state atomically with the
+carrier and removes the WAL; eligibility requires its resulting digest to match
+the authoritative carrier. A separate outbox worker reads `last_intent`. If the
+resulting state is relevant and delivery is available, the worker emits one
+event on the existing built-in `resync` stream:
 
 ```text
 stream = resync
 key = binding name
 supersede = true
+idempotency = PublicationIntent.proposal_id
 subject = <binding> · <up to three whole facts> [<topics>]
 body = { binding, snapshotDigest, topics, facts }
 ```
@@ -639,32 +698,58 @@ Subjects are at most 96 Unicode scalars. Facts retain publication order and are
 included only whole; topic space is reserved before facts are admitted. If no
 fact fits, a compatible bounded fallback remains. The durable body retains the
 complete bounded fact list. It contains no snapshot bytes, provider payload,
-credential, URI, reason, or provider cursor. Existing event deduplication,
-inbox storage, DING rendering, and supersession apply unchanged. Multiple
-topics for one atomic publication produce one invalidation.
+credential, URI, reason, or provider cursor. Existing inbox storage, DING
+rendering, deduplication, and supersession apply unchanged. Multiple topics for
+one atomic publication produce one invalidation.
 
-If delivery is unavailable, a relevant publication replaces the pending
-selected topics and facts with that latest relevant semantic envelope and sets
-`pending_relevant_change = true`. A later irrelevant publication may advance
-`current_snapshot_digest` but does not clear the pending envelope. When
-delivery becomes available, st2 emits at most one invalidation for the
-then-current digest with the retained latest relevant topics and facts, and
-clears pending state only after event ingress accepts the record. No transition
-backlog exists. This is level-triggered current-state catch-up, not event replay.
+Acknowledgement is a separate durable transition keyed by deterministic
+`proposal_id`. Loss of acknowledgement leaves the intent retryable; a retry
+uses the same event identity. An obsolete intent is not replayed as history:
+the worker reconciles against current binding state and may replace delivery
+with at most one invalidation for the then-current digest.
 
-Health has separate descriptor, selector, runtime, observation, publication,
-and delivery stages. Every stage reports affected scheme and binding without
-including URI credentials or provider payloads. The last proven snapshot stays
-readable with explicit freshness when observation fails; failure never relabels
-old bytes as newly observed state.
+If delivery is unavailable, a relevant publication sets
+`pending_relevant_change` and initially points it at `last_intent` without
+duplicating topics or facts. Before a later irrelevant publication replaces
+`last_intent`, the reducer materializes the older relevant envelope into
+`pending_selected_topics` and `pending_facts` and clears
+`pending_from_last_intent`. The later publication may advance the current
+digest but does not clear pending relevance. When delivery becomes available,
+catch-up emits at most one invalidation for the then-current digest with the
+retained latest relevant envelope, and clears pending state only after durable
+acknowledgement. No transition backlog is delivered. This is level-triggered
+current-state catch-up, not event replay.
+
+Health has separate component loading, descriptor, selector, capability,
+observation, proposal validation, publication, and delivery stages. Every stage
+reports affected scheme and binding without including URI credentials or
+provider payloads. The last proven snapshot stays readable with explicit
+freshness when observation fails; failure never relabels old bytes as newly
+observed state.
+
+## Deliberate exclusions and evidence gates (PROFILE-R21..R25)
+
+| Exclusion | Evidence required before reconsideration |
+| --- | --- |
+| WASIp3 production execution | A stable Wasmtime/WIT toolchain and component ecosystem, a production provider requirement that WASIp2 cannot express, cross-version fixtures, and cancellation plus capability-containment evidence at least as strong as the WASIp2 suite. |
+| Store or instance pooling | Representative provider profiles showing fresh Store creation materially violates an accepted latency or resource bound, plus an exhaustive reset proof covering guest memory, tables, resources, host state, traps, fuel, deadlines, async imports, and cancellation with zero cross-observation leakage. |
+| Generic exec, raw HTTP, arbitrary filesystem, or raw socket authority | A real provider operation that cannot be represented as a narrower typed domain interface, an explicit threat and credential model, fixed authority and resource bounds, cancellation/containment tests, and an accepted decision for the enlarged trust boundary. |
+| Parallel native or host-process provider framework | A production provider that cannot run through the component world, measurements showing the incompatibility is fundamental rather than packaging cost, and evidence that a second lifecycle, health, fencing, and security model is safer and simpler than extending typed capabilities. |
+| Runtime WAC or provider-selected component graph | At least two production providers requiring runtime composition, a closed graph ownership and versioning model, transitive capability review, deterministic failure/fencing semantics, and measurements showing host linkage is the limiting constraint. |
+
+These are evidence gates, not deferred implementation commitments. Until a gate
+is met and an accepted decision changes the contract, the excluded mechanism is
+non-conforming.
 
 ## Design questions
 
-- **DQ-P1 ABI compatibility:** Prove descriptor and host-protocol compatibility
-  with frozen fixtures and cross-version conformance tests before third-party
-  implementations.
-- **DQ-P2 Runtime observability:** Derive the minimum low-noise health, freshness,
-  log, span, metric, and operator surfaces from GitHub-profile dogfood.
+- **DQ-P1 Component compatibility:** Prove old-component/new-host,
+  new-component/old-host, provider-world, and domain-capability compatibility
+  with frozen WIT fixtures and a cross-version conformance matrix before
+  independently released third-party components or capabilities.
+- **DQ-P2 Provider observability:** Derive the minimum low-noise component,
+  capability, proposal, publication, freshness, outbox, and delivery health
+  surfaces from one operated GitHub provider.
 
 Resolved design questions and their evidence remain recorded in
 [`open-questions.md`](./open-questions.md).
