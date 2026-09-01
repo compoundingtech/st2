@@ -55,4 +55,3 @@ interface provider-api {
   describe: func() -> result<provider-descriptor, descriptor-error>;
   observe: func(request: observe-request) -> observation-result;
 }
-
