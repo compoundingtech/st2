@@ -18,7 +18,7 @@ use std::process::ExitStatus;
 use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
-    PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+    install_signal_handler, run_provider_observed, ProviderOutcome, PROVIDER_POLL, STOP,
 };
 use crate::{harness_state, harness_version, hooks, message, status};
 
@@ -359,14 +359,8 @@ mod tests {
     /// admitted: it is not the build any capture measured.
     #[test]
     fn version_gate_refuses_a_prerelease_inside_an_admitted_minor() {
-        for version in [
-            "18.0.9-rc1",
-            "18.0.9+meta",
-            "18.1.2-rc1",
-            "18.1.2+meta",
-        ] {
-            let fake =
-                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+        for version in ["18.0.9-rc1", "18.0.9+meta", "18.1.2-rc1", "18.1.2+meta"] {
+            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             assert!(
                 verify_supported_version(fake.path().to_str().unwrap()).is_err(),
                 "{version} must not be admitted as its base release"
@@ -380,9 +374,7 @@ mod tests {
     /// carrying two different releases fails closed.
     #[test]
     fn a_stray_version_in_the_banner_cannot_admit_an_unverified_provider() {
-        let fake = FakeExecutable::new(
-            "#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.2.0\\n'\n",
-        );
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.2.0\\n'\n");
         let error = verify_supported_version(fake.path().to_str().unwrap())
             .expect_err("the omp-labelled 18.2.0 must decide, not the stray 18.0.0")
             .to_string();
@@ -391,8 +383,7 @@ mod tests {
             "must name the provider's own release: {error}"
         );
 
-        let ambiguous =
-            FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.2.0\\n'\n");
+        let ambiguous = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.2.0\\n'\n");
         assert!(
             verify_supported_version(ambiguous.path().to_str().unwrap()).is_err(),
             "an unlabelled banner with two different releases must fail closed"
@@ -422,8 +413,7 @@ mod tests {
     #[test]
     fn version_gate_refuses_a_neighbouring_minor_that_shares_a_prefix() {
         for version in ["18.10.0", "18.2.0"] {
-            let fake =
-                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             let error = verify_supported_version(fake.path().to_str().unwrap())
                 .expect_err(version)
                 .to_string();
