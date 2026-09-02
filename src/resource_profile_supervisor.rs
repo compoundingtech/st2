@@ -26,7 +26,7 @@ use st2_resource_protocol::ProposalFence;
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_providers::{
     GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
-    PtyStatsModule, PtyStatsScope,
+    PtyStatsModule, PtyStatsScope, VistaConfig, VistaModule,
 };
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_wasip2::{
@@ -1179,6 +1179,10 @@ enum ProviderRuntime {
         executor: Wasip2Executor<PtyStatsModule>,
         component: LoadedComponent,
     },
+    Vista {
+        executor: Wasip2Executor<VistaModule>,
+        component: LoadedComponent,
+    },
 }
 #[cfg(feature = "wasip2-provider-runtime")]
 fn validate_provider_descriptor(
@@ -1225,6 +1229,7 @@ impl ProviderRuntime {
             Self::GitHubIssue { executor, .. } => executor.interruption_handle(),
             Self::GitHubPr { executor, .. } => executor.interruption_handle(),
             Self::PtyStats { executor, .. } => executor.interruption_handle(),
+            Self::Vista { executor, .. } => executor.interruption_handle(),
         };
         ObservationCancellation { interruption }
     }
@@ -1246,6 +1251,11 @@ impl ProviderRuntime {
                 ..
             } => executor.observe(component, request, Some(&cancellation.interruption)),
             Self::PtyStats {
+                executor,
+                component,
+                ..
+            } => executor.observe(component, request, Some(&cancellation.interruption)),
+            Self::Vista {
                 executor,
                 component,
                 ..
@@ -1443,6 +1453,34 @@ impl RuntimeProcess {
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
                     ProviderRuntime::PtyStats {
+                        executor,
+                        component,
+                    }
+                }
+                crate::catalog::DeclaredProviderCapability::Vista {
+                    executable,
+                    cwd,
+                    deadline_ms,
+                } => {
+                    let executable =
+                        crate::expand::expand_catalog(executable, catalog_root);
+                    let cwd = crate::expand::expand_catalog(cwd, catalog_root);
+                    let config = VistaConfig::resolve(
+                        executable,
+                        PathBuf::from(cwd),
+                        Duration::from_millis(*deadline_ms),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    let module = VistaModule::new(config);
+                    let executor = Wasip2Executor::new(
+                        Wasip2RuntimeConfig::default(),
+                        None,
+                        module,
+                    )?;
+                    let component = executor.load(&sample.component.bytes)?;
+                    let descriptor = executor.describe(&component, None)?;
+                    validate_provider_descriptor(&descriptor, &sample.descriptor)?;
+                    ProviderRuntime::Vista {
                         executor,
                         component,
                     }

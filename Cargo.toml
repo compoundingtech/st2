@@ -6,6 +6,7 @@ members = [
   "components/github-issue",
   "components/github-pr",
   "components/pty-stats",
+  "components/vista",
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
   "crates/st2-resource-protocol",

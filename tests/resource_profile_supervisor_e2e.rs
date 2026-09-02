@@ -98,6 +98,52 @@ fn supervisor_compatibility_contract_uses_the_production_pty_component() {
 
 
 #[test]
+fn supervisor_spawns_vista_capability_and_preserves_stable_snapshot() {
+    let _guard = STATE_ENV.lock();
+    let temporary = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("XDG_STATE_HOME", temporary.path().join("state")) };
+    let executable = temporary.path().join("vista");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+if [ "$#" -ne 6 ] || [ "$1" != artifact ] || [ "$2" != get ] || [ "$3" != release-notes ] || [ "$4" != v7 ] || [ "$5" != --output ] || [ "$6" != json ]; then
+  exit 64
+fi
+printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"release-notes","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"created","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/release-notes/v7"}'
+"#,
+    );
+    let selector =
+        r#"{"slug":"release-notes","version":7,"topics":["ready","updated","failed","expired"]}"#;
+    let vista = ProviderFixture::new_with_uri(
+        temporary.path().join("catalog"),
+        "vista",
+        "vista://release-notes/v7",
+        component("ST2_VISTA_COMPONENT"),
+        selector,
+        &format!(
+            "vista executable={:?} cwd={:?} deadline-ms=10000",
+            executable,
+            temporary.path()
+        ),
+        "dev.schickling.vista.snapshot.v1",
+        &["ready", "updated", "failed", "expired"],
+    );
+
+    let first = vista.observe(None);
+    assert_eq!(first.status, ObserveReceiptStatus::SettledChanged, "{first:?}");
+    let first_bytes = fs::read(vista.snapshot()).unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(
+        snapshot.get("schema").and_then(serde_json::Value::as_str),
+        Some("dev.schickling.vista.snapshot.v1")
+    );
+    assert!(snapshot.get("observedAt").is_none());
+    let replay = vista.observe(first.digest);
+    assert_eq!(replay.status, ObserveReceiptStatus::SettledUnchanged);
+    assert_eq!(fs::read(vista.snapshot()).unwrap(), first_bytes);
+}
+
+#[test]
 fn production_component_preserves_resync_filter_catch_up_and_scope_isolation() {
     let _guard = STATE_ENV.lock();
     let temporary = tempfile::tempdir().unwrap();
@@ -519,7 +565,7 @@ struct ProviderFixture {
     root: PathBuf,
     agent: PathBuf,
     host: String,
-    scheme: String,
+    uri: String,
     selector: Mutex<String>,
     supervisor: ResourceProfileSupervisor,
 }
@@ -535,6 +581,29 @@ impl ProviderFixture {
         schema_id: &str,
         topic: &str,
     ) -> Self {
+        Self::new_with_uri(
+            root,
+            scheme,
+            &format!("{scheme}://subject"),
+            component,
+            selector,
+            capability,
+            schema_id,
+            &[topic],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_uri(
+        root: PathBuf,
+        scheme: &str,
+        uri: &str,
+        component: PathBuf,
+        selector: &str,
+        capability: &str,
+        schema_id: &str,
+        topics: &[&str],
+    ) -> Self {
         let host = "e2e".to_owned();
         let agent = root.join("agents/e2e/worker");
         fs::create_dir_all(agent.join("resources")).unwrap();
@@ -546,7 +615,7 @@ impl ProviderFixture {
         fs::copy(component, installed_component).unwrap();
         fs::write(
             root.join("resolver.wasm"),
-            observable_resolver_wasm(schema_id, topic, selector),
+            observable_resolver_wasm(schema_id, topics, selector),
         )
         .unwrap();
         fs::write(
@@ -556,14 +625,14 @@ impl ProviderFixture {
             ),
         )
         .unwrap();
-        write_agent(&agent, &host, scheme, selector);
+        write_agent(&agent, &host, uri, selector);
         st2::event::publish_owner_binding_for_test(&root, &host).unwrap();
         let supervisor = ResourceProfileSupervisor::new(root.clone(), host.clone()).unwrap();
         let fixture = Self {
             root,
             agent,
             host,
-            scheme: scheme.to_owned(),
+            uri: uri.to_owned(),
             selector: Mutex::new(selector.to_owned()),
             supervisor,
         };
@@ -587,7 +656,7 @@ impl ProviderFixture {
 
     fn rewrite_selector(&self, selector: &str) {
         *self.selector.lock() = selector.to_owned();
-        write_agent(&self.agent, &self.host, &self.scheme, selector);
+        write_agent(&self.agent, &self.host, &self.uri, selector);
     }
 
     fn observe(&self, prior: Option<st2::resource_profile::SnapshotDigest>) -> ObserveReceipt {
@@ -660,24 +729,24 @@ impl ProviderFixture {
     }
 }
 
-fn write_agent(agent: &Path, host: &str, scheme: &str, selector: &str) {
+fn write_agent(agent: &Path, host: &str, uri: &str, selector: &str) {
     fs::write(
         agent.join("agent.kdl"),
         format!(
-            "agent \"worker\" {{\n  host {host:?}\n  command \"true\"\n  resource \"observed\" uri=\"{scheme}://subject\" reason=\"Observed state.\" selector=#\"{selector}\"#\n}}\n"
+            "agent \"worker\" {{\n  host {host:?}\n  command \"true\"\n  resource \"observed\" uri={uri:?} reason=\"Observed state.\" selector=#\"{selector}\"#\n}}\n"
         ),
     )
     .unwrap();
 }
 
-fn observable_resolver_wasm(schema_id: &str, topic: &str, selector: &str) -> Vec<u8> {
+fn observable_resolver_wasm(schema_id: &str, topics: &[&str], selector: &str) -> Vec<u8> {
     let selector_value: serde_json::Value = serde_json::from_str(selector).unwrap();
     let descriptor = serde_json::to_vec(&serde_json::json!({
         "abiVersion": 3,
         "capabilities": ["resolve", "read", "observe"],
         "selectorSchema": { "type": "object", "additionalProperties": true },
         "defaultSelector": selector_value,
-        "topics": [{"name": topic}, {"name": "ignored"}],
+        "topics": topics.iter().map(|name| serde_json::json!({"name": name})).chain([serde_json::json!({"name": "ignored"})]).collect::<Vec<_>>(),
         "runtime": {"topology": "shared"},
         "snapshot": {"mediaType": "application/json", "schemaId": schema_id}
     }))

@@ -2194,6 +2194,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "st2-vista-component"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "st2-wire"
 version = "0.1.0"
 dependencies = [

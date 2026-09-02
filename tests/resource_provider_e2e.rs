@@ -9,7 +9,7 @@ use serde_json::json;
 use st2_resource_protocol::{ObservationResult, SnapshotDigest};
 use st2_resource_providers::{
     GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
-    PtyStatsModule, PtyStatsScope,
+    PtyStatsModule, PtyStatsScope, VistaConfig, VistaModule,
 };
 use st2_resource_wasip2::{Executor, ObservationRequest, RuntimeConfig};
 
@@ -160,6 +160,154 @@ fn github_pr_component_describes_and_denies_out_of_scope_before_transport() {
             diagnostic: Some(diagnostic)
         } if diagnostic.contains("GitHub pull request scope denied")
     ));
+}
+
+#[test]
+fn vista_component_observes_replays_and_enforces_identity_before_spawn() {
+    let temporary = tempfile::tempdir().unwrap();
+    let executable = temporary.path().join("vista");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+set -eu
+if [ "$#" -ne 6 ] || [ "$1" != artifact ] || [ "$2" != get ] || [ "$3" != release-notes ] || [ "$4" != v7 ] || [ "$5" != --output ] || [ "$6" != json ]; then
+  printf 'unexpected argv: %s\n' "$*" >&2
+  exit 64
+fi
+printf '%s\n' "$*" >> "$PWD/invocations"
+IFS= read -r mode < "$PWD/mode"
+case "$mode" in
+  ready)
+    printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"release-notes","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"created","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/release-notes/v7","title":"Release notes","status":{"locked":1,"open":2,"awaiting":3}}'
+    ;;
+  changed)
+    printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"release-notes","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"revised","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/release-notes/v7","title":"Revised release notes","status":{"locked":1,"open":1,"awaiting":2}}'
+    ;;
+  mismatch)
+    printf '%s\n' '{"schemaVersion":1,"uri":"vista://different/v7","slug":"different","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"wrong","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/different/v7"}'
+    ;;
+  unknown-field)
+    printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"release-notes","version":7,"author":"agent","timestamp":"2026-09-02T10:00:00Z","changeSummary":"wrong","parent":null,"retired":false,"state":"ready","canonicalUrl":"https://vista.example/release-notes/v7","extra":true}'
+    ;;
+  nonzero)
+    printf 'artifact unavailable for release-notes\n' >&2
+    exit 7
+    ;;
+esac
+"#,
+    );
+    fs::write(temporary.path().join("mode"), "ready\n").unwrap();
+
+    let module = VistaModule::new(
+        VistaConfig::resolve(
+            &executable,
+            temporary.path().to_path_buf(),
+            Duration::from_secs(5),
+        )
+        .unwrap(),
+    );
+    let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
+    let component_bytes = fs::read(component("ST2_VISTA_COMPONENT")).unwrap();
+    let loaded = executor.load(&component_bytes).unwrap();
+    let descriptor = executor.describe(&loaded, None).unwrap();
+    assert_eq!(descriptor.capabilities.len(), 1);
+    assert_eq!(
+        descriptor.topics,
+        ["ready", "updated", "failed", "expired"]
+    );
+    assert_eq!(
+        descriptor.snapshot_schema_id,
+        "dev.schickling.vista.snapshot.v1"
+    );
+    assert_eq!(descriptor.snapshot_media_type, "application/json");
+
+    let request = |invocation_id, prior_digest| ObservationRequest {
+        invocation_id,
+        uri: "vista://release-notes/v7".into(),
+        selector: json!({
+            "slug": "release-notes",
+            "version": 7,
+            "topics": ["ready", "updated", "failed", "expired"]
+        }),
+        prior_digest,
+        demand_watermark: Some(invocation_id),
+    };
+    let first = executor.observe(&loaded, &request(1, None), None).unwrap();
+    let publication = match first {
+        ObservationResult::Published { publication } => publication,
+        other => panic!("first Vista observation must publish, got {other:?}"),
+    };
+    assert_eq!(publication.topics, ["ready"]);
+    assert_eq!(
+        publication
+            .facts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|fact| fact.key())
+            .collect::<Vec<_>>(),
+        ["state"]
+    );
+    let carrier: serde_json::Value =
+        serde_json::from_slice(publication.bytes.as_slice()).unwrap();
+    assert_eq!(
+        carrier.get("schema").and_then(serde_json::Value::as_str),
+        Some("dev.schickling.vista.snapshot.v1")
+    );
+    assert!(carrier.get("observedAt").is_none());
+    let prior = SnapshotDigest::of(publication.bytes.as_slice());
+
+    assert_eq!(
+        executor
+            .observe(&loaded, &request(2, Some(prior)), None)
+            .unwrap(),
+        ObservationResult::Unchanged
+    );
+
+    fs::write(temporary.path().join("mode"), "changed\n").unwrap();
+    let changed = executor.observe(&loaded, &request(3, Some(prior)), None).unwrap();
+    assert!(matches!(
+        changed,
+        ObservationResult::Published { publication }
+            if publication.topics == ["updated", "ready"]
+    ));
+
+    let invocations_before = fs::read_to_string(temporary.path().join("invocations")).unwrap();
+    let malformed = executor
+        .observe(
+            &loaded,
+            &ObservationRequest {
+                invocation_id: 4,
+                uri: "vista://bad--slug/v7".into(),
+                selector: json!({ "slug": "bad--slug", "version": 7 }),
+                prior_digest: None,
+                demand_watermark: Some(4),
+            },
+            None,
+        )
+        .unwrap();
+    assert!(matches!(malformed, ObservationResult::Failed { .. }));
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("invocations")).unwrap(),
+        invocations_before
+    );
+
+    for (mode, expected) in [
+        ("mismatch", "different artifact identity"),
+        ("unknown-field", "invalid manifest"),
+        ("nonzero", "artifact unavailable for release-notes"),
+    ] {
+        fs::write(temporary.path().join("mode"), format!("{mode}\n")).unwrap();
+        let result = executor
+            .observe(&loaded, &request(5, None), None)
+            .unwrap();
+        assert!(matches!(
+            &result,
+            ObservationResult::Failed {
+                diagnostic: Some(diagnostic)
+            } if diagnostic.contains(expected)
+        ));
+    }
 }
 
 #[test]

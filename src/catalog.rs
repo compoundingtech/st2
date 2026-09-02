@@ -78,6 +78,11 @@ pub enum DeclaredProviderCapability {
         scope: DeclaredPtyStatsScope,
         deadline_ms: u64,
     },
+    Vista {
+        executable: String,
+        cwd: String,
+        deadline_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,9 +286,16 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_pty_stats_capability(scheme, runtime_child)?);
                     }
+                    "vista" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_vista_capability(scheme, runtime_child)?);
+                    }
                     other => anyhow::bail!(
                         "profile '{scheme}': runtime field '{other}' is unknown \
-                         (expected component, demand, github-issue, github-pr, or pty-stats)"
+                         (expected component, demand, github-issue, github-pr, pty-stats, or vista)"
                     ),
                 }
             }
@@ -461,6 +473,28 @@ fn parse_pty_stats_capability(
         executable,
         cwd,
         scope,
+        deadline_ms,
+    })
+}
+
+fn parse_vista_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': vista requires executable, cwd, and deadline-ms properties"
+    );
+    let executable = required_string_property(scheme, node, "executable")?;
+    let cwd = required_string_property(scheme, node, "cwd")?;
+    let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
+    anyhow::ensure!(
+        deadline_ms > 0 && deadline_ms <= 60_000,
+        "profile '{scheme}': Vista deadline must be between 1ms and 60000ms"
+    );
+    Ok(DeclaredProviderCapability::Vista {
+        executable,
+        cwd,
         deadline_ms,
     })
 }
@@ -1000,6 +1034,42 @@ mod tests {
             r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=0 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
             r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=3 total-timeout-ms=2 } }"#,
             r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn vista_runtime_capability_is_exact_and_bounded() {
+        let config = parse(
+            r#"
+            profile "vista" {
+              wasm "vista-resolver.wasm"
+              runtime {
+                component "components/vista.component.wasm"
+                demand #true
+                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" deadline-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/vista.component.wasm".into(),
+                capability: DeclaredProviderCapability::Vista {
+                    executable: "/nix/store/example/bin/vista".into(),
+                    cwd: "/var/empty".into(),
+                    deadline_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=0 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=60001 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=1 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }
