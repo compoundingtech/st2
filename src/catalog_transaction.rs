@@ -280,6 +280,33 @@ impl DeclarationProjection {
     }
 }
 
+fn raw_declarations_match(
+    catalog: &Path,
+    current: &DeclarationProjection,
+    desired: &DeclarationProjection,
+) -> bool {
+    if !current
+        .files
+        .iter()
+        .all(|(path, file)| desired.files.get(path) == Some(file))
+    {
+        return false;
+    }
+
+    let mut live_profile_modules = BTreeMap::new();
+    for path in &desired.profile_modules {
+        if current.files.contains_key(path) {
+            continue;
+        }
+        if add_profile_module(catalog, Path::new(path), &mut live_profile_modules).is_err() {
+            return false;
+        }
+    }
+    desired.files.iter().all(|(path, file)| {
+        current.files.get(path) == Some(file) || live_profile_modules.get(path) == Some(file)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionSource {
     Current,
@@ -1628,7 +1655,12 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
                 &desired.workspace_dirs,
             )?
         };
-        if current.root_sha256 == desired.root_sha256 && same_pty_root {
+        let same_declarations = if raw_preimage {
+            raw_declarations_match(&catalog, &current, &desired)
+        } else {
+            current.root_sha256 == desired.root_sha256
+        };
+        if same_declarations && same_pty_root {
             return Ok(ApplyResult {
                 schema: if raw_preimage {
                     RAW_APPLY_SCHEMA
@@ -2264,6 +2296,11 @@ fn add_profile_module(
     anyhow::ensure!(
         metadata.is_file(),
         "profile module is not a no-follow regular file: {}",
+        relative.display()
+    );
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "profile module is hard-linked: {}",
         relative.display()
     );
     let limit = agent_spec::profile::DEFAULT_MODULE_LIMIT_BYTES;

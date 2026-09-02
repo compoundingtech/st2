@@ -1994,6 +1994,20 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     let temp = tempfile::tempdir().unwrap();
     let valid = temp.path().join("valid");
     write_agent(&valid, "worker", false);
+    fs::write(
+        agent_dir(&valid, "worker").join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let workspace = agent_dir(&valid, "worker").join(".workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(valid.join("resolvers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, valid.join("resolvers/observe.wasm")).unwrap();
+    fs::write(
+        valid.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.observe", "resolvers/observe.wasm")]),
+    )
+    .unwrap();
     let valid_prepared = temp.path().join("valid-prepared");
     snapshot(&valid, &valid_prepared);
     let valid_raw_snapshot = raw_snapshot(&valid, &temp.path().join("valid-raw"));
@@ -2003,6 +2017,7 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
         String::from_utf8_lossy(&valid_raw_snapshot.stderr)
     );
     let valid_raw_snapshot: Value = serde_json::from_slice(&valid_raw_snapshot.stdout).unwrap();
+    let generation_before = fs::read(valid.join(".st2/catalog-generation")).ok();
     let valid_raw_apply = raw_apply(
         &valid,
         &valid_prepared,
@@ -2013,9 +2028,60 @@ fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
         "{}",
         String::from_utf8_lossy(&valid_raw_apply.stderr)
     );
+    let valid_raw_apply: Value = serde_json::from_slice(&valid_raw_apply.stdout).unwrap();
+    assert_eq!(valid_raw_apply["status"], "unchanged");
+    assert!(!valid.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read(valid.join(".st2/catalog-generation")).ok(),
+        generation_before
+    );
+    assert!(workspace.is_dir());
+
+    fs::write(valid.join("resolvers/observe.wasm"), b"stale module").unwrap();
+    let stale_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        stale_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_module_apply.stderr)
+    );
+    let stale_module_apply: Value =
+        serde_json::from_slice(&stale_module_apply.stdout).unwrap();
+    assert_eq!(stale_module_apply["status"], "applied");
+    assert_eq!(
+        fs::read(valid.join("resolvers/observe.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+    assert!(workspace.is_dir());
+
+    let live_module = valid.join("resolvers/observe.wasm");
+    let module_alias = temp.path().join("observe-alias.wasm");
+    fs::hard_link(&live_module, &module_alias).unwrap();
+    let hard_linked_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        hard_linked_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hard_linked_module_apply.stderr)
+    );
+    let hard_linked_module_apply: Value =
+        serde_json::from_slice(&hard_linked_module_apply.stdout).unwrap();
+    assert_eq!(hard_linked_module_apply["status"], "applied");
+    fs::write(&module_alias, b"mutated alias").unwrap();
+    assert_eq!(
+        fs::read(&live_module).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
 
     let invalid = temp.path().join("invalid");
     write_invalid_agent(&invalid, "worker");
+    fs::create_dir(agent_dir(&invalid, "worker").join(".workspace")).unwrap();
     ensure_external_pty_config(&invalid);
     let declaration = agent_dir(&invalid, "worker").join("agent.kdl");
     let context = agent_dir(&invalid, "worker").join("resources/context/now.md");
