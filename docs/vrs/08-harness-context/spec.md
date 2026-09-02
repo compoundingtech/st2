@@ -241,12 +241,16 @@ reading arrives
    +-- compaction edge?                                  -> write
    +-- floor(used / (BUCKET_PERCENT% of window)) changed
    |     since the last written reading?                  -> write
+   +-- proven Claude account-window exhaustion changed?   -> write
    +-- record older than HARNESS_CONTEXT_HEARTBEAT?       -> write
    +-- otherwise                                          -> skip
 ```
 
-Fixed quantization at 1% of the window — 100 buckets — plus a compaction edge
-and a 300-second heartbeat. The heartbeat fires only when the producer holds a
+Fixed quantization at 1% of the window — 100 buckets — plus a compaction edge,
+a bounded Claude exhaustion/reset edge, and a 300-second heartbeat. Codex
+account-window occupancy does not classify availability because Codex can
+continue through credits and this record does not carry the credit metadata
+needed to prove otherwise. The heartbeat fires only when the producer holds a
 reading taken since the last write: it re-publishes a *fresh* reading whose
 bucket happens not to have changed, and never re-stamps a stale one. A producer
 with no new reading writes nothing at all, and the record ages visibly through

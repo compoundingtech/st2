@@ -241,6 +241,7 @@ struct ContextJson<'a> {
     cost_usd: Option<f64>,
     session_total_tokens: Option<u64>,
     rate_limits: harness_context::RateLimits,
+    rate_limited: bool,
     compactions: u64,
     last_compaction_ms: Option<u64>,
     last_compaction_trigger: Option<&'static str>,
@@ -265,6 +266,7 @@ impl<'a> ContextJson<'a> {
             cost_usd: context.cost_usd,
             session_total_tokens: context.session_total_tokens,
             rate_limits: context.rate_limits,
+            rate_limited: context.is_rate_limited(),
             compactions: context.compactions,
             last_compaction_ms: context.last_compaction_ms,
             last_compaction_trigger: context
@@ -616,6 +618,7 @@ mod tests {
                 "costUsd": null,
                 "sessionTotalTokens": 2235329,
                 "rateLimits": {"fiveHour": 31.0, "sevenDay": 55.0},
+                "rateLimited": false,
                 "compactions": 3,
                 "lastCompactionMs": 1788000097290u64,
                 "lastCompactionTrigger": "unknown",
@@ -664,6 +667,50 @@ mod tests {
             wire[0]["context"]["rateLimits"]["fiveHour"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn exhausted_claude_rate_limit_is_explicit_beside_active_state() {
+        let mut limited = row("hetz.worker", State::Available, None, false, None, 0);
+        limited.observed = Some(harness_state::Observed {
+            state: harness_state::Activity::Active,
+            blocked_on: harness_state::BlockedOn::None,
+            input_buffer: harness_state::InputBuffer::Unknown,
+            ask: harness_state::Ask::None,
+            harness: Some("claude".to_string()),
+            since_ms: Some(1788000100000),
+            exit: None,
+            reason: None,
+        });
+        limited.context = Some(harness_context::Observed {
+            harness: harness_context::Harness::Claude,
+            used_tokens: Some(194_763),
+            window_tokens: Some(1_000_000),
+            used_percent: Some(19.0),
+            model: Some("claude-opus-5".to_string()),
+            cost_usd: Some(4.7312),
+            session_total_tokens: None,
+            rate_limits: harness_context::RateLimits {
+                five_hour: Some(100.0),
+                seven_day: Some(55.0),
+            },
+            compactions: 0,
+            last_compaction_ms: None,
+            last_compaction_trigger: None,
+            observed_at_ms: 1788000100000,
+            age_ms: 4210,
+            stale: false,
+        });
+
+        let wire: serde_json::Value =
+            serde_json::from_str(&to_json(&[limited.clone()], false)).unwrap();
+        assert_eq!(wire[0]["observedState"]["state"], "active");
+        assert_eq!(wire[0]["context"]["rateLimits"]["fiveHour"], 100.0);
+        assert_eq!(wire[0]["context"]["rateLimited"], true);
+
+        limited.context.as_mut().unwrap().stale = true;
+        let stale: serde_json::Value = serde_json::from_str(&to_json(&[limited], false)).unwrap();
+        assert_eq!(stale[0]["context"]["rateLimited"], false);
     }
 
     #[test]
