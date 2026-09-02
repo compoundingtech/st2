@@ -18,7 +18,7 @@ use std::process::ExitStatus;
 use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
-    PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+    install_signal_handler, run_provider_observed, ProviderOutcome, PROVIDER_POLL, STOP,
 };
 use crate::{harness_state, harness_version, hooks, message, status};
 
@@ -44,15 +44,17 @@ pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
 /// harmless either way.
 const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
-/// The omp MINORS verified against the admission checks in `docs/vrs/06-omp-driver/spec.md`
-/// (18.0 measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28).
+/// The omp MINORS verified against the admission checks in `docs/vrs/06-omp-driver/spec.md`.
+///
+/// 18.0 was measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28.
+/// 18.1 was measured at 18.1.2 on 2026-09-02.
 ///
 /// Admission is per minor, per decision 0007 ("hard version gate on the minor, 18.x initially")
 /// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
 /// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
 /// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
 /// MINOR still costs the five OMP-R05 probes.
-const SUPPORTED_OMP_MINORS: [(u32, u32); 1] = [(18, 0)];
+const SUPPORTED_OMP_MINORS: [(u32, u32); 2] = [(18, 0), (18, 1)];
 
 /// The omp builds the harness-context producer's arithmetic was measured against (HC-R13, HC-T03).
 ///
@@ -317,14 +319,15 @@ mod tests {
     /// `.experiments/` capture that justifies it.
     #[test]
     fn admitted_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0)]);
+        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0), (18, 1)]);
     }
 
-    /// The two versions actually measured must still launch — widening to the minor must not
-    /// drop the evidence the minor was admitted on.
+    /// Every exact build that admitted a minor must still launch. Keeping the literals here makes
+    /// each OMP-R05 capture a deliberate part of the gate rather than inferring evidence from the
+    /// admitted series.
     #[test]
-    fn version_gate_admits_every_measured_version() {
-        for version in MEASURED_CONTEXT_VERSIONS {
+    fn version_gate_admits_every_admission_capture() {
+        for version in ["18.0.3", "18.0.9", "18.1.2"] {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
@@ -352,36 +355,35 @@ mod tests {
         }
     }
 
-    /// A pre-release must not be admitted as its base release, even though its base minor is
+    /// A pre-release must not be admitted as its base release, even when its base minor is
     /// admitted: it is not the build any capture measured.
     #[test]
     fn version_gate_refuses_a_prerelease_inside_an_admitted_minor() {
-        for version in ["18.0.9-rc1", "18.0.9+meta"] {
-            let fake =
-                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+        for version in ["18.0.9-rc1", "18.0.9+meta", "18.1.2-rc1", "18.1.2+meta"] {
+            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             assert!(
                 verify_supported_version(fake.path().to_str().unwrap()).is_err(),
-                "{version} must not be admitted as 18.0.9"
+                "{version} must not be admitted as its base release"
             );
         }
     }
 
     /// A banner mentioning some other version must not bind the gate to it. Reported in review of
-    /// #370: `runtime 18.0.0 omp/18.1.0` would otherwise admit on the unrelated `18.0.0` and then
-    /// launch an unverified 18.1 provider. The provider's own label decides; an unlabelled banner
+    /// #370: `runtime 18.0.0 omp/18.2.0` would otherwise admit on the unrelated `18.0.0` and then
+    /// launch an unverified 18.2 provider. The provider's own label decides; an unlabelled banner
     /// carrying two different releases fails closed.
     #[test]
     fn a_stray_version_in_the_banner_cannot_admit_an_unverified_provider() {
-        let fake = FakeExecutable::new(
-            "#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.1.0\\n'\n",
-        );
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 omp/18.2.0\\n'\n");
         let error = verify_supported_version(fake.path().to_str().unwrap())
-            .expect_err("the omp-labelled 18.1.0 must decide, not the stray 18.0.0")
+            .expect_err("the omp-labelled 18.2.0 must decide, not the stray 18.0.0")
             .to_string();
-        assert!(error.contains("18.1.0"), "must name the provider's own release: {error}");
+        assert!(
+            error.contains("18.2.0"),
+            "must name the provider's own release: {error}"
+        );
 
-        let ambiguous =
-            FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.1.0\\n'\n");
+        let ambiguous = FakeExecutable::new("#!/bin/sh\nprintf 'runtime 18.0.0 18.2.0\\n'\n");
         assert!(
             verify_supported_version(ambiguous.path().to_str().unwrap()).is_err(),
             "an unlabelled banner with two different releases must fail closed"
@@ -406,13 +408,12 @@ mod tests {
         );
     }
 
-    /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.0`,
+    /// Minors are compared as numbers. `18.10` must not pass on the strength of admitted `18.1`,
     /// which is how a minor gate would decay into "accept anything that starts with 18".
     #[test]
     fn version_gate_refuses_a_neighbouring_minor_that_shares_a_prefix() {
-        for version in ["18.10.0", "18.1.0"] {
-            let fake =
-                FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
+        for version in ["18.10.0", "18.2.0"] {
+            let fake = FakeExecutable::new(&format!("#!/bin/sh\nprintf '{version}\\n'\n"));
             let error = verify_supported_version(fake.path().to_str().unwrap())
                 .expect_err(version)
                 .to_string();
@@ -425,14 +426,18 @@ mod tests {
     /// allowlist; passes once the gate keys on MAJOR.MINOR.
     #[test]
     fn a_patch_inside_an_admitted_minor_is_accepted_without_new_evidence() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf 'omp v18.0.11\\n18.0.11\\n'\n");
-        verify_supported_version(fake.path().to_str().unwrap())
-            .expect("18.0.11 is inside admitted minor 18.0 and must launch");
+        for version in ["18.0.11", "18.1.99"] {
+            let fake = FakeExecutable::new(&format!(
+                "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
+            ));
+            verify_supported_version(fake.path().to_str().unwrap())
+                .unwrap_or_else(|error| panic!("{version} is inside an admitted minor: {error}"));
+        }
     }
 
     #[test]
     fn version_gate_refuses_an_unverified_minor() {
-        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.1.0\\n'\n");
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
         let error = verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
         assert!(error.to_string().contains("unverified"), "{error}");
     }
@@ -464,7 +469,7 @@ mod tests {
                     let mut paths = Vec::with_capacity(ROUNDS);
                     barrier.wait();
                     for _ in 0..ROUNDS {
-                        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.1.0\\n'\n");
+                        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
                         paths.push(fake.path().to_path_buf());
                         let error =
                             verify_supported_version(fake.path().to_str().unwrap()).unwrap_err();
