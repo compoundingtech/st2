@@ -530,7 +530,8 @@ and native DING owners concurrently for the same identity.
 A pi agent does not use DING. Its messages are delivered natively into the live session by the
 channel extension st2 injects, which calls pi's own message API and reads pi's own idle proof, so
 no screen is inspected on that path. Declare it with a typed `pi {}` driver or with
-`deliver "pi-channel"`; a declaration carrying both `ding` and `deliver` is refused.
+`deliver "pi-channel"`. If the declaration also carries `ding`, native delivery wins and st2 omits
+the sidecar.
 
 Native DING watches the recipient inbox and delivers a normalized notice:
 

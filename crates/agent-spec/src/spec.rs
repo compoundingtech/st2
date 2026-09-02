@@ -971,10 +971,9 @@ impl RawSpec {
             .transpose()?;
         let driver = self.driver.lower(&identity)?;
         let has_driver = driver.is_some();
-        anyhow::ensure!(
-            !(self.ding && delivery.is_some()),
-            "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
-        );
+        // Native delivery owns the inbox when both forms are present. Treat `ding` as stale
+        // compatibility input and omit its sidecar instead of making the declaration invalid.
+        let ding = self.ding && delivery.is_none() && !has_driver;
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -1024,7 +1023,7 @@ impl RawSpec {
                 lifecycle,
             });
         }
-        if self.ding {
+        if ding {
             tasks.push(Task {
                 kind: TaskKind::Exec,
                 derived: true,

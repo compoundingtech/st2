@@ -1913,7 +1913,7 @@ The aggregate agent subject controls all its task members. Stopping the agent st
 | `deliver "VALUE"` | `mcp`, `app-server`, or `pi-channel` | No explicit transport. This is for a hand-authored launch. |
 | `command "SHELL"` | One shell string | No compact command. This creates the primary PTY task. |
 | `argv "PROGRAM" "ARG"...` | One or more strings | No compact argument vector. This creates the primary PTY task. |
-| `ding` | No values or children | Disabled; this creates the legacy derived delivery task. |
+| `ding` | No values or children | Disabled; this creates the legacy derived delivery task only when no native delivery owner exists. |
 | `env { ... }` | One environment map | Empty. |
 | `meta { ... }` | One metadata map | Empty. |
 | `render { ... }` | One ordered render block | Empty. |
@@ -1925,7 +1925,7 @@ The aggregate agent subject controls all its task members. Stopping the agent st
 
 The compact `command` and `argv` forms are mutually exclusive. They are also mutually exclusive with a typed driver.
 
-A typed driver and `deliver` are mutually exclusive. `ding` is mutually exclusive with `deliver` and with an explicit task named `ding`.
+A typed driver and `deliver` are mutually exclusive. A typed driver or `deliver` takes precedence over `ding`, which adds no task. `ding` remains mutually exclusive with an explicit task named `ding`.
 
 An agent must have one non-derived launch. A typed driver, compact launch, explicit PTY, or explicit exec satisfies this rule.
 
