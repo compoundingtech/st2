@@ -577,6 +577,43 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   direct child; terminating the direct child alone does not. [PR
   #202](https://github.com/compoundingtech/st2/pull/202) provides
   descendant-lifetime and direct-child-reap evidence for this contract.
+- **R39:** Spawn ownership is a closed two-case lifetime choice:
+
+  - `DetachedTask` is the existing production PTY/exec task generation.
+    Detachment through the PTY daemon or `setsid` keeps it outside the
+    supervisor's ownership group. Supervisor return, unwind, replacement, or
+    `SIGKILL` therefore leaves its PID and creation identity unchanged; only an
+    explicit down, retirement, replacement, or other reconciliation action may
+    stop it.
+  - `OwnedChildGroup` is an integration/evaluation harness child that must not
+    outlive its parent. The owner first starts a
+    watchdog as leader of a fresh process group, then joins the child to that
+    exact group. Keeping the watchdog in the group pins the group ID until
+    cleanup has signalled it, so a stale numeric PID cannot redirect teardown
+    to a later process.
+
+  The owner and watchdog hold opposite ends of a Unix socket pair. Only the
+  owner retains the write end; it is close-on-exec and the child closes its
+  inherited descriptor before exec. Normal return and Rust unwind run the
+  guard's `Drop`, which sends `SIGKILL` to the exact group, closes the
+  liveness channel, and reaps the direct child and watchdog. Cleanup polls for
+  at most two seconds; any waits still outstanding are moved to a background
+  reaper before control returns. If the parent dies before `Drop`, socket EOF
+  releases the in-group watchdog, which sends `SIGKILL` to its own group.
+  Descendants inherit group membership and are included. After hard parent
+  death the kernel reparents and the host init/subreaper reaps the now-orphaned
+  processes; synchronous wait by the dead owner is impossible.
+
+  This hard-death realization is supported on the Unix hosts st2 targets; it
+  does not claim a Windows job-object equivalent. The executable regressions
+  are
+  `tests/catalog_apply.rs::paused_catalog_child_is_reaped_when_test_unwinds`
+  for unwind cleanup and
+  `tests/eval_up.rs::owned_test_child_group_dies_after_hard_parent_death` for
+  socket-EOF group cleanup. The control in
+  `tests/eval_up.rs::st2_up_spec_supervises_and_respawns_a_killed_agent`, plus
+  the forced-kill cases in `tests/nomad_survival.rs`, proves that an owned
+  supervisor child is cleaned without absorbing the detached production task.
 - **R06:** st2 passes the complete effective task definition to the underlying
   launcher so manual and supervised restarts are equivalent. Harness readiness
   that depends on a dynamically selected account belongs to that declared
