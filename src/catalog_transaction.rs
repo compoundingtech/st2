@@ -1812,7 +1812,9 @@ fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let mut files = BTreeMap::new();
     add_optional_regular(root, &root.join(crate::catalog::CONFIG_FILE), &mut files)?;
     let spec_paths = collect_canonical_specs(root, ProjectionSource::Current, &mut files)?;
-    let workspace_dirs = raw_workspace_dirs(root, &spec_paths)?;
+    // Invalid declarations cannot establish typed workspace facts; canonical runtime directories
+    // are excluded structurally by the shared bundle collector instead.
+    let workspace_dirs = BTreeSet::new();
     for spec in &spec_paths {
         let bundle = spec.parent().context("canonical spec has no bundle")?;
         collect_bundle_files(
@@ -1832,30 +1834,6 @@ fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
         workspace_dirs,
         root_sha256,
     })
-}
-
-fn raw_workspace_dirs(root: &Path, spec_paths: &[PathBuf]) -> Result<BTreeSet<String>> {
-    let mut workspace_dirs = BTreeSet::new();
-    for spec in spec_paths {
-        let bundle = spec.parent().context("canonical spec has no bundle")?;
-        let workspace = bundle.join(".workspace");
-        match fs::symlink_metadata(&workspace) {
-            Ok(metadata) => {
-                anyhow::ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "canonical workspace fact is not a real directory: {}",
-                    workspace.display()
-                );
-                workspace_dirs.insert(normalized_relative(root, &workspace)?);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect workspace fact {}", workspace.display()));
-            }
-        }
-    }
-    Ok(workspace_dirs)
 }
 
 fn project(
