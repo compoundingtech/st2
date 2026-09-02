@@ -90,6 +90,12 @@ pub struct CatalogConfig {
     pub profiles: Vec<DeclaredProfile>,
 }
 
+/// The catalog fields that raw-preimage repair may interpret from an otherwise invalid catalog.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEnvelope {
+    pub pty_root: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedProfileModule {
     CatalogRelative(PathBuf),
@@ -124,28 +130,7 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                     anyhow::bail!("catalog block declared more than once");
                 }
                 seen_catalog = true;
-                let Some(children) = node.children() else {
-                    continue;
-                };
-                for child in children.nodes() {
-                    match child.name().value() {
-                        "pty-root" => {
-                            let value = child
-                                .get(0)
-                                .and_then(|v| v.as_string())
-                                .filter(|v| !v.is_empty())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
-                                    )
-                                })?;
-                            config.pty_root = Some(value.to_string());
-                        }
-                        other => {
-                            anyhow::bail!("unknown catalog field '{other}' (expected pty-root)")
-                        }
-                    }
-                }
+                config.pty_root = parse_catalog_node(node)?;
             }
             "profile" => {
                 let profile = parse_profile(node)?;
@@ -161,6 +146,53 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
         }
     }
     Ok(config)
+}
+
+/// Parse only the catalog envelope while treating every other top-level declaration as opaque.
+///
+/// Raw-preimage repair uses this parser so an obsolete profile or agent grammar cannot prevent
+/// replacement, while the PTY-root boundary remains subject to the ordinary catalog semantics.
+pub(crate) fn parse_envelope(text: &str) -> anyhow::Result<CatalogEnvelope> {
+    let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("KDL parse error: {e}"))?;
+    let mut envelope = CatalogEnvelope::default();
+    let mut seen_catalog = false;
+    for node in doc.nodes() {
+        if node.name().value() != "catalog" {
+            continue;
+        }
+        if seen_catalog {
+            anyhow::bail!("catalog block declared more than once");
+        }
+        seen_catalog = true;
+        envelope.pty_root = parse_catalog_node(node)?;
+    }
+    Ok(envelope)
+}
+
+fn parse_catalog_node(node: &kdl::KdlNode) -> anyhow::Result<Option<String>> {
+    let Some(children) = node.children() else {
+        return Ok(None);
+    };
+    let mut pty_root = None;
+    for child in children.nodes() {
+        match child.name().value() {
+            "pty-root" => {
+                anyhow::ensure!(pty_root.is_none(), "pty-root declared more than once");
+                let value = child
+                    .get(0)
+                    .and_then(|v| v.as_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
+                        )
+                    })?;
+                pty_root = Some(value.to_string());
+            }
+            other => anyhow::bail!("unknown catalog field '{other}' (expected pty-root)"),
+        }
+    }
+    Ok(pty_root)
 }
 
 fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
@@ -508,6 +540,18 @@ pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
     match std::fs::read_to_string(config_path(catalog_root)) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogConfig::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read only the envelope of `<catalog>/catalog.kdl`.
+///
+/// A missing file is the default envelope, matching [`load`]. Non-envelope declarations must be
+/// syntactically valid KDL but are otherwise left uninterpreted for raw-preimage repair.
+pub(crate) fn load_envelope(catalog_root: &Path) -> anyhow::Result<CatalogEnvelope> {
+    match std::fs::read_to_string(config_path(catalog_root)) {
+        Ok(text) => parse_envelope(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogEnvelope::default()),
         Err(e) => Err(e.into()),
     }
 }

@@ -1868,6 +1868,117 @@ fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
 }
 
 #[test]
+fn raw_preimage_migrates_legacy_argv_profile_to_a_component_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let pty_root = temp.path().join("shared-pty");
+    let pty_root = pty_root.to_str().unwrap();
+    let legacy_config = format!(
+        r#"catalog {{ pty-root {pty_root:?} }}
+profile "dev.example.observe" {{
+  wasm "resolvers/observe.wasm"
+  runtime {{
+    argv "legacy-provider" "--unsafe"
+  }}
+}}
+"#
+    );
+    fs::write(catalog.join("catalog.kdl"), &legacy_config).unwrap();
+    let legacy_error = st2::catalog::load(&catalog).unwrap_err();
+    assert!(
+        legacy_error
+            .to_string()
+            .contains("runtime field 'argv' is unknown"),
+        "{legacy_error:#}"
+    );
+
+    let agent = agent_dir(&catalog, "worker");
+    fs::create_dir_all(agent.join("resources/context")).unwrap();
+    fs::write(
+        agent.join("resources/context/now.md"),
+        "preserve mutable context",
+    )
+    .unwrap();
+    fs::write(agent.join("status"), "busy").unwrap();
+
+    let raw_capture_dir = temp.path().join("raw-capture-legacy");
+    let captured = raw_snapshot(&catalog, &raw_capture_dir);
+    assert!(
+        captured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    assert_eq!(
+        fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
+        legacy_config
+    );
+
+    let desired = temp.path().join("desired-component");
+    write_agent(&desired, "worker", false);
+    fs::create_dir_all(desired.join("resolvers")).unwrap();
+    fs::create_dir_all(desired.join("providers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, desired.join("resolvers/observe.wasm")).unwrap();
+    fs::copy(
+        DEMO_WASM_SRC,
+        desired.join("providers/observe.component.wasm"),
+    )
+    .unwrap();
+    fs::write(
+        desired.join("catalog.kdl"),
+        format!(
+            r#"catalog {{ pty-root {pty_root:?} }}
+profile "dev.example.observe" {{
+  wasm "resolvers/observe.wasm"
+  runtime {{
+    component "providers/observe.component.wasm"
+    pty-stats executable="/bin/true" cwd="/" deadline-ms=1000
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared-component");
+    snapshot(&desired, &prepared);
+
+    let repaired = raw_apply(
+        &catalog,
+        &prepared,
+        captured["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("resources/context/now.md")).unwrap(),
+        "preserve mutable context"
+    );
+    assert_eq!(fs::read_to_string(agent.join("status")).unwrap(), "busy");
+    let applied = st2::catalog::load(&catalog).unwrap();
+    assert_eq!(applied.pty_root.as_deref(), Some(pty_root));
+    assert_eq!(
+        applied.profiles[0]
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.component.as_str()),
+        Some("providers/observe.component.wasm")
+    );
+    assert!(
+        !fs::read_to_string(catalog.join("catalog.kdl"))
+            .unwrap()
+            .contains("argv")
+    );
+    assert_eq!(
+        fs::read(catalog.join("providers/observe.component.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+}
+
+#[test]
 fn raw_preimage_refuses_valid_catalogs_and_wrong_cas_without_declaration_writes() {
     let temp = tempfile::tempdir().unwrap();
     let valid = temp.path().join("valid");
@@ -1943,15 +2054,32 @@ fn raw_preimage_rejects_hard_linked_declarations() {
 #[test]
 fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
     let temp = tempfile::tempdir().unwrap();
-    let malformed_envelope = temp.path().join("malformed-envelope");
-    write_invalid_agent(&malformed_envelope, "worker");
-    fs::write(malformed_envelope.join("catalog.kdl"), "catalog {").unwrap();
-    let rejected = raw_snapshot(&malformed_envelope, &temp.path().join("malformed-capture"));
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr)
-            .contains("requires a valid incumbent catalog envelope")
-    );
+    for (case, envelope) in [
+        ("malformed", "catalog {"),
+        (
+            "duplicate-catalog",
+            "catalog { pty-root \"/tmp/a\" }\ncatalog { pty-root \"/tmp/a\" }\n",
+        ),
+        (
+            "duplicate-pty-root",
+            "catalog { pty-root \"/tmp/a\"; pty-root \"/tmp/a\" }\n",
+        ),
+    ] {
+        let malformed_envelope = temp.path().join(format!("{case}-envelope"));
+        write_invalid_agent(&malformed_envelope, "worker");
+        fs::write(malformed_envelope.join("catalog.kdl"), envelope).unwrap();
+        let rejected = raw_snapshot(
+            &malformed_envelope,
+            &temp.path().join(format!("{case}-capture")),
+        );
+        assert!(!rejected.status.success(), "{case}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("requires a valid incumbent catalog envelope"),
+            "{case}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
 
     let catalog = temp.path().join("catalog");
     write_invalid_agent(&catalog, "worker");
