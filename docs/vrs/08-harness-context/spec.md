@@ -863,14 +863,11 @@ For the same reason this producer has no heartbeat: its numerator is pushed and
 not pullable, so it never holds a re-taken reading to publish, and a quiet seat's
 record ages visibly instead (HC-R06). A window that takes no turn does not fill,
 so the aging number stays true. One consequence is expected and must not be
-"fixed": an OpenCode seat idle for longer than `HARNESS_CONTEXT_STALE` (60
-minutes) crosses the horizon and Doctor's HC-R17 stale-record line fires beside a
-`running` desired state until the next turn. The other four producers re-pull on
-a cadence and never reach it; this one cannot, because there is nothing to
-re-pull. Closing that advisory by heartbeating the in-memory numerator would
-re-stamp `observedAtMs` on a reading no one re-took, which is exactly what the
-writer's contract forbids — the advisory is the honest report of a seat whose
-last measured occupancy is an hour old.
+"fixed": a quiet push-only seat crosses `HARNESS_CONTEXT_STALE` after 60 minutes.
+Codex, pi, omp, and OpenCode obtain fresh occupancy only from harness events.
+Only Claude re-pulls through its five-second status-line cadence. Closing the
+advisory by heartbeating an in-memory numerator would re-stamp `observedAtMs` on
+a reading no one re-took, which is exactly what the writer's contract forbids.
 
 `model` is written in OpenCode's own `providerID/modelID` spelling
 (`opencode/hy3-free`): `modelID` alone is ambiguous across providers, and this is
@@ -999,7 +996,7 @@ Doctor emits an advisory line for an agent it owns in two cases:
 | Condition | Advisory | Exit status |
 | --- | --- | --- |
 | `usedPercent` ≥ `HARNESS_CONTEXT_WARN_PERCENT` | context fill, with the reading's age | unchanged |
-| record `stale` while desired state is `running` | the numbers are older than the horizon | unchanged |
+| record `stale` while desired state is `running` | the measurement is old, with no reader-health inference | unchanged |
 | no record, unreadable record, or a fresh reading below the threshold | nothing | unchanged |
 
 Neither case is ever a failure. This matches how Doctor already treats the
@@ -1007,6 +1004,10 @@ categorical axis ([`OHS-R10`](../05-harness-state/requirements.md)): a stale or
 session-dead record beside a `running` desired state is worth a warning and
 never an exit-code failure, and the numeric axis adds no new authority
 (HC-A02).
+
+The stale line does not ask whether the driver still reads the harness. The
+context record has no reader-health evidence, and a live push-only reader can
+expose the same old measurement as a dead reader.
 
 **80 is st2's number, not the harness's.** It is a threshold for "worth a
 human's attention", chosen so an operator sees a filling window with room left

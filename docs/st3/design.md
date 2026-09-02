@@ -639,7 +639,7 @@ Both close forms cite their evidence. Detecting delivery never auto-publishes ac
 
 The reducer rejects a transition that skips a lifecycle step. A closed claim waits until an accepted claim exists.
 
-The driver also publishes typed claims for work start, idle, turn usage, turn cost, compaction, clear, and harness errors.
+The driver also publishes typed claims for work start, idle, turn usage, turn cost, context, reader coverage, compaction, clear, and harness errors.
 
 Each appended turn produces its usage and cost claim. This observation needs no timer.
 
@@ -990,6 +990,8 @@ The first implementation needs these state-bearing claim families:
 - `presence.observed` records agent presence.
 - `harness.work-started` and `harness.idle` record session activity transitions.
 - `harness.turn-usage` records tokens and cost for one appended turn.
+- `harness.context-measured` records one context value at one source event frontier.
+- `harness.reader-observed` records the reader connection epoch, consumed frontier, and observation gaps.
 - `harness.compacted` and `harness.cleared` record context-generation events.
 - `harness.error` records a typed native harness error.
 - `gate.observed` records a declared gate entering or leaving the visible screen.
@@ -1493,11 +1495,68 @@ The driver declares each session file as a `harness.session-file` resource and r
 
 It reads the current session resource at startup. File notifications process each later append without polling.
 
-It publishes message delivery, work start, idle, turn usage, turn cost, compaction, clear, and error claims.
+It publishes message delivery, work start, idle, turn usage, turn cost, context, reader coverage, compaction, clear, and error claims.
 
 The session file proves that a message reached the conversation. It cannot prove that the agent accepted it.
 
 Harness claims answer only when their session generation matches the current incarnation.
+
+### Observation value and reader coverage
+
+An observation value never proves that its reader remained live after the measurement.
+
+An empty result proves absence only when the reader covered the complete search domain. A positive liveness result requires bounded revalidation before convergence.
+
+Every observer records its value separately from its coverage. A consumer must use both records before it treats the value as current or complete.
+
+This rule applies to process inspection, resource providers, transport negotiation, external liveness gates, and harness context.
+
+One observation claim records what the source returned. One reader claim records which source events the observer consumed without a known gap.
+
+```text
+HarnessContextClaim {
+    member: Subject
+    incarnation_id: IncarnationId
+    session_generation: SessionGeneration
+    harness: Harness
+    used_tokens: Option<u64>
+    window_tokens: Option<u64>
+    used_percent: Option<f64>
+    measured_at_ns: i64
+    reader_epoch: ReaderEpoch
+    event_frontier: SourceFrontier
+}
+
+HarnessReaderClaim {
+    member: Subject
+    incarnation_id: IncarnationId
+    session_generation: SessionGeneration
+    harness: Harness
+    reader_epoch: ReaderEpoch
+    state: "connected" | "gap" | "closed"
+    last_consumed_event: Option<SourceFrontier>
+    observed_at_ns: i64
+    reason: Option<ReaderGapReason>
+}
+```
+
+A source frontier is a source sequence, a file offset and generation, or another monotonic source position. It is never a local read counter.
+
+A connection or watcher replacement starts a new reader epoch. An overflow, parse skip, disconnect, or unsupported event records a gap.
+
+The reader publishes only a changed connection state or consumed frontier. It does not publish an unchanged timer heartbeat.
+
+A context projection is `settled` when both claims match the current session and the reader covers the measurement frontier without a gap.
+
+A settled measurement can be old. A quiet push-only harness does not change its context when it produces no context event.
+
+A context projection is `unread` when the reader is absent, closed, gapped, on another epoch, or behind a known context event.
+
+Every status and API projection includes `measured_at_ns` and the derived measurement age beside the value. A warning is not the only age surface.
+
+A reader observation can change coverage. It must never replace the context measurement time or make an old value appear newly measured.
+
+A judge or supervisor that acts on context cites both claim IDs. It cannot infer reader health from the context age.
 
 The PTY output path matches only declared gate profiles. A gate entering or leaving the screen appends `gate.observed`.
 

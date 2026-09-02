@@ -2129,8 +2129,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     report_advisory(
                         &format!("{bus_id} harness context stale"),
                         &format!(
-                            "the numbers are {} old while desired state is running — is its \
-                             driver still reading the harness?",
+                            "the last measurement is {} old while desired state is running — \
+                             context age does not report reader health",
                             humanize_ms(context.age_ms)
                         ),
                     );
