@@ -65,6 +65,13 @@ pub enum DeclaredProviderCapability {
         connect_timeout_ms: u64,
         total_timeout_ms: u64,
     },
+    GitHubPr {
+        owner: String,
+        repo: String,
+        number: u64,
+        connect_timeout_ms: u64,
+        total_timeout_ms: u64,
+    },
     PtyStats {
         executable: String,
         cwd: String,
@@ -260,6 +267,13 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_github_issue_capability(scheme, runtime_child)?);
                     }
+                    "github-pr" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_github_pr_capability(scheme, runtime_child)?);
+                    }
                     "pty-stats" => {
                         anyhow::ensure!(
                             capability.is_none() && runtime_child.children().is_none(),
@@ -269,7 +283,7 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                     }
                     other => anyhow::bail!(
                         "profile '{scheme}': runtime field '{other}' is unknown \
-                         (expected component, demand, github-issue, or pty-stats)"
+                         (expected component, demand, github-issue, github-pr, or pty-stats)"
                     ),
                 }
             }
@@ -377,6 +391,39 @@ fn parse_github_issue_capability(
         "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
     );
     Ok(DeclaredProviderCapability::GitHubIssue {
+        owner,
+        repo,
+        number,
+        connect_timeout_ms,
+        total_timeout_ms,
+    })
+}
+
+fn parse_github_pr_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-pr requires owner, repo, number, \
+         connect-timeout-ms, and total-timeout-ms properties"
+    );
+    let owner = required_string_property(scheme, node, "owner")?;
+    let repo = required_string_property(scheme, node, "repo")?;
+    let number = required_u64_property(scheme, node, "number")?;
+    let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
+    let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
+    anyhow::ensure!(
+        number > 0,
+        "profile '{scheme}': GitHub pull request number must be positive"
+    );
+    anyhow::ensure!(
+        connect_timeout_ms > 0
+            && connect_timeout_ms <= total_timeout_ms
+            && total_timeout_ms <= 60_000,
+        "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
+    );
+    Ok(DeclaredProviderCapability::GitHubPr {
         owner,
         repo,
         number,
@@ -915,6 +962,44 @@ mod tests {
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000; github-issue owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="shell" deadline-ms=1000 } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn github_pr_runtime_capability_is_exact_and_bounded() {
+        let config = parse(
+            r#"
+            profile "github-pr" {
+              wasm "github-pr-resolver.wasm"
+              runtime {
+                component "components/github-pr.component.wasm"
+                demand #true
+                github-pr owner="example" repo="demo" number=389 connect-timeout-ms=3000 total-timeout-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/github-pr.component.wasm".into(),
+                capability: DeclaredProviderCapability::GitHubPr {
+                    owner: "example".into(),
+                    repo: "demo".into(),
+                    number: 389,
+                    connect_timeout_ms: 3000,
+                    total_timeout_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=0 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=3 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }

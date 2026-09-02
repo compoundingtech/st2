@@ -8,7 +8,8 @@ use std::time::Duration;
 use serde_json::json;
 use st2_resource_protocol::{ObservationResult, SnapshotDigest};
 use st2_resource_providers::{
-    GitHubIssueConfig, GitHubIssueModule, PtyStatsConfig, PtyStatsModule, PtyStatsScope,
+    GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
+    PtyStatsModule, PtyStatsScope,
 };
 use st2_resource_wasip2::{Executor, ObservationRequest, RuntimeConfig};
 
@@ -103,6 +104,61 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
         ObservationResult::Failed {
             diagnostic: Some(diagnostic)
         } if diagnostic.contains("PTY stats scope denied")
+    ));
+}
+
+#[test]
+fn github_pr_component_describes_and_denies_out_of_scope_before_transport() {
+    let module = GitHubPrModule::new(GitHubPrConfig {
+        owner: "example".into(),
+        repo: "demo".into(),
+        number: 389,
+        connect_timeout: Duration::from_secs(3),
+        total_timeout: Duration::from_secs(10),
+    })
+    .unwrap();
+    let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
+    let component_bytes = fs::read(component("ST2_GITHUB_PR_COMPONENT")).unwrap();
+    let loaded = executor.load(&component_bytes).unwrap();
+    let descriptor = executor.describe(&loaded, None).unwrap();
+    assert_eq!(
+        descriptor.topics,
+        [
+            "ci.failure",
+            "mergeability.conflict",
+            "review.requested",
+            "terminal"
+        ]
+    );
+    assert_eq!(
+        descriptor.snapshot_schema_id,
+        "dev.schickling.github-pr.snapshot.v1"
+    );
+    assert_eq!(descriptor.snapshot_media_type, "application/json");
+
+    let denied = executor
+        .observe(
+            &loaded,
+            &ObservationRequest {
+                invocation_id: 1,
+                uri: "github-pr://other/demo/389".into(),
+                selector: json!({
+                    "owner": "other",
+                    "repo": "demo",
+                    "number": 389,
+                    "topics": ["ci.failure"]
+                }),
+                prior_digest: None,
+                demand_watermark: Some(1),
+            },
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        &denied,
+        ObservationResult::Failed {
+            diagnostic: Some(diagnostic)
+        } if diagnostic.contains("GitHub pull request scope denied")
     ));
 }
 

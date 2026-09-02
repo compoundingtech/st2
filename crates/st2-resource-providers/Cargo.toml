@@ -2,13 +2,15 @@
 name = "st2-resource-providers"
 version = "0.1.0"
 edition = "2024"
-description = "Typed host capabilities for the st2 GitHub Issue and PTY stats resource components."
+description = "Typed host capabilities for the st2 GitHub and PTY stats resource components."
 license = "MIT"
 publish = false
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "rustls-tls", "stream"] }
 serde_json = "1"
 st2-resource-wasip2 = { path = "../st2-resource-wasip2", features = ["runtime"] }
