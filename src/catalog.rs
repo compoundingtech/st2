@@ -65,10 +65,24 @@ pub enum DeclaredProviderCapability {
         connect_timeout_ms: u64,
         total_timeout_ms: u64,
     },
+    GitHubPr {
+        owner: String,
+        repo: String,
+        number: u64,
+        connect_timeout_ms: u64,
+        total_timeout_ms: u64,
+    },
     PtyStats {
         executable: String,
         cwd: String,
         scope: DeclaredPtyStatsScope,
+        deadline_ms: u64,
+    },
+    Vista {
+        executable: String,
+        cwd: String,
+        slug: String,
+        version: u64,
         deadline_ms: u64,
     },
 }
@@ -260,6 +274,13 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_github_issue_capability(scheme, runtime_child)?);
                     }
+                    "github-pr" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_github_pr_capability(scheme, runtime_child)?);
+                    }
                     "pty-stats" => {
                         anyhow::ensure!(
                             capability.is_none() && runtime_child.children().is_none(),
@@ -267,9 +288,16 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                         );
                         capability = Some(parse_pty_stats_capability(scheme, runtime_child)?);
                     }
+                    "vista" => {
+                        anyhow::ensure!(
+                            capability.is_none() && runtime_child.children().is_none(),
+                            "profile '{scheme}': runtime declares more than one capability"
+                        );
+                        capability = Some(parse_vista_capability(scheme, runtime_child)?);
+                    }
                     other => anyhow::bail!(
                         "profile '{scheme}': runtime field '{other}' is unknown \
-                         (expected component, demand, github-issue, or pty-stats)"
+                         (expected component, demand, github-issue, github-pr, pty-stats, or vista)"
                     ),
                 }
             }
@@ -385,6 +413,39 @@ fn parse_github_issue_capability(
     })
 }
 
+fn parse_github_pr_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-pr requires owner, repo, number, \
+         connect-timeout-ms, and total-timeout-ms properties"
+    );
+    let owner = required_string_property(scheme, node, "owner")?;
+    let repo = required_string_property(scheme, node, "repo")?;
+    let number = required_u64_property(scheme, node, "number")?;
+    let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
+    let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
+    anyhow::ensure!(
+        number > 0,
+        "profile '{scheme}': GitHub pull request number must be positive"
+    );
+    anyhow::ensure!(
+        connect_timeout_ms > 0
+            && connect_timeout_ms <= total_timeout_ms
+            && total_timeout_ms <= 60_000,
+        "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
+    );
+    Ok(DeclaredProviderCapability::GitHubPr {
+        owner,
+        repo,
+        number,
+        connect_timeout_ms,
+        total_timeout_ms,
+    })
+}
+
 fn parse_pty_stats_capability(
     scheme: &str,
     node: &kdl::KdlNode,
@@ -416,6 +477,46 @@ fn parse_pty_stats_capability(
         scope,
         deadline_ms,
     })
+}
+
+fn parse_vista_capability(
+    scheme: &str,
+    node: &kdl::KdlNode,
+) -> anyhow::Result<DeclaredProviderCapability> {
+    anyhow::ensure!(
+        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': vista requires executable, cwd, slug, version, and deadline-ms properties"
+    );
+    let executable = required_string_property(scheme, node, "executable")?;
+    let cwd = required_string_property(scheme, node, "cwd")?;
+    let slug = required_string_property(scheme, node, "slug")?;
+    let version = required_u64_property(scheme, node, "version")?;
+    let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
+    anyhow::ensure!(
+        valid_vista_slug(&slug) && (1..=9_007_199_254_740_991).contains(&version),
+        "profile '{scheme}': Vista artifact scope is invalid"
+    );
+    anyhow::ensure!(
+        deadline_ms > 0 && deadline_ms <= 60_000,
+        "profile '{scheme}': Vista deadline must be between 1ms and 60000ms"
+    );
+    Ok(DeclaredProviderCapability::Vista {
+        executable,
+        cwd,
+        slug,
+        version,
+        deadline_ms,
+    })
+}
+
+fn valid_vista_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && slug.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (byte == b'-' && index > 0)
+        })
+        && !slug.ends_with('-')
+        && !slug.contains("--")
 }
 
 fn required_string_property(
@@ -915,6 +1016,85 @@ mod tests {
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000; github-issue owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="shell" deadline-ms=1000 } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn github_pr_runtime_capability_is_exact_and_bounded() {
+        let config = parse(
+            r#"
+            profile "github-pr" {
+              wasm "github-pr-resolver.wasm"
+              runtime {
+                component "components/github-pr.component.wasm"
+                demand #true
+                github-pr owner="example" repo="demo" number=389 connect-timeout-ms=3000 total-timeout-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/github-pr.component.wasm".into(),
+                capability: DeclaredProviderCapability::GitHubPr {
+                    owner: "example".into(),
+                    repo: "demo".into(),
+                    number: 389,
+                    connect_timeout_ms: 3000,
+                    total_timeout_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=0 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=3 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
+        ] {
+            assert!(parse(malformed).is_err(), "expected error for: {malformed}");
+        }
+    }
+
+    #[test]
+    fn vista_runtime_capability_is_exact_and_bounded() {
+        let config = parse(
+            r#"
+            profile "vista" {
+              wasm "vista-resolver.wasm"
+              runtime {
+                component "components/vista.component.wasm"
+                demand #true
+                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" slug="release-notes" version=7 deadline-ms=10000
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.profiles[0].runtime,
+            Some(DeclaredProfileRuntime {
+                component: "components/vista.component.wasm".into(),
+                capability: DeclaredProviderCapability::Vista {
+                    executable: "/nix/store/example/bin/vista".into(),
+                    cwd: "/var/empty".into(),
+                    slug: "release-notes".into(),
+                    version: 7,
+                    deadline_ms: 10000,
+                },
+                demand: true,
+            })
+        );
+        for malformed in [
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=0 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=60001 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="-release" version=1 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=0 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=9007199254740992 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=1 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }

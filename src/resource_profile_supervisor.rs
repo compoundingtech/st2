@@ -25,7 +25,8 @@ use sha2::{Digest as _, Sha256};
 use st2_resource_protocol::ProposalFence;
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_providers::{
-    GitHubIssueConfig, GitHubIssueModule, PtyStatsConfig, PtyStatsModule, PtyStatsScope,
+    GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
+    PtyStatsModule, PtyStatsScope, VistaConfig, VistaModule,
 };
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_wasip2::{
@@ -1170,8 +1171,16 @@ enum ProviderRuntime {
         executor: Wasip2Executor<GitHubIssueModule>,
         component: LoadedComponent,
     },
+    GitHubPr {
+        executor: Wasip2Executor<GitHubPrModule>,
+        component: LoadedComponent,
+    },
     PtyStats {
         executor: Wasip2Executor<PtyStatsModule>,
+        component: LoadedComponent,
+    },
+    Vista {
+        executor: Wasip2Executor<VistaModule>,
         component: LoadedComponent,
     },
 }
@@ -1218,7 +1227,9 @@ impl ProviderRuntime {
     fn cancellation(&self) -> ObservationCancellation {
         let interruption = match self {
             Self::GitHubIssue { executor, .. } => executor.interruption_handle(),
+            Self::GitHubPr { executor, .. } => executor.interruption_handle(),
             Self::PtyStats { executor, .. } => executor.interruption_handle(),
+            Self::Vista { executor, .. } => executor.interruption_handle(),
         };
         ObservationCancellation { interruption }
     }
@@ -1234,7 +1245,17 @@ impl ProviderRuntime {
                 component,
                 ..
             } => executor.observe(component, request, Some(&cancellation.interruption)),
+            Self::GitHubPr {
+                executor,
+                component,
+                ..
+            } => executor.observe(component, request, Some(&cancellation.interruption)),
             Self::PtyStats {
+                executor,
+                component,
+                ..
+            } => executor.observe(component, request, Some(&cancellation.interruption)),
+            Self::Vista {
                 executor,
                 component,
                 ..
@@ -1372,6 +1393,34 @@ impl RuntimeProcess {
                         component,
                     }
                 }
+                crate::catalog::DeclaredProviderCapability::GitHubPr {
+                    owner,
+                    repo,
+                    number,
+                    connect_timeout_ms,
+                    total_timeout_ms,
+                } => {
+                    let module = GitHubPrModule::new(GitHubPrConfig {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                        number: *number,
+                        connect_timeout: Duration::from_millis(*connect_timeout_ms),
+                        total_timeout: Duration::from_millis(*total_timeout_ms),
+                    })
+                    .map_err(anyhow::Error::msg)?;
+                    let executor = Wasip2Executor::new(
+                        Wasip2RuntimeConfig::default(),
+                        None,
+                        module,
+                    )?;
+                    let component = executor.load(&sample.component.bytes)?;
+                    let descriptor = executor.describe(&component, None)?;
+                    validate_provider_descriptor(&descriptor, &sample.descriptor)?;
+                    ProviderRuntime::GitHubPr {
+                        executor,
+                        component,
+                    }
+                }
                 crate::catalog::DeclaredProviderCapability::PtyStats {
                     executable,
                     cwd,
@@ -1404,6 +1453,38 @@ impl RuntimeProcess {
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
                     ProviderRuntime::PtyStats {
+                        executor,
+                        component,
+                    }
+                }
+                crate::catalog::DeclaredProviderCapability::Vista {
+                    executable,
+                    cwd,
+                    slug,
+                    version,
+                    deadline_ms,
+                } => {
+                    let executable =
+                        crate::expand::expand_catalog(executable, catalog_root);
+                    let cwd = crate::expand::expand_catalog(cwd, catalog_root);
+                    let config = VistaConfig::resolve(
+                        executable,
+                        PathBuf::from(cwd),
+                        slug.clone(),
+                        *version,
+                        Duration::from_millis(*deadline_ms),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    let module = VistaModule::new(config);
+                    let executor = Wasip2Executor::new(
+                        Wasip2RuntimeConfig::default(),
+                        None,
+                        module,
+                    )?;
+                    let component = executor.load(&sample.component.bytes)?;
+                    let descriptor = executor.describe(&component, None)?;
+                    validate_provider_descriptor(&descriptor, &sample.descriptor)?;
+                    ProviderRuntime::Vista {
                         executor,
                         component,
                     }

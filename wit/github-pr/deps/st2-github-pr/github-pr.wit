@@ -1,0 +1,41 @@
+package compoundingtech:st2-github-pr@0.1.0;
+
+interface github-pr {
+  record pull-request-request {
+    owner: string,
+    repo: string,
+    number: u64,
+  }
+
+  record source-object {
+    etag: option<string>,
+    body: list<u8>,
+  }
+
+  record source-snapshot {
+    pull-request: source-object,
+    check-runs: source-object,
+    combined-status: source-object,
+    observed-at: string,
+  }
+
+  record source-observation {
+    current: source-snapshot,
+    previous: option<source-snapshot>,
+  }
+
+  variant pull-request-response {
+    ok(source-observation),
+    not-modified,
+  }
+
+  variant pull-request-error {
+    denied,
+    unavailable,
+    resource-exhausted,
+    deadline-exceeded,
+  }
+
+  get: func(request: pull-request-request) -> result<pull-request-response, pull-request-error>;
+  bind-snapshot: func(digest: list<u8>) -> result<_, pull-request-error>;
+}

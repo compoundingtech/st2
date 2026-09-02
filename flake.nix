@@ -144,7 +144,11 @@
             "--exclude"
             "st2-github-issue-component"
             "--exclude"
+            "st2-github-pr-component"
+            "--exclude"
             "st2-pty-stats-component"
+            "--exclude"
+            "st2-vista-component"
             "--lib"
             "--bins"
             "--test"
@@ -192,7 +196,11 @@
             "--exclude"
             "st2-github-issue-component"
             "--exclude"
+            "st2-github-pr-component"
+            "--exclude"
             "st2-pty-stats-component"
+            "--exclude"
+            "st2-vista-component"
             "--test"
             "resync"
             "--test"
@@ -253,9 +261,19 @@
           wasmName = "st2_github_issue_component";
         };
 
+        st2GitHubPrComponent = buildProviderComponent {
+          package = "st2-github-pr-component";
+          wasmName = "st2_github_pr_component";
+        };
+
         st2PtyStatsComponent = buildProviderComponent {
           package = "st2-pty-stats-component";
           wasmName = "st2_pty_stats_component";
+        };
+
+        st2VistaComponent = buildProviderComponent {
+          package = "st2-vista-component";
+          wasmName = "st2_vista_component";
         };
 
         st2ProviderRuntime = st2.overrideAttrs (old: {
@@ -271,11 +289,15 @@
         st2ProviderRuntimeCheck = st2ProviderRuntime.overrideAttrs (_: {
           pname = "st2-provider-runtime-check";
           ST2_GITHUB_ISSUE_COMPONENT = "${st2GitHubIssueComponent}/share/st2/providers/st2_github_issue_component.component.wasm";
+          ST2_GITHUB_PR_COMPONENT = "${st2GitHubPrComponent}/share/st2/providers/st2_github_pr_component.component.wasm";
           ST2_PTY_STATS_COMPONENT = "${st2PtyStatsComponent}/share/st2/providers/st2_pty_stats_component.component.wasm";
+          ST2_VISTA_COMPONENT = "${st2VistaComponent}/share/st2/providers/st2_vista_component.component.wasm";
           cargoTestFlags = [
             "-p"
             "st2-resource-providers"
             "--lib"
+            "--test"
+            "github_pr_component"
             "-p"
             "st2"
             "--features"
@@ -388,7 +410,9 @@
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         packages.st2-github-issue-component = st2GitHubIssueComponent;
+        packages.st2-github-pr-component = st2GitHubPrComponent;
         packages.st2-pty-stats-component = st2PtyStatsComponent;
+        packages.st2-vista-component = st2VistaComponent;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -410,7 +434,9 @@
         checks.wasip2-resource-executor = st2Wasip2ExecutorCheck;
         checks.wasip2-resource-providers = st2ProviderRuntimeCheck;
         checks.github-issue-component = st2GitHubIssueComponent;
+        checks.github-pr-component = st2GitHubPrComponent;
         checks.pty-stats-component = st2PtyStatsComponent;
+        checks.vista-component = st2VistaComponent;
         # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
         # the same artifact strictly admits a catalog carrying a real wasm profile module.
         checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''
