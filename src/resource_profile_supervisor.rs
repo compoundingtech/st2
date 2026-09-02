@@ -6,9 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -26,7 +26,7 @@ use st2_resource_protocol::ProposalFence;
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_providers::{
     GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
-    PtyStatsModule, PtyStatsScope, VistaConfig, VistaModule,
+    PtyStatsModule, VistaConfig, VistaModule,
 };
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_wasip2::{
@@ -280,8 +280,10 @@ impl ObservationCancellation {
 
 #[cfg(feature = "wasip2-provider-runtime")]
 fn catch_observation(
-    observe: impl FnOnce(
-    ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError>,
+    observe: impl FnOnce() -> Result<
+        st2_resource_protocol::ObservationResult,
+        st2_resource_wasip2::ObserveError,
+    >,
 ) -> Result<st2_resource_protocol::ObservationResult, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe))
         .map_err(|_| "provider observation panicked".to_owned())?
@@ -336,8 +338,6 @@ impl ComponentSnapshotCache {
         Ok(snapshot)
     }
 }
-
-
 
 #[derive(Debug, Clone, PartialEq)]
 struct DesiredBinding {
@@ -801,8 +801,7 @@ impl Worker {
         let spawn = thread::Builder::new()
             .name(format!("st2-resource-observe-{job_id}"))
             .spawn(move || {
-                let result =
-                    catch_observation(|| provider.observe(&request, &thread_cancellation));
+                let result = catch_observation(|| provider.observe(&request, &thread_cancellation));
                 let _ = completion_tx.send(Msg::ObservationCompleted(ObservationCompletion {
                     job_id,
                     runtime_key: thread_runtime_key,
@@ -868,8 +867,7 @@ impl Worker {
             && active.registration == completion.authority.registration
             && active.desired.generation == completion.fence.generation()
             && active.revision == completion.fence.revision()
-            && active.catch_up.state().current_snapshot_digest()
-                == completion.fence.prior_digest()
+            && active.catch_up.state().current_snapshot_digest() == completion.fence.prior_digest()
             && active
                 .demand
                 .in_flight
@@ -881,11 +879,11 @@ impl Worker {
         match completion.result {
             Ok(result) => {
                 let failure_detail = match &result {
-                    st2_resource_protocol::ObservationResult::Failed { diagnostic } => {
-                        Some(diagnostic.clone().unwrap_or_else(|| {
-                            "provider returned a failed observation".to_owned()
-                        }))
-                    }
+                    st2_resource_protocol::ObservationResult::Failed { diagnostic } => Some(
+                        diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "provider returned a failed observation".to_owned()),
+                    ),
                     _ => None,
                 };
                 let message = RuntimeMessage::ObservationResult {
@@ -900,7 +898,8 @@ impl Worker {
                 if let Err(error) = runtime.accept(message, &catalog_root, &this_host) {
                     if let Some(active) = runtime.bindings.get_mut(&completion.stable_key) {
                         active.health.state = RuntimeHealthState::Degraded;
-                        active.health.detail = Some(format!("provider proposal rejected: {error:#}"));
+                        active.health.detail =
+                            Some(format!("provider proposal rejected: {error:#}"));
                         let _ = settle_active_demand(
                             &runtime.request_dir,
                             &runtime.receipt_dir,
@@ -1145,7 +1144,6 @@ impl Worker {
         }
     }
 
-
     fn stop_all(&mut self) {
         for (_, mut runtime) in std::mem::take(&mut self.runtimes) {
             runtime.stop();
@@ -1219,8 +1217,6 @@ fn validate_provider_descriptor(
     );
     Ok(())
 }
-
-
 
 #[cfg(feature = "wasip2-provider-runtime")]
 impl ProviderRuntime {
@@ -1366,25 +1362,20 @@ impl RuntimeProcess {
         {
             let provider = match &sample.runtime.capability {
                 crate::catalog::DeclaredProviderCapability::GitHubIssue {
-                    owner,
-                    repo,
-                    number,
+                    auth_executable,
                     connect_timeout_ms,
                     total_timeout_ms,
                 } => {
+                    let auth_executable =
+                        crate::expand::expand_catalog(auth_executable, catalog_root);
                     let module = GitHubIssueModule::new(GitHubIssueConfig {
-                        owner: owner.clone(),
-                        repo: repo.clone(),
-                        number: *number,
+                        auth_executable: PathBuf::from(auth_executable),
                         connect_timeout: Duration::from_millis(*connect_timeout_ms),
                         total_timeout: Duration::from_millis(*total_timeout_ms),
                     })
                     .map_err(anyhow::Error::msg)?;
-                    let executor = Wasip2Executor::new(
-                        Wasip2RuntimeConfig::default(),
-                        None,
-                        module,
-                    )?;
+                    let executor =
+                        Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module)?;
                     let component = executor.load(&sample.component.bytes)?;
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
@@ -1394,25 +1385,20 @@ impl RuntimeProcess {
                     }
                 }
                 crate::catalog::DeclaredProviderCapability::GitHubPr {
-                    owner,
-                    repo,
-                    number,
+                    auth_executable,
                     connect_timeout_ms,
                     total_timeout_ms,
                 } => {
+                    let auth_executable =
+                        crate::expand::expand_catalog(auth_executable, catalog_root);
                     let module = GitHubPrModule::new(GitHubPrConfig {
-                        owner: owner.clone(),
-                        repo: repo.clone(),
-                        number: *number,
+                        auth_executable: PathBuf::from(auth_executable),
                         connect_timeout: Duration::from_millis(*connect_timeout_ms),
                         total_timeout: Duration::from_millis(*total_timeout_ms),
                     })
                     .map_err(anyhow::Error::msg)?;
-                    let executor = Wasip2Executor::new(
-                        Wasip2RuntimeConfig::default(),
-                        None,
-                        module,
-                    )?;
+                    let executor =
+                        Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module)?;
                     let component = executor.load(&sample.component.bytes)?;
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
@@ -1424,31 +1410,19 @@ impl RuntimeProcess {
                 crate::catalog::DeclaredProviderCapability::PtyStats {
                     executable,
                     cwd,
-                    scope,
                     deadline_ms,
                 } => {
-                    let executable =
-                        crate::expand::expand_catalog(executable, catalog_root);
+                    let executable = crate::expand::expand_catalog(executable, catalog_root);
                     let cwd = crate::expand::expand_catalog(cwd, catalog_root);
-                    let scope = match scope {
-                        crate::catalog::DeclaredPtyStatsScope::All => PtyStatsScope::All,
-                        crate::catalog::DeclaredPtyStatsScope::Session(session) => {
-                            PtyStatsScope::Session(session.clone())
-                        }
-                    };
                     let config = PtyStatsConfig::resolve(
                         executable,
                         PathBuf::from(cwd),
-                        scope,
                         Duration::from_millis(*deadline_ms),
                     )
                     .map_err(anyhow::Error::msg)?;
                     let module = PtyStatsModule::new(config);
-                    let executor = Wasip2Executor::new(
-                        Wasip2RuntimeConfig::default(),
-                        None,
-                        module,
-                    )?;
+                    let executor =
+                        Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module)?;
                     let component = executor.load(&sample.component.bytes)?;
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
@@ -1460,27 +1434,19 @@ impl RuntimeProcess {
                 crate::catalog::DeclaredProviderCapability::Vista {
                     executable,
                     cwd,
-                    slug,
-                    version,
                     deadline_ms,
                 } => {
-                    let executable =
-                        crate::expand::expand_catalog(executable, catalog_root);
+                    let executable = crate::expand::expand_catalog(executable, catalog_root);
                     let cwd = crate::expand::expand_catalog(cwd, catalog_root);
                     let config = VistaConfig::resolve(
                         executable,
                         PathBuf::from(cwd),
-                        slug.clone(),
-                        *version,
                         Duration::from_millis(*deadline_ms),
                     )
                     .map_err(anyhow::Error::msg)?;
                     let module = VistaModule::new(config);
-                    let executor = Wasip2Executor::new(
-                        Wasip2RuntimeConfig::default(),
-                        None,
-                        module,
-                    )?;
+                    let executor =
+                        Wasip2Executor::new(Wasip2RuntimeConfig::default(), None, module)?;
                     let component = executor.load(&sample.component.bytes)?;
                     let descriptor = executor.describe(&component, None)?;
                     validate_provider_descriptor(&descriptor, &sample.descriptor)?;
@@ -1491,8 +1457,7 @@ impl RuntimeProcess {
                 }
             };
             let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let incarnation =
-                RuntimeIncarnation::new(format!("{}-{sequence}", sample.generation))?;
+            let incarnation = RuntimeIncarnation::new(format!("{}-{sequence}", sample.generation))?;
             let claim = OwnerClaim::new(hash_text(&format!(
                 "{}\0{}\0{}\0{sequence}",
                 catalog_root.display(),
@@ -1930,7 +1895,6 @@ impl RuntimeProcess {
         Ok(())
     }
 
-
     fn refresh_process_health(&mut self) {
         let degraded = self
             .bindings
@@ -2150,7 +2114,6 @@ fn finalize_active_demand(
         }
     }
 }
-
 
 fn selector_topics(selector: &Value) -> anyhow::Result<TopicSelection> {
     let topics = selector
@@ -2381,7 +2344,6 @@ fn hash_path(path: &Path) -> String {
     hash_text(&path.to_string_lossy())
 }
 
-
 fn hash_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -2390,7 +2352,6 @@ fn hash_text(value: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
-
 
     #[test]
     fn runtime_keys_enforce_shared_and_per_binding_topology() {
@@ -2540,7 +2501,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn publication_subject_renders_ordered_facts_and_reserves_topics() {
         let facts = vec![
@@ -2584,12 +2544,10 @@ mod tests {
         );
     }
 
-
     #[cfg(feature = "wasip2-provider-runtime")]
     #[test]
     fn observation_panic_becomes_a_typed_failed_completion() {
         let result = catch_observation(|| panic!("synthetic provider panic"));
         assert_eq!(result.unwrap_err(), "provider observation panicked");
     }
-
 }

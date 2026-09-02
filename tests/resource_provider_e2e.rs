@@ -9,24 +9,39 @@ use serde_json::json;
 use st2_resource_protocol::{ObservationResult, SnapshotDigest};
 use st2_resource_providers::{
     GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
-    PtyStatsModule, PtyStatsScope, VistaConfig, VistaModule,
+    PtyStatsModule, VistaConfig, VistaModule,
 };
 use st2_resource_wasip2::{Executor, ObservationRequest, RuntimeConfig};
 
 #[test]
-fn pty_component_observes_replays_and_enforces_capability_scope() {
+fn pty_component_observes_replays_and_rejects_invalid_identity_before_spawn() {
     let temporary = tempfile::tempdir().unwrap();
-    let executable = temporary.path().join("pty-stats");
+    let executable = temporary.path().join("pty");
     write_executable(
         &executable,
-        "#!/bin/sh\nprintf '%s\\n' '{\"sessions\":2,\"bytes\":64}'\n",
+        r#"#!/bin/sh
+set -eu
+case "$*" in
+  "list --json")
+    printf '%s\n' "$*" >> "$PWD/invocations"
+    printf '%s\n' '[{"name":"demo","status":"running","command":"agent","cwd":"/workspace","createdAt":"2026-09-02T10:00:00Z","tags":{"private":"false"},"displayName":"Demo"}]'
+    ;;
+  "stats --json demo")
+    printf '%s\n' "$*" >> "$PWD/invocations"
+    printf '%s\n' '{"name":"demo","status":"running","terminal":{"cols":120,"rows":40,"cursorX":1,"cursorY":2,"scrollbackUsed":3,"scrollbackCapacity":1000},"process":{"alive":true,"exitCode":null,"resources":{"rssKb":64,"cpuPercent":1.5}},"clients":{"total":1,"attached":1,"readOnly":0},"modes":{"sgrMouse":false,"cursorHidden":false,"kittyKeyboard":false,"kittyKeyboardFlags":[]},"uptimeSeconds":10}'
+    ;;
+  *)
+    printf 'unexpected argv: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
     );
 
     let module = PtyStatsModule::new(
         PtyStatsConfig::resolve(
             &executable,
             temporary.path().to_path_buf(),
-            PtyStatsScope::All,
             Duration::from_secs(5),
         )
         .unwrap(),
@@ -35,30 +50,29 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
     let component_bytes = fs::read(component("ST2_PTY_STATS_COMPONENT")).unwrap();
     let loaded = executor.load(&component_bytes).unwrap();
     let descriptor = executor.describe(&loaded, None).unwrap();
-    assert_eq!(descriptor.topics, ["stats"]);
-    assert_eq!(descriptor.snapshot_schema_id, "st2.resource.pty-stats.v1");
+    assert_eq!(descriptor.topics, ["lifecycle", "metadata", "runtime"]);
+    assert_eq!(
+        descriptor.snapshot_schema_id,
+        "dev.schickling.pty.snapshot.v1"
+    );
     assert_eq!(descriptor.snapshot_media_type, "application/json");
 
-
+    let request = |invocation_id, prior_digest, topics: &[&str]| ObservationRequest {
+        invocation_id,
+        uri: "pty:demo".into(),
+        selector: json!({ "topics": topics }),
+        prior_digest,
+        demand_watermark: Some(invocation_id),
+    };
     let first = executor
-        .observe(
-            &loaded,
-            &ObservationRequest {
-                invocation_id: 1,
-                uri: "dev.st2.pty-stats://all".into(),
-                selector: json!({ "topics": ["stats"] }),
-                prior_digest: None,
-                demand_watermark: Some(1),
-            },
-            None,
-        )
+        .observe(&loaded, &request(1, None, &["lifecycle", "metadata"]), None)
         .unwrap();
     let publication = match first {
         ObservationResult::Published { publication } => publication,
         other => panic!("first observation must publish, got {other:?}"),
     };
-    assert_eq!(publication.schema_id, "st2.resource.pty-stats.v1");
-    assert_eq!(publication.topics, ["stats"]);
+    assert_eq!(publication.schema_id, "dev.schickling.pty.snapshot.v1");
+    assert_eq!(publication.topics, ["lifecycle", "metadata", "runtime"]);
     assert_eq!(
         publication
             .facts
@@ -67,32 +81,25 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
             .iter()
             .map(|fact| fact.key())
             .collect::<Vec<_>>(),
-        ["scope"]
+        ["session", "state"]
     );
     let prior = SnapshotDigest::of(publication.bytes.as_slice());
 
-    let replay = executor
-        .observe(
-            &loaded,
-            &ObservationRequest {
-                invocation_id: 2,
-                uri: "dev.st2.pty-stats://all".into(),
-                selector: json!({ "topics": ["stats"] }),
-                prior_digest: Some(prior),
-                demand_watermark: Some(2),
-            },
-            None,
-        )
-        .unwrap();
-    assert_eq!(replay, ObservationResult::Unchanged);
+    assert_eq!(
+        executor
+            .observe(&loaded, &request(2, Some(prior), &["runtime"]), None)
+            .unwrap(),
+        ObservationResult::Unchanged
+    );
 
+    let invocations_before = fs::read_to_string(temporary.path().join("invocations")).unwrap();
     let denied = executor
         .observe(
             &loaded,
             &ObservationRequest {
                 invocation_id: 3,
-                uri: "dev.st2.pty-stats://session/other".into(),
-                selector: json!({ "session": "other", "topics": ["stats"] }),
+                uri: "pty:bad/other".into(),
+                selector: json!({ "topics": ["lifecycle"] }),
                 prior_digest: None,
                 demand_watermark: Some(3),
             },
@@ -103,16 +110,18 @@ fn pty_component_observes_replays_and_enforces_capability_scope() {
         &denied,
         ObservationResult::Failed {
             diagnostic: Some(diagnostic)
-        } if diagnostic.contains("PTY stats scope denied")
+        } if diagnostic.contains("invalid PTY URI")
     ));
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("invocations")).unwrap(),
+        invocations_before
+    );
 }
 
 #[test]
-fn github_pr_component_describes_and_denies_out_of_scope_before_transport() {
+fn github_pr_component_describes_and_rejects_noncanonical_uri_before_transport() {
     let module = GitHubPrModule::new(GitHubPrConfig {
-        owner: "example".into(),
-        repo: "demo".into(),
-        number: 389,
+        auth_executable: PathBuf::from("/nonexistent/gh"),
         connect_timeout: Duration::from_secs(3),
         total_timeout: Duration::from_secs(10),
     })
@@ -143,9 +152,6 @@ fn github_pr_component_describes_and_denies_out_of_scope_before_transport() {
                 invocation_id: 1,
                 uri: "github-pr://other/demo/389".into(),
                 selector: json!({
-                    "owner": "other",
-                    "repo": "demo",
-                    "number": 389,
                     "topics": ["ci.failure"]
                 }),
                 prior_digest: None,
@@ -158,7 +164,7 @@ fn github_pr_component_describes_and_denies_out_of_scope_before_transport() {
         &denied,
         ObservationResult::Failed {
             diagnostic: Some(diagnostic)
-        } if diagnostic.contains("GitHub pull request scope denied")
+        } if diagnostic.contains("invalid canonical GitHub pull request URI")
     ));
 }
 
@@ -202,8 +208,6 @@ esac
         VistaConfig::resolve(
             &executable,
             temporary.path().to_path_buf(),
-            "release-notes".into(),
-            7,
             Duration::from_secs(5),
         )
         .unwrap(),
@@ -213,10 +217,7 @@ esac
     let loaded = executor.load(&component_bytes).unwrap();
     let descriptor = executor.describe(&loaded, None).unwrap();
     assert_eq!(descriptor.capabilities.len(), 1);
-    assert_eq!(
-        descriptor.topics,
-        ["ready", "updated", "failed", "expired"]
-    );
+    assert_eq!(descriptor.topics, ["ready", "updated", "failed", "expired"]);
     assert_eq!(
         descriptor.snapshot_schema_id,
         "dev.schickling.vista.snapshot.v1"
@@ -227,8 +228,6 @@ esac
         invocation_id,
         uri: "vista://release-notes/v7".into(),
         selector: json!({
-            "slug": "release-notes",
-            "version": 7,
             "topics": ["ready", "updated", "failed", "expired"]
         }),
         prior_digest,
@@ -248,15 +247,14 @@ esac
             .iter()
             .map(|fact| fact.key())
             .collect::<Vec<_>>(),
-        ["state"]
+        ["artifact", "state", "blocks"]
     );
-    let carrier: serde_json::Value =
-        serde_json::from_slice(publication.bytes.as_slice()).unwrap();
+    let carrier: serde_json::Value = serde_json::from_slice(publication.bytes.as_slice()).unwrap();
     assert_eq!(
         carrier.get("schema").and_then(serde_json::Value::as_str),
         Some("dev.schickling.vista.snapshot.v1")
     );
-    assert!(carrier.get("observedAt").is_none());
+    assert!(carrier.get("observedAt").is_some());
     let prior = SnapshotDigest::of(publication.bytes.as_slice());
 
     assert_eq!(
@@ -267,11 +265,13 @@ esac
     );
 
     fs::write(temporary.path().join("mode"), "changed\n").unwrap();
-    let changed = executor.observe(&loaded, &request(3, Some(prior)), None).unwrap();
+    let changed = executor
+        .observe(&loaded, &request(3, Some(prior)), None)
+        .unwrap();
     assert!(matches!(
         changed,
         ObservationResult::Published { publication }
-            if publication.topics == ["updated", "ready"]
+            if publication.topics == ["updated"]
     ));
 
     let invocations_before = fs::read_to_string(temporary.path().join("invocations")).unwrap();
@@ -281,7 +281,7 @@ esac
             &ObservationRequest {
                 invocation_id: 4,
                 uri: "vista://bad--slug/v7".into(),
-                selector: json!({ "slug": "bad--slug", "version": 7 }),
+                selector: json!({ "topics": ["ready"] }),
                 prior_digest: None,
                 demand_watermark: Some(4),
             },
@@ -300,9 +300,7 @@ esac
         ("nonzero", "artifact unavailable for release-notes"),
     ] {
         fs::write(temporary.path().join("mode"), format!("{mode}\n")).unwrap();
-        let result = executor
-            .observe(&loaded, &request(5, None), None)
-            .unwrap();
+        let result = executor.observe(&loaded, &request(5, None), None).unwrap();
         assert!(matches!(
             &result,
             ObservationResult::Failed {
@@ -316,9 +314,7 @@ esac
 #[ignore = "explicit read-only public GitHub smoke; requires network and ST2_GITHUB_ISSUE_COMPONENT"]
 fn github_component_public_read_only_smoke() {
     let module = GitHubIssueModule::new(GitHubIssueConfig {
-        owner: "rust-lang".into(),
-        repo: "rust".into(),
-        number: 1,
+        auth_executable: PathBuf::from("/nonexistent/gh"),
         connect_timeout: Duration::from_secs(3),
         total_timeout: Duration::from_secs(10),
     })
@@ -327,10 +323,13 @@ fn github_component_public_read_only_smoke() {
     let component_bytes = fs::read(component("ST2_GITHUB_ISSUE_COMPONENT")).unwrap();
     let loaded = executor.load(&component_bytes).unwrap();
     let descriptor = executor.describe(&loaded, None).unwrap();
-    assert_eq!(descriptor.topics, ["issue"]);
+    assert_eq!(
+        descriptor.topics,
+        ["body", "state", "labels", "assignment", "discussion"]
+    );
     assert_eq!(
         descriptor.snapshot_schema_id,
-        "st2.resource.github-issue.v1"
+        "dev.schickling.github-issue.snapshot.v1"
     );
     assert_eq!(descriptor.snapshot_media_type, "application/json");
 
@@ -339,12 +338,9 @@ fn github_component_public_read_only_smoke() {
             &loaded,
             &ObservationRequest {
                 invocation_id: 1,
-                uri: "dev.st2.github-issue://rust-lang/rust/1".into(),
+                uri: "github-issue://github.com/rust-lang/rust/issues/1".into(),
                 selector: json!({
-                    "owner": "rust-lang",
-                    "repo": "rust",
-                    "number": 1,
-                    "topics": ["issue"]
+                    "topics": ["discussion"]
                 }),
                 prior_digest: None,
                 demand_watermark: Some(1),

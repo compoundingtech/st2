@@ -297,6 +297,8 @@
             "st2-resource-providers"
             "--lib"
             "--test"
+            "github_issue_component"
+            "--test"
             "github_pr_component"
             "-p"
             "st2"
