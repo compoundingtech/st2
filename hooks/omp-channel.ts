@@ -2,12 +2,12 @@
 //
 // Forked from pi-channel.ts: omp is pi-family and loads the same extension shape, but the two
 // diverge where it matters (measured 2026-08-25, omp v18.0.3 — see
-// docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so the idle edge is
-// `agent_end` followed by bounded polling of `ctx.isIdle()`; and omp exposes
-// `tool_approval_requested`/`tool_approval_resolved`, which carry the blocked-on-human axis pi
-// cannot express. Like the pi asset this file holds no policy: st2 decides which message is
-// delivered, how, and what a starting session is told. It fails open in both directions — an
-// unmanaged omp session loads this extension and does nothing; a slow channel starts the session
+// docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so terminal
+// `agent_end` uses a bounded `ctx.isIdle()` poll; structured `ask` tool events and approval events
+// carry the blocked-on-human axis pi cannot express. Like the pi asset this file holds no delivery
+// policy: st2 decides which message is delivered, how, and what a starting session is told. It
+// fails open in both directions — an unmanaged omp session loads this extension and does nothing;
+// a slow channel starts the session
 // without restored context rather than hanging it.
 import childProcess from "node:child_process";
 import type {
@@ -62,6 +62,10 @@ type Stash = {
    * frame omitting the cost would erase the published one on the very next turn boundary.
    */
   lastCostUsd?: number;
+  /** The structured `ask` tool call currently waiting for its matching result. */
+  pendingAskToolCallId?: string;
+  /** Generation fencing every bounded settle poll against newer activity. */
+  settleGeneration?: number;
 };
 
 /**
@@ -71,6 +75,38 @@ type Stash = {
  */
 const finiteOrNull = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
+
+const REASON_MAX_CHARS = 240;
+
+/** Keep diagnostic state bounded and stable across multiline/model-authored input. */
+const boundedReason = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replace(/\s+/gu, " ");
+  if (!normalized) return undefined;
+  const chars = [...normalized];
+  return chars.length <= REASON_MAX_CHARS
+    ? normalized
+    : `${chars.slice(0, REASON_MAX_CHARS - 1).join("")}…`;
+};
+
+type AgentEndFrame = {
+  willContinue?: unknown;
+  messages?: unknown;
+};
+
+/** A terminal provider error requires operator action; it is not an idle settle. */
+const terminalAssistantError = (event: AgentEndFrame): string | undefined => {
+  if (!Array.isArray(event.messages)) return undefined;
+  for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+    const message = event.messages[index];
+    if (!message || typeof message !== "object") continue;
+    if (!("role" in message) || message.role !== "assistant") continue;
+    if (!("stopReason" in message) || message.stopReason !== "error") return undefined;
+    return boundedReason("errorMessage" in message ? message.errorMessage : undefined) ??
+      "assistant error";
+  }
+  return undefined;
+};
 
 /**
  * Compile-time coupling to the pinned pi declarations for the surfaces the context producer reads.
@@ -146,6 +182,10 @@ export default function (pi: ExtensionAPI) {
   const state = stash();
   const { bin, catalog, identity, runtimeId, session, seq } = state;
 
+
+  const cancelSettle = () => {
+    state.settleGeneration = (state.settleGeneration ?? 0) + 1;
+  };
   // Always close a NAMED channel, never "whatever is current". A session replacement tears the
   // old session down around the new one's start, so a teardown handler that closed `current`
   // would reap the successor it just opened (measured on pi; same lifecycle shape here).
@@ -190,7 +230,9 @@ export default function (pi: ExtensionAPI) {
     // by design, so without this a replacement session's first frames would restate the old
     // session's cost as their own.
     state.lastCostUsd = undefined;
+    state.pendingAskToolCallId = undefined;
 
+    cancelSettle();
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
     if (session) channelEnv[SESSION] = session;
@@ -301,13 +343,19 @@ export default function (pi: ExtensionAPI) {
   const IDLE_POLL_BUDGET_MS = 5000;
 
   const watchSettle = (ctx: ExtensionContext) => {
+    // Starting a newer settle attempt also retires every older one.
+    const generation = (state.settleGeneration ?? 0) + 1;
+    state.settleGeneration = generation;
     // Bind this poll to the channel that was live when it started. A session
     // replacement inside the polling window would otherwise let a retired
     // context publish `idle` into the SUCCESSOR's channel while it is active.
     const originatingChild = state.child;
     const startedAt = Date.now();
     const poller = setInterval(() => {
-      if (state.child !== originatingChild) {
+      if (
+        state.child !== originatingChild ||
+        state.settleGeneration !== generation
+      ) {
         clearInterval(poller);
         return;
       }
@@ -413,10 +461,24 @@ export default function (pi: ExtensionAPI) {
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
-  pi.on("agent_start", async () => sendFrame({ type: "state", state: "active" }));
+  pi.on("agent_start", async () => {
+    cancelSettle();
+    sendFrame({ type: "state", state: "active" });
+  });
   pi.on("agent_end", async (event, ctx) => {
     captureCost(event);
     sendContext(ctx);
+    const end = event as AgentEndFrame;
+    if (end.willContinue === true) {
+      cancelSettle();
+      return;
+    }
+    const error = terminalAssistantError(end);
+    if (error) {
+      cancelSettle();
+      sendFrame({ type: "state", state: "active", reason: error });
+      return;
+    }
     watchSettle(ctx);
   });
 
@@ -442,17 +504,76 @@ export default function (pi: ExtensionAPI) {
     sendContext(ctx, { trigger: null, count: durableCompactions(ctx) });
   });
 
-  // omp exposes these two events but the pinned pi typings (0.84.2, which this asset imports)
-  // do not declare them — measured live on omp v18.0.3. Registered through a widened view of
-  // the same bound `on`; the payload shape is the one captured in
-  // docs/vrs/06-omp-driver/.experiments/2026-08-25-omp-harness-integration.md.
+  // omp's structured ask tool is observable at its real blocking interval: `tool_call` fires
+  // before the dialog and the matching `tool_result` only after the operator answers. Keep the
+  // correlating id in process-wide state so an unrelated concurrent result cannot clear the ask.
+  type ToolCallFrame = {
+    toolName?: unknown;
+    toolCallId?: unknown;
+    input?: unknown;
+  };
+  type ToolResultFrame = { toolCallId?: unknown };
+  const firstAskQuestion = (event: ToolCallFrame): string | undefined => {
+    if (
+      event.toolName !== "ask" ||
+      typeof event.toolCallId !== "string" ||
+      event.toolCallId.trim() === ""
+    ) {
+      return undefined;
+    }
+    if (!event.input || typeof event.input !== "object" || !("questions" in event.input)) {
+      return undefined;
+    }
+    const questions = event.input.questions;
+    if (!Array.isArray(questions)) return undefined;
+    for (const question of questions) {
+      if (!question || typeof question !== "object" || !("question" in question)) continue;
+      const reason = boundedReason(question.question);
+      if (reason) return reason;
+    }
+    return undefined;
+  };
+
+  onWidened("tool_call", async (rawEvent) => {
+    // Pinned pi declarations do not know OMP's tool events; the handler validates fields below.
+    const event = rawEvent as ToolCallFrame;
+    const question = firstAskQuestion(event);
+    if (!question || typeof event.toolCallId !== "string") return;
+    state.pendingAskToolCallId = event.toolCallId;
+    cancelSettle();
+    sendFrame({
+      type: "state",
+      state: "active",
+      blockedOn: "human",
+      ask: "question",
+      reason: question,
+    });
+  });
+  onWidened("tool_result", async (rawEvent, ctx) => {
+    const event = rawEvent as ToolResultFrame;
+    if (
+      typeof event.toolCallId !== "string" ||
+      event.toolCallId !== state.pendingAskToolCallId
+    ) {
+      return;
+    }
+    state.pendingAskToolCallId = undefined;
+    if (idleProof(ctx)) {
+      sendFrame({ type: "state", state: "idle" });
+      return;
+    }
+    sendFrame({ type: "state", state: "active" });
+    watchSettle(ctx);
+  });
+
+  // Approval events are an independent human-blocking surface. omp's pinned pi typings do not
+  // declare them, so register through the same widened `on` view.
   type ApprovalFrame = { toolName?: unknown };
-  const onApproval = pi.on.bind(pi) as unknown as (
-    event: "tool_approval_requested" | "tool_approval_resolved",
-    handler: (event: ApprovalFrame, ctx: ExtensionContext) => void | Promise<void>,
-  ) => void;
-  onApproval("tool_approval_requested", async (event) => {
+  onWidened("tool_approval_requested", async (rawEvent) => {
+    if (state.pendingAskToolCallId) return;
+    const event = rawEvent as ApprovalFrame;
     const tool = typeof event.toolName === "string" ? event.toolName : "unknown";
+    cancelSettle();
     sendFrame({
       type: "state",
       state: "active",
@@ -461,13 +582,20 @@ export default function (pi: ExtensionAPI) {
       reason: tool,
     });
   });
-  onApproval("tool_approval_resolved", async (_event, ctx) => {
+  onWidened("tool_approval_resolved", async (_event, ctx) => {
+    if (state.pendingAskToolCallId) return;
     if (idleProof(ctx)) {
       sendFrame({ type: "state", state: "idle" });
       return;
     }
     sendFrame({ type: "state", state: "active" });
     watchSettle(ctx);
+  });
+
+  onWidened("session_before_compact", async () => {
+    // Rust owns the durable context path and the write-if-blank policy. The extension carries only
+    // the observed edge, so it cannot accidentally overwrite authored state itself.
+    sendFrame({ type: "pre_compact" });
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -494,11 +622,12 @@ export default function (pi: ExtensionAPI) {
       );
     }
   });
-  // Only a real quit closes from here. A session replacement also fires `session_shutdown`, and
-  // it fires around the successor's `session_start`; closing on those reasons would reap the
-  // channel the new session just opened. Replacement is handled by `open()` closing its
-  // predecessor instead.
-  pi.on("session_shutdown", async (event) => {
-    if ((event as { reason?: string })?.reason === "quit") closeChild(state.child);
+  // Upstream's `session_shutdown` payload has no reason: source defines it as process exit only.
+  // Replacement is a separate session-switch lifecycle and remains handled by `open()` closing
+  // the named predecessor.
+  pi.on("session_shutdown", async () => {
+    cancelSettle();
+    state.pendingAskToolCallId = undefined;
+    closeChild(state.child);
   });
 }

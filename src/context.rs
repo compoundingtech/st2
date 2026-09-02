@@ -16,7 +16,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use crate::message;
+
+const NOW_LOCK: &str = ".now.lock";
 
 /// `<agent_dir>/resources/context`.
 pub fn context_dir(agent_dir: &Path) -> PathBuf {
@@ -84,9 +88,38 @@ pub fn read_now_fresh(context_dir: &Path, max_age: Duration) -> String {
 }
 
 /// Overwrite `now.md` with `content` (atomic). Creates the context dir.
+///
+/// Every writer takes the same lock used by [`write_now_if_blank`], so a conditional recovery
+/// write cannot pass its predicate and then overwrite authored state that landed in between.
 pub fn write_now(context_dir: &Path, content: &str) -> anyhow::Result<()> {
-    fs::create_dir_all(context_dir)?;
+    let _lock = lock_now(context_dir)?;
     write_atomic(&now_file(context_dir), content)
+}
+
+/// Atomically replace an absent or successfully decoded whitespace-only `now.md`.
+///
+/// Read errors other than `NotFound` are preserved. Treating an unreadable file as empty would
+/// overwrite state precisely when its contents cannot be proven blank.
+pub fn write_now_if_blank(context_dir: &Path, content: &str) -> anyhow::Result<bool> {
+    let _lock = lock_now(context_dir)?;
+    let path = now_file(context_dir);
+    match fs::read_to_string(&path) {
+        Ok(current) if !current.trim().is_empty() => Ok(false),
+        Ok(_) => {
+            write_atomic(&path, content)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic(&path, content)?;
+            Ok(true)
+        }
+        Err(error) => Err(error).context("read current now.md before conditional write"),
+    }
+}
+
+fn lock_now(context_dir: &Path) -> anyhow::Result<fs::File> {
+    crate::harness_state::lock_exclusive(&context_dir.join(NOW_LOCK))
+        .context("acquire now.md writer lock")
 }
 
 /// Append one decision to the log. `decision` and `why` must be single non-empty lines (the log is a
@@ -216,6 +249,36 @@ mod tests {
             "mid-refactor: step 3 of 5\n"
         );
         assert_eq!(read_now_fresh(&dir, Duration::ZERO), "");
+    }
+
+    #[test]
+    fn conditional_write_replaces_only_decoded_blank_state_and_preserves_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+
+        assert!(write_now_if_blank(&dir, "stub\n").unwrap());
+        assert_eq!(read(&dir, View::Now), "stub\n");
+
+        write_now(&dir, "authored\n").unwrap();
+        assert!(!write_now_if_blank(&dir, "replacement\n").unwrap());
+        assert_eq!(read(&dir, View::Now), "authored\n");
+
+        std::fs::remove_file(now_file(&dir)).unwrap();
+        std::fs::write(now_file(&dir), [0xff]).unwrap();
+        let error = write_now_if_blank(&dir, "replacement\n")
+            .expect_err("an undecodable now.md must not be classified as blank");
+        assert!(
+            error
+                .to_string()
+                .contains("read current now.md before conditional write"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(now_file(&dir)).unwrap(),
+            [0xff],
+            "undecodable state stays byte-for-byte intact"
+        );
+
     }
 
     #[test]

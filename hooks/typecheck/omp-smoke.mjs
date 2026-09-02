@@ -1,9 +1,6 @@
-// Runtime smoke of the shipped omp extension: drives the channel-open path far enough that a
-// use-before-declaration (TDZ), a broken import, or a top-level throw fails the check — the
-// classes a type-only gate is provably blind to. The channel binary is `true`, so the open
-// times out its hello and resolves empty; any thrown error fails the smoke. Mirrors smoke.mjs,
-// minus `agent_settled`: omp has no such event (measured 2026-08-25), so the idle edge is the
-// agent_end poll, which this smoke exercises with an immediately-true isIdle.
+// Runtime smoke of the shipped omp extension: drives lifecycle, human-blocking, compaction, and
+// terminal edges against a recorder standing in for the Rust channel. This catches both runtime
+// defects a type-only gate cannot see and wire-contract regressions between the two languages.
 import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
@@ -48,9 +45,12 @@ const pi = {
 mod.default(pi);
 for (const name of [
   "session_start",
+  "session_before_compact",
   "session_shutdown",
   "agent_start",
   "agent_end",
+  "tool_call",
+  "tool_result",
   "tool_approval_requested",
   "tool_approval_resolved",
 ]) {
@@ -114,12 +114,119 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("agent_end")(messageEvent, ctx);
   // omp's event names no reason: the producer must withhold the trigger, never invent one.
   await handlers.get("session_compact")({ compactionEntry: { id: "86c8955c" } }, ctx);
-  await handlers.get("session_shutdown")({ reason: "smoke" }, ctx);
+  await handlers.get("session_before_compact")({}, ctx);
+  await handlers.get("session_shutdown")({}, ctx);
 }
+
+// Structured ask observation is correlated by toolCallId. An unrelated result must emit nothing
+// (and therefore leave the durable blocked frame intact); only the matching result clears it.
+const activeCtx = { ...fullCtx, isIdle: () => false };
+await handlers.get("session_start")({}, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+const beforeAsk = readFrames().filter((frame) => frame.type === "state").length;
+await handlers.get("tool_call")(
+  {
+    toolName: "ask",
+    toolCallId: "ask-1",
+    input: {
+      questions: [{ id: "target", question: "  Which\n deployment target?  ", options: [] }],
+    },
+  },
+  activeCtx,
+);
+await handlers.get("tool_result")({ toolName: "read", toolCallId: "unrelated" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+let askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
+assert.deepStrictEqual(askStates, [
+  {
+    type: "state",
+    state: "active",
+    blockedOn: "human",
+    ask: "question",
+    reason: "Which deployment target?",
+  },
+]);
+await handlers.get("tool_result")({ toolName: "ask", toolCallId: "ask-1" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
+assert.deepStrictEqual(askStates.at(-1), { type: "state", state: "active" });
+
+// Every poll is generation-fenced. New activity, an automatic continuation, and a terminal error
+// each retire an older settle poll before it can publish a stale idle frame.
+let settleIdle = false;
+const settleCtx = { ...fullCtx, isIdle: () => settleIdle };
+const successfulEnd = {
+  messages: [{ role: "assistant", stopReason: "stop" }],
+};
+
+let beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+await handlers.get("agent_end")(successfulEnd, settleCtx);
+await handlers.get("agent_start")({}, settleCtx);
+settleIdle = true;
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  [{ type: "state", state: "active" }],
+  "new activity must cancel the older settle poll",
+);
+
+settleIdle = false;
+beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+await handlers.get("agent_end")(successfulEnd, settleCtx);
+await handlers.get("agent_end")(
+  {
+    willContinue: true,
+    messages: [{ role: "assistant", stopReason: "error", errorMessage: "transient retry" }],
+  },
+  settleCtx,
+);
+settleIdle = true;
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.strictEqual(
+  readFrames().filter((frame) => frame.type === "state").length,
+  beforeSettleCase,
+  "willContinue must cancel the older poll and start no new settle",
+);
+
+settleIdle = false;
+beforeSettleCase = readFrames().filter((frame) => frame.type === "state").length;
+await handlers.get("agent_end")(successfulEnd, settleCtx);
+await handlers.get("agent_end")(
+  {
+    messages: [
+      { role: "user" },
+      { role: "assistant", stopReason: "error", errorMessage: "  credential\n expired  " },
+    ],
+  },
+  settleCtx,
+);
+settleIdle = true;
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "state").slice(beforeSettleCase),
+  [{ type: "state", state: "active", reason: "credential expired" }],
+  "terminal error must cancel the older poll and remain actionable",
+);
+
+// `session_shutdown` has no reason field upstream and always denotes process exit. Closing must
+// make a later observational frame a no-op.
+const beforeShutdown = readFrames().filter((frame) => frame.type === "state").length;
+await handlers.get("session_shutdown")({}, fullCtx);
+await handlers.get("agent_start")({}, fullCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.strictEqual(
+  readFrames().filter((frame) => frame.type === "state").length,
+  beforeShutdown,
+  "shutdown without a reason closes the channel",
+);
 
 // Give the recorder a moment to drain, then assert the wire the Rust decoder reads.
 await new Promise((resolve) => setTimeout(resolve, 500));
 const frames = readFrames();
+assert.ok(
+  frames.some((frame) => frame.type === "pre_compact"),
+  "session_before_compact must emit the Rust-owned recovery edge",
+);
 const context = frames.filter((frame) => frame.type === "context");
 assert.ok(context.length > 0, "the producer must emit context frames, not merely load");
 
