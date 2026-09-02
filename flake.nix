@@ -161,6 +161,10 @@
             "run"
             "--test"
             "driver_expansion"
+            # Lifecycle tests fork while holding temporary sockets and executables.
+            # Serial execution prevents sibling tests from inheriting those live handles.
+            "--"
+            "--test-threads=1"
           ];
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
