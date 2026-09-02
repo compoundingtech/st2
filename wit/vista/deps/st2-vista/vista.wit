@@ -6,17 +6,29 @@ interface vista {
     version: u64,
   }
 
+  record source-snapshot {
+    manifest-json: list<u8>,
+    observed-at: string,
+  }
+
+  record source-observation {
+    current: source-snapshot,
+    previous: option<source-snapshot>,
+  }
+
   variant exit-status {
     code(s32),
     signal(s32),
   }
 
-  record outcome {
-    stdout: list<u8>,
+  record command-failure {
     stderr: list<u8>,
-    stdout-truncated: bool,
-    stderr-truncated: bool,
     exit: exit-status,
+  }
+
+  variant artifact-response {
+    ok(source-observation),
+    command-failed(command-failure),
   }
 
   variant vista-error {
@@ -27,5 +39,6 @@ interface vista {
     cancelled,
   }
 
-  get: func(request: artifact-request) -> result<outcome, vista-error>;
+  get: func(request: artifact-request) -> result<artifact-response, vista-error>;
+  bind-snapshot: func(digest: list<u8>) -> result<_, vista-error>;
 }

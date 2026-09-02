@@ -59,38 +59,25 @@ pub struct DeclaredProfileRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredProviderCapability {
     GitHubIssue {
-        owner: String,
-        repo: String,
-        number: u64,
+        auth_executable: String,
         connect_timeout_ms: u64,
         total_timeout_ms: u64,
     },
     GitHubPr {
-        owner: String,
-        repo: String,
-        number: u64,
+        auth_executable: String,
         connect_timeout_ms: u64,
         total_timeout_ms: u64,
     },
     PtyStats {
         executable: String,
         cwd: String,
-        scope: DeclaredPtyStatsScope,
         deadline_ms: u64,
     },
     Vista {
         executable: String,
         cwd: String,
-        slug: String,
-        version: u64,
         deadline_ms: u64,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeclaredPtyStatsScope {
-    All,
-    Session(String),
 }
 
 /// What `<catalog>/catalog.kdl` declares. An absent file leaves every field empty.
@@ -101,6 +88,12 @@ pub struct CatalogConfig {
     pub pty_root: Option<String>,
     /// Resource profiles in declaration order.
     pub profiles: Vec<DeclaredProfile>,
+}
+
+/// The catalog fields that raw-preimage repair may interpret from an otherwise invalid catalog.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEnvelope {
+    pub pty_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,28 +130,7 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
                     anyhow::bail!("catalog block declared more than once");
                 }
                 seen_catalog = true;
-                let Some(children) = node.children() else {
-                    continue;
-                };
-                for child in children.nodes() {
-                    match child.name().value() {
-                        "pty-root" => {
-                            let value = child
-                                .get(0)
-                                .and_then(|v| v.as_string())
-                                .filter(|v| !v.is_empty())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
-                                    )
-                                })?;
-                            config.pty_root = Some(value.to_string());
-                        }
-                        other => {
-                            anyhow::bail!("unknown catalog field '{other}' (expected pty-root)")
-                        }
-                    }
-                }
+                config.pty_root = parse_catalog_node(node)?;
             }
             "profile" => {
                 let profile = parse_profile(node)?;
@@ -174,6 +146,53 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
         }
     }
     Ok(config)
+}
+
+/// Parse only the catalog envelope while treating every other top-level declaration as opaque.
+///
+/// Raw-preimage repair uses this parser so an obsolete profile or agent grammar cannot prevent
+/// replacement, while the PTY-root boundary remains subject to the ordinary catalog semantics.
+pub(crate) fn parse_envelope(text: &str) -> anyhow::Result<CatalogEnvelope> {
+    let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("KDL parse error: {e}"))?;
+    let mut envelope = CatalogEnvelope::default();
+    let mut seen_catalog = false;
+    for node in doc.nodes() {
+        if node.name().value() != "catalog" {
+            continue;
+        }
+        if seen_catalog {
+            anyhow::bail!("catalog block declared more than once");
+        }
+        seen_catalog = true;
+        envelope.pty_root = parse_catalog_node(node)?;
+    }
+    Ok(envelope)
+}
+
+fn parse_catalog_node(node: &kdl::KdlNode) -> anyhow::Result<Option<String>> {
+    let Some(children) = node.children() else {
+        return Ok(None);
+    };
+    let mut pty_root = None;
+    for child in children.nodes() {
+        match child.name().value() {
+            "pty-root" => {
+                anyhow::ensure!(pty_root.is_none(), "pty-root declared more than once");
+                let value = child
+                    .get(0)
+                    .and_then(|v| v.as_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pty-root needs a non-empty path, e.g. pty-root \"/run/agents/pty\""
+                        )
+                    })?;
+                pty_root = Some(value.to_string());
+            }
+            other => anyhow::bail!("unknown catalog field '{other}' (expected pty-root)"),
+        }
+    }
+    Ok(pty_root)
 }
 
 fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
@@ -306,7 +325,9 @@ fn parse_profile(node: &kdl::KdlNode) -> anyhow::Result<DeclaredProfile> {
                     anyhow::anyhow!("profile '{scheme}': runtime needs exactly one component path")
                 })?,
                 capability: capability.ok_or_else(|| {
-                    anyhow::anyhow!("profile '{scheme}': runtime needs exactly one typed capability")
+                    anyhow::anyhow!(
+                        "profile '{scheme}': runtime needs exactly one typed capability"
+                    )
                 })?,
                 demand,
             });
@@ -388,16 +409,17 @@ fn parse_github_issue_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': github-issue requires owner, repo, number, \
-         connect-timeout-ms, and total-timeout-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-issue requires auth-executable, connect-timeout-ms, and \
+         total-timeout-ms properties"
     );
-    let owner = required_string_property(scheme, node, "owner")?;
-    let repo = required_string_property(scheme, node, "repo")?;
-    let number = required_u64_property(scheme, node, "number")?;
+    let auth_executable = required_string_property(scheme, node, "auth-executable")?;
+    anyhow::ensure!(
+        Path::new(&auth_executable).is_absolute(),
+        "profile '{scheme}': GitHub authentication executable must be absolute"
+    );
     let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
     let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
-    anyhow::ensure!(number > 0, "profile '{scheme}': GitHub issue number must be positive");
     anyhow::ensure!(
         connect_timeout_ms > 0
             && connect_timeout_ms <= total_timeout_ms
@@ -405,9 +427,7 @@ fn parse_github_issue_capability(
         "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
     );
     Ok(DeclaredProviderCapability::GitHubIssue {
-        owner,
-        repo,
-        number,
+        auth_executable,
         connect_timeout_ms,
         total_timeout_ms,
     })
@@ -418,19 +438,17 @@ fn parse_github_pr_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': github-pr requires owner, repo, number, \
-         connect-timeout-ms, and total-timeout-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': github-pr requires auth-executable, connect-timeout-ms, and \
+         total-timeout-ms properties"
     );
-    let owner = required_string_property(scheme, node, "owner")?;
-    let repo = required_string_property(scheme, node, "repo")?;
-    let number = required_u64_property(scheme, node, "number")?;
+    let auth_executable = required_string_property(scheme, node, "auth-executable")?;
+    anyhow::ensure!(
+        Path::new(&auth_executable).is_absolute(),
+        "profile '{scheme}': GitHub authentication executable must be absolute"
+    );
     let connect_timeout_ms = required_u64_property(scheme, node, "connect-timeout-ms")?;
     let total_timeout_ms = required_u64_property(scheme, node, "total-timeout-ms")?;
-    anyhow::ensure!(
-        number > 0,
-        "profile '{scheme}': GitHub pull request number must be positive"
-    );
     anyhow::ensure!(
         connect_timeout_ms > 0
             && connect_timeout_ms <= total_timeout_ms
@@ -438,9 +456,7 @@ fn parse_github_pr_capability(
         "profile '{scheme}': GitHub deadlines must be positive, ordered, and at most 60000ms"
     );
     Ok(DeclaredProviderCapability::GitHubPr {
-        owner,
-        repo,
-        number,
+        auth_executable,
         connect_timeout_ms,
         total_timeout_ms,
     })
@@ -451,8 +467,8 @@ fn parse_pty_stats_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 4 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': pty-stats requires executable, cwd, scope, and deadline-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': pty-stats requires executable, cwd, and deadline-ms properties"
     );
     let executable = required_string_property(scheme, node, "executable")?;
     let cwd = required_string_property(scheme, node, "cwd")?;
@@ -461,20 +477,9 @@ fn parse_pty_stats_capability(
         deadline_ms > 0 && deadline_ms <= 60_000,
         "profile '{scheme}': PTY deadline must be between 1ms and 60000ms"
     );
-    let scope = required_string_property(scheme, node, "scope")?;
-    let scope = if scope == "all" {
-        DeclaredPtyStatsScope::All
-    } else if let Some(session) = scope.strip_prefix("session:").filter(|value| !value.is_empty()) {
-        DeclaredPtyStatsScope::Session(session.to_owned())
-    } else {
-        anyhow::bail!(
-            "profile '{scheme}': PTY scope must be 'all' or 'session:<id>'"
-        );
-    };
     Ok(DeclaredProviderCapability::PtyStats {
         executable,
         cwd,
-        scope,
         deadline_ms,
     })
 }
@@ -484,18 +489,12 @@ fn parse_vista_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': vista requires executable, cwd, slug, version, and deadline-ms properties"
+        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': vista requires executable, cwd, and deadline-ms properties"
     );
     let executable = required_string_property(scheme, node, "executable")?;
     let cwd = required_string_property(scheme, node, "cwd")?;
-    let slug = required_string_property(scheme, node, "slug")?;
-    let version = required_u64_property(scheme, node, "version")?;
     let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
-    anyhow::ensure!(
-        valid_vista_slug(&slug) && (1..=9_007_199_254_740_991).contains(&version),
-        "profile '{scheme}': Vista artifact scope is invalid"
-    );
     anyhow::ensure!(
         deadline_ms > 0 && deadline_ms <= 60_000,
         "profile '{scheme}': Vista deadline must be between 1ms and 60000ms"
@@ -503,20 +502,8 @@ fn parse_vista_capability(
     Ok(DeclaredProviderCapability::Vista {
         executable,
         cwd,
-        slug,
-        version,
         deadline_ms,
     })
-}
-
-fn valid_vista_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 128
-        && slug.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (byte == b'-' && index > 0)
-        })
-        && !slug.ends_with('-')
-        && !slug.contains("--")
 }
 
 fn required_string_property(
@@ -536,11 +523,7 @@ fn required_string_property(
         })
 }
 
-fn required_u64_property(
-    scheme: &str,
-    node: &kdl::KdlNode,
-    name: &str,
-) -> anyhow::Result<u64> {
+fn required_u64_property(scheme: &str, node: &kdl::KdlNode, name: &str) -> anyhow::Result<u64> {
     node.get(name)
         .and_then(|value| value.as_integer())
         .and_then(|value| u64::try_from(value).ok())
@@ -557,6 +540,18 @@ pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
     match std::fs::read_to_string(config_path(catalog_root)) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogConfig::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read only the envelope of `<catalog>/catalog.kdl`.
+///
+/// A missing file is the default envelope, matching [`load`]. Non-envelope declarations must be
+/// syntactically valid KDL but are otherwise left uninterpreted for raw-preimage repair.
+pub(crate) fn load_envelope(catalog_root: &Path) -> anyhow::Result<CatalogEnvelope> {
+    match std::fs::read_to_string(config_path(catalog_root)) {
+        Ok(text) => parse_envelope(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogEnvelope::default()),
         Err(e) => Err(e.into()),
     }
 }
@@ -985,7 +980,7 @@ mod tests {
               runtime {
                 component "components/github-issue.wasm"
                 demand #true
-                github-issue owner="rust-lang" repo="rust" number=1 connect-timeout-ms=3000 total-timeout-ms=10000
+                github-issue auth-executable="/nix/store/example/bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
               }
             }
             "#,
@@ -996,9 +991,7 @@ mod tests {
             Some(DeclaredProfileRuntime {
                 component: "components/github-issue.wasm".into(),
                 capability: DeclaredProviderCapability::GitHubIssue {
-                    owner: "rust-lang".into(),
-                    repo: "rust".into(),
-                    number: 1,
+                    auth_executable: "/nix/store/example/bin/gh".into(),
                     connect_timeout_ms: 3000,
                     total_timeout_ms: 10000,
                 },
@@ -1010,19 +1003,19 @@ mod tests {
             r#"profile "dev.x" { wasm "x.wasm"; runtime "shell" { component "x.wasm" } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x.wasm" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component ""; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; component "y"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component ""; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; component "y"; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
             r#"profile "dev.x" { wasm "x.wasm"; runtime { argv "x" } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000; github-issue owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" scope="all" deadline-ms=1000 } }"#,
-            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" scope="shell" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" deadline-ms=1000; github-issue auth-executable="/bin/gh" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; demand #true; demand #true; pty-stats executable="pty" cwd="/" deadline-ms=1000 } }"#,
+            r#"profile "dev.x" { wasm "x.wasm"; runtime { component "x"; pty-stats executable="pty" cwd="/" deadline-ms=1000 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }
     }
 
     #[test]
-    fn github_pr_runtime_capability_is_exact_and_bounded() {
+    fn github_pr_runtime_capability_authorizes_dynamic_resources_with_bounded_transport() {
         let config = parse(
             r#"
             profile "github-pr" {
@@ -1030,7 +1023,7 @@ mod tests {
               runtime {
                 component "components/github-pr.component.wasm"
                 demand #true
-                github-pr owner="example" repo="demo" number=389 connect-timeout-ms=3000 total-timeout-ms=10000
+                github-pr auth-executable="/nix/store/example/bin/gh" connect-timeout-ms=3000 total-timeout-ms=10000
               }
             }
             "#,
@@ -1041,9 +1034,7 @@ mod tests {
             Some(DeclaredProfileRuntime {
                 component: "components/github-pr.component.wasm".into(),
                 capability: DeclaredProviderCapability::GitHubPr {
-                    owner: "example".into(),
-                    repo: "demo".into(),
-                    number: 389,
+                    auth_executable: "/nix/store/example/bin/gh".into(),
                     connect_timeout_ms: 3000,
                     total_timeout_ms: 10000,
                 },
@@ -1051,16 +1042,17 @@ mod tests {
             })
         );
         for malformed in [
-            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=0 connect-timeout-ms=1 total-timeout-ms=2 } }"#,
-            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=3 total-timeout-ms=2 } }"#,
-            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr owner="o" repo="r" number=1 connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" owner="o" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="gh" connect-timeout-ms=1 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" connect-timeout-ms=3 total-timeout-ms=2 } }"#,
+            r#"profile "github-pr" { wasm "x"; runtime { component "x"; github-pr auth-executable="/bin/gh" connect-timeout-ms=1 total-timeout-ms=60001 } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }
     }
 
     #[test]
-    fn vista_runtime_capability_is_exact_and_bounded() {
+    fn vista_runtime_capability_authorizes_dynamic_artifacts_with_bounded_execution() {
         let config = parse(
             r#"
             profile "vista" {
@@ -1068,7 +1060,7 @@ mod tests {
               runtime {
                 component "components/vista.component.wasm"
                 demand #true
-                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" slug="release-notes" version=7 deadline-ms=10000
+                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" deadline-ms=10000
               }
             }
             "#,
@@ -1081,20 +1073,15 @@ mod tests {
                 capability: DeclaredProviderCapability::Vista {
                     executable: "/nix/store/example/bin/vista".into(),
                     cwd: "/var/empty".into(),
-                    slug: "release-notes".into(),
-                    version: 7,
                     deadline_ms: 10000,
                 },
                 demand: true,
             })
         );
         for malformed in [
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=0 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=60001 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="-release" version=1 deadline-ms=1 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=0 deadline-ms=1 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=9007199254740992 deadline-ms=1 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=1 extra="no" } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=0 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=60001 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=1 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }

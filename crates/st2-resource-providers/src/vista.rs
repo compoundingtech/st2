@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -8,9 +9,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, Utc};
 use parking_lot::Mutex;
 use st2_resource_wasip2::{
-    CapabilityContext, CapabilityModule, InterruptionReason,
+    CapabilityContext, CapabilityModule, CapabilityPhase, InterruptionReason,
     InvocationControl as ExecutorInvocationControl, InvocationStore,
 };
 use wasmtime::component::{HasSelf, Linker};
@@ -23,20 +25,21 @@ mod bindings {
 }
 
 use bindings::compoundingtech::st2_vista::vista::{
-    ArtifactRequest, ExitStatus, Host, Outcome, VistaError,
+    ArtifactRequest, ArtifactResponse, CommandFailure, ExitStatus, Host, SourceObservation,
+    SourceSnapshot, VistaError,
 };
 
 const IMPORT_NAME: &str = "compoundingtech:st2-vista/vista@0.1.0";
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const MAX_VERSION: u64 = 9_007_199_254_740_991;
+const MAX_VERSION: u64 = 9_999_999_999_999_999_999;
+const SNAPSHOT_DIGEST_BYTES: usize = 32;
+const MAX_CACHED_SNAPSHOTS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VistaConfig {
     pub executable: PathBuf,
     pub cwd: PathBuf,
-    pub slug: String,
-    pub version: u64,
     pub deadline: Duration,
 }
 
@@ -44,8 +47,6 @@ impl VistaConfig {
     pub fn resolve(
         executable: impl AsRef<Path>,
         cwd: impl Into<PathBuf>,
-        slug: String,
-        version: u64,
         deadline: Duration,
     ) -> Result<Self, &'static str> {
         if deadline.is_zero() || deadline > Duration::from_secs(60) {
@@ -57,14 +58,9 @@ impl VistaConfig {
         if !cwd.is_absolute() {
             return Err("Vista cwd must be absolute");
         }
-        if !valid_slug(&slug) || !(1..=MAX_VERSION).contains(&version) {
-            return Err("Vista artifact scope is invalid");
-        }
         Ok(Self {
             executable,
             cwd,
-            slug,
-            version,
             deadline,
         })
     }
@@ -73,16 +69,49 @@ impl VistaConfig {
 #[derive(Clone)]
 pub struct VistaModule {
     config: VistaConfig,
+    cache: Arc<Mutex<SnapshotCache>>,
 }
 
 impl VistaModule {
     pub fn new(config: VistaConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cache: Arc::new(Mutex::new(SnapshotCache::default())),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedSource {
+    manifest_json: Vec<u8>,
+    observed_at: String,
+}
+
+#[derive(Default)]
+struct SnapshotCache {
+    sources: BTreeMap<[u8; SNAPSHOT_DIGEST_BYTES], CachedSource>,
+}
+
+impl SnapshotCache {
+    fn get(&self, digest: &[u8; SNAPSHOT_DIGEST_BYTES]) -> Option<&CachedSource> {
+        self.sources.get(digest)
+    }
+
+    fn insert(&mut self, digest: [u8; SNAPSHOT_DIGEST_BYTES], source: CachedSource) {
+        if !self.sources.contains_key(&digest) && self.sources.len() >= MAX_CACHED_SNAPSHOTS {
+            if let Some(evicted) = self.sources.keys().next().copied() {
+                self.sources.remove(&evicted);
+            }
+        }
+        self.sources.insert(digest, source);
     }
 }
 
 pub struct VistaInvocation {
     config: VistaConfig,
+    cache: Arc<Mutex<SnapshotCache>>,
+    prior_digest: Option<[u8; SNAPSHOT_DIGEST_BYTES]>,
+    current_source: Option<CachedSource>,
     control: Arc<ProcessControl>,
 }
 
@@ -175,9 +204,7 @@ impl ProcessControl {
                 Ordering::Acquire,
             )
             .is_ok();
-        if changed
-            && let ChildOwnership::Live(process_group) = *self.child.lock()
-        {
+        if changed && let ChildOwnership::Live(process_group) = *self.child.lock() {
             let _ = kill_process_group(process_group);
         }
         changed
@@ -235,27 +262,42 @@ impl CapabilityModule for VistaModule {
     }
 
     fn begin(&self, context: CapabilityContext<'_>) -> Self::Invocation {
+        let prior_digest = match context.phase() {
+            CapabilityPhase::Describe => None,
+            CapabilityPhase::Observe(request) => request
+                .prior_digest
+                .as_ref()
+                .map(|digest| *digest.as_bytes()),
+        };
         VistaInvocation {
             config: self.config.clone(),
+            cache: Arc::clone(&self.cache),
+            prior_digest,
+            current_source: None,
             control: Arc::new(ProcessControl::new(context.control().clone())),
         }
     }
 }
 
 impl Host for InvocationStore<VistaInvocation> {
-    fn get(&mut self, request: ArtifactRequest) -> Result<Outcome, VistaError> {
+    fn get(&mut self, request: ArtifactRequest) -> Result<ArtifactResponse, VistaError> {
         self.capability_mut().get(request)
+    }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), VistaError> {
+        self.capability_mut().bind_snapshot(digest)
     }
 }
 
 impl VistaInvocation {
-    fn get(&mut self, request: ArtifactRequest) -> Result<Outcome, VistaError> {
-        if !request_is_valid(&request)
-            || request.slug != self.config.slug
-            || request.version != self.config.version
-        {
+    fn get(&mut self, request: ArtifactRequest) -> Result<ArtifactResponse, VistaError> {
+        if !request_is_valid(&request) {
             return Err(VistaError::Denied);
         }
+        let prior = self
+            .prior_digest
+            .as_ref()
+            .and_then(|digest| self.cache.lock().get(digest).cloned());
         match self.control.termination() {
             Termination::Cancelled => return Err(VistaError::Cancelled),
             Termination::TimedOut => return Err(VistaError::DeadlineExceeded),
@@ -322,21 +364,22 @@ impl VistaInvocation {
         let deadline_control = Arc::clone(&self.control);
         let timer = match thread::Builder::new()
             .name("st2-vista-deadline".into())
-            .spawn(move || loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    deadline_control.terminate(Termination::TimedOut);
-                    return;
+            .spawn(move || {
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        deadline_control.terminate(Termination::TimedOut);
+                        return;
+                    }
+                    match completed_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if deadline_control.synchronize_interruption() != Termination::None {
+                        return;
+                    }
                 }
-                match completed_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                if deadline_control.synchronize_interruption() != Termination::None {
-                    return;
-                }
-            })
-        {
+            }) {
             Ok(timer) => timer,
             Err(_) => {
                 self.control.kill_and_reap(&mut child);
@@ -374,13 +417,48 @@ impl VistaInvocation {
             || ExitStatus::Signal(status.signal().unwrap_or(0)),
             ExitStatus::Code,
         );
-        Ok(Outcome {
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-            exit,
-        })
+        match exit {
+            ExitStatus::Code(0) => {
+                let observed_at = prior
+                    .as_ref()
+                    .filter(|prior| prior.manifest_json == stdout)
+                    .map_or_else(
+                        || Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        |prior| prior.observed_at.clone(),
+                    );
+                let source = CachedSource {
+                    manifest_json: stdout,
+                    observed_at,
+                };
+                let current = source_to_wit(&source);
+                self.current_source = Some(source);
+                Ok(ArtifactResponse::Ok(SourceObservation {
+                    current,
+                    previous: prior.as_ref().map(source_to_wit),
+                }))
+            }
+            exit @ (ExitStatus::Code(_) | ExitStatus::Signal(_)) => {
+                Ok(ArtifactResponse::CommandFailed(CommandFailure {
+                    stderr,
+                    exit,
+                }))
+            }
+        }
+    }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), VistaError> {
+        let digest: [u8; SNAPSHOT_DIGEST_BYTES] =
+            digest.try_into().map_err(|_| VistaError::Denied)?;
+        let source = self.current_source.take().ok_or(VistaError::Unavailable)?;
+        self.cache.lock().insert(digest, source);
+        Ok(())
+    }
+}
+
+fn source_to_wit(source: &CachedSource) -> SourceSnapshot {
+    SourceSnapshot {
+        manifest_json: source.manifest_json.clone(),
+        observed_at: source.observed_at.clone(),
     }
 }
 
@@ -433,12 +511,7 @@ fn wait_without_reaping(pid: u32) -> std::io::Result<()> {
         // process-group identity cannot be recycled before ownership is fenced.
         let result = unsafe {
             let mut info = std::mem::zeroed::<libc::siginfo_t>();
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
         };
         if result == 0 {
             return Ok(());
@@ -483,9 +556,8 @@ fn resolve_executable_at(
 }
 
 fn executable_is_runnable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| {
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-    })
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
@@ -502,21 +574,19 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn config(
+    fn invocation(
         executable: &Path,
         cwd: &Path,
         deadline: Duration,
-        slug: &str,
-        version: u64,
-    ) -> VistaConfig {
-        VistaConfig::resolve(
-            executable,
-            cwd.to_path_buf(),
-            slug.to_owned(),
-            version,
-            deadline,
-        )
-        .unwrap()
+        control: Arc<ProcessControl>,
+    ) -> VistaInvocation {
+        VistaInvocation {
+            config: VistaConfig::resolve(executable, cwd.to_path_buf(), deadline).unwrap(),
+            cache: Arc::new(Mutex::new(SnapshotCache::default())),
+            prior_digest: None,
+            current_source: None,
+            control,
+        }
     }
 
     fn request(slug: &str, version: u64) -> ArtifactRequest {
@@ -534,42 +604,35 @@ mod tests {
             &executable,
             "#!/bin/sh\nprintf '%s\\n' \"$#|$1|$2|$3|$4|$5|$6\"\n",
         );
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_secs(1),
-                "release-notes",
-                7,
-            ),
-            control: Arc::new(ProcessControl::detached()),
+        let mut invocation = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::new(ProcessControl::detached()),
+        );
+        let response = invocation.get(request("release-notes", 7)).unwrap();
+        let ArtifactResponse::Ok(observation) = response else {
+            panic!("the successful command did not return a source observation");
         };
-        let outcome = invocation.get(request("release-notes", 7)).unwrap();
         assert_eq!(
-            outcome.stdout,
+            observation.current.manifest_json,
             b"6|artifact|get|release-notes|v7|--output|json\n"
         );
     }
 
     #[test]
-    fn exact_artifact_scope_is_denied_before_spawn() {
+    fn dynamic_artifact_identity_is_validated_before_spawn() {
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("vista");
         let marker = temporary.path().join("spawned");
-        write_executable(&executable, "#!/bin/sh\ntouch \"$PWD/spawned\"\n");
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_secs(1),
-                "release-notes",
-                7,
-            ),
-            control: Arc::new(ProcessControl::detached()),
-        };
+        write_executable(&executable, "#!/bin/sh\n: > \"$PWD/spawned\"\n");
+        let mut first = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::new(ProcessControl::detached()),
+        );
         for denied in [
-            request("other-valid-slug", 7),
-            request("release-notes", 8),
             request("", 7),
             request("-leading", 7),
             request("trailing-", 7),
@@ -578,13 +641,28 @@ mod tests {
             request("release-notes", 0),
             request("release-notes", MAX_VERSION + 1),
         ] {
-            assert!(matches!(invocation.get(denied), Err(VistaError::Denied)));
+            assert!(matches!(first.get(denied), Err(VistaError::Denied)));
         }
         assert!(!marker.exists());
+        assert!(matches!(
+            first.get(request("release-notes", 7)),
+            Ok(ArtifactResponse::Ok(_))
+        ));
+        let mut second = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::new(ProcessControl::detached()),
+        );
+        assert!(matches!(
+            second.get(request("other-valid-slug", MAX_VERSION)),
+            Ok(ArtifactResponse::Ok(_))
+        ));
+        assert!(marker.exists());
     }
 
     #[test]
-    fn artifact_version_is_bounded_by_the_javascript_safe_integer_contract() {
+    fn artifact_version_is_bounded_by_the_canonical_nineteen_digit_contract() {
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("vista");
         write_executable(&executable, "#!/bin/sh\nexit 0\n");
@@ -594,12 +672,53 @@ mod tests {
             VistaConfig::resolve(
                 &executable,
                 temporary.path().to_path_buf(),
-                "release".into(),
-                MAX_VERSION + 1,
                 Duration::from_secs(1),
             )
-            .is_err()
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn snapshot_binding_recovers_the_previous_source_by_digest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("vista");
+        write_executable(&executable, "#!/bin/sh\nprintf '{\"schemaVersion\":1}'\n");
+        let cache = Arc::new(Mutex::new(SnapshotCache::default()));
+        let mut first = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::new(ProcessControl::detached()),
+        );
+        first.cache = Arc::clone(&cache);
+        let ArtifactResponse::Ok(first_observation) = first.get(request("release", 7)).unwrap()
+        else {
+            panic!("the successful command did not return a source observation");
+        };
+        assert!(first_observation.previous.is_none());
+        let digest = [7; SNAPSHOT_DIGEST_BYTES];
+        first.bind_snapshot(digest.to_vec()).unwrap();
+
+        let mut second = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::new(ProcessControl::detached()),
+        );
+        second.cache = cache;
+        second.prior_digest = Some(digest);
+        let ArtifactResponse::Ok(second_observation) = second.get(request("release", 7)).unwrap()
+        else {
+            panic!("the successful command did not return a source observation");
+        };
+        let previous = second_observation
+            .previous
+            .expect("the bound source should be recovered");
+        assert_eq!(
+            previous.manifest_json,
+            second_observation.current.manifest_json
+        );
+        assert_eq!(previous.observed_at, second_observation.current.observed_at);
     }
 
     #[test]
@@ -610,16 +729,12 @@ mod tests {
         write_executable(&executable, "#!/bin/sh\ntouch \"$PWD/spawned\"\n");
         let control = Arc::new(ProcessControl::detached());
         control.terminate(Termination::Cancelled);
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_secs(1),
-                "valid",
-                1,
-            ),
+        let mut invocation = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
             control,
-        };
+        );
         assert!(matches!(
             invocation.get(request("valid", 1)),
             Err(VistaError::Cancelled)
@@ -645,16 +760,12 @@ mod tests {
             "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::inherited_pipe_holder --nocapture) &\nread marker < \"$PWD/started\"\nprintf 'direct child exited\\n'\nexit 0\n",
         );
         let control = Arc::new(ProcessControl::detached());
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_millis(100),
-                "valid",
-                1,
-            ),
-            control: Arc::clone(&control),
-        };
+        let mut invocation = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_millis(100),
+            Arc::clone(&control),
+        );
         assert!(matches!(
             invocation.get(request("valid", 1)),
             Err(VistaError::DeadlineExceeded)
@@ -679,16 +790,12 @@ mod tests {
             "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::inherited_pipe_holder --nocapture) &\nread marker < \"$PWD/started\"\nprintf 'ready\\n' > \"$PWD/cancel-ready\"\nprintf 'direct child exited\\n'\nexit 0\n",
         );
         let control = Arc::new(ProcessControl::detached());
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_secs(10),
-                "valid",
-                1,
-            ),
-            control: Arc::clone(&control),
-        };
+        let mut invocation = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(10),
+            Arc::clone(&control),
+        );
         let worker = thread::spawn(move || invocation.get(request("valid", 1)));
         let mut ready = String::new();
         let mut ready_pipe = std::fs::File::open(temporary.path().join("cancel-ready")).unwrap();
@@ -717,18 +824,16 @@ mod tests {
             "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::closed_pipe_descendant_holder --nocapture) &\nread marker < \"$PWD/started\"\nexit 0\n",
         );
         let control = Arc::new(ProcessControl::detached());
-        let mut invocation = VistaInvocation {
-            config: config(
-                &executable,
-                temporary.path(),
-                Duration::from_secs(1),
-                "valid",
-                1,
-            ),
-            control: Arc::clone(&control),
-        };
-        let outcome = invocation.get(request("valid", 1)).unwrap();
-        assert!(matches!(outcome.exit, ExitStatus::Code(0)));
+        let mut invocation = invocation(
+            &executable,
+            temporary.path(),
+            Duration::from_secs(1),
+            Arc::clone(&control),
+        );
+        assert!(matches!(
+            invocation.get(request("valid", 1)),
+            Ok(ArtifactResponse::Ok(_))
+        ));
         let lock_path = temporary.path().join("descendant-lock");
         let (acquired_tx, acquired_rx) = mpsc::sync_channel(0);
         let waiter = thread::spawn(move || {
@@ -744,11 +849,10 @@ mod tests {
         let acquired = acquired_rx.recv_timeout(Duration::from_secs(1));
         if let Err(error) = &acquired {
             drop(acquired_rx);
-            let pid: i32 =
-                std::fs::read_to_string(temporary.path().join("descendant-pid"))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
+            let pid: i32 = std::fs::read_to_string(temporary.path().join("descendant-pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
             // SAFETY: the fixture wrote its live pid after acquiring the lock.
             unsafe { libc::kill(pid, libc::SIGKILL) };
             waiter.join().unwrap();

@@ -23,116 +23,171 @@ const TOPICS: [&str; 4] = [
 const SELECTOR_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {
-    "owner": { "type": "string" },
-    "repo": { "type": "string" },
-    "number": { "type": "integer" },
     "topics": {
       "type": "array",
       "items": { "type": "string" },
       "uniqueItems": true
     }
   },
-  "required": ["owner", "repo", "number"],
   "additionalProperties": false
 }"#;
 
 struct Component;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct Selector {
-    owner: String,
-    repo: String,
-    number: u64,
     #[serde(default)]
     topics: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct PullRequestResponse {
+#[derive(Clone)]
+struct PullRequestRef {
+    owner: String,
+    repo: String,
     number: u64,
-    #[serde(default = "null")]
-    url: Value,
-    #[serde(default = "null")]
-    html_url: Value,
-    #[serde(default = "null")]
-    state: Value,
-    #[serde(default)]
-    draft: Option<bool>,
-    #[serde(default)]
-    merged: Option<bool>,
-    #[serde(default = "null")]
-    merged_at: Value,
-    #[serde(default = "null")]
-    closed_at: Value,
-    #[serde(default)]
-    mergeable: Option<bool>,
-    #[serde(default = "null")]
-    mergeable_state: Value,
-    head: PullRequestHeadResponse,
-    base: PullRequestBaseResponse,
-    #[serde(default)]
-    requested_reviewers: Option<Vec<RequestedReviewerResponse>>,
-    #[serde(default)]
-    requested_teams: Option<Vec<RequestedTeamResponse>>,
+}
+
+impl PullRequestRef {
+    fn parse_uri(uri: &str) -> Option<Self> {
+        Self::parse_subject(uri.strip_prefix("github-pr://github.com/")?, "pull")
+    }
+
+    fn parse_html_url(url: &str) -> Option<Self> {
+        Self::parse_subject(url.strip_prefix("https://github.com/")?, "pull")
+    }
+
+    fn parse_subject(subject: &str, collection: &str) -> Option<Self> {
+        let mut parts = subject.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if parts.next()? != collection {
+            return None;
+        }
+        let number = parts.next()?;
+        if parts.next().is_some()
+            || !valid_component(owner, 39)
+            || !valid_component(repo, 100)
+            || number.is_empty()
+            || number.len() > 10
+            || number.starts_with('0')
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(Self {
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            number: number.parse().ok()?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
-struct PullRequestHeadResponse {
-    sha: String,
-    #[serde(default = "null")]
-    r#ref: Value,
+struct GraphqlData {
+    repository: Option<RepositoryResponse>,
 }
 
 #[derive(Deserialize)]
-struct PullRequestBaseResponse {
-    #[serde(default = "null")]
-    r#ref: Value,
+#[serde(rename_all = "camelCase")]
+struct RepositoryResponse {
+    pull_request: Option<PullRequestResponse>,
 }
 
 #[derive(Deserialize)]
-struct RequestedReviewerResponse {
+#[serde(rename_all = "camelCase")]
+struct PullRequestResponse {
+    url: String,
+    title: String,
+    body: String,
+    state: String,
+    is_draft: bool,
+    merged: bool,
+    merged_at: Option<String>,
+    closed_at: Option<String>,
+    mergeable: String,
+    author: Option<ActorResponse>,
+    head_ref_oid: String,
+    head_ref_name: String,
+    base_ref_name: String,
+    review_decision: Option<String>,
+    review_requests: ReviewRequestsResponse,
+    commits: CommitsResponse,
+}
+
+#[derive(Deserialize)]
+struct ActorResponse {
     login: String,
 }
 
 #[derive(Deserialize)]
-struct RequestedTeamResponse {
-    slug: String,
+#[serde(rename_all = "camelCase")]
+struct ReviewRequestsResponse {
+    total_count: u64,
+    nodes: Vec<ReviewRequestResponse>,
 }
 
 #[derive(Deserialize)]
-struct CheckRunsResponse {
-    #[serde(default)]
-    check_runs: Option<Vec<CheckRunResponse>>,
+#[serde(rename_all = "camelCase")]
+struct ReviewRequestResponse {
+    requested_reviewer: Option<RequestedReviewerResponse>,
 }
 
 #[derive(Deserialize)]
-struct CheckRunResponse {
-    name: String,
-    #[serde(default = "null")]
-    status: Value,
-    #[serde(default = "null")]
-    conclusion: Value,
-    #[serde(default = "null")]
-    details_url: Value,
+#[serde(tag = "__typename")]
+enum RequestedReviewerResponse {
+    User { login: String },
+    Team { slug: String },
+    Bot { login: String },
+    Mannequin { login: String },
 }
 
 #[derive(Deserialize)]
-struct CombinedStatusResponse {
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    statuses: Option<Vec<StatusResponse>>,
+struct CommitsResponse {
+    nodes: Vec<CommitNodeResponse>,
 }
 
 #[derive(Deserialize)]
-struct StatusResponse {
-    context: String,
+struct CommitNodeResponse {
+    commit: CommitResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitResponse {
+    status_check_rollup: Option<CheckRollupResponse>,
+}
+
+#[derive(Deserialize)]
+struct CheckRollupResponse {
     state: String,
-    #[serde(default = "null")]
-    target_url: Value,
-    #[serde(default = "null")]
-    description: Value,
+    contexts: CheckContextsResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckContextsResponse {
+    total_count: u64,
+    nodes: Vec<CheckContextResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum CheckContextResponse {
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        #[serde(rename = "detailsUrl")]
+        details_url: Option<String>,
+    },
+    StatusContext {
+        context: String,
+        state: String,
+        #[serde(rename = "targetUrl")]
+        target_url: Option<String>,
+        description: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -157,36 +212,44 @@ struct RepositorySnapshot<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestSnapshot {
-    api_url: Value,
-    html_url: Value,
-    state: Value,
+    api_url: String,
+    html_url: String,
+    title: String,
+    body: String,
+    state: String,
+    author: Option<String>,
     draft: bool,
     merged: bool,
-    merged_at: Value,
-    closed_at: Value,
+    merged_at: Option<String>,
+    closed_at: Option<String>,
     mergeable: Option<bool>,
-    mergeable_state: Value,
+    mergeable_state: String,
     head: HeadSnapshot,
     base: BaseSnapshot,
+    review_decision: Option<String>,
     requested_reviewers: Vec<String>,
     requested_teams: Vec<String>,
+    review_request_total_count: u64,
+    review_requests_truncated: bool,
 }
 
 #[derive(Serialize)]
 struct HeadSnapshot {
     sha: String,
-    r#ref: Value,
+    r#ref: String,
 }
 
 #[derive(Serialize)]
 struct BaseSnapshot {
-    r#ref: Value,
+    r#ref: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CiSnapshot {
     state: String,
+    total_count: u64,
+    truncated: bool,
     check_runs: Vec<CheckRunSnapshot>,
     statuses: Vec<StatusSnapshot>,
 }
@@ -195,9 +258,9 @@ struct CiSnapshot {
 #[serde(rename_all = "camelCase")]
 struct CheckRunSnapshot {
     name: String,
-    status: Value,
-    conclusion: Value,
-    details_url: Value,
+    status: String,
+    conclusion: Option<String>,
+    details_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -205,8 +268,8 @@ struct CheckRunSnapshot {
 struct StatusSnapshot {
     context: String,
     state: String,
-    target_url: Value,
-    description: Value,
+    target_url: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq)]
@@ -231,9 +294,8 @@ impl provider_api::Guest for Component {
     }
 
     fn observe(request: provider_api::ObserveRequest) -> provider_api::ObservationResult {
-        observe(request).unwrap_or_else(|diagnostic| {
-            provider_api::ObservationResult::Failed(Some(diagnostic))
-        })
+        observe(request)
+            .unwrap_or_else(|diagnostic| provider_api::ObservationResult::Failed(Some(diagnostic)))
     }
 }
 
@@ -242,38 +304,20 @@ fn observe(
 ) -> Result<provider_api::ObservationResult, String> {
     let selector: Selector = serde_json::from_str(&request.selector_json)
         .map_err(|_| "invalid GitHub pull request selector".to_owned())?;
-    if selector.owner.is_empty() || selector.repo.is_empty() || selector.number == 0 {
-        return Err("GitHub pull request selector fields must be non-empty".into());
-    }
-    let expected_uri = format!(
-        "github-pr://{}/{}/{}",
-        selector.owner, selector.repo, selector.number
-    );
-    if request.uri != expected_uri {
-        return Err("GitHub pull request URI did not match the selector".into());
-    }
-    let response = github_pr::get(&github_pr::PullRequestRequest {
-        owner: selector.owner.clone(),
-        repo: selector.repo.clone(),
-        number: selector.number,
+    let reference = PullRequestRef::parse_uri(&request.uri)
+        .ok_or_else(|| "invalid canonical GitHub pull request URI".to_owned())?;
+    let observation = github_pr::get(&github_pr::PullRequestRequest {
+        owner: reference.owner.clone(),
+        repo: reference.repo.clone(),
+        number: reference.number,
     })
     .map_err(map_source_error)?;
-    let observation = match response {
-        github_pr::PullRequestResponse::NotModified => {
-            return Ok(provider_api::ObservationResult::Unchanged);
-        }
-        github_pr::PullRequestResponse::Ok(observation) => observation,
-    };
 
-    let current = build_snapshot(
-        &request.uri,
-        &selector,
-        &observation.current,
-    )?;
+    let current = build_snapshot(&request.uri, &reference, &observation.current)?;
     let previous = observation
         .previous
         .as_ref()
-        .map(|source| build_snapshot(&request.uri, &selector, source))
+        .map(|source| build_snapshot(&request.uri, &reference, source))
         .transpose()?;
     if previous
         .as_ref()
@@ -294,7 +338,7 @@ fn observe(
         return Ok(provider_api::ObservationResult::Unchanged);
     }
     let publication_topics = topics(previous.as_ref(), &current);
-    let facts = facet_facts(previous.as_ref(), &current);
+    let facts = facts(previous.as_ref(), &current, reference.number);
     let _ = (request.demand_watermark, selector.topics);
     Ok(provider_api::ObservationResult::Published(
         provider_api::Publication {
@@ -309,62 +353,151 @@ fn observe(
 
 fn build_snapshot(
     uri: &str,
-    selector: &Selector,
+    reference: &PullRequestRef,
     source: &github_pr::SourceSnapshot,
 ) -> Result<Value, String> {
-    let pull: PullRequestResponse = serde_json::from_slice(&source.pull_request.body)
+    let response: GraphqlData = serde_json::from_slice(&source.graphql_data)
         .map_err(|_| "GitHub pull request response was invalid".to_owned())?;
-    if pull.number != selector.number || !valid_head_sha(&pull.head.sha) {
-        return Err("GitHub response did not match the requested pull request".into());
+    let pull = response
+        .repository
+        .and_then(|repository| repository.pull_request)
+        .ok_or_else(|| "GitHub pull request was missing".to_owned())?;
+    if !valid_head_sha(&pull.head_ref_oid) {
+        return Err("GitHub pull request head SHA was invalid".into());
     }
-    let checks: CheckRunsResponse = serde_json::from_slice(&source.check_runs.body)
-        .map_err(|_| "GitHub check runs response was invalid".to_owned())?;
-    let status: CombinedStatusResponse = serde_json::from_slice(&source.combined_status.body)
-        .map_err(|_| "GitHub combined status response was invalid".to_owned())?;
+    let resolved = PullRequestRef::parse_html_url(&pull.url)
+        .filter(|resolved| resolved.number == reference.number)
+        .ok_or_else(|| "GitHub pull request URL was invalid".to_owned())?;
+    let api_url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}",
+        resolved.owner, resolved.repo, resolved.number
+    );
 
-    let mut requested_reviewers: Vec<_> = pull
-        .requested_reviewers
-        .unwrap_or_default()
-        .into_iter()
-        .map(|reviewer| reviewer.login)
-        .collect();
+    let review_request_total_count = pull.review_requests.total_count;
+    let connection_count = pull.review_requests.nodes.len();
+    if connection_count > 100 || review_request_total_count < connection_count as u64 {
+        return Err("GitHub pull request bounded connection was invalid".into());
+    }
+    let mut requested_reviewers = Vec::new();
+    let mut requested_teams = Vec::new();
+    for request in pull.review_requests.nodes {
+        let Some(reviewer) = request.requested_reviewer else {
+            continue;
+        };
+        match reviewer {
+            RequestedReviewerResponse::User { login }
+            | RequestedReviewerResponse::Bot { login }
+            | RequestedReviewerResponse::Mannequin { login } => requested_reviewers.push(login),
+            RequestedReviewerResponse::Team { slug } => requested_teams.push(slug),
+        }
+    }
     requested_reviewers.sort();
-    let mut requested_teams: Vec<_> = pull
-        .requested_teams
-        .unwrap_or_default()
-        .into_iter()
-        .map(|team| team.slug)
-        .collect();
     requested_teams.sort();
-    let mut check_runs: Vec<_> = checks
-        .check_runs
-        .unwrap_or_default()
-        .into_iter()
-        .map(|check| CheckRunSnapshot {
-            name: check.name,
-            status: check.status,
-            conclusion: check.conclusion,
-            details_url: check.details_url,
-        })
-        .collect();
+    let review_request_observed_count = requested_reviewers.len() + requested_teams.len();
+
+    let mut commits = pull.commits.nodes.into_iter();
+    let commit = commits
+        .next()
+        .ok_or_else(|| "GitHub pull request commit was missing".to_owned())?;
+    if commits.next().is_some() {
+        return Err("GitHub pull request bounded connection was invalid".into());
+    }
+    let (combined_state, total_count, truncated, mut check_runs, mut statuses) =
+        if let Some(rollup) = commit.commit.status_check_rollup {
+            let observed_count = rollup.contexts.nodes.len();
+            if observed_count > 100 || rollup.contexts.total_count < observed_count as u64 {
+                return Err("GitHub pull request bounded connection was invalid".into());
+            }
+            let mut check_runs = Vec::new();
+            let mut statuses = Vec::new();
+            for context in rollup.contexts.nodes {
+                match context {
+                    CheckContextResponse::CheckRun {
+                        name,
+                        status,
+                        conclusion,
+                        details_url,
+                    } => check_runs.push(CheckRunSnapshot {
+                        name,
+                        status: normalized_enum(
+                            status,
+                            &[
+                                "completed",
+                                "in_progress",
+                                "pending",
+                                "queued",
+                                "requested",
+                                "waiting",
+                            ],
+                        )?,
+                        conclusion: conclusion
+                            .map(|value| {
+                                normalized_enum(
+                                    value,
+                                    &[
+                                        "action_required",
+                                        "cancelled",
+                                        "failure",
+                                        "neutral",
+                                        "skipped",
+                                        "stale",
+                                        "startup_failure",
+                                        "success",
+                                        "timed_out",
+                                    ],
+                                )
+                            })
+                            .transpose()?,
+                        details_url,
+                    }),
+                    CheckContextResponse::StatusContext {
+                        context,
+                        state,
+                        target_url,
+                        description,
+                    } => statuses.push(StatusSnapshot {
+                        context,
+                        state: normalized_enum(
+                            state,
+                            &["error", "expected", "failure", "pending", "success"],
+                        )?,
+                        target_url,
+                        description,
+                    }),
+                }
+            }
+            (
+                normalized_enum(
+                    rollup.state,
+                    &["error", "expected", "failure", "pending", "success"],
+                )?,
+                rollup.contexts.total_count,
+                rollup.contexts.total_count > observed_count as u64,
+                check_runs,
+                statuses,
+            )
+        } else {
+            ("pending".to_owned(), 0, false, Vec::new(), Vec::new())
+        };
     check_runs.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut statuses: Vec<_> = status
-        .statuses
-        .unwrap_or_default()
-        .into_iter()
-        .map(|status| StatusSnapshot {
-            context: status.context,
-            state: status.state,
-            target_url: status.target_url,
-            description: status.description,
-        })
-        .collect();
     statuses.sort_by(|left, right| left.context.cmp(&right.context));
 
+    let state = normalized_enum(pull.state, &["open", "closed", "merged"])?;
+    let review_decision = pull
+        .review_decision
+        .map(|value| normalized_enum(value, &["approved", "changes_requested", "review_required"]))
+        .transpose()?
+        .map(|value| value.to_ascii_uppercase());
+    let (mergeable, mergeable_state) = match pull.mergeable.as_str() {
+        "MERGEABLE" => (Some(true), "clean"),
+        "CONFLICTING" => (Some(false), "dirty"),
+        "UNKNOWN" => (None, "unknown"),
+        _ => return Err("GitHub pull request enum was invalid".into()),
+    };
     let check_failure = check_runs.iter().any(|check| {
-        check.status.as_str() == Some("completed")
+        check.status == "completed"
             && matches!(
-                check.conclusion.as_str(),
+                check.conclusion.as_deref(),
                 Some(
                     "failure"
                         | "timed_out"
@@ -375,13 +508,16 @@ fn build_snapshot(
                 )
             )
     });
-    let combined_state = status.state.unwrap_or_else(|| "pending".to_owned());
+    let status_failure = statuses
+        .iter()
+        .any(|status| matches!(status.state.as_str(), "failure" | "error"));
     let facets = Facets {
-        review_requested: !requested_reviewers.is_empty() || !requested_teams.is_empty(),
-        ci_failure: check_failure || matches!(combined_state.as_str(), "failure" | "error"),
-        merge_conflict: pull.mergeable == Some(false)
-            || pull.mergeable_state.as_str() == Some("dirty"),
-        terminal: pull.merged == Some(true) || pull.state.as_str() == Some("closed"),
+        review_requested: review_request_total_count > 0,
+        ci_failure: check_failure
+            || status_failure
+            || matches!(combined_state.as_str(), "failure" | "error"),
+        merge_conflict: mergeable == Some(false),
+        terminal: pull.merged || matches!(state.as_str(), "closed" | "merged"),
     };
 
     serde_json::to_value(Snapshot {
@@ -389,38 +525,55 @@ fn build_snapshot(
         uri,
         observed_at: &source.observed_at,
         repository: RepositorySnapshot {
-            owner: &selector.owner,
-            name: &selector.repo,
+            owner: &reference.owner,
+            name: &reference.repo,
         },
-        number: selector.number,
+        number: reference.number,
         pull_request: PullRequestSnapshot {
-            api_url: pull.url,
-            html_url: pull.html_url,
-            state: pull.state,
-            draft: pull.draft.unwrap_or(false),
-            merged: pull.merged.unwrap_or(false),
+            api_url,
+            html_url: pull.url,
+            title: pull.title,
+            body: pull.body,
+            state,
+            author: pull.author.map(|author| author.login),
+            draft: pull.is_draft,
+            merged: pull.merged,
             merged_at: pull.merged_at,
             closed_at: pull.closed_at,
-            mergeable: pull.mergeable,
-            mergeable_state: pull.mergeable_state,
+            mergeable,
+            mergeable_state: mergeable_state.to_owned(),
             head: HeadSnapshot {
-                sha: pull.head.sha,
-                r#ref: pull.head.r#ref,
+                sha: pull.head_ref_oid,
+                r#ref: pull.head_ref_name,
             },
             base: BaseSnapshot {
-                r#ref: pull.base.r#ref,
+                r#ref: pull.base_ref_name,
             },
+            review_decision,
             requested_reviewers,
             requested_teams,
+            review_request_total_count,
+            review_requests_truncated: review_request_total_count
+                > review_request_observed_count as u64,
         },
         ci: CiSnapshot {
             state: combined_state,
+            total_count,
+            truncated,
             check_runs,
             statuses,
         },
         facets,
     })
     .map_err(|_| "GitHub pull request snapshot normalization failed".to_owned())
+}
+
+fn normalized_enum(value: String, allowed: &[&str]) -> Result<String, String> {
+    let normalized = value.to_ascii_lowercase();
+    allowed
+        .contains(&normalized.as_str())
+        .then_some(normalized)
+        .ok_or_else(|| "GitHub pull request enum was invalid".to_owned())
 }
 
 fn same_semantics(before: &Value, after: &Value) -> bool {
@@ -459,28 +612,66 @@ fn topics(previous: Option<&Value>, current: &Value) -> Vec<String> {
     .collect()
 }
 
-fn facet_facts(previous: Option<&Value>, current: &Value) -> Vec<provider_api::Fact> {
-    [
-        ("facets.ciFailure", "ciFailure"),
-        ("facets.mergeConflict", "mergeConflict"),
-        ("facets.reviewRequested", "reviewRequested"),
-        ("facets.terminal", "terminal"),
-    ]
-    .into_iter()
-    .filter_map(|(key, facet)| {
-        let before = previous.and_then(|value| facet_value(value, facet));
-        let after = facet_value(current, facet);
-        (before != after).then(|| provider_api::Fact {
-            key: key.into(),
-            before: before.map_or(provider_api::FactValue::Omitted, |value| {
-                provider_api::FactValue::Value(value.to_string())
-            }),
-            after: after.map_or(provider_api::FactValue::Null, |value| {
-                provider_api::FactValue::Value(value.to_string())
-            }),
-        })
-    })
-    .collect()
+fn facts(previous: Option<&Value>, current: &Value, number: u64) -> Vec<provider_api::Fact> {
+    fn state(snapshot: &Value) -> Option<&str> {
+        let pull_request = snapshot.get("pullRequest")?;
+        if pull_request.get("merged").and_then(Value::as_bool) == Some(true) {
+            Some("merged")
+        } else if pull_request.get("state").and_then(Value::as_str) == Some("closed") {
+            Some("closed")
+        } else if pull_request.get("draft").and_then(Value::as_bool) == Some(true) {
+            Some("draft")
+        } else {
+            pull_request.get("state").and_then(Value::as_str)
+        }
+    }
+    fn ci(snapshot: &Value) -> Option<&str> {
+        if snapshot
+            .get("facets")
+            .and_then(|facets| facets.get("ciFailure"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            Some("failure")
+        } else {
+            snapshot
+                .get("ci")
+                .and_then(|ci| ci.get("state"))
+                .and_then(Value::as_str)
+        }
+    }
+    let current_state = state(current).unwrap_or("unknown");
+    let current_ci = ci(current).unwrap_or("unknown");
+    let mut facts = vec![current_fact("pr", format!("#{number}"))];
+    match previous {
+        Some(previous) => {
+            facts.push(transition_fact("state", state(previous), current_state));
+            facts.push(transition_fact("ci", ci(previous), current_ci));
+        }
+        None => {
+            facts.push(current_fact("state", current_state));
+            facts.push(current_fact("ci", current_ci));
+        }
+    }
+    facts
+}
+
+fn current_fact(key: &str, value: impl Into<String>) -> provider_api::Fact {
+    provider_api::Fact {
+        key: key.into(),
+        before: provider_api::FactValue::Omitted,
+        after: provider_api::FactValue::Value(value.into()),
+    }
+}
+
+fn transition_fact(key: &str, before: Option<&str>, after: &str) -> provider_api::Fact {
+    provider_api::Fact {
+        key: key.into(),
+        before: before.map_or(provider_api::FactValue::Null, |value| {
+            provider_api::FactValue::Value(value.into())
+        }),
+        after: provider_api::FactValue::Value(after.into()),
+    }
 }
 
 fn facet_value(snapshot: &Value, facet: &str) -> Option<bool> {
@@ -490,17 +681,25 @@ fn facet_value(snapshot: &Value, facet: &str) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
-fn valid_head_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+fn valid_component(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn null() -> Value {
-    Value::Null
+fn valid_head_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn map_source_error(error: github_pr::PullRequestError) -> String {
     match error {
         github_pr::PullRequestError::Denied => "GitHub pull request scope denied",
+        github_pr::PullRequestError::AuthenticationRequired => {
+            "GitHub authentication is unavailable"
+        }
         github_pr::PullRequestError::Unavailable => "GitHub is unavailable",
         github_pr::PullRequestError::ResourceExhausted => "GitHub response exceeded limits",
         github_pr::PullRequestError::DeadlineExceeded => "GitHub request deadline exceeded",

@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, Utc};
+use reqwest::header::HeaderValue;
+use serde::{Deserialize, Serialize};
 use st2_resource_wasip2::{
     CapabilityContext, CapabilityModule, CapabilityPhase, InterruptionReason, InvocationControl,
     InvocationStore,
 };
 use wasmtime::component::{HasSelf, Linker};
+
+use crate::github_auth::discover_authorization;
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -17,29 +23,29 @@ mod bindings {
 }
 
 use bindings::compoundingtech::st2_github_issue::github_issue::{
-    Host, IssueError, IssueRequest, IssueResponse,
+    Host, IssueError, IssueRequest, IssueResponse, SourceObject, SourceObservation, SourceSnapshot,
 };
 
 const IMPORT_NAME: &str = "compoundingtech:st2-github-issue/github-issue@0.1.0";
 const API_HOST: &str = "api.github.com";
 const API_PORT: u16 = 443;
 const MAX_HEADERS_BYTES: usize = 16 * 1024;
-const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_ETAG_BYTES: usize = 1024;
+const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ETAG_BYTES: usize = 512;
+const SNAPSHOT_DIGEST_BYTES: usize = 32;
+const MAX_CACHED_SNAPSHOTS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubIssueConfig {
-    pub owner: String,
-    pub repo: String,
-    pub number: u64,
+    pub auth_executable: PathBuf,
     pub connect_timeout: Duration,
     pub total_timeout: Duration,
 }
 
 impl GitHubIssueConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !valid_slug(&self.owner) || !valid_slug(&self.repo) || self.number == 0 {
-            return Err("GitHub issue scope is invalid");
+        if !self.auth_executable.is_absolute() {
+            return Err("GitHub authentication executable must be absolute");
         }
         if self.connect_timeout.is_zero()
             || self.total_timeout.is_zero()
@@ -55,36 +61,63 @@ impl GitHubIssueConfig {
 #[derive(Clone)]
 pub struct GitHubIssueModule {
     config: GitHubIssueConfig,
-    cache: Arc<Mutex<BTreeMap<IssueKey, CachedIssue>>>,
+    authorization: Option<HeaderValue>,
+    cache: Arc<Mutex<SnapshotCache>>,
 }
 
 impl GitHubIssueModule {
     pub fn new(config: GitHubIssueConfig) -> Result<Self, &'static str> {
         config.validate()?;
+        let authorization = Instant::now()
+            .checked_add(config.total_timeout)
+            .and_then(|deadline| discover_authorization(&config.auth_executable, deadline));
         Ok(Self {
             config,
-            cache: Arc::new(Mutex::new(BTreeMap::new())),
+            authorization,
+            cache: Arc::new(Mutex::new(SnapshotCache::default())),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct IssueKey {
-    owner: String,
-    repo: String,
-    number: u64,
-}
-
 #[derive(Debug, Clone)]
-struct CachedIssue {
+struct CachedObject {
     etag: Option<String>,
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedSource {
+    issue: CachedObject,
+    latest_comment: Option<CachedObject>,
+    observed_at: String,
+}
+
+#[derive(Default)]
+struct SnapshotCache {
+    sources: BTreeMap<[u8; SNAPSHOT_DIGEST_BYTES], CachedSource>,
+}
+
+impl SnapshotCache {
+    fn get(&self, digest: &[u8; SNAPSHOT_DIGEST_BYTES]) -> Option<&CachedSource> {
+        self.sources.get(digest)
+    }
+
+    fn insert(&mut self, digest: [u8; SNAPSHOT_DIGEST_BYTES], source: CachedSource) {
+        if !self.sources.contains_key(&digest) && self.sources.len() >= MAX_CACHED_SNAPSHOTS {
+            if let Some(evicted) = self.sources.keys().next().copied() {
+                self.sources.remove(&evicted);
+            }
+        }
+        self.sources.insert(digest, source);
+    }
+}
+
 pub struct GitHubIssueInvocation {
     config: GitHubIssueConfig,
-    cache: Arc<Mutex<BTreeMap<IssueKey, CachedIssue>>>,
-    has_authoritative_prior: bool,
+    authorization: Option<HeaderValue>,
+    cache: Arc<Mutex<SnapshotCache>>,
+    prior_digest: Option<[u8; SNAPSHOT_DIGEST_BYTES]>,
+    current_source: Option<CachedSource>,
     control: InvocationControl,
 }
 
@@ -103,14 +136,19 @@ impl CapabilityModule for GitHubIssueModule {
     }
 
     fn begin(&self, context: CapabilityContext<'_>) -> Self::Invocation {
-        let has_authoritative_prior = match context.phase() {
-            CapabilityPhase::Describe => false,
-            CapabilityPhase::Observe(request) => request.prior_digest.is_some(),
+        let prior_digest = match context.phase() {
+            CapabilityPhase::Describe => None,
+            CapabilityPhase::Observe(request) => request
+                .prior_digest
+                .as_ref()
+                .map(|digest| *digest.as_bytes()),
         };
         GitHubIssueInvocation {
             config: self.config.clone(),
+            authorization: self.authorization.clone(),
             cache: Arc::clone(&self.cache),
-            has_authoritative_prior,
+            prior_digest,
+            current_source: None,
             control: context.control().clone(),
         }
     }
@@ -120,61 +158,143 @@ impl Host for InvocationStore<GitHubIssueInvocation> {
     fn get(&mut self, request: IssueRequest) -> Result<IssueResponse, IssueError> {
         self.capability_mut().get(request)
     }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), IssueError> {
+        self.capability_mut().bind_snapshot(digest)
+    }
 }
 
 impl GitHubIssueInvocation {
     fn get(&mut self, request: IssueRequest) -> Result<IssueResponse, IssueError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| IssueError::Unavailable)?;
-        runtime.block_on(self.get_async(request))
+        run_on_runtime(self.get_async(request))
     }
 
     async fn get_async(&mut self, request: IssueRequest) -> Result<IssueResponse, IssueError> {
-        if !request_matches_scope(&self.config, &request) {
+        if !valid_request(&request) {
             return Err(IssueError::Denied);
         }
-        let key = IssueKey {
-            owner: request.owner,
-            repo: request.repo,
-            number: request.number,
+        if let Some(reason) = self.control.interruption_reason() {
+            return Err(interruption_error(reason));
+        }
+        let prior = match self.prior_digest.as_ref() {
+            Some(digest) => self
+                .cache
+                .lock()
+                .map_err(|_| IssueError::Unavailable)?
+                .get(digest)
+                .cloned(),
+            None => None,
         };
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| IssueError::Unavailable)?
-            .get(&key)
-            .cloned();
-        let requested_etag = request.etag;
-        let reused_cached_entry = self.has_authoritative_prior
-            && requested_etag.is_none()
-            && cached.as_ref().is_some_and(|entry| entry.etag.is_some());
-        let etag = conditional_etag(
-            self.has_authoritative_prior,
-            requested_etag,
-            cached.as_ref().and_then(|entry| entry.etag.clone()),
-        );
-        let endpoint = format!(
-            "https://{API_HOST}/repos/{}/{}/issues/{}",
-            key.owner, key.repo, key.number
-        );
-        let address = resolve_public_api_address()?;
+        let deadline = Instant::now()
+            .checked_add(self.config.total_timeout)
+            .ok_or(IssueError::DeadlineExceeded)?;
+        let address = resolve_public_api_address(&self.control, deadline).await?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(self.config.connect_timeout)
-            .timeout(self.config.total_timeout)
             .gzip(true)
             .resolve(API_HOST, address)
             .build()
             .map_err(|_| IssueError::Unavailable)?;
+        let issue_endpoint = format!(
+            "https://{API_HOST}/repos/{}/{}/issues/{}",
+            request.owner, request.repo, request.number
+        );
+        let issue = self
+            .fetch_object(
+                &client,
+                issue_endpoint,
+                prior.as_ref().map(|source| &source.issue),
+                deadline,
+            )
+            .await?;
+        let metadata: IssueMetadata =
+            serde_json::from_slice(&issue.object.body).map_err(|_| IssueError::Unavailable)?;
+
+        let latest_comment = if metadata.comments == 0 {
+            None
+        } else {
+            let cached = prior.as_ref().and_then(|source| {
+                let previous: IssueMetadata = serde_json::from_slice(&source.issue.body).ok()?;
+                (previous.comments == metadata.comments)
+                    .then_some(source.latest_comment.as_ref())
+                    .flatten()
+            });
+            let endpoint = format!(
+                "https://{API_HOST}/repos/{}/{}/issues/{}/comments?per_page=1&page={}",
+                request.owner, request.repo, request.number, metadata.comments
+            );
+            let mut fetched = self
+                .fetch_object(&client, endpoint, cached, deadline)
+                .await?;
+            fetched.object.body = normalize_latest_comment(&fetched.object.body)?;
+            Some(fetched)
+        };
+
+        if !issue.modified
+            && latest_comment
+                .as_ref()
+                .is_none_or(|comment| !comment.modified)
+        {
+            return Ok(IssueResponse::NotModified);
+        }
+        let latest_object = latest_comment.map(|comment| comment.object);
+        let observed_at = prior
+            .as_ref()
+            .filter(|prior| {
+                prior.issue.body == issue.object.body
+                    && prior.latest_comment.as_ref().map(|object| &object.body)
+                        == latest_object.as_ref().map(|object| &object.body)
+            })
+            .map_or_else(
+                || Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                |prior| prior.observed_at.clone(),
+            );
+        let source = CachedSource {
+            issue: issue.object,
+            latest_comment: latest_object,
+            observed_at,
+        };
+        let current = source_to_wit(&source);
+        self.current_source = Some(source);
+        Ok(IssueResponse::Ok(SourceObservation {
+            current,
+            previous: prior.as_ref().map(source_to_wit),
+        }))
+    }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), IssueError> {
+        let digest: [u8; SNAPSHOT_DIGEST_BYTES] =
+            digest.try_into().map_err(|_| IssueError::Denied)?;
+        let source = self.current_source.take().ok_or(IssueError::Unavailable)?;
+        self.cache
+            .lock()
+            .map_err(|_| IssueError::Unavailable)?
+            .insert(digest, source);
+        Ok(())
+    }
+
+    async fn fetch_object(
+        &self,
+        client: &reqwest::Client,
+        endpoint: String,
+        cached: Option<&CachedObject>,
+        deadline: Instant,
+    ) -> Result<FetchedObject, IssueError> {
+        if let Some(reason) = self.control.interruption_reason() {
+            return Err(interruption_error(reason));
+        }
         let mut builder = client
             .get(endpoint)
+            .timeout(remaining(deadline)?)
             .header("accept", "application/vnd.github+json")
             .header("x-github-api-version", "2022-11-28")
-            .header("user-agent", "st2-resource-provider");
-        if let Some(etag) = etag.as_deref() {
-            builder = builder.header("if-none-match", etag);
+            .header("user-agent", "st2-github-resource-profile/1");
+        if let Some(authorization) = self.authorization.clone() {
+            builder = builder.header(reqwest::header::AUTHORIZATION, authorization);
+        }
+        if let Some(etag) = cached.and_then(|object| object.etag.as_deref()) {
+            builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
         }
         let mut response = tokio::select! {
             biased;
@@ -187,15 +307,7 @@ impl GitHubIssueInvocation {
         if status.is_redirection() && status.as_u16() != 304 {
             return Err(IssueError::Denied);
         }
-        let header_bytes = response.headers().iter().try_fold(0_usize, |total, (name, value)| {
-            total
-                .checked_add(name.as_str().len())
-                .and_then(|total| total.checked_add(value.as_bytes().len()))
-                .ok_or(IssueError::ResourceExhausted)
-        })?;
-        if header_bytes > MAX_HEADERS_BYTES {
-            return Err(IssueError::ResourceExhausted);
-        }
+        validate_headers(response.headers())?;
         let response_etag = response
             .headers()
             .get(reqwest::header::ETAG)
@@ -203,47 +315,155 @@ impl GitHubIssueInvocation {
             .filter(|value| valid_etag(value))
             .map(str::to_owned);
         match status.as_u16() {
-            304 => Ok(not_modified_response(
-                reused_cached_entry,
-                response_etag,
-                etag,
-                cached,
-            )),
-            200 => {
-                let mut body = Vec::new();
-                loop {
-                    let chunk = tokio::select! {
-                        biased;
-                        reason = wait_for_interruption(&self.control) => {
-                            return Err(interruption_error(reason));
-                        }
-                        chunk = response.chunk() => chunk.map_err(map_transport_error)?,
-                    };
-                    let Some(chunk) = chunk else {
-                        break;
-                    };
-                    if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-                        return Err(IssueError::ResourceExhausted);
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                self.cache
-                    .lock()
-                    .map_err(|_| IssueError::Unavailable)?
-                    .insert(
-                        key,
-                        CachedIssue {
-                            etag: response_etag.clone(),
-                            body: body.clone(),
-                        },
-                    );
-                Ok(IssueResponse::Ok((response_etag, body)))
-            }
+            304 => replay_not_modified(cached, response_etag),
+            200 => Ok(FetchedObject {
+                object: CachedObject {
+                    etag: response_etag,
+                    body: read_body(&mut response, &self.control).await?,
+                },
+                modified: true,
+            }),
             401 | 403 | 404 => Err(IssueError::Denied),
+            429 => Err(IssueError::ResourceExhausted),
             _ => Err(IssueError::Unavailable),
         }
     }
 }
+
+#[derive(Deserialize)]
+struct IssueMetadata {
+    comments: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CommentMetadata {
+    updated_at: String,
+}
+
+fn normalize_latest_comment(body: &[u8]) -> Result<Vec<u8>, IssueError> {
+    let comments: Vec<CommentMetadata> =
+        serde_json::from_slice(body).map_err(|_| IssueError::Unavailable)?;
+    let [comment] = comments.as_slice() else {
+        return Err(IssueError::Unavailable);
+    };
+    serde_json::to_vec(&[comment]).map_err(|_| IssueError::Unavailable)
+}
+
+struct FetchedObject {
+    object: CachedObject,
+    modified: bool,
+}
+
+fn replay_not_modified(
+    cached: Option<&CachedObject>,
+    response_etag: Option<String>,
+) -> Result<FetchedObject, IssueError> {
+    let cached = cached.ok_or(IssueError::Unavailable)?;
+    let effective_etag = response_etag.or_else(|| cached.etag.clone());
+    if cached.etag != effective_etag {
+        return Err(IssueError::Unavailable);
+    }
+    Ok(FetchedObject {
+        object: cached.clone(),
+        modified: false,
+    })
+}
+
+fn source_to_wit(source: &CachedSource) -> SourceSnapshot {
+    SourceSnapshot {
+        issue: object_to_wit(&source.issue),
+        latest_comment: source.latest_comment.as_ref().map(object_to_wit),
+        observed_at: source.observed_at.clone(),
+    }
+}
+
+fn object_to_wit(object: &CachedObject) -> SourceObject {
+    SourceObject {
+        etag: object.etag.clone(),
+        body: object.body.clone(),
+    }
+}
+
+fn run_on_runtime<T>(future: impl Future<Output = Result<T, IssueError>>) -> Result<T, IssueError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| IssueError::Unavailable)?;
+    runtime.block_on(future)
+}
+
+fn valid_request(request: &IssueRequest) -> bool {
+    valid_component(&request.owner, 39) && valid_component(&request.repo, 100) && request.number > 0
+}
+
+fn valid_component(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_etag(value: &str) -> bool {
+    if value.len() > MAX_ETAG_BYTES {
+        return false;
+    }
+    let quoted = value.strip_prefix("W/").unwrap_or(value);
+    let Some(inner) = quoted
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+    else {
+        return false;
+    };
+    !inner.is_empty()
+        && inner.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'+' | b'-')
+        })
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, IssueError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(IssueError::DeadlineExceeded)
+}
+
+fn validate_headers(headers: &reqwest::header::HeaderMap) -> Result<(), IssueError> {
+    let bytes = headers.iter().try_fold(0_usize, |total, (name, value)| {
+        total
+            .checked_add(name.as_str().len())
+            .and_then(|total| total.checked_add(value.as_bytes().len()))
+            .ok_or(IssueError::ResourceExhausted)
+    })?;
+    if bytes > MAX_HEADERS_BYTES {
+        return Err(IssueError::ResourceExhausted);
+    }
+    Ok(())
+}
+
+async fn read_body(
+    response: &mut reqwest::Response,
+    control: &InvocationControl,
+) -> Result<Vec<u8>, IssueError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            reason = wait_for_interruption(control) => return Err(interruption_error(reason)),
+            chunk = response.chunk() => chunk.map_err(map_transport_error)?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_SOURCE_BYTES {
+            return Err(IssueError::ResourceExhausted);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn wait_for_interruption(control: &InvocationControl) -> InterruptionReason {
     loop {
         if let Some(reason) = control.interruption_reason() {
@@ -260,54 +480,6 @@ fn interruption_error(reason: InterruptionReason) -> IssueError {
     }
 }
 
-fn request_matches_scope(config: &GitHubIssueConfig, request: &IssueRequest) -> bool {
-    request.owner == config.owner
-        && request.repo == config.repo
-        && request.number == config.number
-        && request.etag.as_ref().is_none_or(|etag| valid_etag(etag))
-}
-
-
-fn conditional_etag(
-    has_authoritative_prior: bool,
-    requested: Option<String>,
-    cached: Option<String>,
-) -> Option<String> {
-    has_authoritative_prior
-        .then(|| requested.or(cached))
-        .flatten()
-}
-
-fn not_modified_response(
-    reused_cached_entry: bool,
-    response_etag: Option<String>,
-    conditional_etag: Option<String>,
-    cached: Option<CachedIssue>,
-) -> IssueResponse {
-    let effective_etag = response_etag.or(conditional_etag);
-    if reused_cached_entry
-        && let Some(cached) = cached
-        && cached.etag == effective_etag
-    {
-        return IssueResponse::Ok((effective_etag, cached.body));
-    }
-    IssueResponse::NotModified(effective_etag)
-}
-
-fn valid_slug(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 100
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn valid_etag(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_ETAG_BYTES
-        && !value.bytes().any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
-}
-
 fn map_transport_error(error: reqwest::Error) -> IssueError {
     if error.is_timeout() {
         IssueError::DeadlineExceeded
@@ -316,15 +488,34 @@ fn map_transport_error(error: reqwest::Error) -> IssueError {
     }
 }
 
-fn resolve_public_api_address() -> Result<SocketAddr, IssueError> {
-    let addresses = (API_HOST, API_PORT)
-        .to_socket_addrs()
-        .map_err(|_| IssueError::Unavailable)?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() || addresses.iter().any(|address| !is_public(address.ip())) {
+async fn resolve_public_api_address(
+    control: &InvocationControl,
+    deadline: Instant,
+) -> Result<SocketAddr, IssueError> {
+    let resolver = hickory_resolver::Resolver::builder_tokio()
+        .and_then(hickory_resolver::ResolverBuilder::build)
+        .map_err(|_| IssueError::Unavailable)?;
+    let lookup = tokio::select! {
+        biased;
+        reason = wait_for_interruption(control) => return Err(interruption_error(reason)),
+        result = await_dns_lookup(remaining(deadline)?, resolver.lookup_ip(API_HOST)) => result?,
+    };
+    let mut addresses = lookup.iter();
+    let first = addresses.next().ok_or(IssueError::Unavailable)?;
+    if !is_public(first) || addresses.any(|address| !is_public(address)) {
         return Err(IssueError::Denied);
     }
-    addresses.into_iter().next().ok_or(IssueError::Unavailable)
+    Ok(SocketAddr::new(first, API_PORT))
+}
+
+async fn await_dns_lookup<T, E>(
+    timeout: Duration,
+    lookup: impl Future<Output = Result<T, E>>,
+) -> Result<T, IssueError> {
+    tokio::time::timeout(timeout, lookup)
+        .await
+        .map_err(|_| IssueError::DeadlineExceeded)?
+        .map_err(|_| IssueError::Unavailable)
 }
 
 fn is_public(address: IpAddr) -> bool {
@@ -365,48 +556,76 @@ fn is_public(address: IpAddr) -> bool {
 mod tests {
     use super::*;
 
-
-    fn live_config() -> GitHubIssueConfig {
-        GitHubIssueConfig {
-            owner: "rust-lang".into(),
-            repo: "rust".into(),
-            number: 1,
-            connect_timeout: Duration::from_secs(3),
-            total_timeout: Duration::from_secs(10),
+    #[test]
+    fn capability_accepts_dynamic_valid_subjects_and_rejects_invalid_components() {
+        for request in [
+            IssueRequest {
+                owner: "example".into(),
+                repo: "demo".into(),
+                number: 1,
+            },
+            IssueRequest {
+                owner: "other-owner".into(),
+                repo: "private.repo".into(),
+                number: 42,
+            },
+        ] {
+            assert!(valid_request(&request));
+        }
+        for request in [
+            IssueRequest {
+                owner: "..".into(),
+                repo: "demo".into(),
+                number: 1,
+            },
+            IssueRequest {
+                owner: "example".into(),
+                repo: "demo/path".into(),
+                number: 1,
+            },
+            IssueRequest {
+                owner: "example".into(),
+                repo: "demo".into(),
+                number: 0,
+            },
+        ] {
+            assert!(!valid_request(&request));
         }
     }
 
     #[test]
-    fn exact_scope_and_header_policy_deny_before_transport() {
-        let module = GitHubIssueModule::new(live_config()).unwrap();
-        for request in [
-            IssueRequest {
-                owner: "other".into(),
-                repo: "rust".into(),
-                number: 1,
-                etag: None,
-            },
-            IssueRequest {
-                owner: "rust-lang".into(),
-                repo: "other".into(),
-                number: 1,
-                etag: None,
-            },
-            IssueRequest {
-                owner: "rust-lang".into(),
-                repo: "rust".into(),
-                number: 2,
-                etag: None,
-            },
-            IssueRequest {
-                owner: "rust-lang".into(),
-                repo: "rust".into(),
-                number: 1,
-                etag: Some("\"ok\"\r\nx-injected: true".into()),
-            },
-        ] {
-            assert!(!request_matches_scope(&module.config, &request));
-        }
+    fn etags_are_quoted_and_header_safe() {
+        assert!(valid_etag("\"issue-v1\""));
+        assert!(valid_etag("W/\"comment/v1:2\""));
+        assert!(!valid_etag("issue-v1"));
+        assert!(!valid_etag("\"bad header\""));
+        assert!(!valid_etag("\"ok\"\r\nx-injected: true"));
+    }
+
+    #[test]
+    fn latest_comment_source_exposes_only_updated_at_metadata() {
+        let normalized = normalize_latest_comment(
+            br#"[{"updated_at":"2026-08-30T11:22:33Z","body":"private discussion"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&normalized).unwrap(),
+            serde_json::json!([{"updated_at": "2026-08-30T11:22:33Z"}])
+        );
+    }
+
+    #[test]
+    fn not_modified_replays_only_the_exact_cached_etag_and_body() {
+        let cached = CachedObject {
+            etag: Some("\"issue-v1\"".into()),
+            body: br#"{"comments":2}"#.to_vec(),
+        };
+        let replayed = replay_not_modified(Some(&cached), Some("\"issue-v1\"".into())).unwrap();
+        assert!(!replayed.modified);
+        assert_eq!(replayed.object.etag, cached.etag);
+        assert_eq!(replayed.object.body, cached.body);
+        assert!(replay_not_modified(Some(&cached), Some("\"issue-v2\"".into())).is_err());
+        assert!(replay_not_modified(None, Some("\"issue-v1\"".into())).is_err());
     }
 
     #[test]
@@ -430,49 +649,4 @@ mod tests {
         assert!(is_public("8.8.8.8".parse().unwrap()));
         assert!(is_public("2606:4700:4700::1111".parse().unwrap()));
     }
-
-    #[test]
-    fn deadlines_are_bounded_and_ordered() {
-        let mut config = live_config();
-        config.connect_timeout = Duration::from_secs(11);
-        assert!(config.validate().is_err());
-        config.connect_timeout = Duration::from_secs(1);
-        config.total_timeout = Duration::from_secs(61);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn shared_runtime_only_reuses_an_etag_for_a_binding_with_prior_state() {
-        assert_eq!(conditional_etag(false, None, Some("\"cached\"".into())), None);
-        assert_eq!(
-            conditional_etag(true, None, Some("\"cached\"".into())),
-            Some("\"cached\"".into())
-        );
-    }
-
-    #[test]
-    fn shared_runtime_304_replays_cached_body_to_an_older_binding() {
-        let newest_body = br#"{"title":"new"}"#.to_vec();
-        let cached = CachedIssue {
-            etag: Some("\"new\"".into()),
-            body: newest_body.clone(),
-        };
-        let response = not_modified_response(
-            true,
-            None,
-            Some("\"new\"".into()),
-            Some(cached),
-        );
-        let IssueResponse::Ok((etag, body)) = response else {
-            panic!("shared cached revalidation must return the exact cached body");
-        };
-        assert_eq!(etag.as_deref(), Some("\"new\""));
-        assert_eq!(body, newest_body);
-        assert_ne!(
-            st2_resource_protocol::SnapshotDigest::of(b"{\"title\":\"old\"}"),
-            st2_resource_protocol::SnapshotDigest::of(&body),
-            "the guest can compare and publish the newer body for the skewed binding"
-        );
-    }
-
 }

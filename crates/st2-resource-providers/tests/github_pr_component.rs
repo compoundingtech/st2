@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 use serde_json::{Value, json};
 use st2_resource_protocol::{ObservationResult, SnapshotDigest};
@@ -19,8 +19,7 @@ mod bindings {
 }
 
 use bindings::compoundingtech::st2_github_pr::github_pr::{
-    Host, PullRequestError, PullRequestRequest, PullRequestResponse, SourceObject,
-    SourceObservation, SourceSnapshot,
+    Host, PullRequestError, PullRequestRequest, SourceObservation, SourceSnapshot,
 };
 
 const IMPORT_NAME: &str = "compoundingtech:st2-github-pr/github-pr@0.1.0";
@@ -60,27 +59,24 @@ impl CapabilityModule for FixtureModule {
 }
 
 impl Host for InvocationStore<FixtureInvocation> {
-    fn get(
-        &mut self,
-        request: PullRequestRequest,
-    ) -> Result<PullRequestResponse, PullRequestError> {
+    fn get(&mut self, request: PullRequestRequest) -> Result<SourceObservation, PullRequestError> {
         assert_eq!(request.owner, "example");
         assert_eq!(request.repo, "demo");
         assert_eq!(request.number, 389);
         let call = self.capability().calls.fetch_add(1, Ordering::SeqCst);
         Ok(match call {
-            0 => PullRequestResponse::Ok(SourceObservation {
+            0 => SourceObservation {
                 current: source(false, "2026-08-30T12:34:56Z"),
                 previous: None,
-            }),
-            1 => PullRequestResponse::Ok(SourceObservation {
+            },
+            1 => SourceObservation {
                 current: source(true, "2026-08-30T12:35:56Z"),
                 previous: Some(source(false, "2026-08-30T12:34:56Z")),
-            }),
-            _ => PullRequestResponse::Ok(SourceObservation {
+            },
+            _ => SourceObservation {
                 current: source(true, "2026-08-30T12:36:56Z"),
                 previous: Some(source(true, "2026-08-30T12:35:56Z")),
-            }),
+            },
         })
     }
 
@@ -124,10 +120,7 @@ impl CapabilityModule for BlockingModule {
 }
 
 impl Host for InvocationStore<BlockingInvocation> {
-    fn get(
-        &mut self,
-        _request: PullRequestRequest,
-    ) -> Result<PullRequestResponse, PullRequestError> {
+    fn get(&mut self, _request: PullRequestRequest) -> Result<SourceObservation, PullRequestError> {
         let capability = self.capability();
         capability.entered.wait();
         match capability.control.wait_for_interruption() {
@@ -142,8 +135,9 @@ impl Host for InvocationStore<BlockingInvocation> {
 }
 
 #[test]
-fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
+fn component_pins_approved_snapshot_facts_topics_and_atomic_results() {
     let module = FixtureModule::default();
+    let calls = Arc::clone(&module.calls);
     let bindings = Arc::clone(&module.bindings);
     let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
     let bytes = fs::read(component()).unwrap();
@@ -163,10 +157,13 @@ fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
         "dev.schickling.github-pr.snapshot.v1"
     );
     assert_eq!(descriptor.snapshot_media_type, "application/json");
-
-    let first = executor
-        .observe(&loaded, &request(1, None), None)
+    let selector_properties = descriptor.selector_schema["properties"]
+        .as_object()
         .unwrap();
+    assert!(selector_properties.contains_key("topics"));
+    assert!(!selector_properties.contains_key("owner"));
+
+    let first = executor.observe(&loaded, &request(1, None), None).unwrap();
     let first = match first {
         ObservationResult::Published { publication } => publication,
         other => panic!("first observation must publish, got {other:?}"),
@@ -180,42 +177,63 @@ fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
             "terminal"
         ]
     );
+    assert_eq!(
+        first
+            .facts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|fact| (fact.key(), fact.before(), fact.after()))
+            .collect::<Vec<_>>(),
+        [
+            ("pr", None, Some(Some("#389"))),
+            ("state", None, Some(Some("open"))),
+            ("ci", None, Some(Some("failure"))),
+        ]
+    );
     let snapshot: Value = serde_json::from_slice(first.bytes.as_slice()).unwrap();
     assert_eq!(
         snapshot,
         json!({
-            "ci": {
-                "checkRuns": [
-                    {"conclusion": "failure", "detailsUrl": "https://example.invalid/a", "name": "a-build", "status": "completed"},
-                    {"conclusion": "success", "detailsUrl": "https://example.invalid/z", "name": "z-test", "status": "completed"}
-                ],
-                "state": "failure",
-                "statuses": [
-                    {"context": "a/build", "description": "failed", "state": "failure", "targetUrl": "https://example.invalid/a"},
-                    {"context": "z/lint", "description": null, "state": "success", "targetUrl": "https://example.invalid/z"}
-                ]
-            },
-            "facets": {"ciFailure": true, "mergeConflict": false, "reviewRequested": true, "terminal": false},
-            "number": 389,
+            "schema": "dev.schickling.github-pr.snapshot.v1",
+            "uri": "github-pr://github.com/example/demo/pull/389",
             "observedAt": "2026-08-30T12:34:56Z",
+            "repository": {"owner": "example", "name": "demo"},
+            "number": 389,
             "pullRequest": {
                 "apiUrl": "https://api.github.com/repos/example/demo/pulls/389",
-                "base": {"ref": "main"},
-                "closedAt": null,
-                "draft": false,
-                "head": {"ref": "resources", "sha": HEAD_SHA},
                 "htmlUrl": "https://github.com/example/demo/pull/389",
-                "mergeable": true,
-                "mergeableState": "clean",
+                "title": "Canonical pull request",
+                "body": "Authoritative PR body",
+                "state": "open",
+                "author": "octocat",
+                "draft": false,
                 "merged": false,
                 "mergedAt": null,
-                "requestedReviewers": ["a-reviewer", "z-reviewer"],
-                "requestedTeams": ["team-a", "team-b"],
-                "state": "open"
+                "closedAt": null,
+                "mergeable": true,
+                "mergeableState": "clean",
+                "head": {"sha": HEAD_SHA, "ref": "resources"},
+                "base": {"ref": "main"},
+                "reviewDecision": "REVIEW_REQUIRED",
+                "requestedReviewers": ["copilot-pull-request-reviewer", "former-reviewer", "z-reviewer"],
+                "requestedTeams": ["team-a"],
+                "reviewRequestTotalCount": 4,
+                "reviewRequestsTruncated": false
             },
-            "repository": {"name": "demo", "owner": "example"},
-            "schema": "dev.schickling.github-pr.snapshot.v1",
-            "uri": "github-pr://example/demo/389"
+            "ci": {
+                "state": "failure",
+                "totalCount": 101,
+                "truncated": true,
+                "checkRuns": [
+                    {"name": "a-build", "status": "completed", "conclusion": "failure", "detailsUrl": "https://github.com/example/demo/actions/a"},
+                    {"name": "z-test", "status": "completed", "conclusion": "success", "detailsUrl": "https://github.com/example/demo/actions/z"}
+                ],
+                "statuses": [
+                    {"context": "a/build", "state": "failure", "targetUrl": "https://ci.example/a", "description": "failed"}
+                ]
+            },
+            "facets": {"reviewRequested": true, "ciFailure": true, "mergeConflict": false, "terminal": false}
         })
     );
 
@@ -239,7 +257,7 @@ fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
             .iter()
             .map(|fact| fact.key())
             .collect::<Vec<_>>(),
-        ["facets.terminal"]
+        ["pr", "state", "ci"]
     );
 
     let third = executor
@@ -250,7 +268,36 @@ fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
         )
         .unwrap();
     assert_eq!(third, ObservationResult::Unchanged);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(bindings.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn component_rejects_old_short_uri_before_import_as_one_failed_result() {
+    let module = FixtureModule::default();
+    let calls = Arc::clone(&module.calls);
+    let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
+    let loaded = executor.load(&fs::read(component()).unwrap()).unwrap();
+    let result = executor
+        .observe(
+            &loaded,
+            &ObservationRequest {
+                invocation_id: 9,
+                uri: "github-pr://example/demo/389".into(),
+                selector: json!({}),
+                prior_digest: None,
+                demand_watermark: Some(9),
+            },
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        &result,
+        ObservationResult::Failed {
+            diagnostic: Some(diagnostic)
+        } if diagnostic == "invalid canonical GitHub pull request URI"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -289,7 +336,7 @@ fn interrupt_blocked_import(interruption: BlockedInterruption) -> ObserveError {
     let handle = executor.interruption_handle();
     let trigger = handle.clone();
     let observing =
-        std::thread::spawn(move || executor.observe(&loaded, &request(4, None), Some(&handle)));
+        std::thread::spawn(move || executor.observe(&loaded, &request(10, None), Some(&handle)));
     entered.wait();
     match interruption {
         BlockedInterruption::Cancel => assert!(trigger.cancel()),
@@ -301,73 +348,79 @@ fn interrupt_blocked_import(interruption: BlockedInterruption) -> ObserveError {
 fn request(invocation_id: u64, prior_digest: Option<SnapshotDigest>) -> ObservationRequest {
     ObservationRequest {
         invocation_id,
-        uri: "github-pr://example/demo/389".into(),
-        selector: json!({
-            "owner": "example",
-            "repo": "demo",
-            "number": 389,
-            "topics": ["ci.failure", "terminal"]
-        }),
+        uri: "github-pr://github.com/example/demo/pull/389".into(),
+        selector: json!({"topics": ["ci.failure", "terminal"]}),
         prior_digest,
         demand_watermark: Some(invocation_id),
     }
 }
 
 fn source(terminal: bool, observed_at: &str) -> SourceSnapshot {
-    let state = if terminal { "closed" } else { "open" };
+    let mut data = graphql_data();
+    let pull = &mut data["repository"]["pullRequest"];
+    if terminal {
+        pull["state"] = json!("CLOSED");
+        pull["merged"] = json!(true);
+        pull["mergedAt"] = json!("2026-08-30T12:35:00Z");
+        pull["closedAt"] = json!("2026-08-30T12:35:00Z");
+    }
     SourceSnapshot {
-        pull_request: object(
-            "\"pull-v1\"",
-            json!({
-                "number": 389,
-                "url": "https://api.github.com/repos/example/demo/pulls/389",
-                "html_url": "https://github.com/example/demo/pull/389",
-                "state": state,
-                "draft": false,
-                "merged": terminal,
-                "merged_at": if terminal { Some("2026-08-30T12:35:00Z") } else { None },
-                "closed_at": if terminal { Some("2026-08-30T12:35:00Z") } else { None },
-                "mergeable": true,
-                "mergeable_state": "clean",
-                "head": {"sha": HEAD_SHA, "ref": "resources"},
-                "base": {"ref": "main"},
-                "requested_reviewers": [{"login": "z-reviewer"}, {"login": "a-reviewer"}],
-                "requested_teams": [{"slug": "team-b"}, {"slug": "team-a"}]
-            }),
-        ),
-        check_runs: object(
-            "\"checks-v1\"",
-            json!({
-                "check_runs": [
-                    {"name": "z-test", "status": "completed", "conclusion": "success", "details_url": "https://example.invalid/z"},
-                    {"name": "a-build", "status": "completed", "conclusion": "failure", "details_url": "https://example.invalid/a"}
-                ]
-            }),
-        ),
-        combined_status: object(
-            "\"status-v1\"",
-            json!({
-                "state": "failure",
-                "statuses": [
-                    {"context": "z/lint", "state": "success", "target_url": "https://example.invalid/z", "description": null},
-                    {"context": "a/build", "state": "failure", "target_url": "https://example.invalid/a", "description": "failed"}
-                ]
-            }),
-        ),
+        graphql_data: serde_json::to_vec(&data).unwrap(),
         observed_at: observed_at.into(),
     }
 }
 
-fn object(etag: &str, value: Value) -> SourceObject {
-    SourceObject {
-        etag: Some(etag.into()),
-        body: serde_json::to_vec(&value).unwrap(),
-    }
+fn graphql_data() -> Value {
+    json!({
+        "repository": {
+            "pullRequest": {
+                "url": "https://github.com/example/demo/pull/389",
+                "title": "Canonical pull request",
+                "body": "Authoritative PR body",
+                "state": "OPEN",
+                "isDraft": false,
+                "merged": false,
+                "mergedAt": null,
+                "closedAt": null,
+                "mergeable": "MERGEABLE",
+                "author": {"login": "octocat"},
+                "headRefOid": HEAD_SHA,
+                "headRefName": "resources",
+                "baseRefName": "main",
+                "reviewDecision": "REVIEW_REQUIRED",
+                "reviewRequests": {
+                    "totalCount": 4,
+                    "nodes": [
+                        {"requestedReviewer": {"__typename": "User", "login": "z-reviewer"}},
+                        {"requestedReviewer": {"__typename": "Team", "slug": "team-a"}},
+                        {"requestedReviewer": {"__typename": "Bot", "login": "copilot-pull-request-reviewer"}},
+                        {"requestedReviewer": {"__typename": "Mannequin", "login": "former-reviewer"}}
+                    ]
+                },
+                "commits": {
+                    "nodes": [{
+                        "commit": {
+                            "statusCheckRollup": {
+                                "state": "FAILURE",
+                                "contexts": {
+                                    "totalCount": 101,
+                                    "nodes": [
+                                        {"__typename": "CheckRun", "name": "z-test", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/example/demo/actions/z"},
+                                        {"__typename": "CheckRun", "name": "a-build", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/example/demo/actions/a"},
+                                        {"__typename": "StatusContext", "context": "a/build", "state": "FAILURE", "targetUrl": "https://ci.example/a", "description": "failed"}
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        }
+    })
 }
 
 fn component() -> PathBuf {
     PathBuf::from(
-        std::env::var_os("ST2_GITHUB_PR_COMPONENT")
-            .expect("ST2_GITHUB_PR_COMPONENT is not set"),
+        std::env::var_os("ST2_GITHUB_PR_COMPONENT").expect("ST2_GITHUB_PR_COMPONENT is not set"),
     )
 }

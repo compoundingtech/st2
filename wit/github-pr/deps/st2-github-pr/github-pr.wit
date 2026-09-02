@@ -7,15 +7,8 @@ interface github-pr {
     number: u64,
   }
 
-  record source-object {
-    etag: option<string>,
-    body: list<u8>,
-  }
-
   record source-snapshot {
-    pull-request: source-object,
-    check-runs: source-object,
-    combined-status: source-object,
+    graphql-data: list<u8>,
     observed-at: string,
   }
 
@@ -24,18 +17,15 @@ interface github-pr {
     previous: option<source-snapshot>,
   }
 
-  variant pull-request-response {
-    ok(source-observation),
-    not-modified,
-  }
 
   variant pull-request-error {
     denied,
+    authentication-required,
     unavailable,
     resource-exhausted,
     deadline-exceeded,
   }
 
-  get: func(request: pull-request-request) -> result<pull-request-response, pull-request-error>;
+  get: func(request: pull-request-request) -> result<source-observation, pull-request-error>;
   bind-snapshot: func(digest: list<u8>) -> result<_, pull-request-error>;
 }

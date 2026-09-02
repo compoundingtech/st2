@@ -1171,9 +1171,13 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
             !catalog_is_strictly_valid(&catalog),
             "raw-preimage snapshot refuses an already-valid catalog"
         );
-        let incumbent_config = crate::catalog::load(&catalog)
+        let incumbent_envelope = crate::catalog::load_envelope(&catalog)
             .context("raw-preimage snapshot requires a valid incumbent catalog envelope")?;
-        validate_external_pty_root(&catalog, &incumbent_config, "raw-preimage snapshot v1")?;
+        validate_external_pty_root(
+            &catalog,
+            incumbent_envelope.pty_root.as_deref(),
+            "raw-preimage snapshot v1",
+        )?;
         let projection = project_raw_current(&catalog)?;
         validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
         projection
@@ -1278,7 +1282,11 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
     materialize_projection(&desired, admission.path())?;
     validate_full_catalog(admission.path())?;
     let desired_config = crate::catalog::load(admission.path())?;
-    validate_external_pty_root(&catalog, &desired_config, "catalog bootstrap v1")?;
+    validate_external_pty_root(
+        &catalog,
+        desired_config.pty_root.as_deref(),
+        "catalog bootstrap v1",
+    )?;
 
     match fs::symlink_metadata(&catalog) {
         Ok(_) => {
@@ -1593,7 +1601,11 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     materialize_projection(&desired, admission.path())?;
     validate_full_catalog(admission.path())?;
     let desired_config = crate::catalog::load(admission.path())?;
-    validate_external_pty_root(&catalog, &desired_config, "catalog apply v1")?;
+    validate_external_pty_root(
+        &catalog,
+        desired_config.pty_root.as_deref(),
+        "catalog apply v1",
+    )?;
 
     let stage_name = stage_name(&desired.root_sha256);
     let stage_path = control.join(&stage_name);
@@ -1610,14 +1622,16 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
                 "raw-preimage apply refuses an already-valid catalog"
             );
         }
-        let live_config = if raw_preimage {
-            crate::catalog::load(&catalog)
-                .context("raw-preimage apply requires a valid incumbent catalog envelope")?
+        let live_pty_root = if raw_preimage {
+            let live_envelope = crate::catalog::load_envelope(&catalog)
+                .context("raw-preimage apply requires a valid incumbent catalog envelope")?;
+            effective_pty_root(&catalog, live_envelope.pty_root.as_deref())
         } else {
-            crate::catalog::load(&catalog)?
+            let live_config = crate::catalog::load(&catalog)?;
+            effective_pty_root(&catalog, live_config.pty_root.as_deref())
         };
-        let same_pty_root = effective_pty_root(&catalog, &live_config)
-            == effective_pty_root(&catalog, &desired_config);
+        let same_pty_root =
+            live_pty_root == effective_pty_root(&catalog, desired_config.pty_root.as_deref());
         if !raw_preimage {
             cleanup_writer_temporaries(&catalog)?;
         }
@@ -2333,7 +2347,6 @@ pub(crate) fn read_provider_component(root: &Path, relative: &Path) -> Result<Ve
         .context("admitted provider component disappeared")
 }
 
-
 fn add_regular(
     root: &Path,
     path: &Path,
@@ -2903,8 +2916,8 @@ fn validate_declaration_leaf_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn effective_pty_root(live_catalog: &Path, config: &crate::catalog::CatalogConfig) -> PathBuf {
-    match &config.pty_root {
+fn effective_pty_root(live_catalog: &Path, declared_pty_root: Option<&str>) -> PathBuf {
+    match declared_pty_root {
         Some(declared) => live_catalog.join(crate::expand::expand_catalog(declared, live_catalog)),
         None => live_catalog.join("pty"),
     }
@@ -2920,14 +2933,14 @@ fn validate_live_workspace_facts(catalog: &Path, facts: &BTreeSet<String>) -> Re
 
 fn validate_external_pty_root(
     catalog: &Path,
-    config: &crate::catalog::CatalogConfig,
+    declared_pty_root: Option<&str>,
     operation: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        config.pty_root.is_some(),
+        declared_pty_root.is_some(),
         "{operation} requires an explicit external pty-root"
     );
-    let pty_root = lexical_absolute(&effective_pty_root(catalog, config))?;
+    let pty_root = lexical_absolute(&effective_pty_root(catalog, declared_pty_root))?;
     anyhow::ensure!(
         !pty_root.starts_with(catalog),
         "{operation} requires pty-root outside the catalog: {}",
