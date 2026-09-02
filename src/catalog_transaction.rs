@@ -1167,17 +1167,7 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 
     let _lock = CatalogLock::shared(&catalog)?;
     let projection = if request.raw_preimage {
-        anyhow::ensure!(
-            !catalog_is_strictly_valid(&catalog),
-            "raw-preimage snapshot refuses an already-valid catalog"
-        );
-        let incumbent_envelope = crate::catalog::load_envelope(&catalog)
-            .context("raw-preimage snapshot requires a valid incumbent catalog envelope")?;
-        validate_external_pty_root(
-            &catalog,
-            incumbent_envelope.pty_root.as_deref(),
-            "raw-preimage snapshot v1",
-        )?;
+
         let projection = project_raw_current(&catalog)?;
         validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
         projection
@@ -1616,22 +1606,13 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         );
         (expect_sha256.clone(), marker.original_paths, None)
     } else {
-        if raw_preimage {
-            anyhow::ensure!(
-                !catalog_is_strictly_valid(&catalog),
-                "raw-preimage apply refuses an already-valid catalog"
-            );
-        }
-        let live_pty_root = if raw_preimage {
-            let live_envelope = crate::catalog::load_envelope(&catalog)
-                .context("raw-preimage apply requires a valid incumbent catalog envelope")?;
-            effective_pty_root(&catalog, live_envelope.pty_root.as_deref())
+        let same_pty_root = if raw_preimage {
+            true
         } else {
             let live_config = crate::catalog::load(&catalog)?;
             effective_pty_root(&catalog, live_config.pty_root.as_deref())
+                == effective_pty_root(&catalog, desired_config.pty_root.as_deref())
         };
-        let same_pty_root =
-            live_pty_root == effective_pty_root(&catalog, desired_config.pty_root.as_deref());
         if !raw_preimage {
             cleanup_writer_temporaries(&catalog)?;
         }
@@ -1782,26 +1763,16 @@ pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
 fn format_issue(issue: &crate::validate::Issue) -> String {
     format!("{} [{}]: {}", issue.path, issue.code, issue.message)
 }
-
-fn catalog_is_strictly_valid(root: &Path) -> bool {
-    project(root, ProjectionSource::Current, root)
-        .and_then(|projection| {
-            validate_live_workspace_facts(root, &projection.workspace_dirs)?;
-            validate_full_catalog(root)
-        })
-        .is_ok()
-}
-
-/// Project the declaration plane without interpreting declaration bytes.
+/// Project the current declaration plane without interpreting declaration bytes.
 ///
-/// This exists solely to bind a repair transaction to the exact bytes of an invalid current
-/// catalog. It deliberately has no policy for why those bytes are invalid. Mutable agent state is
-/// excluded by the same structural boundaries as the strict projection; a prospective catalog is
-/// never admitted through this path.
+/// This exists solely to bind a repair transaction to an exact opaque preimage. It deliberately
+/// has no policy for whether or why those bytes are invalid. Mutable agent state is excluded by the
+/// same structural boundaries as the strict projection; a prospective catalog is never admitted
+/// through this path.
 ///
 /// In particular, `catalog.kdl` is captured as raw bytes but its profile module references are not
-/// resolved here. Module presence, kind, and size are prospective admission policy; requiring an
-/// invalid incumbent module to satisfy that policy would make its own repair preimage unreachable.
+/// resolved here. Module presence, kind, and size remain prospective admission policy; requiring
+/// incumbent bytes to satisfy that policy could make their own repair preimage unreachable.
 fn project_raw_current(root: &Path) -> Result<DeclarationProjection> {
     let metadata = fs::symlink_metadata(root)?;
     anyhow::ensure!(
