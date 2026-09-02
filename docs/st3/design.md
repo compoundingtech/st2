@@ -1788,6 +1788,22 @@ If one member is unreachable, the scope stays actually non-empty with a `cannot 
 
 The stop judges pass only after no recorded member remains. The verdict stays in the claims store after the scope stops.
 
+### External-state convergence eval
+
+A gate must not treat the first affirmative external liveness reading as settled evidence.
+
+An observed process can still report `running` briefly after it exits. A slow observer can hide this window for years. A faster replacement can expose it without changing the provider's state transition.
+
+A liveness gate requires two ordered observations of the same incarnation with no terminal observation between them. The second observation is a bounded revalidation action, not a periodic timer.
+
+The eval corpus must start one process that exits immediately. The eval permits an initial `running` observation and requires convergence to `exited` before its deadline.
+
+The eval fails if a gate advances from the first `running` observation. It also fails if the process remains incorrectly `running` until the deadline.
+
+Long-lived fixtures such as `cat` or `sleep 30` do not cover this class. A passing suite with only those fixtures gives no evidence about immediate-exit convergence.
+
+This rule comes from the st2 boot gate. Node `pty list --json` took 33 milliseconds and stepped over a five-millisecond stale window. Rust answered in 1.2 milliseconds and exposed the single-reading decision.
+
 ## Complete KDL specification
 
 st3 keeps the current st2 agent declaration shape. It places that shape inside one explicit desired-state block.
