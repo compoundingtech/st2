@@ -2558,6 +2558,9 @@ fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
         Some(percent) => format!("{}%", percent.round()),
         None => "?".to_string(),
     };
+    if context.is_rate_limited() {
+        column.push_str(" rate-limited");
+    }
     if context.compactions > 0 {
         column.push_str(&format!(" ⟳{}", context.compactions));
     }

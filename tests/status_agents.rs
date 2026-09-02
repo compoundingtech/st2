@@ -482,6 +482,10 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
             used_percent: Some(92.0),
             model: Some("claude-opus-5".to_string()),
             cost_usd: Some(3.5),
+            rate_limits: st2::harness_context::RateLimits {
+                five_hour: Some(100.0),
+                seven_day: Some(55.0),
+            },
             ..Reading::default()
         })
         .unwrap();
@@ -514,6 +518,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         assert_eq!(rows[0]["context"]["harness"], "claude");
         assert_eq!(rows[0]["context"]["usedPercent"], 92.0);
         assert_eq!(rows[0]["context"]["usedTokens"], 184_000);
+        assert_eq!(rows[0]["context"]["rateLimited"], true);
         assert_eq!(rows[0]["context"]["compactions"], 1);
         assert_eq!(rows[0]["context"]["lastCompactionTrigger"], "auto");
         assert_eq!(rows[0]["context"]["stale"], false);
@@ -532,7 +537,10 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:92% \u{27f3}1\t\t\n");
+    assert_eq!(
+        human(root),
+        "hetz.filling\tbusy\tobs:-\tctx:92% rate-limited \u{27f3}1\t\t\n"
+    );
 
     // A record whose percent the harness withheld — Claude before its first API response — must
     // not render like no record at all: the producer is watching and honestly does not know.
