@@ -14,12 +14,13 @@ use exports::st2::resource_provider::provider_api;
 
 const SNAPSHOT_SCHEMA: &str = "dev.schickling.vista.snapshot.v1";
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const MAX_VERSION: u64 = 9_007_199_254_740_991;
 const TOPICS: [&str; 4] = ["ready", "updated", "failed", "expired"];
 const SELECTOR_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {
     "slug": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
-    "version": { "type": "integer", "minimum": 1 },
+    "version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "topics": {
       "type": "array",
       "items": { "type": "string", "enum": ["ready", "updated", "failed", "expired"] },
@@ -125,7 +126,7 @@ fn observe(
         return Err("invalid Vista URI".into());
     };
     if !valid_slug(&selector.slug)
-        || selector.version == 0
+        || !(1..=MAX_VERSION).contains(&selector.version)
         || selector.slug != uri_slug
         || selector.version != uri_version
     {
@@ -204,14 +205,14 @@ fn parse_uri(uri: &str) -> Option<(&str, u64)> {
     if version.contains('/')
         || !valid_slug(slug)
         || digits.is_empty()
-        || digits.len() > 19
+        || digits.len() > 16
         || digits.starts_with('0')
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
     let version = digits.parse::<u64>().ok()?;
-    (version > 0).then_some((slug, version))
+    (1..=MAX_VERSION).contains(&version).then_some((slug, version))
 }
 
 fn valid_slug(slug: &str) -> bool {
@@ -247,15 +248,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vista_uri_identity_grammar_is_strict() {
-        assert_eq!(parse_uri("vista://release-notes/v7"), Some(("release-notes", 7)));
+    fn vista_version_matches_the_javascript_safe_integer_contract() {
         assert_eq!(
-            parse_uri("vista://a/v9999999999999999999"),
-            Some(("a", 9_999_999_999_999_999_999))
+            parse_uri("vista://release-notes/v9007199254740991"),
+            Some(("release-notes", 9_007_199_254_740_991))
         );
         for invalid in [
             "vista://release-notes/v0",
             "vista://release-notes/v01",
+            "vista://release-notes/v9007199254740992",
             "vista://release-notes/v10000000000000000000",
             "vista://-release/v1",
             "vista://release-/v1",
@@ -266,6 +267,12 @@ mod tests {
         ] {
             assert_eq!(parse_uri(invalid), None, "{invalid}");
         }
+
+        let schema: serde_json::Value = serde_json::from_str(SELECTOR_SCHEMA).unwrap();
+        assert_eq!(
+            schema["properties"]["version"]["maximum"],
+            serde_json::json!(9_007_199_254_740_991_u64)
+        );
     }
 
     #[test]

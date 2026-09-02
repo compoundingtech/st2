@@ -202,6 +202,8 @@ esac
         VistaConfig::resolve(
             &executable,
             temporary.path().to_path_buf(),
+            "release-notes".into(),
+            7,
             Duration::from_secs(5),
         )
         .unwrap(),

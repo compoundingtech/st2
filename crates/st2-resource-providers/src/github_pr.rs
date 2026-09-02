@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,8 @@ const API_PORT: u16 = 443;
 const MAX_HEADERS_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_ETAG_BYTES: usize = 1024;
+const SNAPSHOT_DIGEST_BYTES: usize = 32;
+const MAX_CACHED_SNAPSHOTS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubPrConfig {
@@ -61,7 +64,7 @@ impl GitHubPrConfig {
 #[derive(Clone)]
 pub struct GitHubPrModule {
     config: GitHubPrConfig,
-    cache: Arc<Mutex<BTreeMap<PullRequestKey, CachedSource>>>,
+    cache: Arc<Mutex<SnapshotCache>>,
 }
 
 impl GitHubPrModule {
@@ -69,12 +72,12 @@ impl GitHubPrModule {
         config.validate()?;
         Ok(Self {
             config,
-            cache: Arc::new(Mutex::new(BTreeMap::new())),
+            cache: Arc::new(Mutex::new(SnapshotCache::default())),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 struct PullRequestKey {
     owner: String,
     repo: String,
@@ -95,10 +98,31 @@ struct CachedSource {
     observed_at: String,
 }
 
+#[derive(Default)]
+struct SnapshotCache {
+    sources: BTreeMap<[u8; SNAPSHOT_DIGEST_BYTES], CachedSource>,
+}
+
+impl SnapshotCache {
+    fn get(&self, digest: &[u8; SNAPSHOT_DIGEST_BYTES]) -> Option<&CachedSource> {
+        self.sources.get(digest)
+    }
+
+    fn insert(&mut self, digest: [u8; SNAPSHOT_DIGEST_BYTES], source: CachedSource) {
+        if !self.sources.contains_key(&digest) && self.sources.len() >= MAX_CACHED_SNAPSHOTS {
+            if let Some(evicted) = self.sources.keys().next().cloned() {
+                self.sources.remove(&evicted);
+            }
+        }
+        self.sources.insert(digest, source);
+    }
+}
+
 pub struct GitHubPrInvocation {
     config: GitHubPrConfig,
-    cache: Arc<Mutex<BTreeMap<PullRequestKey, CachedSource>>>,
-    has_authoritative_prior: bool,
+    cache: Arc<Mutex<SnapshotCache>>,
+    prior_digest: Option<[u8; SNAPSHOT_DIGEST_BYTES]>,
+    current_source: Option<CachedSource>,
     control: InvocationControl,
 }
 
@@ -117,14 +141,17 @@ impl CapabilityModule for GitHubPrModule {
     }
 
     fn begin(&self, context: CapabilityContext<'_>) -> Self::Invocation {
-        let has_authoritative_prior = match context.phase() {
-            CapabilityPhase::Describe => false,
-            CapabilityPhase::Observe(request) => request.prior_digest.is_some(),
+        let prior_digest = match context.phase() {
+            CapabilityPhase::Describe => None,
+            CapabilityPhase::Observe(request) => {
+                request.prior_digest.as_ref().map(|digest| *digest.as_bytes())
+            }
         };
         GitHubPrInvocation {
             config: self.config.clone(),
             cache: Arc::clone(&self.cache),
-            has_authoritative_prior,
+            prior_digest,
+            current_source: None,
             control: context.control().clone(),
         }
     }
@@ -137,6 +164,10 @@ impl Host for InvocationStore<GitHubPrInvocation> {
     ) -> Result<PullRequestResponse, PullRequestError> {
         self.capability_mut().get(request)
     }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), PullRequestError> {
+        self.capability_mut().bind_snapshot(digest)
+    }
 }
 
 impl GitHubPrInvocation {
@@ -144,11 +175,7 @@ impl GitHubPrInvocation {
         &mut self,
         request: PullRequestRequest,
     ) -> Result<PullRequestResponse, PullRequestError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| PullRequestError::Unavailable)?;
-        runtime.block_on(self.get_async(request))
+        run_on_runtime(self.get_async(request))
     }
 
     async fn get_async(
@@ -166,13 +193,15 @@ impl GitHubPrInvocation {
             repo: request.repo,
             number: request.number,
         };
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| PullRequestError::Unavailable)?
-            .get(&key)
-            .cloned();
-        let prior = authoritative_prior(self.has_authoritative_prior, cached.as_ref());
+        let prior = match self.prior_digest.as_ref() {
+            Some(digest) => self
+                .cache
+                .lock()
+                .map_err(|_| PullRequestError::Unavailable)?
+                .get(digest)
+                .cloned(),
+            None => None,
+        };
         let deadline = Instant::now()
             .checked_add(self.config.total_timeout)
             .ok_or(PullRequestError::DeadlineExceeded)?;
@@ -193,7 +222,7 @@ impl GitHubPrInvocation {
             .fetch_object(
                 &client,
                 pull_endpoint,
-                prior.map(|source| &source.pull_request),
+                prior.as_ref().map(|source| &source.pull_request),
                 deadline,
                 MAX_SOURCE_BYTES,
             )
@@ -211,15 +240,16 @@ impl GitHubPrInvocation {
             "https://{API_HOST}/repos/{}/{}/commits/{}/check-runs?per_page=100",
             key.owner, key.repo, pull.head.sha
         );
-        let check_runs = self
-            .fetch_object(
+        let check_runs = require_complete(
+            self.fetch_object(
                 &client,
                 checks_endpoint,
-                prior.map(|source| &source.check_runs),
+                prior.as_ref().map(|source| &source.check_runs),
                 deadline,
                 remaining,
             )
-            .await?;
+            .await?,
+        )?;
         remaining = remaining
             .checked_sub(check_runs.object.body.len())
             .ok_or(PullRequestError::ResourceExhausted)?;
@@ -227,33 +257,58 @@ impl GitHubPrInvocation {
             "https://{API_HOST}/repos/{}/{}/commits/{}/status?per_page=100",
             key.owner, key.repo, pull.head.sha
         );
-        let combined_status = self
-            .fetch_object(
+        let combined_status = require_complete(
+            self.fetch_object(
                 &client,
                 status_endpoint,
-                prior.map(|source| &source.combined_status),
+                prior.as_ref().map(|source| &source.combined_status),
                 deadline,
                 remaining,
             )
-            .await?;
+            .await?,
+        )?;
 
         if !pull_request.modified && !check_runs.modified && !combined_status.modified {
             return Ok(PullRequestResponse::NotModified);
         }
+        let observed_at = prior
+            .as_ref()
+            .filter(|prior| {
+                prior.pull_request.body == pull_request.object.body
+                    && prior.check_runs.body == check_runs.object.body
+                    && prior.combined_status.body == combined_status.object.body
+            })
+            .map_or_else(
+                || Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                |prior| prior.observed_at.clone(),
+            );
         let source = CachedSource {
             pull_request: pull_request.object,
             check_runs: check_runs.object,
             combined_status: combined_status.object,
-            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            observed_at,
         };
+        let current = source_to_wit(&source);
+        self.current_source = Some(source);
+        Ok(PullRequestResponse::Ok(SourceObservation {
+            current,
+            previous: prior.as_ref().map(source_to_wit),
+        }))
+    }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), PullRequestError> {
+        let digest: [u8; SNAPSHOT_DIGEST_BYTES] = digest
+            .try_into()
+            .map_err(|_| PullRequestError::Denied)?;
+        let source = self
+            .current_source
+            .take()
+            .ok_or(PullRequestError::Unavailable)?;
         self.cache
             .lock()
             .map_err(|_| PullRequestError::Unavailable)?
-            .insert(key, source.clone());
-        Ok(PullRequestResponse::Ok(SourceObservation {
-            current: source_to_wit(&source),
-            previous: prior.map(source_to_wit),
-        }))
+            .insert(digest, source);
+        Ok(())
     }
 
     async fn fetch_object(
@@ -274,15 +329,7 @@ impl GitHubPrInvocation {
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(PullRequestError::DeadlineExceeded)?;
-        let mut builder = client
-            .get(endpoint)
-            .timeout(remaining)
-            .header("accept", "application/vnd.github+json")
-            .header("x-github-api-version", "2022-11-28")
-            .header("user-agent", "st2-github-pr-resource-profile/1");
-        if let Some(etag) = cached.and_then(|object| object.etag.as_deref()) {
-            builder = builder.header("if-none-match", etag);
-        }
+        let builder = request_builder(client, endpoint, remaining, cached);
         let mut response = tokio::select! {
             biased;
             reason = wait_for_interruption(&self.control) => {
@@ -312,8 +359,9 @@ impl GitHubPrInvocation {
             .and_then(|value| value.to_str().ok())
             .filter(|value| valid_etag(value))
             .map(str::to_owned);
+        let has_next_page = response_has_next_page(response.headers());
         match status.as_u16() {
-            304 => replay_not_modified(cached, response_etag),
+            304 => replay_not_modified(cached, response_etag, has_next_page),
             200 => {
                 let mut body = Vec::new();
                 loop {
@@ -337,6 +385,7 @@ impl GitHubPrInvocation {
                         etag: response_etag,
                         body,
                     },
+                    has_next_page,
                     modified: true,
                 })
             }
@@ -360,6 +409,15 @@ struct PullRequestHeadSha {
 struct FetchedObject {
     object: CachedObject,
     modified: bool,
+    has_next_page: bool,
+}
+
+fn require_complete(object: FetchedObject) -> Result<FetchedObject, PullRequestError> {
+    if object.has_next_page {
+        Err(PullRequestError::ResourceExhausted)
+    } else {
+        Ok(object)
+    }
 }
 
 fn source_to_wit(source: &CachedSource) -> SourceSnapshot {
@@ -371,16 +429,49 @@ fn source_to_wit(source: &CachedSource) -> SourceSnapshot {
         observed_at: source.observed_at.clone(),
     }
 }
-fn authoritative_prior(
-    has_authoritative_prior: bool,
-    cached: Option<&CachedSource>,
-) -> Option<&CachedSource> {
-    has_authoritative_prior.then_some(cached).flatten()
+
+fn run_on_runtime<T>(
+    future: impl Future<Output = Result<T, PullRequestError>>,
+) -> Result<T, PullRequestError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| PullRequestError::Unavailable)?;
+    runtime.block_on(future)
+}
+
+fn request_builder(
+    client: &reqwest::Client,
+    endpoint: String,
+    timeout: Duration,
+    cached: Option<&CachedObject>,
+) -> reqwest::RequestBuilder {
+    let mut builder = client
+        .get(endpoint)
+        .timeout(timeout)
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", "2022-11-28")
+        .header("user-agent", "st2-github-pr-resource-profile/1");
+    if let Some(etag) = cached.and_then(|object| object.etag.as_deref()) {
+        builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    builder
+}
+
+fn response_has_next_page(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .flat_map(|link| link.split(';').skip(1))
+        .any(|parameter| parameter.trim().eq_ignore_ascii_case(r#"rel="next""#))
 }
 
 fn replay_not_modified(
     cached: Option<&CachedObject>,
     response_etag: Option<String>,
+    has_next_page: bool,
 ) -> Result<FetchedObject, PullRequestError> {
     let cached = cached.ok_or(PullRequestError::Unavailable)?;
     let effective_etag = response_etag.or_else(|| cached.etag.clone());
@@ -390,6 +481,7 @@ fn replay_not_modified(
     Ok(FetchedObject {
         object: cached.clone(),
         modified: false,
+        has_next_page,
     })
 }
 
@@ -459,32 +551,30 @@ async fn resolve_public_api_address(
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(PullRequestError::DeadlineExceeded)?;
-    tokio::select! {
+    let resolver = hickory_resolver::Resolver::builder_tokio()
+        .and_then(hickory_resolver::ResolverBuilder::build)
+        .map_err(|_| PullRequestError::Unavailable)?;
+    let lookup = tokio::select! {
         biased;
-        reason = wait_for_interruption(control) => Err(interruption_error(reason)),
-        result = tokio::time::timeout(
-            remaining,
-            tokio::task::spawn_blocking(resolve_public_api_address_blocking),
-        ) => match result {
-            Err(_) => Err(PullRequestError::DeadlineExceeded),
-            Ok(Err(_)) => Err(PullRequestError::Unavailable),
-            Ok(Ok(result)) => result,
-        },
-    }
-}
-
-fn resolve_public_api_address_blocking() -> Result<SocketAddr, PullRequestError> {
-    let addresses = (API_HOST, API_PORT)
-        .to_socket_addrs()
-        .map_err(|_| PullRequestError::Unavailable)?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() || addresses.iter().any(|address| !is_public(address.ip())) {
+        reason = wait_for_interruption(control) => return Err(interruption_error(reason)),
+        result = await_dns_lookup(remaining, resolver.lookup_ip(API_HOST)) => result?,
+    };
+    let mut addresses = lookup.iter();
+    let first = addresses.next().ok_or(PullRequestError::Unavailable)?;
+    if !is_public(first) || addresses.any(|address| !is_public(address)) {
         return Err(PullRequestError::Denied);
     }
-    addresses
-        .into_iter()
-        .next()
-        .ok_or(PullRequestError::Unavailable)
+    Ok(SocketAddr::new(first, API_PORT))
+}
+
+async fn await_dns_lookup<T, E>(
+    remaining: Duration,
+    lookup: impl Future<Output = Result<T, E>>,
+) -> Result<T, PullRequestError> {
+    tokio::time::timeout(remaining, lookup)
+        .await
+        .map_err(|_| PullRequestError::DeadlineExceeded)?
+        .map_err(|_| PullRequestError::Unavailable)
 }
 
 fn is_public(address: IpAddr) -> bool {
@@ -604,28 +694,113 @@ mod tests {
     }
 
     #[test]
-    fn etag_cache_is_binding_state_and_replays_exact_304_bytes() {
-        let object = CachedObject {
+    fn conditional_cache_is_selected_by_the_exact_prior_digest() {
+        let object_v1 = CachedObject {
             etag: Some("\"v1\"".into()),
-            body: br#"{"state":"open"}"#.to_vec(),
+            body: b"v1".to_vec(),
         };
-        let source = CachedSource {
+        let object_v2 = CachedObject {
+            etag: Some("\"v2\"".into()),
+            body: b"v2".to_vec(),
+        };
+        let source = |object: CachedObject| CachedSource {
             pull_request: object.clone(),
             check_runs: object.clone(),
-            combined_status: object.clone(),
-            observed_at: "2026-08-30T12:34:56Z".into(),
+            combined_status: object,
+            observed_at: "2026-09-02T10:00:00Z".into(),
         };
-        assert!(authoritative_prior(false, Some(&source)).is_none());
-        assert!(authoritative_prior(true, Some(&source)).is_some());
+        let digest_v1 = [1; SNAPSHOT_DIGEST_BYTES];
+        let digest_v2 = [2; SNAPSHOT_DIGEST_BYTES];
+        let mut cache = SnapshotCache::default();
+        cache.insert(digest_v1, source(object_v1));
+        cache.insert(digest_v2, source(object_v2));
+        let prior = cache.get(&digest_v1).unwrap();
+        assert_eq!(prior.pull_request.body, b"v1");
 
-        let replay = replay_not_modified(Some(&object), None).unwrap();
-        assert!(!replay.modified);
-        assert_eq!(replay.object.etag.as_deref(), Some("\"v1\""));
-        assert_eq!(replay.object.body, object.body);
+        let client = reqwest::Client::new();
+        let unbound = request_builder(
+            &client,
+            "https://api.github.com/example".into(),
+            Duration::from_secs(1),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert!(unbound.headers().get(reqwest::header::IF_NONE_MATCH).is_none());
+        let bound = request_builder(
+            &client,
+            "https://api.github.com/example".into(),
+            Duration::from_secs(1),
+            Some(&prior.pull_request),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            bound.headers()[reqwest::header::IF_NONE_MATCH],
+            "\"v1\""
+        );
+    }
+
+    #[test]
+    fn paginated_ci_responses_are_rejected_instead_of_published_incomplete() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/resource?page=2>; rel="next", <https://api.github.com/resource?page=4>; rel="last""#
+                .parse()
+                .unwrap(),
+        );
+        assert!(response_has_next_page(&headers));
+        let incomplete = FetchedObject {
+            object: CachedObject {
+                etag: None,
+                body: Vec::new(),
+            },
+            modified: true,
+            has_next_page: true,
+        };
         assert!(matches!(
-            replay_not_modified(Some(&object), Some("\"different\"".into())),
-            Err(PullRequestError::Unavailable)
+            require_complete(incomplete),
+            Err(PullRequestError::ResourceExhausted)
         ));
+
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/resource?page=1>; rel="prev""#
+                .parse()
+                .unwrap(),
+        );
+        assert!(!response_has_next_page(&headers));
+    }
+
+    #[test]
+    fn async_dns_deadline_drops_the_pending_lookup() {
+        struct PendingLookup(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Future for PendingLookup {
+            type Output = Result<(), ()>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingLookup {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = run_on_runtime(await_dns_lookup(
+            Duration::ZERO,
+            PendingLookup(Arc::clone(&dropped)),
+        ));
+        assert!(matches!(result, Err(PullRequestError::DeadlineExceeded)));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

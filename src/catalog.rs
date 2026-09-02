@@ -81,6 +81,8 @@ pub enum DeclaredProviderCapability {
     Vista {
         executable: String,
         cwd: String,
+        slug: String,
+        version: u64,
         deadline_ms: u64,
     },
 }
@@ -482,12 +484,18 @@ fn parse_vista_capability(
     node: &kdl::KdlNode,
 ) -> anyhow::Result<DeclaredProviderCapability> {
     anyhow::ensure!(
-        node.entries().len() == 3 && node.entries().iter().all(|entry| entry.name().is_some()),
-        "profile '{scheme}': vista requires executable, cwd, and deadline-ms properties"
+        node.entries().len() == 5 && node.entries().iter().all(|entry| entry.name().is_some()),
+        "profile '{scheme}': vista requires executable, cwd, slug, version, and deadline-ms properties"
     );
     let executable = required_string_property(scheme, node, "executable")?;
     let cwd = required_string_property(scheme, node, "cwd")?;
+    let slug = required_string_property(scheme, node, "slug")?;
+    let version = required_u64_property(scheme, node, "version")?;
     let deadline_ms = required_u64_property(scheme, node, "deadline-ms")?;
+    anyhow::ensure!(
+        valid_vista_slug(&slug) && (1..=9_007_199_254_740_991).contains(&version),
+        "profile '{scheme}': Vista artifact scope is invalid"
+    );
     anyhow::ensure!(
         deadline_ms > 0 && deadline_ms <= 60_000,
         "profile '{scheme}': Vista deadline must be between 1ms and 60000ms"
@@ -495,8 +503,20 @@ fn parse_vista_capability(
     Ok(DeclaredProviderCapability::Vista {
         executable,
         cwd,
+        slug,
+        version,
         deadline_ms,
     })
+}
+
+fn valid_vista_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && slug.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (byte == b'-' && index > 0)
+        })
+        && !slug.ends_with('-')
+        && !slug.contains("--")
 }
 
 fn required_string_property(
@@ -1048,7 +1068,7 @@ mod tests {
               runtime {
                 component "components/vista.component.wasm"
                 demand #true
-                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" deadline-ms=10000
+                vista executable="/nix/store/example/bin/vista" cwd="/var/empty" slug="release-notes" version=7 deadline-ms=10000
               }
             }
             "#,
@@ -1061,15 +1081,20 @@ mod tests {
                 capability: DeclaredProviderCapability::Vista {
                     executable: "/nix/store/example/bin/vista".into(),
                     cwd: "/var/empty".into(),
+                    slug: "release-notes".into(),
+                    version: 7,
                     deadline_ms: 10000,
                 },
                 demand: true,
             })
         );
         for malformed in [
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=0 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=60001 } }"#,
-            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" deadline-ms=1 extra="no" } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=0 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=60001 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="-release" version=1 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=0 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=9007199254740992 deadline-ms=1 } }"#,
+            r#"profile "vista" { wasm "x"; runtime { component "x"; vista executable="vista" cwd="/" slug="release" version=1 deadline-ms=1 extra="no" } }"#,
         ] {
             assert!(parse(malformed).is_err(), "expected error for: {malformed}");
         }

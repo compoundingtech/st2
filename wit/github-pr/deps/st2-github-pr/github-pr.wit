@@ -37,4 +37,5 @@ interface github-pr {
   }
 
   get: func(request: pull-request-request) -> result<pull-request-response, pull-request-error>;
+  bind-snapshot: func(digest: list<u8>) -> result<_, pull-request-error>;
 }

@@ -29,12 +29,14 @@ use bindings::compoundingtech::st2_vista::vista::{
 const IMPORT_NAME: &str = "compoundingtech:st2-vista/vista@0.1.0";
 const MAX_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const MAX_VERSION: u64 = 9_999_999_999_999_999_999;
+const MAX_VERSION: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VistaConfig {
     pub executable: PathBuf,
     pub cwd: PathBuf,
+    pub slug: String,
+    pub version: u64,
     pub deadline: Duration,
 }
 
@@ -42,6 +44,8 @@ impl VistaConfig {
     pub fn resolve(
         executable: impl AsRef<Path>,
         cwd: impl Into<PathBuf>,
+        slug: String,
+        version: u64,
         deadline: Duration,
     ) -> Result<Self, &'static str> {
         if deadline.is_zero() || deadline > Duration::from_secs(60) {
@@ -53,9 +57,14 @@ impl VistaConfig {
         if !cwd.is_absolute() {
             return Err("Vista cwd must be absolute");
         }
+        if !valid_slug(&slug) || !(1..=MAX_VERSION).contains(&version) {
+            return Err("Vista artifact scope is invalid");
+        }
         Ok(Self {
             executable,
             cwd,
+            slug,
+            version,
             deadline,
         })
     }
@@ -182,11 +191,16 @@ impl ProcessControl {
         reason
     }
 
-    fn wait_and_reap(
+    fn kill_live_group(&self) {
+        if let ChildOwnership::Live(process_group) = *self.child.lock() {
+            let _ = kill_process_group(process_group);
+        }
+    }
+
+    fn reap_exited(
         &self,
         child: &mut std::process::Child,
     ) -> std::io::Result<std::process::ExitStatus> {
-        wait_without_reaping(child.id())?;
         let mut ownership = self.child.lock();
         debug_assert!(matches!(*ownership, ChildOwnership::Live(_)));
         *ownership = ChildOwnership::Reaping;
@@ -236,7 +250,10 @@ impl Host for InvocationStore<VistaInvocation> {
 
 impl VistaInvocation {
     fn get(&mut self, request: ArtifactRequest) -> Result<Outcome, VistaError> {
-        if !request_is_valid(&request) {
+        if !request_is_valid(&request)
+            || request.slug != self.config.slug
+            || request.version != self.config.version
+        {
             return Err(VistaError::Denied);
         }
         match self.control.termination() {
@@ -328,25 +345,23 @@ impl VistaInvocation {
                 return Err(VistaError::Unavailable);
             }
         };
-        let status = match self.control.wait_and_reap(&mut child) {
-            Ok(status) => status,
-            Err(_) => {
-                self.control.kill_and_reap(&mut child);
-                let _ = completed_tx.send(());
-                let _ = timer.join();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(VistaError::Unavailable);
-            }
-        };
+        if wait_without_reaping(child.id()).is_err() {
+            self.control.kill_and_reap(&mut child);
+            let _ = completed_tx.send(());
+            let _ = timer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(VistaError::Unavailable);
+        }
+        let stdout = stdout_reader.join();
+        let stderr = stderr_reader.join();
+        self.control.kill_live_group();
         let _ = completed_tx.send(());
         let _ = timer.join();
-        let (stdout, stdout_truncated) = stdout_reader
-            .join()
-            .map_err(|_| VistaError::Unavailable)??;
-        let (stderr, stderr_truncated) = stderr_reader
-            .join()
-            .map_err(|_| VistaError::Unavailable)??;
+        let status = self.control.reap_exited(&mut child);
+        let status = status.map_err(|_| VistaError::Unavailable)?;
+        let (stdout, stdout_truncated) = stdout.map_err(|_| VistaError::Unavailable)??;
+        let (stderr, stderr_truncated) = stderr.map_err(|_| VistaError::Unavailable)??;
         match self.control.termination() {
             Termination::Cancelled => return Err(VistaError::Cancelled),
             Termination::TimedOut => return Err(VistaError::DeadlineExceeded),
@@ -487,8 +502,21 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn config(executable: &Path, cwd: &Path, deadline: Duration) -> VistaConfig {
-        VistaConfig::resolve(executable, cwd.to_path_buf(), deadline).unwrap()
+    fn config(
+        executable: &Path,
+        cwd: &Path,
+        deadline: Duration,
+        slug: &str,
+        version: u64,
+    ) -> VistaConfig {
+        VistaConfig::resolve(
+            executable,
+            cwd.to_path_buf(),
+            slug.to_owned(),
+            version,
+            deadline,
+        )
+        .unwrap()
     }
 
     fn request(slug: &str, version: u64) -> ArtifactRequest {
@@ -507,7 +535,13 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$#|$1|$2|$3|$4|$5|$6\"\n",
         );
         let mut invocation = VistaInvocation {
-            config: config(&executable, temporary.path(), Duration::from_secs(1)),
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_secs(1),
+                "release-notes",
+                7,
+            ),
             control: Arc::new(ProcessControl::detached()),
         };
         let outcome = invocation.get(request("release-notes", 7)).unwrap();
@@ -518,27 +552,54 @@ mod tests {
     }
 
     #[test]
-    fn invalid_identity_is_denied_before_spawn() {
+    fn exact_artifact_scope_is_denied_before_spawn() {
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("vista");
         let marker = temporary.path().join("spawned");
         write_executable(&executable, "#!/bin/sh\ntouch \"$PWD/spawned\"\n");
         let mut invocation = VistaInvocation {
-            config: config(&executable, temporary.path(), Duration::from_secs(1)),
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_secs(1),
+                "release-notes",
+                7,
+            ),
             control: Arc::new(ProcessControl::detached()),
         };
         for denied in [
-            request("", 1),
-            request("-leading", 1),
-            request("trailing-", 1),
-            request("two--dashes", 1),
-            request("Upper", 1),
-            request("valid", 0),
-            request("valid", MAX_VERSION + 1),
+            request("other-valid-slug", 7),
+            request("release-notes", 8),
+            request("", 7),
+            request("-leading", 7),
+            request("trailing-", 7),
+            request("two--dashes", 7),
+            request("Upper", 7),
+            request("release-notes", 0),
+            request("release-notes", MAX_VERSION + 1),
         ] {
             assert!(matches!(invocation.get(denied), Err(VistaError::Denied)));
         }
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn artifact_version_is_bounded_by_the_javascript_safe_integer_contract() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("vista");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        assert!(request_is_valid(&request("release", MAX_VERSION)));
+        assert!(!request_is_valid(&request("release", MAX_VERSION + 1)));
+        assert!(
+            VistaConfig::resolve(
+                &executable,
+                temporary.path().to_path_buf(),
+                "release".into(),
+                MAX_VERSION + 1,
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -550,7 +611,13 @@ mod tests {
         let control = Arc::new(ProcessControl::detached());
         control.terminate(Termination::Cancelled);
         let mut invocation = VistaInvocation {
-            config: config(&executable, temporary.path(), Duration::from_secs(1)),
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_secs(1),
+                "valid",
+                1,
+            ),
             control,
         };
         assert!(matches!(
@@ -561,20 +628,31 @@ mod tests {
     }
 
     #[test]
-    fn fixed_command_deadline_kills_and_reaps_the_process_group() {
+    fn deadline_owns_the_process_group_until_inherited_output_pipes_close() {
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("vista");
+        let holder = temporary.path().join("pipe-holder");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &holder).unwrap();
         let fifo = temporary.path().join("block");
-        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: the pathname is a live NUL-terminated byte string owned for the call.
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = temporary.path().join("started");
+        for path in [&fifo, &started] {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the pathname is a live NUL-terminated byte string owned for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
         write_executable(
             &executable,
-            "#!/bin/sh\nexec 3< \"$PWD/block\"\nread value <&3\n",
+            "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::inherited_pipe_holder --nocapture) &\nread marker < \"$PWD/started\"\nprintf 'direct child exited\\n'\nexit 0\n",
         );
         let control = Arc::new(ProcessControl::detached());
         let mut invocation = VistaInvocation {
-            config: config(&executable, temporary.path(), Duration::from_millis(100)),
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_millis(100),
+                "valid",
+                1,
+            ),
             control: Arc::clone(&control),
         };
         assert!(matches!(
@@ -582,5 +660,142 @@ mod tests {
             Err(VistaError::DeadlineExceeded)
         ));
         assert!(matches!(*control.child.lock(), ChildOwnership::Reaped));
+    }
+
+    #[test]
+    fn cancellation_owns_the_process_group_until_inherited_output_pipes_close() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("vista");
+        let holder = temporary.path().join("pipe-holder");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &holder).unwrap();
+        for name in ["block", "started", "cancel-ready"] {
+            let path = temporary.path().join(name);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the pathname is a live NUL-terminated byte string owned for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        write_executable(
+            &executable,
+            "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::inherited_pipe_holder --nocapture) &\nread marker < \"$PWD/started\"\nprintf 'ready\\n' > \"$PWD/cancel-ready\"\nprintf 'direct child exited\\n'\nexit 0\n",
+        );
+        let control = Arc::new(ProcessControl::detached());
+        let mut invocation = VistaInvocation {
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_secs(10),
+                "valid",
+                1,
+            ),
+            control: Arc::clone(&control),
+        };
+        let worker = thread::spawn(move || invocation.get(request("valid", 1)));
+        let mut ready = String::new();
+        let mut ready_pipe = std::fs::File::open(temporary.path().join("cancel-ready")).unwrap();
+        std::io::Read::read_to_string(&mut ready_pipe, &mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        assert!(control.terminate(Termination::Cancelled));
+        assert!(matches!(worker.join().unwrap(), Err(VistaError::Cancelled)));
+        assert!(matches!(*control.child.lock(), ChildOwnership::Reaped));
+    }
+
+    #[test]
+    fn successful_completion_kills_descendants_that_closed_output_pipes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("vista");
+        let holder = temporary.path().join("pipe-holder");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &holder).unwrap();
+        for name in ["block", "started"] {
+            let path = temporary.path().join(name);
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the pathname is a live NUL-terminated byte string owned for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        std::fs::File::create(temporary.path().join("descendant-lock")).unwrap();
+        write_executable(
+            &executable,
+            "#!/bin/sh\n(trap '' HUP; exec \"$PWD/pipe-holder\" --ignored --exact vista::tests::closed_pipe_descendant_holder --nocapture) &\nread marker < \"$PWD/started\"\nexit 0\n",
+        );
+        let control = Arc::new(ProcessControl::detached());
+        let mut invocation = VistaInvocation {
+            config: config(
+                &executable,
+                temporary.path(),
+                Duration::from_secs(1),
+                "valid",
+                1,
+            ),
+            control: Arc::clone(&control),
+        };
+        let outcome = invocation.get(request("valid", 1)).unwrap();
+        assert!(matches!(outcome.exit, ExitStatus::Code(0)));
+        let lock_path = temporary.path().join("descendant-lock");
+        let (acquired_tx, acquired_rx) = mpsc::sync_channel(0);
+        let waiter = thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            // SAFETY: `lock` owns a live file descriptor for the duration of the call.
+            let result =
+                unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) };
+            let _ = acquired_tx.send(result);
+        });
+        let acquired = acquired_rx.recv_timeout(Duration::from_secs(1));
+        if let Err(error) = &acquired {
+            drop(acquired_rx);
+            let pid: i32 =
+                std::fs::read_to_string(temporary.path().join("descendant-pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+            // SAFETY: the fixture wrote its live pid after acquiring the lock.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            waiter.join().unwrap();
+            panic!("the descendant retained its lock after provider completion: {error}");
+        }
+        assert_eq!(acquired.unwrap(), 0);
+        waiter.join().unwrap();
+        assert!(matches!(*control.child.lock(), ChildOwnership::Reaped));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for inherited output pipe ownership"]
+    fn inherited_pipe_holder() {
+        let mut started = std::fs::OpenOptions::new()
+            .write(true)
+            .open("started")
+            .unwrap();
+        writeln!(started, "ready").unwrap();
+        drop(started);
+        let _blocked = std::fs::File::open("block").unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for descendant process-group ownership"]
+    fn closed_pipe_descendant_holder() {
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open("descendant-lock")
+            .unwrap();
+        // SAFETY: `lock` owns a live file descriptor for the duration of the call.
+        assert_eq!(
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) },
+            0
+        );
+        std::fs::write("descendant-pid", std::process::id().to_string()).unwrap();
+        // SAFETY: the subprocess fixture intentionally releases inherited output pipes while
+        // retaining the process-group-owned lock.
+        unsafe {
+            libc::close(libc::STDOUT_FILENO);
+            libc::close(libc::STDERR_FILENO);
+        }
+        let mut started = std::fs::OpenOptions::new()
+            .write(true)
+            .open("started")
+            .unwrap();
+        writeln!(started, "ready").unwrap();
+        drop(started);
+        let _blocked = std::fs::File::open("block").unwrap();
     }
 }

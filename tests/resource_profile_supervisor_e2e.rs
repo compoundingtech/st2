@@ -121,7 +121,7 @@ printf '%s\n' '{"schemaVersion":1,"uri":"vista://release-notes/v7","slug":"relea
         component("ST2_VISTA_COMPONENT"),
         selector,
         &format!(
-            "vista executable={:?} cwd={:?} deadline-ms=10000",
+            "vista executable={:?} cwd={:?} slug=\"release-notes\" version=7 deadline-ms=10000",
             executable,
             temporary.path()
         ),

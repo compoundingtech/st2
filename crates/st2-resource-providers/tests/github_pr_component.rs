@@ -29,10 +29,12 @@ const HEAD_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #[derive(Clone, Default)]
 struct FixtureModule {
     calls: Arc<AtomicUsize>,
+    bindings: Arc<AtomicUsize>,
 }
 
 struct FixtureInvocation {
     calls: Arc<AtomicUsize>,
+    bindings: Arc<AtomicUsize>,
 }
 
 impl CapabilityModule for FixtureModule {
@@ -52,6 +54,7 @@ impl CapabilityModule for FixtureModule {
     fn begin(&self, _context: CapabilityContext<'_>) -> Self::Invocation {
         FixtureInvocation {
             calls: Arc::clone(&self.calls),
+            bindings: Arc::clone(&self.bindings),
         }
     }
 }
@@ -79,6 +82,12 @@ impl Host for InvocationStore<FixtureInvocation> {
                 previous: Some(source(true, "2026-08-30T12:35:56Z")),
             }),
         })
+    }
+
+    fn bind_snapshot(&mut self, digest: Vec<u8>) -> Result<(), PullRequestError> {
+        assert_eq!(digest.len(), 32);
+        self.capability().bindings.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -126,11 +135,17 @@ impl Host for InvocationStore<BlockingInvocation> {
             InterruptionReason::TimedOut => Err(PullRequestError::DeadlineExceeded),
         }
     }
+
+    fn bind_snapshot(&mut self, _digest: Vec<u8>) -> Result<(), PullRequestError> {
+        Ok(())
+    }
 }
 
 #[test]
 fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
-    let executor = Executor::new(RuntimeConfig::default(), None, FixtureModule::default()).unwrap();
+    let module = FixtureModule::default();
+    let bindings = Arc::clone(&module.bindings);
+    let executor = Executor::new(RuntimeConfig::default(), None, module).unwrap();
     let bytes = fs::read(component()).unwrap();
     let loaded = executor.load(&bytes).unwrap();
     let descriptor = executor.describe(&loaded, None).unwrap();
@@ -235,6 +250,7 @@ fn component_preserves_snapshot_facets_delta_topics_and_semantic_replay() {
         )
         .unwrap();
     assert_eq!(third, ObservationResult::Unchanged);
+    assert_eq!(bindings.load(Ordering::SeqCst), 3);
 }
 
 #[test]

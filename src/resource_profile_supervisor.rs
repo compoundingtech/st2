@@ -1460,6 +1460,8 @@ impl RuntimeProcess {
                 crate::catalog::DeclaredProviderCapability::Vista {
                     executable,
                     cwd,
+                    slug,
+                    version,
                     deadline_ms,
                 } => {
                     let executable =
@@ -1468,6 +1470,8 @@ impl RuntimeProcess {
                     let config = VistaConfig::resolve(
                         executable,
                         PathBuf::from(cwd),
+                        slug.clone(),
+                        *version,
                         Duration::from_millis(*deadline_ms),
                     )
                     .map_err(anyhow::Error::msg)?;

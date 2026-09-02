@@ -279,11 +279,17 @@ fn observe(
         .as_ref()
         .is_some_and(|previous| same_semantics(previous, &current))
     {
+        let prior_digest = request
+            .prior_digest
+            .as_deref()
+            .ok_or_else(|| "GitHub prior source lacked a snapshot digest".to_owned())?;
+        github_pr::bind_snapshot(prior_digest).map_err(map_source_error)?;
         return Ok(provider_api::ObservationResult::Unchanged);
     }
     let bytes = serde_json::to_vec(&current)
         .map_err(|_| "GitHub pull request snapshot normalization failed".to_owned())?;
     let digest = Sha256::digest(&bytes);
+    github_pr::bind_snapshot(digest.as_slice()).map_err(map_source_error)?;
     if request.prior_digest.as_deref() == Some(digest.as_slice()) {
         return Ok(provider_api::ObservationResult::Unchanged);
     }
