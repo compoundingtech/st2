@@ -83,6 +83,18 @@ accepted.
   stream's tail, and truncation is observable. A caller that must consume a
   stream whole (structured data for parsing) opts in through an explicitly
   named capture path, so an unbounded read is always visible at its call site.
+- **R39 Disjoint harness-process lifetimes:** Every long-lived st2 process
+  started by an integration/evaluation harness is classified at its spawn
+  boundary as either a durable detached task or a parent-bound owned child
+  group. A durable detached task survives normal return, unwinding, and hard
+  death of the supervisor that launched it; only explicit lifecycle
+  reconciliation may terminate it, and replacement adopts the same runtime
+  identity. A parent-bound group is terminated on normal return, unwinding,
+  and hard parent death. Its cleanup targets the exact owned generation rather
+  than a reusable bare PID, has a finite synchronous deadline, transfers any
+  unfinished waits to a reaper, and includes descendants plus every direct
+  child that requires reaping. Cleanup of one lifetime class never crosses
+  into the other.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision

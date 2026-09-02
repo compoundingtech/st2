@@ -1,13 +1,17 @@
+mod support;
+
 use std::ffi::CString;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+
+use support::{CommandOwnedChildGroupExt as _, OwnedChildGroup};
 
 fn st2() -> Command {
     Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -64,12 +68,9 @@ fn ensure_external_pty_config(catalog: &Path) {
 }
 
 fn profile_catalog_config(profiles: &[(&str, &str)]) -> String {
-    let mut config =
-        "catalog { pty-root \"/tmp/st2-catalog-transaction-test-pty\" }\n".to_string();
+    let mut config = "catalog { pty-root \"/tmp/st2-catalog-transaction-test-pty\" }\n".to_string();
     for (scheme, module) in profiles {
-        config.push_str(&format!(
-            "profile {scheme:?} {{ wasm {module:?} }}\n"
-        ));
+        config.push_str(&format!("profile {scheme:?} {{ wasm {module:?} }}\n"));
     }
     config
 }
@@ -619,9 +620,10 @@ fn concurrent_bootstrap_has_one_publication_and_one_exact_replay() {
                     captured["rootSha256"].as_str().unwrap(),
                     "--json",
                 ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
+                .spawn_owned()
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -757,9 +759,10 @@ fn bootstrap_publishes_its_lock_before_readers_can_enter() {
             "--json",
         ])
         .env("ST2_TEST_CATALOG_LOCK_ANY_ATTEMPT", &lock_attempt)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     wait_for(&lock_attempt);
     assert!(
@@ -1080,7 +1083,7 @@ fn send(catalog: &Path, recipient: &str, body: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     child
         .stdin
@@ -1097,7 +1100,7 @@ fn run_with_stdin(args: &[&str], body: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_owned()
         .unwrap();
     child
         .stdin
@@ -1115,7 +1118,7 @@ fn paused_apply(
     point: &str,
     ready: &Path,
     release: &Path,
-) -> Child {
+) -> OwnedChildGroup {
     let mut command = st2();
     let input_sha256 = prepared_root_sha256(catalog, prepared);
     command
@@ -1132,12 +1135,13 @@ fn paused_apply(
             expected,
             "--json",
         ])
+        .stdin(Stdio::null())
         .env("ST2_TEST_CATALOG_APPLY_PAUSE_AT", point)
         .env("ST2_TEST_CATALOG_APPLY_READY", ready)
         .env("ST2_TEST_CATALOG_APPLY_RELEASE", release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.spawn().unwrap()
+    command.spawn_owned().unwrap()
 }
 
 fn paused_bootstrap(
@@ -1147,7 +1151,7 @@ fn paused_bootstrap(
     point: &str,
     ready: &Path,
     release: &Path,
-) -> Child {
+) -> OwnedChildGroup {
     let mut command = st2();
     command
         .args([
@@ -1161,12 +1165,59 @@ fn paused_bootstrap(
             input_sha256,
             "--json",
         ])
+        .stdin(Stdio::null())
         .env("ST2_TEST_CATALOG_BOOTSTRAP_PAUSE_AT", point)
         .env("ST2_TEST_CATALOG_BOOTSTRAP_READY", ready)
         .env("ST2_TEST_CATALOG_BOOTSTRAP_RELEASE", release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.spawn().unwrap()
+    command.spawn_owned().unwrap()
+}
+
+#[test]
+fn paused_catalog_child_is_reaped_when_test_unwinds() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let prepared = temp.path().join("prepared");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        agent("worker", true),
+    )
+    .unwrap();
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let child_pid = std::cell::Cell::new(0_i32);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = paused_apply(
+            &catalog,
+            &prepared,
+            before["rootSha256"].as_str().unwrap(),
+            "marker-created",
+            &ready,
+            &release,
+        );
+        child_pid.set(child.id() as i32);
+        wait_for(&ready);
+        panic!("exercise panic-safe owned-child cleanup");
+    }));
+    assert!(unwound.is_err());
+
+    let child_pid = child_pid.get();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while st2::host_lock::process_alive(child_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let survived = st2::host_lock::process_alive(child_pid);
+    if survived {
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+    }
+    assert!(!survived, "paused catalog child survived test unwind");
 }
 
 #[test]
@@ -1280,11 +1331,7 @@ fn relative_profile_modules_reject_unsafe_missing_and_unprojected_inputs() {
             "symlink" => {
                 let external = temp.path().join("external.wasm");
                 fs::write(&external, b"external").unwrap();
-                std::os::unix::fs::symlink(
-                    &external,
-                    catalog.join("resolvers/goal.wasm"),
-                )
-                .unwrap();
+                std::os::unix::fs::symlink(&external, catalog.join("resolvers/goal.wasm")).unwrap();
             }
             "fifo" => {
                 let fifo = catalog.join("resolvers/goal.wasm");
@@ -1374,11 +1421,7 @@ fn raw_preimage_repairs_catalogs_with_unadmitted_profile_modules() {
             "symlink" => {
                 let external = temp.path().join("raw-external.wasm");
                 fs::write(&external, b"external").unwrap();
-                std::os::unix::fs::symlink(
-                    &external,
-                    catalog.join("resolvers/goal.wasm"),
-                )
-                .unwrap();
+                std::os::unix::fs::symlink(&external, catalog.join("resolvers/goal.wasm")).unwrap();
             }
             "fifo" => {
                 let fifo = catalog.join("resolvers/goal.wasm");
@@ -1679,8 +1722,7 @@ fn profile_module_recovery_admits_only_recorded_projected_module_paths() {
     let rejected_extra = resume(&catalog);
     assert!(
         !rejected_extra.status.success()
-            && String::from_utf8_lossy(&rejected_extra.stderr)
-                .contains("unowned declaration path"),
+            && String::from_utf8_lossy(&rejected_extra.stderr).contains("unowned declaration path"),
         "{}",
         String::from_utf8_lossy(&rejected_extra.stderr)
     );
@@ -1721,10 +1763,11 @@ fn profile_module_recovery_admits_only_recorded_projected_module_paths() {
     );
     assert!(!marker.exists());
     assert!(!catalog.join("resolvers/old.wasm").exists());
-    assert_eq!(fs::read(catalog.join("resolvers/new.wasm")).unwrap(), b"new");
+    assert_eq!(
+        fs::read(catalog.join("resolvers/new.wasm")).unwrap(),
+        b"new"
+    );
 }
-
-
 
 #[test]
 fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
@@ -3639,21 +3682,27 @@ fn marker_time_state_plane_writes_reject_a_swapped_state_ancestor() {
     ] {
         let ready = temp.path().join(format!("{name}-ready"));
         let release = temp.path().join(format!("{name}-release"));
-        let mut child = st2()
+        let mut command = st2();
+        command
             .args(args)
             .env("ST2_TEST_MESSAGE_CAPABILITY_READY", &ready)
             .env("ST2_TEST_MESSAGE_CAPABILITY_RELEASE", &release)
-            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+            .stderr(Stdio::piped());
+        if input.is_empty() {
+            command.stdin(Stdio::null());
+        } else {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn_owned().unwrap();
+        if !input.is_empty() {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
         wait_for(&ready);
         let resources = agent_dir(&catalog, "old").join("resources");
         let retained = temp.path().join(format!("{name}-retained-resources"));
