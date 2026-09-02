@@ -71,28 +71,44 @@ Shape of `pi_session.rs`:
 ## Channel (`hooks/omp-channel.ts`)
 
 Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON, hello /
-message / delivered / failed / state frames, PROTOCOL constant). Differences:
+message / delivered / failed / state / context frames, PROTOCOL constant). Differences:
 
-- **Idle edge:** on `agent_end`, poll `ctx.isIdle()` every ~100 ms with a bounded window;
-  emit `{type:"state", state:"idle"}` at the first true sample. `agent_start` emits active.
-  No `agent_settled` listener exists.
-- **Blocked axis:** `tool_approval_requested` → state frame carrying
-  `blockedOn:"human", ask:"permission"`, reason `"<toolName>:<truncated command if
-  available>"`; `tool_approval_resolved` → exit edge restoring prior activity/idle per
-  OMP-R02. Frames extend the state frame with optional fields; unknown-frame readers ignore
-  extras.
-- **Session lifecycle:** `session_start` opens the channel and seeds state from
-  `isIdle()`; replacement sessions close their predecessor exactly as the pi channel does
-  (close-named-channel rule); `session_shutdown` closes only on `reason === "quit"`.
-  No abort-signal wiring exists (`ctx = {ui}`).
-- Restored-context seeding uses `sendMessage({customType:"st2-session-start", …},
-  {deliverAs:"nextTurn"})` unchanged.
+- **Idle and terminal edges:** `agent_start` emits active. On a terminal `agent_end`, poll
+  `ctx.isIdle()` every ~100 ms with a bounded window and emit idle at the first true sample.
+  Every poll captures a monotonically increasing generation; a newer settle attempt, new
+  `agent_start`, structured ask, approval ask, session replacement, shutdown,
+  `willContinue:true`, or terminal error advances the generation and retires older polls before
+  they can overwrite newer state. `willContinue:true` means omp already scheduled another turn,
+  so that event starts no settle poll. If the terminal event's latest assistant message has
+  `stopReason:"error"`, emit active with its whitespace-normalized, 240-character-bounded
+  `errorMessage` instead of idle: the failed seat requires operator action. No `agent_settled`
+  listener exists.
+- **Structured ask axis:** an `ask` `tool_call` with a valid question emits active with
+  `blockedOn:"human"`, `ask:"question"`, and the first nonblank question as its bounded reason.
+  The process-wide stash retains its `toolCallId`; unrelated `tool_result` events emit nothing,
+  and only the matching result clears the ask to the activity proved by `isIdle()`.
+- **Approval axis:** `tool_approval_requested` emits active with `blockedOn:"human"`,
+  `ask:"permission"`, and the tool name as reason; `tool_approval_resolved` clears it to the
+  activity proved by `isIdle()`. Approval frames do not overwrite a tracked structured ask.
+- **Pre-compaction edge:** `session_before_compact` emits `{type:"pre_compact"}`. The extension
+  carries no durable path and writes no context itself.
+- **Session lifecycle:** `session_start` opens the channel and seeds state from `isIdle()`;
+  replacement sessions close their named predecessor in `open()`. Upstream defines
+  `session_shutdown` without a `reason` field and fires it on process exit, so every such event
+  closes the current channel.
+- **Restored context:** seeding uses
+  `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.
 
 ## Rust channel process
 
 `st2 driver omp-channel` reuses the pi channel's loop (`pi_channel.rs`) parameterized by
-harness label `"omp"`; the state frame parser accepts the blocked fields. The ding side
-gains no omp adapter (OMP-T03): delivery is channel-only, failing closed when absent.
+harness label `"omp"`; the state frame parser accepts the blocked fields. On `pre_compact`, Rust
+resolves `<agent>/resources/context/now.md` through the canonical context API. The blank predicate
+and atomic replacement execute under the same lock used by every `now.md` writer, so an authored
+write cannot land between them. Only `NotFound` or successfully decoded whitespace-only content
+permits the recovery stub; nonblank content is preserved, and every other read failure leaves the
+entry untouched and publishes a deterministic actionable error state. The ding side gains no omp
+adapter (OMP-T03): delivery is channel-only, failing closed when absent.
 
 ## Admission evidence required for a new minor
 

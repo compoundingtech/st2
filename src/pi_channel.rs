@@ -39,6 +39,15 @@ new work.";
 /// refuse: st2 never guesses what an older asset understands.
 pub const PROTOCOL: u32 = 1;
 
+/// Last-resort durable state when compaction begins before the agent authored a checkpoint.
+///
+/// The stable text deliberately carries no extension-owned path or clock. Rust owns both the
+/// canonical context path and its atomic writer; the file mtime supplies freshness.
+const PRE_COMPACT_STUB: &str = "# now — pre-compact stub\n\n\
+PreCompact fired before the model captured durable working state. Reconstruct from git status,\n\
+recent commits, and the st2 inbox, then write a real checkpoint with `st2 context write`.\n";
+const PRE_COMPACT_ERROR_REASON: &str = "pre-compact context recovery failed";
+
 /// How pi is asked to hand one delivered message to the agent.
 ///
 /// `steer` is the only value st2 currently emits. It is the earliest point at which pi accepts
@@ -191,6 +200,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         &input_rx,
         &mut stdout,
         &inbox,
+        &agent_dir,
         &mut writer,
         context_writer.as_mut(),
         identity,
@@ -208,6 +218,7 @@ fn channel_loop(
     input: &Receiver<io::Result<String>>,
     out: &mut impl Write,
     inbox: &Path,
+    agent_dir: &Path,
     writer: &mut harness_state::Writer,
     mut context_writer: Option<&mut harness_context::Writer>,
     identity: &str,
@@ -248,6 +259,26 @@ fn channel_loop(
                     tracing::warn!(
                         "st2 {label} channel: recording harness context failed: {error}"
                     );
+                }
+                if frame.as_ref().is_some_and(|frame| {
+                    frame.get("type").and_then(Value::as_str) == Some("pre_compact")
+                }) && let Err(error) = ensure_pre_compact_context(agent_dir)
+                {
+                    tracing::warn!(
+                        "st2 {label} channel: writing pre-compact context stub failed: {error}"
+                    );
+                    let actionable = harness_state::Observation::new(
+                        harness_state::Activity::Active,
+                        harness_state::BlockedOn::None,
+                        harness_state::InputBuffer::Unknown,
+                    )
+                    .with_reason(PRE_COMPACT_ERROR_REASON);
+                    if let Err(state_error) = writer.observe_unless_ended(actionable) {
+                        tracing::warn!(
+                            "st2 {label} channel: recording pre-compact recovery failure failed: \
+                             {state_error}"
+                        );
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -302,6 +333,15 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
         observation = observation.with_reason(reason);
     }
     Some(observation)
+}
+
+/// Write the recovery stub only when durable working state is absent or whitespace-only.
+///
+/// The extension cannot perform this check: it owns neither the resolved agent directory nor the
+/// context module's shared writer lock. The context API keeps predicate and replacement in one
+/// critical section and preserves every read error except `NotFound`.
+fn ensure_pre_compact_context(agent_dir: &Path) -> Result<bool> {
+    context::write_now_if_blank(&context::context_dir(agent_dir), PRE_COMPACT_STUB)
 }
 
 /// One `type: "context"` frame as the shipped extension emits it: a reading, a compaction edge, or
@@ -527,6 +567,18 @@ mod tests {
         assert_eq!(blocked.ask, harness_state::Ask::Permission);
         assert_eq!(blocked.reason.as_deref(), Some("bash"));
 
+        let question = state_observation(&json!({
+            "type":"state","state":"active","blockedOn":"human",
+            "ask":"question","reason":"Which deployment target?"
+        }))
+        .unwrap();
+        assert_eq!(question.blocked_on, harness_state::BlockedOn::Human);
+        assert_eq!(question.ask, harness_state::Ask::Question);
+        assert_eq!(
+            question.reason.as_deref(),
+            Some("Which deployment target?")
+        );
+
         let unknown_ask = state_observation(&json!({
             "type":"state","state":"active","blockedOn":"human",
             "ask":"sacrifice"
@@ -538,6 +590,70 @@ mod tests {
         let plain = state_observation(&json!({"type":"state","state":"idle"})).unwrap();
         assert_eq!(plain.blocked_on, harness_state::BlockedOn::None);
         assert_eq!(plain.ask, harness_state::Ask::None);
+    }
+
+    /// A pre-compaction edge creates a last-resort checkpoint only for whitespace-only state. The
+    /// channel, not the TypeScript extension, resolves the durable path and performs the write.
+    #[test]
+    fn pre_compact_frame_writes_only_over_blank_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        let inbox = message::inbox_dir(agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let context_dir = context::context_dir(agent_dir);
+        context::write_now(&context_dir, " \n\t").unwrap();
+
+        let run_frame = || {
+            let mut writer =
+                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(r#"{"type":"pre_compact"}"#.to_string()))
+                .unwrap();
+            drop(tx);
+            channel_loop(
+                &rx,
+                &mut Vec::new(),
+                &inbox,
+                agent_dir,
+                &mut writer,
+                None,
+                "h.worker",
+                "omp",
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        };
+
+        run_frame();
+        assert_eq!(
+            context::read(&context_dir, context::View::Now),
+            PRE_COMPACT_STUB
+        );
+
+        let authored = "Investigating scheduler race; next run the focused repro.\n";
+        context::write_now(&context_dir, authored).unwrap();
+        run_frame();
+        assert_eq!(
+            context::read(&context_dir, context::View::Now),
+            authored,
+            "the recovery edge must never replace authored state"
+        );
+
+        std::fs::remove_file(context_dir.join("now.md")).unwrap();
+        std::fs::write(context_dir.join("now.md"), [0xff]).unwrap();
+        run_frame();
+        assert_eq!(
+            std::fs::read(context_dir.join("now.md")).unwrap(),
+            [0xff],
+            "undecodable state must not be replaced"
+        );
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(harness_state::harness_state_path(agent_dir)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["state"], "active");
+        assert_eq!(raw["reason"], PRE_COMPACT_ERROR_REASON);
     }
 
     /// The stdio connection is the evidence. While it lives, the record's heartbeat advances
@@ -565,6 +681,7 @@ mod tests {
             &rx,
             &mut out,
             &message::inbox_dir(agent_dir),
+            agent_dir,
             &mut writer,
             None,
             "h.worker",
@@ -620,6 +737,7 @@ mod tests {
             &rx,
             &mut out,
             &message::inbox_dir(agent_dir),
+            agent_dir,
             &mut channel_writer,
             None,
             "h.worker",
