@@ -10,7 +10,13 @@ trace="$state/injector.trace"
 mkdir -p "$state"
 
 item_commits() {
-  grep -cE ' feat: item [1-4]$' "$ledger/.git/logs/HEAD" 2>/dev/null || true
+  local base
+  base="$(git -C "$ledger" rev-list --max-parents=0 HEAD 2>/dev/null || true)"
+  if [ -z "$base" ]; then
+    printf '0\n'
+    return
+  fi
+  git -C "$ledger" rev-list --count "$base..HEAD" 2>/dev/null || printf '0\n'
 }
 
 worker_route() {
