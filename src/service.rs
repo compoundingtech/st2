@@ -13,12 +13,12 @@
 //! now a safe thing to install.
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "linux")]
-use std::{fs, process::Command};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -37,9 +37,8 @@ pub struct ServiceSpec {
     catalog: PathBuf,
     /// Baked `--host`; `None` lets `st2 up` auto-detect the hostname (matching a manual `st2 up`).
     host: Option<String>,
-    /// Explicit command search path inherited by st2 and every task it launches. A systemd user
-    /// manager normally has only system directories on PATH, while pty/Codex commonly live under
-    /// user-local or version-manager directories.
+    /// Explicit command search path determined by st2 for the supervisor and every launched task.
+    /// It includes the installed st2 directory, common user tool directories, and system paths.
     path: String,
     /// Optional machine-local pty registry. This is deliberately independent of the synced catalog:
     /// an explicit adoption can use an existing registry without syncing pid/socket state.
@@ -129,7 +128,15 @@ pub fn install(
                 .with_context(|| format!("pty root {} does not exist", root.display()))
         })
         .transpose()?;
-    let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb, collect_otel_env())?;
+    let spec = ServiceSpec::new(
+        exe,
+        &catalog,
+        host,
+        path,
+        pty_root,
+        memory_max_mb,
+        collect_otel_env(),
+    )?;
 
     install_systemd_user(&spec)?;
 
@@ -147,20 +154,88 @@ pub fn install(
     Ok(())
 }
 
-/// Persist the invoking PATH in the unit, prepending the installed st2 directory when necessary.
-/// This makes the unit independent of systemd's sparse manager environment while retaining the
-/// exact version-manager/user-local directories the operator verified at install time.
+/// Build a stable service PATH without reading the caller's PATH. Reinstalling from an agent must
+/// not retain an older release directory, workspace wrappers, temporary Codex paths, or duplicates.
 fn service_path(exe: &Path) -> Result<String> {
-    let ambient = env::var_os("PATH").context("PATH is not set")?;
-    let mut entries: Vec<PathBuf> = env::split_paths(&ambient).collect();
-    if let Some(parent) = exe.parent()
-        && !entries.iter().any(|entry| entry == parent)
-    {
-        entries.insert(0, parent.to_path_buf());
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    service_path_for(exe, &home)
+}
+
+fn service_path_for(exe: &Path, home: &Path) -> Result<String> {
+    let mut entries = Vec::new();
+    let mut push = |entry: PathBuf| {
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    };
+
+    if let Some(parent) = exe.parent() {
+        push(parent.to_path_buf());
     }
+    if let Some(nvm_bin) = selected_nvm_bin(home) {
+        push(nvm_bin);
+    }
+    for relative in [".cargo/bin", ".local/bin", "bin", ".deno/bin"] {
+        push(home.join(relative));
+    }
+    push(PathBuf::from("/usr/local/go/bin"));
+    push(home.join("go/bin"));
+    for system in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/snap/bin",
+    ] {
+        push(PathBuf::from(system));
+    }
+
     env::join_paths(entries)
         .context("service PATH contains an unsupported byte")
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Select the highest installed NVM version that matches its numeric default alias. Non-numeric
+/// aliases such as `node` fall back to the highest installed version. This reads no shell state.
+fn selected_nvm_bin(home: &Path) -> Option<PathBuf> {
+    let nvm = home.join(".nvm");
+    let versions_root = nvm.join("versions/node");
+    let alias = fs::read_to_string(nvm.join("alias/default")).unwrap_or_default();
+    let prefix = numeric_version(alias.trim());
+    let installed = fs::read_dir(&versions_root)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let version = numeric_version(entry.file_name().to_str()?);
+            (!version.is_empty() && entry.path().join("bin").is_dir())
+                .then_some((version, entry.path().join("bin")))
+        })
+        .collect::<Vec<_>>();
+    if prefix.is_empty() {
+        installed
+            .into_iter()
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, bin)| bin)
+    } else {
+        installed
+            .into_iter()
+            .filter(|(version, _)| version.starts_with(&prefix))
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, bin)| bin)
+    }
+}
+
+fn numeric_version(value: &str) -> Vec<u64> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let parts = value
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    parts.unwrap_or_default()
 }
 
 /// `st2 service status` — show the unit's systemd status.
@@ -280,7 +355,10 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .otel_env
         .iter()
         .map(|(key, value)| {
-            format!("Environment={}\n", systemd_quote_arg(&format!("{key}={value}")))
+            format!(
+                "Environment={}\n",
+                systemd_quote_arg(&format!("{key}={value}"))
+            )
         })
         .collect::<String>();
     format!(
@@ -421,7 +499,8 @@ mod tests {
 
     #[test]
     fn zero_memory_max_is_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0, Vec::new()).unwrap_err();
+        let err =
+            ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
     }
 
@@ -441,6 +520,86 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn service_path_is_deterministic_and_deduplicates_the_executable_directory() -> Result<()> {
+        let home = Path::new("/home/operator");
+        let path = service_path_for(Path::new("/home/operator/.cargo/bin/st2"), home)?;
+        let entries = env::split_paths(&path).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![
+                home.join(".cargo/bin"),
+                home.join(".local/bin"),
+                home.join("bin"),
+                home.join(".deno/bin"),
+                PathBuf::from("/usr/local/go/bin"),
+                home.join("go/bin"),
+                PathBuf::from("/usr/local/sbin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/sbin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/sbin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/snap/bin"),
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| *entry == &home.join(".cargo/bin"))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nvm_default_selects_the_highest_matching_installed_version() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let nvm = home.path().join(".nvm");
+        fs::create_dir_all(nvm.join("alias"))?;
+        fs::write(nvm.join("alias/default"), "24\n")?;
+        for version in ["v22.23.1", "v24.9.0", "v24.18.0", "v25.0.0"] {
+            fs::create_dir_all(nvm.join("versions/node").join(version).join("bin"))?;
+        }
+
+        assert_eq!(
+            selected_nvm_bin(home.path()),
+            Some(nvm.join("versions/node/v24.18.0/bin"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nvm_symbolic_default_uses_the_highest_installed_version() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let nvm = home.path().join(".nvm");
+        fs::create_dir_all(nvm.join("alias"))?;
+        fs::write(nvm.join("alias/default"), "node\n")?;
+        for version in ["v22.23.1", "v24.18.0"] {
+            fs::create_dir_all(nvm.join("versions/node").join(version).join("bin"))?;
+        }
+
+        assert_eq!(
+            selected_nvm_bin(home.path()),
+            Some(nvm.join("versions/node/v24.18.0/bin"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nvm_numeric_default_never_falls_back_to_another_major() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let nvm = home.path().join(".nvm");
+        fs::create_dir_all(nvm.join("alias"))?;
+        fs::write(nvm.join("alias/default"), "25\n")?;
+        fs::create_dir_all(nvm.join("versions/node/v24.18.0/bin"))?;
+
+        assert_eq!(selected_nvm_bin(home.path()), None);
+        Ok(())
     }
 
     #[test]
