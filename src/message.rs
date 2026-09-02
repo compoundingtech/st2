@@ -1264,7 +1264,7 @@ fn marker_state_exists(agent_dir: &Path) -> anyhow::Result<bool> {
     }
     let resources = agent_dir.join("resources");
     if resources.is_dir() {
-        for relative in ["inbox", "archive", "context", "context/decisions", "links"] {
+        for relative in ["inbox", "archive", "context", "context/decisions"] {
             match fs::symlink_metadata(resources.join(relative)) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
                 Ok(_) => anyhow::bail!("agent resource path is not a real directory"),
@@ -1841,15 +1841,32 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
     let (inbox, archive) = recipient.boxes()?;
     let archived = archive.join(&record.filename);
     if archived.is_file() {
-        anyhow::ensure!(
-            fs::read_to_string(&archived)? == record.rendered_message,
-            "archived message differs from pending send {}",
-            record.filename
-        );
+        let same = match fs::read_to_string(&archived) {
+            Ok(content) => content == record.rendered_message,
+            // A read failure is a failed delivery too: report it before propagating so
+            // message_deliveries_total{result="fail"} covers filesystem errors, not just mismatches.
+            Err(error) => {
+                crate::metrics::record_message_delivery(true);
+                return Err(error.into());
+            }
+        };
+        if !same {
+            crate::metrics::record_message_delivery(true);
+            anyhow::bail!("archived message differs from pending send {}", record.filename);
+        }
+        crate::metrics::record_message_delivery(false);
         return Ok(());
     }
-    materialize_message_once(&inbox, &record.filename, &record.rendered_message)?;
-    Ok(())
+    match materialize_message_once(&inbox, &record.filename, &record.rendered_message) {
+        Ok(_) => {
+            crate::metrics::record_message_delivery(false);
+            Ok(())
+        }
+        Err(error) => {
+            crate::metrics::record_message_delivery(true);
+            Err(error)
+        }
+    }
 }
 
 fn key_path(root: &Path, to: &str, key: &str) -> anyhow::Result<PathBuf> {
@@ -2180,6 +2197,19 @@ pub fn archive_msg(inbox_dir: &Path, archive_dir: &Path, filename: &str) -> anyh
         Err(_) if receipt.is_file() => remove_inbox_duplicate(&source, filename),
         Err(e) => Err(anyhow::anyhow!("archiving {filename}: {e}")),
     }
+}
+
+/// Settle every canonical message still present in an agent's inbox.
+///
+/// Retirement invokes this on every reconciliation pass. The archive receipt remains authoritative,
+/// so replay after an interrupted pass or a sync-restored inbox duplicate is idempotent.
+pub fn archive_inbox(agent_dir: &Path) -> anyhow::Result<()> {
+    let inbox = inbox_dir(agent_dir);
+    let archive = archive_dir(agent_dir);
+    for message in list_inbox(&inbox)? {
+        archive_msg(&inbox, &archive, &message.filename)?;
+    }
+    Ok(())
 }
 
 fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {

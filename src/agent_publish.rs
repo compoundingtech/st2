@@ -95,6 +95,24 @@ pub struct SourceDigest {
     pub sha256: String,
 }
 
+/// The staging name `axe agent check` requires in place at
+/// `<catalog>/agents/<host>/<identity>/agent.kdl.candidate`.
+const CANDIDATE_SPEC_FILE_NAME: &str = "agent.kdl.candidate";
+
+/// Whether `path` names a canonical KDL declaration source.
+///
+/// The gate exists to keep legacy TOML/JSON declarations out of publication, so it reads the
+/// file name rather than the bytes. `agent.kdl.candidate` is accepted because the prescribed
+/// authoring workflow validates a candidate under exactly that name; rejecting it forced a
+/// second copy of the same bytes to exist during publication.
+fn is_canonical_kdl_spec_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == CANDIDATE_SPEC_FILE_NAME
+        || path.extension().and_then(|value| value.to_str()) == Some("kdl")
+}
+
 impl Candidate {
     fn stage_in(parent: &Path, source: PublishSource) -> Result<Self> {
         let stage = tempfile::Builder::new()
@@ -124,14 +142,13 @@ impl Candidate {
             }
         };
         let spec_path = stage.path().join("agent.kdl");
-        anyhow::ensure!(
-            match &source {
-                PublishSource::Spec(path) =>
-                    path.extension().and_then(|value| value.to_str()) == Some("kdl"),
-                PublishSource::Bundle(_) => true,
-            },
-            "published spec must be canonical KDL"
-        );
+        if let PublishSource::Spec(path) = &source {
+            anyhow::ensure!(
+                is_canonical_kdl_spec_name(path),
+                "spec source must be named `*.kdl` or `{CANDIDATE_SPEC_FILE_NAME}`, found {}",
+                path.display()
+            );
+        }
         let metadata = fs::symlink_metadata(&spec_path)
             .with_context(|| format!("read candidate spec {}", spec_path.display()))?;
         anyhow::ensure!(
@@ -212,6 +229,46 @@ pub fn digest_source(source: PublishSource) -> Result<SourceDigest> {
         },
         sha256: candidate.input_sha256,
     })
+}
+/// Strictly validate one unpublished candidate as an overlay on the selected live catalog.
+///
+/// The live declaration plane is held under its shared authoring fence and never modified. The
+/// returned report uses the ordinary versioned validation vocabulary so callers do not need to
+/// construct or interpret a shadow catalog themselves.
+pub fn validate_candidate_for_host(
+    catalog: &Path,
+    source: PublishSource,
+    this_host: &str,
+) -> crate::validate::Report {
+    let source_path = match &source {
+        PublishSource::Spec(path) | PublishSource::Bundle(path) => path.display().to_string(),
+    };
+    let attempt = (|| -> Result<crate::validate::Report> {
+        let catalog = catalog
+            .canonicalize()
+            .with_context(|| format!("canonicalize catalog {}", catalog.display()))?;
+        let _lock = CatalogLock::shared(&catalog)?;
+        let staging = tempfile::tempdir().context("create candidate validation staging root")?;
+        let candidate = Candidate::stage_in(staging.path(), source)?;
+        let shadow = build_overlay(&catalog, staging.path(), &candidate)?;
+        Ok(crate::validate::validate_strict_for_host(
+            shadow.path(),
+            this_host,
+        ))
+    })();
+    match attempt {
+        Ok(report) => report,
+        Err(error) => {
+            let mut report = crate::validate::validate_strict_for_host(catalog, this_host);
+            report.issues.push(crate::validate::Issue::error(
+                "candidate-error",
+                source_path,
+                None,
+                format!("{error:#}"),
+            ));
+            report
+        }
+    }
 }
 
 /// Publish one spec under the catalog's exclusive authoring lock.
@@ -466,10 +523,20 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
+    let shadow = build_overlay(catalog, control, candidate)?;
+    crate::catalog_transaction::validate_full_catalog(shadow.path())
+        .context("candidate fails full-catalog validation")
+}
+
+fn build_overlay(
+    catalog: &Path,
+    staging_parent: &Path,
+    candidate: &Candidate,
+) -> Result<tempfile::TempDir> {
     let shadow = tempfile::Builder::new()
         .prefix("catalog-admission-")
-        .tempdir_in(&control)
-        .with_context(|| format!("create validation shadow in {}", control.display()))?;
+        .tempdir_in(staging_parent)
+        .with_context(|| format!("create validation shadow in {}", staging_parent.display()))?;
     let live_target = catalog
         .join("agents")
         .join(&candidate.host)
@@ -487,9 +554,7 @@ fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Re
             .context("write candidate into validation shadow")?,
         CandidateKind::Bundle => overlay_tree(candidate.stage.path(), &target)?,
     }
-
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    Ok(shadow)
 }
 
 fn copy_filtered_catalog(

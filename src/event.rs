@@ -94,6 +94,46 @@ struct ResolvedStream {
     recipient: String,
 }
 
+enum StreamAdmission {
+    Declared,
+    BuiltinResync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamOwnerIncarnation {
+    catalog_lock_device: u64,
+    catalog_lock_inode: u64,
+    supervisor_pid: u32,
+    supervisor_start_time_ticks: u64,
+}
+
+impl StreamOwnerIncarnation {
+    pub(crate) fn occurrence_token(self, sequence: u64) -> String {
+        format!(
+            "v1:{}:{}:{}:{}:{sequence}",
+            self.catalog_lock_device,
+            self.catalog_lock_inode,
+            self.supervisor_pid,
+            self.supervisor_start_time_ticks
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        catalog_lock_device: u64,
+        catalog_lock_inode: u64,
+        supervisor_pid: u32,
+        supervisor_start_time_ticks: u64,
+    ) -> Self {
+        Self {
+            catalog_lock_device,
+            catalog_lock_inode,
+            supervisor_pid,
+            supervisor_start_time_ticks,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamOwnerBinding {
@@ -105,8 +145,29 @@ struct StreamOwnerBinding {
     supervisor_start_time_ticks: u64,
 }
 
+impl StreamOwnerBinding {
+    fn incarnation(&self) -> StreamOwnerIncarnation {
+        StreamOwnerIncarnation {
+            catalog_lock_device: self.catalog_lock_device,
+            catalog_lock_inode: self.catalog_lock_inode,
+            supervisor_pid: self.supervisor_pid,
+            supervisor_start_time_ticks: self.supervisor_start_time_ticks,
+        }
+    }
+}
+
 pub(crate) fn publish_owner_binding(root: &Path, host: &str) -> anyhow::Result<()> {
     let lock = crate::catalog_lock::CatalogLock::shared_for_state_plane(root)?;
+    publish_owner_binding_under_lock(root, host, &lock)
+}
+
+/// Publish against a caller-held catalog read fence so related declaration reads and this
+/// incarnation binding observe one catalog generation.
+pub(crate) fn publish_owner_binding_under_lock(
+    root: &Path,
+    host: &str,
+    lock: &crate::catalog_lock::CatalogLock,
+) -> anyhow::Result<()> {
     let metadata = lock.control().metadata()?;
     let binding = StreamOwnerBinding {
         schema: "st2.stream-owner.v1".to_owned(),
@@ -151,11 +212,11 @@ pub fn publish_owner_binding_for_test(root: &Path, host: &str) -> anyhow::Result
     publish_owner_binding(root, host)
 }
 
-fn validate_owner_binding(
+fn read_valid_owner_binding(
     root: &Path,
     host: &str,
     lock: &crate::CatalogLock,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StreamOwnerBinding> {
     let path = crate::park::SupervisorScope::current(root, host)?.stream_owner_binding_path();
     let binding: StreamOwnerBinding = serde_json::from_slice(
         &fs::read(&path)
@@ -175,7 +236,23 @@ fn validate_owner_binding(
                 == Some(binding.supervisor_start_time_ticks),
         "stream owner binding for host '{host}' is stale"
     );
-    Ok(())
+    Ok(binding)
+}
+
+pub(crate) fn current_stream_owner_incarnation(
+    root: &Path,
+    host: &str,
+) -> anyhow::Result<StreamOwnerIncarnation> {
+    let lock = crate::CatalogLock::shared(root)?;
+    Ok(read_valid_owner_binding(root, host, &lock)?.incarnation())
+}
+
+fn validate_owner_binding(
+    root: &Path,
+    host: &str,
+    lock: &crate::CatalogLock,
+) -> anyhow::Result<()> {
+    read_valid_owner_binding(root, host, lock).map(|_| ())
 }
 
 fn resolve_stream(
@@ -183,6 +260,7 @@ fn resolve_stream(
     this_host: &str,
     recipient: &str,
     stream: &str,
+    admission: StreamAdmission,
 ) -> anyhow::Result<ResolvedStream> {
     let discovered = crate::discover_strict(root);
     anyhow::ensure!(
@@ -227,11 +305,17 @@ fn resolve_stream(
         spec.bus_id(this_host),
         spec.resolved_host(this_host)
     );
-    anyhow::ensure!(
-        spec.streams.iter().any(|declared| declared.name == stream),
-        "agent '{}' does not declare stream '{stream}'",
-        spec.bus_id(this_host)
-    );
+    match admission {
+        StreamAdmission::Declared => anyhow::ensure!(
+            spec.streams.iter().any(|declared| declared.name == stream),
+            "agent '{}' does not declare stream '{stream}'",
+            spec.bus_id(this_host),
+        ),
+        StreamAdmission::BuiltinResync => anyhow::ensure!(
+            stream == crate::resync::RESYNC_STREAM,
+            "built-in resync admission requires the reserved resync stream"
+        ),
+    }
     anyhow::ensure!(
         spec.desired_state.is_running(),
         "agent '{}' is {}; refusing event while its eyes are closed",
@@ -281,6 +365,58 @@ pub fn emit(
     body: &str,
     supersede: bool,
 ) -> anyhow::Result<EventReceipt> {
+    emit_admitted(
+        root,
+        this_host,
+        recipient,
+        stream,
+        event_id,
+        key,
+        subject,
+        body,
+        supersede,
+        StreamAdmission::Declared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_builtin_resync(
+    root: &Path,
+    this_host: &str,
+    recipient: &str,
+    event_id: &str,
+    key: Option<&str>,
+    subject: Option<&str>,
+    body: &str,
+    supersede: bool,
+) -> anyhow::Result<EventReceipt> {
+    emit_admitted(
+        root,
+        this_host,
+        recipient,
+        crate::resync::RESYNC_STREAM,
+        event_id,
+        key,
+        subject,
+        body,
+        supersede,
+        StreamAdmission::BuiltinResync,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_admitted(
+    root: &Path,
+    this_host: &str,
+    recipient: &str,
+    stream: &str,
+    event_id: &str,
+    key: Option<&str>,
+    subject: Option<&str>,
+    body: &str,
+    supersede: bool,
+    admission: StreamAdmission,
+) -> anyhow::Result<EventReceipt> {
     validate_component("stream", stream)?;
     validate_component("event id", event_id)?;
     if let Some(key) = key {
@@ -293,7 +429,7 @@ pub fn emit(
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
     let catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
     validate_owner_binding(root, this_host, &catalog_lock)?;
-    let resolved = resolve_stream(root, this_host, recipient, stream)?;
+    let resolved = resolve_stream(root, this_host, recipient, stream, admission)?;
     let canonical_recipient = resolved.recipient;
     let from = format!("{canonical_recipient}/{stream}");
     let rendered = render_event(&from, subject, stream, event_id, key, body);

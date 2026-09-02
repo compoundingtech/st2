@@ -2,6 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use st2::driver::{
+    CHANNEL_DEV_CONSENT_REQUIRED, CHANNEL_NO_INBOX_TRANSPORT, CHANNEL_NOT_REGISTERED,
+    CHANNEL_ROUTE_UNKNOWN, claude_channel_advisories,
+};
 use st2::materialize::materialize_agent;
 use st2::reconcile::{TaskCompileContext, compile_generated_tasks};
 use st2::{discover, driver::expand_driver};
@@ -132,11 +136,40 @@ fn pi_deliver_wraps_the_authored_launch_without_rendering_anything() {
         "{rendered:?}"
     );
 }
+#[test]
+fn opaque_session_driver_materializes_without_rewriting_or_adding_launch_tasks() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(
+        &path,
+        r#"agent "worker" {
+  host "h"
+  argv "axe" "agent" "launch" "--harness" "claude-code"
+  session-driver "claude"
+}"#,
+    )
+    .unwrap();
+    let (specs, errors) = st2::discover_file(&catalog, &path).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    let mut spec = specs.into_iter().next().unwrap();
+    let original_task = spec.tasks[0].clone();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+    let context = TaskCompileContext::new(catalog.clone(), executable).unwrap();
+
+    compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
+
+    assert_eq!(spec.tasks, [original_task]);
+    assert!(materialize_agent(&catalog, &spec, "h").unwrap().is_empty());
+}
 
 #[test]
 fn cli_prints_each_snapshot_without_changing_its_input() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver");
-    for provider in ["claude", "codex", "pi"] {
+    for provider in ["claude", "codex", "pi", "omp"] {
         let input = fixtures.join(format!("{provider}.in.kdl"));
         let before = fs::read(&input).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -161,6 +194,10 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
             output.stdout,
             fs::read(fixtures.join(format!("{provider}.out.kdl"))).unwrap()
         );
+        // Expansion is a read of the declaration, so it stays silent; the channel advisories
+        // belong to the command that actually creates the seat.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("channel"), "{provider}: {stderr}");
         assert_eq!(fs::read(&input).unwrap(), before);
     }
 }
@@ -292,6 +329,16 @@ fn claude_mcp_is_canonical_and_claude_is_a_hidden_alias() {
         .unwrap();
     let current_error = String::from_utf8(current.stderr).unwrap();
     assert!(!current_error.contains("deprecated"));
+
+    let implicit = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .env("ST_AGENT", "missing")
+        .arg("--catalog")
+        .arg(temp.path())
+        .args(["driver", "claude-mcp"])
+        .output()
+        .unwrap();
+    let implicit_error = String::from_utf8(implicit.stderr).unwrap();
+    assert!(!implicit_error.contains("--identity is required"));
 }
 
 #[test]
@@ -379,4 +426,114 @@ fn ambiguous_driver_source_neither_compiles_nor_materializes() {
             .contains("choose one launch source")
     );
     assert!(!workspace.join(".mcp.json").exists());
+}
+
+fn spec_from(catalog: &Path, body: &str) -> st2::spec::AgentSpec {
+    let path = catalog.join("agent.kdl");
+    fs::create_dir_all(catalog).unwrap();
+    fs::write(&path, body).unwrap();
+    let (specs, errors) = st2::discover_file(catalog, &path).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    specs.into_iter().next().unwrap()
+}
+
+/// A Claude seat's channel state comes from the launch that will actually run.
+#[test]
+fn claude_driver_names_the_channel_state_the_seat_is_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let unrouted = spec_from(
+        &temp.path().join("unrouted"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { prompt "boot" }
+}
+"#,
+    );
+    // No channel and no `ding`: this seat has no inbox transport whatsoever, which is a stronger
+    // and more urgent fact than the skipped channel on its own.
+    assert_eq!(
+        claude_channel_advisories(&unrouted),
+        vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT]
+    );
+
+    let dev = spec_from(
+        &temp.path().join("dev"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { dev-channels #true; prompt "boot" }
+}
+"#,
+    );
+    assert!(claude_channel_advisories(&dev).is_empty());
+
+    // An explicit development flag still reaches the provider launch verbatim.
+    let dev_via_args = spec_from(
+        &temp.path().join("dev-via-args"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  claude { prompt "boot"; args "--dangerously-load-development-channels=server:st2" }
+}
+"#,
+    );
+    assert_eq!(
+        claude_channel_advisories(&dev_via_args),
+        vec![CHANNEL_DEV_CONSENT_REQUIRED]
+    );
+
+    // A harness that renders no st2 channel server has nothing to say.
+    let codex = spec_from(
+        &temp.path().join("codex"),
+        r#"agent "worker" {
+  host "h"
+  workspace "/work"
+  codex { prompt "boot" }
+}
+"#,
+    );
+    assert!(claude_channel_advisories(&codex).is_empty());
+}
+
+/// The legacy `deliver "mcp"` transport renders the same `.mcp.json`, so it is in the same states
+/// — read back from structured argv when the operator provides it. A shell program can reach the
+/// flag through a wrapper or variable, while a source-text occurrence may only be quoted or
+/// commented, so shell source never proves the route and must remain opaque.
+#[test]
+fn legacy_mcp_delivery_reads_the_channel_state_off_the_authored_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    for (launch, expected) in [
+        (
+            r#"argv "claude" "boot""#,
+            vec![CHANNEL_NOT_REGISTERED, CHANNEL_NO_INBOX_TRANSPORT],
+        ),
+        (
+            r#"argv "claude" "--dangerously-load-development-channels" "boot""#,
+            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+        ),
+        (
+            r#"argv "claude" "--dangerously-load-development-channels=server:st2" "boot""#,
+            vec![CHANNEL_DEV_CONSENT_REQUIRED],
+        ),
+        (r#"command "exec claude boot""#, vec![CHANNEL_ROUTE_UNKNOWN]),
+        (
+            r#"command "exec claude --dangerously-load-development-channels=server:st2 boot""#,
+            vec![CHANNEL_ROUTE_UNKNOWN],
+        ),
+    ] {
+        let spec = spec_from(
+            &temp.path().join(format!("legacy{}", launch.len())),
+            &format!(
+                r#"agent "worker" {{
+  host "h"
+  workspace "/work"
+  deliver "mcp"
+  {launch}
+}}
+"#
+            ),
+        );
+        assert_eq!(claude_channel_advisories(&spec), expected, "{launch}");
+    }
 }

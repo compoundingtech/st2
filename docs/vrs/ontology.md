@@ -132,6 +132,213 @@ Authority: [`harness_state`](../../src/harness_state.rs);
 [05-harness-state requirements](05-harness-state/requirements.md);
 [decision 0006](.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md)
 
+### native driver diagnostic
+
+The current typed explanation that a native harness driver's boundary cannot
+produce trustworthy evidence or complete transport work. It is advisory
+evidence, not the provider's free-form error, not observed harness state, and
+not authority to launch, retry, deliver, reconcile, or archive.
+
+Authority: [05-harness-state requirements OHS-R11–OHS-R15](05-harness-state/requirements.md);
+[`driver_diagnostic`](../../src/driver_diagnostic.rs)
+
+### diagnostic stage
+
+One closed native-driver boundary at which a diagnostic is observed:
+version gate, API gate, event stream, state seed, delivery, or read-back. A
+stage owns its bounded reasons and sources; a reason paired with another stage
+is unknown evidence rather than a best-effort match.
+
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+
+### diagnostic evidence age
+
+Reader-derived elapsed time since the current native driver diagnostic was
+observed. The origin timestamp is durable; age is a projection and never file
+mtime.
+
+Authority: [native driver diagnostic snapshot](05-harness-state/spec.md#native-driver-diagnostic-snapshot-ohs-r11ohs-r15)
+
+### harness context record
+
+The driver-written numeric record of how full an agent's harness context window
+is, how often that harness has compacted, and the adjacent facts the same
+channel carries. It is the numeric sibling of
+[observed harness state](#observed-harness-state)'s categorical axis: unfenced,
+quantized rather than transition-guarded, and readable with its own age even
+when the state axis reads `unknown`. Advisory: it authorizes nothing.
+
+Its roster key is `context`, but the canonical term is *harness context record*.
+It is not [working state](#working-state) — R09's restored durable context,
+which owns the bare word *context* in st2's language.
+
+Authority: [08-harness-context requirements](08-harness-context/requirements.md);
+[decision 0014](.decisions/0014-harness-context-is-a-sibling-numeric-record.md)
+
+### context fill
+
+How much of a harness's context window its current conversation occupies,
+published as `usedTokens`, `windowTokens`, and `usedPercent`.
+
+`usedPercent` is **harness-native**: the number that harness itself displays to
+its operator, by that harness's own rule — Claude's clamped integer over the
+full window, Codex's percentage over a window with a fixed baseline removed,
+pi's and omp's float, and an st2-computed ratio for OpenCode, which shows none.
+The record's `harness` field is what names the rule. Two agents' `usedPercent`
+values are therefore comparable as operator views, not as one measured quantity,
+and a value above 100 is a real overrun rather than something to clamp.
+
+Authority: [08-harness-context requirements HC-A04, HC-R02](08-harness-context/requirements.md);
+[producer table](08-harness-context/spec.md)
+
+### occupancy
+
+What a context window currently holds — the numerator of
+[context fill](#context-fill). Distinct from **cumulative session total**
+(`sessionTotalTokens`), which is every token a session has ever spent and grows
+without bound: one measured session read 2,235,329 cumulative tokens against a
+258,400-token window. Every harness that publishes both publishes them side by
+side under names easy to confuse; the two are never interchangeable, and only
+occupancy is ever a percent's numerator.
+
+Authority: [08-harness-context requirements HC-R16](08-harness-context/requirements.md);
+[record fields](08-harness-context/spec.md)
+
+### compaction trigger
+
+Why a harness compacted, drawn from the closed union
+`manual | auto | threshold | overflow | idle | unknown`. It is the harness's own
+reason, not st2's inference: only Claude and pi put one on the compaction edge,
+so `unknown` is the honest value for the other three producers rather than an
+error. An unrecognized future word decodes as `unknown`, never as a definite
+trigger.
+
+Authority: [08-harness-context requirements HC-R12](08-harness-context/requirements.md);
+[compaction accounting](08-harness-context/spec.md)
+
+### Resource
+
+An externally identified thing an agent points at, named by an absolute URI.
+st2 preserves the URI's exact bytes and never normalizes them. The scheme is the
+exact lookup key for an optional, catalog-declared
+[Resource Profile](07-resource-profile/requirements.md); scheme meaning stays
+downstream-owned and st2 ships no built-in profiles, so an unregistered scheme
+stays opaque. Possession of a URI grants no authority, access, or capability.
+
+One concept, one edge: a Resource is reached through a
+[Resource binding](#resource-binding). The [linked record](#linked-record-retired)
+plane that once shared the word is retired.
+
+Authority: [R20 portable Resource bindings](requirements.md#L161-L168);
+[issue #61 resolution](https://github.com/compoundingtech/st2/issues/61)
+
+### Resource binding
+
+A publisher-declared edge from one agent to one Resource, written as a
+`resource` node in the agent declaration and carrying an agent-local unique
+name, the URI, a required `reason`, and an optional `inactive-reason`. Bindings
+are desired state: they change only through compare-and-swap publication of the
+whole declaration, and a binding-only change never stops, replaces, or relaunches
+healthy work.
+
+A binding says what an agent *is for* — the work it reads and the durable state
+carriers it owns. It is not a record of what the agent produced.
+
+Authority: [`Resource`](../../crates/agent-spec/src/spec.rs#L239-L245) — the
+live contract; [R20](requirements.md#L161-L168); [R21](requirements.md#L169-L172).
+The canonical [Agent Spec Resource bindings](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#agent-spec-resource-bindings)
+anchor still describes the pre-#307 envelope of name and `uri` only, and would
+reject the required `reason`; it is pending sync (07-resource DQ-R8).
+
+### Resource snapshot
+
+The one atomic profile-defined representation of a Resource binding's current
+observed state. Its bytes, media type, schema identity, content digest, and
+freshness form the state-first read contract. Provider webhooks, polls, and
+native subscriptions are observations used to reconcile the snapshot; none is
+canonical by itself.
+
+Authority: [PROFILE-R14 atomic snapshot authority](07-resource-profile/requirements.md);
+[decision 0014](.decisions/0014-resource-profiles-are-state-first-read-and-observe-capabilities.md)
+
+### Resource invalidation
+
+A thin, superseding notice that a binding's canonical
+[Resource snapshot](#resource-snapshot) changed in a way selected for agent
+attention. It carries the binding identity, current snapshot digest, and
+semantic topics. It does not carry canonical snapshot bytes, a rendered
+summary, or a complete provider transition.
+
+Authority: [PROFILE-R17 semantic invalidation](07-resource-profile/requirements.md);
+[Resource Profile spec](07-resource-profile/spec.md#semantic-invalidation-and-catch-up-profile-r17r20)
+
+### semantic topic
+
+A profile-owned stable identifier that classifies why a Resource snapshot
+changed, such as `ci.failure` or `mergeability.conflict`. The profile descriptor
+publishes the vocabulary and defaults. A Resource binding selector can choose
+from that vocabulary but cannot create topics or change provider authority.
+
+Authority: [PROFILE-R12 versioned profile descriptor](07-resource-profile/requirements.md);
+[PROFILE-R13 validated binding selectors](07-resource-profile/requirements.md)
+
+### pending relevance
+
+The level-triggered fact that at least one selected Resource snapshot change has
+not been delivered while delivery was unavailable. It is one boolean beside
+the current and last-delivered digests, not a pending event, historical digest,
+cursor, or backlog. Resume invalidates the then-current snapshot.
+
+Authority: [PROFILE-R19 level-triggered catch-up](07-resource-profile/requirements.md);
+[lifecycle prototype](07-resource-profile/.experiments/2026-08-29-smart-resource-lifecycle-prototype.md)
+
+### linked record (retired)
+
+An agent-owned record of something an agent produced, stored as one markdown
+file with `url`, optional `title`/`tags`/`relation`, and an optional body under
+`<agent-dir>/resources/links/`, written through `st2 resource add`.
+
+**Retired.** The term is kept only so a reader who meets a surviving record
+under `resources/links/` can identify it. Recording produced artifacts is
+`axe work update --artifact <path> --pty <name>`. Nothing in st2 reads a linked
+record, and *resource* now names only the declared plane.
+
+Authority: [07-resource spec](07-resource/spec.md);
+[decision 0011](.decisions/0011-the-linked-record-plane-is-retired.md)
+
+### agent resource directory
+
+The per-agent directory `<agent-dir>/resources/`, canonical for an agent's
+resource files. It holds the message planes (`inbox/`, `archive/`, `sent/`),
+working state and decisions (`context/`), scratch material (`tmp/`), and the
+realized carriers themselves (`goal.md` and siblings).
+
+It is not a separate meaning of *resource*. It is the **realization surface**
+for [Resource bindings](#resource-binding): a binding names a carrier by URI and
+the carrier's bytes live here. `dev.schickling.agent-goal://<host>/<identity>`
+realizes as `resources/goal.md`; `decision-tree://<host>/<identity>` realizes as
+`resources/context/decisions/`. Identity is the URI; the path is realization,
+and st2 does not resolve one into the other ([R20](requirements.md#L161-L168)).
+
+Authority: [`message::with_resolved_state_dir`](../../src/message.rs);
+[07-resource spec](07-resource/spec.md)
+
+### working state
+
+An agent's restored durable context — what it is doing, what it decided, and what
+it ruled out — written through `st2 context` and realized at
+`resources/context/now.md`. Never a liveness or activity term; the observed
+signal is [observed harness state](#observed-harness-state).
+
+Addressed as a [Resource binding](#resource-binding) under the scheme
+`working-state://<host>/<identity>`. st2 writes the carrier through
+`st2 context`; resolving the scheme is a catalog's choice via an optional
+[Resource Profile](07-resource-profile/requirements.md), not something st2 ships.
+
+Authority: [R09 state continuity](requirements.md#L131-L132);
+[`context`](../../src/context.rs);
+[decision 0012](.decisions/0012-working-state-is-a-declared-carrier.md)
+
 ### restart policy
 
 The declared rules that bound when and how an agent task may be relaunched
@@ -337,6 +544,27 @@ operator action --creates--> unpark request --targets--> owning supervisor run
 leitwort for policy and budget; `park` links the terminal decision to its
 explicit `unpark` recovery request.
 
+```text
+native driver boundary --publishes/clears--> native driver diagnostic
+       |                                      |
+       `-- diagnostic stage                   `-- derives diagnostic evidence age
+```
+
+`diagnostic` is the leitwort for typed driver degradation; `observed` remains
+the leitwort for harness activity evidence.
+
+```text
+harness channel --publishes--> context fill --occupies--> context window
+       |                            |
+       `-- compaction edge          `-- derives context fill age
+              |
+              `-- carries compaction trigger
+```
+
+`harness context` is the leitwort for the numeric axis, `context fill` for
+occupancy, and `compaction` for the edge and its counter. *Working state* stays
+outside this family entirely.
+
 ## Collision rules
 
 - Qualify **root** as [root agent](requirements.md#L51-L54) or
@@ -358,6 +586,13 @@ explicit `unpark` recovery request.
 - *Working state* remains R09's restored durable context and is never a
   liveness or activity term; the observed signal is **observed harness
   state**, not *working state*.
+- Use **native driver diagnostic** for typed boundary degradation and
+  **observed harness state** for the harness activity projection. Neither is
+  presence or session state, and a driver diagnostic never rewrites the
+  observed tuple.
+- Use **diagnostic stage**, **reason**, and **source** for the closed fields.
+  Provider error prose may be logged, but must not become consumer branching
+  vocabulary.
 - Use **parked task** or **park decision** for the owning supervisor's policy
   decision. Do not use *parked* as a session state or replace the runtime
   observation with it.
@@ -366,6 +601,33 @@ explicit `unpark` recovery request.
 - Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
   value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
   host-qualified address.
+- **Resource** names one concept: a [Resource binding](#resource-binding) and
+  nothing else. The [linked record](#linked-record-retired) plane that once shared the
+  word is retired. Do not reintroduce a second sense.
+- The [agent resource directory](#agent-resource-directory) is not a second
+  sense either — it is where bindings are realized. Say *binding* for the
+  declared edge and *carrier* for the realized bytes when both are in view.
+- Use [working state](#working-state) for R09's restored durable context. The
+  verb is `st2 context` and the directory is `resources/context/`, but the
+  canonical term and its scheme are *working state*, not *context*.
+- Bare **context** is therefore already taken. Say
+  [harness context record](#harness-context-record) for the numeric harness
+  axis, even though its roster key is `context`; say *working state* for R09's
+  restored durable context. The two share no field, no file, and no producer,
+  and neither is [observed harness state](#observed-harness-state) — that is the
+  categorical axis. A record's numbers never imply a state, and a state never
+  implies a fill.
+- Use [context fill](#context-fill) for occupancy as a fraction and qualify it
+  as **harness-native** wherever a reader might otherwise assume one formula.
+  Do not call a cross-harness aggregate of `usedPercent` a measurement; it is an
+  aggregate of operator views.
+- Use [occupancy](#occupancy) for what the window currently holds and
+  **cumulative session total** for lifetime spend. Never *total* unqualified:
+  the harnesses themselves spell both `total`, and dividing the wrong one by the
+  window reports several hundred percent.
+- Use [compaction trigger](#compaction-trigger) for the harness's own stated
+  reason. `unknown` is a value, not a failure, and st2 never infers a trigger a
+  harness did not state.
 - Use [message](../../src/message.rs#L26-L46) for the durable record and
   [DING](../../src/ding/mod.rs#L1-L14) for its terminal notification.
 - Qualify **event**: a bare *event* in stream context is the durable

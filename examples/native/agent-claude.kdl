@@ -24,6 +24,13 @@ agent "<identity>" {
     // exit leaves the last state to age out; both read indeterminate, never wrong. The full
     // producer (heartbeats, terminal exits) comes with the session wrapper, i.e. a typed
     // `claude {}` driver seat or `deliver "mcp"`.
+    //
+    // The `statusLine` entry is the harness-context tee: it is Claude's ONLY channel carrying a
+    // context window, and the slot is single-valued — the winning declaration replaces the others
+    // outright rather than merging. So this command records the payload and then chains to the
+    // operator's own renderer, resolved from `$ST_CLAUDE_STATUSLINE_RENDERER` or
+    // `~/.claude/statusline-renderer.json`, passing the payload through unchanged when neither
+    // resolves. Declaring anything else here would silently remove the operator's status line.
     json-upsert ".claude/settings.local.json" arrays="union" #"""
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -50,6 +57,20 @@ agent "<identity>" {
           {
             "type": "command",
             "command": "\"$ST_HOOKS/claude-pre-compact.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" PreCompact"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-observe.sh\" PostCompact"
           }
         ]
       }
@@ -114,6 +135,12 @@ agent "<identity>" {
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+    "padding": 0,
+    "refreshInterval": 5
   }
 }
 """#

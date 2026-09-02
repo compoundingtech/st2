@@ -48,6 +48,67 @@ fn compact_agent_catalog_is_clean() {
     assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
     assert_eq!(r.warnings(), 0, "unexpected warnings: {:?}", r.issues);
 }
+#[test]
+fn native_session_driver_is_clean_with_explicit_readiness() {
+    let c = catalog(&[(
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "claude"
+  delivery-readiness "credential" account-id="tokengate/shared"
+}"#,
+    )]);
+
+    let report = validate(c.path());
+    assert_eq!(report.errors(), 0, "unexpected issues: {:?}", report.issues);
+    assert_eq!(report.agents, 1);
+}
+
+#[test]
+fn native_delivery_requires_explicit_matching_driver_and_readiness() {
+    for (name, declaration, code) in [
+        (
+            "legacy-deliver",
+            r#"agent "legacy-deliver" { host "h"; command "codex"; deliver "app-server" }"#,
+            "native-driver-missing",
+        ),
+        (
+            "missing-readiness",
+            r#"agent "missing-readiness" { host "h"; argv "axe"; session-driver "codex" }"#,
+            "delivery-readiness-missing",
+        ),
+    ] {
+        let c = catalog(&[(&format!("h/{name}/agent.kdl"), declaration)]);
+        let report = validate(c.path());
+        assert!(
+            has(&report, code, Severity::Error),
+            "{name}: {:?}",
+            report.issues
+        );
+    }
+}
+
+#[test]
+fn explicit_and_typed_session_drivers_preempt_ding() {
+    for (name, body) in [
+        (
+            "opaque",
+            r#"argv "axe" "agent" "launch"; session-driver "claude"; delivery-readiness "credential"; ding"#,
+        ),
+        (
+            "typed",
+            r#"claude { prompt "Start work." }; delivery-readiness "credential"; ding"#,
+        ),
+    ] {
+        let c = catalog(&[(
+            &format!("h/{name}/agent.kdl"),
+            &format!(r#"agent "{name}" {{ host "h"; workspace "/work/{name}"; {body} }}"#),
+        )]);
+        let report = validate(c.path());
+        assert_eq!(report.errors(), 0, "{name}: {:?}", report.issues);
+    }
+}
 
 #[test]
 fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
@@ -96,6 +157,7 @@ fn active_agents_may_share_an_opaque_resource_uri() {
             "h/integrator/agent.kdl",
             r#"agent "integrator" {
   host "h"
+  supervisor "h.reviewer"
   resource "subject" uri="git-commit://github.com/example/project/0123456789abcdef" reason="reviewed example commit"
   command "true"
 }"#,
@@ -179,6 +241,8 @@ fn shared_workspace_render_conflict_is_an_error() {
 
 #[test]
 fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
+    // #399 moved the conflict into the parser: a delivery transport pins its session driver,
+    // so `deliver "app-server"` refuses a `claude` driver block at discovery time.
     let c = catalog(&[(
         "h/worker/agent.kdl",
         r#"agent "worker" {
@@ -193,13 +257,14 @@ fn a_driver_block_and_deliver_are_two_conflicting_launch_sources() {
     let issue = report
         .issues
         .iter()
-        .find(|issue| issue.code == "driver-deliver-conflict")
+        .find(|issue| issue.code == "parse-error")
         .unwrap();
     assert_eq!(issue.severity, Severity::Error);
     assert_eq!(
         issue.message,
-        "agent 'worker' declares both a driver block and `deliver`; choose one launch source"
+        "agent 'worker' delivery transport 'app-server' requires session-driver 'codex', not 'claude'"
     );
+    assert_eq!(report.agents, 0, "the declaration never lowers to a spec");
 }
 
 #[test]
@@ -424,6 +489,7 @@ fn fleet_validation_compiles_remote_driver_launches() {
   host "Silber"
   workspace "/tmp"
   claude { prompt "boot" }
+  delivery-readiness "credential" account-id="tokengate/shared"
 }"#,
     )]);
     let found = st2::discover(c.path());
@@ -439,7 +505,6 @@ fn fleet_validation_compiles_remote_driver_launches() {
         );
     }
 }
-
 #[test]
 fn validation_reports_shared_task_compiler_errors() {
     let c = catalog(&[(
@@ -584,19 +649,22 @@ fn the_future_schedule_preview_is_explicitly_rejected() {
 // ---- warnings --------------------------------------------------------------------------------
 
 #[test]
-fn a_dangling_supervisor_is_a_warning() {
-    let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
-    )]);
+fn a_dangling_supervisor_is_an_error() {
+    // #399 made the supervisor chain authoritative: a reference to a missing parent is a
+    // structural error, not a warning.
+    let c = catalog(&[
+        (
+            "hetz/base/agent.kdl",
+            r#"agent "base" { host "hetz"; command "x" }"#,
+        ),
+        (
+            "hetz/w/agent.kdl",
+            r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
+        ),
+    ]);
     let r = validate(c.path());
-    assert!(has(&r, "dangling-supervisor", Severity::Warn));
-    assert_eq!(
-        r.errors(),
-        0,
-        "a dangling supervisor must not be an error: {:?}",
-        r.issues
-    );
+    assert!(has(&r, "supervisor-missing", Severity::Error));
+    assert_eq!(r.errors(), 1, "unexpected issues: {:?}", r.issues);
 }
 
 #[test]
@@ -605,6 +673,10 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
         (
             "Silber/cos/agent.kdl",
             r#"agent "cos" { host "Silber"; command "x" }"#,
+        ),
+        (
+            "hetz/base/agent.kdl",
+            r#"agent "base" { host "hetz"; command "x" }"#,
         ),
         (
             "hetz/w/agent.kdl",
@@ -619,6 +691,107 @@ fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
         "runtime-routable qualified supervisors must validate: {:?}",
         r.issues
     );
+}
+
+#[test]
+fn retired_unsupervised_declarations_remain_valid() {
+    let c = catalog(&[
+        (
+            "h/cos/agent.kdl",
+            r#"agent "cos" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/old-legacy/agent.kdl",
+            r#"agent "old-legacy" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/old-explicit/agent.kdl",
+            r#"agent "old-explicit" { host "h"; desired-state "retired" reason="Replaced by cos"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+}
+
+#[test]
+fn a_host_may_have_multiple_unsupervised_agents() {
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; desired-state "suspended" reason="maintenance window"; command "x" }"#,
+        ),
+        (
+            "h/rival/agent.kdl",
+            r#"agent "rival" { host "h"; command "x" }"#,
+        ),
+    ]);
+    assert_eq!(
+        validate(c.path()).errors(),
+        0,
+        "independent root trees must validate: {:?}",
+        validate(c.path()).issues
+    );
+}
+#[test]
+fn an_active_chain_may_not_terminate_at_a_retired_root() {
+    // The worker's declared supervisor is retired, so its active tree has no active owner.
+    let c = catalog(&[
+        (
+            "h/live/agent.kdl",
+            r#"agent "live" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/dead/agent.kdl",
+            r#"agent "dead" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; supervisor "h.dead"; command "x" }"#,
+        ),
+    ]);
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "retired-root"
+            && i.severity == Severity::Error
+            && i.message.contains("h.worker")
+            && i.message.contains("h.dead")),
+        "expected retired-root on h.worker, got {:?}",
+        r.issues
+    );
+    assert_eq!(r.errors(), 1, "unexpected issues: {:?}", r.issues);
+
+    // Retired descendants of a retired root stay legal: tombstone trees are outside the
+    // org chart and the check only binds active agents.
+    let tombstones = catalog(&[
+        (
+            "h/live/agent.kdl",
+            r#"agent "live" { host "h"; command "x" }"#,
+        ),
+        (
+            "h/dead/agent.kdl",
+            r#"agent "dead" { host "h"; retired #true; command "x" }"#,
+        ),
+        (
+            "h/ghost-worker/agent.kdl",
+            r#"agent "ghost-worker" { host "h"; supervisor "h.dead"; retired #true; command "x" }"#,
+        ),
+    ]);
+    assert_eq!(
+        validate(tombstones.path()).errors(),
+        0,
+        "retired chains must not error: {:?}",
+        validate(tombstones.path()).issues
+    );
+}
+
+#[test]
+fn a_host_may_have_no_active_root() {
+    let c = catalog(&[(
+        "h/ghost/agent.kdl",
+        r#"agent "ghost" { host "h"; retired #true; command "x" }"#,
+    )]);
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
 }
 
 #[test]
@@ -712,10 +885,10 @@ fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     )]);
     assert!(!run_validate(&[err.path().as_os_str()]).status.success());
 
-    // A warning-only catalog exits 0 normally, 1 under --strict.
+    // A warning-only catalog exits 0 normally and exits 1 under --strict.
     let warn = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
+        "hetz/folder-name/agent.kdl",
+        r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(run_validate(&[warn.path().as_os_str()]).status.success());
     let strict = std::ffi::OsStr::new("--strict");

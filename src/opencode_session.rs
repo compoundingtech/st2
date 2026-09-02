@@ -31,13 +31,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use crate::driver_diagnostic::{
+    Driver as DiagnosticDriver, Publisher as DiagnosticPublisher, Reason as DiagnosticReason,
+    Source as DiagnosticSource, Stage as DiagnosticStage, Support as DiagnosticSupport,
+};
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
-use crate::{ding, message, status};
+use crate::{ding, harness_context, harness_version, message, status};
 
-/// OpenCode versions whose `/event`, `/session`, and `prompt_async` surfaces were verified.
-/// The live `/doc` check below guards the shape; this list guards the semantics behind it.
-const SUPPORTED_OPENCODE_VERSIONS: [&str; 1] = ["1.18.19"];
+/// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
+/// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
+/// the semantics behind it.
+///
+/// Admission is per minor so a patch bump inside a verified minor keeps native delivery instead
+/// of silently degrading to none — the profile shipping 1.18.25 against a 1.18.19 allowlist is
+/// exactly that case. The tradeoff is explicit: `/doc` still catches a SHAPE change on any
+/// version, but a SEMANTIC change within an admitted minor would not be caught, which is the
+/// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
+const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
 
 const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -80,20 +91,35 @@ pub fn run(
         !opencode_argv.is_empty(),
         "opencode driver '{runtime_id}' has no provider argv"
     );
-    let version_ok = match supported_version(&opencode_argv[0]) {
+    let version_probe = supported_version(&opencode_argv[0]);
+    let (version_ok, producer_version, support, version_failure) = match version_probe {
         Ok(version) => {
-            let ok = SUPPORTED_OPENCODE_VERSIONS.contains(&version.as_str());
-            if !ok {
-                eprintln!(
-                    "st2 opencode-session: version {version} is unverified (supported: {}); native delivery disabled",
-                    SUPPORTED_OPENCODE_VERSIONS.join(", ")
+            let supported = version_is_supported(&version);
+            if !supported {
+                tracing::warn!(
+                    "st2 opencode-session: version {version} is unverified (supported minors: {}); native delivery disabled",
+                    harness_version::series_display(&SUPPORTED_OPENCODE_MINORS)
                 );
             }
-            ok
+            (
+                supported,
+                Some(version),
+                if supported {
+                    DiagnosticSupport::Supported
+                } else {
+                    DiagnosticSupport::Unsupported
+                },
+                (!supported).then_some(DiagnosticReason::UnsupportedVersion),
+            )
         }
         Err(error) => {
-            eprintln!("st2 opencode-session: cannot read opencode version: {error:#}");
-            false
+            tracing::warn!("st2 opencode-session: cannot read opencode version: {error:#}");
+            (
+                false,
+                None,
+                DiagnosticSupport::Unknown,
+                Some(DiagnosticReason::VersionProbeFailed),
+            )
         }
     };
 
@@ -115,6 +141,17 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+        let mut diagnostics =
+            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        if let Some(reason) = version_failure {
+            diagnostics.publish(
+                DiagnosticStage::VersionGate,
+                reason,
+                DiagnosticSource::VersionProbe,
+            );
+        } else {
+            diagnostics.clear(DiagnosticStage::VersionGate);
+        }
         Session {
             client,
             version_ok,
@@ -127,8 +164,21 @@ pub fn run(
                 "opencode",
                 Some(runtime_id.clone()),
             )
-            .with_ownership(session, seq),
+            .with_ownership(session.clone(), seq),
+            // The same incarnation token as the state record beside it, carried as provenance
+            // only (HC-R15): nothing on this record is fenced on it. The claim above already
+            // removed any predecessor's context record, so no second removal belongs here.
+            context: match ContextProducer::new(&agent_dir, &identity, &session) {
+                Ok(producer) => Some(producer),
+                Err(error) => {
+                    tracing::warn!(
+                        "st2 opencode-session: no context record for this seat: {error:#}"
+                    );
+                    None
+                }
+            },
             delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+            diagnostics,
         }
     };
     let mut child = match spawn_provider(&argv, &password) {
@@ -157,7 +207,11 @@ struct Session {
     version_ok: bool,
     status_path: PathBuf,
     writer: Writer,
+    /// The numeric axis, `None` only where the record has nowhere safe to stage. Its absence is a
+    /// missing advisory number, never a reason to fail a launch that is otherwise healthy.
+    context: Option<ContextProducer>,
     delivery: Delivery,
+    diagnostics: DiagnosticPublisher,
 }
 
 fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Result<()> {
@@ -175,6 +229,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
     let mut next_gate_attempt = Instant::now();
     let mut next_presence = Instant::now();
     let mut next_inbox = Instant::now();
+    // The context producer's own handle on the server: `Client` is a port and a password, and a
+    // separate one keeps its pull from borrowing the session while the producer is borrowed
+    // mutably.
+    let context_client = session.client.clone();
 
     let outcome = loop {
         if STOP.load(Ordering::SeqCst) {
@@ -213,15 +271,30 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         if !api_ok && Instant::now() >= next_gate_attempt {
             match session.client.get_json("/doc") {
                 Ok(doc) => match check_openapi_subset(&doc) {
-                    Ok(()) => api_ok = true,
+                    Ok(()) => {
+                        api_ok = true;
+                        session.diagnostics.clear(DiagnosticStage::ApiGate);
+                    }
                     Err(error) => {
-                        eprintln!("st2 opencode-session: API gate failed: {error:#}");
+                        session.diagnostics.publish(
+                            DiagnosticStage::ApiGate,
+                            DiagnosticReason::IncompatibleApi,
+                            DiagnosticSource::OpenApiDocument,
+                        );
+                        tracing::warn!("st2 opencode-session: API gate failed: {error:#}");
                         // A failed shape check is terminal for this launch: the surface will not
                         // change until the binary does. Stop probing; run presence-only.
                         next_gate_attempt = Instant::now() + Duration::from_secs(3600);
                     }
                 },
-                Err(_) => next_gate_attempt = Instant::now() + Duration::from_millis(250),
+                Err(_) => {
+                    session.diagnostics.publish(
+                        DiagnosticStage::ApiGate,
+                        DiagnosticReason::ApiUnavailable,
+                        DiagnosticSource::OpenApiDocument,
+                    );
+                    next_gate_attempt = Instant::now() + Duration::from_millis(250);
+                }
             }
         }
         if api_ok && !sse_started {
@@ -229,19 +302,33 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             sse_started = true;
         }
 
+        // Accumulated across the whole drain and published once at its end: `message.updated` and
+        // `session.updated` arrive back-to-back, so one publish per batch carries the turn's cost
+        // and cumulative total alongside the numerator that made the reading fresh.
+        let mut fresh_reading = false;
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
                     machine = EventMachine::default();
                     sse_connected = true;
+                    session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
                     // on a transiently failed seed would re-stamp whatever the disk last said.
-                    evidence = seed_from_server(&session.client, &mut machine);
+                    evidence = seed_with_diagnostics(
+                        &session.client,
+                        &mut machine,
+                        &mut session.diagnostics,
+                    );
                     next_seed_attempt = Instant::now() + SEED_RETRY;
                 }
-                SseMessage::Disconnected => {
+                SseMessage::Disconnected(reason) => {
                     sse_connected = false;
                     evidence = false;
+                    session.diagnostics.publish(
+                        DiagnosticStage::Sse,
+                        reason,
+                        DiagnosticSource::EventStream,
+                    );
                     // Everything from here until a successful reseed happened unobserved: the
                     // next observation must open a fresh transition even if it restates the
                     // pre-outage tuple.
@@ -252,7 +339,19 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                         session.delivery.saw_session(sid);
                     }
                     machine.apply(&value);
+                    if let Some(context) = session.context.as_mut() {
+                        fresh_reading |= context.apply(&value);
+                    }
                 }
+            }
+        }
+        // The numeric axis is independent of the categorical one (HC-R07): it is not gated on
+        // `evidence`, not reset by a reconnect, and not interrupted by a poisoned projection. A
+        // token count stays true while its record ages, and the reader returns it with that age.
+        if let Some(context) = session.context.as_mut() {
+            context.refresh_windows(&context_client, api_ok);
+            if fresh_reading {
+                context.publish();
             }
         }
         if machine.poisoned && machine.ended.is_none() && evidence {
@@ -261,10 +360,18 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             evidence = false;
             session.writer.interrupt();
             next_seed_attempt = Instant::now();
+            session.diagnostics.publish(
+                DiagnosticStage::Sse,
+                DiagnosticReason::UnknownEvent,
+                DiagnosticSource::EventStream,
+            );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_from_server(&session.client, &mut machine);
-            next_seed_attempt = Instant::now() + SEED_RETRY;
+            evidence = seed_with_diagnostics(
+                &session.client,
+                &mut machine,
+                &mut session.diagnostics,
+            );
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -285,7 +392,9 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         }
         if inbox_due {
             if session.version_ok && api_ok {
-                session.delivery.pump(&session.client);
+                session
+                    .delivery
+                    .pump_diagnosed(&session.client, &mut session.diagnostics);
             }
             next_inbox = Instant::now() + INBOX_REFRESH_FALLBACK;
         }
@@ -371,6 +480,14 @@ fn supported_version(binary: &str) -> Result<String> {
         .to_string();
     anyhow::ensure!(!version.is_empty(), "{binary} --version printed nothing");
     Ok(version)
+}
+
+/// Whether a reported opencode version is inside a verified MINOR. This is the whole admission
+/// decision, named so a test can exercise the same code the wrapper runs rather than re-deriving
+/// it — an assertion that re-implements the rule cannot notice the rule changing.
+fn version_is_supported(version: &str) -> bool {
+    harness_version::find_release(version, "opencode")
+        .is_some_and(|(_, release)| SUPPORTED_OPENCODE_MINORS.contains(&release.series()))
 }
 
 /// Verify the served OpenAPI document still carries every arm st2 consumes. Substring markers are
@@ -542,7 +659,7 @@ fn base64(bytes: &[u8]) -> String {
 enum SseMessage {
     Connected,
     Event(Value),
-    Disconnected,
+    Disconnected(DiagnosticReason),
 }
 
 fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc<AtomicBool>) {
@@ -573,12 +690,18 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
                             data.clear();
                         }
                     }
-                    if tx.send(SseMessage::Disconnected).is_err() {
+                    if tx
+                        .send(SseMessage::Disconnected(DiagnosticReason::SseDisconnected))
+                        .is_err()
+                    {
                         return;
                     }
                 }
                 Err(_) => {
-                    if tx.send(SseMessage::Disconnected).is_err() {
+                    if tx
+                        .send(SseMessage::Disconnected(DiagnosticReason::SseConnectFailed))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -591,7 +714,12 @@ fn spawn_sse_reader(client: Client, tx: Sender<SseMessage>, stop: std::sync::Arc
 /// Re-seed observed state from the level surface after (re)connecting: events missed while
 /// disconnected are unrecoverable, and `/session/status` omits idle sessions, so an empty map over
 /// a live server is itself the idle proof.
-fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
+type SeedFailure = (DiagnosticReason, DiagnosticSource);
+
+fn seed_from_server(
+    client: &Client,
+    machine: &mut EventMachine,
+) -> std::result::Result<(), SeedFailure> {
     // The seed is built in a FRESH machine and swapped in only once every read validates:
     // mutating the live one would leave half-seeded asks behind a mid-seed failure, and a
     // successful re-seed must also CLEAR stale busy/blocked entries whose exits passed while
@@ -599,61 +727,86 @@ fn seed_from_server(client: &Client, machine: &mut EventMachine) -> bool {
     // that raced the seed re-arrives or is re-listed on the next reconnect. Delivery targeting
     // deliberately learns nothing here: status-map iteration order is not recency (W8-5); the
     // pending-work recovery path resolves targets from the session listing instead.
-    let Ok(statuses) = client.get_json("/session/status") else {
-        return false;
-    };
+    let statuses = client.get_json("/session/status").map_err(|_| {
+        (
+            DiagnosticReason::StatusUnavailable,
+            DiagnosticSource::StatusSnapshot,
+        )
+    })?;
     // A response that is not the documented object shape proves nothing: seeding definite idle
     // from a null or an array would fabricate level evidence out of a shape this version cannot
     // read. Fail the seed and retry.
-    let Some(map) = statuses.as_object() else {
-        return false;
-    };
+    let map = statuses.as_object().ok_or((
+        DiagnosticReason::MalformedStatus,
+        DiagnosticSource::StatusSnapshot,
+    ))?;
     let mut seeded = EventMachine::default();
     seeded.seed_idle();
-    {
-        for (session_id, status) in map {
-            // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is
-            // surface drift the /doc gate vocabulary did not cover, and evidence restored over
-            // words we cannot read would be fabricated. Fail the seed and retry instead.
-            match status.get("type").and_then(Value::as_str) {
-                Some("idle") => {}
-                Some("busy") => seeded.seed_busy(session_id.clone(), false),
-                Some("retry") => seeded.seed_busy(session_id.clone(), true),
-                _ => return false,
+    for (session_id, status) in map {
+        // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is surface
+        // drift the /doc gate vocabulary did not cover.
+        match status.get("type").and_then(Value::as_str) {
+            Some("idle") => {}
+            Some("busy") => seeded.seed_busy(session_id.clone(), false),
+            Some("retry") => seeded.seed_busy(session_id.clone(), true),
+            _ => {
+                return Err((
+                    DiagnosticReason::UnknownStatus,
+                    DiagnosticSource::StatusSnapshot,
+                ));
             }
         }
     }
-    // An ask opened before this connection would otherwise be invisible until its exit event:
-    // re-seed pending asks so blockedOn survives an SSE reconnect, with each id kept so the
-    // ordinary id-matched exit still releases it. Both listing endpoints are measured on 1.18.19
-    // (the committed capture drove them: `GET /permission` and `GET /question` return pending
-    // ids), so a question open across a reconnect is recovered exactly like a permission.
-    // Both listings must succeed for the seed to count: a transient failure here would restore
-    // evidence on an unblocked picture and silently wedge an ask opened during the outage —
-    // return false instead, keep heartbeats off, and let the seed retry.
-    for (endpoint, kind) in [("/permission", "permission"), ("/question", "question")] {
-        let Ok(pending) = client.get_json(endpoint) else {
-            return false;
-        };
-        let Some(items) = pending.as_array() else {
-            return false;
-        };
+    // Both pending-ask listings must succeed for the seed to count: a transient failure must not
+    // restore evidence on an unblocked picture and silently wedge an ask opened during the outage.
+    for (endpoint, kind, unavailable, malformed, source) in [
+        (
+            "/permission",
+            "permission",
+            DiagnosticReason::PermissionUnavailable,
+            DiagnosticReason::MalformedPermissions,
+            DiagnosticSource::PermissionSnapshot,
+        ),
+        (
+            "/question",
+            "question",
+            DiagnosticReason::QuestionUnavailable,
+            DiagnosticReason::MalformedQuestions,
+            DiagnosticSource::QuestionSnapshot,
+        ),
+    ] {
+        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
-            // An entry whose id this version cannot read is a pending ask that could never be
-            // released by its id-matched exit: seeding around it would restore evidence on a
-            // picture that silently drops a human block. Fail the seed and retry.
-            let Some(id) = item
+            // An unreadable id could never be released by its id-matched exit.
+            let id = item
                 .get("id")
                 .or_else(|| item.get("requestID"))
                 .and_then(Value::as_str)
-            else {
-                return false;
-            };
+                .ok_or((DiagnosticReason::MissingAskId, source))?;
             seeded.seed_ask(id.to_string(), kind);
         }
     }
     *machine = seeded;
-    true
+    Ok(())
+}
+
+fn seed_with_diagnostics(
+    client: &Client,
+    machine: &mut EventMachine,
+    diagnostics: &mut DiagnosticPublisher,
+) -> bool {
+    match seed_from_server(client, machine) {
+        Ok(()) => {
+            diagnostics.clear(DiagnosticStage::Seed);
+            diagnostics.clear(DiagnosticStage::Sse);
+            true
+        }
+        Err((reason, source)) => {
+            diagnostics.publish(DiagnosticStage::Seed, reason, source);
+            false
+        }
+    }
 }
 
 // ---- event projection ------------------------------------------------------------------------
@@ -871,8 +1024,287 @@ fn event_session_id(event: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+// ---- harness context (HC-R02, HC-R11, HC-R12) --------------------------------------------------
+
+/// How long a fruitless `GET /config/providers` waits before another attempt. Without a backoff a
+/// model the providers document does not name would re-pull the whole document once per
+/// [`PROVIDER_POLL`] for the life of the session.
+const PROVIDERS_RETRY: Duration = Duration::from_secs(60);
+/// How long a providers document that ANSWERED but does not name the model waits. A custom or
+/// local provider can be absent from the config surface for the life of the session, and re-pulling
+/// the whole document every minute for it would be the same busy loop one step slower. A model
+/// change resets the clock and asks again at once, so nothing is lost by waiting; the horizon
+/// matches the API gate's own terminal arm.
+const PROVIDERS_UNLISTED_RETRY: Duration = Duration::from_secs(3600);
+
+/// The numeric axis for an OpenCode seat (HC-R02, HC-R11): the one producer whose numerator is
+/// pushed and whose denominator has to be pulled.
+///
+/// - **Numerator**: `tokens.total` of the last **non-summary assistant** `message.updated`. Two
+///   measured traps live here. `summary` is overloaded — on user messages it is an object
+///   (`{diffs: []}`) and therefore truthy — so the filter reads it as a boolean and requires the
+///   assistant role. And the compaction summarizer's own message is an assistant message whose
+///   `tokens.total` is the cost of the summarization call (1,511 measured), not the size of the
+///   new context; taking it would report a freshly compacted window as nearly empty.
+/// - **Denominator**: `providers[].models[<modelID>].limit.context` from `GET /config/providers`,
+///   pulled on demand and cached per `providerID/modelID`. While it is unknown both the window and
+///   the percent are withheld (HC-R02), never guessed from a model table.
+/// - **`usedPercent`**: st2's own division, unrounded and unclamped — OpenCode displays no
+///   percentage of its own, so there is no harness number to carry. Rounding would put the written
+///   value in a different 1% bucket than the truth and make
+///   [`harness_context::HARNESS_CONTEXT_WARN_PERCENT`] fire below the threshold it names.
+/// - **`sessionTotalTokens`**: the sum of `session.info.tokens`, which carries no `total` key and
+///   is cumulative over the session's lifetime. It grows without bound and is never the numerator
+///   of the percent — the field's name is that guard.
+///
+/// The state lives here rather than on [`EventMachine`], which is rebuilt from scratch on every SSE
+/// reconnect: a window cache and a numerator hung off it would be discarded by a blip. A reconnect
+/// deliberately does not disturb this producer — a token count stays true while its record ages,
+/// which is the whole of HC-R06.
+///
+/// Which session's reading this is, when one server holds several, is `DQ-C10`: v1 is
+/// last-writer-wins over every session on the stream, matching the categorical producer's
+/// aggregate rather than inventing a seat-session rule the open question exists to defer.
+struct ContextProducer {
+    writer: harness_context::Writer,
+    /// `providerID/modelID` → `limit.context`.
+    windows: BTreeMap<String, u64>,
+    /// The model that produced the current numerator, in OpenCode's own `providerID/modelID`
+    /// spelling — `modelID` alone is ambiguous across providers, and this is the key the window is
+    /// looked up under, so the record always pairs a numerator with its own denominator.
+    model: Option<String>,
+    /// The session's configured model, which can change before any assistant message proves it.
+    /// It only warms the window cache; it never becomes the reading's model.
+    configured_model: Option<String>,
+    used_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    session_total_tokens: Option<u64>,
+    next_providers_attempt: Instant,
+}
+
+impl ContextProducer {
+    fn new(agent_dir: &Path, identity: &str, session: &str) -> Result<Self> {
+        Ok(Self {
+            writer: harness_context::Writer::new(
+                agent_dir,
+                identity,
+                harness_context::Harness::OpenCode,
+            )?
+            .with_session(session),
+            windows: BTreeMap::new(),
+            model: None,
+            configured_model: None,
+            used_tokens: None,
+            cost_usd: None,
+            session_total_tokens: None,
+            next_providers_attempt: Instant::now(),
+        })
+    }
+
+    /// Fold one SSE frame in, returning whether it carried a fresh occupancy numerator.
+    ///
+    /// A compaction edge writes immediately: it is rare, it always lands, and it deliberately
+    /// carries no reading — the numbers already on the record predate the compaction, and
+    /// re-stamping them would hide that. Nothing zeroes the numerator on the edge either
+    /// (HC-R03); the next turn's `message.updated` replaces it with an observation.
+    fn apply(&mut self, event: &Value) -> bool {
+        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        let properties = event.get("properties").unwrap_or(&Value::Null);
+        let info = || properties.get("info").unwrap_or(&Value::Null);
+        match kind {
+            "message.updated" => self.apply_message(info()),
+            "session.updated" => {
+                self.apply_session(info());
+                false
+            }
+            // `{sessionID}` and nothing else — no reason, no timestamp, no before/after sizes — so
+            // the trigger is `unknown` and the count is st2's, scoped to this incarnation. The
+            // richer v2 `session.next.compaction.*` events do carry a reason, but did not fire once
+            // on the measured legacy path; nothing here depends on them.
+            "session.compacted" => {
+                if let Err(error) = self.writer.compacted(harness_context::Compaction::new(
+                    harness_context::CompactionTrigger::Unknown,
+                )) {
+                    tracing::warn!(
+                        "st2 opencode-session: recording a compaction failed: {error:#}"
+                    );
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_message(&mut self, info: &Value) -> bool {
+        if info.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        // `summary` is a BOOLEAN on assistant messages and an object on user messages; `as_bool`
+        // reads only the former, so `{diffs: []}` can never be mistaken for a compaction summary.
+        if info.get("summary").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        // The key's PRESENCE is the proof, not its value: the first `message.updated` of a message
+        // carries all-zero token fields and no `total` at all, and reading a missing key as zero
+        // would publish an empty window at the start of every turn.
+        let Some(total) = info.pointer("/tokens/total").and_then(Value::as_u64) else {
+            return false;
+        };
+        let (Some(provider), Some(model)) = (
+            info.get("providerID").and_then(Value::as_str),
+            info.get("modelID").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        self.used_tokens = Some(total);
+        self.model = Some(model_key(provider, model));
+        true
+    }
+
+    /// The adjacent facts (HC-R16). None of them is a reading: this frame never publishes, and its
+    /// values ride out on the next numerator instead. Publishing here would stamp `observedAtMs` on
+    /// a numerator that may be hours old — the one thing [`harness_context::Writer::observe`]
+    /// forbids its callers.
+    fn apply_session(&mut self, info: &Value) {
+        if let Some(cost) = info.get("cost").and_then(Value::as_f64) {
+            self.cost_usd = Some(cost);
+        }
+        if let Some(tokens) = info.get("tokens")
+            && let Some(total) = cumulative_tokens(tokens)
+        {
+            self.session_total_tokens = Some(total);
+        }
+        if let (Some(provider), Some(model)) = (
+            info.pointer("/model/providerID").and_then(Value::as_str),
+            info.pointer("/model/id").and_then(Value::as_str),
+        ) {
+            let key = model_key(provider, model);
+            if self.configured_model.as_deref() != Some(key.as_str()) {
+                // A model change re-opens the denominator question before any assistant message
+                // proves the new model, so the cache is warmed now rather than the percent being
+                // withheld for a whole turn.
+                self.configured_model = Some(key);
+                self.next_providers_attempt = Instant::now();
+            }
+        }
+    }
+
+    /// A model whose window is not cached yet, if any.
+    fn window_wanted(&self) -> Option<&str> {
+        [self.model.as_deref(), self.configured_model.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|key| !self.windows.contains_key(*key))
+    }
+
+    /// Pull the denominator when a window this producer needs is missing, at most once per
+    /// [`PROVIDERS_RETRY`]. The only HTTP this producer does.
+    fn refresh_windows(&mut self, client: &Client, api_ok: bool) {
+        if !api_ok || self.window_wanted().is_none() {
+            return;
+        }
+        if Instant::now() < self.next_providers_attempt {
+            return;
+        }
+        self.next_providers_attempt = Instant::now() + PROVIDERS_RETRY;
+        match client.get_json("/config/providers") {
+            Ok(doc) => {
+                self.ingest_providers(&doc);
+                if self.window_wanted().is_some() {
+                    self.next_providers_attempt = Instant::now() + PROVIDERS_UNLISTED_RETRY;
+                }
+            }
+            Err(error) => {
+                tracing::warn!("st2 opencode-session: reading model windows failed: {error:#}");
+            }
+        }
+    }
+
+    /// The pure half of that pull, so the join is provable from a captured document.
+    fn ingest_providers(&mut self, doc: &Value) {
+        let Some(providers) = doc.get("providers").and_then(Value::as_array) else {
+            return;
+        };
+        for provider in providers {
+            let Some(provider_id) = provider.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(models) = provider.get("models").and_then(Value::as_object) else {
+                continue;
+            };
+            for (model_id, model) in models {
+                if let Some(context) = model.pointer("/limit/context").and_then(Value::as_u64) {
+                    self.windows
+                        .insert(model_key(provider_id, model_id), context);
+                }
+            }
+        }
+    }
+
+    fn reading(&self) -> harness_context::Reading {
+        let window = self
+            .model
+            .as_deref()
+            .and_then(|key| self.windows.get(key))
+            .copied();
+        harness_context::Reading {
+            used_tokens: self.used_tokens,
+            window_tokens: window,
+            used_percent: match (self.used_tokens, window) {
+                (Some(used), Some(window)) if window > 0 => {
+                    Some(used as f64 / window as f64 * 100.0)
+                }
+                _ => None,
+            },
+            model: self.model.clone(),
+            cost_usd: self.cost_usd,
+            session_total_tokens: self.session_total_tokens,
+            rate_limits: harness_context::RateLimits::default(),
+        }
+    }
+
+    /// Publish the current reading, returning whether a write landed — the core's quantization is
+    /// what bounds a stream this chatty to one write per 1% of the window.
+    ///
+    /// Called only where a fresh numerator just arrived. This producer's numerator is pushed and
+    /// not pullable, so it never holds a reading to heartbeat with: a quiet seat's record ages
+    /// visibly instead, and a reader gets the numbers it has with their age (HC-R06) — which stay
+    /// true, because a window taking no turn does not fill.
+    fn publish(&mut self) -> bool {
+        match self.writer.observe(self.reading()) {
+            Ok(landed) => landed,
+            Err(error) => {
+                tracing::warn!(
+                    "st2 opencode-session: writing the context record failed: {error:#}"
+                );
+                false
+            }
+        }
+    }
+}
+
+/// OpenCode's own spelling for a model, and the key a window is cached under.
+fn model_key(provider_id: &str, model_id: &str) -> String {
+    format!("{provider_id}/{model_id}")
+}
+
+/// The cumulative session total: `session.info.tokens` carries no `total` key, so the producer sums
+/// the leaves it does carry. Never occupancy — across the measured two-turn run this reached 16,400
+/// while occupancy stayed at 8,200.
+fn cumulative_tokens(tokens: &Value) -> Option<u64> {
+    let leaf = |pointer: &str| tokens.pointer(pointer).and_then(Value::as_u64);
+    let mut total = leaf("/input")?;
+    for pointer in ["/output", "/reasoning", "/cache/read", "/cache/write"] {
+        total = total.saturating_add(leaf(pointer).unwrap_or(0));
+    }
+    Some(total)
+}
+
 // ---- native delivery -------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 enum ReadBack {
     Durable,
     Absent,
@@ -970,13 +1402,30 @@ impl Delivery {
         self.target_session = Some(session_id.to_string());
     }
 
+    #[cfg(test)]
     fn pump(&mut self, client: &Client) {
-        if let Err(error) = self.pump_inner(client) {
-            eprintln!("st2 opencode-session: delivery: {error:#}");
+        self.pump_with_diagnostics(client, None);
+    }
+
+    fn pump_diagnosed(&mut self, client: &Client, diagnostics: &mut DiagnosticPublisher) {
+        self.pump_with_diagnostics(client, Some(diagnostics));
+    }
+
+    fn pump_with_diagnostics(
+        &mut self,
+        client: &Client,
+        diagnostics: Option<&mut DiagnosticPublisher>,
+    ) {
+        if let Err(error) = self.pump_inner(client, diagnostics) {
+            tracing::warn!("st2 opencode-session: delivery: {error:#}");
         }
     }
 
-    fn pump_inner(&mut self, client: &Client) -> Result<()> {
+    fn pump_inner(
+        &mut self,
+        client: &Client,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
         let unread = message::list_inbox(&self.inbox)?;
         if let Some(state) = self.state.as_ref()
             && unread
@@ -989,6 +1438,10 @@ impl Delivery {
             return Ok(());
         }
         let Some(head) = unread.into_iter().next() else {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.clear(DiagnosticStage::Delivery);
+                diagnostics.clear(DiagnosticStage::ReadBack);
+            }
             return Ok(());
         };
         let target = match self.target_session.clone() {
@@ -1017,8 +1470,16 @@ impl Delivery {
                 return Ok(()); // The bound message is behind the head; archive precedence resolves it.
             }
             match state.phase {
-                DeliveryPhase::Accepted => return Ok(()),
-                DeliveryPhase::Attempted => return self.reconcile_or_retry(client, state),
+                DeliveryPhase::Accepted => {
+                    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                        diagnostics.clear(DiagnosticStage::Delivery);
+                        diagnostics.clear(DiagnosticStage::ReadBack);
+                    }
+                    return Ok(());
+                }
+                DeliveryPhase::Attempted => {
+                    return self.reconcile_or_retry(client, state, diagnostics);
+                }
             }
         }
 
@@ -1034,11 +1495,18 @@ impl Delivery {
         };
         self.write_state(state.clone())?;
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text)
+        self.send(client, &state, &text, diagnostics)
     }
 
-    fn reconcile_or_retry(&mut self, client: &Client, state: DeliveryState) -> Result<()> {
-        match self.read_back(client, &state) {
+    fn reconcile_or_retry(
+        &mut self,
+        client: &Client,
+        state: DeliveryState,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
+        let read_back = self.read_back(client, &state);
+        report_read_back(read_back, &mut diagnostics);
+        match read_back {
             ReadBack::Durable => {
                 let mut accepted = state;
                 accepted.phase = DeliveryPhase::Accepted;
@@ -1061,22 +1529,51 @@ impl Delivery {
             return Ok(());
         };
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text)
+        self.send(client, &state, &text, diagnostics)
     }
 
-    fn send(&mut self, client: &Client, state: &DeliveryState, text: &str) -> Result<()> {
+    fn send(
+        &mut self,
+        client: &Client,
+        state: &DeliveryState,
+        text: &str,
+        mut diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
             "messageID": state.message_id,
             "parts": [{ "type": "text", "text": text }],
         });
         let path = format!("/session/{}/prompt_async", state.session_id);
-        let status = client.post_json(&path, &payload)?;
-        anyhow::ensure!(
-            (200..300).contains(&status),
-            "POST {path} returned {status}"
-        );
-        if matches!(self.read_back(client, state), ReadBack::Durable) {
+        let status = match client.post_json(&path, &payload) {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.publish(
+                        DiagnosticStage::Delivery,
+                        DiagnosticReason::DeliveryUnavailable,
+                        DiagnosticSource::PromptTransport,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if !(200..300).contains(&status) {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.publish(
+                    DiagnosticStage::Delivery,
+                    DiagnosticReason::DeliveryRejected,
+                    DiagnosticSource::PromptTransport,
+                );
+            }
+            anyhow::bail!("POST {path} returned {status}");
+        }
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.clear(DiagnosticStage::Delivery);
+        }
+        let read_back = self.read_back(client, state);
+        report_read_back(read_back, &mut diagnostics);
+        if matches!(read_back, ReadBack::Durable) {
             let mut accepted = state.clone();
             accepted.phase = DeliveryPhase::Accepted;
             self.write_state(accepted)?;
@@ -1109,6 +1606,31 @@ impl Delivery {
         }
         self.state = None;
         Ok(())
+    }
+}
+
+fn report_read_back(
+    read_back: ReadBack,
+    diagnostics: &mut Option<&mut DiagnosticPublisher>,
+) {
+    let Some(diagnostics) = diagnostics.as_deref_mut() else {
+        return;
+    };
+    match read_back {
+        ReadBack::Durable => {
+            diagnostics.clear(DiagnosticStage::ReadBack);
+            diagnostics.clear(DiagnosticStage::Delivery);
+        }
+        ReadBack::Absent => diagnostics.publish(
+            DiagnosticStage::ReadBack,
+            DiagnosticReason::NotDurable,
+            DiagnosticSource::MessageReadBack,
+        ),
+        ReadBack::Indeterminate => diagnostics.publish(
+            DiagnosticStage::ReadBack,
+            DiagnosticReason::ReadBackUnavailable,
+            DiagnosticSource::MessageReadBack,
+        ),
     }
 }
 
@@ -1168,6 +1690,37 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins the admitted set itself: widening opencode has to be a deliberate edit here, beside
+    /// the verification the minor was admitted on.
+    #[test]
+    fn admitted_opencode_minors_are_exactly_the_measured_set() {
+        assert_eq!(SUPPORTED_OPENCODE_MINORS, [(1, 18)]);
+    }
+
+    /// The principal's actual case: the profile ships 1.18.25 against a list built at 1.18.19.
+    /// A patch inside the verified minor must keep native delivery rather than degrade to none.
+    #[test]
+    fn a_patch_inside_an_admitted_opencode_minor_keeps_native_delivery() {
+        for version in ["1.18.19", "1.18.25"] {
+            assert!(
+                version_is_supported(version),
+                "{version} is inside verified minor 1.18"
+            );
+        }
+    }
+
+    /// Fail closed the other way: a different minor, a neighbouring minor sharing a prefix, and
+    /// unparseable output must all leave native delivery disabled.
+    #[test]
+    fn other_minors_and_garbled_versions_stay_unverified() {
+        for version in ["1.19.0", "1.180.0", "2.18.0", "1.18", "not-a-version", ""] {
+            assert!(
+                !version_is_supported(version),
+                "{version} must not be treated as verified"
+            );
+        }
+    }
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
@@ -1494,6 +2047,8 @@ mod tests {
                     }
                 } else if method == "GET" && path == "/session" {
                     200
+                } else if method == "GET" && path == "/config/providers" {
+                    200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
                         500
@@ -1517,6 +2072,8 @@ mod tests {
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
+                } else if method == "GET" && path == "/config/providers" {
+                    OC_PROVIDERS.to_string()
                 } else if method == "GET" && path == "/session/status" {
                     if let Some(body) = status_body_t.lock().unwrap().clone() {
                         body
@@ -1604,6 +2161,72 @@ mod tests {
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn delivery_and_read_back_boundaries_publish_and_clear_diagnostics_without_changing_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            Some("1.18.19".to_string()),
+            DiagnosticSupport::Supported,
+        );
+
+        server.accept_posts.store(false, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        let crate::driver_diagnostic::Observed::Failure(failure) =
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir))
+        else {
+            panic!("rejected prompt must be diagnosed")
+        };
+        assert_eq!(failure.stage, DiagnosticStage::Delivery);
+        assert_eq!(failure.reason, DiagnosticReason::DeliveryRejected);
+
+        server.accept_posts.store(true, Ordering::SeqCst);
+        delivery.next_attempt = Instant::now();
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        assert_eq!(
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir)),
+            crate::driver_diagnostic::Observed::Absent,
+            "successful retry and durable read-back clear both boundaries"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            Some("1.18.19".to_string()),
+            DiagnosticSupport::Supported,
+        );
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        let crate::driver_diagnostic::Observed::Failure(failure) =
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir))
+        else {
+            panic!("indeterminate read-back must be diagnosed")
+        };
+        assert_eq!(failure.stage, DiagnosticStage::ReadBack);
+        assert_eq!(failure.reason, DiagnosticReason::ReadBackUnavailable);
+
+        server.read_back_error.store(false, Ordering::SeqCst);
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+        assert_eq!(
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir)),
+            crate::driver_diagnostic::Observed::Absent,
+            "read-back recovery clears without a second POST"
+        );
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
     /// An ask opened before the SSE connection must survive the reconnect seed with its id, so
     /// the ordinary id-matched exit still releases it.
     #[test]
@@ -1614,14 +2237,14 @@ mod tests {
         // A transiently failing level seed yields no evidence at all.
         server.status_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         server.status_error.store(false, Ordering::SeqCst);
 
         // So does a failing pending-ask listing: an ask opened during the outage must not be
         // reported unblocked with heartbeats restored — the seed retries instead.
         server.ask_error.store(true, Ordering::SeqCst);
         let mut machine = EventMachine::default();
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         server.ask_error.store(false, Ordering::SeqCst);
 
         // A successful seed recovers the pending ask under its own id.
@@ -1632,7 +2255,7 @@ mod tests {
             .unwrap()
             .push("per_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let blocked = observed(&machine);
         assert_eq!(blocked.state, Activity::Active);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
@@ -1654,7 +2277,7 @@ mod tests {
             .unwrap()
             .push("que_pending".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let blocked = observed(&machine);
         assert_eq!(blocked.blocked_on, BlockedOn::Human);
         assert_eq!(blocked.ask, Ask::Question);
@@ -1861,7 +2484,7 @@ mod tests {
         server.ask_error.store(true, Ordering::SeqCst);
         // ask_error fails BOTH listings; simulate the split by failing only after /permission:
         // the atomicity claim is the same — nothing of the attempt lands.
-        assert!(!seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_err());
         let snapshot = observed(&machine);
         assert_eq!(
             snapshot.blocked_on,
@@ -1872,7 +2495,7 @@ mod tests {
 
         // A successful re-seed states the whole level truth: the settled session and the
         // resolved ask disappear, the listed pending ask remains.
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         let snapshot = observed(&machine);
         assert_eq!(snapshot.blocked_on, BlockedOn::Human);
         machine.apply(&event(
@@ -1945,7 +2568,7 @@ mod tests {
         *server.ask_body.lock().unwrap() = Some(r#"[{"id":"per_ok"},{"token":42}]"#.to_string());
         let mut machine = EventMachine::default();
         assert!(
-            !seed_from_server(&client, &mut machine),
+            seed_from_server(&client, &mut machine).is_err(),
             "an entry without a readable id must fail the seed, not be skipped"
         );
 
@@ -1956,7 +2579,7 @@ mod tests {
             .unwrap()
             .push("per_ok".to_string());
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
         assert_eq!(observed(&machine).blocked_on, BlockedOn::Human);
     }
 
@@ -1972,7 +2595,7 @@ mod tests {
             *server.status_body.lock().unwrap() = Some(shape.to_string());
             let mut machine = EventMachine::default();
             assert!(
-                !seed_from_server(&client, &mut machine),
+                seed_from_server(&client, &mut machine).is_err(),
                 "shape {shape} must fail the seed"
             );
             assert_eq!(
@@ -1983,7 +2606,7 @@ mod tests {
         }
         *server.status_body.lock().unwrap() = None;
         let mut machine = EventMachine::default();
-        assert!(seed_from_server(&client, &mut machine));
+        assert!(seed_from_server(&client, &mut machine).is_ok());
     }
 
     /// n8: a server that accepts the stream and then goes silent must surface as a disconnect
@@ -2010,7 +2633,7 @@ mod tests {
         let mut saw_disconnect = false;
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(SseMessage::Disconnected) => {
+                Ok(SseMessage::Disconnected(_)) => {
                     saw_disconnect = true;
                     break;
                 }
@@ -2020,5 +2643,327 @@ mod tests {
         }
         stop.store(true, Ordering::SeqCst);
         assert!(saw_disconnect, "silence must surface as a disconnect");
+    }
+
+    // ---- harness context: frames captured verbatim from OpenCode 1.18.25 (HC-R13) -------------
+    //
+    // Every constant below is one `data:` payload of the credential-free lab run recorded in
+    // `docs/vrs/08-harness-context/spec.md` §opencode, unedited. The version the frames were
+    // captured against is asserted from the frames themselves — `session.updated` carries
+    // `info.version` — so a bump that changes the numerator, the denominator, or the shape of the
+    // join fails here rather than silently publishing a differently-meaning number.
+
+    /// Turn 1's FIRST `message.updated` for the assistant message: all-zero token fields and **no**
+    /// `total` key at all.
+    const OC_TURN_1_OPENING: &str = r#"{"id":"evt_04cfa35b9001JZ9d0L9djTMOAJ","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfa35b9001v0KGCf03ofZ2UX","parentID":"msg0000000000000000000000001","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997861305},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM"}}}"#;
+    /// Turn 1's FINAL `message.updated`, the one carrying `tokens.total`. Emitted twice with
+    /// identical content, which is why the second is fed to the producer in the same test.
+    const OC_TURN_1_FINAL: &str = r#"{"id":"evt_04cfa4404001t29p1VUcmmPoRG","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfa35b9001v0KGCf03ofZ2UX","parentID":"msg0000000000000000000000001","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":8200,"input":6455,"output":4,"reasoning":13,"cache":{"write":0,"read":1728}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997861305,"completed":1787997864970},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","finish":"stop"}}}"#;
+    /// The `session.updated` that follows turn 1: cumulative `info.tokens`, no `total` key.
+    const OC_TURN_1_SESSION: &str = r#"{"id":"evt_04cfa4415001vEbJR0Dd0RfwXA","type":"session.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"ses_fb305cb62ffeA6a053WBLMBcRM","slug":"tidy-falcon","projectID":"global","directory":"/tmp/oclab/work","path":"tmp/oclab/work","title":"New session - 2026-08-29T10:04:21.022Z","agent":"build","model":{"id":"hy3-free","providerID":"opencode","variant":"default"},"version":"1.18.25","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":6455,"output":4,"reasoning":13,"cache":{"read":1728,"write":0}},"time":{"created":1787997861022,"updated":1787997864980}}}}"#;
+    /// Turn 2's final `message.updated`: a different message, the SAME occupancy (8,200) — the
+    /// window did not grow because the earlier turn moved into the cache.
+    const OC_TURN_2_FINAL: &str = r#"{"id":"evt_04cfb088c001CyXonjcqRdxBfA","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfb00ba001bh7MmStxmbJ0J3","parentID":"msg0000000000000000000000002","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":8200,"input":133,"output":3,"reasoning":0,"cache":{"write":0,"read":8064}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997913274,"completed":1787997915280},"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","finish":"stop"}}}"#;
+    /// The `session.updated` after turn 2: the cumulative total has doubled while occupancy has
+    /// not moved. 6588 + 7 + 13 + 9792 = 16,400 = 2 × 8,200.
+    const OC_TURN_2_SESSION: &str = r#"{"id":"evt_04cfb089b0013nTIMhUVKqyBW6","type":"session.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"ses_fb305cb62ffeA6a053WBLMBcRM","slug":"tidy-falcon","projectID":"global","directory":"/tmp/oclab/work","path":"tmp/oclab/work","title":"Request to say pineapple","agent":"build","model":{"id":"hy3-free","providerID":"opencode","variant":"default"},"version":"1.18.25","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":6588,"output":7,"reasoning":13,"cache":{"read":9792,"write":0}},"time":{"created":1787997861022,"updated":1787997915290}}}}"#;
+    /// A USER message whose `summary` is an OBJECT — truthy, and not a compaction summary.
+    const OC_USER_SUMMARY_OBJECT: &str = r#"{"id":"evt_04cfa360b001CDm6cFnqfAt7cc","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"role":"user","time":{"created":1787997861241},"agent":"build","model":{"providerID":"opencode","modelID":"hy3-free"},"id":"msg0000000000000000000000001","sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","summary":{"diffs":[]}}}}"#;
+    /// The compaction summarizer's own assistant message: `summary: true`, and a `tokens.total` of
+    /// 1,511 that is the cost of the summarization call, not the size of the new context.
+    const OC_SUMMARIZER_MESSAGE: &str = r#"{"id":"evt_04cfc5814001Vn5oChuQ2RQooq","type":"message.updated","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","info":{"id":"msg_04cfc2fce0012p4wkSC7k1IXrQ","role":"assistant","parentID":"msg_04cfc2fc00017s1bHmHcf4uNkQ","sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM","mode":"compaction","agent":"compaction","summary":true,"path":{"cwd":"/tmp/oclab/work","root":"/"},"cost":0,"tokens":{"total":1511,"input":387,"output":103,"reasoning":957,"cache":{"write":0,"read":64}},"modelID":"hy3-free","providerID":"opencode","time":{"created":1787997990862,"completed":1787998001175},"finish":"stop"}}}"#;
+    /// The whole compaction edge: a session id and nothing else.
+    const OC_SESSION_COMPACTED: &str = r#"{"id":"evt_04cfc5818001PhY4Ho4tMNhoNz","type":"session.compacted","properties":{"sessionID":"ses_fb305cb62ffeA6a053WBLMBcRM"}}"#;
+    /// `GET /config/providers`, verbatim in envelope and in the two model entries kept, which are
+    /// the join's whole surface: `providers[].models[<modelID>].limit.context`.
+    const OC_PROVIDERS: &str = r#"{"providers":[{"id":"opencode","name":"OpenCode Zen","source":"custom","env":["OPENCODE_API_KEY"],"options":{"apiKey":"public"},"models":{"nemotron-3-ultra-free":{"id":"nemotron-3-ultra-free","providerID":"opencode","api":{"id":"nemotron-3-ultra-free","url":"https://opencode.ai/zen/v1","npm":"@ai-sdk/openai-compatible"},"name":"Nemotron 3 Ultra Free","family":"nemotron-free","cost":{"input":0,"output":0,"cache":{"read":0,"write":0}},"limit":{"context":1000000,"output":128000},"status":"active","options":{},"headers":{},"release_date":"2026-06-04","variants":{}},"hy3-free":{"id":"hy3-free","providerID":"opencode","api":{"id":"hy3-free","url":"https://opencode.ai/zen/v1","npm":"@ai-sdk/openai-compatible"},"name":"Hy3 Free","family":"hy3-free","cost":{"input":0,"output":0,"cache":{"read":0,"write":0}},"limit":{"context":190000,"output":64000},"status":"active","options":{},"headers":{},"release_date":"2026-07-06","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}}}],"default":{"opencode":"big-pickle"}}"#;
+
+    /// The window `hy3-free` published, and the occupancy every measured turn settled at.
+    const OC_WINDOW: u64 = 190_000;
+    const OC_OCCUPANCY: u64 = 8_200;
+
+    struct ContextFixture {
+        _tmp: tempfile::TempDir,
+        agent_dir: PathBuf,
+        producer: ContextProducer,
+    }
+
+    impl ContextFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path().join("agents").join("hetz").join("seat");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let producer = ContextProducer::new(&agent_dir, "hetz.seat", "incarnation-1").unwrap();
+            Self {
+                _tmp: tmp,
+                agent_dir,
+                producer,
+            }
+        }
+
+        /// One batch of frames, exactly as the wrapper's drain treats them: fold them all in, then
+        /// publish once if any of them carried a fresh numerator. Returns whether a write landed.
+        /// Batching is what lets a turn's cost and cumulative total ride out with the numerator
+        /// that made the reading fresh — they arrive on `session.updated` a frame later.
+        fn drain(&mut self, frames: &[&str]) -> bool {
+            let mut fresh = false;
+            for raw in frames {
+                fresh |= self.producer.apply(&event(raw));
+            }
+            fresh && self.producer.publish()
+        }
+
+        fn feed(&mut self, raw: &str) -> bool {
+            self.drain(&[raw])
+        }
+
+        fn record(&self) -> Option<harness_context::Observed> {
+            harness_context::read(&harness_context::harness_context_path(&self.agent_dir))
+        }
+    }
+
+    /// The version the fixtures are pinned to, read out of the frames themselves.
+    fn captured_version(raw: &str) -> String {
+        event(raw)
+            .pointer("/properties/info/version")
+            .and_then(Value::as_str)
+            .expect("session.updated carries the server version")
+            .to_string()
+    }
+
+    /// HC-R02, HC-R13: two measured turns become readings — last non-summary assistant
+    /// `tokens.total` over the model's `limit.context` — and the duplicate final frame OpenCode
+    /// emits for every completion lands no second write (the DQ-H2 flood the sibling record hit).
+    #[test]
+    fn captured_opencode_turns_publish_the_assistant_total_over_the_providers_window() {
+        assert_eq!(captured_version(OC_TURN_1_SESSION), "1.18.25");
+        assert_eq!(captured_version(OC_TURN_2_SESSION), "1.18.25");
+
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+
+        // The opening frame of a message carries no `total`: not a reading, and nothing written.
+        assert!(!fixture.feed(OC_TURN_1_OPENING));
+        assert!(
+            fixture.record().is_none(),
+            "an all-zero opening frame must not publish a 0% window"
+        );
+
+        // Turn 1's batch: the final frame OpenCode emits twice, then the session frame carrying
+        // the turn's adjacent facts. One landed write for the whole turn.
+        assert!(
+            fixture.drain(&[OC_TURN_1_FINAL, OC_TURN_1_FINAL, OC_TURN_1_SESSION]),
+            "turn 1 is a reading"
+        );
+        let record = fixture.record().expect("a context record");
+        assert_eq!(record.harness, harness_context::Harness::OpenCode);
+        assert_eq!(record.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(record.window_tokens, Some(OC_WINDOW));
+        let expected = OC_OCCUPANCY as f64 / OC_WINDOW as f64 * 100.0;
+        assert!(
+            (record.used_percent.expect("a percent") - expected).abs() < 1e-9,
+            "the percent is st2's own unrounded division: {:?}",
+            record.used_percent
+        );
+        assert_eq!(record.model.as_deref(), Some("opencode/hy3-free"));
+        assert_eq!(record.cost_usd, Some(0.0));
+        assert_eq!(record.compactions, 0);
+
+        // Turn 2 is a genuinely fresh reading in the same 1% bucket, so nothing is written and the
+        // record stays the coherent turn-1 snapshot it was — its own `observedAtMs` says so. That
+        // is the guard the sibling record's restatement flood (DQ-H2) taught this one to keep.
+        assert!(
+            !fixture.drain(&[OC_TURN_2_FINAL, OC_TURN_2_FINAL, OC_TURN_2_SESSION]),
+            "a reading inside the written bucket must not write again"
+        );
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.observed_at_ms, record.observed_at_ms);
+        assert_eq!(after.session_total_tokens, record.session_total_tokens);
+    }
+
+    /// HC-R16: `session.info.tokens` is cumulative and carries no `total` key. It is the session
+    /// total and never the numerator — after two turns it is twice the occupancy.
+    #[test]
+    fn cumulative_session_tokens_are_the_session_total_and_never_the_occupancy() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+
+        // Adjacent facts alone are not a reading: `session.updated` never publishes, because its
+        // numbers say nothing about occupancy and stamping them would date a numerator that may
+        // be hours old.
+        fixture.feed(OC_TURN_1_SESSION);
+        assert!(
+            fixture.record().is_none(),
+            "a cumulative-token frame must not stamp a reading of its own"
+        );
+
+        fixture.drain(&[OC_TURN_1_FINAL, OC_TURN_1_SESSION]);
+        fixture.drain(&[OC_TURN_2_FINAL, OC_TURN_2_SESSION]);
+        // The reading the producer now holds, whatever the write guard decides to do with it: the
+        // cumulative total has reached twice the occupancy, and the percent divides the occupancy.
+        let reading = fixture.producer.reading();
+        assert_eq!(reading.session_total_tokens, Some(16_400));
+        assert_eq!(reading.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(reading.window_tokens, Some(OC_WINDOW));
+        assert!(
+            (reading.used_percent.expect("a percent") - 4.315_789_473_684_21).abs() < 1e-9,
+            "the cumulative total is never the numerator: {reading:?}"
+        );
+        // 16,400 of a 190,000 window would read 8.6%: twice the truth, and growing every turn.
+        assert!(reading.used_percent.expect("a percent") < 5.0);
+        let record = fixture.record().expect("a context record");
+        assert_eq!(record.used_tokens, Some(OC_OCCUPANCY));
+    }
+
+    /// HC-R02: the two measured `summary` traps. The user message's `summary` is an OBJECT and
+    /// therefore truthy, and the compaction summarizer's own assistant message carries a
+    /// `tokens.total` of 1,511 that would report a freshly compacted window as nearly empty.
+    #[test]
+    fn neither_summary_shape_is_ever_the_reading() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_2_FINAL);
+        let before = fixture.record().expect("a context record");
+
+        assert!(!fixture.feed(OC_USER_SUMMARY_OBJECT));
+        assert!(!fixture.feed(OC_SUMMARIZER_MESSAGE));
+
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.used_tokens, Some(OC_OCCUPANCY));
+        assert_ne!(after.used_tokens, Some(1_511));
+        assert_eq!(after.observed_at_ms, before.observed_at_ms);
+    }
+
+    /// HC-R12: `session.compacted` carries `{sessionID}` and nothing else, so the trigger is
+    /// `unknown` and the count is st2's, scoped to this incarnation. The edge carries no reading,
+    /// so the numbers keep the age they had — they genuinely predate the compaction — and nothing
+    /// zeroes them (HC-R03); the next turn replaces them with an observation.
+    #[test]
+    fn a_captured_compaction_counts_once_with_an_unknown_trigger_and_no_restamp() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_1_FINAL);
+        let before = fixture.record().expect("a context record");
+        assert_eq!(before.compactions, 0);
+
+        fixture.feed(OC_SUMMARIZER_MESSAGE);
+        fixture.feed(OC_SESSION_COMPACTED);
+
+        let after = fixture.record().expect("a context record");
+        assert_eq!(after.compactions, 1);
+        assert_eq!(
+            after.last_compaction_trigger,
+            Some(harness_context::CompactionTrigger::Unknown)
+        );
+        assert!(after.last_compaction_ms.is_some());
+        assert_eq!(
+            after.observed_at_ms, before.observed_at_ms,
+            "a compaction edge carries no reading and must not re-stamp one"
+        );
+        assert_eq!(after.used_tokens, Some(OC_OCCUPANCY));
+    }
+
+    /// HC-R02, HC-R03: with no window for the reading's model the percent is withheld rather than
+    /// guessed from a table, and the first successful providers pull is itself a bucket change, so
+    /// the join lands as soon as it is known.
+    #[test]
+    fn an_unjoined_model_withholds_the_window_and_the_percent_until_the_pull_lands() {
+        let mut fixture = ContextFixture::new();
+        assert!(fixture.feed(OC_TURN_1_FINAL));
+        let withheld = fixture.record().expect("a context record");
+        assert_eq!(withheld.used_tokens, Some(OC_OCCUPANCY));
+        assert_eq!(withheld.window_tokens, None);
+        assert_eq!(withheld.used_percent, None);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/hy3-free"),
+            "an unjoined model is what makes the producers pull due"
+        );
+
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        assert_eq!(fixture.producer.window_wanted(), None);
+        assert!(
+            fixture.feed(OC_TURN_2_FINAL),
+            "withheld-to-known is itself a bucket change"
+        );
+        let joined = fixture.record().expect("a context record");
+        assert_eq!(joined.window_tokens, Some(OC_WINDOW));
+        assert!(joined.used_percent.is_some());
+    }
+
+    /// The denominator's whole live path: the exact endpoint string, through the real `Client`, into
+    /// the cache the reading divides by. The pull is gated on the API gate having passed, and a
+    /// document that answers without naming the model backs off far rather than re-pulling every
+    /// minute for the life of the session.
+    #[test]
+    fn the_window_pull_reads_config_providers_through_the_real_client() {
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let mut fixture = ContextFixture::new();
+        assert!(fixture.feed(OC_TURN_1_FINAL));
+        assert_eq!(fixture.record().expect("a record").window_tokens, None);
+
+        fixture.producer.refresh_windows(&client, false);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/hy3-free"),
+            "the pull waits for the API gate"
+        );
+
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(fixture.producer.window_wanted(), None);
+        assert!(fixture.feed(OC_TURN_2_FINAL));
+        assert_eq!(
+            fixture.record().expect("a record").window_tokens,
+            Some(OC_WINDOW)
+        );
+
+        // A model the answered document does not name: the retry moves out to the long horizon
+        // instead of re-pulling the whole document once a minute forever.
+        let switched = OC_TURN_1_SESSION.replace(
+            r#""model":{"id":"hy3-free","providerID":"opencode","variant":"default"}"#,
+            r#""model":{"id":"big-pickle","providerID":"opencode","variant":"default"}"#,
+        );
+        fixture.feed(&switched);
+        fixture.producer.refresh_windows(&client, true);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/big-pickle")
+        );
+        assert!(
+            fixture.producer.next_providers_attempt
+                > Instant::now() + PROVIDERS_UNLISTED_RETRY - Duration::from_secs(60),
+            "an unlisted model must not keep the pull due every minute"
+        );
+    }
+
+    /// A model change on `session.updated` re-opens the denominator question before any assistant
+    /// message proves the new model, so the pull is due again — and it never becomes the reading's
+    /// own model, which stays the one that produced the numerator.
+    #[test]
+    fn a_configured_model_change_makes_the_window_pull_due_without_retagging_the_reading() {
+        let mut fixture = ContextFixture::new();
+        fixture.producer.ingest_providers(&event(OC_PROVIDERS));
+        fixture.feed(OC_TURN_1_FINAL);
+        fixture.feed(OC_TURN_1_SESSION);
+        assert_eq!(fixture.producer.window_wanted(), None);
+
+        let switched = OC_TURN_1_SESSION.replace(
+            r#""model":{"id":"hy3-free","providerID":"opencode","variant":"default"}"#,
+            r#""model":{"id":"big-pickle","providerID":"opencode","variant":"default"}"#,
+        );
+        fixture.feed(&switched);
+        assert_eq!(
+            fixture.producer.window_wanted(),
+            Some("opencode/big-pickle"),
+            "a model the providers document does not name keeps the pull due"
+        );
+        let record = fixture.record().expect("a context record");
+        assert_eq!(
+            record.model.as_deref(),
+            Some("opencode/hy3-free"),
+            "the record pairs a numerator with the model that produced it"
+        );
+        assert_eq!(record.window_tokens, Some(OC_WINDOW));
     }
 }

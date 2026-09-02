@@ -458,11 +458,39 @@ fn incomplete_apply_marker_blocks_declarations_but_not_the_state_plane() {
         String::from_utf8_lossy(&context.stderr)
     );
 
+    let decision = st2()
+        .args([
+            "context",
+            "append",
+            "host.worker",
+            "--decision",
+            "still writable",
+            "--why",
+            "the state plane is not fenced by an incomplete apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        decision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision.stderr)
+    );
+
+    // `st2 resource` authors a declaration now, not a link record, so the marker must fence it
+    // exactly like `agent publish` above — it is no longer a state-plane write.
     let resource = st2()
         .args([
             "resource",
             "add",
+            "work",
+            "--uri",
             "https://example.invalid/result",
+            "--reason",
+            "Blocked by the incomplete apply.",
+            "--agent",
+            "worker",
             "--as",
             "host.worker",
             "--catalog",
@@ -471,8 +499,12 @@ fn incomplete_apply_marker_blocks_declarations_but_not_the_state_plane() {
         .output()
         .unwrap();
     assert!(
-        resource.status.success(),
-        "{}",
+        !resource.status.success(),
+        "a binding write is a declaration write and must be fenced"
+    );
+    assert!(
+        String::from_utf8_lossy(&resource.stderr).contains("apply is incomplete"),
+        "stderr: {}",
         String::from_utf8_lossy(&resource.stderr)
     );
 
@@ -1259,6 +1291,53 @@ fn retirement_cannot_commit_between_reconcile_discovery_and_launch() {
     assert_eq!(
         fs::read_to_string(agent.join("agent.kdl")).unwrap(),
         valid_spec(true)
+    );
+}
+
+#[test]
+fn an_in_place_candidate_is_a_publishable_spec_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path();
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    // The name `axe agent check` requires for an in-place candidate.
+    let candidate = agent.join("agent.kdl.candidate");
+    fs::write(&candidate, valid_spec(false)).unwrap();
+
+    assert_eq!(
+        source_digest("--spec", &candidate),
+        sha256(valid_spec(false).as_bytes())
+    );
+
+    let published = publish(catalog, &candidate, &["--expect-absent"]);
+    assert!(
+        published.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(target(catalog)).unwrap(),
+        valid_spec(false)
+    );
+}
+
+#[test]
+fn a_rejected_spec_source_names_the_filename_it_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("worker.toml");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let output = publish(temp.path(), &spec, &["--expect-absent"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("spec source must be named `*.kdl` or `agent.kdl.candidate`")
+            && stderr.contains("worker.toml"),
+        "stderr: {stderr}"
     );
 }
 

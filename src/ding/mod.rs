@@ -14,7 +14,6 @@
 //! work into one generic recovery DING. `busy` never suppresses a notification; fresh `dnd` does.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{Read as _, Seek as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -27,15 +26,17 @@ mod composer;
 mod harness;
 
 use crate::message::{self, Message};
+use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
-use composer::{ComposerState, classify_composer, classify_receipt};
+use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, chain_bus_ids, resolve_spec};
+
+use composer::{ComposerState, classify_composer, classify_located_composer, classify_receipt};
 use harness::ReceiptState;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const SUBJECT_MAX_CHARS: usize = 160;
 const SENDER_MAX_CHARS: usize = 80;
-const SUPERVISOR_CHAIN_LIMIT: usize = 64;
 /// The marker for a declared non-agent event source. A fixed st2-chosen literal — never
 /// producer-supplied text — so the bounded-notice proofs are unaffected.
 const SOURCE_MARKER: &str = "»";
@@ -96,51 +97,6 @@ fn normalize_field(value: Option<&str>, fallback: &str, max_chars: usize) -> Str
     }
 }
 
-fn resolve_spec<'a>(
-    specs: &'a [crate::AgentSpec],
-    identity: &str,
-    local_host: &str,
-) -> Option<&'a crate::AgentSpec> {
-    let mut matches = specs.iter().filter(|spec| {
-        spec.bus_id(local_host) == identity
-            || (spec.resolved_host(local_host) == local_host && spec.identity == identity)
-    });
-    let resolved = matches.next()?;
-    matches.next().is_none().then_some(resolved)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SupervisorChainError {
-    Cycle,
-    MissingSupervisor,
-    DepthLimit,
-}
-
-fn supervisor_chain(
-    specs: &[crate::AgentSpec],
-    start: &crate::AgentSpec,
-    this_host: &str,
-) -> Result<Vec<String>, SupervisorChainError> {
-    let mut chain = Vec::new();
-    let mut visited = HashSet::new();
-    let mut current = start;
-
-    for _ in 0..SUPERVISOR_CHAIN_LIMIT {
-        let bus_id = current.bus_id(this_host);
-        if !visited.insert(bus_id.clone()) {
-            return Err(SupervisorChainError::Cycle);
-        }
-        chain.push(bus_id);
-        let Some(supervisor) = current.supervisor.as_deref() else {
-            return Ok(chain);
-        };
-        current = resolve_spec(specs, supervisor, current.resolved_host(this_host))
-            .ok_or(SupervisorChainError::MissingSupervisor)?;
-    }
-
-    Err(SupervisorChainError::DepthLimit)
-}
-
 struct RelationshipResolver {
     specs: Vec<crate::AgentSpec>,
     valid: bool,
@@ -177,10 +133,10 @@ fn relationship_marker(
     if sender_id == recipient_id {
         return "↺".to_string();
     }
-    let Ok(recipient_chain) = supervisor_chain(&resolver.specs, recipient, this_host) else {
+    let Ok(recipient_chain) = chain_bus_ids(&resolver.specs, recipient, this_host) else {
         return "?".to_string();
     };
-    let Ok(sender_chain) = supervisor_chain(&resolver.specs, sender, this_host) else {
+    let Ok(sender_chain) = chain_bus_ids(&resolver.specs, sender, this_host) else {
         return "?".to_string();
     };
 
@@ -287,7 +243,74 @@ pub enum PokeOutcome {
     /// A maintained adapter positively proved that the exact staged notice is absent. Queue state
     /// decides whether an archive receipt makes that proof sufficient to relinquish ownership.
     NotRetained,
-    Deferred,
+    Deferred(DeferralReason),
+}
+
+/// Why one attempt performed no input at all.
+///
+/// A deferral is the one outcome that both delivers nothing and leaves nothing behind, so it is
+/// the one that must say why. The two composer verdicts are deliberately distinct: a human drafting
+/// in a harness we understand is a wait, while a pane no maintained harness can locate is a gap in
+/// coverage that will never resolve on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferralReason {
+    /// The lowest maintained composer holds text that is not the exact notice — typically a human
+    /// draft. Named by harness only: the text on that pane belongs to whoever is typing it.
+    ComposerChanged { harness: &'static str },
+    /// A maintained harness located its composer but proved nothing about this screen — an active
+    /// turn, a modal, or a footer it does not recognise. Distinct from an unlocatable pane: this
+    /// one is covered and can clear on its own, so it is a wait rather than a coverage gap.
+    ComposerUnproven { harness: &'static str },
+    /// No maintained harness could locate a composer on this pane, so nothing is proven either
+    /// way. An unrecognised, resized, or not-yet-drawn TUI lands here.
+    NoMaintainedComposer,
+    /// The poker performs no input of its own; delivery is somebody else's job.
+    NoInputPerformed,
+}
+
+impl std::fmt::Display for DeferralReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ComposerChanged { harness } => write!(
+                formatter,
+                "the {harness} composer holds other text (a draft or an unfinished turn); waiting rather than typing over it"
+            ),
+            Self::ComposerUnproven { harness } => write!(
+                formatter,
+                "the {harness} composer was located but proved nothing about this screen (an active turn, a modal, or an unrecognised footer); waiting for it to settle"
+            ),
+            Self::NoMaintainedComposer => formatter.write_str(
+                "no maintained harness could locate a composer on this pane; nothing will be delivered here until one can",
+            ),
+            Self::NoInputPerformed => formatter.write_str("this poker performs no input"),
+        }
+    }
+}
+
+/// Whether a deferral is news, so a pane stuck in one verdict costs one log line rather than one
+/// per retry. The first deferral after progress is news, a changed verdict is news, and the same
+/// verdict repeating is the same fact.
+#[derive(Debug, Default)]
+pub struct DeferralJournal {
+    last: Option<DeferralReason>,
+}
+
+impl DeferralJournal {
+    pub fn observe(&mut self, current: Option<DeferralReason>) -> bool {
+        if self.last == current {
+            return false;
+        }
+        self.last = current;
+        current.is_some()
+    }
+}
+
+/// What one `flush_pending` chose not to do. Deliberately a plain struct rather than an
+/// `Option`: callers that only want the flush keep compiling as statements.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FlushReport {
+    /// Set when the front notice performed no input this pass.
+    pub deferred: Option<DeferralReason>,
 }
 
 /// How DING delivers a poke and checks liveness, abstracted so the watch loop is testable without a
@@ -295,7 +318,7 @@ pub enum PokeOutcome {
 pub trait Poker {
     fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome>;
     fn retry_staged(&self, _text: &str) -> anyhow::Result<PokeOutcome> {
-        Ok(PokeOutcome::Deferred)
+        Ok(PokeOutcome::Deferred(DeferralReason::NoInputPerformed))
     }
     fn adopt_staged(&self, _candidates: &[String]) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -329,6 +352,9 @@ impl PtyPoker {
         Ok(())
     }
 
+    /// Reads the terminal screen of the session. Output capture is tail-capped at
+    /// [`crate::run::CAPTURE_CAP_BYTES`]; semantics are preserved because a terminal screen is
+    /// far below that bound.
     fn peek(&self) -> anyhow::Result<String> {
         let out = output_with_timeout(
             Command::new(&self.bin).args(["peek", self.session.as_str()]),
@@ -391,8 +417,10 @@ impl Poker for PtyPoker {
     }
 }
 
-/// Run a non-interactive child with bounded output capture. Temporary files keep an escaped
-/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+/// Run a non-interactive child with bounded output capture: each stream keeps at most its last
+/// [`crate::run::CAPTURE_CAP_BYTES`] bytes (tail-preserving, with a diagnostic line on
+/// truncation). Temporary files keep an escaped descendant that inherited stdout/stderr from
+/// blocking cleanup after the direct child times out.
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -421,23 +449,27 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
                 libc::kill(-pid, libc::SIGKILL);
             }
             let _ = child.kill();
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
+            reap_detached(child);
             anyhow::bail!("timed out after {:.1}s", timeout.as_secs_f64());
         }
         thread::sleep(Duration::from_millis(10));
     };
-    stdout.rewind()?;
-    stderr.rewind()?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    let stdout_stream = read_bounded_tail(&mut stdout, CAPTURE_CAP_BYTES)?;
+    let stderr_stream = read_bounded_tail(&mut stderr, CAPTURE_CAP_BYTES)?;
+    let program = command.get_program().to_string_lossy();
+    for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
+        if stream.truncated() {
+            eprintln!(
+                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                stream.bytes.len(),
+                stream.total,
+            );
+        }
+    }
     Ok(Output {
         status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout: stdout_stream.bytes,
+        stderr: stderr_stream.bytes,
     })
 }
 
@@ -464,7 +496,9 @@ fn transport_and_observe_with_window(
     // Preserve the accepted transport-first transaction. Once it starts, any command or
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
-        eprintln!("st2 ding: DING transport became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: DING transport became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -484,7 +518,7 @@ fn observe_receipt_with_window(
         let screen = match peek() {
             Ok(screen) => screen,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2 ding: post-submit receipt observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
@@ -513,7 +547,9 @@ fn retry_staged_with_window(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!("st2 ding: staged retry observation failed; retaining ownership: {error}");
+            tracing::warn!(
+                "st2 ding: staged retry observation failed; retaining ownership: {error}"
+            );
             return Ok(PokeOutcome::Staged);
         }
     };
@@ -543,7 +579,7 @@ fn submit_retained_after_final_observation(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2 ding: final retained-composer observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
@@ -558,11 +594,13 @@ fn submit_retained_after_final_observation(
         }
     }
     if let Err(error) = before_submit() {
-        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
         return Ok(PokeOutcome::Staged);
     }
     if let Err(error) = submit() {
-        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -598,7 +636,8 @@ fn observed_poke_with_window(
     before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
     observation_window: Duration,
 ) -> anyhow::Result<PokeOutcome> {
-    match classify_composer(&peek()?, text) {
+    let (state, harness) = classify_located_composer(&peek()?, text);
+    match state {
         ComposerState::ExactSafe => {
             return submit_after_final_observation(
                 text,
@@ -612,14 +651,27 @@ fn observed_poke_with_window(
         ComposerState::ExactBlocked => return Ok(PokeOutcome::Staged),
         ComposerState::EmptySafe => {}
         ComposerState::Changed | ComposerState::Ambiguous => {
-            return Ok(PokeOutcome::Deferred);
+            // Whether a harness was located is the difference between a wait and a coverage gap,
+            // so it decides the reason rather than being folded into one catch-all.
+            return Ok(PokeOutcome::Deferred(match (state, harness) {
+                (ComposerState::Changed, Some(harness)) => {
+                    DeferralReason::ComposerChanged { harness }
+                }
+                // `Changed` cannot arise without a located harness — only a located composer can
+                // be read as holding other text — but the classifier owns that invariant, not
+                // this call site, so an unlocated pane is reported as exactly what was observed.
+                (_, Some(harness)) => DeferralReason::ComposerUnproven { harness },
+                (_, None) => DeferralReason::NoMaintainedComposer,
+            }));
         }
     }
 
     // Once this command starts, success is ambiguous on any error or timeout: the paste may already
     // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
     if let Err(error) = stage() {
-        eprintln!("st2 ding: paste command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: paste command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
 
@@ -628,7 +680,7 @@ fn observed_poke_with_window(
         let screen = match peek() {
             Ok(screen) => screen,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2 ding: post-paste observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
@@ -669,7 +721,7 @@ fn submit_after_final_observation(
     let screen = match peek() {
         Ok(screen) => screen,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2 ding: final composer observation failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
@@ -685,11 +737,13 @@ fn submit_after_final_observation(
         }
     }
     if let Err(error) = before_submit() {
-        eprintln!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
+        tracing::warn!("st2 ding: pre-submit receipt failed; retaining staged ownership: {error}");
         return Ok(PokeOutcome::Staged);
     }
     if let Err(error) = submit() {
-        eprintln!("st2 ding: Return command became ambiguous; retaining staged ownership: {error}");
+        tracing::warn!(
+            "st2 ding: Return command became ambiguous; retaining staged ownership: {error}"
+        );
         return Ok(PokeOutcome::Staged);
     }
     observe_receipt_with_window(text, peek, poll, observation_window)
@@ -994,6 +1048,7 @@ pub fn run_ding(
     let mut logged_waiting = false;
     let mut last_refresh: Option<Instant> = None;
     let mut next_delivery_attempt: Option<Instant> = None;
+    let mut deferrals = DeferralJournal::default();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1041,11 +1096,21 @@ pub fn run_ding(
                         }
                         Ok(None) => startup_candidates = None,
                         Err(error) => {
-                            eprintln!("st2 ding: startup staged-notice adoption failed: {error}")
+                            tracing::warn!(
+                                "st2 ding: startup staged-notice adoption failed: {error}"
+                            )
                         }
                     }
                 }
-                flush_pending(context, status_path, &mut pending, poker);
+                let report = flush_pending(context, status_path, &mut pending, poker);
+                if deferrals.observe(report.deferred)
+                    && let Some(reason) = report.deferred
+                {
+                    tracing::warn!(
+                        "st2 ding: delivery deferred for '{}', no input performed: {reason}",
+                        context.recipient
+                    );
+                }
                 next_delivery_attempt = (startup_candidates.is_some() || !pending.is_empty())
                     .then(|| Instant::now() + DELIVERY_RETRY_BACKOFF);
             }
@@ -1107,9 +1172,10 @@ fn flush_pending(
     status_path: Option<&Path>,
     pending: &mut VecDeque<PendingNotice>,
     poker: &dyn Poker,
-) {
+) -> FlushReport {
+    let mut report = FlushReport::default();
     if delivery_suppressed(status_path) {
-        return;
+        return report;
     }
 
     let mut resolver = None;
@@ -1138,7 +1204,7 @@ fn flush_pending(
                 notice.set_staged_text(Some(text));
                 break;
             }
-            Ok(PokeOutcome::Deferred) if was_staged => {
+            Ok(PokeOutcome::Deferred(_)) if was_staged => {
                 // The exact owned payload disappeared or changed. Adopted startup text has the
                 // generic recovery notice behind it, while unread ordinary work may make one later
                 // fresh guarded attempt. Archived work is done.
@@ -1148,13 +1214,20 @@ fn flush_pending(
                 }
                 pending.pop_front();
             }
-            Ok(PokeOutcome::Deferred) => break,
+            // The one outcome that delivers nothing and leaves nothing behind. Report it out so
+            // the watch loop can say so; an unreported break here is how an eleven-day fleet-wide
+            // delivery failure stayed invisible.
+            Ok(PokeOutcome::Deferred(reason)) => {
+                report.deferred = Some(reason);
+                break;
+            }
             Err(error) => {
-                eprintln!("st2 ding: {error}");
+                tracing::warn!("st2 ding: {error}");
                 break;
             }
         }
     }
+    report
 }
 
 /// Set by SIGINT/SIGTERM so `st2 ding` exits cleanly when st2 tears the sidecar down.
@@ -1279,6 +1352,22 @@ mod tests {
         );
     }
 
+    /// Block until `ready` holds, reporting whether it did. The ceiling bounds a DING loop that
+    /// made no progress at all; it is not the behaviour under test, so it is far larger than any
+    /// plausible scheduling delay and a loaded host cannot turn it into a failure. Callers report
+    /// the result after their scope ends rather than panicking inside it, because an unwind from a
+    /// scoped thread leaves `run_ding` without the `stop` flag that ends it.
+    fn await_ding_progress(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
     #[derive(Default)]
     struct RecordingPoker {
         alive: AtomicBool,
@@ -1301,7 +1390,7 @@ mod tests {
         fn poke(&self, text: &str) -> anyhow::Result<PokeOutcome> {
             self.calls.lock().unwrap().push(text.to_string());
             if self.defer.load(Ordering::SeqCst) {
-                return Ok(PokeOutcome::Deferred);
+                return Ok(PokeOutcome::Deferred(DeferralReason::NoMaintainedComposer));
             }
             let mut failures = self.failures.lock().unwrap();
             if *failures > 0 {
@@ -1471,8 +1560,8 @@ mod tests {
         let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
 
         assert_eq!(
-            supervisor_chain(&resolver.specs, recipient, "h"),
-            Err(SupervisorChainError::Cycle),
+            chain_bus_ids(&resolver.specs, recipient, "h"),
+            Err(crate::supervisor_chain::SupervisorChainError::Cycle),
             "cycle detection must be distinct from the independent depth limit"
         );
 
@@ -3668,16 +3757,18 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             status_refresh: Duration::from_secs(60),
         };
 
+        // Two separate barriers, each with its own generous budget. Sharing one 3s deadline
+        // across both meant the first wait could spend it: the loop then stopped after a single
+        // poke and the count assertion failed while naming neither barrier. The ceiling bounds a
+        // loop that never ran at all, so a loaded host cannot turn it into a failure — and `stop`
+        // is set on every path, because panicking here would leave `run_ding` looping forever.
+        let mut polled = false;
+        let mut poked_twice = false;
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while poker.probes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
+                polled = await_ding_progress(|| poker.probes.load(Ordering::SeqCst) > 0);
                 send_to_inbox(&inbox, "new", Some("post-start"), None, &[], "new").unwrap();
-                while poker.calls.lock().unwrap().len() < 2 && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
+                poked_twice = await_ding_progress(|| poker.calls.lock().unwrap().len() >= 2);
                 stop.store(true, Ordering::SeqCst);
             });
 
@@ -3696,6 +3787,8 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .unwrap();
         });
 
+        assert!(polled, "the ding loop never reached its first poll");
+        assert!(poked_twice, "the ding loop never delivered both notices");
         let calls = poker.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], RECOVERY_POKE);
@@ -3719,9 +3812,24 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             status_refresh: Duration::from_secs(60),
         };
 
+        // Synchronize on the loop's own progress rather than a wall-clock window. `session_alive`
+        // runs exactly once per iteration, so `probes` counts polls directly: stop only once the
+        // first poke landed AND the loop polled several more times, which is precisely when a
+        // missing backoff would poke again. A fixed window instead ends wherever the host's
+        // scheduler leaves it — on a loaded machine before the first poll, so the test observed zero
+        // pokes and failed while asserting nothing about backoff.
+        const POLLS_AFTER_FIRST_POKE: usize = 5;
+        let barrier = Duration::from_secs(30);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(250));
+                let deadline = Instant::now() + barrier;
+                while poker.calls.lock().unwrap().is_empty() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let polled = poker.probes.load(Ordering::SeqCst) + POLLS_AFTER_FIRST_POKE;
+                while poker.probes.load(Ordering::SeqCst) < polled && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 stop.store(true, Ordering::SeqCst);
             });
             run_ding(
@@ -3739,6 +3847,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             .unwrap();
         });
 
+        // Without this the counter-test is vacuous: one poke across one poll proves no backoff.
+        assert!(
+            poker.probes.load(Ordering::SeqCst) > POLLS_AFTER_FIRST_POKE,
+            "the loop did not poll again, so no backoff was exercised"
+        );
         assert_eq!(
             poker.calls.lock().unwrap().len(),
             1,
@@ -3826,5 +3939,90 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             session_liveness_in(tmp.path(), "dead"),
             SessionLiveness::Dead
         );
+    }
+
+    /// A deferral is the one outcome that both delivers nothing and leaves nothing behind, so it
+    /// has to carry why. The two causes want different responses: a human drafting in a harness we
+    /// understand clears on its own, a pane no harness can locate never will.
+    #[test]
+    fn a_deferral_names_the_cause_that_produced_it() {
+        let text = "[DING] ? cos: guarded [id:abc123]";
+        for (screen, expected) in [
+            (
+                human_codex_screen(),
+                DeferralReason::ComposerChanged { harness: "codex" },
+            ),
+            // Located, but an unrecognised footer proves nothing about the screen. This is a wait,
+            // not a coverage gap, and must not be reported as an unlocatable pane.
+            (
+                idle_codex_screen_with_footer("Esc to interrupt"),
+                DeferralReason::ComposerUnproven { harness: "codex" },
+            ),
+            (
+                "unrecognized renderer".to_string(),
+                DeferralReason::NoMaintainedComposer,
+            ),
+        ] {
+            let outcome = observed_poke_with_window(
+                text,
+                &mut || Ok(screen.clone()),
+                &mut || Ok(()),
+                &mut || Ok(()),
+                &mut || {},
+                &mut || Ok(()),
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert_eq!(outcome, PokeOutcome::Deferred(expected));
+        }
+    }
+
+    /// The deferral has to reach the watch loop, which is the only place that knows the recipient
+    /// and can decide whether it is worth saying.
+    #[test]
+    fn flush_reports_a_deferral_outward() {
+        let catalog = tempfile::tempdir().unwrap();
+        let context = DingContext {
+            catalog_root: catalog.path(),
+            this_host: "h",
+            recipient: "h.recipient",
+        };
+        let notice = || {
+            VecDeque::from([PendingNotice::message(msg(
+                "1785070000000-abc123.md",
+                "h.sender",
+                Some("hello"),
+            ))])
+        };
+
+        let poker = RecordingPoker::live();
+        poker.defer.store(true, Ordering::SeqCst);
+        assert_eq!(
+            flush_pending(context, None, &mut notice(), &poker).deferred,
+            Some(DeferralReason::NoMaintainedComposer)
+        );
+
+        // A delivery that lands has nothing to report.
+        let poker = RecordingPoker::live();
+        assert_eq!(
+            flush_pending(context, None, &mut notice(), &poker).deferred,
+            None
+        );
+    }
+
+    /// A pane stuck in one verdict costs one line, not one per retry — but a changed verdict, and
+    /// the first deferral after delivery resumed, are both news.
+    #[test]
+    fn only_a_changed_deferral_verdict_is_worth_reporting() {
+        let changed = DeferralReason::ComposerChanged { harness: "codex" };
+        let unknown = DeferralReason::NoMaintainedComposer;
+        let mut journal = DeferralJournal::default();
+
+        assert!(journal.observe(Some(changed)));
+        assert!(!journal.observe(Some(changed)));
+        assert!(journal.observe(Some(unknown)));
+        assert!(!journal.observe(Some(unknown)));
+        assert!(!journal.observe(None));
+        assert!(journal.observe(Some(unknown)));
     }
 }

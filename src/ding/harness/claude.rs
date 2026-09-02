@@ -9,6 +9,10 @@ use crate::ding::composer::{
 pub(super) struct Claude;
 
 impl Harness for Claude {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
     fn locate(&self, screen: &Screen<'_>) -> Option<Located> {
         located_bottom_claude_composer(screen.plain).map(|(row, _, _)| Located { row })
     }

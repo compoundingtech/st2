@@ -518,3 +518,162 @@ fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     );
     assert!(stdout.contains("(malformed-record)"), "{stdout}");
 }
+
+#[test]
+fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
+    use st2::driver_diagnostic::{Driver, Publisher, Reason, Source, Stage, Support};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; opencode { prompt "go" } }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap();
+    fs::write(agent_dir.join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let mut publisher = Publisher::new(
+        agent_dir,
+        Driver::OpenCode,
+        Some("1.18.19".to_string()),
+        Support::Supported,
+    );
+    publisher.publish(Stage::Seed, Reason::UnknownStatus, Source::StatusSnapshot);
+
+    let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&catalog)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+    assert!(roster.status.success());
+    let wire: serde_json::Value = serde_json::from_slice(&roster.stdout).unwrap();
+    assert_eq!(wire[0]["driverDiagnostic"]["status"], "failure");
+    assert_eq!(wire[0]["driverDiagnostic"]["stage"], "seed");
+    assert_eq!(wire[0]["driverDiagnostic"]["reason"], "unknownStatus");
+
+    let diagnosed = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&diagnosed.stdout);
+    assert!(diagnosed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic: seed/unknownStatus"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(st2::driver_diagnostic::repair_text(
+            &st2::driver_diagnostic::read(&st2::driver_diagnostic::path(agent_dir))
+        )),
+        "{stdout}"
+    );
+
+    publisher.clear(Stage::Seed);
+    let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&recovered.stdout);
+    assert!(recovered.status.success(), "{stdout}");
+    assert!(stdout.contains("native driver diagnostic absent"), "{stdout}");
+    assert!(!stdout.contains("seed/unknownStatus"), "{stdout}");
+
+    fs::write(st2::driver_diagnostic::path(agent_dir), b"{bad").unwrap();
+    let malformed = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&malformed.stdout);
+    assert!(malformed.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic indeterminate (malformedRecord)"),
+        "{stdout}"
+    );
+}
+
+/// HC-R17: Doctor's harness-context lines are advisory in both directions — a reading at or above
+/// st2's attention threshold and a stale record beside a `running` desired state each print a
+/// warning and leave the exit status alone, while a fresh reading below the threshold prints
+/// nothing at all. Nothing here can fail a health check on an unfenced, advisory number.
+#[test]
+fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() {
+    use st2::harness_context::{Harness, Reading, Writer, harness_context_path};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; opencode { prompt "go" } }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap().to_path_buf();
+    fs::write(agent_dir.join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    // No record at all: Doctor says nothing about context and stays green.
+    let quiet = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&quiet.stdout);
+    assert!(quiet.status.success(), "{stdout}");
+    assert!(!stdout.contains("harness context"), "{stdout}");
+
+    // A fresh reading below the threshold is likewise silent.
+    let mut writer = Writer::new(&agent_dir, "h.worker", Harness::Claude).unwrap();
+    let fill = |percent: f64| Reading {
+        used_tokens: Some((percent * 2_000.0) as u64),
+        window_tokens: Some(200_000),
+        used_percent: Some(percent),
+        ..Reading::default()
+    };
+    writer.observe(fill(41.0)).unwrap();
+    let below = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&below.stdout);
+    assert!(below.status.success(), "{stdout}");
+    assert!(!stdout.contains("harness context"), "{stdout}");
+
+    // At the threshold: an advisory, and the exit status is unchanged.
+    writer.observe(fill(80.0)).unwrap();
+    let warned = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&warned.stdout);
+    assert!(warned.status.success(), "{stdout}");
+    assert!(stdout.contains("h.worker harness context at 80%"), "{stdout}");
+    assert!(stdout.starts_with("  ⚠") || stdout.contains("⚠ h.worker harness context"), "{stdout}");
+    assert!(stdout.contains("all checks passed"), "{stdout}");
+
+    // Above the window is carried raw into the advisory rather than clamped away.
+    writer.observe(fill(104.0)).unwrap();
+    let overrun = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&overrun.stdout);
+    assert!(overrun.status.success(), "{stdout}");
+    assert!(stdout.contains("h.worker harness context at 104%"), "{stdout}");
+
+    // A stale record beside a running desired state warns on its own axis, still advisory. Backdate
+    // the reading past the horizon exactly as the passage of time would.
+    let path = harness_context_path(&agent_dir);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let aged = st2::message::now_ms()
+        - u64::try_from(st2::harness_context::HARNESS_CONTEXT_STALE.as_millis()).unwrap()
+        - 60_000;
+    record["observedAtMs"] = serde_json::json!(aged);
+    record["usedPercent"] = serde_json::json!(12.0);
+    fs::write(&path, format!("{record}\n")).unwrap();
+
+    let stale = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&stale.stdout);
+    assert!(stale.status.success(), "{stdout}");
+    assert!(stdout.contains("h.worker harness context stale"), "{stdout}");
+    assert!(
+        !stdout.contains("harness context at"),
+        "a low stale reading warns about its age, not its level: {stdout}"
+    );
+    assert!(stdout.contains("all checks passed"), "{stdout}");
+}

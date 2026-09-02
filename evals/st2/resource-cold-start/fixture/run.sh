@@ -3,7 +3,8 @@ set -euo pipefail
 
 net="$CATALOG/net"
 events="$CATALOG/events.tsv"
-ref="$(st2 resource add work://eval/cold-start --catalog "$net" --host local --as local.worker --title "Cold start work" --tag work,ready --relation assignment)"
+ref="cold-start"
+st2 resource add "$ref" --uri work://eval/cold-start --reason "Cold start work" --catalog "$net" --host local --as local.worker --agent local.worker >/dev/null
 st2 resource read local.worker "$ref" --catalog "$net" --host local | grep -Fq work://eval/cold-start
 printf '1\tresource-ready\t%s\n' "$ref" >"$events"
 message="$(st2 message send local.worker --catalog "$net" --host local --as local.worker --subject "Resource ready" -m "work://eval/cold-start is ready")"

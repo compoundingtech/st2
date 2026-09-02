@@ -45,6 +45,9 @@ pub struct ServiceSpec {
     /// an explicit adoption can use an existing registry without syncing pid/socket state.
     pty_root: Option<PathBuf>,
     memory_max_mb: u64,
+    /// Ambient `OTEL_*` environment captured at install time and re-serialized into the unit, so
+    /// the supervised supervisor reaches the same OTLP endpoint as an interactive `st2 up`.
+    otel_env: Vec<(String, String)>,
 }
 
 impl ServiceSpec {
@@ -55,6 +58,7 @@ impl ServiceSpec {
         path: impl Into<String>,
         pty_root: Option<PathBuf>,
         memory_max_mb: u64,
+        otel_env: Vec<(String, String)>,
     ) -> Result<Self> {
         if memory_max_mb == 0 {
             bail!("--memory-max-mb must be greater than zero");
@@ -73,6 +77,7 @@ impl ServiceSpec {
             path,
             pty_root,
             memory_max_mb,
+            otel_env,
         })
     }
 
@@ -90,6 +95,14 @@ impl ServiceSpec {
         }
         args
     }
+}
+
+/// Ambient `OTEL_*` variables worth carrying into a unit. Captured at install time because the
+/// systemd user manager has no shell to expand them from.
+pub(crate) fn collect_otel_env() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(key, _)| key.starts_with("OTEL_"))
+        .collect()
 }
 
 /// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
@@ -116,7 +129,7 @@ pub fn install(
                 .with_context(|| format!("pty root {} does not exist", root.display()))
         })
         .transpose()?;
-    let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb)?;
+    let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb, collect_otel_env())?;
 
     install_systemd_user(&spec)?;
 
@@ -263,6 +276,13 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .map(|arg| systemd_quote_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    let otel_env = spec
+        .otel_env
+        .iter()
+        .map(|(key, value)| {
+            format!("Environment={}\n", systemd_quote_arg(&format!("{key}={value}")))
+        })
+        .collect::<String>();
     format!(
         "[Unit]\n\
 Description=st2 supervisor (st2 up)\n\
@@ -272,6 +292,7 @@ After=network.target\n\
 Type=simple\n\
 Environment={}\n\
 {}\
+{otel_env}\
 ExecStart={exec_start}\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
@@ -332,6 +353,7 @@ mod tests {
             "/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin",
             None,
             DEFAULT_MEMORY_MAX_MB,
+            Vec::new(),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -363,6 +385,7 @@ mod tests {
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/legacy-pty")),
             512,
+            Vec::new(),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -384,6 +407,7 @@ mod tests {
             "/opt/st2 tools:/usr/bin",
             Some(PathBuf::from("/srv/pty 100%")),
             256,
+            Vec::new(),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
@@ -397,13 +421,13 @@ mod tests {
 
     #[test]
     fn zero_memory_max_is_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0).unwrap_err();
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
     }
 
     #[test]
     fn empty_path_and_relative_pty_root_are_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "", None, 1).unwrap_err();
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "", None, 1, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("PATH cannot be empty"));
 
         let err = ServiceSpec::new(
@@ -413,8 +437,66 @@ mod tests {
             "/bin",
             Some(PathBuf::from("relative")),
             1,
+            Vec::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn unit_emits_one_quoted_environment_line_per_captured_otel_var() -> Result<()> {
+        let spec = ServiceSpec::new(
+            "/usr/local/bin/st2",
+            "/srv/catalog",
+            None,
+            "/usr/local/bin:/usr/bin",
+            Some(PathBuf::from("/srv/pty")),
+            DEFAULT_MEMORY_MAX_MB,
+            vec![
+                (
+                    "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                    "http://127.0.0.1:4317".to_string(),
+                ),
+                (
+                    "OTEL_SERVICE_NAME".to_string(),
+                    "st2 supervisor 100%".to_string(),
+                ),
+            ],
+        )?;
+
+        let unit = render_systemd_user_unit(&spec);
+
+        // One `Environment=` line per captured var. All-safe-char values stay bare (quote rule),
+        // values with spaces/`%` are double-quoted via systemd_quote_arg.
+        assert!(unit.contains("Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317"));
+        assert!(
+            unit.contains("Environment=\"OTEL_SERVICE_NAME=st2 supervisor 100%%\""),
+            "value with space/percent must go through systemd_quote_arg"
+        );
+
+        // Ordering: after the PTY_ROOT line, before ExecStart.
+        let pty_root_at = unit.find("Environment=PTY_ROOT=/srv/pty").unwrap();
+        let first_otel_at = unit.find("Environment=\"OTEL_").unwrap();
+        let exec_start_at = unit.find("ExecStart=").unwrap();
+        assert!(pty_root_at < first_otel_at && first_otel_at < exec_start_at);
+        Ok(())
+    }
+
+    #[test]
+    fn unit_without_otel_vars_emits_no_extra_environment_lines() -> Result<()> {
+        let spec = ServiceSpec::new(
+            "/usr/local/bin/st2",
+            "/srv/catalog",
+            None,
+            "/usr/local/bin:/usr/bin",
+            None,
+            DEFAULT_MEMORY_MAX_MB,
+            Vec::new(),
+        )?;
+
+        let unit = render_systemd_user_unit(&spec);
+
+        assert!(!unit.contains("OTEL_"));
+        Ok(())
     }
 }

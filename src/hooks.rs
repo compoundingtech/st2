@@ -21,15 +21,19 @@ const CLAUDE_SESSION_START: &[u8] = include_bytes!("../hooks/claude-session-star
 const CLAUDE_PRE_COMPACT: &[u8] = include_bytes!("../hooks/claude-pre-compact.sh");
 const CLAUDE_STOP_FAILURE: &[u8] = include_bytes!("../hooks/claude-stop-failure.sh");
 const CLAUDE_OBSERVE: &[u8] = include_bytes!("../hooks/claude-observe.sh");
+const CLAUDE_STATUSLINE: &[u8] = include_bytes!("../hooks/claude-statusline.sh");
 // pi has no lifecycle-hook mechanism of its own; an extension is where a pi session exposes the
-// same surface, so it is published and verified as part of the same immutable set.
+// same surface, so it is published and verified as part of the same immutable set. omp is
+// pi-family and takes a forked extension asset (measured divergences: no `agent_settled`, plus
+// approval events) — same publication path.
 const PI_CHANNEL: &[u8] = include_bytes!("../hooks/pi-channel.ts");
+const OMP_CHANNEL: &[u8] = include_bytes!("../hooks/omp-channel.ts");
 
 const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
-const HOOKS: [(&str, &[u8]); 8] = [
+const HOOKS: [(&str, &[u8]); 10] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
     ("codex-stop.sh", CODEX_STOP),
@@ -37,7 +41,9 @@ const HOOKS: [(&str, &[u8]); 8] = [
     ("claude-pre-compact.sh", CLAUDE_PRE_COMPACT),
     ("claude-stop-failure.sh", CLAUDE_STOP_FAILURE),
     ("claude-observe.sh", CLAUDE_OBSERVE),
+    ("claude-statusline.sh", CLAUDE_STATUSLINE),
     ("pi-channel.ts", PI_CHANNEL),
+    ("omp-channel.ts", OMP_CHANNEL),
 ];
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -132,10 +138,23 @@ pub fn claude_settings_registration() -> serde_json::Value {
                     "command": "\"$ST_HOOKS/claude-observe.sh\" SessionStart",
                 },
             ] }],
-            "PreCompact": [{ "hooks": [{
-                "type": "command",
-                "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
-            }] }],
+            // Two commands on one event, deliberately: the stub writes a working-state
+            // reconstruction into the seat's context directory, while the observe hook counts the
+            // compaction on the harness-context record. They do different jobs on the same edge
+            // and both must run, so the registration carries both rather than choosing.
+            "PreCompact": [{ "hooks": [
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-pre-compact.sh\"",
+                },
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" PreCompact",
+                },
+            ] }],
+            // The completion edge. It never increments the count `PreCompact` already made — see
+            // `claude_session::observe_compaction` for why the dedupe is positional.
+            "PostCompact": observe("PostCompact"),
             "StopFailure": [{ "hooks": [{
                 "type": "command",
                 "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
@@ -145,6 +164,23 @@ pub fn claude_settings_registration() -> serde_json::Value {
             "PermissionRequest": observe("PermissionRequest"),
             "PreToolUse": observe("PreToolUse"),
             "PostToolUse": observe("PostToolUse"),
+        },
+        // The status-line payload is the ONLY Claude channel carrying a context window, so st2
+        // occupies the slot to read it — and the slot is single-valued, with the winning
+        // declaration replacing rather than merging. `.claude/settings.local.json` is the
+        // highest-precedence file, so this entry MUST be the chaining tee and never a bare
+        // recorder: anything else silently removes the operator's own status line on every
+        // managed seat (HC-R18).
+        //
+        // All three keys are carried deliberately. `padding: 0` renders the line flush to the
+        // terminal edge, and `refreshInterval: 5` re-runs the command every 5 seconds in addition
+        // to event-driven updates — which is what makes the record a live reading rather than one
+        // frozen between turns, and is well inside the 300-second write heartbeat.
+        "statusLine": {
+            "type": "command",
+            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
+            "padding": 0,
+            "refreshInterval": 5,
         }
     })
 }
@@ -291,6 +327,78 @@ pub(crate) fn launch_invokes_pi(
         crate::reconcile::TaskLaunch::Shell(command) => command_invokes_pi(command),
         crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_pi(argv, catalog_root),
     }
+}
+
+/// Whether this host has an omp agent whose next launch needs this hook set — same shape as pi:
+/// nothing omp renders references `$ST_HOOKS`, but the launch cannot proceed without
+/// `omp-channel.ts`.
+pub fn required_by_omp(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
+    specs
+        .iter()
+        .any(|spec| required_by_omp_agent(spec, this_host, catalog_root))
+}
+
+/// Whether one local declaration owns an omp agent launch.
+pub fn required_by_omp_agent(
+    spec: &agent_spec::spec::AgentSpec,
+    this_host: &str,
+    catalog_root: &Path,
+) -> bool {
+    spec.host.as_deref().is_none_or(|host| host == this_host)
+        && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Omp(_)))
+            || spec.tasks.iter().any(|task| {
+                task.name == "agent"
+                    && (task.command.as_deref().is_some_and(command_invokes_omp)
+                        || task
+                            .argv
+                            .as_deref()
+                            .is_some_and(|argv| argv_invokes_omp(argv, catalog_root)))
+            }))
+}
+
+pub(crate) fn launch_invokes_omp(
+    launch: &crate::reconcile::TaskLaunch,
+    catalog_root: &Path,
+) -> bool {
+    match launch {
+        crate::reconcile::TaskLaunch::Shell(command) => command_invokes_omp(command),
+        crate::reconcile::TaskLaunch::Argv(argv) => argv_invokes_omp(argv, catalog_root),
+    }
+}
+
+fn argv_invokes_omp(argv: &[String], catalog_root: &Path) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let program = crate::expand::expand_catalog(program, catalog_root);
+    let Some(program) = Path::new(&program).file_name() else {
+        return false;
+    };
+    if program == "omp" {
+        return true;
+    }
+    program == "st2"
+        && argv.get(1).map(String::as_str) == Some("--catalog")
+        && argv.get(3).map(String::as_str) == Some("driver")
+        && argv.get(4).map(String::as_str) == Some("omp-session")
+}
+
+fn command_invokes_omp(command: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("exec ")
+        .unwrap_or(command)
+        .trim_start();
+    let Some(program) = command.split_ascii_whitespace().next() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "omp")
 }
 
 fn argv_invokes_pi(argv: &[String], catalog_root: &Path) -> bool {
@@ -644,6 +752,51 @@ mod tests {
     /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
     /// expansion actually emits.
     #[test]
+    #[test]
+    fn omp_launch_classification_is_exact() {
+        let root = Path::new("/catalog");
+        assert!(command_invokes_omp("exec omp --model x 'boot'"));
+        assert!(command_invokes_omp("/opt/bin/omp --model x"));
+        assert!(!command_invokes_omp("echo omp"));
+        // pi is not omp: the forked channel assets and version gates are per harness.
+        assert!(!command_invokes_omp("exec /opt/bin/pi -a 'boot'"));
+        assert!(argv_invokes_omp(
+            &["omp".into(), "--model".into(), "x".into()],
+            root
+        ));
+        assert!(argv_invokes_omp(&["/opt/bin/omp".into()], root));
+        assert!(argv_invokes_omp(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "omp-session".into(),
+                "--identity".into(),
+                "h.worker".into(),
+            ],
+            root
+        ));
+        // A different wrapper, a missing `--catalog`, and a lookalike program are all not omp.
+        assert!(!argv_invokes_omp(
+            &[
+                "st2".into(),
+                "--catalog".into(),
+                "/catalog".into(),
+                "driver".into(),
+                "pi-session".into(),
+                "--identity".into(),
+                "h.worker".into(),
+            ],
+            root
+        ));
+        assert!(!argv_invokes_omp(
+            &["st2".into(), "driver".into(), "omp-session".into()],
+            root
+        ));
+        assert!(!argv_invokes_omp(&["/opt/bin/omph".into()], root));
+    }
+
     fn pi_launch_classification_is_exact() {
         let root = Path::new("/catalog");
         assert!(command_invokes_pi("exec pi -a 'boot'"));

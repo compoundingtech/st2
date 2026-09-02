@@ -10,7 +10,9 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::declared::{DeclaredParse, parse_declared_document};
+use crate::declared::{
+    DeclaredDiagnosticCode, DeclaredParse, parse_declared_document,
+};
 use crate::spec::{AgentSpec, RawSpec};
 
 /// The result of walking a catalog folder. Sorted + deterministic.
@@ -81,7 +83,8 @@ pub fn discover_strict(root: &Path) -> Discovered {
 /// `root` supplies the same path defaults as [`discover`]. The returned warnings describe only
 /// this file.
 pub fn discover_file(root: &Path, path: &Path) -> anyhow::Result<(Vec<AgentSpec>, Vec<String>)> {
-    let raws = parse_raw_file(path)?;
+    let nested_in_bundle = is_nested_in_declaration_bundle(root, path);
+    let raws = parse_raw_file_with_context(Some(root), path, nested_in_bundle).raws?;
     load_specs(root, path, raws)
 }
 
@@ -94,7 +97,7 @@ fn discover_impl(root: &Path, strict: bool) -> Discovered {
     for path in files {
         let nested_in_bundle = is_nested_in_declaration_bundle(root, &path);
         let ParsedRawFile { raws, declaration } =
-            parse_raw_file_with_context(&path, nested_in_bundle);
+            parse_raw_file_with_context(Some(root), &path, nested_in_bundle);
         let agents = raws
             .as_ref()
             .map(|raws| raws.iter().map(Declared::from).collect())
@@ -136,7 +139,7 @@ fn is_nested_in_declaration_bundle(root: &Path, path: &Path) -> bool {
         if dir == root {
             break;
         }
-        if is_declaration_parent(dir) {
+        if is_declaration_parent(root, dir) {
             return true;
         }
         ancestor = dir.parent();
@@ -186,7 +189,7 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
     let mut parent = root.to_path_buf();
     for name in components {
         if matches!(name.to_str(), Some("resources" | "archive" | "inbox"))
-            && is_declaration_parent(&parent)
+            && is_declaration_parent(root, &parent)
         {
             return false;
         }
@@ -202,7 +205,7 @@ pub fn is_catalog_path(root: &Path, path: &Path) -> bool {
 /// cannot suddenly expose its inbox as candidate specs. Named declaration files are recognized
 /// only when they parse as an agent spec, which keeps ordinary project JSON/TOML/KDL from claiming
 /// an unrelated `resources` directory.
-fn is_declaration_parent(dir: &Path) -> bool {
+fn is_declaration_parent(catalog_root: &Path, dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
@@ -219,14 +222,16 @@ fn is_declaration_parent(dir: &Path) -> bool {
         if path.file_stem().and_then(|stem| stem.to_str()) == Some("agent") {
             return true;
         }
-        parse_raw_file(&path).is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec))
+        parse_raw_file(Some(catalog_root), &path)
+            .is_ok_and(|raws| raws.iter().any(RawSpec::looks_like_spec))
     })
 }
 
-/// Recursively gather candidate spec files, skipping only explicit control/runtime namespaces and
-/// anything that isn't one of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble
-/// an agent spec; it is runner state, never catalog input. Unreadable directories are skipped, not
-/// fatal in ordinary discovery. Strict discovery records them as uncertainty.
+/// Recursively gather candidate spec files, skipping explicit control/runtime namespaces, static
+/// descendants beneath a canonical `agents/<host>/<identity>` bundle, and anything that isn't one
+/// of [`SPEC_EXTS`]. `pty` session metadata includes JSON that can resemble an agent spec; it is
+/// runner state, never catalog input. Unreadable directories are skipped, not fatal in ordinary
+/// discovery. Strict discovery records them as uncertainty.
 fn collect_spec_files(
     root: &Path,
     dir: &Path,
@@ -263,6 +268,9 @@ fn collect_spec_files(
         if !is_catalog_path(root, &path) {
             continue;
         }
+        if is_canonical_bundle_descendant(root, &path) {
+            continue;
+        }
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(error) => {
@@ -286,6 +294,20 @@ fn collect_spec_files(
             });
         }
     }
+}
+
+/// Files below the canonical agent bundle root are resource/static payload, even when a nested
+/// payload happens to use a generic declaration filename such as `docs/agent.kdl`.
+fn is_canonical_bundle_descendant(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components().filter_map(|component| match component {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    });
+    components.next().and_then(|name| name.to_str()) == Some("agents")
+        && components.count() >= 4
 }
 
 fn has_spec_extension(path: &Path) -> bool {
@@ -355,14 +377,17 @@ impl From<&RawSpec> for Declared {
 /// One entry per parsed node, *including* nodes [`discover`] skips as non-specs, so this is not
 /// positionally paired with that file's [`Discovered::specs`].
 pub fn parse_declared(path: &Path) -> anyhow::Result<Vec<Declared>> {
-    Ok(parse_raw_file(path)?.iter().map(Declared::from).collect())
+    Ok(parse_raw_file(None, path)?
+        .iter()
+        .map(Declared::from)
+        .collect())
 }
 
 /// Parse a spec file into its raw (pre-resolution) shape — one per `agent` node for KDL, 0-or-1 for
 /// TOML/JSON. Non-spec extensions yield an empty vec. Shared by discovery and [`parse_declared`]
 /// (which exposes the *raw* `type` and `identity` before normalization, without leaking [`RawSpec`]).
-fn parse_raw_file(path: &Path) -> anyhow::Result<Vec<RawSpec>> {
-    parse_raw_file_with_declaration(path).raws
+fn parse_raw_file(catalog_root: Option<&Path>, path: &Path) -> anyhow::Result<Vec<RawSpec>> {
+    parse_raw_file_with_declaration(catalog_root, path).raws
 }
 
 struct ParsedRawFile {
@@ -370,11 +395,15 @@ struct ParsedRawFile {
     declaration: Option<DeclaredParse>,
 }
 
-fn parse_raw_file_with_declaration(path: &Path) -> ParsedRawFile {
-    parse_raw_file_with_context(path, false)
+fn parse_raw_file_with_declaration(catalog_root: Option<&Path>, path: &Path) -> ParsedRawFile {
+    parse_raw_file_with_context(catalog_root, path, false)
 }
 
-fn parse_raw_file_with_context(path: &Path, nested_in_bundle: bool) -> ParsedRawFile {
+fn parse_raw_file_with_context(
+    catalog_root: Option<&Path>,
+    path: &Path,
+    nested_in_bundle: bool,
+) -> ParsedRawFile {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -386,7 +415,8 @@ fn parse_raw_file_with_context(path: &Path, nested_in_bundle: bool) -> ParsedRaw
         }
     };
     if ext == "kdl" {
-        let declaration = parse_declared_document(path, &text);
+        let mut declaration = parse_declared_document(path, &text);
+        admit_catalog_envelope_nodes(catalog_root, path, &mut declaration);
         let is_adjacent_kdl = declaration
             .document
             .as_ref()
@@ -435,6 +465,36 @@ fn parse_raw_file_with_context(path: &Path, nested_in_bundle: bool) -> ParsedRaw
         raws,
         declaration: None,
     }
+}
+
+/// The catalog root's `catalog.kdl` is a shared envelope: st2 owns its `catalog`/`profile` nodes
+/// while Agent Spec discovery owns any colocated `agent` nodes. Suppress only the top-level
+/// diagnostics attached to those two explicitly admitted envelope node kinds; a nested file that
+/// merely shares the basename has no catalog-control-plane authority.
+fn admit_catalog_envelope_nodes(
+    catalog_root: Option<&Path>,
+    path: &Path,
+    declaration: &mut DeclaredParse,
+) {
+    let Some(catalog_root) = catalog_root else {
+        return;
+    };
+    if path.strip_prefix(catalog_root).ok() != Some(Path::new("catalog.kdl")) {
+        return;
+    }
+    let Some(document) = declaration.document.as_ref() else {
+        return;
+    };
+    let admitted_spans = document
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.name.as_str(), "catalog" | "profile"))
+        .map(|node| node.span)
+        .collect::<Vec<_>>();
+    declaration.diagnostics.retain(|diagnostic| {
+        diagnostic.code != DeclaredDiagnosticCode::UnexpectedTopLevelNode
+            || !admitted_spans.contains(&diagnostic.span)
+    });
 }
 
 /// Parse one file into `(specs, warnings)`. TOML/JSON yield 0-or-1 spec; KDL yields one per `agent`

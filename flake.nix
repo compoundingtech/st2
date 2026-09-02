@@ -4,10 +4,19 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    fenix.url = "github:nix-community/fenix";
+    fenix.inputs.nixpkgs.follows = "nixpkgs";
     # Packaged PTY dependency: the merged revision with atomic metadata patching and the
     # fleet-observation guarantees required by st2 reconciliation.
     pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
     pty.inputs.nixpkgs.follows = "nixpkgs";
+    # Shared tooling packages from overengineering: provides the `otelite`
+    # OTLP collector binary that the OTel export integration gate
+    # (`tests/otel_export.rs`, exposed as `checks.otel-export`) drives to
+    # prove real span export end-to-end. Pinned to a full rev (like `pty`)
+    # so CI is reproducible; bump deliberately via `nix flake lock`.
+    effect-utils.url =
+      "github:overengineeringstudio/effect-utils/911e2ce0f4ac39d2b54f9ebd6df035234982f721";
   };
 
   outputs =
@@ -15,12 +24,23 @@
       self,
       nixpkgs,
       flake-utils,
+      fenix,
       pty,
+      effect-utils,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        providerRustToolchain = fenix.packages.${system}.combine [
+          fenix.packages.${system}.stable.cargo
+          fenix.packages.${system}.stable.rustc
+          fenix.packages.${system}.targets.wasm32-unknown-unknown.stable.rust-std
+        ];
+        providerRustPlatform = pkgs.makeRustPlatform {
+          cargo = providerRustToolchain;
+          rustc = providerRustToolchain;
+        };
 
         # Cargo.toml is the single source of truth for the version, so a release
         # bump needs no matching edit here.
@@ -71,6 +91,7 @@
           # env var, captured at compile time by `option_env!` (see
           # src/version.rs). A derivation env var change rebuilds the crate.
           CLI_BUILD_STAMP = buildStamp;
+          ST2_EXECUTOR_BUILD_IDENTITY = buildStamp;
           AGENT_SPEC_REVISION = agentSpecRevision;
 
           # The hook integration test executes the shipped Bash scripts with
@@ -118,6 +139,12 @@
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
             "--workspace"
+            "--exclude"
+            "st2-resource-providers"
+            "--exclude"
+            "st2-github-issue-component"
+            "--exclude"
+            "st2-pty-stats-component"
             "--lib"
             "--bins"
             "--test"
@@ -182,6 +209,123 @@
           ${st3}/bin/st3-migrate --help >> $out
         '';
 
+        # Production variant for catalogs that declare wasm resource-profile resolvers. Keep the
+        # default package lightweight; consumers opt into the wasmtime closure explicitly.
+        st2WasmResolver = st2.overrideAttrs (old: {
+          pname = "st2-wasm-resolver";
+          cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasm-resolver" ];
+          cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasm-resolver" ];
+          # Wasmtime's Cranelift build and the feature-gated resolver tests need the Rust toolchain
+          # inherited from buildRustPackage plus an LLVM linker on every supported platform.
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
+        });
+
+        # Non-vacuous feature gate: both the runner's live resync integration and agent-spec's wasm
+        # ABI/containment suite compile and execute with the same features as the production variant.
+        st2WasmResolverCheck = st2WasmResolver.overrideAttrs (_: {
+          pname = "st2-wasm-resolver-check";
+          cargoTestFlags = [
+            "--workspace"
+            "--exclude"
+            "st2-resource-providers"
+            "--exclude"
+            "st2-github-issue-component"
+            "--exclude"
+            "st2-pty-stats-component"
+            "--test"
+            "resync"
+            "--test"
+            "resync_notify_chain"
+            "--test"
+            "profile_wasm"
+          ];
+        });
+
+        # The default workspace remains Wasmtime-free; this focused gate opts the Component Model
+        # executor into its runtime feature and drives its fixture and cache trust boundary.
+        st2Wasip2ExecutorCheck = st2.overrideAttrs (old: {
+          pname = "st2-resource-wasip2-check";
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
+          cargoTestFlags = [
+            "-p"
+            "st2-resource-wasip2"
+            "--features"
+            "runtime"
+            "--lib"
+            "--test"
+            "executor"
+          ];
+        });
+
+        buildProviderComponent =
+          {
+            package,
+            wasmName,
+          }:
+          providerRustPlatform.buildRustPackage {
+            pname = package;
+            inherit version;
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildPhase = ''
+              runHook preBuild
+              cargo build --offline --release -p ${package} --target wasm32-unknown-unknown
+              runHook postBuild
+            '';
+            doCheck = false;
+            nativeBuildInputs = [
+              pkgs.lld
+              pkgs.wasm-tools
+            ];
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/share/st2/providers"
+              wasm-tools component new \
+                "target/wasm32-unknown-unknown/release/${wasmName}.wasm" \
+                -o "$out/share/st2/providers/${wasmName}.component.wasm"
+              runHook postInstall
+            '';
+          };
+
+        st2GitHubIssueComponent = buildProviderComponent {
+          package = "st2-github-issue-component";
+          wasmName = "st2_github_issue_component";
+        };
+
+        st2PtyStatsComponent = buildProviderComponent {
+          package = "st2-pty-stats-component";
+          wasmName = "st2_pty_stats_component";
+        };
+
+        st2ProviderRuntime = st2.overrideAttrs (old: {
+          pname = "st2-provider-runtime";
+          cargoBuildFeatures = (old.cargoBuildFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
+          cargoCheckFeatures = (old.cargoCheckFeatures or [ ]) ++ [ "wasip2-provider-runtime" ];
+          nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+            pkgs.lld
+            pty.packages.${system}.default
+          ];
+        });
+
+        st2ProviderRuntimeCheck = st2ProviderRuntime.overrideAttrs (_: {
+          pname = "st2-provider-runtime-check";
+          ST2_GITHUB_ISSUE_COMPONENT = "${st2GitHubIssueComponent}/share/st2/providers/st2_github_issue_component.component.wasm";
+          ST2_PTY_STATS_COMPONENT = "${st2PtyStatsComponent}/share/st2/providers/st2_pty_stats_component.component.wasm";
+          cargoTestFlags = [
+            "-p"
+            "st2-resource-providers"
+            "--lib"
+            "-p"
+            "st2"
+            "--features"
+            "st2/wasip2-provider-runtime"
+            "--test"
+            "resource_profile_supervisor_e2e"
+            "--test"
+            "resource_provider_e2e"
+          ];
+        });
+
         # Narrow sandbox-safe integration gate for the atomic snapshot boundary. The main package
         # deliberately omits the broad doctor suite because some doctor cases exercise facilities
         # unavailable in the Nix sandbox. A dedicated target containing exactly one test makes the
@@ -237,6 +381,29 @@
           ];
         });
 
+        # OTLP export integration gate. `tests/otel_export.rs` is skipped
+        # unless `ST2_OTELITE_BIN` points at a real collector, so the package's
+        # own test boundary never exercises span export — this dedicated
+        # derivation is what makes the contract non-vacuous: it pins the exact
+        # `otelite` build from effect-utils and does NOT set
+        # `ST2_ALLOW_OTEL_SKIP`, so a broken export path fails the gate instead
+        # of silently skipping.
+        st2OtelExport = st2.overrideAttrs (old: {
+          pname = "st2-otel-export-check";
+          # The test drives `st2 up --once`, whose reconcile pass shells out to
+          # `pty list --json` — the same real-producer requirement as
+          # st2ParkedRecovery, so the packaged pty must be on the check's PATH.
+          nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
+            pty.packages.${system}.default
+            effect-utils.packages.${system}.otelite
+          ];
+          ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          cargoTestFlags = [
+            "--test"
+            "otel_export"
+          ];
+        });
+
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
           cp -R ${self} $out
           chmod -R u+w $out
@@ -259,6 +426,10 @@
         packages.st2 = st2;
         packages.st3 = st3;
         packages.st3-migrate = st3;
+        packages.st2-wasm-resolver = st2WasmResolver;
+        packages.st2-provider-runtime = st2ProviderRuntime;
+        packages.st2-github-issue-component = st2GitHubIssueComponent;
+        packages.st2-pty-stats-component = st2PtyStatsComponent;
         packages.default = st2;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
@@ -277,6 +448,39 @@
         checks.catalog-bootstrap = st2CatalogBootstrap;
         checks.message-cli = st2MessageCli;
         checks.parked-recovery = st2ParkedRecovery;
+        checks.otel-export = st2OtelExport;
+        checks.wasm-resolver-feature = st2WasmResolverCheck;
+        checks.wasip2-resource-executor = st2Wasip2ExecutorCheck;
+        checks.wasip2-resource-providers = st2ProviderRuntimeCheck;
+        checks.github-issue-component = st2GitHubIssueComponent;
+        checks.pty-stats-component = st2PtyStatsComponent;
+        # Exercise the shipped binary, not a cargo-side surrogate: its version entrypoint runs and
+        # the same artifact strictly admits a catalog carrying a real wasm profile module.
+        checks.wasm-resolver-artifact = pkgs.runCommand "st2-wasm-resolver-artifact-${version}" { } ''
+          ${st2WasmResolver}/bin/st2 --version |
+            ${pkgs.gnugrep}/bin/grep -E '^st2 [^[:space:]]+' >/dev/null
+
+          catalog="$TMPDIR/catalog"
+          mkdir -p "$catalog/resolvers" "$catalog/h/worker"
+          cp ${self}/crates/agent-spec/tests/fixtures/demo_resolver.wasm \
+            "$catalog/resolvers/goal.wasm"
+          cat > "$catalog/catalog.kdl" <<'EOF'
+          profile "dev.schickling.agent-goal" {
+            wasm "resolvers/goal.wasm"
+            class "immediate"
+          }
+          EOF
+          cat > "$catalog/h/worker/agent.kdl" <<'EOF'
+          agent "worker" {
+            host "h"
+            command "true"
+            resource "goal" uri="dev.schickling.agent-goal://h/worker" reason="Mission."
+          }
+          EOF
+
+          ${st2WasmResolver}/bin/st2 validate "$catalog" --host h --strict
+          touch "$out"
+        '';
 
         # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
         # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
@@ -328,17 +532,32 @@
             # result here would mean nothing.
             test -f hooks/pi-channel.ts
             grep -q '@earendil-works/pi-coding-agent' hooks/pi-channel.ts
+            test -f hooks/omp-channel.ts
+            grep -q '@earendil-works/pi-coding-agent' hooks/omp-channel.ts
 
             tsc --noEmit -p hooks/typecheck/tsconfig.json
 
             # Runtime smoke: the type gate is provably blind to execution-order defects (a TDZ
             # use-before-declaration shipped green through it), so the asset is transpiled and
             # actually driven through its open path.
+            #
+            # Each handler is driven with three contexts — bare, fully populated, and one whose
+            # every telemetry pull throws — because a bare context takes the fail-open branch and
+            # never executes the harness-context producer's body at all, which is the same blind
+            # spot in a new place. The channel is a recorder rather than `true`, so the smoke reads
+            # the frames back and asserts the wire `src/pi_channel.rs` decodes: with a pipe nobody
+            # reads, a producer that silently emits nothing is indistinguishable from a working
+            # one, and that failure looks exactly like the pre-producer state where every
+            # declaration's context reads null. Nothing else couples the two halves of that wire —
+            # they are different languages in different files.
             ${pkgs.esbuild}/bin/esbuild hooks/pi-channel.ts \
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/pi-channel.mjs
-            SMOKE_TRUE_BIN=${pkgs.coreutils}/bin/true \
-              ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/smoke.mjs
+            ${pkgs.esbuild}/bin/esbuild hooks/omp-channel.ts \
+              --format=esm --platform=node --target=es2022 \
+              --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
             touch $out
           '';
 
@@ -483,8 +702,18 @@
             pkgs.rustfmt
             pkgs.rust-analyzer
             pkgs.git
+            # wasm guest modules (resource-profile resolvers) link with lld; nixpkgs rustc does
+            # not bundle rust-lld the way the rustup toolchain does.
+            pkgs.lld
             pty.packages.${system}.default
+            # Local runs of the OTLP export integration gate
+            # (`cargo test --test otel_export`) need the same collector the
+            # Nix check pins; `ST2_OTELITE_BIN` points at it.
+            effect-utils.packages.${system}.otelite
           ];
+          # Same collector the Nix gate pins, so a bare
+          # `cargo test --test otel_export` in this shell runs against it.
+          ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
         };
       }
     );

@@ -13,6 +13,11 @@ fn st2() -> Command {
     Command::new(env!("CARGO_BIN_EXE_st2"))
 }
 
+const DEMO_WASM_SRC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/agent-spec/tests/fixtures/demo_resolver.wasm"
+);
+
 fn agent(identity: &str, retired: bool) -> String {
     format!("agent \"{identity}\" {{\n  host \"host\"\n  retired #{retired}\n  argv \"true\"\n}}\n")
 }
@@ -56,6 +61,17 @@ fn ensure_external_pty_config(catalog: &Path) {
         )
         .unwrap();
     }
+}
+
+fn profile_catalog_config(profiles: &[(&str, &str)]) -> String {
+    let mut config =
+        "catalog { pty-root \"/tmp/st2-catalog-transaction-test-pty\" }\n".to_string();
+    for (scheme, module) in profiles {
+        config.push_str(&format!(
+            "profile {scheme:?} {{ wasm {module:?} }}\n"
+        ));
+    }
+    config
 }
 
 fn snapshot(catalog: &Path, output: &Path) -> Value {
@@ -412,10 +428,18 @@ fn apply_input_fence_survives_source_free_crash_resume() {
         .output()
         .unwrap();
     assert!(!interrupted.status.success());
-    let marker: Value =
-        serde_json::from_slice(&fs::read(catalog.join(".st2/catalog-apply-incomplete")).unwrap())
-            .unwrap();
+    let marker_path = catalog.join(".st2/catalog-apply-incomplete");
+    let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
     assert_eq!(marker["preparedRootSha256"], input_sha256);
+    assert!(
+        marker
+            .as_object_mut()
+            .unwrap()
+            .remove("originalProfileModules")
+            .is_some(),
+        "the current writer must include the field before emulating an older v1 marker"
+    );
+    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
     fs::remove_dir_all(&prepared).unwrap();
 
     let recovered = resume(&catalog);
@@ -1030,6 +1054,7 @@ fn write_test_marker(catalog: &Path, original_paths: &[&str]) {
         "stageName": format!("catalog-apply-stage-{hash}"),
         "expectedRootSha256": hash,
         "preparedRootSha256": "0".repeat(64),
+        "originalProfileModules": [],
         "originalPaths": original_paths,
     });
     fs::write(
@@ -1185,6 +1210,521 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
     assert_eq!(second["status"], "unchanged");
     assert_eq!(second["rootSha256"], first["rootSha256"]);
 }
+#[test]
+fn snapshot_projects_relative_profile_modules_once_and_hashes_their_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    fs::create_dir(catalog.join("resolvers")).unwrap();
+    fs::write(catalog.join("resolvers/goal.wasm"), b"module-v1").unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        profile_catalog_config(&[
+            ("dev.example.goal", "resolvers/goal.wasm"),
+            ("dev.example.alias", "resolvers/./goal.wasm"),
+        ]),
+    )
+    .unwrap();
+
+    let first_output = temp.path().join("first");
+    let first = snapshot(&catalog, &first_output);
+    assert!(first_output.join("catalog.kdl").is_file());
+    assert_eq!(
+        fs::read(first_output.join("resolvers/goal.wasm")).unwrap(),
+        b"module-v1"
+    );
+    assert_eq!(first["entries"], 3);
+
+    fs::write(catalog.join("resolvers/goal.wasm"), b"module-v2").unwrap();
+    let second = snapshot(&catalog, &temp.path().join("second"));
+    assert_ne!(first["rootSha256"], second["rootSha256"]);
+}
+
+#[test]
+fn absolute_profile_module_is_an_external_input_and_is_not_bundled() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let module = catalog.join("external-by-declaration.wasm");
+    fs::write(&module, b"external").unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.external", module.to_str().unwrap())]),
+    )
+    .unwrap();
+
+    let output = temp.path().join("snapshot");
+    let result = snapshot(&catalog, &output);
+    assert_eq!(result["entries"], 2);
+    assert!(!output.join("external-by-declaration.wasm").exists());
+}
+
+#[test]
+fn relative_profile_modules_reject_unsafe_missing_and_unprojected_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    for case in ["traversal", "missing", "symlink", "fifo", "oversized"] {
+        let catalog = temp.path().join(format!("catalog-{case}"));
+        write_agent(&catalog, "worker", false);
+        fs::create_dir(catalog.join("resolvers")).unwrap();
+        let declared = match case {
+            "traversal" => "../escape.wasm",
+            _ => "resolvers/goal.wasm",
+        };
+        fs::write(
+            catalog.join("catalog.kdl"),
+            profile_catalog_config(&[("dev.example.goal", declared)]),
+        )
+        .unwrap();
+        match case {
+            "traversal" | "missing" => {}
+            "symlink" => {
+                let external = temp.path().join("external.wasm");
+                fs::write(&external, b"external").unwrap();
+                std::os::unix::fs::symlink(
+                    &external,
+                    catalog.join("resolvers/goal.wasm"),
+                )
+                .unwrap();
+            }
+            "fifo" => {
+                let fifo = catalog.join("resolvers/goal.wasm");
+                let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            }
+            "oversized" => {
+                let module = fs::File::create(catalog.join("resolvers/goal.wasm")).unwrap();
+                module
+                    .set_len(agent_spec::profile::DEFAULT_MODULE_LIMIT_BYTES as u64 + 1)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let output = st2()
+            .args([
+                "catalog",
+                "snapshot",
+                "--catalog",
+                catalog.to_str().unwrap(),
+                "--output",
+                temp.path()
+                    .join(format!("snapshot-{case}"))
+                    .to_str()
+                    .unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "profile module case {case} unexpectedly succeeded"
+        );
+    }
+
+    let missing = temp.path().join("catalog-validation-missing");
+    write_agent(&missing, "worker", false);
+    fs::write(
+        missing.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "missing.wasm")]),
+    )
+    .unwrap();
+    assert!(
+        st2::validate::validate(&missing)
+            .issues
+            .iter()
+            .any(|issue| issue.code == "profile-module")
+    );
+
+    let catalog = temp.path().join("catalog-extra");
+    write_agent(&catalog, "worker", false);
+    fs::create_dir(catalog.join("resolvers")).unwrap();
+    fs::write(catalog.join("resolvers/goal.wasm"), b"goal").unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/goal.wasm")]),
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared-extra");
+    let before = snapshot(&catalog, &prepared);
+    fs::write(prepared.join("resolvers/extra.wasm"), b"extra").unwrap();
+    let rejected = apply(&catalog, &prepared, before["rootSha256"].as_str().unwrap());
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unprojected file"));
+}
+
+#[test]
+fn raw_preimage_repairs_catalogs_with_unadmitted_profile_modules() {
+    let temp = tempfile::tempdir().unwrap();
+    for case in ["traversal", "missing", "symlink", "fifo", "oversized"] {
+        let catalog = temp.path().join(format!("raw-module-{case}"));
+        write_agent(&catalog, "worker", false);
+        fs::create_dir(catalog.join("resolvers")).unwrap();
+        let declared = if case == "traversal" {
+            "../escape.wasm"
+        } else {
+            "resolvers/goal.wasm"
+        };
+        fs::write(
+            catalog.join("catalog.kdl"),
+            profile_catalog_config(&[("dev.example.goal", declared)]),
+        )
+        .unwrap();
+        match case {
+            "traversal" | "missing" => {}
+            "symlink" => {
+                let external = temp.path().join("raw-external.wasm");
+                fs::write(&external, b"external").unwrap();
+                std::os::unix::fs::symlink(
+                    &external,
+                    catalog.join("resolvers/goal.wasm"),
+                )
+                .unwrap();
+            }
+            "fifo" => {
+                let fifo = catalog.join("resolvers/goal.wasm");
+                let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            }
+            "oversized" => {
+                let module = fs::File::create(catalog.join("resolvers/goal.wasm")).unwrap();
+                module
+                    .set_len(agent_spec::profile::DEFAULT_MODULE_LIMIT_BYTES as u64 + 1)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let raw_output = temp.path().join(format!("raw-module-capture-{case}"));
+        let captured = raw_snapshot(&catalog, &raw_output);
+        assert!(
+            captured.status.success(),
+            "raw capture {case}: {}",
+            String::from_utf8_lossy(&captured.stderr)
+        );
+        let captured: Value = serde_json::from_slice(&captured.stdout).unwrap();
+        assert!(raw_output.join("catalog.kdl").is_file());
+        assert!(raw_output.join("agents/host/worker/agent.kdl").is_file());
+        assert!(!raw_output.join("resolvers/goal.wasm").exists());
+
+        let desired = temp.path().join(format!("raw-module-desired-{case}"));
+        write_agent(&desired, "worker", false);
+        fs::create_dir(desired.join("resolvers")).unwrap();
+        fs::copy(DEMO_WASM_SRC, desired.join("resolvers/repaired.wasm")).unwrap();
+        fs::write(
+            desired.join("catalog.kdl"),
+            profile_catalog_config(&[("dev.example.goal", "resolvers/repaired.wasm")]),
+        )
+        .unwrap();
+        let prepared = temp.path().join(format!("raw-module-prepared-{case}"));
+        snapshot(&desired, &prepared);
+
+        let repaired = raw_apply(
+            &catalog,
+            &prepared,
+            captured["rootSha256"].as_str().unwrap(),
+        );
+        assert!(
+            repaired.status.success(),
+            "raw repair {case}: {}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        assert!(catalog.join("resolvers/repaired.wasm").is_file());
+        assert!(
+            fs::read_to_string(catalog.join("catalog.kdl"))
+                .unwrap()
+                .contains("resolvers/repaired.wasm")
+        );
+    }
+}
+
+#[test]
+fn profile_modules_reject_reserved_catalog_paths_before_apply_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let reserved = [
+        ".st2/generation",
+        ".git/x.wasm",
+        "pty/x.wasm",
+        "workspace/x.wasm",
+        "workspaces/x.wasm",
+        "resources/x.wasm",
+        "agents/host/worker/.workspace/x.wasm",
+        "agents/host/worker/resources/x.wasm",
+        "agents/host/worker/archive/x.wasm",
+        "agents/host/worker/inbox/x.wasm",
+        "agents/host/worker/status/x.wasm",
+        "_templates/resources/x.wasm",
+    ];
+    for (index, declared) in reserved.into_iter().enumerate() {
+        let source = temp.path().join(format!("reserved-source-{index}"));
+        write_agent(&source, "worker", false);
+        let module = source.join(declared);
+        fs::create_dir_all(module.parent().unwrap()).unwrap();
+        fs::write(&module, b"module").unwrap();
+        fs::write(
+            source.join("catalog.kdl"),
+            profile_catalog_config(&[("dev.example.reserved", declared)]),
+        )
+        .unwrap();
+
+        let snapshot_output = temp.path().join(format!("reserved-snapshot-{index}"));
+        let rejected_snapshot = st2()
+            .args([
+                "catalog",
+                "snapshot",
+                "--catalog",
+                source.to_str().unwrap(),
+                "--output",
+                snapshot_output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !rejected_snapshot.status.success()
+                && String::from_utf8_lossy(&rejected_snapshot.stderr)
+                    .contains("reserved control/state path"),
+            "reserved module {declared}: {}",
+            String::from_utf8_lossy(&rejected_snapshot.stderr)
+        );
+        assert!(!snapshot_output.exists());
+
+        let catalog = temp.path().join(format!("reserved-live-{index}"));
+        write_agent(&catalog, "worker", false);
+        let before = snapshot(
+            &catalog,
+            &temp.path().join(format!("reserved-before-{index}")),
+        );
+        let live_config = fs::read(catalog.join("catalog.kdl")).unwrap();
+        let live_spec = fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap();
+        let rejected_apply = apply(&catalog, &source, before["rootSha256"].as_str().unwrap());
+        assert!(
+            !rejected_apply.status.success(),
+            "reserved module apply unexpectedly succeeded: {declared}"
+        );
+        assert_eq!(fs::read(catalog.join("catalog.kdl")).unwrap(), live_config);
+        assert_eq!(
+            fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
+            live_spec
+        );
+        assert!(!catalog.join(declared).exists());
+        assert!(!catalog.join(".st2/catalog-generation").exists());
+        assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    }
+}
+
+#[test]
+fn prepared_profile_bundle_applies_and_loads_from_live_catalog() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let before = snapshot(&catalog, &temp.path().join("before"));
+
+    let source = temp.path().join("source");
+    write_agent(&source, "worker", false);
+    fs::create_dir(source.join("resolvers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, source.join("resolvers/goal.wasm")).unwrap();
+    fs::write(
+        source.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/goal.wasm")]),
+    )
+    .unwrap();
+    let prepared = temp.path().join("prepared-profile");
+    snapshot(&source, &prepared);
+
+    let applied = apply(&catalog, &prepared, before["rootSha256"].as_str().unwrap());
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(
+        fs::read(catalog.join("resolvers/goal.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+    let registry = st2::catalog::declared_profiles(&catalog).unwrap();
+    assert_eq!(
+        registry.get("dev.example.goal").unwrap().module(),
+        Some(catalog.join("resolvers/goal.wasm").as_path())
+    );
+}
+#[test]
+fn profile_module_publication_is_superset_biased_around_catalog_kdl() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    fs::create_dir(catalog.join("resolvers")).unwrap();
+    fs::write(catalog.join("resolvers/old.wasm"), b"old").unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/old.wasm")]),
+    )
+    .unwrap();
+    let before = snapshot(&catalog, &temp.path().join("before-publication"));
+
+    let source = temp.path().join("publication-source");
+    write_agent(&source, "worker", false);
+    fs::create_dir(source.join("resolvers")).unwrap();
+    fs::write(source.join("resolvers/new.wasm"), b"new").unwrap();
+    fs::write(
+        source.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/new.wasm")]),
+    )
+    .unwrap();
+    let prepared = temp.path().join("publication-prepared");
+    snapshot(&source, &prepared);
+
+    let ready = temp.path().join("publication-ready");
+    let release = temp.path().join("publication-release");
+    let child = paused_apply(
+        &catalog,
+        &prepared,
+        before["rootSha256"].as_str().unwrap(),
+        "mid-write",
+        &ready,
+        &release,
+    );
+    wait_for(&ready);
+    assert!(
+        fs::read_to_string(catalog.join("catalog.kdl"))
+            .unwrap()
+            .contains("resolvers/old.wasm")
+    );
+    assert!(catalog.join("resolvers/old.wasm").is_file());
+    assert!(catalog.join("resolvers/new.wasm").is_file());
+
+    fs::write(&release, "").unwrap();
+    let applied = child.wait_with_output().unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(
+        fs::read_to_string(catalog.join("catalog.kdl"))
+            .unwrap()
+            .contains("resolvers/new.wasm")
+    );
+    assert!(!catalog.join("resolvers/old.wasm").exists());
+    assert!(catalog.join("resolvers/new.wasm").is_file());
+}
+
+#[test]
+fn profile_module_recovery_admits_only_recorded_projected_module_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog-recovery-profile");
+    write_agent(&catalog, "worker", false);
+    fs::create_dir(catalog.join("resolvers")).unwrap();
+    fs::write(catalog.join("resolvers/old.wasm"), b"old").unwrap();
+    fs::write(
+        catalog.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/old.wasm")]),
+    )
+    .unwrap();
+    let before = snapshot(&catalog, &temp.path().join("recovery-profile-before"));
+
+    let source = temp.path().join("recovery-profile-source");
+    write_agent(&source, "worker", false);
+    fs::create_dir(source.join("resolvers")).unwrap();
+    fs::write(source.join("resolvers/new.wasm"), b"new").unwrap();
+    fs::write(
+        source.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.goal", "resolvers/new.wasm")]),
+    )
+    .unwrap();
+    let prepared = temp.path().join("recovery-profile-prepared");
+    let desired = snapshot(&source, &prepared);
+    let crashed = st2()
+        .args([
+            "catalog",
+            "apply",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--prepared",
+            prepared.to_str().unwrap(),
+            "--input-sha256",
+            desired["rootSha256"].as_str().unwrap(),
+            "--expect-sha256",
+            before["rootSha256"].as_str().unwrap(),
+        ])
+        .env("ST2_TEST_CATALOG_APPLY_CRASH_AT", "marker-created")
+        .output()
+        .unwrap();
+    assert!(!crashed.status.success());
+
+    let marker = catalog.join(".st2/catalog-apply-incomplete");
+    let marker_json: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(
+        marker_json["originalProfileModules"],
+        serde_json::json!(["resolvers/old.wasm"])
+    );
+    assert!(
+        marker_json["originalPaths"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("resolvers/old.wasm".to_owned()))
+    );
+
+    let forged_resolver = catalog.join("resolvers/forged.wasm");
+    fs::write(&forged_resolver, b"preserve").unwrap();
+    let mut forged_extra = marker_json.clone();
+    forged_extra["originalPaths"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("resolvers/forged.wasm".to_owned()));
+    forged_extra["originalPaths"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    fs::write(&marker, serde_json::to_vec(&forged_extra).unwrap()).unwrap();
+    let rejected_extra = resume(&catalog);
+    assert!(
+        !rejected_extra.status.success()
+            && String::from_utf8_lossy(&rejected_extra.stderr)
+                .contains("unowned declaration path"),
+        "{}",
+        String::from_utf8_lossy(&rejected_extra.stderr)
+    );
+    assert_eq!(fs::read(&forged_resolver).unwrap(), b"preserve");
+
+    let reserved_module = catalog.join(".git/forged.wasm");
+    fs::create_dir_all(reserved_module.parent().unwrap()).unwrap();
+    fs::write(&reserved_module, b"preserve").unwrap();
+    let mut forged_reserved = marker_json.clone();
+    for field in ["originalPaths", "originalProfileModules"] {
+        forged_reserved[field]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String(".git/forged.wasm".to_owned()));
+        forged_reserved[field]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    }
+    fs::write(&marker, serde_json::to_vec(&forged_reserved).unwrap()).unwrap();
+    let rejected_reserved = resume(&catalog);
+    assert!(
+        !rejected_reserved.status.success()
+            && String::from_utf8_lossy(&rejected_reserved.stderr)
+                .contains("reserved profile module path"),
+        "{}",
+        String::from_utf8_lossy(&rejected_reserved.stderr)
+    );
+    assert_eq!(fs::read(&reserved_module).unwrap(), b"preserve");
+
+    fs::write(&marker, serde_json::to_vec(&marker_json).unwrap()).unwrap();
+    fs::remove_dir_all(&prepared).unwrap();
+    let recovered = resume(&catalog);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(!marker.exists());
+    assert!(!catalog.join("resolvers/old.wasm").exists());
+    assert_eq!(fs::read(catalog.join("resolvers/new.wasm")).unwrap(), b"new");
+}
+
+
 
 #[test]
 fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
@@ -2577,6 +3117,7 @@ fn mismatched_recovery_and_malformed_markers_remain_fenced_without_mutation() {
             .starts_with("catalog-apply-stage-")
     );
     assert!(marker_json["preparedRootSha256"].as_str().is_some());
+    assert!(marker_json["originalProfileModules"].is_array());
     assert!(marker_json["originalPaths"].is_array());
 
     fs::write(
@@ -2707,11 +3248,13 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         "{}",
         String::from_utf8_lossy(&context.stderr)
     );
-    let resource = st2()
+    let message = st2()
         .args([
-            "resource",
-            "add",
-            "https://example.test/result",
+            "message",
+            "send",
+            "host.old",
+            "-m",
+            "state plane during apply",
             "--catalog",
             catalog_text,
             "--as",
@@ -2722,9 +3265,9 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         .output()
         .unwrap();
     assert!(
-        resource.status.success(),
+        message.status.success(),
         "{}",
-        String::from_utf8_lossy(&resource.stderr)
+        String::from_utf8_lossy(&message.stderr)
     );
     let status = st2()
         .args([
@@ -2749,7 +3292,7 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
         "working during apply"
     );
     assert!(
-        old.join("resources/links")
+        old.join("resources/inbox")
             .read_dir()
             .unwrap()
             .next()
@@ -3038,7 +3581,7 @@ fn marker_time_status_write_remains_bound_to_its_retained_agent_capability() {
 }
 
 #[test]
-fn marker_time_context_and_resource_writes_reject_a_swapped_state_ancestor() {
+fn marker_time_state_plane_writes_reject_a_swapped_state_ancestor() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
     write_agent(&catalog, "old", false);
@@ -3077,15 +3620,17 @@ fn marker_time_context_and_resource_writes_reject_a_swapped_state_ancestor() {
             "must-not-land",
         ),
         (
-            "resource",
+            "decisions",
             vec![
-                "resource",
-                "add",
-                "https://example.test/must-not-land",
+                "context",
+                "append",
+                "host.old",
+                "--decision",
+                "must-not-land",
+                "--why",
+                "must-not-land",
                 "--catalog",
                 catalog.to_str().unwrap(),
-                "--as",
-                "host.old",
                 "--host",
                 "host",
             ],

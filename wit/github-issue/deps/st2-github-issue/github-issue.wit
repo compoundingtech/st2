@@ -1,0 +1,24 @@
+package compoundingtech:st2-github-issue@0.1.0;
+
+interface github-issue {
+  record issue-request {
+    owner: string,
+    repo: string,
+    number: u64,
+    etag: option<string>,
+  }
+
+  variant issue-response {
+    ok(tuple<option<string>, list<u8>>),
+    not-modified(option<string>),
+  }
+
+  variant issue-error {
+    denied,
+    unavailable,
+    resource-exhausted,
+    deadline-exceeded,
+  }
+
+  get: func(request: issue-request) -> result<issue-response, issue-error>;
+}

@@ -968,7 +968,7 @@ fn write_eval_driver(output: &mut String, driver: &Driver) {
             driver.args.as_slice(),
             None,
         ),
-        Driver::Pi(_) | Driver::OpenCode(_) => {
+        Driver::Pi(_) | Driver::OpenCode(_) | Driver::Omp(_) => {
             unreachable!("the compact eval grammar accepts only Claude and Codex drivers")
         }
     };
@@ -1119,7 +1119,7 @@ fn infer_agent_model(agent: &st2::eval_spec::SpecAgent) -> Option<String> {
     match agent.driver.as_ref() {
         Some(Driver::Claude(driver)) => driver.model.clone(),
         Some(Driver::Codex(driver)) => driver.model.clone(),
-        Some(Driver::Pi(_)) | Some(Driver::OpenCode(_)) => None,
+        Some(Driver::Pi(_)) | Some(Driver::OpenCode(_)) | Some(Driver::Omp(_)) => None,
         None => agent.command.as_deref().and_then(infer_model),
     }
 }

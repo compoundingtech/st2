@@ -5,10 +5,10 @@
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
 //! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, `deliver`, typed harness drivers, task lifecycle, Resource bindings (declaration
-//! metadata), and the tasks. Everything else that is render-only (`harness`, `model`, `persona`,
-//! `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked into the
-//! tasks/commands by the render layer and ignored here.
+//! `restart{}`, `deliver`, `session-driver`, typed harness drivers, task lifecycle, Resource
+//! bindings (declaration metadata), and the tasks. Everything else that is render-only (`harness`,
+//! `model`, `persona`, `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked
+//! into the tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
 //! TOML/JSON (serde). Every spec is a `service` — `type = batch` is retired; evals run through the
@@ -68,7 +68,119 @@ impl DeliveryTransport {
             ),
         }
     }
+
+    pub fn session_driver(self) -> SessionDriver {
+        match self {
+            Self::Mcp => SessionDriver::Claude,
+            Self::AppServer => SessionDriver::Codex,
+            Self::PiChannel => SessionDriver::Pi,
+        }
+    }
 }
+/// The native session driver entered by an otherwise opaque launch.
+///
+/// This is an ownership assertion only. It does not render a provider launch or select a message
+/// delivery transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionDriver {
+    Claude,
+    Codex,
+    Pi,
+    OpenCode,
+    Omp,
+}
+
+impl SessionDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
+            "opencode" => Ok(Self::OpenCode),
+            "omp" => Ok(Self::Omp),
+            _ => anyhow::bail!(
+                "unsupported `session-driver` value '{value}' (expected `claude`, `codex`, `pi`, `opencode`, or `omp`)"
+            ),
+        }
+    }
+
+    /// Parse the canonical driver name carried by `session-driver`.
+    pub fn from_name(value: &str) -> anyhow::Result<Self> {
+        Self::parse(value)
+    }
+}
+
+/// Non-secret facts that prove how a managed session can be admitted for delivery.
+///
+/// This is deliberately separate from activity and runtime health. A credential-backed seat names
+/// only its opaque account identifier; an anonymous seat names the exact harness and model allowlist
+/// it can launch without credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+pub enum DeliveryReadiness {
+    Credential {
+        account_id: Option<String>,
+    },
+    Anonymous {
+        harness: SessionDriver,
+        models: Vec<String>,
+    },
+}
+
+impl DeliveryReadiness {
+    pub fn validate(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Credential { account_id } => {
+                if let Some(account_id) = account_id {
+                    validate_delivery_readiness_value("account-id", account_id)?;
+                }
+            }
+            Self::Anonymous { harness: _, models } => {
+                anyhow::ensure!(
+                    !models.is_empty(),
+                    "anonymous delivery-readiness requires at least one model"
+                );
+                anyhow::ensure!(
+                    models.len() <= 32,
+                    "anonymous delivery-readiness accepts at most 32 models"
+                );
+                for model in models.iter() {
+                    validate_delivery_readiness_value("model", model)?;
+                }
+                models.sort();
+                models.dedup();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_delivery_readiness_value(field: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 200,
+        "delivery-readiness {field} must be 1..=200 UTF-8 bytes"
+    );
+    anyhow::ensure!(
+        value.trim() == value
+            && !value
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')),
+        "delivery-readiness {field} must have no surrounding whitespace, controls, or line separators"
+    );
+    Ok(())
+}
+
 
 /// One typed harness driver declaration.
 ///
@@ -79,6 +191,7 @@ pub enum Driver {
     Codex(CodexDriver),
     Pi(PiDriver),
     OpenCode(OpenCodeDriver),
+    Omp(OmpDriver),
 }
 
 impl Driver {
@@ -88,6 +201,17 @@ impl Driver {
             Self::Codex(_) => "codex",
             Self::Pi(_) => "pi",
             Self::OpenCode(_) => "opencode",
+            Self::Omp(_) => "omp",
+        }
+    }
+
+    pub fn session_driver(&self) -> SessionDriver {
+        match self {
+            Self::Claude(_) => SessionDriver::Claude,
+            Self::Codex(_) => SessionDriver::Codex,
+            Self::Pi(_) => SessionDriver::Pi,
+            Self::OpenCode(_) => SessionDriver::OpenCode,
+            Self::Omp(_) => SessionDriver::Omp,
         }
     }
 }
@@ -138,6 +262,20 @@ pub struct CodexDriver {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct OpenCodeDriver {
     pub model: Option<String>,
+    pub prompt: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Typed fields accepted by an `omp {}` driver block.
+///
+/// omp is pi-family and exposes the same two axes under the same flags: `effort` carries omp's
+/// thinking level verbatim (`--thinking`), exactly as [`PiDriver`] does for pi.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OmpDriver {
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -200,8 +338,12 @@ pub struct AgentSpec {
     pub restart: Option<Restart>,
     /// Provider-native delivery selected by `deliver`; `None` means legacy `ding` or no delivery.
     pub delivery: Option<DeliveryTransport>,
+    /// Native session ownership asserted for an otherwise opaque launch.
+    pub session_driver: Option<SessionDriver>,
     /// Typed harness declaration used by task and render compilation.
     pub driver: Option<Driver>,
+    /// Non-secret admission facts for the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
     /// Named typed references used by the agent. st2 preserves these for readers but does not
     /// resolve them or assign launch, readiness, access, or lifecycle semantics.
     pub resources: Vec<Resource>,
@@ -212,6 +354,22 @@ pub struct AgentSpec {
     pub tasks: Vec<Task>,
     /// Where this spec was loaded from — the anchor for its resources and for edits.
     pub path: PathBuf,
+}
+
+impl AgentSpec {
+    /// The explicit native session owner after typed-driver normalization.
+    pub fn effective_session_driver(&self) -> Option<SessionDriver> {
+        self.session_driver
+            .or_else(|| self.driver.as_ref().map(Driver::session_driver))
+    }
+}
+fn deserialize_optional_selector<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// One agent-local semantic binding to an externally identified resource.
@@ -226,6 +384,8 @@ pub struct Resource {
     reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     inactive_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -235,16 +395,28 @@ struct ResourceDescriptor {
     uri: String,
     reason: String,
     inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    selector: Option<serde_json::Value>,
 }
 
 impl Resource {
     /// Construct a descriptor after enforcing the same invariants as catalog parsing.
     pub fn new(name: String, uri: String, reason: String) -> Result<Self, String> {
-        if name.is_empty() {
-            return Err("resource binding name cannot be empty".into());
+        if name.is_empty()
+            || name.len() > 200
+            || name.trim() != name
+            || name.chars().any(char::is_control)
+        {
+            return Err(
+                "resource binding name must be 1..=200 bytes without surrounding whitespace or controls"
+                    .into(),
+            );
         }
-        validate_absolute_uri(&uri).map_err(|reason| {
-            format!("resource binding '{name}' `uri` must be an exact absolute URI: {reason}")
+        if name == "declaration" {
+            return Err("resource binding name 'declaration' is reserved by resync".into());
+        }
+        validate_resource_uri(&uri).map_err(|reason| {
+            format!("resource binding '{name}' `uri` must be an exact absolute URI or a catalog-relative path: {reason}")
         })?;
         validate_resource_explanation(&name, "reason", &reason)?;
         Ok(Self {
@@ -252,6 +424,7 @@ impl Resource {
             uri,
             reason,
             inactive_reason: None,
+            selector: None,
         })
     }
 
@@ -283,6 +456,15 @@ impl Resource {
     pub fn inactive_reason(&self) -> Option<&str> {
         self.inactive_reason.as_deref()
     }
+
+    pub fn selector(&self) -> Option<&serde_json::Value> {
+        self.selector.as_ref()
+    }
+
+    pub fn with_selector(mut self, selector: serde_json::Value) -> Self {
+        self.selector = Some(selector);
+        self
+    }
 }
 
 impl<'de> Deserialize<'de> for Resource {
@@ -291,6 +473,7 @@ impl<'de> Deserialize<'de> for Resource {
         D: serde::Deserializer<'de>,
     {
         let descriptor = ResourceDescriptor::deserialize(deserializer)?;
+        let selector = descriptor.selector;
         let resource = match descriptor.inactive_reason {
             None => Self::new(descriptor.name, descriptor.uri, descriptor.reason),
             Some(inactive_reason) => Self::new_inactive(
@@ -300,7 +483,12 @@ impl<'de> Deserialize<'de> for Resource {
                 inactive_reason,
             ),
         };
-        resource.map_err(de::Error::custom)
+        resource
+            .map(|resource| match selector {
+                Some(selector) => resource.with_selector(selector),
+                None => resource,
+            })
+            .map_err(de::Error::custom)
     }
 }
 
@@ -505,6 +693,11 @@ pub(crate) struct RawSpec {
     /// Compact catalog form: select one provider-native delivery transport.
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub deliver: Option<Option<String>>,
+    /// Native session ownership asserted for an otherwise opaque launch.
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub session_driver: Option<Option<String>>,
+    /// Non-secret facts used to admit the managed delivery path.
+    pub delivery_readiness: Option<DeliveryReadiness>,
     /// A direct provider block or the equivalent `harness "provider" {}` block.
     #[serde(flatten)]
     pub driver: RawDriver,
@@ -569,6 +762,10 @@ fn validate_stream_name(identity: &str, name: &str) -> anyhow::Result<()> {
             && !name.ends_with('-'),
         "agent '{identity}' stream name '{name}' must match [a-z0-9]([a-z0-9-]*[a-z0-9])?"
     );
+    anyhow::ensure!(
+        name != "resync",
+        "agent '{identity}' stream name '{name}' is reserved for built-in resync events"
+    );
     Ok(())
 }
 
@@ -579,6 +776,7 @@ pub(crate) struct RawDriver {
     pub(crate) codex: Option<CodexDriver>,
     pub(crate) pi: Option<PiDriver>,
     pub(crate) opencode: Option<OpenCodeDriver>,
+    pub(crate) omp: Option<OmpDriver>,
 }
 
 impl RawDriver {
@@ -596,6 +794,9 @@ impl RawDriver {
         }
         if let Some(driver) = self.opencode {
             declared.push(("opencode", Driver::OpenCode(driver)));
+        }
+        if let Some(driver) = self.omp {
+            declared.push(("omp", Driver::Omp(driver)));
         }
         match declared.len() {
             0 => Ok(None),
@@ -621,6 +822,8 @@ pub(crate) struct RawResource {
     pub(crate) uri: String,
     pub(crate) reason: String,
     pub(crate) inactive_reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_selector")]
+    pub(crate) selector: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -680,13 +883,18 @@ impl RawResources {
         self.0
             .into_iter()
             .map(|(name, resource)| {
-                match resource.inactive_reason {
+                let selector = resource.selector;
+                let resource = match resource.inactive_reason {
                     None => Resource::new(name, resource.uri, resource.reason),
                     Some(inactive_reason) => {
                         Resource::new_inactive(name, resource.uri, resource.reason, inactive_reason)
                     }
                 }
-                .map_err(anyhow::Error::msg)
+                .map_err(anyhow::Error::msg)?;
+                Ok(match selector {
+                    Some(selector) => resource.with_selector(selector),
+                    None => resource,
+                })
             })
             .collect()
     }
@@ -742,6 +950,87 @@ fn validate_resource_explanation(name: &str, field: &str, value: &str) -> Result
         ));
     }
     Ok(())
+}
+
+/// A resource URI is either an exact absolute URI (any scheme) or a catalog-relative path with no
+/// scheme at all, resolved by the consumer against the declaration directory. Relative carriers
+/// are an st2 extension pending canonical Agent Spec adoption (see 06-resync).
+fn validate_resource_uri(uri: &str) -> Result<(), &'static str> {
+    if let Some(colon) = uri.find(':') {
+        let first_separator = uri.find(|character| matches!(character, '/' | '\\'));
+        if first_separator.is_none_or(|separator| colon < separator) {
+            return validate_absolute_uri(uri);
+        }
+    }
+    if uri.is_empty() {
+        return Err("catalog-relative uri must be a non-empty relative path");
+    }
+    let decoded = decode_percent_path(uri)?;
+    if decoded.starts_with('/') || decoded.split('/').any(|part| part == "..") {
+        return Err(
+            "catalog-relative uri must be a relative path without parent (`..`) components",
+        );
+    }
+    Ok(())
+}
+
+/// Decode filesystem-path percent escapes without allowing an escape to change path segmentation.
+///
+/// Consumers may apply additional policy to the decoded path (for example, catalog-relative
+/// resources reject every parent component). This shared boundary rejects bytes that cannot name
+/// the same UTF-8 filesystem path the resource URI visibly denotes.
+pub fn decode_percent_path(encoded_path: &str) -> Result<String, &'static str> {
+    let bytes = encoded_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut component_start = 0;
+    let mut component_had_escape = false;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'/' {
+            if component_had_escape && decoded[component_start..] == *b".." {
+                return Err("path contains an encoded parent (`..`) component");
+            }
+            decoded.push(b'/');
+            component_start = decoded.len();
+            component_had_escape = false;
+            offset += 1;
+            continue;
+        }
+        if bytes[offset] != b'%' {
+            decoded.push(bytes[offset]);
+            offset += 1;
+            continue;
+        }
+        let Some(high) = bytes.get(offset + 1).and_then(|byte| hex_digit(*byte)) else {
+            return Err("path contains an invalid percent escape");
+        };
+        let Some(low) = bytes.get(offset + 2).and_then(|byte| hex_digit(*byte)) else {
+            return Err("path contains an invalid percent escape");
+        };
+        let byte = (high << 4) | low;
+        if matches!(byte, b'/' | b'\\') {
+            return Err("path contains an encoded separator");
+        }
+        if byte == b'\0' {
+            return Err("path decodes to NUL");
+        }
+        decoded.push(byte);
+        component_had_escape = true;
+        offset += 3;
+    }
+    if component_had_escape && decoded[component_start..] == *b".." {
+        return Err("path contains an encoded parent (`..`) component");
+    }
+    String::from_utf8(decoded).map_err(|_| "percent-decoded path is not valid UTF-8")
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_absolute_uri(uri: &str) -> Result<(), &'static str> {
@@ -917,11 +1206,11 @@ fn validate_uri_component(value: &str, extra: &[u8]) -> Result<(), &'static str>
 
 impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
-    /// lifecycle intent, a `type`, or task blocks. Random TOML/JSON in the tree has none of these
-    /// and is skipped.
+    /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
+    /// has none of these and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
         self.identity.is_some()
-            || self.job_type.is_some()
+            || self.job_type.as_deref() == Some("service")
             || self.retired.is_some()
             || self.desired_state.is_some()
             || self.desired_state_reason.is_some()
@@ -929,6 +1218,8 @@ impl RawSpec {
             || self.argv.is_some()
             || self.ding
             || self.deliver.is_some()
+            || self.session_driver.is_some()
+            || self.delivery_readiness.is_some()
             || self.driver.claude.is_some()
             || self.driver.codex.is_some()
             // pi predates this predicate gaining driver awareness and was silently skipped too:
@@ -936,6 +1227,7 @@ impl RawSpec {
             // still be a candidate, whichever provider the block names.
             || self.driver.pi.is_some()
             || self.driver.opencode.is_some()
+            || self.driver.omp.is_some()
             || !self.resource.0.is_empty()
             || !self.pty.is_empty()
             || !self.exec.is_empty()
@@ -969,11 +1261,50 @@ impl RawSpec {
             .as_deref()
             .map(DeliveryTransport::parse)
             .transpose()?;
+        let session_driver = reject_explicit_null("session_driver", self.session_driver)?
+            .as_deref()
+            .map(SessionDriver::parse)
+            .transpose()?;
         let driver = self.driver.lower(&identity)?;
         let has_driver = driver.is_some();
+        let mut delivery_readiness = self.delivery_readiness;
+        if let Some(readiness) = delivery_readiness.as_mut() {
+            readiness.validate()?;
+        }
+        anyhow::ensure!(
+            !(session_driver.is_some() && has_driver),
+            "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
+        );
+        let effective_session_driver =
+            session_driver.or_else(|| driver.as_ref().map(Driver::session_driver));
+        if let (Some(delivery), Some(effective)) = (delivery, effective_session_driver) {
+            anyhow::ensure!(
+                delivery.session_driver() == effective,
+                "agent '{identity}' delivery transport '{}' requires session-driver '{}', not '{}'",
+                delivery.as_str(),
+                delivery.session_driver().as_str(),
+                effective.as_str()
+            );
+        }
+        if let (
+            Some(DeliveryReadiness::Anonymous { harness, .. }),
+            Some(effective),
+        ) = (delivery_readiness.as_ref(), effective_session_driver)
+        {
+            anyhow::ensure!(
+                *harness == effective,
+                "agent '{identity}' anonymous delivery-readiness harness '{}' does not match effective session-driver '{}'",
+                harness.as_str(),
+                effective.as_str()
+            );
+        }
         // Native delivery owns the inbox when both forms are present. Treat `ding` as stale
         // compatibility input and omit its sidecar instead of making the declaration invalid.
-        let ding = self.ding && delivery.is_none() && !has_driver;
+        let ding = self.ding
+            && delivery.is_none()
+            && !has_driver
+            && session_driver.is_none()
+            && delivery_readiness.is_none();
         validate_launch(
             &identity,
             self.command.as_ref(),
@@ -1124,7 +1455,9 @@ impl RawSpec {
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             delivery,
+            session_driver,
             driver,
+            delivery_readiness,
             resources,
             streams,
             tasks,
@@ -1316,13 +1649,26 @@ mod tests {
     /// or path-derived discovery silently skips the seat.
     #[test]
     fn a_lone_driver_block_of_any_provider_is_a_spec_candidate() {
-        for provider in ["claude", "codex", "pi", "opencode"] {
+        for provider in ["claude", "codex", "pi", "opencode", "omp"] {
             let block = format!("[{provider}]\nprompt = \"Start the assigned work.\"");
             let raw: super::RawSpec = toml::from_str(&block).unwrap();
             assert!(raw.looks_like_spec(), "[{provider}] must look like a spec");
         }
         let raw: super::RawSpec = toml::from_str("unrelated = true").unwrap();
         assert!(!raw.looks_like_spec());
+    }
+
+    #[test]
+    fn only_service_type_is_a_spec_candidate_by_itself() {
+        let esm_manifest: super::RawSpec = serde_json::from_str(r#"{"type":"module"}"#).unwrap();
+        assert!(!esm_manifest.looks_like_spec());
+
+        let service: super::RawSpec = serde_json::from_str(r#"{"type":"service"}"#).unwrap();
+        assert!(service.looks_like_spec());
+
+        let unknown_type_declaration: super::RawSpec =
+            serde_json::from_str(r#"{"identity":"worker","type":"module"}"#).unwrap();
+        assert!(unknown_type_declaration.looks_like_spec());
     }
     use super::*;
 
@@ -1336,6 +1682,35 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30)); // bare = seconds
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn catalog_relative_uris_share_filesystem_safe_percent_decoding() {
+        for uri in [
+            "report..md",
+            "reports/.../goal.md",
+            "reports/%2Ereport.md",
+            "reports/child..name/goal.md",
+            "reports/with%20space/%E2%82%AC.md",
+        ] {
+            assert_eq!(validate_resource_uri(uri), Ok(()), "{uri}");
+        }
+
+        for uri in [
+            "..",
+            "../goal.md",
+            "reports/../goal.md",
+            "%2e%2e/goal.md",
+            "reports/%2E%2e/goal.md",
+            "reports%2f..%2fgoal.md",
+            "reports/encoded%2Fseparator",
+            "reports/encoded%5cseparator",
+            "reports/a%00b",
+            "reports/%FF.md",
+            "reports/bad%escape",
+        ] {
+            assert!(validate_resource_uri(uri).is_err(), "{uri}");
+        }
     }
 
     #[test]

@@ -194,27 +194,32 @@ An agent may directly declare zero or more generic Resource bindings:
 resource "work" uri="github-issue://example/project/123" reason="release work item"
 ```
 
-The positional name is an agent-local semantic role. `reason` explains why the reference belongs
-to this agent (required; optional `inactive-reason` retains inactive bindings). `uri` is the exact RFC 3986 absolute resource
-identity, preserved byte-for-byte without normalization, and its scheme selects the open,
-downstream-owned Resource profile.
-Declaration order has no meaning and binding names are unique within one
-agent. A Resource URI may be referenced by any number of agent declarations.
-The public `agent-spec` read model preserves the bindings in name order across
-canonical KDL and the supported TOML/JSON forms. `st2 agents --json` projects
-the same descriptors for language-neutral inspection.
+The positional name is an agent-local semantic role. `reason` explains why the
+reference belongs to this agent (required; optional `inactive-reason` retains
+inactive bindings). `uri` is the exact RFC 3986 absolute Resource identity,
+preserved byte-for-byte without normalization. Declaration order has no meaning
+and binding names are unique within one agent. A Resource URI may be referenced
+by any number of agent declarations. The public `agent-spec` read model
+preserves the bindings in name order across canonical KDL and the supported
+TOML/JSON forms. `st2 agents --json` projects the same descriptors for
+language-neutral inspection.
 
-st2 validates only this portable envelope. It does not register schemes, define downstream profile
-schemas, resolve targets, infer authority from URI possession, or attach
-required/optional, access, readiness, or lifecycle semantics. Those concerns
-remain outside the generic binding contract. A Resource binding is declaration
-metadata and is absent from task launch targets; changing only Resource
+The generic binding envelope does not register schemes, resolve targets, infer
+authority from URI possession, or attach required/optional, access, readiness,
+or lifecycle semantics. Its scheme is, however, the exact lookup key for an
+optional catalog-declared Resource Profile. The built-in registry is empty;
+unregistered schemes stay opaque. Registered schemes resolve through the
+feature-gated wasm-only SDK boundary specified by
+[`07-resource-profile`](07-resource-profile/spec.md) and may supply a contained
+local path plus resync notification class. Scheme semantics and profile modules
+remain downstream-owned.
+
+A Resource binding and its optional resolution are declaration/observation
+metadata and are absent from task launch targets. Changing only Resource
 bindings adopts an already-live task without stop, replacement, or relaunch.
-
-The unresolved-resource runtime discussion remains tracked in
-[st2#60](https://github.com/compoundingtech/st2/issues/60), read-oriented
-renderer integration in [st2#61](https://github.com/compoundingtech/st2/issues/61),
-and the portable Agent Spec envelope in
+Read-oriented renderer integration remains tracked in
+[st2#61](https://github.com/compoundingtech/st2/issues/61), and the portable
+Agent Spec envelope in
 [evals#41](https://github.com/compoundingtech/evals/issues/41).
 
 ## Transactional catalog authoring
@@ -722,6 +727,87 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   observation has a short outer deadline so a wedged client fails the pass
   closed instead of hanging reconciliation. The deadline is containment, not
   the mechanism for admitting a larger fleet.
+
+### Child-process execution (R32, R34)
+
+Non-interactive helper shells-outs (`src/run.rs`, `src/ding/mod.rs`) share one
+shape: the child is `setsid` so its pid is its process group, stdout/stderr go
+to unlinked tempfiles (an escaped descendant that inherited them cannot block
+cleanup), and deadline expiry kills the whole group. Wait ownership for a
+killed child transfers to one shared reaper thread draining a channel — never
+one detached thread per timed-out child, which accumulates without bound under
+timeout storms.
+
+Read-back is tail-capped at `CAPTURE_CAP_BYTES` (256 KiB) per stream: over-cap
+streams keep their last 256 KiB and emit one diagnostic line naming the
+command, stream, kept/total bytes, and cap. Memory per capture is therefore
+bounded by calls × 2 × cap regardless of child behavior. `pty list --json`
+parses structured output that must be whole, so it uses the explicitly named
+full-stdout variant; that read is intentionally uncapped and visible at its
+call site. Eval run steps and agent log dumps stream child output straight to
+their catalog log files without buffering it. Rationale and rejected
+alternatives: [decision 0007](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
+
+## Catalog graph and native delivery admission (R35–R38)
+
+Managed harness ownership is explicit. A declaration uses its typed driver or
+one `session-driver "claude|codex|pi|opencode|omp"` and pairs it with exactly
+one non-secret readiness declaration:
+
+```kdl
+delivery-readiness "credential"
+delivery-readiness "credential" account-id="tokengate/shared"
+delivery-readiness "anonymous" "model-a" "model-b" harness="omp"
+```
+
+Credential omission delegates account choice to the native driver. Anonymous
+readiness has at least one model; lowering sorts and deduplicates the model set,
+and `harness` must equal the effective native driver. A legacy `deliver` value
+must match that same explicit driver. No command-basename inference is
+admitted. A managed driver, readiness, or native delivery transport cannot
+coexist with Ding; Ding remains only for opaque non-harness PTYs.
+
+`st2 catalog graph --json` schema `st2.catalog-graph.v2` publishes
+`effectiveSessionDriver` and `deliveryReadiness` separately from `runtime`. It
+also publishes admitted topology:
+
+```json
+{
+  "parentId": "host.parent",
+  "rootId": "host.root",
+  "depth": 2,
+  "ancestorIds": ["host.parent", "host.root"]
+}
+```
+
+A root has null `parentId`, its own `rootId`, depth zero, and an empty ancestor
+array. A machine can declare zero or more independent roots. Duplicate
+identity, a missing or ambiguous parent, a cycle, or depth beyond 64 is an
+error. An active agent whose chain terminates at a retired declaration is also
+an error (`retired-root`), because the active agent has no active supervisor.
+Every affected topology field
+is null and the graph envelope has `complete: false`; downstream consumers use
+these admitted facts rather than walking supervisor edges themselves. The
+`declarations` view applies the same fold to legacy `retired #true`, publishing
+`desiredState: "retired"`; an absent lifecycle stays null, which lowers to
+running.
+
+Retired reconciliation first attempts every live task teardown for the agent.
+Only when all of those attempts succeed does it settle the declaration's whole
+inbox; one failure leaves every inbox file untouched and the next pass retries
+teardown plus settlement. With no live tasks, settlement proceeds immediately.
+Each canonical inbox filename is linked into `resources/archive` and then
+removed from the inbox. An existing archive file wins byte-for-byte, so replay
+and a sync-restored duplicate converge without overwriting the receipt.
+Suspended reconciliation never performs this settlement.
+
+Before starting a Codex provider, st2 asks that binary to generate its
+app-server JSON schemas and fingerprints only the delivery-critical projection:
+every client request and server notification arm st2 uses, the exact
+method-to-`params` reference for each arm, recursively referenced definitions,
+and response definitions st2 reads. Only reviewed fingerprints are admitted.
+Live turn, resume, and durable-receipt evidence remains a separate behavioral
+check and is not inferred from the fingerprint.
 
 ## Message lifecycle
 

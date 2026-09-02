@@ -219,7 +219,8 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         serde_json::json!([{
             "name": "work",
             "uri": "issue://example/live",
-            "reason": "example work item"
+            "reason": "example work item",
+            "resync": "unsupported"
         }])
     );
     assert_eq!(rows[1]["identity"], "h.retired");
@@ -286,7 +287,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "h.live\tavailable\tobs:-\t\t\nh.retired\tbusy\tobs:-\t\t\t[retired]\n"
+        "h.live\tavailable\tobs:-\tctx:-\t\t\nh.retired\tbusy\tobs:-\tctx:-\t\t\t[retired]\n"
     );
 }
 
@@ -451,6 +452,104 @@ fn roster_derives_unknown_from_a_stale_version_1_heartbeat() {
         - u64::try_from((st2::status::STATUS_STALE + Duration::from_secs(60)).as_millis()).unwrap();
     fs::write(&sp, format!("available\nv1 {stale_ms}\n")).unwrap();
     assert_eq!(roster(root, "hetz")[0].status, State::Unknown);
+}
+
+/// HC-R14/HC-R07: a real harness-context record on disk joins the roster as a fourth axis, in
+/// both JSON forms and in the human column, and it stays readable while the categorical record
+/// beside it derives `unknown` — the wedge case the record exists for.
+#[test]
+fn roster_joins_a_real_context_record_independently_of_observed_state() {
+    use st2::harness_context::{Compaction, CompactionTrigger, Harness, Reading, Writer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "hetz/filling/agent.kdl",
+        &agent_kdl("filling", "hetz"),
+    );
+    let agent_dir = root.join("hetz/filling");
+    set_state(&status_path(&agent_dir), State::Busy).unwrap();
+
+    // No record: the axis is emitted as `null`, not omitted.
+    assert!(roster(root, "hetz")[0].context.is_none());
+
+    let mut writer = Writer::new(&agent_dir, "hetz.filling", Harness::Claude).unwrap();
+    writer
+        .observe(Reading {
+            used_tokens: Some(184_000),
+            window_tokens: Some(200_000),
+            used_percent: Some(92.0),
+            model: Some("claude-opus-5".to_string()),
+            cost_usd: Some(3.5),
+            ..Reading::default()
+        })
+        .unwrap();
+    writer
+        .compacted(Compaction::new(CompactionTrigger::Auto))
+        .unwrap();
+
+    // The state record is absent, so `observedState` is null — and the numbers are still there.
+    let row = &roster(root, "hetz")[0];
+    assert!(row.observed.is_none());
+    let context = row.context.as_ref().expect("the record joins the roster");
+    assert_eq!(context.used_percent, Some(92.0));
+    assert_eq!(context.compactions, 1);
+    assert!(!context.stale);
+
+    for form in [vec!["--json"], vec!["--json", "--enrich"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .arg("agents")
+            .arg(root)
+            .args(["--host", "hetz"])
+            .args(&form)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(rows[0]["context"]["harness"], "claude");
+        assert_eq!(rows[0]["context"]["usedPercent"], 92.0);
+        assert_eq!(rows[0]["context"]["usedTokens"], 184_000);
+        assert_eq!(rows[0]["context"]["compactions"], 1);
+        assert_eq!(rows[0]["context"]["lastCompactionTrigger"], "auto");
+        assert_eq!(rows[0]["context"]["stale"], false);
+        // Declared presence and the other axes keep their own meanings.
+        assert_eq!(rows[0]["status"], "busy");
+        assert_eq!(rows[0]["observedState"], serde_json::Value::Null);
+    }
+
+    let human = |root: &Path| {
+        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+            .arg("agents")
+            .arg(root)
+            .args(["--host", "hetz"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:92% \u{27f3}1\t\t\n");
+
+    // A record whose percent the harness withheld — Claude before its first API response — must
+    // not render like no record at all: the producer is watching and honestly does not know.
+    Writer::new(&agent_dir, "hetz.filling", Harness::Claude)
+        .unwrap()
+        .observe(Reading {
+            window_tokens: Some(200_000),
+            ..Reading::default()
+        })
+        .unwrap();
+    let row = &roster(root, "hetz")[0];
+    assert!(row.context.as_ref().unwrap().used_percent.is_none());
+    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n");
+
+    // …and no record at all still reads `-`.
+    fs::remove_file(st2::harness_context::harness_context_path(&agent_dir)).unwrap();
+    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:-\t\t\n");
 }
 
 #[test]

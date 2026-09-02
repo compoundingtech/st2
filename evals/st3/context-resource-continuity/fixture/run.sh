@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-state="$PWD/state"
-socket="$PWD/st3.sock"
+runtime_root="$(mktemp -d "${TMPDIR:-/tmp}/st3-continuity.XXXXXX")"
+state="$runtime_root/state"
+socket="$runtime_root/st3.sock"
 daemon=""
 : >result.txt
 stop_daemon() {
@@ -12,6 +13,10 @@ stop_daemon() {
     daemon=""
   fi
   rm -f "$socket"
+}
+cleanup() {
+  stop_daemon
+  rm -rf -- "$runtime_root"
 }
 start_daemon() {
   rm -f "$socket"
@@ -23,7 +28,7 @@ start_daemon() {
   done
   return 1
 }
-trap stop_daemon EXIT
+trap cleanup EXIT
 
 start_daemon
 printf '%s\n' CONTEXT-NOW-7b9d | ST_AGENT=cr.agent st3 --endpoint "$socket" context write cr.agent
@@ -38,8 +43,13 @@ for cycle in 1 2; do
   stop_daemon
 done
 start_daemon
+test -f "$state/claims.sqlite3"
+test -S "$socket"
+printf 'state-green\n' >>result.txt
 st3 --endpoint "$socket" context read cr.agent --full >>result.txt
 st3 --endpoint "$socket" resource read "$ref" >>result.txt
-printf 'cleanup-green\n' >>result.txt
 stop_daemon
+test ! -S "$socket"
+printf 'cleanup-green\n' >>result.txt
+cleanup
 trap - EXIT

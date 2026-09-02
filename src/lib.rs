@@ -8,6 +8,7 @@ pub mod agent_author;
 pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
+pub mod catalog_graph;
 pub mod catalog_lock;
 pub mod catalog_transaction;
 pub mod claude_channel;
@@ -17,18 +18,23 @@ pub mod codex_app_server;
 pub mod context;
 pub mod ding;
 pub mod driver;
+pub mod driver_diagnostic;
 pub mod eval_run;
 pub mod eval_spec;
 pub mod event;
 pub mod exec_backend;
 pub mod expand;
 pub mod flapping;
+pub mod harness_context;
 pub mod harness_state;
+pub mod harness_version;
 pub mod hooks;
 pub mod host_lock;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+pub mod omp_session;
+pub mod metrics;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
@@ -37,11 +43,16 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
-pub mod resource;
+pub mod resource_observe;
+pub mod resource_profile;
+pub mod resource_profile_supervisor;
+pub mod resync;
 pub mod run;
 pub mod service;
 pub mod status;
+pub mod supervisor_chain;
 pub mod task_inventory;
+pub mod telemetry;
 pub mod validate;
 pub mod version;
 mod watch;
@@ -55,8 +66,8 @@ pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, 
 pub use agent_spec::kdl_version;
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, Task, TaskKind, TaskLifecycle,
-    parse_duration,
+    OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, SessionDriver, Task,
+    TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;

@@ -19,7 +19,9 @@ The record-shape and coverage decisions are recorded in
 Delivery gating is explicitly not this subsystem's concern: DING and the
 native transports keep their own evidence
 ([`01-ding/requirements.md`](../01-ding/requirements.md)), and no delivery
-path reads this record.
+path reads the observed-state record. The adjacent native-driver diagnostic
+snapshot reports where that independent evidence path failed; it never
+authorizes or changes delivery.
 
 ## Assumptions
 
@@ -150,6 +152,42 @@ path reads this record.
 - **OHS-R10 Doctor exposure:** Doctor surfaces observed state for agents it
   owns as advisory output — a stale or session-dead record beside a `running`
   desired state is worth a warning, never an exit-code failure in v1.
+
+### Must make native-driver degradation structured and recoverable
+
+- **OHS-R11 Closed driver diagnostic:** Each agent has at most one current
+  `<agent-dir>/driver-diagnostic` record, schema
+  `st2.driver-diagnostic.v1`, owned by native driver core. The tagged,
+  additive-tolerant snapshot carries a closed stage, reason, source, producer
+  version/support classification, origin timestamp, and clearing contract.
+  Readers derive evidence age. Generic roster and Doctor consumers branch on
+  these typed fields, never provider error prose.
+- **OHS-R12 Fail-visible reading:** An absent record is explicitly `absent`;
+  malformed bytes, an unsupported schema, unknown vocabulary, future clock
+  skew, or a known reason paired with the wrong stage/source are
+  `indeterminate`. None reads
+  as healthy. A valid record is `failure`; success is represented only by
+  stage recovery clearing that stage, with the record removed after the last
+  outstanding stage recovers.
+- **OHS-R13 Exact OpenCode boundaries:** The OpenCode driver publishes or
+  clears diagnostics at `versionGate`, `apiGate`, `sse`, `seed`, `delivery`,
+  and `readBack`. The in-process publisher retains at most one failure per
+  stage and persists the earliest failing boundary, so a downstream transport
+  symptom cannot hide an admission failure. Publishing is advisory and must
+  not change prompt submission, retry, durable read-back, or archive
+  semantics.
+- **OHS-R14 Shared exposure and repair:** `st2 agents --json` carries the
+  complete `driverDiagnostic` projection for every row, including explicit
+  absent and indeterminate states. For a declaration whose native driver is
+  expected to publish the record (OpenCode in this version), Doctor reads the
+  same core projection and emits advisory-only stable repair text for every
+  state; the two surfaces cannot independently interpret provider strings.
+- **OHS-R15 Bounded telemetry:** Each failure/recovery transition emits a
+  driver-diagnostic span/event and counter. Metric labels and `span.label`
+  are limited to closed `stage`, `reason`, `source`, `support`, and `outcome`
+  vocabularies. Raw versions and any agent/runtime/session/message identity
+  are forbidden from metric labels and `span.label`; raw prompt, message
+  body, and path data are forbidden from the durable record and all labels.
 
 ## Evidence
 

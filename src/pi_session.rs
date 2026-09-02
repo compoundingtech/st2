@@ -25,6 +25,15 @@ use crate::{harness_state, hooks, message, status};
 /// The extension file inside this binary's immutable hook set.
 const EXTENSION: &str = "pi-channel.ts";
 
+/// The pi release the harness-context producer's arithmetic was measured against (HC-R13).
+///
+/// pi has no runtime version gate — unlike omp, whose wrapper refuses an unadmitted minor — so the
+/// only place this repository couples itself to a pi build is `flake.nix`'s extension check, which
+/// type-checks and runtime-smokes the shipped asset against exactly this tarball. That makes the
+/// flake pin the gate for this constant, and `pi_channel`'s fixture asserts the two agree: a pi
+/// bump that changes what `getContextUsage().tokens` means must move both together or fail.
+pub const MEASURED_CONTEXT_VERSION: &str = "0.84.2";
+
 /// The exact st2 executable the pi extension must spawn for its channel.
 pub const CHANNEL_BIN: &str = "ST2_PI_CHANNEL_BIN";
 /// The catalog root that executable must be pointed at.
@@ -165,7 +174,7 @@ fn record_session_end(
         harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
             .with_ownership(session, seq);
     if let Err(error) = writer.ended(label) {
-        eprintln!("st2 pi driver: recording session end failed: {error}");
+        tracing::warn!("st2 pi driver: recording session end failed: {error}");
     }
 }
 

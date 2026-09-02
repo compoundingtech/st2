@@ -26,6 +26,10 @@ accepted.
 
 - **T01 Explicit limits:** A documented unsupported case is preferable to a
   hidden distributed guarantee.
+- **T02 Native ownership over heuristic reach:** A managed harness that cannot
+  declare a matching native session driver and non-secret delivery readiness is
+  rejected rather than routed through generic terminal injection. Ding remains
+  available only for opaque non-harness PTYs.
 
 ## Requirements
 
@@ -48,10 +52,10 @@ accepted.
 
 ### Must provide intelligent host supervision
 
-- **R04 Root supervision:** Every machine has exactly one root agent. The
-  deterministic st2 reconciler keeps declared local processes converged; the
-  root observes host-local runtime health, diagnoses failures, performs bounded
-  recovery, and escalates what it cannot resolve.
+- **R04 Root supervision:** A machine can declare zero or more root agents.
+  Each root owns one independent supervisor tree. The deterministic st2
+  reconciler keeps declared local processes converged. Each root observes its
+  tree, performs bounded recovery, and escalates what it cannot resolve.
 - **R31 Reachable restart bounds:** Within one supervisor run, restart
   accounting is per task and only successful launches spend the declared
   budget. `delay` is the minimum launch spacing in either mode. In delay mode,
@@ -72,6 +76,13 @@ accepted.
   that outlive that child. st2 either reaps the direct child before returning or
   transfers wait ownership to a background reaper; the failure remains bounded
   and reports its originating input error or timeout.
+- **R34 Bounded helper output capture:** Capturing a spawned non-interactive
+  helper's stdout/stderr consumes memory bounded by a fixed per-stream cap
+  independent of the child's output volume and of how many captures run
+  concurrently. When a stream exceeds the cap, the retained bytes are that
+  stream's tail, and truncation is observable. A caller that must consume a
+  stream whole (structured data for parsing) opts in through an explicitly
+  named capture path, so an unbounded read is always visible at its call site.
 - **R22 Quiet coordination after events:** A network with minimal or default
   personas stays quiet while useful work continues. Agents coordinate only after
   an inbox DING, a durable failure, a real blocker, a completion or decision
@@ -154,11 +165,14 @@ accepted.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves an RFC 3986 absolute URI byte-for-byte without
-  normalization. The URI scheme selects an open, downstream-owned Resource profile;
-  st2 does not register schemes. The generic envelope does not imply resolution,
-  access, readiness, or lifecycle semantics;
-  declarations that add such unsupported policy are rejected rather than
-  silently ignored.
+  normalization. Its URI scheme is the exact lookup key for an optional,
+  catalog-declared Resource Profile; scheme meaning remains downstream-owned,
+  and st2 ships no built-in profiles. A registered profile may give the URI a
+  contained local denotation under
+  [`07-resource-profile`](07-resource-profile/requirements.md); an unregistered
+  scheme stays opaque. The generic envelope itself does not imply resolution,
+  access, readiness, or lifecycle semantics, and declarations that add such
+  unsupported policy are rejected rather than silently ignored.
 - **R21 Nondisruptive Resource observation:** Machine-readable catalog
   inspection exposes every Resource binding without interpreting its profile or URI.
   Resource-only declaration changes do not alter a task's effective launch
@@ -322,3 +336,30 @@ accepted.
   identity recheck immediately before disruption. Renaming remains
   retire-old/add-new. Every behavior remains complete with an ordinary catalog
   folder and without CAS, captured generations, or replacement journals.
+- **R35 Authoritative admitted graph:** `st2 catalog graph --json` is the sole
+  catalog topology authority. For each uniquely admitted agent it publishes
+  the effective native session driver plus direct parent, root, depth, and
+  nearest-parent-first ancestor facts. Duplicate identity, missing parent,
+  supervisor cycle, bounded-depth overflow, and a per-host root count other
+  than exactly one are errors; affected topology facts are null and the graph
+  is incomplete. Consumers do not reimplement those generic graph rules.
+- **R36 Explicit native delivery readiness:** Managed Claude, Codex, pi,
+  OpenCode, OMP sessions declare their matching native session driver and one
+  tagged delivery-readiness value. Credential readiness may name a non-secret
+  account identifier or leave selection to the driver. Anonymous OMP readiness
+  names OMP and a non-empty normalized model set. Readiness is declaration
+  state, never inferred from activity, argv, process names, or credentials.
+- **R37 Retirement settles the inbox:** Every reconciliation of a retired
+  local agent first tears down every live owned task. Only after every teardown
+  attempt for that agent succeeds does the pass archive its canonical inbox
+  messages; any teardown failure leaves the entire inbox in place and retries
+  teardown plus settlement on the next reconciliation. The archive filename is
+  the durable receipt: repeated settlement and a sync-restored duplicate remove
+  the inbox copy without overwriting the archived bytes. Suspension retains the
+  inbox and does not settle it.
+- **R38 Codex schema admission:** Codex app-server launch is gated by an
+  admitted fingerprint of the delivery-critical schema projection. Admission
+  proves each emitted or consumed method discriminator is linked to its exact
+  payload arm and recursively covers the referenced definitions. Behavioral
+  turn, resume, and receipt evidence is reviewed separately; a schema match
+  alone does not claim it.

@@ -81,7 +81,8 @@ enum Command {
     /// An agent's working-state context for lossless restart: read/write/append.
     #[command(subcommand)]
     Context(ContextCmd),
-    /// An agent's linked resources (high-value output a peer can find): add/ls/read/remove.
+    /// An agent's declared Resource bindings (a named, exact URI a peer can resolve):
+    /// ls/read/add/remove/rename.
     #[command(subcommand)]
     Resource(ResourceCmd),
     /// Install `st2 up` as a systemd-user service on headless Linux. macOS stays manual (TCC).
@@ -240,6 +241,9 @@ enum Command {
         /// cover the whole catalog. Defaults to the local hostname.
         #[arg(long)]
         host: Option<String>,
+        /// Validate this one unpublished canonical Agent Spec as an overlay on the live catalog.
+        #[arg(long, value_name = "FILE")]
+        candidate: Option<PathBuf>,
         /// Fail (non-zero exit) on warnings too, not just errors.
         #[arg(long)]
         strict: bool,
@@ -365,6 +369,12 @@ enum DriverCmd {
         #[arg(long)]
         event: String,
     },
+    /// Tee Claude's status-line payload (stdin JSON) into harness context, then chain to the
+    /// operator's own renderer.
+    ClaudeStatusline {
+        #[arg(long)]
+        identity: String,
+    },
     /// Run pi under the session-owned presence wrapper.
     PiSession {
         #[arg(long)]
@@ -376,6 +386,20 @@ enum DriverCmd {
     },
     /// Run the pi native message channel over stdio, owned by the shipped pi extension.
     PiChannel {
+        #[arg(long)]
+        identity: String,
+    },
+    /// Run omp under the session-owned presence wrapper with a hard version gate.
+    OmpSession {
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        runtime_id: String,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Run the omp native message channel over stdio, owned by the shipped omp extension.
+    OmpChannel {
         #[arg(long)]
         identity: String,
     },
@@ -476,6 +500,15 @@ enum AgentCmd {
 
 #[derive(Subcommand)]
 enum CatalogCmd {
+    /// Emit one fail-closed declaration graph plus runtime observation envelope.
+    Graph {
+        /// Host used to resolve declarations with no host and host-local runtime facts.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the versioned machine-readable envelope. Required in v1.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compute the authoritative digest bound by `catalog apply --input-sha256`.
     Digest {
         /// Complete prepared declaration directory. Runtime state and control paths are rejected.
@@ -671,41 +704,94 @@ enum HooksCmd {
 
 #[derive(Subcommand)]
 enum ResourceCmd {
-    /// Link a resource (a URL you produced or reference) into your resource list.
-    Add {
-        /// The resource URL (any `scheme:` — http/https/file/pty/…).
-        url: String,
-        #[arg(long)]
-        title: Option<String>,
-        /// Comma-separated tags.
-        #[arg(long = "tag", value_delimiter = ',')]
-        tags: Vec<String>,
-        /// A relation label (e.g. `output`, `reference`).
-        #[arg(long)]
-        relation: Option<String>,
-        /// Read a body/notes from stdin.
-        #[arg(long = "body-stdin")]
-        body_stdin: bool,
-        #[command(flatten)]
-        ctx: MsgCtx,
-    },
-    /// List an agent's resources. Defaults to your own.
+    /// List an agent's declared Resource bindings. Defaults to your own.
     Ls {
+        /// Whose declaration to read — bus id or bare identity. Defaults to you (`$ST_AGENT`).
         identity: Option<String>,
+        /// Emit the bindings as a JSON array.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Read one resource. With a leading identity, from that agent; otherwise your own.
+    /// Read one declared binding. With a leading identity, from that agent; otherwise your own.
     Read {
         first: String,
         second: Option<String>,
+        /// Emit the binding as a JSON object.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
-    /// Remove one resource.
-    Remove {
+    /// Ask the resident profile runtime to observe one binding now and wait for exact evidence.
+    Refresh {
+        /// Binding name, or an agent selector when followed by a binding name.
         first: String,
+        /// Binding name when the first positional selects the agent.
         second: Option<String>,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long, conflicts_with = "second")]
+        agent: Option<String>,
+        /// Client-only wait bound in seconds. Expiry never cancels or retracts queued demand.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+        /// Emit the stable receipt (or timeout envelope) as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Declare a Resource binding, or prove the identical binding already exists.
+    Add {
+        /// The agent-local binding name.
+        name: String,
+        /// The exact absolute URI this binding names (any `scheme:` — the identity is verbatim).
+        #[arg(long)]
+        uri: String,
+        /// Why this reference belongs in the declaration.
+        #[arg(long)]
+        reason: String,
+        /// Preserve the binding as no longer active for this agent, and say why.
+        #[arg(long = "inactive-reason", value_name = "TEXT")]
+        inactive_reason: Option<String>,
+        /// Profile-specific observation selector as JSON.
+        #[arg(long = "selector-json", value_name = "JSON")]
+        selector_json: Option<String>,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Remove one declared binding, or prove it is already absent.
+    Remove {
+        /// The agent-local binding name.
+        name: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
+    /// Rename one declared binding's agent-local label, keeping its uri and reasons.
+    Rename {
+        /// The current binding name.
+        old: String,
+        /// The new binding name.
+        new: String,
+        /// Exact target agent; defaults to --as / $ST_AGENT.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit a stable JSON receipt.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -1004,8 +1090,38 @@ fn main() -> Result<()> {
         catalog_path,
         command,
     } = Cli::parse();
-    initialize_catalog_env(catalog_path.as_deref())?;
 
+    // Claude's status-line tee is the one subcommand whose cadence a HARNESS sets rather than an
+    // operator or an event: `refreshInterval: 5` makes it ~720 short-lived processes per hour per
+    // seat, and Claude waits for each to exit. Building an OTel pipeline per render — and, at
+    // exit, flushing it — would put a collector round-trip in the render path for a run that is
+    // not an operation worth a span, so the tee never builds one (`DQ-C13`). This is a cadence
+    // rule, not a hook rule: `claude-observe` is event-driven and stays instrumented, exactly as
+    // `06-observability`'s spec names it.
+    let mut telemetry = if matches!(command, Command::Driver(DriverCmd::ClaudeStatusline { .. })) {
+        st2::telemetry::Telemetry::local_only()
+    } else {
+        st2::telemetry::Telemetry::init(if matches!(command, Command::Up { once: false, .. }) {
+            "supervisor"
+        } else if matches!(
+            command,
+            // Hook executions are their own process unit: `st2 driver claude-observe` runs per
+            // Claude hook event and records hook_invocations_total, which the documented
+            // process-unit contract assigns to `st2-hook`, not `st2-cli`.
+            Command::Driver(DriverCmd::ClaudeObserve { .. })
+        ) {
+            "hook"
+        } else {
+            "cli"
+        })
+    };
+    let result = dispatch(command, catalog_path.as_deref());
+    telemetry.shutdown();
+    result
+}
+
+fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<()> {
+    initialize_catalog_env(catalog_path.map(|path| path.to_path_buf()).as_deref())?;
     match command {
         Command::Ls { root } => {
             let root = catalog_arg(root)?;
@@ -1068,14 +1184,6 @@ fn main() -> Result<()> {
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
         }
-        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
-            let catalog = catalog_arg(None)?;
-            let catalog = catalog.canonicalize().unwrap_or(catalog);
-            let identity = identity
-                .or_else(|| std::env::var("ST_AGENT").ok())
-                .context("--identity is required when ST_AGENT is not set")?;
-            st2::claude_mcp::run(&catalog, &identity)
-        }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
@@ -1089,6 +1197,28 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::pi_session::run(&catalog, identity, runtime_id, argv)
+        }
+        Command::Driver(DriverCmd::ClaudeMcp { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            let identity = identity
+                .or_else(|| std::env::var("ST_AGENT").ok())
+                .context("--identity is required when ST_AGENT is not set")?;
+            st2::claude_mcp::run(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::OmpChannel { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::pi_channel::run_omp(&catalog, &identity)
+        }
+        Command::Driver(DriverCmd::OmpSession {
+            identity,
+            runtime_id,
+            argv,
+        }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::omp_session::run(&catalog, identity, runtime_id, argv)
         }
         Command::Driver(DriverCmd::Claude { identity }) => {
             eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");
@@ -1113,6 +1243,11 @@ fn main() -> Result<()> {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
             st2::claude_session::run_observe(&catalog, &identity, runtime_id.as_deref(), &event)
+        }
+        Command::Driver(DriverCmd::ClaudeStatusline { identity }) => {
+            let catalog = catalog_arg(None)?;
+            let catalog = catalog.canonicalize().unwrap_or(catalog);
+            st2::claude_session::run_statusline(&catalog, &identity)
         }
         Command::Driver(DriverCmd::OpencodeSession {
             identity,
@@ -1190,6 +1325,21 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&digest)?);
             } else {
                 println!("{}", digest.sha256);
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Graph { host, json }) => {
+            if !json {
+                anyhow::bail!("`st2 catalog graph` v1 requires --json");
+            }
+            let graph = st2::catalog_graph::snapshot(
+                &catalog_arg(None)?,
+                &host.unwrap_or_else(detect_host),
+            )?;
+            let complete = graph.complete;
+            println!("{}", serde_json::to_string_pretty(&graph)?);
+            if !complete {
+                std::process::exit(1);
             }
             Ok(())
         }
@@ -1359,11 +1509,12 @@ fn main() -> Result<()> {
         Command::Validate {
             root,
             host,
+            candidate,
             strict,
             json,
         } => {
             let root = catalog_arg(root)?;
-            validate_cmd(&root, host, strict, json)
+            validate_cmd(&root, host, candidate, strict, json)
         }
         Command::Pty { args } => pty_cmd(&args),
         Command::Shell { args } => shell_cmd(&args),
@@ -1544,12 +1695,26 @@ fn eval_cmd(folder: &Path, host: Option<String>, keep: bool, json: bool) -> Resu
     }
 }
 
-fn validate_cmd(root: &Path, host: Option<String>, strict: bool, json: bool) -> Result<()> {
+fn validate_cmd(
+    root: &Path,
+    host: Option<String>,
+    candidate: Option<PathBuf>,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
     let catalog_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let host = host.unwrap_or_else(detect_host);
-    let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
-        .context("acquire shared catalog-authoring lock for validation")?;
-    let report = st2::validate::validate_for_host(&catalog_root, &host);
+    let report = if let Some(candidate) = candidate {
+        st2::agent_publish::validate_candidate_for_host(
+            &catalog_root,
+            st2::agent_publish::PublishSource::Spec(candidate),
+            &host,
+        )
+    } else {
+        let _catalog_lock = st2::CatalogLock::shared(&catalog_root)
+            .context("acquire shared catalog-authoring lock for validation")?;
+        st2::validate::validate_for_host(&catalog_root, &host)
+    };
     let (errors, warnings) = (report.errors(), report.warnings());
 
     if json {
@@ -1934,6 +2099,67 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     "",
                 ),
             }
+            // Harness context is advisory-only too (HC-R17), and on a narrower axis than the
+            // categorical record above: a filling window is worth a human's attention, and it is
+            // never a health failure. Absence says nothing here — no producer has published a
+            // number, which is not a fault — so only a high reading and a stale record beside a
+            // `running` desired state speak.
+            if let Some(context) =
+                st2::harness_context::read(&st2::harness_context::harness_context_path(dir))
+            {
+                // The harness's own percent, never one st2 divided out of the operands beside it,
+                // and never clamped: an overrun above 100 is exactly what this warns about.
+                if context.used_percent.is_some_and(|percent| {
+                    percent >= st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT
+                }) {
+                    report_advisory(
+                        &format!(
+                            "{bus_id} harness context at {}%",
+                            context.used_percent.unwrap_or_default().round()
+                        ),
+                        &format!(
+                            "at or above st2's {}% attention threshold, read {} ago — st2's own \
+                             number, not a prediction of where this harness compacts",
+                            st2::harness_context::HARNESS_CONTEXT_WARN_PERCENT.round(),
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+                if context.stale && spec.desired_state.as_str() == "running" {
+                    report_advisory(
+                        &format!("{bus_id} harness context stale"),
+                        &format!(
+                            "the numbers are {} old while desired state is running — is its \
+                             driver still reading the harness?",
+                            humanize_ms(context.age_ms)
+                        ),
+                    );
+                }
+            }
+            if st2::driver_diagnostic::expected_for(spec) {
+                let diagnostic = st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
+                match &diagnostic {
+                    st2::driver_diagnostic::Observed::Failure(failure) => report_advisory(
+                        &format!(
+                            "{bus_id} native driver diagnostic: {}/{}",
+                            failure.stage.as_str(),
+                            failure.reason.as_str()
+                        ),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                    st2::driver_diagnostic::Observed::Indeterminate(reason) => report_advisory(
+                        &format!(
+                            "{bus_id} native driver diagnostic indeterminate ({})",
+                            reason.as_str()
+                        ),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                    st2::driver_diagnostic::Observed::Absent => report_advisory(
+                        &format!("{bus_id} native driver diagnostic absent"),
+                        st2::driver_diagnostic::repair_text(&diagnostic),
+                    ),
+                }
+            }
         }
     }
 
@@ -2050,6 +2276,16 @@ fn report_check(problems: &mut usize, ok: bool, label: &str, detail: &str) {
 
 fn report_advisory(label: &str, detail: &str) {
     println!("  ⚠ {label} — {detail}");
+}
+
+/// A coarse age for an advisory line: an operator reads "12m", not "743109ms".
+fn humanize_ms(age_ms: u64) -> String {
+    let seconds = age_ms / 1_000;
+    match seconds {
+        0..=90 => format!("{seconds}s"),
+        91..=5_400 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3_600),
+    }
 }
 
 fn presentation_cmd(
@@ -2272,10 +2508,11 @@ fn agents_cmd(
                 )
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 observed_column(r.observed.as_ref()),
+                context_column(r.context.as_ref()),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
                 lifecycle,
@@ -2303,6 +2540,31 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
         column = format!("unknown({reason})");
     }
     format!("obs:{column}")
+}
+
+/// The compact harness-context column for human `st2 agents` output. `-` means no record exists;
+/// `?` means a record exists whose percent the harness withheld — Claude before its session's
+/// first API response, pi across a compaction — and the two must not render alike, or the column
+/// says "nobody is watching" for a producer that is watching and honestly does not know.
+fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
+    // Prefixed like the observed column beside it, so neither compact word is mistaken for the
+    // other or for declared presence.
+    let Some(context) = context else {
+        return "ctx:-".to_string();
+    };
+    // The harness's own percent, rounded for width and never clamped: a reading above 100 is a
+    // real overrun and the one an operator most needs to see.
+    let mut column = match context.used_percent {
+        Some(percent) => format!("{}%", percent.round()),
+        None => "?".to_string(),
+    };
+    if context.compactions > 0 {
+        column.push_str(&format!(" ⟳{}", context.compactions));
+    }
+    if context.stale {
+        column.push_str(" stale");
+    }
+    format!("ctx:{column}")
 }
 
 fn ding_cmd(
@@ -2386,17 +2648,21 @@ fn resolve_message_inbox(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
 
 /// Body from `-m`, else stdin (so `st2 message send x < file` works).
 fn body_or_stdin(body: Option<String>) -> Result<String> {
-    match body {
-        Some(b) => Ok(b),
+    let body = match body {
+        Some(body) => body,
         None => {
             use std::io::Read as _;
-            let mut s = String::new();
+            let mut body = String::new();
             std::io::stdin()
-                .read_to_string(&mut s)
+                .read_to_string(&mut body)
                 .context("reading message body from stdin")?;
-            Ok(s)
+            body
         }
+    };
+    if body.is_empty() {
+        anyhow::bail!("message body must not be empty");
     }
+    Ok(body)
 }
 
 /// `[identity] <filename>` positionals: if `second` is present, `first` is the identity; otherwise
@@ -3105,98 +3371,340 @@ fn claude_channel_cmd(cmd: ClaudeChannelCmd) -> Result<()> {
     }
 }
 
+/// Read one agent's declared Resource bindings. Selector resolution mirrors the mediated author
+/// (`bus_id` first, then bare identity, unique or refuse) so `ls` and `add` always name the same
+/// declaration, and a malformed catalog refuses rather than silently hiding an agent.
+fn resource_bindings(
+    root: &Path,
+    selector: &str,
+    host: &str,
+) -> Result<(String, Vec<st2::Resource>)> {
+    with_resource_bindings_snapshot(root, selector, host, |identity, bindings| {
+        Ok((identity, bindings))
+    })
+}
+
+/// Resolve one binding projection and let the caller finish consuming that exact catalog snapshot
+/// before its shared authoring fence is released.
+fn with_resource_bindings_snapshot<T>(
+    root: &Path,
+    selector: &str,
+    host: &str,
+    consume: impl FnOnce(String, Vec<st2::Resource>) -> Result<T>,
+) -> Result<T> {
+    let _catalog_lock = st2::CatalogLock::shared(root)
+        .context("acquire shared catalog-authoring lock for Resource bindings")?;
+    let found = st2::discover_strict(root);
+    if let Some(error) = found.errors.first() {
+        anyhow::bail!(
+            "cannot prove an exact Resource binding target while {} is malformed: {}",
+            error.path.display(),
+            error.message
+        );
+    }
+    let exact = found
+        .specs
+        .iter()
+        .filter(|spec| spec.bus_id(host) == selector)
+        .collect::<Vec<_>>();
+    let matches = if exact.is_empty() {
+        found
+            .specs
+            .iter()
+            .filter(|spec| spec.identity == selector)
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    let (identity, bindings) = match matches.as_slice() {
+        [] => anyhow::bail!("no agent '{selector}' found in catalog {}", root.display()),
+        [spec] => (spec.bus_id(host), spec.resources.clone()),
+        many => {
+            let mut candidates = many
+                .iter()
+                .map(|spec| format!("{} ({})", spec.bus_id(host), spec.path.display()))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            anyhow::bail!(
+                "agent selector '{selector}' is ambiguous: {}",
+                candidates.join(", ")
+            )
+        }
+    };
+    consume(identity, bindings)
+}
+
+#[cfg(debug_assertions)]
+fn resource_refresh_snapshot_checkpoint() {
+    let (Ok(ready), Ok(release)) = (
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_READY"),
+        std::env::var("ST2_TEST_RESOURCE_REFRESH_SNAPSHOT_RELEASE"),
+    ) else {
+        return;
+    };
+    let _ = std::fs::write(ready, b"ready");
+    while !Path::new(&release).exists() {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn resource_refresh_snapshot_checkpoint() {}
+
 fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
-        ResourceCmd::Add {
-            url,
-            title,
-            tags,
-            relation,
-            body_stdin,
+        ResourceCmd::Ls {
+            identity,
+            json,
             ctx,
         } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let id = acting_id(&ctx)?;
-            let body = if body_stdin {
-                std::io::read_to_string(std::io::stdin())?
-            } else {
-                String::new()
-            };
-            let f = message::with_resolved_state_dir(
-                &root,
-                &id,
-                &host,
-                &["resources", "links"],
-                true,
-                |dir| {
-                    st2::resource::add(
-                        dir,
-                        &url,
-                        title.as_deref(),
-                        &tags,
-                        relation.as_deref(),
-                        &body,
-                    )
-                },
-            )?;
-            println!("{f}");
-            Ok(())
-        }
-        ResourceCmd::Ls { identity, ctx } => {
             let (root, host) = resolve_ctx(&ctx)?;
             let id = match identity {
                 Some(i) => i,
                 None => acting_id(&ctx)?,
             };
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
-            let items = st2::resource::list(&dir);
-            println!("# {} resource{} for {id}", items.len(), plural(items.len()));
-            for r in &items {
-                let title = r.title.as_deref().unwrap_or("");
-                println!("{}  {}  {title}", r.filename, r.url);
+            let (identity, bindings) = resource_bindings(&root, &id, &host)?;
+            if json {
+                println!("{}", serde_json::to_string(&bindings)?);
+                return Ok(());
             }
-            Ok(())
-        }
-        ResourceCmd::Read { first, second, ctx } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
-            let dir = st2::resource::links_dir(&agent_dir_of(&root, &id, &host)?);
-            let r = st2::resource::read(&dir, &filename)?;
-            println!("url:      {}", r.url);
-            if let Some(t) = &r.title {
-                println!("title:    {t}");
-            }
-            if !r.tags.is_empty() {
-                println!("tags:     {}", r.tags.join(", "));
-            }
-            if let Some(rel) = &r.relation {
-                println!("relation: {rel}");
-            }
-            if !r.body.is_empty() {
-                println!();
-                print!("{}", r.body);
-            }
-            Ok(())
-        }
-        ResourceCmd::Remove { first, second, ctx } => {
-            let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
-            anyhow::ensure!(
-                message::is_message_filename(&filename),
-                "invalid resource filename {filename:?}"
+            println!(
+                "# {} resource{} for {identity}",
+                bindings.len(),
+                plural(bindings.len())
             );
-            message::with_resolved_state_dir(
+            // Align the uri column to the widest name so a long binding name still leaves a
+            // separator. `{:<width$}` pads by chars, so measure chars, not bytes.
+            let width = bindings
+                .iter()
+                .map(|binding| binding.name().chars().count())
+                .max()
+                .unwrap_or(0)
+                + 2;
+            for binding in &bindings {
+                println!("  {:<width$}{}", binding.name(), binding.uri());
+            }
+            Ok(())
+        }
+        ResourceCmd::Read {
+            first,
+            second,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (id, name) = box_target(first, second, &ctx)?;
+            let (identity, bindings) = resource_bindings(&root, &id, &host)?;
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.name() == name)
+                .with_context(|| format!("no resource binding '{name}' declared by {identity}"))?;
+            if json {
+                println!("{}", serde_json::to_string(binding)?);
+                return Ok(());
+            }
+            println!("{:<17}{}", "name:", binding.name());
+            println!("{:<17}{}", "uri:", binding.uri());
+            println!("{:<17}{}", "reason:", binding.reason());
+            if let Some(inactive_reason) = binding.inactive_reason() {
+                println!("{:<17}{}", "inactive-reason:", inactive_reason);
+            }
+            if let Some(selector) = binding.selector() {
+                println!("{:<17}{}", "selector:", serde_json::to_string(selector)?);
+            }
+            Ok(())
+        }
+        ResourceCmd::Refresh {
+            first,
+            second,
+            agent,
+            wait,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (selector, name) = match second {
+                Some(name) => (first, name),
+                None => {
+                    let selector = match agent {
+                        Some(agent) => agent,
+                        None => acting_id(&ctx)?,
+                    };
+                    (selector, first)
+                }
+            };
+            let (identity, request) =
+                with_resource_bindings_snapshot(&root, &selector, &host, |identity, bindings| {
+                    bindings
+                        .iter()
+                        .find(|binding| binding.name() == name)
+                        .with_context(|| {
+                            format!("no resource binding '{name}' declared by {identity}")
+                        })?;
+                    resource_refresh_snapshot_checkpoint();
+                    let generation = st2::resource_observe::catalog_generation(&root)?;
+                    let request = st2::resource_observe::ObserveRequest::new(
+                        identity.clone(),
+                        name.clone(),
+                        generation,
+                        None,
+                    )?;
+                    Ok((identity, request))
+                })?;
+            let request_id = request.request_id.clone();
+            let client = st2::resource_observe::submit_request(&root, &host, &request)?;
+            let waited = client.wait_for_terminal(Duration::from_secs(wait))?;
+            if waited.timed_out {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "status": "timeout",
+                            "requestId": request_id,
+                            "queued": true,
+                            "receipt": &waited.receipt,
+                        }))?
+                    );
+                }
+                let last = waited
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.status.as_str())
+                    .unwrap_or("pending");
+                anyhow::bail!(
+                    "resource refresh for {identity} {name} exceeded the {wait}s client wait bound \
+                     (last status: {last}); the request remains queued and may still settle"
+                );
+            }
+            let receipt = waited
+                .receipt
+                .context("Resource observation ended without a receipt")?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            }
+            if !receipt.status.is_success() {
+                anyhow::bail!(
+                    "resource refresh for {identity} {name}: {}{}",
+                    receipt.status.as_str(),
+                    receipt
+                        .diagnostic
+                        .as_deref()
+                        .map(|detail| format!(": {detail}"))
+                        .unwrap_or_default()
+                );
+            }
+            if !json {
+                let digest = receipt
+                    .digest
+                    .map(|digest| format!(" ({digest})"))
+                    .unwrap_or_default();
+                println!(
+                    "resource {name} on {identity}: {}{digest}",
+                    receipt.status.as_str()
+                );
+            }
+            Ok(())
+        }
+        ResourceCmd::Add {
+            name,
+            uri,
+            reason,
+            inactive_reason,
+            selector_json,
+            agent,
+            json,
+            ctx,
+        } => {
+            let selector = selector_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("--selector-json is not valid JSON: {error}"))?;
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt = st2::agent_author::add_resource_with_selector(
                 &root,
-                &id,
+                &target,
                 &host,
-                &["resources", "links"],
-                false,
-                |dir| st2::resource::remove(dir, &filename),
+                actor.as_deref(),
+                &name,
+                &uri,
+                &reason,
+                inactive_reason.as_deref(),
+                selector.as_ref(),
             )?;
-            println!("removed");
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} on {}",
+                    receipt.result, receipt.name, receipt.identity
+                );
+            }
+            Ok(())
+        }
+        ResourceCmd::Remove {
+            name,
+            agent,
+            json,
+            ctx,
+        } => {
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt =
+                st2::agent_author::remove_resource(&root, &target, &host, actor.as_deref(), &name)?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} on {}",
+                    receipt.result, receipt.name, receipt.identity
+                );
+            }
+            Ok(())
+        }
+        ResourceCmd::Rename {
+            old,
+            new,
+            agent,
+            json,
+            ctx,
+        } => {
+            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let receipt = st2::agent_author::rename_resource(
+                &root,
+                &target,
+                &host,
+                actor.as_deref(),
+                &old,
+                &new,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "{:?} resource {} -> {} on {}",
+                    receipt.result, receipt.old, receipt.new, receipt.identity
+                );
+            }
             Ok(())
         }
     }
+}
+
+/// The catalog root, host, acting actor, and authored target for one mediated binding edit.
+fn resource_author_target(
+    agent: Option<String>,
+    ctx: &MsgCtx,
+) -> Result<(PathBuf, String, Option<String>, String)> {
+    let (root, host) = resolve_ctx(ctx)?;
+    let actor = ctx
+        .as_id
+        .clone()
+        .or_else(|| std::env::var("ST_AGENT").ok())
+        .filter(|value| !value.is_empty());
+    let target = agent
+        .or_else(|| actor.clone())
+        .context("no resource binding target: pass --agent, --as, or set $ST_AGENT")?;
+    Ok((root, host, actor, target))
 }
 
 /// Resolve an agent's context dir (`<agent_dir>/resources/context`). Identity defaults to `$ST_AGENT`.
@@ -3257,6 +3765,9 @@ fn up_spec_fleet(spec_file: &Path, host: Option<String>, once: bool, interval: u
         print_report(&report);
         if report.skipped {
             anyhow::bail!("one-shot reconcile pass was skipped");
+        }
+        if !report.errors.is_empty() {
+            anyhow::bail!("one-shot reconcile pass reported errors");
         }
         return Ok(());
     }
@@ -3395,6 +3906,9 @@ fn up(
         }
         if targeted && !report.errors.is_empty() {
             anyhow::bail!("targeted one-shot reconcile pass reported errors");
+        }
+        if !report.errors.is_empty() {
+            anyhow::bail!("one-shot reconcile pass reported errors");
         }
         return Ok(());
     }

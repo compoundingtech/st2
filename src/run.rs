@@ -25,7 +25,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use opentelemetry::trace::Status;
 use serde::{Deserialize, Serialize};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::exec_backend::ExecBackend;
 use crate::flapping::FlappingCap;
@@ -69,9 +71,65 @@ impl PresentationPatchCursor {
     }
 }
 
-/// Run a non-interactive child with bounded output capture. Regular temporary files keep an escaped
-/// descendant that inherited stdout/stderr from blocking cleanup after the direct child times out.
+/// Per-stream cap for captured child diagnostics. Tail-preserving: when output exceeds the cap,
+/// the LAST [`CAPTURE_CAP_BYTES`] bytes are kept — recent output is what a failure message needs,
+/// and an uncapped capture lets one chatty child balloon sidecar memory without bound.
+pub(crate) const CAPTURE_CAP_BYTES: usize = 256 * 1024;
+
+/// One captured child stream capped to [`CAPTURE_CAP_BYTES`], keeping the tail.
+pub(crate) struct BoundedStream {
+    pub bytes: Vec<u8>, // last <= cap bytes
+    pub total: u64,     // complete stream size before capping
+}
+
+impl BoundedStream {
+    pub fn truncated(&self) -> bool {
+        self.total as usize > self.bytes.len()
+    }
+}
+
+/// Read back at most `cap` bytes of a temp-file capture, preserving the tail. The file is stat'ed
+/// and seek'ed straight to `len - cap`, so the cost is O(cap) no matter how much the child wrote.
+pub(crate) fn read_bounded_tail(
+    file: &mut std::fs::File,
+    cap: usize,
+) -> std::io::Result<BoundedStream> {
+    let total = file.metadata()?.len();
+    let skip = total.saturating_sub(cap as u64);
+    file.seek(std::io::SeekFrom::Start(skip))?;
+    let mut bytes = Vec::with_capacity((total - skip) as usize);
+    file.take(cap as u64).read_to_end(&mut bytes)?;
+    Ok(BoundedStream { bytes, total })
+}
+
+/// Send an already-killed child to ONE shared reaper thread instead of spawning a detached thread
+/// per timed-out child: under a timeout storm one-thread-per-child accumulates without bound.
+/// The thread starts lazily on first use.
+pub(crate) fn reap_detached(child: std::process::Child) {
+    static REAPER: std::sync::LazyLock<std::sync::mpsc::Sender<Child>> =
+        std::sync::LazyLock::new(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<Child>();
+            // Thread-spawn exhaustion is the only failure mode; panicking here surfaces it at the
+            // call site instead of silently leaking unreaped children.
+            std::thread::Builder::new()
+                .name("st2-child-reaper".to_string())
+                .spawn(move || {
+                    for mut child in receiver {
+                        let _ = child.wait();
+                    }
+                })
+                .expect("spawn shared child reaper thread");
+            sender
+        });
+    let _ = REAPER.send(child);
+}
+
+/// Run a non-interactive child with bounded output capture: each stream keeps at most its last
+/// [`CAPTURE_CAP_BYTES`] bytes (tail-preserving, with a diagnostic line on truncation). Regular
+/// temporary files keep an escaped descendant that inherited stdout/stderr from blocking cleanup
+/// after the direct child times out.
 /// The child still gets a fresh process group so the common wrapper-and-descendants case is reaped.
+#[cfg(test)]
 fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
     output_with_input_timeout(command, timeout, None)
 }
@@ -92,9 +150,7 @@ fn terminate_and_reap_before(mut child: Child, pid: i32, deadline: Instant) {
                 );
             }
             Ok(None) | Err(_) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+                reap_detached(child);
                 return;
             }
         }
@@ -153,11 +209,40 @@ fn output_with_input_timeout(
 /// that pid is also its process group id — the group this function signals on every failure path.
 /// Tests need it to assert the child was reaped, and the child cannot supply it: a test whose
 /// deadline expires before the child is first scheduled would never see anything the child wrote.
+///
+/// It runs BEFORE the child deadline starts, and tests rely on that: a lifecycle test blocks in
+/// `on_spawn` until the fixture reached the state it wants to measure, so fork+exec scheduling is
+/// paid outside the deadline instead of out of it. See
+/// `tests::the_spawn_observer_runs_before_the_child_deadline_starts`.
 fn output_with_input_timeout_observed(
     command: &mut Command,
     timeout: Duration,
     input: Option<Vec<u8>>,
     on_spawn: impl FnOnce(i32),
+) -> anyhow::Result<Output> {
+    run_captured(command, timeout, input, on_spawn, false)
+}
+
+/// Like [`output_with_timeout`], but returns the COMPLETE stdout: callers parse structured data
+/// (e.g. `pty list --json`) that must be whole, and capping it would corrupt the parse for large
+/// fleets. Stdout is therefore intentionally uncapped — one chatty child can balloon this buffer.
+/// Stderr stays tail-capped at [`CAPTURE_CAP_BYTES`] with a diagnostic line on truncation,
+/// because stderr is only surfaced inside error messages.
+pub(crate) fn output_full_stdout_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> anyhow::Result<Output> {
+    run_captured(command, timeout, None, |_| {}, true)
+}
+
+/// Shared spawn/wait/read-back core. The child is `setsid`, so its pid is also its process group
+/// id — the group this function signals on every failure path.
+fn run_captured(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+    on_spawn: impl FnOnce(i32),
+    full_stdout: bool,
 ) -> anyhow::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -181,6 +266,9 @@ fn output_with_input_timeout_observed(
     let mut child = command.spawn()?;
     let pid = child.id() as i32;
     on_spawn(pid);
+    // Load-bearing order: the deadline starts after `on_spawn` returns, so a test that blocks there
+    // as a readiness barrier spends none of `timeout` on fork+exec. Moving this line above
+    // `on_spawn` is silent in production and makes every barrier test load-sensitive again.
     let deadline = Instant::now() + timeout;
     if let Some(input) = input {
         let Some(stdin) = child.stdin.take() else {
@@ -209,16 +297,33 @@ fn output_with_input_timeout_observed(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    stdout.rewind()?;
-    stderr.rewind()?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    let stdout_stream = if full_stdout {
+        // Intentionally uncapped: callers parse structured data that must be whole.
+        stdout.rewind()?;
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        BoundedStream {
+            total: bytes.len() as u64,
+            bytes,
+        }
+    } else {
+        read_bounded_tail(&mut stdout, CAPTURE_CAP_BYTES)?
+    };
+    let stderr_stream = read_bounded_tail(&mut stderr, CAPTURE_CAP_BYTES)?;
+    let program = command.get_program().to_string_lossy();
+    for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
+        if stream.truncated() {
+            eprintln!(
+                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                stream.bytes.len(),
+                stream.total,
+            );
+        }
+    }
     Ok(Output {
         status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+        stdout: stdout_stream.bytes,
+        stderr: stderr_stream.bytes,
     })
 }
 
@@ -661,7 +766,7 @@ impl PtyCli {
     }
 
     fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
-        let out = output_with_timeout(
+        let out = output_full_stdout_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
                 .env("PTY_ROOT", root),
@@ -1164,7 +1269,7 @@ impl ParkChannel {
         let scope = match crate::park::SupervisorScope::current(catalog_root, host) {
             Ok(scope) => scope,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot open the supervisor park channel ({error}); parks remain terminal but cannot be observed or explicitly released."
                 );
                 return Self {
@@ -1176,7 +1281,7 @@ impl ParkChannel {
         let projection = match crate::park::ParkProjection::current(scope.park_dir()) {
             Ok(projection) => Some(projection),
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "st2: cannot publish parked tasks ({error}); `st2 tasks` will not show park faults for this supervisor."
                 );
                 None
@@ -1216,6 +1321,7 @@ pub fn execute(
         cap,
         &mut PresentationPatchCursor::default(),
         report,
+        &mut |_| {},
     );
 }
 
@@ -1234,13 +1340,53 @@ fn stop_live_derived_companions(
     }
 }
 
+/// Bounded driver label for lifecycle metrics (`task_launches_total` / `task_reaps_total`).
+/// Typed drivers report their own name; legacy routed and hand-authored seats are classified
+/// by what their launch actually invokes. Anything unrecognizable collapses to `other`, so
+/// the label stays a closed set: `codex|claude|opencode|pi|omp|exec|other`. Observational only —
+/// callers gate on [`crate::metrics::enabled`], and it never influences reconcile decisions.
+fn driver_label(launch: &crate::reconcile::Launch<'_>, target: &TaskTarget) -> &'static str {
+    if target.kind == TaskKind::Exec {
+        return "exec";
+    }
+    if let Some(driver) = &launch.spec.driver {
+        return driver.name();
+    }
+    // Legacy routed (`deliver "mcp"` → claude-session, ...) or hand-authored seats: inspect
+    // the launch source by its alphanumeric tokens.
+    let tokens = |needle: &str| match &target.launch {
+        TaskLaunch::Argv(argv) => argv.iter().any(|arg| {
+            arg.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|t| t == needle)
+        }),
+        TaskLaunch::Shell(command) => command
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == needle),
+    };
+    if tokens("codex") {
+        "codex"
+    } else if tokens("claude") {
+        "claude"
+    } else if tokens("opencode") {
+        "opencode"
+    } else if tokens("omp") {
+        "omp"
+    } else if tokens("pi") {
+        "pi"
+    } else {
+        "other"
+    }
+}
+
 fn execute_with_presentation_cursor(
     plan: &ReconcilePlan,
     runner: &dyn Runner,
     cap: &mut FlappingCap,
     presentation_cursor: &mut PresentationPatchCursor,
     report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
 ) {
+
     // The corpses tied to a launch target (dead, non-keep, active ptys) are reaped inside the launch
     // loop so a parked flapper keeps its evidence. Everything else in `gc` (e.g. a retired agent's
     // dead sessions) is reaped here.
@@ -1313,7 +1459,9 @@ fn execute_with_presentation_cursor(
             let restarting = gc_set.contains(target.pty_id.as_str());
             if restarting {
                 match runner.reap_for_restart(&target.pty_id) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        crate::metrics::record_task_reap(driver_label(launch, target));
+                    }
                     Err(e) => {
                         report
                             .errors
@@ -1326,8 +1474,13 @@ fn execute_with_presentation_cursor(
                     }
                 }
             }
+            let spawn_started = Instant::now();
             match runner.spawn(target, spec_dir) {
                 Ok(()) => {
+                    crate::metrics::record_session_start(
+                        spawn_started.elapsed(),
+                        driver_label(launch, target),
+                    );
                     cap.record(&target.pty_id, now);
                     if restarting {
                         report.restarted.push(target.pty_id.clone());
@@ -1336,6 +1489,9 @@ fn execute_with_presentation_cursor(
                     }
                     if target.name == "agent" && !target.derived {
                         agent_available = true;
+                        // Baseline the canonical seat synchronously at the exact transition that
+                        // made it live. A later target may block while its carriers keep changing.
+                        on_canonical_live(launch.spec);
                     }
                 }
                 Err(e) => {
@@ -1358,12 +1514,32 @@ fn execute_with_presentation_cursor(
     // the same safe direction.
     cap.end_pass(Instant::now(), &plan.live);
 
+    let mut failed_retirement_teardowns = HashSet::new();
     for td in &plan.teardown {
+        let mut failed = false;
         for id in &td.pty_ids {
             match runner.kill(id) {
                 Ok(()) => report.torn_down.push(id.clone()),
-                Err(e) => report.errors.push(format!("kill {id}: {e}")),
+                Err(e) => {
+                    failed = true;
+                    report.errors.push(format!("kill {id}: {e}"));
+                }
             }
+        }
+        if failed {
+            failed_retirement_teardowns.insert(td.spec.path.clone());
+        }
+    }
+    for spec in &plan.settle_retirement {
+        if failed_retirement_teardowns.contains(&spec.path) {
+            continue;
+        }
+        let agent_dir = spec.path.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(error) = crate::message::archive_inbox(agent_dir) {
+            report.errors.push(format!(
+                "archive retired inbox for {}: {error:#}",
+                spec.identity
+            ));
         }
     }
 
@@ -1471,6 +1647,39 @@ impl LivenessDebounce {
     }
 }
 
+/// Specs whose canonical agent seat this pass proved live. Desired state and whole-spec adoption
+/// are not evidence: the canonical task itself must have been observed alive or spawned successfully.
+fn live_resync_specs(
+    specs: &[agent_spec::spec::AgentSpec],
+    this_host: &str,
+    sessions: &[Session],
+    report: &UpReport,
+) -> Vec<agent_spec::spec::AgentSpec> {
+    let live_task_ids = sessions
+        .iter()
+        .filter(|session| session.alive)
+        .map(|session| session.pty_id.as_str())
+        .chain(report.launched.iter().map(String::as_str))
+        .chain(report.restarted.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    specs
+        .iter()
+        .filter(|spec| {
+            spec.tasks.iter().any(|task| {
+                if task.name != "agent" {
+                    return false;
+                }
+                let task_id = task
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                live_task_ids.contains(task_id.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// One full reconcile pass: discover → list actual → reconcile → execute. On a `pty list` failure the
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
@@ -1483,20 +1692,41 @@ fn reconcile_pass(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
+    resync: Option<&crate::resync::ResyncSupervisor>,
+    resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
 ) -> UpReport {
-    let _catalog_lock = match crate::CatalogLock::shared(root) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return UpReport {
-                skipped: true,
-                errors: vec![format!(
-                    "acquire shared catalog-authoring lock (pass skipped): {error:#}"
-                )],
-                ..Default::default()
-            };
+    let _catalog_lock = {
+        let span = catalog_lock_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let result = crate::CatalogLock::shared(root);
+        finish_child_span(span.as_ref(), result.is_err());
+        drop(entered);
+        match result {
+            Ok(lock) => lock,
+            Err(error) => {
+                return UpReport {
+                    skipped: true,
+                    errors: vec![format!(
+                        "acquire shared catalog-authoring lock (pass skipped): {error:#}"
+                    )],
+                    ..Default::default()
+                };
+            }
         }
     };
-    let found = crate::discover(root);
+    let found = {
+        let span = catalog_discover_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let found = crate::discover(root);
+        if let Some(span) = &span {
+            span.record("st2.catalog.spec_count", span_count(found.specs.len()));
+            span.record("st2.report.warning_count", span_count(found.warnings.len()));
+            span.record("st2.report.error_count", span_count(found.errors.len()));
+            finish_child_span(Some(span), !found.errors.is_empty());
+        }
+        drop(entered);
+        found
+    };
     let mut report = UpReport {
         warnings: found.warnings.clone(),
         errors: found
@@ -1519,13 +1749,43 @@ fn reconcile_pass(
     // pi needs the same verified set, but for its launch only: nothing it renders references
     // `$ST_HOOKS`, while `st2 driver pi-session` cannot start without the channel extension. So a
     // pi agent contributes to this verification without having its materialization deferred.
-    let needs_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root)
-        || crate::hooks::required_by_pi(&found.specs, this_host, root);
-    let hook_error = needs_hooks
-        .then(crate::hooks::verify_required_set)
-        .transpose()
-        .err()
-        .map(|error| error.to_string());
+    let tracer_export_enabled = crate::telemetry::tracer_export_enabled();
+    let needs_codex_hooks = crate::hooks::required_by_codex(&found.specs, this_host, root);
+    let needs_pi_hooks = if needs_codex_hooks && !tracer_export_enabled {
+        false
+    } else {
+        crate::hooks::required_by_pi(&found.specs, this_host, root)
+    };
+    let needs_omp_hooks = if (needs_codex_hooks || needs_pi_hooks) && !tracer_export_enabled {
+        false
+    } else {
+        crate::hooks::required_by_omp(&found.specs, this_host, root)
+    };
+    let needs_hooks = needs_codex_hooks || needs_pi_hooks || needs_omp_hooks;
+    let hook_error = {
+        let consumer = match (needs_codex_hooks, needs_pi_hooks, needs_omp_hooks) {
+            (true, true, true) => "codex+pi+omp",
+            (true, true, false) => "codex+pi",
+            (true, false, true) => "codex+omp",
+            (false, true, true) => "pi+omp",
+            (true, false, false) => "codex",
+            (false, true, false) => "pi",
+            (false, false, true) => "omp",
+            (false, false, false) => "none",
+        };
+        let span = needs_hooks
+            .then(|| lifecycle_hooks_span(consumer))
+            .flatten();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let hook_error = needs_hooks
+            .then(crate::hooks::verify_required_set)
+            .transpose()
+            .err()
+            .map(|error| error.to_string());
+        finish_child_span(span.as_ref(), hook_error.is_some());
+        drop(entered);
+        hook_error
+    };
     if let Some(error) = &hook_error {
         report.errors.push(format!(
             "verify this binary's lifecycle hooks before harness materialization: {error}; materialization deferred"
@@ -1544,36 +1804,72 @@ fn reconcile_pass(
     // active fleet even when another gate defers one owner's writes. A gating render failure removes
     // only that agent from this pass; advisory git-exclude failures remain warnings and never block
     // a launch.
-    let materialized = crate::materialize::materialize_catalog_against(
-        root,
-        &materializable_specs,
-        &found.specs,
-        this_host,
-    );
+    let materialized = {
+        let span = catalog_materialize_span("catalog");
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let materialized = crate::materialize::materialize_catalog_against(
+            root,
+            &materializable_specs,
+            &found.specs,
+            this_host,
+        );
+        if let Some(span) = &span {
+            span.record(
+                "st2.materialize.failure_count",
+                span_count(materialized.failed_agents.len()),
+            );
+            span.record(
+                "st2.report.warning_count",
+                span_count(materialized.warnings.len()),
+            );
+            span.record(
+                "st2.report.error_count",
+                span_count(materialized.errors.len()),
+            );
+            finish_child_span(Some(span), !materialized.errors.is_empty());
+        }
+        drop(entered);
+        materialized
+    };
     report.warnings.extend(materialized.warnings);
     report.errors.extend(materialized.errors);
-    let mut eligible_specs: Vec<_> = found
-        .specs
+    let mut compiled_specs = Vec::new();
+    for mut spec in found.specs.iter().cloned() {
+        if let Err(error) =
+            compile_generated_tasks(std::slice::from_mut(&mut spec), this_host, task_context)
+        {
+            report.errors.push(format!(
+                "compile generated tasks for {}: {error:#}",
+                spec.path.display()
+            ));
+            continue;
+        }
+        compiled_specs.push(spec);
+    }
+    let eligible_specs = compiled_specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
-        .collect();
-    if let Err(error) = compile_generated_tasks(&mut eligible_specs, this_host, task_context) {
-        report.skipped = true;
-        report
-            .errors
-            .push(format!("compile generated tasks (pass skipped): {error:#}"));
-        return report;
-    }
+        .collect::<Vec<_>>();
 
-    let sessions = match runner.list_sessions() {
-        Ok(s) => s,
-        Err(e) => {
-            report.skipped = true;
-            report
-                .errors
-                .push(format!("list sessions (pass skipped): {e}"));
-            return report;
+    let sessions = {
+        let span = runtime_observe_span();
+        let entered = span.as_ref().map(tracing::Span::enter);
+        let sessions = runner.list_sessions();
+        if let (Some(span), Ok(sessions)) = (span.as_ref(), sessions.as_ref()) {
+            span.record("st2.runtime.session_count", span_count(sessions.len()));
+        }
+        finish_child_span(span.as_ref(), sessions.is_err());
+        drop(entered);
+        match sessions {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                report.skipped = true;
+                report
+                    .errors
+                    .push(format!("list sessions (pass skipped): {e}"));
+                return report;
+            }
         }
     };
     let now = Instant::now();
@@ -1586,52 +1882,344 @@ fn reconcile_pass(
         }
     };
     report.deferred = debounce.defer_flickers(&mut plan, now);
-    gate_harness_launches_on_hooks(&mut plan, root, &mut report, || match &hook_error {
+    if let Some(resync) = resync {
+        for launch in &plan.launch {
+            if launch.tasks.iter().any(|task| task.name == "agent") {
+                resync.deactivate(launch.spec, this_host);
+            }
+        }
+    }
+    if let Some(resource_profiles) = resource_profiles {
+        for launch in &plan.launch {
+            if launch.tasks.iter().any(|task| task.name == "agent") {
+                resource_profiles.deactivate(launch.spec);
+            }
+        }
+    }
+    gate_harness_launches_on_hooks(&mut plan, root, &mut report, |_| match &hook_error {
         Some(error) => anyhow::bail!("{error}"),
         None => Ok(()),
     });
-    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
+    if let Some(resync) = resync {
+        // Existing canonical seats are established by this pass's observation. Reinstall their
+        // complete catalog-aware sets synchronously before unrelated repairs can block. The
+        // targeted upsert retains unchanged baselines and pending transitions, so this is
+        // idempotent across steady-state passes.
+        for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
+            report
+                .warnings
+                .extend(resync.install_live(&spec, &found.specs, this_host));
+        }
+    }
+    let mut boundary_warnings = Vec::new();
+    let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
+        if let Some(resync) = resync {
+            boundary_warnings.extend(resync.install_live(spec, &found.specs, this_host));
+        }
+    };
+    execute_reconcile(
+        &plan,
+        runner,
+        cap,
+        presentation_cursor,
+        &mut report,
+        &mut install_new_live_seat,
+    );
+    report.warnings.extend(boundary_warnings);
+    if resync.is_some() || resource_profiles.is_some() {
+        let loaded = crate::catalog::declared_profile_catalog(root)
+            .context("parse resource profiles in catalog.kdl");
+        let catalog_profile_error = loaded.is_err();
+        let malformed_declarations = found
+            .errors
+            .iter()
+            .map(|error| error.path.clone())
+            .filter(|path| {
+                !catalog_profile_error || *path != crate::catalog::config_path(root)
+            })
+            .collect::<Vec<_>>();
+        let (config, profiles) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                report.errors.push(format!("{error:#}"));
+                (
+                    crate::catalog::CatalogConfig::default(),
+                    agent_spec::profile::ResourceProfileRegistry::empty(),
+                )
+            }
+        };
+        let live_subscription_specs =
+            live_resync_specs(&compiled_specs, this_host, &sessions, &report);
+        if let Some(resource_profiles) = resource_profiles {
+            let generation = match crate::catalog_lock::read_generation_token(root) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    report.errors.push(format!(
+                        "read catalog generation for Resource Profiles: {error:#}"
+                    ));
+                    None
+                }
+            };
+            report.warnings.extend(
+                resource_profiles
+                    .refresh(&config, &profiles, generation, &live_subscription_specs)
+                    .warnings,
+            );
+        }
+        if let Some(resync) = resync {
+            let passive = match crate::catalog::passive_profiles(&config, &profiles) {
+                Ok(passive) => passive,
+                Err(error) => {
+                    report.errors.push(format!(
+                        "derive passive Resource Profile registry: {error:#}"
+                    ));
+                    agent_spec::profile::ResourceProfileRegistry::empty()
+                }
+            };
+            report.warnings.extend(resync.refresh_with_profiles(
+                passive,
+                &found.specs,
+                &live_subscription_specs,
+                this_host,
+                &sessions,
+                &malformed_declarations,
+            ));
+        }
+    }
     report
 }
 
-/// A missing Codex agent must not launch against stale lifecycle hooks. Suppress the affected agent
-/// launches (including their sidecars) and surface the error when hook verification fails.
+/// A missing Codex, pi, or omp agent must not launch against stale lifecycle hooks. Suppress the
+/// affected agent launches (including their sidecars) and surface the error when verification fails.
 ///
 /// Workspace trust belongs to the declared provider command and its selected account-specific
 /// runtime. Reconciliation deliberately does not mutate an ambient Codex config: an account selector
 /// may choose `CODEX_HOME` only after this process launches the command, so such a write would target
 /// the wrong state and could not satisfy the launched seat's trust gate.
+fn lifecycle_hook_consumer(needs_codex: bool, needs_pi: bool, needs_omp: bool) -> &'static str {
+    match (needs_codex, needs_pi, needs_omp) {
+        (true, true, true) => "codex+pi+omp",
+        (true, true, false) => "codex+pi",
+        (true, false, true) => "codex+omp",
+        (false, true, true) => "pi+omp",
+        (true, false, false) => "codex",
+        (false, true, false) => "pi",
+        (false, false, true) => "omp",
+        (false, false, false) => unreachable!("gated launch has a lifecycle-hook consumer"),
+    }
+}
+
 fn gate_harness_launches_on_hooks<'a, V>(
     plan: &mut ReconcilePlan<'a>,
     catalog_root: &Path,
     report: &mut UpReport,
     verify_hooks: V,
 ) where
-    V: FnOnce() -> anyhow::Result<()>,
+    V: FnOnce(Option<&'static str>) -> anyhow::Result<()>,
 {
     let mut gated_agents = Vec::new();
+    let mut needs_codex = false;
+    let mut needs_pi = false;
+    let mut needs_omp = false;
     for launch in &plan.launch {
-        let Some(_) = launch.tasks.iter().find(|target| {
-            target.name == "agent"
-                && (crate::hooks::launch_invokes_codex(&target.launch, catalog_root)
-                    || crate::hooks::launch_invokes_pi(&target.launch, catalog_root))
-        }) else {
-            continue;
-        };
-        gated_agents.push(launch.spec.identity.clone());
+        let mut gated = false;
+        for target in &launch.tasks {
+            if target.name != "agent" {
+                continue;
+            }
+            let invokes_codex = crate::hooks::launch_invokes_codex(&target.launch, catalog_root);
+            let invokes_pi = crate::hooks::launch_invokes_pi(&target.launch, catalog_root);
+            let invokes_omp = crate::hooks::launch_invokes_omp(&target.launch, catalog_root);
+            needs_codex |= invokes_codex;
+            needs_pi |= invokes_pi;
+            needs_omp |= invokes_omp;
+            gated |= invokes_codex || invokes_pi || invokes_omp;
+        }
+        if gated {
+            gated_agents.push(launch.spec.identity.clone());
+        }
     }
     if gated_agents.is_empty() {
         return;
     }
 
-    if let Err(error) = verify_hooks() {
+    let consumer = crate::telemetry::tracer_export_enabled()
+        .then(|| lifecycle_hook_consumer(needs_codex, needs_pi, needs_omp));
+    if let Err(error) = verify_hooks(consumer) {
         plan.launch
             .retain(|launch| !gated_agents.contains(&launch.spec.identity));
         report.errors.push(format!(
-            "verify lifecycle hooks for new Codex or pi agent(s) {}: {error}; launch suppressed",
+            "verify lifecycle hooks for new Codex, pi, or omp agent(s) {}: {error}; launch suppressed",
             gated_agents.join(", ")
         ));
     }
+}
+
+/// Root span for one reconcile pass. The compatibility name remains `st2.reconcile_pass`;
+/// `span.label` and `st2.reconcile.path` distinguish the bounded path enum.
+fn reconcile_span(this_host: &str, path: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "st2.reconcile_pass",
+        "span.label" = path,
+        "st2.host" = this_host,
+        "st2.reconcile.path" = path,
+        "st2.crash_loops" = tracing::field::Empty,
+        "st2.unparked" = tracing::field::Empty,
+        "st2.report.errors" = tracing::field::Empty,
+        "st2.report.warnings" = tracing::field::Empty,
+        "st2.reconcile.skipped" = tracing::field::Empty,
+        "st2.result" = tracing::field::Empty,
+    )
+}
+
+fn catalog_lock_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.lock",
+            "span.label" = "shared",
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn catalog_discover_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.discover",
+            "span.label" = "catalog",
+            "st2.catalog.spec_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn lifecycle_hooks_span(consumer: &'static str) -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.hooks.verify",
+            "span.label" = "lifecycle hooks",
+            "st2.hooks.consumer" = consumer,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn catalog_materialize_span(label: &'static str) -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.catalog.materialize",
+            "span.label" = label,
+            "st2.materialize.failure_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn runtime_observe_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.runtime.observe",
+            "span.label" = "all sessions",
+            "st2.runtime.session_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn reconcile_execute_span() -> Option<tracing::Span> {
+    crate::telemetry::tracer_export_enabled().then(|| {
+        tracing::info_span!(
+            "st2.reconcile.execute",
+            "span.label" = "apply plan",
+            "st2.plan.launch_count" = tracing::field::Empty,
+            "st2.plan.gc_count" = tracing::field::Empty,
+            "st2.plan.teardown_count" = tracing::field::Empty,
+            "st2.report.warning_count" = tracing::field::Empty,
+            "st2.report.error_count" = tracing::field::Empty,
+            "st2.result" = tracing::field::Empty,
+        )
+    })
+}
+
+fn span_count(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn finish_child_span(span: Option<&tracing::Span>, failed: bool) {
+    let Some(span) = span else {
+        return;
+    };
+    span.record("st2.result", if failed { "fail" } else { "pass" });
+    if failed {
+        span.set_status(Status::error(""));
+    }
+}
+
+fn execute_reconcile(
+    plan: &ReconcilePlan,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    presentation_cursor: &mut PresentationPatchCursor,
+    report: &mut UpReport,
+    on_canonical_live: &mut dyn FnMut(&agent_spec::spec::AgentSpec),
+) {
+    let span = reconcile_execute_span();
+    let before = span
+        .as_ref()
+        .map(|_| (report.warnings.len(), report.errors.len()));
+    let _entered = span.as_ref().map(tracing::Span::enter);
+    execute_with_presentation_cursor(
+        plan,
+        runner,
+        cap,
+        presentation_cursor,
+        report,
+        on_canonical_live,
+    );
+    if let (Some(span), Some((warnings_before, errors_before))) = (span.as_ref(), before) {
+        span.record("st2.plan.launch_count", span_count(plan.launch.len()));
+        span.record("st2.plan.gc_count", span_count(plan.gc.len()));
+        span.record("st2.plan.teardown_count", span_count(plan.teardown.len()));
+        span.record(
+            "st2.report.warning_count",
+            span_count(report.warnings.len().saturating_sub(warnings_before)),
+        );
+        let added_errors = report.errors.len().saturating_sub(errors_before);
+        span.record("st2.report.error_count", span_count(added_errors));
+        finish_child_span(Some(span), added_errors > 0);
+    }
+}
+
+/// Stamp bounded pass outcomes onto the root and emit the deterministic per-pass completion log.
+/// Call while the span is entered.
+fn finish_reconcile_pass(span: &tracing::Span, report: &UpReport) {
+    span.record("st2.crash_loops", span_count(report.crash_loops.len()));
+    span.record("st2.unparked", span_count(report.unparked.len()));
+    span.record("st2.report.errors", span_count(report.errors.len()));
+    span.record("st2.report.warnings", span_count(report.warnings.len()));
+    span.record("st2.reconcile.skipped", report.skipped);
+    let failed = !report.errors.is_empty();
+    let result = if failed { "fail" } else { "pass" };
+    span.record("st2.result", result);
+    if failed {
+        span.set_status(Status::error(""));
+    }
+    tracing::info!(target: "st2", result, "reconcile pass complete");
+}
+
+fn finish_failed_reconcile_pass(span: &tracing::Span) {
+    span.record("st2.crash_loops", 0_i64);
+    span.record("st2.unparked", 0_i64);
+    span.record("st2.report.errors", 1_i64);
+    span.record("st2.report.warnings", 0_i64);
+    span.record("st2.reconcile.skipped", true);
+    span.record("st2.result", "fail");
+    span.set_status(Status::error(""));
+    tracing::info!(target: "st2", result = "fail", "reconcile pass complete");
 }
 
 /// One reconcile pass with a throwaway flapping-cap (`st2 up --once`). Returns an owned report;
@@ -1640,15 +2228,23 @@ fn gate_harness_launches_on_hooks<'a, V>(
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
-    Ok(reconcile_pass(
-        root,
+    let started = Instant::now();
+    let span = reconcile_span(this_host, "catalog");
+    let report = {
+        let _entered = span.enter();
+        let report = reconcile_pass(root,
         this_host,
         &task_context,
         runner,
         &mut FlappingCap::default(),
         &mut debounce,
         &mut PresentationPatchCursor::default(),
-    ))
+        None, None);
+        finish_reconcile_pass(&span, &report);
+        report
+    };
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
+    Ok(report)
 }
 
 /// Like [`reconcile_pass`] but over IN-MEMORY specs (a single-file st2 spec's team) rather than a
@@ -1684,36 +2280,52 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
+    let started = Instant::now();
+    let span = reconcile_span(this_host, "spec");
     let mut report = UpReport::default();
-    if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
-        report.errors.push(error.to_string());
-        return report;
-    }
-    let sessions = match runner.list_sessions() {
-        Ok(s) => s,
-        Err(e) => {
-            report.skipped = true;
-            report
-                .errors
-                .push(format!("list sessions (pass skipped): {e}"));
-            return report;
+    {
+        let _entered = span.enter();
+        if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
+            report.errors.push(error.to_string());
+        } else {
+            let observe_span = runtime_observe_span();
+            let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
+            let sessions = runner.list_sessions();
+            if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
+                span.record("st2.runtime.session_count", span_count(sessions.len()));
+            }
+            finish_child_span(observe_span.as_ref(), sessions.is_err());
+            drop(observe_entered);
+            match sessions {
+                Ok(sessions) => reconcile_specs_with_sessions_in_span(
+                    specs,
+                    &sessions,
+                    this_host,
+                    runner,
+                    cap,
+                    debounce,
+                    presentation_cursor,
+                    &mut report,
+                ),
+                Err(error) => {
+                    report.skipped = true;
+                    report
+                        .errors
+                        .push(format!("list sessions (pass skipped): {error}"));
+                }
+            }
         }
-    };
-    reconcile_pass_specs_with_sessions(
-        specs,
-        &sessions,
-        this_host,
-        runner,
-        cap,
-        debounce,
-        presentation_cursor,
-    )
+        finish_reconcile_pass(&span, &report);
+    }
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
+    report
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
 /// this so crash classification and reconciliation see the same terminal state: otherwise a clean
 /// process can exit between two `pty list` calls, be reaped by the second call, then look like a
-/// vanished crash on the next tick.
+/// vanished crash on the next tick. The external snapshot deliberately omits
+/// `st2.runtime.observe`; its provenance is outside this pass.
 pub(crate) fn reconcile_pass_specs_with_sessions(
     specs: &[agent_spec::spec::AgentSpec],
     sessions: &[Session],
@@ -1723,19 +2335,53 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
 ) -> UpReport {
+    let started = Instant::now();
+    let span = reconcile_span(this_host, "spec");
     let mut report = UpReport::default();
+    {
+        let _entered = span.enter();
+        reconcile_specs_with_sessions_in_span(
+            specs,
+            sessions,
+            this_host,
+            runner,
+            cap,
+            debounce,
+            presentation_cursor,
+            &mut report,
+        );
+        finish_reconcile_pass(&span, &report);
+    }
+    crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
+    report
+}
+
+fn reconcile_specs_with_sessions_in_span(
+    specs: &[agent_spec::spec::AgentSpec],
+    sessions: &[Session],
+    this_host: &str,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+    report: &mut UpReport,
+) {
     let now = Instant::now();
     debounce.observe(sessions, now);
-    let mut plan = match crate::reconcile(specs, sessions, this_host) {
-        Ok(plan) => plan,
-        Err(error) => {
-            report.errors.push(error.to_string());
-            return report;
+    match crate::reconcile(specs, sessions, this_host) {
+        Ok(mut plan) => {
+            report.deferred = debounce.defer_flickers(&mut plan, now);
+            execute_reconcile(
+                &plan,
+                runner,
+                cap,
+                presentation_cursor,
+                report,
+                &mut |_| {},
+            );
         }
-    };
-    report.deferred = debounce.defer_flickers(&mut plan, now);
-    execute_with_presentation_cursor(&plan, runner, cap, presentation_cursor, &mut report);
-    report
+        Err(error) => report.errors.push(error.to_string()),
+    }
 }
 
 /// One reconcile pass over an in-memory spec team (`st2 up <spec> --once`). Throwaway cap+debounce
@@ -1763,9 +2409,31 @@ pub fn up_once_selected_specs(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    up_once_selected_specs_with_gates(catalog_root, specs, selector, this_host, runner, || {
-        crate::hooks::verify_installed().map(|_| ())
-    })
+    let span = reconcile_span(this_host, "selected");
+    let result = {
+        let _entered = span.enter();
+        let result = up_once_selected_specs_with_gates(
+            catalog_root,
+            specs,
+            selector,
+            this_host,
+            runner,
+            |consumer| {
+                let hook_span = consumer.and_then(lifecycle_hooks_span);
+                let hook_entered = hook_span.as_ref().map(tracing::Span::enter);
+                let result = crate::hooks::verify_installed().map(|_| ());
+                finish_child_span(hook_span.as_ref(), result.is_err());
+                drop(hook_entered);
+                result
+            },
+        );
+        match &result {
+            Ok(report) => finish_reconcile_pass(&span, report),
+            Err(_) => finish_failed_reconcile_pass(&span),
+        }
+        result
+    };
+    result
 }
 
 /// Discover a folder catalog once, resolve one task before any owner hook/render mutation, then
@@ -1776,53 +2444,111 @@ pub fn up_once_selected(
     this_host: &str,
     runner: &dyn Runner,
 ) -> anyhow::Result<UpReport> {
-    let _catalog_lock = crate::CatalogLock::shared(catalog_root)
-        .context("acquire shared catalog-authoring lock for selected reconcile")?;
-    let found = crate::discovery::discover(catalog_root);
-    let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
-    let mut report = UpReport::default();
-    report.warnings.extend(found.warnings);
-    report.errors.extend(
-        found
-            .errors
-            .into_iter()
-            .map(|e| format!("{}: {}", e.path.display(), e.message)),
-    );
-    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
-        report.errors.push(error.to_string());
-        return Ok(report);
-    }
-    let owner = owner.clone();
-    if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root)
-        && let Err(error) = crate::hooks::verify_installed()
-    {
-        report
-            .errors
-            .push(format!("verify lifecycle hooks: {error}"));
-        return Ok(report);
-    }
-    let materialized = crate::materialize::materialize_catalog_against(
-        catalog_root,
-        std::slice::from_ref(&owner),
-        &found.specs,
-        this_host,
-    );
-    report.warnings.extend(materialized.warnings);
-    let owner_materialization_failed = !materialized.failed_agents.is_empty();
-    report.errors.extend(materialized.errors);
-    if owner_materialization_failed {
-        return Ok(report);
-    }
-    let execution = up_once_selected_specs_with_gates(
-        catalog_root,
-        &found.specs,
-        selector,
-        this_host,
-        runner,
-        || Ok(()),
-    )?;
-    report.absorb(execution);
-    Ok(report)
+    let span = reconcile_span(this_host, "selected");
+    let result = {
+        let _entered = span.enter();
+        let result = (|| {
+            let _catalog_lock = {
+                let lock_span = catalog_lock_span();
+                let lock_entered = lock_span.as_ref().map(tracing::Span::enter);
+                let result = crate::CatalogLock::shared(catalog_root)
+                    .context("acquire shared catalog-authoring lock for selected reconcile");
+                finish_child_span(lock_span.as_ref(), result.is_err());
+                drop(lock_entered);
+                result?
+            };
+            let found = {
+                let discover_span = catalog_discover_span();
+                let discover_entered = discover_span.as_ref().map(tracing::Span::enter);
+                let found = crate::discovery::discover(catalog_root);
+                if let Some(span) = &discover_span {
+                    span.record("st2.catalog.spec_count", span_count(found.specs.len()));
+                    span.record("st2.report.warning_count", span_count(found.warnings.len()));
+                    span.record("st2.report.error_count", span_count(found.errors.len()));
+                    finish_child_span(Some(span), !found.errors.is_empty());
+                }
+                drop(discover_entered);
+                found
+            };
+            let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+            let mut report = UpReport::default();
+            report.warnings.extend(found.warnings);
+            report.errors.extend(
+                found
+                    .errors
+                    .into_iter()
+                    .map(|e| format!("{}: {}", e.path.display(), e.message)),
+            );
+            if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host)
+            {
+                report.errors.push(error.to_string());
+                return Ok(report);
+            }
+            let owner = owner.clone();
+            if crate::hooks::required_by_codex_agent(&owner, this_host, catalog_root) {
+                let hook_span = lifecycle_hooks_span("codex");
+                let hook_entered = hook_span.as_ref().map(tracing::Span::enter);
+                let verification = crate::hooks::verify_installed();
+                finish_child_span(hook_span.as_ref(), verification.is_err());
+                drop(hook_entered);
+                if let Err(error) = verification {
+                    report
+                        .errors
+                        .push(format!("verify lifecycle hooks: {error}"));
+                    return Ok(report);
+                }
+            }
+            let materialized = {
+                let materialize_span = catalog_materialize_span("selected owner");
+                let materialize_entered = materialize_span.as_ref().map(tracing::Span::enter);
+                let materialized = crate::materialize::materialize_catalog_against(
+                    catalog_root,
+                    std::slice::from_ref(&owner),
+                    &found.specs,
+                    this_host,
+                );
+                if let Some(span) = &materialize_span {
+                    span.record(
+                        "st2.materialize.failure_count",
+                        span_count(materialized.failed_agents.len()),
+                    );
+                    span.record(
+                        "st2.report.warning_count",
+                        span_count(materialized.warnings.len()),
+                    );
+                    span.record(
+                        "st2.report.error_count",
+                        span_count(materialized.errors.len()),
+                    );
+                    finish_child_span(Some(span), !materialized.errors.is_empty());
+                }
+                drop(materialize_entered);
+                materialized
+            };
+            report.warnings.extend(materialized.warnings);
+            let owner_materialization_failed = !materialized.failed_agents.is_empty();
+            report.errors.extend(materialized.errors);
+            if owner_materialization_failed {
+                return Ok(report);
+            }
+            let execution = up_once_selected_specs_with_gates(
+                catalog_root,
+                &found.specs,
+                selector,
+                this_host,
+                runner,
+                |_| Ok(()),
+            )?;
+            report.absorb(execution);
+            Ok(report)
+        })();
+        match &result {
+            Ok(report) => finish_reconcile_pass(&span, report),
+            Err(_) => finish_failed_reconcile_pass(&span),
+        }
+        result
+    };
+    result
 }
 
 fn up_once_selected_specs_with_gates<V>(
@@ -1834,21 +2560,36 @@ fn up_once_selected_specs_with_gates<V>(
     verify_hooks: V,
 ) -> anyhow::Result<UpReport>
 where
-    V: FnOnce() -> anyhow::Result<()>,
+    V: FnOnce(Option<&'static str>) -> anyhow::Result<()>,
 {
     crate::reconcile::resolve_task(specs, selector, this_host)?;
     crate::reconcile::validate_task_identities(specs, this_host)?;
     let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
     let mut compiled_specs = specs.to_vec();
     compile_generated_tasks(&mut compiled_specs, this_host, &task_context)?;
-    let sessions = runner
-        .list_sessions()
-        .map_err(|e| anyhow::anyhow!("list sessions: {e}"))?;
+    let sessions = {
+        let observe_span = runtime_observe_span();
+        let observe_entered = observe_span.as_ref().map(tracing::Span::enter);
+        let sessions = runner.list_sessions();
+        if let (Some(span), Ok(sessions)) = (observe_span.as_ref(), sessions.as_ref()) {
+            span.record("st2.runtime.session_count", span_count(sessions.len()));
+        }
+        finish_child_span(observe_span.as_ref(), sessions.is_err());
+        drop(observe_entered);
+        sessions.map_err(|e| anyhow::anyhow!("list sessions: {e}"))?
+    };
     let mut plan =
         crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
     let mut report = UpReport::default();
     gate_harness_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
-    execute(&plan, runner, &mut FlappingCap::default(), &mut report);
+    execute_reconcile(
+        &plan,
+        runner,
+        &mut FlappingCap::default(),
+        &mut PresentationPatchCursor::default(),
+        &mut report,
+        &mut |_| {},
+    );
     Ok(report)
 }
 
@@ -1890,7 +2631,10 @@ pub fn up_loop_specs(
         }
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
-                eprintln!(
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2055,7 +2799,7 @@ fn best_effort_catalog_watcher(
     match crate::watch::watch_catalog_declarations(root, tx) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
             );
             None
@@ -2111,8 +2855,6 @@ fn up_loop_until(
     install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogDeclarationWatcher>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
-    crate::event::publish_owner_binding(root, this_host)
-        .context("publish machine-local stream owner binding")?;
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
     let mut watcher = install_watcher(root, tx);
@@ -2125,6 +2867,13 @@ fn up_loop_until(
     // Surface each parked crash-loop once (not every pass): an stderr line AND a message to the
     // agent's supervisor over the native bus, so a crash-loop isn't only visible to whoever is
     // watching the log.
+    // Profile parsing and stream-owner publication both belong behind the catalog read fence.
+    // Defer them together until the first readable pass: an incomplete catalog apply keeps a
+    // resident supervisor alive and retrying without exposing declarations or starting runtime I/O.
+    // Once initialized, every reconcile pass reloads profiles and atomically replaces the registry
+    // with the watch set; malformed later edits install an empty, fail-closed profile set.
+    let mut resync = None;
+    let mut resource_profiles = None;
     let mut reported_flapping: HashSet<String> = HashSet::new();
     let mut recurring_warnings = RecurringWarnings::default();
     let park_channel = ParkChannel::for_supervisor(root, this_host);
@@ -2132,15 +2881,61 @@ fn up_loop_until(
     loop {
         let mut pre = UpReport::default();
         park_channel.grant_requests(&mut cap, &mut pre);
-        let mut report = reconcile_pass(
-            root,
-            this_host,
-            &task_context,
-            runner,
-            &mut cap,
-            &mut debounce,
-            &mut presentation_cursor,
-        );
+        if resync.is_none() {
+            let catalog_lock = match crate::CatalogLock::shared(root) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    pre.skipped = true;
+                    pre.errors.push(format!(
+                        "acquire shared catalog-authoring lock for resident initialization (pass skipped): {error:#}"
+                    ));
+                    on_report(&pre);
+                    if stop.load(Ordering::SeqCst)
+                        || wait_for_reconcile(&rx, interval, stop) == ReconcileWake::Stop
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let (config, profiles) = crate::catalog::declared_profile_catalog(root)
+                .context("parse resource profiles in catalog.kdl")?;
+            let passive_profiles = crate::catalog::passive_profiles(&config, &profiles)
+                .context("derive passive Resource Profile registry")?;
+            crate::event::publish_owner_binding_under_lock(root, this_host, &catalog_lock)
+                .context("publish machine-local stream owner binding")?;
+            resync = Some(crate::resync::ResyncSupervisor::with_profiles(
+                root.to_path_buf(),
+                this_host.to_owned(),
+                passive_profiles,
+            ));
+            resource_profiles = Some(
+                crate::resource_profile_supervisor::ResourceProfileSupervisor::new(
+                    root.to_path_buf(),
+                    this_host.to_owned(),
+                )?,
+            );
+        }
+        let mut report = {
+            let started = Instant::now();
+            let span = reconcile_span(this_host, "catalog");
+            let pass = {
+                let _entered = span.enter();
+                let pass = reconcile_pass(root,
+                this_host,
+                &task_context,
+                runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+                resync.as_ref(),
+                resource_profiles.as_ref());
+                finish_reconcile_pass(&span, &pass);
+                pass
+            };
+            crate::metrics::record_reconcile_pass(started.elapsed(), !pass.errors.is_empty());
+            pass
+        };
         pre.absorb(report);
         report = pre;
         if let Some(watcher) = &mut watcher {
@@ -2155,7 +2950,10 @@ fn up_loop_until(
         park_channel.publish(&cap, &mut report);
         for cl in &report.crash_loops {
             if reported_flapping.insert(cl.pty_id.clone()) {
-                eprintln!(
+                // Counted once per park (the initial transition), not per pass: a task stays
+                // parked, so per-pass counting would inflate crash_loops_total unboundedly.
+                crate::metrics::record_crash_loop();
+                tracing::error!(
                     "st2: GAVE UP on '{id}' — crash-looping past its restart{{}} policy (mode=fail); leaving it parked and its last session for inspection. It is reported as parked by `st2 tasks`. Fix the cause, then `st2 unpark {id}` — no supervisor restart needed.",
                     id = cl.pty_id
                 );
@@ -2188,7 +2986,7 @@ fn up_loop_until(
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
             cl.pty_id
         );
@@ -2196,7 +2994,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
     };
     let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
     else {
-        eprintln!(
+        tracing::warn!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
             cl.pty_id
         );
@@ -2220,7 +3018,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         &tags,
         &body,
     ) {
-        eprintln!(
+        tracing::warn!(
             "st2: failed to notify supervisor '{supervisor}' of crash-loop '{}': {e}",
             cl.pty_id
         );
@@ -2244,14 +3042,16 @@ pub fn detect_host() -> String {
     "localhost".to_string()
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
-    use agent_spec::spec::{AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+    use agent_spec::spec::{
+        AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
 
     #[cfg(target_os = "linux")]
     fn linux_process_state(pid: i32) -> Option<char> {
@@ -2261,6 +3061,31 @@ mod tests {
             .1
             .chars()
             .next()
+    }
+
+    /// Block until the fixture publishes `marker`, which its script creates by an atomic rename so
+    /// the barrier never observes a half-written file. Called from `on_spawn`, which runs before
+    /// [`run_captured`] starts the child deadline: fork+exec scheduling is therefore paid here and
+    /// not out of the deadline the test then measures. The ceiling is deliberately far larger than
+    /// any plausible fork+exec — it bounds a fixture that never ran at all, and is not itself the
+    /// behaviour under test, so a loaded host cannot turn it into a failure.
+    fn await_fixture_ready(pid: i32, marker: &Path, what: &str) {
+        const CEILING: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + CEILING;
+        while !marker.exists() {
+            if Instant::now() >= deadline {
+                // Do not leak the fixture's long sleeper into the test host on the way out.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                panic!(
+                    "{what} within {CEILING:?}: {} never appeared",
+                    marker.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn process_can_retain_cleanup_resources(pid: i32) -> bool {
@@ -2366,6 +3191,7 @@ mod tests {
                 &mut cap,
                 &mut cursor,
                 &mut UpReport::default(),
+                &mut |_| {},
             );
         }
 
@@ -2383,6 +3209,33 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_hook_consumer_is_a_closed_enum() {
+        let consumers = [
+            lifecycle_hook_consumer(true, false, false),
+            lifecycle_hook_consumer(false, true, false),
+            lifecycle_hook_consumer(false, false, true),
+            lifecycle_hook_consumer(true, true, false),
+            lifecycle_hook_consumer(true, false, true),
+            lifecycle_hook_consumer(false, true, true),
+            lifecycle_hook_consumer(true, true, true),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(
+            consumers,
+            BTreeSet::from([
+                "codex",
+                "pi",
+                "omp",
+                "codex+pi",
+                "codex+omp",
+                "pi+omp",
+                "codex+pi+omp",
+            ])
+        );
+    }
+
+    #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
             identity: "codex".into(),
@@ -2397,7 +3250,9 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -2424,7 +3279,10 @@ mod tests {
             "test.codex.agent",
             "test",
             &runner,
-            || anyhow::bail!("stale receipt"),
+            |consumer| {
+                assert_eq!(consumer, None);
+                anyhow::bail!("stale receipt")
+            },
         )
         .unwrap();
         assert_eq!(runner.list_calls.get(), 1);
@@ -2449,7 +3307,9 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![Task {
@@ -2481,7 +3341,7 @@ mod tests {
             "test.codex.agent",
             "test",
             &runner,
-            || {
+            |_| {
                 verify_calls.set(verify_calls.get() + 1);
                 Ok(())
             },
@@ -2538,9 +3398,12 @@ mod tests {
         .unwrap();
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(350));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -2551,7 +3414,10 @@ mod tests {
                 Duration::from_millis(100),
                 &stop,
                 |_, _| None, // watcher installation fails, as it did on dev3's oversized catalog
-                |_| passes += 1,
+                |_| {
+                    passes += 1;
+                    let _ = started_tx.try_send(());
+                },
             )
             .unwrap();
         });
@@ -2574,10 +3440,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let passes = std::sync::Arc::new(AtomicUsize::new(0));
         let observed = passes.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let started = Instant::now();
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(200));
                 std::fs::write(
                     &spec,
@@ -2608,6 +3476,7 @@ mod tests {
                 best_effort_catalog_watcher,
                 |_| {
                     passes.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
@@ -2618,6 +3487,139 @@ mod tests {
             "a declaration mutation must wake the supervisor long before the 60s timer"
         );
         assert!(observed.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn resident_loop_reloads_added_changed_removed_and_malformed_profiles() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("agent.kdl"),
+            r#"agent "live" {
+  host "test-host"
+  command "true"
+  resource "alpha" uri="alpha://test-host/live" reason="Alpha."
+  resource "beta" uri="beta://test-host/live" reason="Beta."
+}"#,
+        )
+        .unwrap();
+        let missing = catalog.path().join("missing.wasm");
+        let profile = |scheme: &str| {
+            format!(
+                "profile {scheme:?} {{ wasm {:?} }}\n",
+                missing.display().to_string()
+            )
+        };
+        let config = crate::catalog::config_path(catalog.path());
+        let runner = SpawnCountingRunner::default();
+        runner
+            .sessions
+            .borrow_mut()
+            .push(sess("test-host.live.agent", true));
+        let stop = AtomicBool::new(false);
+        let mut reports = Vec::new();
+
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = reports.len();
+                reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(&config, profile("alpha")).unwrap(),
+                    1 => std::fs::write(&config, profile("beta")).unwrap(),
+                    2 => std::fs::write(&config, "").unwrap(),
+                    3 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("profile removal run stops after four passes"),
+                }
+            },
+        )
+        .unwrap();
+
+        let profile_warnings = |reports: &Vec<(Vec<String>, Vec<String>)>, pass: usize| {
+            reports[pass]
+                .0
+                .iter()
+                .filter(|warning| warning.contains("resync profile"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            profile_warnings(&reports, 0).is_empty(),
+            "no profile is initially declared"
+        );
+        assert!(
+            profile_warnings(&reports, 1)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "an added profile takes effect: {:?}",
+            reports[1]
+        );
+        assert!(
+            profile_warnings(&reports, 2)
+                .iter()
+                .any(|warning| warning.contains("resource 'beta'"))
+                && !profile_warnings(&reports, 2)
+                    .iter()
+                    .any(|warning| warning.contains("resource 'alpha'")),
+            "changing definitions replaces the registry: {:?}",
+            reports[2]
+        );
+        assert!(
+            profile_warnings(&reports, 3).is_empty(),
+            "removing every profile removes the old resolution semantics: {:?}",
+            reports[3]
+        );
+
+        // A separate resident lifetime starts valid, then makes the envelope malformed. The
+        // initial hard parse still accepts the valid declaration; the later edit must clear its
+        // active semantics rather than silently carrying them forward.
+        std::fs::write(&config, profile("alpha")).unwrap();
+        stop.store(false, Ordering::SeqCst);
+        let mut malformed_reports = Vec::new();
+        up_loop_until(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_millis(5),
+            &stop,
+            |_, _| None,
+            |report| {
+                let pass = malformed_reports.len();
+                malformed_reports.push((report.warnings.clone(), report.errors.clone()));
+                match pass {
+                    0 => std::fs::write(
+                        &config,
+                        r#"profiel "alpha" { wasm "missing.wasm" }"#,
+                    )
+                    .unwrap(),
+                    1 => stop.store(true, Ordering::SeqCst),
+                    _ => unreachable!("malformed profile run stops after two passes"),
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            profile_warnings(&malformed_reports, 0)
+                .iter()
+                .any(|warning| warning.contains("resource 'alpha'")),
+            "the profile is active before the malformed edit: {:?}",
+            malformed_reports[0]
+        );
+        assert!(
+            malformed_reports[1]
+                .1
+                .iter()
+                .any(|error| error.contains("unknown catalog.kdl top-level node 'profiel'"))
+                && profile_warnings(&malformed_reports, 1).is_empty(),
+            "malformed catalog state is reported and fails closed instead of retaining alpha: {:?}",
+            malformed_reports[1]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2762,9 +3764,12 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut passes = 0usize;
         let mut warnings_seen = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
 
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let stop = &stop;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
                 std::thread::sleep(Duration::from_millis(300));
                 stop.store(true, Ordering::SeqCst);
             });
@@ -2778,6 +3783,7 @@ mod tests {
                 |report| {
                     passes += 1;
                     warnings_seen += report.warnings.len();
+                    let _ = started_tx.try_send(());
                 },
             )
             .unwrap();
@@ -2867,12 +3873,1138 @@ mod tests {
             keep: false,
             restart: None,
             delivery: None,
+            session_driver: None,
             driver: None,
+            delivery_readiness: None,
             resources: vec![],
             streams: Vec::new(),
             tasks: vec![],
             path: std::path::PathBuf::from("/x"),
         }
+    }
+
+    #[test]
+    fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
+        let legacy_spec = spec_fixture();
+        let legacy_launch = Launch {
+            spec: &legacy_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        let mut omp_argv = target("hetz.demo.agent", "unused");
+        omp_argv.launch = TaskLaunch::Argv(vec![
+            "st2".into(),
+            "driver".into(),
+            "omp-session".into(),
+        ]);
+        let mut exec = target("hetz.demo.agent", "codex");
+        exec.kind = TaskKind::Exec;
+        let targets = [
+            target("hetz.demo.agent", "codex"),
+            target("hetz.demo.agent", "claude"),
+            target("hetz.demo.agent", "opencode"),
+            target("hetz.demo.agent", "pi"),
+            omp_argv,
+            exec,
+            target("hetz.demo.agent", "unrecognized"),
+        ];
+        let labels = targets
+            .iter()
+            .map(|target| driver_label(&legacy_launch, target))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            BTreeSet::from(["codex", "claude", "opencode", "pi", "omp", "exec", "other"])
+        );
+
+        let mut typed_spec = spec_fixture();
+        typed_spec.driver = Some(Driver::Omp(OmpDriver {
+            model: None,
+            effort: None,
+            prompt: String::new(),
+            args: Vec::new(),
+        }));
+        let typed_launch = Launch {
+            spec: &typed_spec,
+            tasks: Vec::new(),
+            live_derived: Vec::new(),
+        };
+        assert_eq!(
+            driver_label(&typed_launch, &target("hetz.demo.agent", "claude")),
+            "omp",
+            "typed driver identity must take precedence over argv heuristics"
+        );
+    }
+
+    #[test]
+    fn resync_watch_eligibility_requires_a_proven_live_agent_seat() {
+        let spec = |identity: &str, explicit_id: Option<&str>| {
+            let mut spec = spec_fixture();
+            spec.identity = identity.to_owned();
+            spec.tasks = vec![Task {
+                kind: TaskKind::Pty,
+                derived: false,
+                name: "agent".into(),
+                id: explicit_id.map(str::to_owned),
+                command: Some("agent".into()),
+                argv: None,
+                cwd: None,
+                tags: BTreeMap::new(),
+                env: BTreeMap::new(),
+                keep: false,
+                lifecycle: TaskLifecycle::Service,
+            }];
+            spec
+        };
+        let specs = vec![
+            spec("desired", None),
+            spec("dead-adopted", None),
+            spec("observed-live", None),
+            spec("launched", None),
+            spec("restarted", Some("custom-seat")),
+        ];
+        let sessions = vec![
+            sess("hetz.dead-adopted.agent", false),
+            // A live canonical seat remains eligible even when a missing companion means the
+            // whole spec was not adopted and the companion later fails to launch.
+            sess("hetz.observed-live.agent", true),
+        ];
+        let report = UpReport {
+            adopted: vec!["dead-adopted".into()],
+            launched: vec![
+                "hetz.launched.agent".into(),
+                // A successfully launched companion is not evidence of a live agent seat.
+                "hetz.desired.ding".into(),
+            ],
+            restarted: vec!["custom-seat".into()],
+            ..UpReport::default()
+        };
+
+        let eligible = live_resync_specs(&specs, "hetz", &sessions, &report)
+            .into_iter()
+            .map(|spec| spec.identity)
+            .collect::<Vec<_>>();
+        assert_eq!(eligible, vec!["observed-live", "launched", "restarted"]);
+    }
+
+    struct BlockingLaunchRunner {
+        sessions: RefCell<Vec<Session>>,
+        fail_id: Option<String>,
+        block_id: String,
+        entered: mpsc::SyncSender<()>,
+        release: RefCell<mpsc::Receiver<()>>,
+    }
+
+    impl Runner for BlockingLaunchRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self.sessions.borrow().clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            if self.fail_id.as_deref() == Some(&target.pty_id) {
+                anyhow::bail!("simulated launch failure");
+            }
+            if target.pty_id == self.block_id {
+                self.entered.send(()).unwrap();
+                self.release.borrow_mut().recv().unwrap();
+            }
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    struct SteadyChainRunner {
+        sessions: std::sync::Mutex<Vec<Session>>,
+        block_id: String,
+        entered: mpsc::SyncSender<()>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    impl Runner for SteadyChainRunner {
+        fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
+
+        fn spawn(&self, target: &TaskTarget, _spec_dir: &Path) -> anyhow::Result<()> {
+            if target.pty_id == self.block_id {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv()
+                    .unwrap();
+            }
+            self.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sess(&target.pty_id, true));
+            Ok(())
+        }
+
+        fn kill(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn remove(&self, _pty_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_resync_agent(catalog: &Path, identity: &str) -> (PathBuf, PathBuf) {
+        let agent_dir = catalog.join("agents/hetz").join(identity);
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                r#"agent "{identity}" {{
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}}"#
+            ),
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        (agent_dir, goal)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_profile(catalog: &Path) {
+        let resolver_dir = catalog.join("resolvers");
+        std::fs::create_dir_all(&resolver_dir).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/agent-spec/tests/fixtures/demo_resolver.wasm"),
+            resolver_dir.join("goal.wasm"),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::catalog::config_path(catalog),
+            r#"profile "dev.schickling.agent-goal" {
+  wasm "resolvers/goal.wasm"
+  class "immediate"
+  notify-chain #true
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_agent(
+        catalog: &Path,
+        identity: &str,
+        supervisor: Option<&str>,
+        later_task: bool,
+    ) -> (PathBuf, PathBuf) {
+        write_notify_chain_agent_with_state(catalog, identity, supervisor, later_task, None)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn write_notify_chain_agent_with_state(
+        catalog: &Path,
+        identity: &str,
+        supervisor: Option<&str>,
+        later_task: bool,
+        desired_state: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let agent_dir = catalog.join("agents/hetz").join(identity);
+        let resources = agent_dir.join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let supervisor = supervisor
+            .map(|supervisor| format!("  supervisor {supervisor:?}\n"))
+            .unwrap_or_default();
+        let desired_state = desired_state
+            .map(|desired_state| format!("  {desired_state}\n"))
+            .unwrap_or_default();
+        let later_task = if later_task {
+            "  exec \"later\" { command \"true\" }\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                r#"agent "{identity}" {{
+  host "hetz"
+{supervisor}{desired_state}  command "agent"
+{later_task}  resource "goal" uri="dev.schickling.agent-goal://hetz/{identity}" reason="Layer."
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let goal = resources.join("goal.md");
+        std::fs::write(&goal, "before\n").unwrap();
+        (agent_dir, goal)
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn current_resync_event_for_key(agent_dir: &Path, key: &str) -> Option<String> {
+        let expected = format!("key: {key}");
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|body| {
+                body.lines().any(|line| line == "stream: resync")
+                    && body.lines().any(|line| line == expected)
+            })
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn wait_for_resync_event_for_key(agent_dir: &Path, key: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event_for_key(agent_dir, key) {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn wait_for_resync_event_key_change(
+        agent_dir: &Path,
+        key: &str,
+        prior: &str,
+    ) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event_for_key(agent_dir, key)
+                && body != prior
+            {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn current_resync_event(agent_dir: &Path) -> Option<String> {
+        std::fs::read_dir(agent_dir.join("resources/inbox"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|body| body.lines().any(|line| line == "stream: resync"))
+    }
+
+    fn wait_for_resync_event(agent_dir: &Path) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir) {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_resync_event_change(agent_dir: &Path, prior: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = current_resync_event(agent_dir)
+                && body != prior
+            {
+                return Some(body);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(feature = "wasm-resolver")]
+    #[test]
+    fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
+        let catalog = tempfile::tempdir().unwrap();
+        write_notify_chain_profile(catalog.path());
+        let (root_dir, root_goal) =
+            write_notify_chain_agent(catalog.path(), "root", None, false);
+        let (lead_dir, lead_goal) =
+            write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+        let (worker_dir, _worker_goal) =
+            write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let task_id = |spec: &AgentSpec, task: &Task| {
+            task.id
+                .clone()
+                .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name))
+        };
+        let mut sessions = Vec::new();
+        for spec in &specs {
+            for task in &spec.tasks {
+                sessions.push(sess(&task_id(spec, task), true));
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = SteadyChainRunner {
+            sessions: std::sync::Mutex::new(sessions),
+            block_id: "hetz.worker.later".to_owned(),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        };
+        let stop = AtomicBool::new(false);
+        let (first_report_tx, first_report_rx) = mpsc::sync_channel(1);
+        let observer_catalog = catalog.path().to_path_buf();
+
+        let evidence = std::thread::scope(|scope| {
+            let observer_stop = &stop;
+            let observer = scope.spawn(move || {
+                first_report_rx.recv().unwrap();
+
+                std::fs::write(&root_goal, "steady baseline transition\n").unwrap();
+                let root_initial = wait_for_resync_event_for_key(&root_dir, "goal");
+                let lead_initial =
+                    wait_for_resync_event_for_key(&lead_dir, "goal@hetz.root");
+                let worker_initial =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+
+                write_notify_chain_agent(
+                    &observer_catalog,
+                    "worker",
+                    Some("hetz.lead"),
+                    true,
+                );
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                let root_after_reconcile = root_initial.as_deref().and_then(|prior| {
+                    std::fs::write(&root_goal, "transition during steady reconcile\n").unwrap();
+                    wait_for_resync_event_key_change(&root_dir, "goal", prior)
+                });
+                let lead_after_reconcile = lead_initial.as_deref().and_then(|prior| {
+                    wait_for_resync_event_key_change(&lead_dir, "goal@hetz.root", prior)
+                });
+                let worker_after_reconcile = worker_initial.as_deref().and_then(|prior| {
+                    wait_for_resync_event_key_change(&worker_dir, "goal@hetz.root", prior)
+                });
+
+                std::fs::write(&lead_goal, "lead transition during steady reconcile\n").unwrap();
+                let lead_own = wait_for_resync_event_for_key(&lead_dir, "goal");
+                let worker_from_lead =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.lead");
+
+                let _ = release_tx.send(());
+                observer_stop.store(true, Ordering::SeqCst);
+                (
+                    entered,
+                    root_initial,
+                    lead_initial,
+                    worker_initial,
+                    root_after_reconcile,
+                    lead_after_reconcile,
+                    worker_after_reconcile,
+                    lead_own,
+                    worker_from_lead,
+                )
+            });
+            up_loop_until(
+                catalog.path(),
+                "hetz",
+                &runner,
+                Duration::from_millis(25),
+                &stop,
+                |_, _| None,
+                |_| {
+                    let _ = first_report_tx.try_send(());
+                },
+            )
+            .unwrap();
+            observer.join().unwrap()
+        });
+
+        assert!(evidence.0, "the steady-state reconcile must reach its later task");
+        assert!(evidence.1.is_some(), "root must receive its own transition");
+        assert!(
+            evidence.2.is_some() && evidence.3.is_some(),
+            "root transition must fan out through lead and worker"
+        );
+        assert!(
+            evidence.4.is_some() && evidence.5.is_some() && evidence.6.is_some(),
+            "a steady reconcile must not replace chain sets with self-only sets"
+        );
+        assert!(
+            evidence.7.is_some() && evidence.8.is_some(),
+            "lead transition must reach lead and worker"
+        );
+        assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology();
+    }
+
+    #[cfg(all(test, feature = "wasm-resolver"))]
+    fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
+        for retirement in [
+            "retired #true",
+            "desired-state \"retired\" reason=\"fixture\"",
+        ] {
+            let catalog = tempfile::tempdir().unwrap();
+            write_notify_chain_profile(catalog.path());
+            let (root_dir, root_goal) =
+                write_notify_chain_agent(catalog.path(), "root", None, false);
+            let (middle_dir, _middle_goal) = write_notify_chain_agent_with_state(
+                catalog.path(),
+                "middle",
+                Some("hetz.root"),
+                false,
+                Some(retirement),
+            );
+            let (child_dir, _child_goal) =
+                write_notify_chain_agent(catalog.path(), "child", Some("hetz.middle"), false);
+            let specs = crate::discover_strict(catalog.path()).specs;
+            let sessions = specs
+                .iter()
+                .filter(|spec| spec.desired_state.is_running())
+                .flat_map(|spec| {
+                    spec.tasks.iter().map(|task| {
+                        let id = task
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name));
+                        sess(&id, true)
+                    })
+                })
+                .collect();
+            let (entered_tx, _entered_rx) = mpsc::sync_channel(1);
+            let (_release_tx, release_rx) = mpsc::channel();
+            let runner = SteadyChainRunner {
+                sessions: std::sync::Mutex::new(sessions),
+                block_id: "never-block".to_owned(),
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            };
+            let stop = AtomicBool::new(false);
+            let missing_supervisor = AtomicBool::new(false);
+            let (first_report_tx, first_report_rx) = mpsc::sync_channel(1);
+
+            let evidence = std::thread::scope(|scope| {
+                let observer_stop = &stop;
+                let observer = scope.spawn(move || {
+                    first_report_rx.recv().unwrap();
+                    // Let the asynchronous full refresh replace the synchronous install before
+                    // mutating the root carrier. The child must retain the complete catalog chain.
+                    std::thread::sleep(Duration::from_millis(300));
+                    std::fs::write(&root_goal, "root transition after full refresh\n").unwrap();
+                    let root_event = wait_for_resync_event_for_key(&root_dir, "goal");
+                    let child_event =
+                        wait_for_resync_event_for_key(&child_dir, "goal@hetz.root");
+                    let middle_event = current_resync_event_for_key(&middle_dir, "goal@hetz.root");
+                    observer_stop.store(true, Ordering::SeqCst);
+                    (root_event, child_event, middle_event)
+                });
+                up_loop_until(
+                    catalog.path(),
+                    "hetz",
+                    &runner,
+                    Duration::from_millis(25),
+                    &stop,
+                    |_, _| None,
+                    |report| {
+                        if report
+                            .errors
+                            .iter()
+                            .chain(&report.warnings)
+                            .any(|message| message.contains("MissingSupervisor"))
+                        {
+                            missing_supervisor.store(true, Ordering::SeqCst);
+                        }
+                        let _ = first_report_tx.try_send(());
+                    },
+                )
+                .unwrap();
+                observer.join().unwrap()
+            });
+
+            assert!(
+                evidence.0.is_some(),
+                "root must receive its own event ({retirement})"
+            );
+            assert!(
+                evidence.1.is_some(),
+                "the live child must receive exactly its owner-qualified root event through the \
+                 retired middle after full refresh ({retirement})"
+            );
+            assert!(
+                evidence.2.is_none(),
+                "the retired middle must own no active subscription ({retirement})"
+            );
+            assert!(
+                !missing_supervisor.load(Ordering::SeqCst),
+                "the complete catalog graph must prevent MissingSupervisor ({retirement})"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (live_dir, live_goal) = write_resync_agent(catalog.path(), "live");
+        let broken_dir = catalog.path().join("agents/hetz/broken");
+        let broken_resources = broken_dir.join("resources");
+        std::fs::create_dir_all(&broken_resources).unwrap();
+        std::fs::create_dir_all(catalog.path().join("broken-workspace")).unwrap();
+        let broken_declaration = broken_dir.join("agent.kdl");
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  exec "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let broken_goal = broken_resources.join("goal.md");
+        std::fs::write(&broken_goal, "before\n").unwrap();
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![
+                sess("hetz.live", true),
+                sess("hetz.broken.agent", true),
+            ]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let first = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
+        assert!(
+            first.errors.iter().any(|error| {
+                error.contains("compile generated tasks")
+                    && error.contains("non-PTY canonical task")
+            }),
+            "{first:#?}"
+        );
+        assert!(!first.skipped, "the valid subset completed its pass");
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "the compile-invalid seat must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while compile failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the already-live valid seat must stay watched across the compile error");
+        assert!(first_event.contains(r#""binding":"goal""#), "{first_event}");
+
+        std::fs::write(&broken_goal, "invalid seat changed\n").unwrap();
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&broken_dir).is_none(),
+            "a compile-invalid seat must not be watched even when its canonical task is live"
+        );
+
+        std::fs::write(&live_goal, "changed while declaration is corrected\n").unwrap();
+        std::fs::write(
+            &broken_declaration,
+            r#"agent "broken" {
+  host "hetz"
+  deliver "mcp"
+  workspace "$CATALOG/broken-workspace"
+  pty "agent" { command "true" }
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}"#,
+        )
+        .unwrap();
+        let corrected = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
+        assert!(
+            corrected
+                .errors
+                .iter()
+                .all(|error| !error.contains("compile generated tasks")),
+            "{corrected:#?}"
+        );
+        assert!(corrected.launched.is_empty(), "{corrected:#?}");
+        assert!(
+            corrected.adopted.iter().any(|identity| identity == "broken"),
+            "the corrected already-live seat should be adopted: {corrected:#?}"
+        );
+        let corrected_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("correcting another declaration must not reseed and hide the live transition");
+        assert!(corrected_event.contains(r#""binding":"goal""#), "{corrected_event}");
+    }
+
+    #[test]
+    fn materialization_failure_retains_only_the_observed_live_resync_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let write_broken_agent = |identity: &str| {
+            let (agent_dir, goal) = write_resync_agent(catalog.path(), identity);
+            let workspace = catalog.path().join(format!("{identity}-workspace"));
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(
+                agent_dir.join("agent.kdl"),
+                format!(
+                    r#"agent "{identity}" {{
+  host "hetz"
+  workspace "{}"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+  render {{
+    copy "_templates/{identity}.md" "AGENTS.md"
+  }}
+}}"#,
+                    workspace.display()
+                ),
+            )
+            .unwrap();
+            (agent_dir, goal)
+        };
+        let (live_dir, live_goal) = write_broken_agent("live");
+        let (dormant_dir, dormant_goal) = write_broken_agent("dormant");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![sess("hetz.live", true)]),
+            ..SpawnCountingRunner::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let failed = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
+        assert!(
+            failed
+                .errors
+                .iter()
+                .filter(|error| error.contains("copy source"))
+                .count()
+                >= 2,
+            "{failed:#?}"
+        );
+        assert!(
+            runner.spawned.borrow().is_empty(),
+            "materialization-failed seats must not launch"
+        );
+
+        std::fs::write(&live_goal, "changed while materialization failed\n").unwrap();
+        std::fs::write(&dormant_goal, "unwatched while materialization failed\n").unwrap();
+        let first_event = wait_for_resync_event(&live_dir)
+            .expect("the observed live seat must remain watched through materialization failure");
+        assert!(first_event.contains(r#""binding":"goal""#), "{first_event}");
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&dormant_dir).is_none(),
+            "a materialization-failed seat without an observed live session must stay unwatched"
+        );
+
+        std::fs::write(&live_goal, "changed immediately before recovery\n").unwrap();
+        std::fs::create_dir_all(catalog.path().join("_templates")).unwrap();
+        std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
+        let recovered = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
+        assert!(
+            recovered
+                .errors
+                .iter()
+                .all(|error| !error.contains("_templates/live.md")),
+            "{recovered:#?}"
+        );
+        assert!(recovered.launched.is_empty(), "{recovered:#?}");
+        let recovered_event = wait_for_resync_event_change(&live_dir, &first_event)
+            .expect("recovery must preserve the pending transition instead of silently reseeding");
+        assert!(
+            recovered_event.contains(r#""binding":"goal""#),
+            "{recovered_event}"
+        );
+    }
+
+    fn execute_resync_plan(
+        plan: &ReconcilePlan<'_>,
+        runner: &dyn Runner,
+        specs: &[AgentSpec],
+        resync: &crate::resync::ResyncSupervisor,
+    ) -> UpReport {
+        let mut report = UpReport::default();
+        let mut install_count = 0;
+        execute_with_presentation_cursor(
+            plan,
+            runner,
+            &mut FlappingCap::default(),
+            &mut PresentationPatchCursor::default(),
+            &mut report,
+            &mut |spec| {
+                install_count += 1;
+                assert!(resync.install_live(spec, specs, "hetz").is_empty());
+            },
+        );
+        assert!(
+            resync
+                .refresh(
+                    specs,
+                    &live_resync_specs(specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
+        );
+        assert!(install_count > 0 || report.launched.is_empty());
+        report
+    }
+
+    #[cfg(feature = "wasm-resolver")]
+    #[test]
+    fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes() {
+        let catalog = tempfile::tempdir().unwrap();
+        write_notify_chain_profile(catalog.path());
+        let (_root_dir, root_goal) =
+            write_notify_chain_agent(catalog.path(), "root", None, false);
+        write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+        let (worker_dir, _worker_goal) =
+            write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let worker = specs
+            .iter()
+            .find(|spec| spec.identity == "worker")
+            .unwrap();
+        let mut later = target("hetz.worker.later", "later");
+        later.name = "later".into();
+        later.derived = true;
+        let plan = ReconcilePlan {
+            launch: vec![Launch {
+                spec: worker,
+                tasks: vec![target("hetz.worker.agent", "agent"), later],
+                live_derived: Vec::new(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.worker.later".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync = crate::resync::ResyncSupervisor::with_profiles(
+            catalog.path().to_path_buf(),
+            "hetz".into(),
+            crate::catalog::declared_profiles(catalog.path()).unwrap(),
+        );
+
+        let event = std::thread::scope(|scope| {
+            let observer = scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&root_goal, "changed while later task launches\n").unwrap();
+                let event =
+                    wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+                release_tx.send(()).unwrap();
+                event
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(
+                report.launched,
+                ["hetz.worker.agent", "hetz.worker.later"]
+            );
+            observer.join().unwrap()
+        })
+        .expect("the fresh worker must receive its ancestor transition before full refresh");
+        assert!(event.contains("key: goal@hetz.root"), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed while second launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(
+                report.launched,
+                ["hetz.first.agent", "hetz.second.agent"]
+            );
+        });
+
+        let event = wait_for_resync_event(&first_dir)
+            .expect("the first seat must observe a carrier transition during the later launch");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_excludes_failed_canonical_seat() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
+        write_resync_agent(catalog.path(), "second");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
+        let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
+        let plan = ReconcilePlan {
+            launch: vec![
+                Launch {
+                    spec: first,
+                    tasks: vec![target("hetz.first.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+                Launch {
+                    spec: second,
+                    tasks: vec![target("hetz.second.agent", "agent")],
+                    live_derived: Vec::new(),
+                },
+            ],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: Some("hetz.first.agent".to_owned()),
+            block_id: "hetz.second.agent".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&first_goal, "changed after failed launch\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            let report = execute_resync_plan(&plan, &runner, &specs, &resync);
+            assert_eq!(report.launched, ["hetz.second.agent"]);
+            assert!(report.errors.iter().any(|error| {
+                error.contains("hetz.first.agent") && error.contains("simulated launch failure")
+            }));
+        });
+
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&first_dir).is_none(),
+            "desired-but-failed canonical seats must remain unwatched"
+        );
+    }
+
+    #[test]
+    fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+            fail_id: None,
+            block_id: "hetz.worker".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(Duration::ZERO);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let seeded = reconcile_pass(catalog.path(),
+        "hetz",
+        &task_context,
+        &runner,
+        &mut cap,
+        &mut debounce,
+        &mut presentation_cursor,
+        Some(&resync), None);
+        assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
+        *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
+        let blocked_goal = goal.clone();
+
+        let relaunched = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&blocked_goal, "changed while replacement launch blocks\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            reconcile_pass(catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync), None)
+        });
+        assert_eq!(relaunched.restarted, ["hetz.worker"]);
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            current_resync_event(&agent_dir).is_none(),
+            "a carrier mutation while no canonical seat is live must not emit"
+        );
+
+        std::fs::write(&goal, "changed after replacement launch\n").unwrap();
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the successful replacement must receive a fresh silent baseline");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
+    }
+
+    #[test]
+    fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let specs = crate::discover_strict(catalog.path()).specs;
+        let spec = &specs[0];
+        let mut derived = target("hetz.worker.ding", "ding");
+        derived.name = "ding".into();
+        derived.derived = true;
+        let plan = ReconcilePlan {
+            launch: vec![Launch {
+                spec,
+                tasks: vec![target("hetz.worker.agent", "agent"), derived],
+                live_derived: Vec::new(),
+            }],
+            ..ReconcilePlan::default()
+        };
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = BlockingLaunchRunner {
+            sessions: RefCell::new(Vec::new()),
+            fail_id: None,
+            block_id: "hetz.worker.ding".to_owned(),
+            entered: entered_tx,
+            release: RefCell::new(release_rx),
+        };
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let installs = AtomicUsize::new(0);
+        let mut report = UpReport::default();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                entered_rx.recv().unwrap();
+                std::fs::write(&goal, "changed while companion launches\n").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).unwrap();
+            });
+            execute_with_presentation_cursor(
+                &plan,
+                &runner,
+                &mut FlappingCap::default(),
+                &mut PresentationPatchCursor::default(),
+                &mut report,
+                &mut |spec| {
+                    installs.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert!(resync.install_live(spec, &specs, "hetz").is_empty());
+                },
+            );
+        });
+        assert!(
+            resync
+                .refresh(
+                    &specs,
+                    &live_resync_specs(&specs, "hetz", &[], &report),
+                    "hetz",
+                    &[],
+                    &[],
+                )
+                .is_empty()
+        );
+
+        assert_eq!(
+            installs.load(AtomicOrdering::SeqCst),
+            1,
+            "only the canonical task transition may install its watch set"
+        );
+        let event = wait_for_resync_event(&agent_dir)
+            .expect("the companion launch and final refresh must preserve the canonical baseline");
+        assert!(event.contains(r#""binding":"goal""#), "{event}");
     }
 
     #[test]
@@ -3012,7 +5144,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || Ok(()));
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| Ok(()));
 
         assert_eq!(
             plan.launch
@@ -3041,7 +5173,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| {
             panic!("an already-live Codex agent must not enter the hook gate")
         });
 
@@ -3075,7 +5207,7 @@ mod tests {
         });
         let mut report = UpReport::default();
 
-        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, || {
+        gate_harness_launches_on_hooks(&mut plan, Path::new("/catalog"), &mut report, |_| {
             anyhow::bail!("stale receipt")
         });
 
@@ -3214,19 +5346,29 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("close-stdin");
-        std::fs::write(&executable, "#!/bin/sh\nexec 0<&-\nsleep 60\n").unwrap();
+        let stdin_closed = temporary.path().join("stdin-closed");
+        // The script signals only AFTER closing its stdin, so the barrier below returns exactly when
+        // the read end is gone and the parent's very next write must fail with EPIPE.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nexec 0<&-\n: > \"$READY.tmp\"\nmv \"$READY.tmp\" \"$READY\"\nsleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        // The pid comes from the parent at spawn. Reading it from a file the child writes made the
-        // case depend on the child being scheduled inside the deadline: miss that and the read
-        // panics with `NotFound` before either assertion runs, naming neither the pipe nor the
-        // deadline. The `on_spawn` seam removes the dependency rather than widening the window.
+        // The pid comes from the parent at spawn, and the barrier makes the deadline measure only
+        // the behaviour under test. Without it the 1s budget also had to cover fork+exec of the
+        // shell, so a loaded host reported `timed out after 1.0s` instead of `Broken pipe` — the
+        // fixture's scheduling consumed the deadline the assertion is about.
         let mut spawned = None;
         let error = output_with_input_timeout_observed(
-            &mut Command::new(&executable),
+            Command::new(&executable).env("READY", &stdin_closed),
             Duration::from_secs(1),
             Some(input),
-            |pid| spawned = Some(pid),
+            |pid| {
+                spawned = Some(pid);
+                await_fixture_ready(pid, &stdin_closed, "the child never closed its stdin");
+            },
         )
         .unwrap_err();
         let pid = spawned.expect("the child was spawned before the input write failed");
@@ -3255,16 +5397,29 @@ mod tests {
         let descendant_pidfile = temporary.path().join("descendant.pid");
         // The descendant inherits stdout/stderr and outlives the direct child, which is exactly the
         // shape the docstring describes. `child.kill()` cannot reach it; only the group signal can.
+        // It publishes its pid by atomic rename, so the barrier never reads a truncated file.
         std::fs::write(
             &executable,
-            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
+            "#!/bin/sh\nsh -c 'printf \"%s\" \"$$\" > \"$DESCENDANT_PIDFILE.tmp\"; mv \"$DESCENDANT_PIDFILE.tmp\" \"$DESCENDANT_PIDFILE\"; sleep 60' &\nsleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = output_with_timeout(
+        // This test *requires* the child to have run — a descendant it never forked is nothing to
+        // reap. Waiting for the pidfile inside `on_spawn` makes that a barrier instead of a race:
+        // the deadline then only has to outlast a `sleep`, never a fork+exec, so a loaded host can
+        // no longer end the run before the fixture has built the thing under test.
+        let error = output_with_input_timeout_observed(
             Command::new(&executable).env("DESCENDANT_PIDFILE", &descendant_pidfile),
-            Duration::from_secs(2),
+            Duration::from_millis(500),
+            None,
+            |pid| {
+                await_fixture_ready(
+                    pid,
+                    &descendant_pidfile,
+                    "the child never forked a descendant, so this case would test nothing",
+                )
+            },
         )
         .unwrap_err();
         assert!(
@@ -3272,16 +5427,15 @@ mod tests {
             "unexpected error: {error:#}"
         );
 
-        // Unlike the deadline case, this test *requires* the child to have run — a descendant it
-        // never forked is nothing to reap — so reading the pid it recorded is sound here. Two
-        // seconds against a fork+exec is a wide margin, and the failure is named rather than a bare
-        // `NotFound`.
         let descendant = std::fs::read_to_string(&descendant_pidfile)
-            .expect("the child never forked a descendant, so this case tested nothing")
+            .expect("the readiness barrier returned without a pidfile")
             .parse::<i32>()
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // Generous on purpose: the descendant is orphaned by the same group kill, so its exit is
+        // observable only once the reparenting init reaps it. That latency is not the behaviour
+        // under test, and waiting longer costs nothing when the kill did reach it.
+        let deadline = Instant::now() + Duration::from_secs(5);
         while process_can_retain_cleanup_resources(descendant) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3334,21 +5488,23 @@ mod tests {
         std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let input = vec![b'x'; 1024 * 1024];
-        let started = Instant::now();
-        // The pid comes from the parent at spawn, not from the child. This case is precisely the one
-        // where the child may never be scheduled: the write blocks as soon as the pipe buffer fills,
-        // which needs no execution by the child at all, and the deadline then terminates the whole
-        // group. Anything the child was supposed to record would never be written, so a test that
-        // waits for it fails on exactly the condition it exists to cover.
+        // The pid comes from the parent at spawn, not from the child, and this case cannot use a
+        // readiness barrier: it is precisely the one where the child may never be scheduled. The
+        // write blocks as soon as the pipe buffer fills, which needs no execution by the child at
+        // all, and the deadline then terminates the whole group. Anything the child was supposed to
+        // record would never be written, so a test that waits for it fails on exactly the condition
+        // it exists to cover. The observed spawn instant is therefore also the clock: timing from
+        // before the call would charge fork+exec to the 1s budget this assertion polices.
         let mut spawned = None;
         let error = output_with_input_timeout_observed(
             &mut Command::new(&executable),
             Duration::from_millis(100),
             Some(input),
-            |pid| spawned = Some(pid),
+            |pid| spawned = Some((pid, Instant::now())),
         )
         .unwrap_err();
-        let pid = spawned.expect("the child was spawned before the input deadline expired");
+        let (pid, started) =
+            spawned.expect("the child was spawned before the input deadline expired");
 
         assert!(
             format!("{error:#}").contains("timed out"),
@@ -3363,6 +5519,137 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::host_lock::process_alive(pid));
+    }
+
+    /// The two lifecycle tests above block in `on_spawn` until their fixture reached the state under
+    /// test, which only keeps them load-insensitive because [`run_captured`] starts the child
+    /// deadline AFTER `on_spawn` returns. Nothing else proves that order: reversing it leaves every
+    /// other test green on an idle host and silently puts both back on a race with the scheduler.
+    #[test]
+    fn the_spawn_observer_runs_before_the_child_deadline_starts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("close-stdin");
+        let stdin_closed = temporary.path().join("stdin-closed");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nexec 0<&-\n: > \"$READY.tmp\"\nmv \"$READY.tmp\" \"$READY\"\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let timeout = Duration::from_millis(200);
+
+        // The barrier deliberately outlasts `timeout`, so the outcome depends on the order alone and
+        // on nothing the host's scheduler does. Deadline after `on_spawn`: the write meets a closed
+        // read end and fails with EPIPE at once. Deadline before `on_spawn`: it has already expired
+        // when the barrier returns, so the write never runs and the call reports a timeout instead.
+        let error = output_with_input_timeout_observed(
+            Command::new(&executable).env("READY", &stdin_closed),
+            timeout,
+            Some(vec![b'x'; 1024]),
+            |pid| {
+                await_fixture_ready(pid, &stdin_closed, "the child never closed its stdin");
+                std::thread::sleep(timeout * 2);
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Broken pipe"),
+            "the child deadline started before `on_spawn` returned: {error:#}"
+        );
+    }
+
+    #[test]
+    fn bounded_capture_keeps_the_tail_of_an_oversized_stream() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("flood");
+        // Start marker, 1 MiB of filler (4x the cap, so both streams truncate), end marker.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf START; head -c 1048576 /dev/zero; printf END\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output =
+            output_with_timeout(&mut Command::new(&executable), Duration::from_secs(5)).unwrap();
+
+        assert_eq!(output.stdout.len(), CAPTURE_CAP_BYTES);
+        assert!(
+            output.stdout.ends_with(b"END"),
+            "capped stdout lost the tail"
+        );
+        assert!(
+            !output.stdout.starts_with(b"START"),
+            "capped stdout kept the head instead of the tail"
+        );
+        // stderr is empty here, so only the stdout read-back may have been capped.
+    }
+
+    #[test]
+    fn full_stdout_variant_returns_complete_output_larger_than_the_cap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("flood");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf START; head -c 1048576 /dev/zero; printf END\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output =
+            output_full_stdout_with_timeout(&mut Command::new(&executable), Duration::from_secs(5))
+                .unwrap();
+
+        assert!(output.stdout.len() > CAPTURE_CAP_BYTES);
+        assert!(
+            output.stdout.starts_with(b"START") && output.stdout.ends_with(b"END"),
+            "full-stdout variant truncated structured output: {} bytes",
+            output.stdout.len()
+        );
+    }
+
+    /// Proves the shared reaper actually waits: the killed child is observed as a zombie BEFORE
+    /// `reap_detached` runs, so only the reaper's `wait()` can clear that state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shared_reaper_reaps_a_killed_child() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while linux_process_state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            linux_process_state(pid),
+            Some('Z'),
+            "fixture did not produce a zombie"
+        );
+
+        reap_detached(child);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while linux_process_state(pid) == Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            linux_process_state(pid),
+            Some('Z'),
+            "the shared reaper did not reap the killed child {pid}"
+        );
     }
 
     #[cfg(target_os = "linux")]

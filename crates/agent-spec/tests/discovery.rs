@@ -13,7 +13,8 @@ use agent_spec::spec::{
     TaskLifecycle,
 };
 use agent_spec::{
-    AgentDesiredState, AgentSpec, JobType, Resource, Task, discover, discover_strict,
+    discover, discover_file, discover_strict, AgentDesiredState, AgentSpec, DeliveryReadiness,
+    JobType, Resource, SessionDriver, Task,
 };
 
 #[test]
@@ -35,6 +36,60 @@ fn discovery_accepts_st2_version_one_and_rejects_st3_version_two() {
     assert!(!found.specs.iter().any(|spec| spec.identity == "two"));
     assert_eq!(found.errors.len(), 1);
     assert!(found.errors[0].message.contains("version 0 or 1"));
+}
+
+#[test]
+fn root_catalog_envelope_allows_a_profile_beside_an_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "catalog.kdl",
+        r#"profile "dev.example.goal" {
+  wasm "resolver.wasm"
+}
+agent "root-agent" { command "true" }
+"#,
+    );
+
+    let found = discover_strict(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(find(&found.specs, "root-agent").identity, "root-agent");
+    let (specs, warnings) = discover_file(tmp.path(), &tmp.path().join("catalog.kdl")).unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("identity mismatch")),
+        "{warnings:?}"
+    );
+    assert_eq!(find(&specs, "root-agent").identity, "root-agent");
+}
+
+#[test]
+fn nested_catalog_basename_does_not_admit_profile_envelope_nodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "nested/catalog.kdl",
+        r#"profile "dev.example.goal" {
+  wasm "resolver.wasm"
+}
+agent "nested-agent" { command "true" }
+"#,
+    );
+
+    let nested = tmp.path().join("nested/catalog.kdl");
+    let found = discover_strict(tmp.path());
+    assert!(found.specs.is_empty(), "{:?}", found.specs);
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert_eq!(found.errors[0].path, nested);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("[unexpected-top-level-node]"),
+        "{:?}",
+        found.errors
+    );
+    assert!(discover_file(tmp.path(), &nested).is_err());
 }
 
 #[test]
@@ -355,6 +410,7 @@ agent "cos" {
         Some("Silber.cos")
     );
     assert!(spec.delivery.is_none());
+    assert!(spec.session_driver.is_none());
     assert!(spec.has_delivery_transport());
 }
 
@@ -466,6 +522,257 @@ fn deliver_rejects_unknown_duplicate_and_malformed_declarations() {
             found.errors[0].message.contains(expected),
             "{name}: expected {expected:?}, got {:?}",
             found.errors[0]
+        );
+    }
+}
+#[test]
+fn session_driver_is_closed_ownership_for_an_opaque_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    for driver in ["claude", "codex", "pi", "opencode", "omp"] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{driver}/agent.kdl"),
+            &format!(
+                r#"agent "{driver}" {{ host "h"; argv "axe" "agent" "launch"; session-driver "{driver}" }}"#
+            ),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    for (name, expected) in [
+        ("claude", SessionDriver::Claude),
+        ("codex", SessionDriver::Codex),
+        ("pi", SessionDriver::Pi),
+        ("opencode", SessionDriver::OpenCode),
+        ("omp", SessionDriver::Omp),
+    ] {
+        let spec = find(&found.specs, name);
+        assert_eq!(spec.session_driver, Some(expected));
+        assert_eq!(spec.session_driver.unwrap().as_str(), name);
+        assert!(spec.driver.is_none());
+        assert!(spec.delivery.is_none());
+        assert_eq!(spec.tasks.len(), 1);
+        assert_eq!(argv(&spec.tasks[0]), ["axe", "agent", "launch"]);
+        assert!(!spec.tasks[0].derived);
+    }
+}
+
+#[test]
+fn delivery_readiness_is_tagged_normalized_and_separate_from_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/codex/agent.kdl",
+        r#"agent "codex" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "codex"
+  deliver "app-server"
+  delivery-readiness "credential"
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/omp/agent.kdl",
+        r#"agent "omp" {
+  host "h"
+  argv "axe" "agent" "launch"
+  session-driver "omp"
+  delivery-readiness "anonymous" "zeta" "alpha" "zeta" harness="omp"
+}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(
+        find(&found.specs, "codex").delivery_readiness,
+        Some(DeliveryReadiness::Credential { account_id: None })
+    );
+    assert_eq!(
+        find(&found.specs, "omp").delivery_readiness,
+        Some(DeliveryReadiness::Anonymous {
+            harness: SessionDriver::Omp,
+            models: vec!["alpha".into(), "zeta".into()],
+        })
+    );
+}
+
+#[test]
+fn delivery_readiness_preempts_ding_and_rejects_mismatched_native_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/ding/agent.kdl",
+        r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(find(&found.specs, "worker")
+        .tasks
+        .iter()
+        .all(|task| !task.derived));
+
+    for (name, declaration, expected) in [
+        (
+            "transport",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server"; delivery-readiness "credential" }"#,
+            "requires session-driver 'codex', not 'claude'",
+        ),
+        (
+            "anonymous",
+            r#"agent "worker" { argv "axe"; session-driver "omp"; delivery-readiness "anonymous" "model" harness="codex" }"#,
+            "does not match effective session-driver",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
+}
+
+#[test]
+fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declarations() {
+    for (name, declaration, expected) in [
+        (
+            "unknown",
+            r#"agent "worker" { argv "axe"; session-driver "cursor" }"#,
+            "unsupported `session-driver` value 'cursor'",
+        ),
+        (
+            "duplicate",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; session-driver "codex" }"#,
+            "declares `session-driver` more than once",
+        ),
+        (
+            "missing",
+            r#"agent "worker" { argv "axe"; session-driver }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "non-string",
+            r#"agent "worker" { argv "axe"; session-driver #true }"#,
+            "value must be a string",
+        ),
+        (
+            "property",
+            r#"agent "worker" { argv "axe"; session-driver "claude" mode="owner" }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "children",
+            r#"agent "worker" { argv "axe"; session-driver "claude" { prompt "ignored" } }"#,
+            "must contain exactly one positional string",
+        ),
+        (
+            "deliver",
+            r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server" }"#,
+            "requires session-driver 'codex', not 'claude'",
+        ),
+        (
+            "driver",
+            r#"agent "worker" { session-driver "claude"; claude { prompt "go" } }"#,
+            "declares both `session-driver` and a typed driver",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            declaration,
+        );
+        let found = discover(tmp.path());
+        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
+        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+        assert!(
+            found.errors[0].message.contains(expected),
+            "{name}: expected {expected:?}, got {:?}",
+            found.errors[0]
+        );
+    }
+}
+
+#[test]
+fn session_driver_lowers_from_toml_and_json_and_rejects_null() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/toml/agent.toml",
+        "identity = \"toml\"\nhost = \"h\"\nargv = [\"axe\"]\nsession_driver = \"codex\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/h/json/agent.json",
+        r#"{"identity":"json","host":"h","argv":["axe"],"session_driver":"pi"}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/null/agent.json",
+        r#"{"identity":"null","host":"h","argv":["axe"],"session_driver":null}"#,
+    );
+
+    let found = discover(tmp.path());
+    assert_eq!(
+        find(&found.specs, "toml").session_driver,
+        Some(SessionDriver::Codex)
+    );
+    assert_eq!(
+        find(&found.specs, "json").session_driver,
+        Some(SessionDriver::Pi)
+    );
+    assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+    assert!(
+        found.errors[0]
+            .message
+            .contains("field `session_driver` must not be null"),
+        "{:?}",
+        found.errors[0]
+    );
+}
+
+#[test]
+fn managed_session_owners_preempt_legacy_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/session/agent.kdl",
+        r#"agent "session" { argv "axe"; session-driver "claude"; ding }"#,
+    );
+
+    for (name, driver) in [
+        ("claude", r#"claude { prompt "go" }"#),
+        ("codex", r#"codex { prompt "go" }"#),
+        ("pi", r#"pi { prompt "go" }"#),
+        ("opencode", r#"opencode { prompt "go" }"#),
+        ("omp", r#"omp { prompt "go" }"#),
+    ] {
+        write(
+            tmp.path(),
+            &format!("agents/h/{name}/agent.kdl"),
+            &format!(r#"agent "{name}" {{ ding; {driver} }}"#),
+        );
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 6);
+    for spec in &found.specs {
+        assert!(
+            spec.tasks.iter().all(|task| !task.derived),
+            "{} retained a derived Ding task: {:?}",
+            spec.identity,
+            spec.tasks
         );
     }
 }
@@ -971,36 +1278,30 @@ fn malformed_or_duplicate_kdl_presentation_is_rejected() {
 #[test]
 fn presentation_bounds_count_unicode_scalars_and_reject_noncanonical_values() {
     use agent_spec::spec::{
-        AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, validate_presentation,
+        validate_presentation, AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS,
     };
 
     let name_at_limit = "é".repeat(AGENT_NAME_MAX_CHARS);
     let description_at_limit = "界".repeat(AGENT_DESCRIPTION_MAX_CHARS);
     assert!(validate_presentation("name", Some(&name_at_limit), AGENT_NAME_MAX_CHARS).is_ok());
-    assert!(
-        validate_presentation(
-            "description",
-            Some(&description_at_limit),
-            AGENT_DESCRIPTION_MAX_CHARS,
-        )
-        .is_ok()
-    );
-    assert!(
-        validate_presentation(
-            "name",
-            Some(&format!("{name_at_limit}x")),
-            AGENT_NAME_MAX_CHARS,
-        )
-        .is_err()
-    );
-    assert!(
-        validate_presentation(
-            "description",
-            Some(&format!("{description_at_limit}x")),
-            AGENT_DESCRIPTION_MAX_CHARS,
-        )
-        .is_err()
-    );
+    assert!(validate_presentation(
+        "description",
+        Some(&description_at_limit),
+        AGENT_DESCRIPTION_MAX_CHARS,
+    )
+    .is_ok());
+    assert!(validate_presentation(
+        "name",
+        Some(&format!("{name_at_limit}x")),
+        AGENT_NAME_MAX_CHARS,
+    )
+    .is_err());
+    assert!(validate_presentation(
+        "description",
+        Some(&format!("{description_at_limit}x")),
+        AGENT_DESCRIPTION_MAX_CHARS,
+    )
+    .is_err());
     for (field, max_chars) in [
         ("name", AGENT_NAME_MAX_CHARS),
         ("description", AGENT_DESCRIPTION_MAX_CHARS),
@@ -1052,12 +1353,12 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
     write(
         tmp.path(),
         "agents/h/kdl/agent.kdl",
-        r#"agent "kdl" {
+        r##"agent "kdl" {
   host "h"
   resource "source" uri="worktree://github.com/example/project/main" reason="Primary checkout."
-  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability."
+  resource "work" uri="github-issue://example/project/41" reason="Current implementation task." inactive-reason="Merged and retained for traceability." selector=#"{"topics":["ci.failure","review.requested"]}"#
   command "true"
-}"#,
+}"##,
     );
     write(
         tmp.path(),
@@ -1066,7 +1367,7 @@ fn named_resource_bindings_are_uri_identities_and_order_independent() {
   "identity": "json",
   "host": "h",
   "resource": {
-    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability."},
+    "work": {"uri": "github-issue://example/project/41", "reason": "Current implementation task.", "inactive_reason": "Merged and retained for traceability.", "selector": {"topics": ["ci.failure", "review.requested"]}},
     "source": {"uri": "worktree://github.com/example/project/main", "reason": "Primary checkout."}
   },
   "command": "true"
@@ -1083,6 +1384,7 @@ command = "true"
 uri = "github-issue://example/project/41"
 reason = "Current implementation task."
 inactive_reason = "Merged and retained for traceability."
+selector = { topics = ["ci.failure", "review.requested"] }
 
 [resource.source]
 uri = "worktree://github.com/example/project/main"
@@ -1105,7 +1407,10 @@ reason = "Primary checkout."
             "Current implementation task.".into(),
             "Merged and retained for traceability.".into(),
         )
-        .unwrap(),
+        .unwrap()
+        .with_selector(serde_json::json!({
+            "topics": ["ci.failure", "review.requested"]
+        })),
     ];
     for identity in ["json", "kdl", "toml"] {
         assert_eq!(find(&found.specs, identity).resources, expected);
@@ -1114,11 +1419,25 @@ reason = "Primary checkout."
     let json = serde_json::to_string(&expected).unwrap();
     assert_eq!(
         json,
-        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability."}]"#
+        r#"[{"name":"source","uri":"worktree://github.com/example/project/main","reason":"Primary checkout."},{"name":"work","uri":"github-issue://example/project/41","reason":"Current implementation task.","inactive_reason":"Merged and retained for traceability.","selector":{"topics":["ci.failure","review.requested"]}}]"#
     );
     assert_eq!(
         serde_json::from_str::<Vec<Resource>>(&json).unwrap(),
         expected
+    );
+
+    let explicit_null = Resource::new(
+        "null-selector".into(),
+        "issue://one".into(),
+        "Null selector probe.".into(),
+    )
+    .unwrap()
+    .with_selector(serde_json::Value::Null);
+    let json = serde_json::to_string(&explicit_null).unwrap();
+    assert!(json.contains(r#""selector":null"#), "{json}");
+    assert_eq!(
+        serde_json::from_str::<Resource>(&json).unwrap(),
+        explicit_null
     );
 }
 
@@ -1185,26 +1504,18 @@ fn malformed_resource_explanations_are_rejected_causally() {
         .iter()
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
-    assert!(
-        messages
-            .iter()
-            .any(|error| error.contains("needs string `reason`"))
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|error| error.contains("unsupported property `relation`"))
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|error| error.contains("`inactive-reason` must be 1..160"))
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|error| error.contains("surrounding Unicode whitespace"))
-    );
+    assert!(messages
+        .iter()
+        .any(|error| error.contains("needs string `reason`")));
+    assert!(messages
+        .iter()
+        .any(|error| error.contains("unsupported property `relation`")));
+    assert!(messages
+        .iter()
+        .any(|error| error.contains("`inactive-reason` must be 1..160")));
+    assert!(messages
+        .iter()
+        .any(|error| error.contains("surrounding Unicode whitespace")));
 }
 
 #[test]
@@ -1213,22 +1524,37 @@ fn resource_explanation_byte_bounds_are_enforced() {
     let multibyte_too_long_reason = "é".repeat(81);
 
     assert!(Resource::new("work".into(), "issue://one".into(), valid_reason,).is_ok());
+    assert!(Resource::new_inactive(
+        "work".into(),
+        "issue://one".into(),
+        "Needed here.".into(),
+        "x".repeat(161),
+    )
+    .is_err());
+    assert!(Resource::new(
+        "work".into(),
+        "issue://one".into(),
+        multibyte_too_long_reason,
+    )
+    .is_err());
+}
+
+#[test]
+fn resource_binding_names_and_scheme_candidates_fail_loudly() {
+    for name in [
+        " declaration".to_owned(),
+        "declaration".to_owned(),
+        "line\nbreak".to_owned(),
+        "x".repeat(201),
+    ] {
+        assert!(
+            Resource::new(name.clone(), "issue://one".into(), "Task.".into()).is_err(),
+            "invalid binding name was accepted: {name:?}"
+        );
+    }
     assert!(
-        Resource::new_inactive(
-            "work".into(),
-            "issue://one".into(),
-            "Needed here.".into(),
-            "x".repeat(161),
-        )
-        .is_err()
-    );
-    assert!(
-        Resource::new(
-            "work".into(),
-            "issue://one".into(),
-            multibyte_too_long_reason,
-        )
-        .is_err()
+        Resource::new("work".into(), "_github://org/repo".into(), "Task.".into(),).is_err(),
+        "a malformed scheme prefix must not become a catalog-relative path"
     );
 }
 
@@ -1247,10 +1573,6 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
         ),
         ("missing-uri", r#"resource "work" reason="Task.""#),
         (
-            "relative-uri",
-            r#"resource "work" uri="./issue/1" reason="Task.""#,
-        ),
-        (
             "policy",
             r#"resource "work" uri="issue://example/1" reason="Task." required=#true"#,
         ),
@@ -1268,38 +1590,164 @@ fn malformed_resource_envelopes_are_rejected_without_defining_downstream_types()
 
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
-    assert_eq!(found.errors.len(), 6, "{:?}", found.errors);
+    assert_eq!(found.errors.len(), 5, "{:?}", found.errors);
     let errors = found
         .errors
         .iter()
         .map(|error| error.message.as_str())
         .collect::<Vec<_>>();
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("duplicate resource binding"))
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("duplicate resource binding")));
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("unsupported property `_tag`")));
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("unsupported property `required`")));
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("cannot have children")));
+}
+
+#[test]
+fn catalog_relative_resource_uris_are_an_st2_extension_resolved_against_the_declaration_dir() {
+    // Catalog-relative carrier paths are an st2 extension pending canonical Agent Spec adoption
+    // (see docs/vrs/06-resync): accepted here, resolved by the consumer against the declaration
+    // directory.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/relative/agent.kdl",
+        r#"agent "relative" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/goal.md" reason="Task."
+}"#,
     );
+    let found = discover(tmp.path());
     assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("unsupported property `_tag`"))
+        found.specs.iter().any(|spec| spec.identity == "relative"
+            && spec
+                .resources
+                .iter()
+                .any(|r| r.uri() == "resources/goal.md")),
+        "{:?}",
+        found.errors
     );
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("needs string `uri`"))
+    let descriptor: Resource =
+        serde_json::from_str(r#"{"name":"work","uri":"resources/goal.md","reason":"Task."}"#)
+            .expect("catalog-relative uri is valid");
+    assert_eq!(descriptor.uri(), "resources/goal.md");
+
+    let absolute = Resource::new(
+        "work".into(),
+        "/etc/absolute".into(),
+        "Still refused.".into(),
     );
-    assert!(errors.iter().any(|error| error.contains("absolute URI")));
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("unsupported property `required`"))
+    assert!(absolute.is_err(), "absolute paths must keep a scheme");
+}
+
+#[test]
+fn resource_percent_paths_are_validated_consistently_across_public_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/valid-kdl/agent.kdl",
+        r#"agent "valid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/with%20space.md" reason="Task."
+}"#,
     );
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("cannot have children"))
+    write(
+        tmp.path(),
+        "agents/h/invalid-kdl/agent.kdl",
+        r#"agent "invalid-kdl" {
+  host "h"
+  command "true"
+  resource "work" uri="resources/a%00b" reason="Task."
+}"#,
     );
+    write(
+        tmp.path(),
+        "agents/h/valid-json/agent.json",
+        r#"{
+  "identity": "valid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/with%20space.md", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-json/agent.json",
+        r#"{
+  "identity": "invalid-json",
+  "host": "h",
+  "command": "true",
+  "resource": {"work": {"uri": "resources/encoded%2Fseparator", "reason": "Task."}}
+}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/valid-toml/agent.toml",
+        r#"identity = "valid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/with%20space.md"
+reason = "Task."
+"#,
+    );
+    write(
+        tmp.path(),
+        "agents/h/invalid-toml/agent.toml",
+        r#"identity = "invalid-toml"
+host = "h"
+command = "true"
+[resource.work]
+uri = "resources/%FF.md"
+reason = "Task."
+"#,
+    );
+
+    let found = discover(tmp.path());
+    let identities = found
+        .specs
+        .iter()
+        .map(|spec| spec.identity.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        vec!["valid-json", "valid-kdl", "valid-toml"],
+        "{:?}",
+        found.errors
+    );
+    assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
+
+    let valid: Resource = serde_json::from_str(
+        r#"{"name":"work","uri":"resources/with%20space/%E2%82%AC.md","reason":"Task."}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        valid.uri(),
+        "resources/with%20space/%E2%82%AC.md",
+        "validation must preserve the URI identity instead of normalizing it"
+    );
+    for uri in [
+        "resources/a%00b",
+        "resources/encoded%2Fseparator",
+        "resources/encoded%5cseparator",
+        "resources/%FF.md",
+        "resources/%2e%2e/goal.md",
+    ] {
+        let descriptor = format!(r#"{{"name":"work","uri":"{uri}","reason":"Task."}}"#);
+        assert!(
+            serde_json::from_str::<Resource>(&descriptor).is_err(),
+            "{uri}"
+        );
+    }
 }
 
 #[test]
@@ -1320,18 +1768,16 @@ fn duplicate_json_resource_names_are_rejected_instead_of_last_write_winning() {
     let found = discover(tmp.path());
     assert!(found.specs.is_empty());
     assert_eq!(found.errors.len(), 1);
-    assert!(
-        found.errors[0]
-            .message
-            .contains("duplicate resource binding 'work'")
-    );
+    assert!(found.errors[0]
+        .message
+        .contains("duplicate resource binding 'work'"));
 }
 
 #[test]
 fn public_resource_json_deserialization_enforces_the_catalog_invariants() {
     for descriptor in [
         r#"{"name":"","uri":"issue://one","reason":"Task."}"#,
-        r#"{"name":"work","uri":"./relative","reason":"Task."}"#,
+        r#"{"name":"work","uri":"/etc/absolute","reason":"Task."}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","_tag":"issue"}"#,
         r#"{"name":"work","uri":"issue://one","reason":"Task.","required":true}"#,
     ] {
@@ -1377,12 +1823,10 @@ reason = "Task."
     let found = discover(tmp.path());
     assert!(found.specs.is_empty(), "{:?}", found.specs);
     assert_eq!(found.errors.len(), 3, "{:?}", found.errors);
-    assert!(
-        found
-            .errors
-            .iter()
-            .all(|error| error.message.contains("must be an exact absolute URI"))
-    );
+    assert!(found
+        .errors
+        .iter()
+        .all(|error| error.message.contains("must be an exact absolute URI")));
 }
 
 #[test]
@@ -1454,11 +1898,9 @@ fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
     );
     let found = discover(tmp.path());
     assert_eq!(found.errors.len(), 1);
-    assert!(
-        found.errors[0]
-            .message
-            .contains("declares both a compact launch")
-    );
+    assert!(found.errors[0]
+        .message
+        .contains("declares both a compact launch"));
 }
 
 #[test]
@@ -1570,12 +2012,10 @@ command = "exec claude 'boot'"
     assert_eq!(s.identity, "real-name");
     assert_eq!(s.host.as_deref(), Some("wrong-host"));
     assert_eq!(found.warnings.len(), 1);
-    assert!(
-        found
-            .warnings
-            .iter()
-            .any(|w| w.contains("identity mismatch"))
-    );
+    assert!(found
+        .warnings
+        .iter()
+        .any(|w| w.contains("identity mismatch")));
 }
 
 #[test]
@@ -1702,7 +2142,7 @@ fn non_spec_files_are_skipped_silently() {
 }
 
 #[test]
-fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
+fn adjacent_and_nested_bundle_kdl_are_outside_strict_agent_admission() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
@@ -1713,6 +2153,11 @@ fn adjacent_non_agent_kdl_is_outside_strict_agent_admission() {
         tmp.path(),
         "agents/hetz/x/agent.kdl",
         r#"agent "x" { host "hetz"; command "true" }"#,
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/x/docs/agent.kdl",
+        r#"note "static payload despite the generic filename""#,
     );
 
     let found = discover(tmp.path());
@@ -1876,12 +2321,10 @@ fn strict_discovery_reports_unobservable_declaration_entries() {
     assert_eq!(strict.errors.len(), 2, "{:?}", strict.errors);
     assert!(strict.errors.iter().any(|error| error.path == dangling));
     assert!(strict.errors.iter().any(|error| error.path == socket));
-    assert!(
-        strict
-            .errors
-            .iter()
-            .all(|error| error.message.contains("unobservable declaration entry"))
-    );
+    assert!(strict
+        .errors
+        .iter()
+        .all(|error| error.message.contains("unobservable declaration entry")));
 }
 
 #[cfg(unix)]
