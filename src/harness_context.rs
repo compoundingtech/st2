@@ -23,14 +23,15 @@
 //!   "190k of 200k, twelve minutes ago" is useful; "active, twelve minutes ago" is not, which is
 //!   why the sibling record derives and this one does not.
 //! - **The write guard is quantization, not equality** (HC-R09, HC-R10). A reading lands when it
-//!   enters a different 1% bucket of the window, crosses account-window exhaustion, when a
-//!   compaction happens, or when the record is older than the heartbeat. Writes per window fill
+//!   enters a different 1% bucket of the window, crosses Claude account-window exhaustion, when
+//!   a compaction happens, or when the record is older than the heartbeat. Writes per window fill
 //!   are therefore capped at
 //!   `100 / HARNESS_CONTEXT_BUCKET_PERCENT` however chatty the producer is, which is what lets one
 //!   constant serve all five harnesses; the bounded exhaustion and reset edges bypass that cap.
 //!
-//! The only st2 classification derived from these numbers is the positive fresh rate-limit signal
-//! used by roster consumers; the raw readings remain advisory for a human, a roster, and Doctor.
+//! The only st2 classification derived from these numbers is the positive fresh Claude rate-limit
+//! signal used by roster consumers; the raw readings remain advisory for a human, a roster, and
+//! Doctor.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,14 +159,21 @@ pub struct RateLimits {
 }
 
 impl RateLimits {
-    /// Whether any reported account window is exhausted. Absent windows remain unknown; this
-    /// predicate proves only the positive classification.
-    pub fn is_exhausted(&self) -> bool {
+    /// Whether any reported account window reached 100%. Absent windows remain unknown, and the
+    /// percentage alone does not classify provider availability.
+    fn is_exhausted(&self) -> bool {
         [self.five_hour, self.seven_day]
             .into_iter()
             .flatten()
             .any(|percent| percent.is_finite() && percent >= 100.0)
     }
+}
+
+/// Whether the retained account-window evidence proves that this harness cannot progress. Codex
+/// can continue through credits after its included allowance is exhausted, and the context record
+/// does not carry the credit metadata needed to classify that state.
+fn proves_rate_limited(harness: Harness, rate_limits: RateLimits) -> bool {
+    harness == Harness::Claude && rate_limits.is_exhausted()
 }
 
 /// The durable record. Additive-tolerant on read (no `deny_unknown_fields`): a reader pinned to an
@@ -336,7 +344,7 @@ impl Writer {
     /// Record a fresh reading, returning whether a write landed.
     ///
     /// The guard is [`Writer::write_locked`]'s quantization: a reading inside the written bucket is
-    /// skipped, a bucket or rate-limit exhaustion crossing lands, and a record older than
+    /// skipped, a bucket or proven Claude rate-limit crossing lands, and a record older than
     /// [`HARNESS_CONTEXT_HEARTBEAT`] lands whatever the bucket. Callers must hold a reading taken
     /// since their last write — the heartbeat re-publishes a *fresh* reading whose bucket happened
     /// not to change, and never re-stamps a stale one.
@@ -452,14 +460,16 @@ impl Writer {
     }
 
     /// The write policy (HC-R09, HC-R10), isolated so it is one testable place: a reading lands
-    /// when it enters a different bucket of the window, crosses account-window exhaustion, or the
-    /// record is older than the heartbeat. A compaction edge bypasses this entirely and is handled
-    /// by the caller.
+    /// when it enters a different bucket of the window, crosses proven Claude account-window
+    /// exhaustion, or the record is older than the heartbeat. A compaction edge bypasses this
+    /// entirely and is handled by the caller.
     fn due(&self, current: &Record, reading: &Reading, now_ms: u64) -> bool {
         if bucket(current.used_percent) != bucket(reading.used_percent) {
             return true;
         }
-        if current.rate_limits.is_exhausted() != reading.rate_limits.is_exhausted() {
+        if proves_rate_limited(current.harness, current.rate_limits)
+            != proves_rate_limited(self.harness, reading.rate_limits)
+        {
             return true;
         }
         // Age is measured from the WRITE, not from the reading: the clause asks how long it has
@@ -513,7 +523,7 @@ pub struct Observed {
 impl Observed {
     /// Whether fresh provider evidence proves that this harness cannot currently progress.
     pub fn is_rate_limited(&self) -> bool {
-        !self.stale && self.rate_limits.is_exhausted()
+        !self.stale && proves_rate_limited(self.harness, self.rate_limits)
     }
 }
 
@@ -818,10 +828,10 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_exhaustion_and_reset_crossings_land_inside_one_usage_bucket() {
+    fn claude_rate_limit_exhaustion_and_reset_crossings_land_inside_one_usage_bucket() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        let mut writer = writer(&agent_dir);
+        let mut writer = Writer::new(&agent_dir, "hetz.worker", Harness::Claude).unwrap();
         let at_limit = |used_tokens, used_percent, five_hour| Reading {
             rate_limits: RateLimits {
                 five_hour: Some(five_hour),
@@ -842,13 +852,51 @@ mod tests {
         );
         assert!(
             writer.observe(at_limit(85_900, 33.9, 0.0)).unwrap(),
-            "a provider reset is also news inside the same usage bucket"
+            "a Claude reset is also news inside the same usage bucket"
         );
         assert!(
             !read(&harness_context_path(&agent_dir))
                 .unwrap()
                 .is_rate_limited()
         );
+    }
+
+    #[test]
+    fn codex_account_window_exhaustion_does_not_prove_the_runtime_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let mut writer = writer(&agent_dir);
+        let path = harness_context_path(&agent_dir);
+
+        assert!(
+            writer
+                .observe(Reading {
+                    rate_limits: RateLimits {
+                        five_hour: None,
+                        seven_day: Some(100.0),
+                    },
+                    ..reading(85_000, 33.0)
+                })
+                .unwrap()
+        );
+        let exhausted = fs::read(&path).unwrap();
+        assert!(
+            !read(&path).unwrap().is_rate_limited(),
+            "included allowance exhaustion is not Codex availability evidence"
+        );
+        assert!(
+            !writer
+                .observe(Reading {
+                    rate_limits: RateLimits {
+                        five_hour: None,
+                        seven_day: Some(0.0),
+                    },
+                    ..reading(85_400, 33.4)
+                })
+                .unwrap(),
+            "a Codex allowance reset is not a classification edge"
+        );
+        assert_eq!(fs::read(path).unwrap(), exhausted, "no write landed");
     }
 
     /// The withheld case has its own bucket behaviour: `null` has no bucket, so withheld↔known is
