@@ -1901,6 +1901,12 @@ profile "dev.example.observe" {{
     )
     .unwrap();
     fs::write(agent.join("status"), "busy").unwrap();
+    fs::create_dir_all(agent.join(".workspace")).unwrap();
+    fs::write(
+        agent.join(".workspace/session.txt"),
+        "preserve live workspace",
+    )
+    .unwrap();
 
     let raw_capture_dir = temp.path().join("raw-capture-legacy");
     let captured = raw_snapshot(&catalog, &raw_capture_dir);
@@ -1914,6 +1920,7 @@ profile "dev.example.observe" {{
         fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
         legacy_config
     );
+    assert!(!raw_capture_dir.join("agents/host/worker/.workspace").exists());
 
     let desired = temp.path().join("desired-component");
     write_agent(&desired, "worker", false);
@@ -1958,6 +1965,10 @@ profile "dev.example.observe" {{
         "preserve mutable context"
     );
     assert_eq!(fs::read_to_string(agent.join("status")).unwrap(), "busy");
+    assert_eq!(
+        fs::read_to_string(agent.join(".workspace/session.txt")).unwrap(),
+        "preserve live workspace"
+    );
     let applied = st2::catalog::load(&catalog).unwrap();
     assert_eq!(applied.pty_root.as_deref(), Some(pty_root));
     assert_eq!(
