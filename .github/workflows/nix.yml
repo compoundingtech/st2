@@ -21,9 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-      # `nix flake check` rather than `nix build`: it builds the package *and*
-      # evaluates every `checks.*`, so fmt, clippy, the hermetic test suite, and
-      # the `--help` smoke test all gate the PR from one entrypoint.
+      # `nix flake check` rather than `nix build`: it builds the package and
+      # evaluates every declared `checks.*` output from one entrypoint. The
+      # flake deliberately excludes formatting and lint checks.
       - run: nix flake check --print-build-logs
 
   # st2 drives real processes — process groups, signals, pipes, reaping — and those paths
