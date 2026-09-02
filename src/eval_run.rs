@@ -811,11 +811,22 @@ fn wait_done(
 /// Fail-fast boot gate: a task whose command exits immediately (127 harness-not-on-PATH, or a crash at
 /// startup) must fail the eval LOUDLY now, not leave it hanging until `max-timeout` waiting for a
 /// confirmation that can never come. Poll briefly for all tasks to be live — a real task is up within
-/// ~1s; a dead-at-boot one never is (tolerant of a slow start + a transient pty-list flicker).
+/// ~1s; a dead-at-boot one never is. Require two consecutive live snapshots because a fast observer
+/// can read a task's stale running record before the PTY runtime records its immediate exit.
+fn stable_boot_reading(consecutive_live: &mut u8, all_live: bool) -> bool {
+    if all_live {
+        *consecutive_live = consecutive_live.saturating_add(1);
+    } else {
+        *consecutive_live = 0;
+    }
+    *consecutive_live >= 2
+}
+
 fn boot_gate(task_ids: &[String], specs: &[AgentSpec], host: &str, catalog: &Path) -> Result<()> {
     let runner = SystemRunner::new(catalog.to_path_buf(), catalog.join("exec"));
     let want: Vec<&str> = task_ids.iter().map(String::as_str).collect();
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut consecutive_live = 0;
     loop {
         let sessions = runner.list_sessions().unwrap_or_default();
         let alive: HashSet<&str> = sessions
@@ -828,7 +839,7 @@ fn boot_gate(task_ids: &[String], specs: &[AgentSpec], host: &str, catalog: &Pat
             .copied()
             .filter(|id| !alive.contains(id))
             .collect();
-        if dead.is_empty() {
+        if stable_boot_reading(&mut consecutive_live, dead.is_empty()) {
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -1827,6 +1838,16 @@ mod tests {
         let path = catalog.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn boot_gate_requires_two_consecutive_live_snapshots() {
+        let mut consecutive_live = 0;
+
+        assert!(!stable_boot_reading(&mut consecutive_live, true));
+        assert!(!stable_boot_reading(&mut consecutive_live, false));
+        assert!(!stable_boot_reading(&mut consecutive_live, true));
+        assert!(stable_boot_reading(&mut consecutive_live, true));
     }
 
     #[test]
