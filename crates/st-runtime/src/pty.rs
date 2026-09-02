@@ -82,7 +82,11 @@ impl PtyRuntime {
         } else {
             arguments.push(OsString::from("--no-display-name"));
         }
-        for (key, value) in env {
+        let mut terminal_env = env.clone();
+        terminal_env
+            .entry("TERM".into())
+            .or_insert_with(|| "xterm-256color".into());
+        for (key, value) in &terminal_env {
             arguments.extend([
                 OsString::from("--env"),
                 OsString::from(format!("{key}={value}")),
@@ -383,10 +387,36 @@ exit 0
             .unwrap();
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("st3.isolation="));
+        assert!(arguments.contains("TERM=xterm-256color"));
         assert!(arguments.contains("--force"));
         if crate::isolation_mode() == crate::Isolation::Scope {
             assert!(arguments.contains("st3.scope-unit=st3-work-"));
         }
+    }
+
+    #[test]
+    fn spawn_preserves_an_explicit_terminal_type() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fake-pty-term");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::from([("TERM".into(), "screen-256color".into())]),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
+        assert!(arguments.contains("TERM=screen-256color"));
+        assert!(!arguments.contains("TERM=xterm-256color"));
     }
 
     #[test]
