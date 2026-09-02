@@ -12,7 +12,7 @@ subgraph {
               model "claude-sonnet-5"
               effort "medium"
               dev-channels #true
-              prompt #"You cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Claim only assigned graph work. Verify the ledger without editing it. Send requester one final confirmation after verification. End the turn when no message remains."#
+              prompt #"You cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Claim only assigned graph work. Verify the ledger without editing it. Send person/eval-requester one final confirmation after verification. End the turn when no message remains."#
               args "--permission-mode" "bypassPermissions"
             }
             restart "never"
@@ -169,7 +169,7 @@ subgraph {
 
       step "verify-and-confirm" timeout="15m" {
         title "The supervisor verifies the recovered batch"
-        goal "Verify the graph-owned restart boundary, all four item results, the final repository, and the worker report. Do not edit the ledger. Send requester one final confirmation."
+        goal "Verify the graph-owned restart boundary, all four item results, the final repository, and the worker report. Do not edit the ledger. Send person/eval-requester one final confirmation."
         assigned-to "agent/rc.sup"
         depends-on { step "process-after-restart" completed }
 
@@ -185,7 +185,7 @@ subgraph {
           }
           step "confirm-requester" {
             title "The requester receives one verified confirmation"
-            goal #"Send requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$PLAN_RUN/verification resource.binding --actor agent/rc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+            goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$PLAN_RUN/verification resource.binding --actor agent/rc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
             depends-on { step "verify-ledger-read-only" completed }
             produces {
               resource "plan-run/${PLAN_RUN}/verification" {

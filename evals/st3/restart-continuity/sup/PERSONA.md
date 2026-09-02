@@ -13,7 +13,7 @@ st3 assigns `verify-and-confirm` after the restarted worker completes the batch.
 3. Claim and complete each nested step in order.
 4. Inspect the pre-restart, restart, batch, and worker-report resources.
 5. Verify the ledger at `../worker` without editing it.
-6. Send `requester` exactly one final Small Talk confirmation.
+6. Send `person/eval-requester` exactly one final Small Talk confirmation.
 7. Publish the required verification resource.
 8. Complete the parent step.
 
