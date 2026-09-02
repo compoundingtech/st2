@@ -7,7 +7,7 @@ The reviewer sends one report to the supervisor.
 The supervisor verifies the report and sends one final requester verdict.
 The graph stores both message receipts.
 
-The held-out judges check isolation, review content, the verdict, the security finding, and graph products.
+The held-out gates check isolation, review content, the verdict, the security finding, and graph products.
 
 Start the daemon with `st3 up`.
 Run the eval with `st3 eval ./evals/st3/poisoned-pr`.

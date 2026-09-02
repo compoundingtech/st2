@@ -5,83 +5,72 @@ subgraph {
   resource "st3-full-corpus-review" { kind "human.review" }
 
   plan "build-st3" state="ready" {
+    goal "Complete plan build-st3."
     step "automated-tests" timeout="30m" {
       title "The implementation and automated tests pass"
       subgraph {
-        exec "build-st3/automated-tests/${PLAN_RUN}" {
+        exec "build-st3/automated-tests/${ST_PLAN_RUN}" {
           workspace "."
           command "cargo test --workspace"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/build-st3/automated-tests/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/build-st3/automated-tests/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/build-st3/automated-tests/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/build-st3/automated-tests/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "translation-parity" timeout="30m" {
       title "The catalog and eval translations pass parity checks"
       depends-on { step "automated-tests" completed }
       subgraph {
-        exec "build-st3/translation-parity/${PLAN_RUN}" {
+        exec "build-st3/translation-parity/${ST_PLAN_RUN}" {
           workspace "."
           command "./scripts/prepare-st3-migration && ./scripts/check-st3-migration"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/build-st3/translation-parity/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/build-st3/translation-parity/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/build-st3/translation-parity/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/build-st3/translation-parity/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "complex-proof-review" {
       title "A person approves one complex paid proof"
       depends-on { step "translation-parity" completed }
-      judges {
-        field "decision" "resource/st3-complex-proof-review" "is" "approved"
-      }
+      gate "condition-1" { field "decision" "resource/st3-complex-proof-review" "is" "approved" }
     }
 
     step "signal-rename-proof" timeout="45m" {
       title "One complex eval proves the complete path"
       depends-on { step "complex-proof-review" completed }
       subgraph {
-        exec "build-st3/signal-rename-proof/${PLAN_RUN}" {
+        exec "build-st3/signal-rename-proof/${ST_PLAN_RUN}" {
           workspace "."
           command "st3 eval ./target/st3-migration/evals/signal-rename"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/build-st3/signal-rename-proof/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/build-st3/signal-rename-proof/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/build-st3/signal-rename-proof/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/build-st3/signal-rename-proof/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "full-corpus-review" {
       title "A person approves the full paid eval corpus"
       depends-on { step "signal-rename-proof" completed }
-      judges {
-        field "decision" "resource/st3-full-corpus-review" "is" "approved"
-      }
+      gate "condition-1" { field "decision" "resource/st3-full-corpus-review" "is" "approved" }
     }
 
     step "full-eval-corpus" timeout="4h" {
       title "All translated evals pass"
       depends-on { step "full-corpus-review" completed }
       subgraph {
-        exec "build-st3/full-eval-corpus/${PLAN_RUN}" {
+        exec "build-st3/full-eval-corpus/${ST_PLAN_RUN}" {
           workspace "."
           command "./scripts/run-all-st3-evals"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/build-st3/full-eval-corpus/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/build-st3/full-eval-corpus/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/build-st3/full-eval-corpus/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/build-st3/full-eval-corpus/${ST_PLAN_RUN}" "is" 0 }
     }
   }
 }

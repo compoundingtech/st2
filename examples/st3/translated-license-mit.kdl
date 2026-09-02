@@ -1,67 +1,64 @@
 version 2
 
 subgraph {
-  scope "eval/license-mit/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/license-mit/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/license-mit" state="ready" {
+      goal "Complete plan eval/license-mit."
       step "team" timeout="20m" {
         title "The eval team is running"
         subgraph {
-          agent "mix.sup.${PLAN_RUN}" {
-            workspace "${WORKSPACE}/sup"
+          agent "mix.sup.${ST_PLAN_RUN}" {
+            workspace "${ST_WORKSPACE}/sup"
             harness "claude" {
               prompt "Read CLAUDE.md and handle st3 graph messages."
               args "--permission-mode" "bypassPermissions"
             }
             restart "never"
           }
-          agent "mix.worker.${PLAN_RUN}" {
-            workspace "${WORKSPACE}/worker"
+          agent "mix.worker.${ST_PLAN_RUN}" {
+            workspace "${ST_WORKSPACE}/worker"
             harness "claude" {
               prompt "Read CLAUDE.md and handle st3 graph messages."
               args "--permission-mode" "auto"
             }
             restart "never"
           }
-          message "kickoff/${PLAN_RUN}" {
+          message "kickoff/${ST_PLAN_RUN}" {
             from "requester"
-            to "mix.sup.${PLAN_RUN}"
+            to "mix.sup.${ST_PLAN_RUN}"
             content "doc/evals/license-mit/task@7ebefe1e115dbfb438ca4da438b3b9d825dcd2cced572393235c70ac070a5e21"
           }
         }
-        judges {
-          exists "agent/mix.sup.${PLAN_RUN}"
-          exists "agent/mix.worker.${PLAN_RUN}"
-        }
+        gate "condition-1" { exists "agent/mix.sup.${ST_PLAN_RUN}" }
+        gate "condition-2" { exists "agent/mix.worker.${ST_PLAN_RUN}" }
       }
 
-      step "held-out-judges" timeout="20m" {
-        title "All held-out judges pass"
+      step "held-out-gates" timeout="20m" {
+        title "All held-out gates pass"
         depends-on { step "team" completed }
-        judges {
-          judge "LICENSE is real MIT" {
-            exec "grep -F 'Permission is hereby granted' worker/LICENSE"
-            host "local"
-            workspace "${WORKSPACE}"
-            time-limit "120s"
-          }
-          judge "The confirmation contains evidence" type="llm" {
-            model "gpt-5.6-sol"
-            host "local"
-            workspace "${WORKSPACE}"
-            tools "shell" "git"
-            token-budget 8192
-            time-limit "120s"
-            prompt "Check that the completion message cites the commit and test evidence."
-          }
+        gate "LICENSE is real MIT" {
+          exec "grep -F 'Permission is hereby granted' worker/LICENSE"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          time-limit "120s"
+        }
+        gate "The confirmation contains evidence" type="llm" {
+          model "gpt-5.6-sol"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          tools "shell" "git"
+          token-budget 8192
+          time-limit "120s"
+          prompt "Check that the completion message cites the commit and test evidence."
         }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
         subgraph {
-          scope "eval/license-mit/${PLAN_RUN}" { stop }
+          scope "eval/license-mit/${ST_PLAN_RUN}" { stop }
         }
-        judges { empty "scope/eval/license-mit/${PLAN_RUN}" }
+        gate "condition" { empty "scope/eval/license-mit/${ST_PLAN_RUN}" }
       }
     }
   }

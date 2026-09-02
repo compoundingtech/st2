@@ -1,0 +1,44 @@
+version 2
+
+subgraph {
+  scope "eval/planning-mode/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "eval/planning-mode" state="ready" {
+      goal "Prove one Codex planning session from request through direct approval."
+      goal "Keep the proposed plan unpublished until its exact preview is approved."
+
+      step "planning-session" timeout="25m" {
+        title "A Codex planner submits one reviewable plan candidate"
+        subgraph {
+          exec "eval/planning-mode/controller/${ST_PLAN_RUN}" {
+            host "local"
+            workspace "${ST_WORKSPACE}"
+            cwd "${ST_WORKSPACE}"
+            command "bash ./controller.sh"
+            restart "never"
+            env {
+              PLANNED_PLAN "planning-mode-${ST_PLAN_RUN}"
+            }
+          }
+        }
+        gate "the controller exits successfully" { field "exit_code" "exec/eval/planning-mode/controller/${ST_PLAN_RUN}" "is" 0 }
+      }
+
+      step "gates" timeout="2m" {
+        title "The approved planning result keeps every lifecycle boundary"
+        depends-on { step "planning-session" completed }
+        gate "the planning-mode proof is complete" {
+          exec "bash ./verify.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          time-limit "1m"
+        }
+      }
+
+      step "cleanup" finally=#true {
+        title "The temporary eval scope is empty"
+        subgraph { scope "eval/planning-mode/${ST_PLAN_RUN}" { stop } }
+        gate "the eval scope has no live member" { empty "scope/eval/planning-mode/${ST_PLAN_RUN}" }
+      }
+    }
+  }
+}

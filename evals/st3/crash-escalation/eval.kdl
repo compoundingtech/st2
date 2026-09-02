@@ -1,47 +1,44 @@
 version 2
 
 subgraph {
-  scope "eval/crash-escalation/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/crash-escalation/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/crash-escalation" state="ready" {
+      goal "Complete plan eval/crash-escalation."
       step "faults" timeout="1m" {
         title "The runtime classifies abnormal and clean exits"
         subgraph {
-          exec "eval/crash-escalation/crash/${PLAN_RUN}" {
+          exec "eval/crash-escalation/crash/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}"
+            workspace "${ST_WORKSPACE}"
             command "exit 17"
             restart "always"
             restart { attempts 1; interval "60s"; mode "fail" }
           }
-          exec "eval/crash-escalation/clean/${PLAN_RUN}" {
+          exec "eval/crash-escalation/clean/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}"
+            workspace "${ST_WORKSPACE}"
             command "exit 0"
             restart "never"
           }
         }
-        judges {
-          field "reachability" "exec/eval/crash-escalation/crash/${PLAN_RUN}" "is" "unreachable"
-          field "exit_code" "exec/eval/crash-escalation/crash/${PLAN_RUN}" "is" 17
-          field "status" "exec/eval/crash-escalation/clean/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/crash-escalation/clean/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "reachability" "exec/eval/crash-escalation/crash/${ST_PLAN_RUN}" "is" "unreachable" }
+        gate "condition-2" { field "exit_code" "exec/eval/crash-escalation/crash/${ST_PLAN_RUN}" "is" 17 }
+        gate "condition-3" { field "status" "exec/eval/crash-escalation/clean/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-4" { field "exit_code" "exec/eval/crash-escalation/clean/${ST_PLAN_RUN}" "is" 0 }
       }
-      step "judge" timeout="1m" {
+      step "gate" timeout="1m" {
         depends-on { step "faults" completed }
-        judges {
-          judge "only the abnormal exit has a raised supervision decision" {
-            exec "bash ./judge.sh"
-            host "local"
-            workspace "${WORKSPACE}/fixture"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "1m"
-          }
+        gate "only the abnormal exit has a raised supervision decision" {
+          exec "bash ./judge.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
+
+          time-limit "1m"
         }
       }
       step "cleanup" finally=#true {
-        subgraph { scope "eval/crash-escalation/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/crash-escalation/${PLAN_RUN}" }
+        subgraph { scope "eval/crash-escalation/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/crash-escalation/${ST_PLAN_RUN}" }
       }
     }
   }

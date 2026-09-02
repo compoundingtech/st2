@@ -8,7 +8,7 @@ The KDL records delegation, diagnosis, regression-first repair, publication, ver
 
 Start the daemon with `st3 up`. Run the eval with `st3 eval ./evals/st3/ghost-bug`.
 
-Held-out judges (identical logic to ghost-bug): isolation (author-gated to `gbx.fix`), suite-green,
+Held-out gates (identical logic to ghost-bug): isolation (author-gated to `gbx.fix`), suite-green,
 root-cause (two blind probes), **regression mutation-valid** (RED on the buggy BASE src — the integrity
 bar, ported verbatim), coordination.
 

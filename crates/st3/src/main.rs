@@ -19,9 +19,11 @@ use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
-    EvalStatus, EventRecord, IntentInput, JudgementRequest, MessageLifecycleRequest,
+    EvalStatus, EventRecord, GateResultRequest, IntentInput, MessageLifecycleRequest,
     MessageSendRequest, MessageView, PlanOutputView, PlanProductionRequest, PlanRequest,
-    PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState, QuickAgentRequest,
+    PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
     QuickAgentResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
     SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
     StepRunView, WorkRequest,
@@ -53,7 +55,12 @@ enum Command {
     /// Publish and attach a Codex agent.
     Codex(QuickArgs),
     /// Preview a new-format KDL intent.
-    Plan(FileArgs),
+    Preview(FileArgs),
+    /// Create and review a durable Codex planning session.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
     /// Apply a new-format KDL intent.
     Run(RunArgs),
     /// Apply all new-format KDL files in one directory tree.
@@ -120,8 +127,8 @@ enum Command {
         #[command(subcommand)]
         command: MessageCommand,
     },
-    /// Record a running judge result.
-    Judgement(JudgementArgs),
+    /// Record a running gate result.
+    GateResult(GateResultArgs),
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
     #[command(hide = true)]
@@ -164,6 +171,73 @@ struct FileArgs {
     file: Option<PathBuf>,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    Start(PlanStartArgs),
+    Show(PlanSessionArgs),
+    Preview(PlanSessionArgs),
+    Submit(PlanSubmitArgs),
+    Revise(PlanReviseArgs),
+    Approve(PlanApproveArgs),
+    Cancel(PlanCancelArgs),
+}
+
+#[derive(Args)]
+struct PlanStartArgs {
+    #[arg(long)]
+    id: String,
+    request: Option<PathBuf>,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long = "as")]
+    requester: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    effort: Option<String>,
+}
+
+#[derive(Args)]
+struct PlanSessionArgs {
+    session: String,
+}
+
+#[derive(Args)]
+struct PlanSubmitArgs {
+    session: String,
+    #[arg(long)]
+    markdown: PathBuf,
+    #[arg(long)]
+    kdl: PathBuf,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+}
+
+#[derive(Args)]
+struct PlanReviseArgs {
+    session: String,
+    feedback: PathBuf,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct PlanApproveArgs {
+    session: String,
+    preview_hash: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct PlanCancelArgs {
+    session: String,
+    #[arg(long = "as")]
+    actor: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Args)]
@@ -586,14 +660,14 @@ struct ReviewArgs {
 }
 
 #[derive(Args)]
-struct JudgementArgs {
+struct GateResultArgs {
     #[arg(value_parser = ["pass", "fail"])]
     verdict: String,
     #[arg(long)]
     reason: String,
     #[arg(long)]
     evidence: Vec<String>,
-    #[arg(long, env = "ST3_JUDGE_CAPABILITY")]
+    #[arg(long, env = "ST_GATE_CAPABILITY")]
     operation_capability: String,
 }
 
@@ -680,7 +754,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Codex(args) => {
             run_quick(&client, endpoint, &config, args, "codex", cli.json).await
         }
-        Command::Plan(args) => run_plan(&client, args, cli.json).await,
+        Command::Preview(args) => run_preview(&client, args, cli.json).await,
+        Command::Plan { command } => run_planning(&client, command, cli.json).await,
         Command::Run(args) => run_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
         Command::Exec(args) => run_exec(&client, args, cli.json).await,
@@ -702,7 +777,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Review { command } => run_review(&client, command, cli.json).await,
         Command::Work { command } => run_work(&client, command, cli.json).await,
         Command::Message { command } => run_message(&client, command, cli.json).await,
-        Command::Judgement(args) => run_judgement(&client, args, cli.json).await,
+        Command::GateResult(args) => run_gate_result(&client, args, cli.json).await,
         Command::Completions(args) => {
             let shell = match args.shell {
                 CompletionShell::Bash => clap_complete::Shell::Bash,
@@ -814,7 +889,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     serve_unix(&config.socket, router(state)).await
 }
 
-async fn run_plan(client: &Client, args: FileArgs, json_output: bool) -> Result<()> {
+async fn run_preview(client: &Client, args: FileArgs, json_output: bool) -> Result<()> {
     let (kdl, source_name) = read_intent(args.file.as_deref())?;
     let response: PlanResponse = client
         .post(
@@ -826,6 +901,140 @@ async fn run_plan(client: &Client, args: FileArgs, json_output: bool) -> Result<
         )
         .await?;
     print_plan(&response, json_output)
+}
+
+async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) -> Result<()> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let response = match command {
+        PlanCommand::Start(args) => {
+            let (request, _) = read_intent(args.request.as_deref())?;
+            let workspace = fs::canonicalize(&args.workspace)
+                .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
+            client
+                .post::<_, PlanningSessionView>(
+                    "/v1/planning-sessions",
+                    &PlanningSessionStartRequest {
+                        plan: args.id,
+                        request: request.into_bytes(),
+                        workspace: workspace.to_string_lossy().into_owned(),
+                        requester: args.requester,
+                        model: args.model,
+                        effort: args.effort,
+                        idempotency_key: format!("planning-start:{nonce}"),
+                    },
+                )
+                .await?
+        }
+        PlanCommand::Show(args) => {
+            client
+                .get::<PlanningSessionView>(&format!(
+                    "/v1/planning-sessions/{}",
+                    urlencoding::encode(&args.session)
+                ))
+                .await?
+        }
+        PlanCommand::Preview(args) => {
+            client
+                .post::<_, PlanningSessionView>(
+                    &format!(
+                        "/v1/planning-sessions/{}/preview",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &json!({}),
+                )
+                .await?
+        }
+        PlanCommand::Submit(args) => {
+            client
+                .post::<_, PlanningSessionView>(
+                    &format!(
+                        "/v1/planning-sessions/{}/submit",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &PlanningCandidateSubmitRequest {
+                        actor: args.actor,
+                        markdown: fs::read(&args.markdown).with_context(|| {
+                            format!("read Markdown {}", args.markdown.display())
+                        })?,
+                        kdl: fs::read(&args.kdl)
+                            .with_context(|| format!("read KDL {}", args.kdl.display()))?,
+                        idempotency_key: format!("planning-submit:{nonce}"),
+                    },
+                )
+                .await?
+        }
+        PlanCommand::Revise(args) => {
+            client
+                .post::<_, PlanningSessionView>(
+                    &format!(
+                        "/v1/planning-sessions/{}/revise",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &PlanningRevisionRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        feedback: fs::read(&args.feedback).with_context(|| {
+                            format!("read feedback {}", args.feedback.display())
+                        })?,
+                        idempotency_key: format!("planning-revise:{nonce}"),
+                    },
+                )
+                .await?
+        }
+        PlanCommand::Approve(args) => {
+            client
+                .post::<_, PlanningSessionView>(
+                    &format!(
+                        "/v1/planning-sessions/{}/approve",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &PlanningApprovalRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        preview_hash: args.preview_hash,
+                        idempotency_key: format!("planning-approve:{nonce}"),
+                    },
+                )
+                .await?
+        }
+        PlanCommand::Cancel(args) => {
+            client
+                .post::<_, PlanningSessionView>(
+                    &format!(
+                        "/v1/planning-sessions/{}/cancel",
+                        urlencoding::encode(&args.session)
+                    ),
+                    &PlanningCancelRequest {
+                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
+                        reason: args.reason,
+                        idempotency_key: format!("planning-cancel:{nonce}"),
+                    },
+                )
+                .await?
+        }
+    };
+    if json_output {
+        return print_value(&response, true);
+    }
+    println!("{}\t{}", response.status, response.subject);
+    println!("Plan: plan/{}", response.plan);
+    println!("Planner: {}", response.planner);
+    if let Some(candidate) = &response.candidate {
+        println!(
+            "Candidate: {} ({})",
+            candidate.revision, candidate.plan_revision
+        );
+    }
+    if let Some(preview) = &response.preview {
+        println!("Preview: {}", preview.hash);
+        println!("\nGraph:\n{}", preview.graph);
+        println!("\nDiff:\n{}", preview.diff);
+        for warning in &preview.plan.warnings {
+            println!("Warning: {warning}");
+        }
+        for blocker in &preview.plan.blockers {
+            println!("Blocker: {blocker}");
+        }
+    }
+    Ok(())
 }
 
 async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<()> {
@@ -1856,6 +2065,12 @@ async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Res
         } else {
             println!("{}\t{}", agent.subject.trim_start_matches("agent/"), state);
         }
+        for grouping in agent.under {
+            match grouping.reason {
+                Some(reason) => println!("  under {} ({reason})", grouping.agent),
+                None => println!("  under {}", grouping.agent),
+            }
+        }
     }
     Ok(())
 }
@@ -2234,8 +2449,14 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 if let Some(title) = step.title {
                     println!("Title: {title}");
                 }
-                if let Some(goal) = step.goal {
+                for goal in step.goals {
                     println!("Goal: {goal}");
+                }
+                for grouping in step.under {
+                    match grouping.reason {
+                        Some(reason) => println!("Under: {} ({reason})", grouping.agent),
+                        None => println!("Under: {}", grouping.agent),
+                    }
                 }
                 Ok(())
             }
@@ -2343,7 +2564,7 @@ async fn post_work(
             if let Some(title) = response.title {
                 println!("Title: {title}");
             }
-            if let Some(goal) = response.goal {
+            for goal in response.goals {
                 println!("Goal: {goal}");
             }
         }
@@ -2651,13 +2872,13 @@ fn thread_root<'a>(message: &'a MessageView, all: &'a [MessageView]) -> &'a Mess
     current
 }
 
-async fn run_judgement(client: &Client, args: JudgementArgs, json_output: bool) -> Result<()> {
+async fn run_gate_result(client: &Client, args: GateResultArgs, json_output: bool) -> Result<()> {
     let response: ClaimRecord = client
         .post(
-            "/v1/judgements",
-            &JudgementRequest {
+            "/v1/gate-results",
+            &GateResultRequest {
                 idempotency_key: format!(
-                    "judgement:{}:{}:{}",
+                    "gate-result:{}:{}:{}",
                     args.operation_capability, args.verdict, args.reason
                 ),
                 operation_capability: args.operation_capability,
@@ -3162,6 +3383,8 @@ async fn run_quick(
         worktree: worktree.to_string_lossy().into_owned(),
         model: args.model,
         effort: args.effort,
+        prompt: None,
+        arguments: Vec::new(),
         expected_subject,
         idempotency_key: String::new(),
     };
@@ -3173,6 +3396,8 @@ async fn run_quick(
             &request.worktree,
             &request.model,
             &request.effort,
+            &request.prompt,
+            &request.arguments,
             &request.expected_subject,
         ))?))
     );
@@ -3944,13 +4169,36 @@ fn work_message_request(
 }
 
 fn work_notification(step: &StepRunView) -> String {
+    let goals = if step.goals.is_empty() {
+        "Follow the step definition and publish its required graph products.".into()
+    } else {
+        step.goals
+            .iter()
+            .map(|goal| format!("- {goal}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let under = if step.under.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nGrouping: {}",
+            step.under
+                .iter()
+                .map(|grouping| match &grouping.reason {
+                    Some(reason) => format!("{} ({reason})", grouping.agent),
+                    None => grouping.agent.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     format!(
-        "A durable st3 plan step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goal. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoal: {2}",
+        "A durable st3 plan step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goals. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoals:\n{2}{3}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
-        step.goal
-            .as_deref()
-            .unwrap_or("Follow the step definition and publish its required graph products."),
+        goals,
+        under,
     )
 }
 
@@ -4575,7 +4823,8 @@ mod tests {
             attempt: 2,
             assignee: Some("agent/worker".into()),
             title: Some("Build the change".into()),
-            goal: Some("Implement and test the requested change.".into()),
+            goals: vec!["Implement and test the requested change.".into()],
+            under: Vec::new(),
             worker_reported: false,
             lease_owner: None,
             lease_incarnation: None,
@@ -4649,7 +4898,8 @@ mod tests {
             attempt: 1,
             assignee: Some(assignee.into()),
             title: None,
-            goal: None,
+            goals: Vec::new(),
+            under: Vec::new(),
             worker_reported: false,
             lease_owner: None,
             lease_incarnation: None,
@@ -4826,7 +5076,8 @@ mod tests {
                 "inspect" => "Inspect the package".into(),
                 _ => step.into(),
             }),
-            goal: None,
+            goals: Vec::new(),
+            under: Vec::new(),
             worker_reported: false,
             lease_owner: None,
             lease_incarnation: None,

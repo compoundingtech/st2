@@ -14,8 +14,9 @@ use crate::model::{
     ApplyResponse, Capability, ChangePolicy, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
     DesiredSubject, DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent,
     PlanOutputView, PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction,
-    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, WorkRequest,
+    PlanningCandidateView, PlanningPreviewView, PlanningSessionView, ReplicaBatch, ReplicaRange,
+    ReplicationBatch, ReplicationResponse, St3Error, StatusResponse, StepRunView, SubjectChange,
+    SubjectStatus, WorkRequest,
 };
 
 const SCHEMA: &str = r#"
@@ -156,7 +157,7 @@ CREATE TABLE IF NOT EXISTS step_runs (
     attempt INTEGER NOT NULL,
     assignee TEXT,
     title TEXT,
-    goal TEXT,
+    goals TEXT NOT NULL,
     worker_reported INTEGER NOT NULL DEFAULT 0,
     lease_owner TEXT,
     lease_incarnation TEXT,
@@ -170,7 +171,38 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
-PRAGMA user_version = 4;
+CREATE TABLE IF NOT EXISTS planning_sessions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    request_ref TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    requester TEXT NOT NULL,
+    planner TEXT NOT NULL,
+    status TEXT NOT NULL,
+    published_revision TEXT,
+    created_at_unix_ms TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS planning_candidates (
+    session_id TEXT NOT NULL REFERENCES planning_sessions(id),
+    revision INTEGER NOT NULL,
+    markdown_ref TEXT NOT NULL,
+    kdl_ref TEXT NOT NULL,
+    plan_revision TEXT NOT NULL,
+    submitted_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(session_id, revision)
+);
+CREATE TABLE IF NOT EXISTS planning_previews (
+    session_id TEXT PRIMARY KEY REFERENCES planning_sessions(id),
+    candidate_revision INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    store_index INTEGER NOT NULL,
+    graph TEXT NOT NULL,
+    diff TEXT NOT NULL,
+    plan_response TEXT NOT NULL,
+    created_at_unix_ms TEXT NOT NULL
+);
+PRAGMA user_version = 5;
 "#;
 
 pub struct Store {
@@ -193,11 +225,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 4,
+        table_count == 0 || version == 5,
         "this database uses an unsupported pre-plan st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 4,
+        version == 0 || version == 5,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -259,6 +291,286 @@ impl Store {
         body.map(|body| serde_json::from_str(&body))
             .transpose()
             .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_planning_session(
+        &self,
+        id: &str,
+        plan: &str,
+        request_ref: &str,
+        workspace: &str,
+        requester: &str,
+        planner: &str,
+    ) -> Result<PlanningSessionView, St3Error> {
+        let now = now_ms().to_string();
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?7)",
+                params![id, plan, request_ref, workspace, requester, planner, now],
+            )
+            .map_err(internal)?;
+        planning_session_view_tx(&connection, id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    "the planning session was not stored",
+                )
+            })
+    }
+
+    pub fn planning_session(&self, id: &str) -> Result<Option<PlanningSessionView>> {
+        let id = id.strip_prefix("planning-session/").unwrap_or(id);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        planning_session_view_tx(&connection, id)
+    }
+
+    pub fn add_planning_candidate(
+        &self,
+        id: &str,
+        actor: &str,
+        markdown_ref: &str,
+        kdl_ref: &str,
+        plan_revision: &str,
+    ) -> Result<PlanningSessionView, St3Error> {
+        let id = id.strip_prefix("planning-session/").unwrap_or(id);
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        let (planner, status): (String, String) = transaction
+            .query_row(
+                "SELECT planner, status FROM planning_sessions WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    format!("planning session `{id}` does not exist"),
+                )
+            })?;
+        if planner != normalize_actor(actor, "agent") {
+            return Err(St3Error::new(
+                "wrong-planner",
+                format!("`{actor}` does not own planning session `{id}`"),
+            ));
+        }
+        if !matches!(
+            status.as_str(),
+            "planning" | "revision-requested" | "review"
+        ) {
+            return Err(St3Error::new(
+                "planning-session-terminal",
+                format!("planning session `{id}` is {status}"),
+            ));
+        }
+        let current = transaction
+            .query_row(
+                "SELECT markdown_ref, kdl_ref, plan_revision FROM planning_candidates
+                 WHERE session_id=?1 ORDER BY revision DESC LIMIT 1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?;
+        if status == "review"
+            && current.as_ref().is_some_and(|(markdown, kdl, revision)| {
+                markdown == markdown_ref && kdl == kdl_ref && revision == plan_revision
+            })
+        {
+            transaction.commit().map_err(internal)?;
+            drop(connection);
+            return self.planning_session(id).map_err(internal)?.ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    "the planning session disappeared",
+                )
+            });
+        }
+        let revision: u32 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM planning_candidates WHERE session_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        let now = now_ms().to_string();
+        transaction
+            .execute(
+                "INSERT INTO planning_candidates(session_id, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, revision, markdown_ref, kdl_ref, plan_revision, now],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute("DELETE FROM planning_previews WHERE session_id=?1", [id])
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "UPDATE planning_sessions SET status='review', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, now],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        drop(connection);
+        self.planning_session(id).map_err(internal)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-planning-session",
+                "the planning session disappeared",
+            )
+        })
+    }
+
+    pub fn save_planning_preview(
+        &self,
+        id: &str,
+        candidate_revision: u32,
+        hash: &str,
+        graph: &str,
+        diff: &str,
+        plan: &PlanResponse,
+    ) -> Result<PlanningSessionView, St3Error> {
+        let id = id.strip_prefix("planning-session/").unwrap_or(id);
+        let now = now_ms().to_string();
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .execute(
+                "INSERT INTO planning_previews(session_id, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(session_id) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
+                   store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
+                   plan_response=excluded.plan_response, created_at_unix_ms=excluded.created_at_unix_ms",
+                params![
+                    id,
+                    candidate_revision,
+                    hash,
+                    plan.store_index,
+                    graph,
+                    diff,
+                    serde_json::to_string(plan).map_err(internal)?,
+                    now,
+                ],
+            )
+            .map_err(internal)?;
+        planning_session_view_tx(&connection, id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    format!("planning session `{id}` does not exist"),
+                )
+            })
+    }
+
+    pub fn request_planning_revision(
+        &self,
+        id: &str,
+        actor: &str,
+    ) -> Result<PlanningSessionView, St3Error> {
+        self.set_planning_status(id, actor, "revision-requested", None)
+    }
+
+    pub fn finish_planning_session(
+        &self,
+        id: &str,
+        actor: &str,
+        status: &str,
+        published_revision: Option<&str>,
+    ) -> Result<PlanningSessionView, St3Error> {
+        if !matches!(status, "approved" | "cancelled") {
+            return Err(St3Error::new(
+                "invalid-planning-status",
+                "invalid terminal planning status",
+            ));
+        }
+        self.set_planning_status(id, actor, status, published_revision)
+    }
+
+    fn set_planning_status(
+        &self,
+        id: &str,
+        actor: &str,
+        status: &str,
+        published_revision: Option<&str>,
+    ) -> Result<PlanningSessionView, St3Error> {
+        let id = id.strip_prefix("planning-session/").unwrap_or(id);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let (requester, current): (String, String) = connection
+            .query_row(
+                "SELECT requester, status FROM planning_sessions WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    format!("planning session `{id}` does not exist"),
+                )
+            })?;
+        if requester != normalize_actor(actor, "person") {
+            return Err(St3Error::new(
+                "planning-review-not-authorized",
+                format!("`{actor}` cannot review planning session `{id}`"),
+            ));
+        }
+        let transition_is_valid = match status {
+            "revision-requested" => current == "review",
+            "approved" => current == "review" || current == "approved",
+            "cancelled" => {
+                matches!(
+                    current.as_str(),
+                    "planning" | "review" | "revision-requested" | "cancelled"
+                )
+            }
+            _ => false,
+        };
+        if !transition_is_valid {
+            return Err(St3Error::new(
+                "invalid-planning-transition",
+                format!("planning session `{id}` cannot move from {current} to {status}"),
+            ));
+        }
+        if current == status {
+            return planning_session_view_tx(&connection, id)
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "missing-planning-session",
+                        "the planning session disappeared",
+                    )
+                });
+        }
+        connection
+            .execute(
+                "UPDATE planning_sessions SET status=?2, published_revision=?3, updated_at_unix_ms=?4 WHERE id=?1",
+                params![id, status, published_revision, now_ms().to_string()],
+            )
+            .map_err(internal)?;
+        if status == "revision-requested" {
+            connection
+                .execute("DELETE FROM planning_previews WHERE session_id=?1", [id])
+                .map_err(internal)?;
+        }
+        planning_session_view_tx(&connection, id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-planning-session",
+                    "the planning session disappeared",
+                )
+            })
     }
 
     pub fn create_plan_run(&self, request: &PlanRunRequest) -> Result<PlanRunView, St3Error> {
@@ -335,20 +647,23 @@ impl Store {
             ));
         }
         let mut variables = BTreeMap::from([
-            ("PLAN".into(), plan.id.clone()),
-            ("PLAN_REVISION".into(), plan.revision.clone()),
-            ("PLAN_RUN".into(), run_id.clone()),
-            ("REQUESTER".into(), requester.clone()),
-            ("ROOT_PLAN_RUN".into(), root_plan_run.clone()),
+            ("ST_PLAN".into(), plan.id.clone()),
+            ("ST_PLAN_REVISION".into(), plan.revision.clone()),
+            ("ST_PLAN_RUN".into(), run_id.clone()),
+            ("ST_REQUESTER".into(), requester.clone()),
+            ("ST_ROOT_PLAN_RUN".into(), root_plan_run.clone()),
+            ("ST_WORKSPACE".into(), request.workspace.clone()),
+            (
+                "ST_PARENT_STEP_RUN".into(),
+                parent_step_run.clone().unwrap_or_default(),
+            ),
         ]);
         let run_scope = plan
             .scope_template
             .as_deref()
             .map(|scope| crate::plan::interpolate(scope, &variables))
             .transpose()?;
-        if let Some(scope) = &run_scope {
-            variables.insert("RUN_SCOPE".into(), scope.clone());
-        }
+        variables.insert("ST_SCOPE".into(), run_scope.clone().unwrap_or_default());
         let now = now_ms();
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -379,12 +694,12 @@ impl Store {
                 .transpose()?;
             let step_subject = format!("step-run/{run_id}/{}", step.path);
             let mut step_variables = variables.clone();
-            step_variables.insert("STEP".into(), step.path.clone());
-            step_variables.insert("STEP_RUN".into(), step_subject.clone());
-            step_variables.insert("ATTEMPT".into(), "1".into());
-            step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+            step_variables.insert("ST_STEP".into(), step.path.clone());
+            step_variables.insert("ST_STEP_RUN".into(), step_subject.clone());
+            step_variables.insert("ST_ATTEMPT".into(), "1".into());
+            step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
-                "PARENT_STEP_RUN".into(),
+                "ST_PARENT_STEP_RUN".into(),
                 crate::plan::parent_step_path(&plan, &step.path)
                     .map(|path| format!("step-run/{run_id}/{path}"))
                     .or_else(|| parent_step_run.clone())
@@ -395,16 +710,12 @@ impl Store {
                 .as_deref()
                 .map(|value| crate::plan::interpolate(value, &step_variables))
                 .transpose()?;
-            let goal = step
-                .goal
-                .as_deref()
-                .map(|value| crate::plan::interpolate(value, &step_variables))
-                .transpose()?;
+            let goals = interpolate_goals(&step.goals, &step_variables)?;
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, created_at_unix_ms, updated_at_unix_ms)
+                    "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                    params![step_subject, run_id, step.path, step.definition_hash, assignee, title, goal, now.to_string()],
+                    params![step_subject, run_id, step.path, step.definition_hash, assignee, title, goals, now.to_string()],
                 )
                 .map_err(internal)?;
         }
@@ -475,7 +786,7 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         let current = transaction
             .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                         lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
                  FROM step_runs WHERE subject=?1",
                 [&subject],
@@ -570,7 +881,7 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let current = connection
             .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                         lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
                  FROM step_runs WHERE subject=?1",
                 [&subject],
@@ -790,12 +1101,12 @@ impl Store {
                 .transpose()?;
             let subject = format!("step-run/{run_id}/{}", step.path);
             let mut step_variables = variables.clone();
-            step_variables.insert("STEP".into(), step.path.clone());
-            step_variables.insert("STEP_RUN".into(), subject.clone());
-            step_variables.insert("ATTEMPT".into(), "1".into());
-            step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+            step_variables.insert("ST_STEP".into(), step.path.clone());
+            step_variables.insert("ST_STEP_RUN".into(), subject.clone());
+            step_variables.insert("ST_ATTEMPT".into(), "1".into());
+            step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
-                "PARENT_STEP_RUN".into(),
+                "ST_PARENT_STEP_RUN".into(),
                 crate::plan::parent_step_path(plan, &step.path)
                     .map(|path| format!("step-run/{run_id}/{path}"))
                     .or_else(|| current.parent_step_run.clone())
@@ -806,21 +1117,17 @@ impl Store {
                 .as_deref()
                 .map(|value| crate::plan::interpolate(value, &step_variables))
                 .transpose()?;
-            let goal = step
-                .goal
-                .as_deref()
-                .map(|value| crate::plan::interpolate(value, &step_variables))
-                .transpose()?;
+            let goals = interpolate_goals(&step.goals, &step_variables)?;
             if reset.contains(&step.path) {
                 transaction
                     .execute(
-                        "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported, created_at_unix_ms, updated_at_unix_ms)
+                        "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, created_at_unix_ms, updated_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, 0, ?8, ?8)
                          ON CONFLICT(subject) DO UPDATE SET definition_hash=excluded.definition_hash, status='pending', attempt=1,
-                           assignee=excluded.assignee, title=excluded.title, goal=excluded.goal, worker_reported=0,
+                           assignee=excluded.assignee, title=excluded.title, goals=excluded.goals, worker_reported=0,
                            lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                            blocked_reason=?9, not_before_unix_ms=NULL, activated_at_unix_ms=NULL, updated_at_unix_ms=?8",
-                        params![subject, run_id, step.path, step.definition_hash, assignee, title, goal, now.to_string(), reason],
+                        params![subject, run_id, step.path, step.definition_hash, assignee, title, goals, now.to_string(), reason],
                     )
                     .map_err(internal)?;
             }
@@ -888,7 +1195,7 @@ impl Store {
         let assignee = assignee.map(|value| normalize_actor(value, "agent"));
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
              FROM step_runs
              WHERE (?1 IS NULL OR assignee=?1)
@@ -904,7 +1211,7 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                         lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
                  FROM step_runs WHERE subject=?1",
                 [subject],
@@ -943,7 +1250,7 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         let current = transaction
             .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                         lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
                  FROM step_runs WHERE subject=?1",
                 [&subject],
@@ -1066,7 +1373,7 @@ impl Store {
         )
         .map_err(internal)?;
         let view = transaction.query_row(
-            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
              FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
         transaction
@@ -1304,6 +1611,21 @@ impl Store {
                 .map_err(internal)
         };
         for desired in intent.subjects.values() {
+            if desired.kind == "agent" {
+                for grouping in crate::graph::agent_under(&desired.desired) {
+                    if grouping.agent == desired.subject {
+                        warnings.push(format!(
+                            "agent `{}` is grouped under itself",
+                            desired.subject
+                        ));
+                    } else if !known(&grouping.agent)? {
+                        warnings.push(format!(
+                            "agent `{}` is grouped under missing agent `{}`",
+                            desired.subject, grouping.agent
+                        ));
+                    }
+                }
+            }
             if desired.kind == "link"
                 && let Some(link) = crate::graph::link_spec(&desired.desired)
             {
@@ -1348,14 +1670,44 @@ impl Store {
                 }
             }
         }
+        let grouping_edges = intent
+            .subjects
+            .values()
+            .filter(|desired| desired.kind == "agent")
+            .map(|desired| {
+                (
+                    desired.subject.clone(),
+                    crate::graph::agent_under(&desired.desired)
+                        .into_iter()
+                        .map(|under| under.agent)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for start in grouping_edges.keys() {
+            let mut frontier = vec![start.as_str()];
+            let mut visited = BTreeSet::new();
+            while let Some(agent) = frontier.pop() {
+                if !visited.insert(agent) {
+                    continue;
+                }
+                for parent in grouping_edges.get(agent).into_iter().flatten() {
+                    if parent == start && agent != start {
+                        warnings.push(format!("agent grouping for `{start}` contains a cycle"));
+                    } else if grouping_edges.contains_key(parent) {
+                        frontier.push(parent);
+                    }
+                }
+            }
+        }
         for checkpoint in &intent.checkpoints {
-            for judge in &checkpoint.judges {
-                let subject = match judge {
-                    crate::model::JudgeSpec::Exists { subject }
-                    | crate::model::JudgeSpec::Empty { subject }
-                    | crate::model::JudgeSpec::Field { subject, .. }
-                    | crate::model::JudgeSpec::Has { subject, .. }
-                    | crate::model::JudgeSpec::Lacks { subject, .. } => Some(subject.as_str()),
+            for gate in &checkpoint.gates {
+                let subject = match gate {
+                    crate::model::GateSpec::Exists { subject, .. }
+                    | crate::model::GateSpec::Empty { subject, .. }
+                    | crate::model::GateSpec::Field { subject, .. }
+                    | crate::model::GateSpec::Has { subject, .. }
+                    | crate::model::GateSpec::Lacks { subject, .. } => Some(subject.as_str()),
                     _ => None,
                 };
                 if let Some(subject) = subject
@@ -2071,15 +2423,20 @@ impl Store {
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                 });
+            let desired_value = desired
+                .as_ref()
+                .map(|row| serde_json::from_str(&row.body))
+                .transpose()?;
+            let under = desired_value
+                .as_ref()
+                .map(crate::graph::agent_under)
+                .unwrap_or_default();
             subjects.push(SubjectStatus {
                 subject,
                 kind,
                 desired_token: desired.as_ref().map(|row| row.claim_id.clone()),
                 desired_revision: desired.as_ref().map(|row| row.revision.clone()),
-                desired: desired
-                    .as_ref()
-                    .map(|row| serde_json::from_str(&row.body))
-                    .transpose()?,
+                desired: desired_value,
                 actual,
                 conflicts,
                 claims,
@@ -2087,6 +2444,7 @@ impl Store {
                 gap,
                 reachability,
                 reason,
+                under,
             });
         }
         Ok(StatusResponse {
@@ -3042,7 +3400,7 @@ fn validate_claim_fields(input: &ClaimInput) -> Result<(), St3Error> {
         }
         "account.quota" => enum_field("quota", &["available", "limited", "exhausted", "unknown"])?,
         "eval.verdict" => enum_field("verdict", &["pass", "fail", "void"])?,
-        "judgement.result" | "judge.result" => enum_field("verdict", &["pass", "fail"])?,
+        "gate.result" => enum_field("verdict", &["pass", "fail"])?,
         "presence.observed" => enum_field("presence", &["available", "busy", "dnd", "offline"])?,
         "reachability.changed" => enum_field(
             "reachability",
@@ -3077,7 +3435,7 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "daemon.started",
         "deadline.reached",
         "eval.verdict",
-        "gate.observed",
+        "terminal-control.observed",
         "harness.activity",
         "harness.cleared",
         "harness.compacted",
@@ -3086,9 +3444,8 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "harness.ready",
         "harness.turn-usage",
         "harness.work-started",
-        "judge.result",
-        "judgement.result",
-        "judgement.requested",
+        "gate.result",
+        "gate.requested",
         "member.observed",
         "member.launch",
         "member.restart-reset",
@@ -3099,7 +3456,14 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "plan-run.created",
         "plan-run.revised",
         "plan-run.state",
+        "plan.documents",
         "plan.published",
+        "planning-session.approved",
+        "planning-session.cancelled",
+        "planning-session.candidate-submitted",
+        "planning-session.previewed",
+        "planning-session.revision-requested",
+        "planning-session.started",
         "presence.observed",
         "pid.observed",
         "reachability.changed",
@@ -3884,12 +4248,12 @@ fn project_plan_run_created(
             .transpose()?;
         let subject = format!("step-run/{run_id}/{}", step.path);
         let mut step_variables = variables.clone();
-        step_variables.insert("STEP".into(), step.path.clone());
-        step_variables.insert("STEP_RUN".into(), subject.clone());
-        step_variables.insert("ATTEMPT".into(), "1".into());
-        step_variables.insert("ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+        step_variables.insert("ST_STEP".into(), step.path.clone());
+        step_variables.insert("ST_STEP_RUN".into(), subject.clone());
+        step_variables.insert("ST_ATTEMPT".into(), "1".into());
+        step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
         step_variables.insert(
-            "PARENT_STEP_RUN".into(),
+            "ST_PARENT_STEP_RUN".into(),
             crate::plan::parent_step_path(&plan, &step.path)
                 .map(|path| format!("step-run/{run_id}/{path}"))
                 .or_else(|| parent_step_run.map(str::to_owned))
@@ -3900,16 +4264,12 @@ fn project_plan_run_created(
             .as_deref()
             .map(|value| crate::plan::interpolate(value, &step_variables))
             .transpose()?;
-        let goal = step
-            .goal
-            .as_deref()
-            .map(|value| crate::plan::interpolate(value, &step_variables))
-            .transpose()?;
+        let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
             .execute(
-                "INSERT OR IGNORE INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT OR IGNORE INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                params![subject, run_id, step.path, step.definition_hash, assignee, title, goal, claim.accepted_at_unix_ms.to_string()],
+                params![subject, run_id, step.path, step.definition_hash, assignee, title, goals, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
     }
@@ -4104,13 +4464,13 @@ fn project_plan_revision(
         let subject = format!("step-run/{run_id}/{}", step.path);
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, 0, ?8, ?8)
                  ON CONFLICT(subject) DO UPDATE SET definition_hash=excluded.definition_hash, status='pending', attempt=1,
-                   assignee=excluded.assignee, title=excluded.title, goal=excluded.goal, worker_reported=0,
+                   assignee=excluded.assignee, title=excluded.title, goals=excluded.goals, worker_reported=0,
                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
                    blocked_reason=?9, not_before_unix_ms=NULL, activated_at_unix_ms=NULL, updated_at_unix_ms=?8",
-                params![subject, run_id, step.path, step.definition_hash, assignee, step.title, step.goal, now.to_string(), reason],
+                params![subject, run_id, step.path, step.definition_hash, assignee, step.title, interpolate_goals(&step.goals, &variables)?, now.to_string(), reason],
             )
             .map_err(internal)?;
     }
@@ -4309,23 +4669,31 @@ fn flatten_steps<'a>(
 pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
-            "PLAN".into(),
+            "ST_PLAN".into(),
             run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
         ),
-        ("PLAN_REVISION".into(), revision.into()),
-        ("PLAN_RUN".into(), run.id.clone()),
+        ("ST_PLAN_REVISION".into(), revision.into()),
+        ("ST_PLAN_RUN".into(), run.id.clone()),
+        ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
+        ("ST_WORKSPACE".into(), run.workspace.clone()),
+        ("ST_REQUESTER".into(), run.requester.clone()),
         (
-            "RUN_SCOPE".into(),
-            run.run_scope.clone().unwrap_or_default(),
-        ),
-        ("WORKSPACE".into(), run.workspace.clone()),
-        ("REQUESTER".into(), run.requester.clone()),
-        (
-            "PARENT_STEP_RUN".into(),
+            "ST_PARENT_STEP_RUN".into(),
             run.parent_step_run.clone().unwrap_or_default(),
         ),
-        ("ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
+        ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
     ])
+}
+
+fn interpolate_goals(
+    goals: &[String],
+    variables: &BTreeMap<String, String>,
+) -> Result<String, St3Error> {
+    let goals = goals
+        .iter()
+        .map(|goal| crate::plan::interpolate(goal, variables))
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_string(&goals).map_err(internal)
 }
 
 pub(crate) fn authorize_plan_revision(
@@ -4459,7 +4827,8 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         attempt: row.get::<_, u32>(5)?,
         assignee: row.get(6)?,
         title: row.get(7)?,
-        goal: row.get(8)?,
+        goals: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+        under: Vec::new(),
         worker_reported: row.get::<_, bool>(9)?,
         lease_owner: row.get(10)?,
         lease_incarnation: row.get(11)?,
@@ -4469,6 +4838,119 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
     })
+}
+
+fn planning_session_view_tx(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<PlanningSessionView>> {
+    let row = connection
+        .query_row(
+            "SELECT plan_id, request_ref, workspace, requester, planner, status, published_revision,
+                    created_at_unix_ms, updated_at_unix_ms
+             FROM planning_sessions WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        plan,
+        request_ref,
+        workspace,
+        requester,
+        planner,
+        status,
+        published_revision,
+        created,
+        updated,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let candidate = connection
+        .query_row(
+            "SELECT revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms
+             FROM planning_candidates WHERE session_id=?1 ORDER BY revision DESC LIMIT 1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(revision, markdown, kdl, plan_revision, submitted)| {
+            Ok::<_, anyhow::Error>(PlanningCandidateView {
+                revision,
+                markdown,
+                kdl,
+                plan: format!("plan/{plan}"),
+                plan_revision,
+                submitted_at_unix_ms: submitted.parse().unwrap_or(0),
+            })
+        })
+        .transpose()?;
+    let preview = connection
+        .query_row(
+            "SELECT candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms
+             FROM planning_previews WHERE session_id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(candidate_revision, hash, store_index, graph, diff, response, created)| {
+            Ok::<_, anyhow::Error>(PlanningPreviewView {
+                hash,
+                candidate_revision,
+                store_index,
+                graph,
+                diff,
+                plan: serde_json::from_str(&response)?,
+                created_at_unix_ms: created.parse().unwrap_or(0),
+            })
+        })
+        .transpose()?;
+    Ok(Some(PlanningSessionView {
+        subject: format!("planning-session/{id}"),
+        id: id.to_owned(),
+        plan,
+        request: request_ref,
+        workspace,
+        requester,
+        planner,
+        status,
+        candidate,
+        preview,
+        published_revision,
+        created_at_unix_ms: created.parse().unwrap_or(0),
+        updated_at_unix_ms: updated.parse().unwrap_or(0),
+    }))
 }
 
 fn plan_output_authority(
@@ -4565,7 +5047,7 @@ fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<P
         },
     )?;
     let mut statement = connection.prepare(
-        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goal, worker_reported,
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                 lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
          FROM step_runs WHERE run_id=?1 ORDER BY created_at_unix_ms, step_path",
     )?;
@@ -4787,7 +5269,7 @@ mod tests {
     fn replication_carries_runnable_plan_definitions() {
         let source = Store::open_memory("source").unwrap();
         let kdl = r#"version 2
-subgraph { plan "remote" state="ready" { step "work" { } } }"#;
+subgraph { plan "remote" state="ready" { goal "Run remote work."; step "work" { } } }"#;
         let intent = parse_intent(kdl, "source").unwrap();
         let planned = source
             .plan(
@@ -4828,6 +5310,7 @@ subgraph { plan "remote" state="ready" { step "work" { } } }"#;
 version 2
 subgraph {
   plan "remote-work" state="ready" {
+    goal "Complete plan remote-work."
     step "work" { assigned-to "agent/worker.one" }
   }
 }
@@ -5234,6 +5717,7 @@ subgraph {
 version 2
 subgraph {
   plan "lease" state="ready" {
+    goal "Complete plan lease."
     step "work" { assigned-to "agent/worker" }
   }
 }
@@ -5335,10 +5819,11 @@ subgraph {
             r#"version 2
 subgraph {
   plan "bootstrap" state="ready" {
+    goal "Complete plan bootstrap."
     step "compile" {
       assigned-to "agent/planner"
       produces-plan "project/work"
-      plan "work" { step "publish" { } }
+      plan "work" { goal "Complete plan work."; step "publish" { } }
     }
   }
 }"#,
@@ -5346,7 +5831,7 @@ subgraph {
         );
         publish(
             r#"version 2
-subgraph { plan "project/work" state="ready" { step "work" { } } }"#,
+subgraph { plan "project/work" state="ready" { goal "Run project work."; step "work" { } } }"#,
             "nested-output-plan",
         );
         let plan = store.plan_spec("project/work", None).unwrap().unwrap();
@@ -5433,7 +5918,7 @@ subgraph { plan "project/work" state="ready" { step "work" { } } }"#,
         };
         publish(
             r#"version 2
-subgraph { plan "retry" state="ready" { step "work" { } } }"#,
+subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } } }"#,
             "retry-plan",
         );
         let run = store
@@ -5479,6 +5964,7 @@ subgraph { plan "retry" state="ready" { step "work" { } } }"#,
 version 2
 subgraph {
   plan "revision" state="ready" {
+    goal "Complete plan revision."
     step "owned" { assigned-to "agent/worker"; goal "First goal." }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
@@ -5507,6 +5993,7 @@ subgraph {
 version 2
 subgraph {
   plan "revision" state="ready" {
+    goal "Complete plan revision."
     step "owned" { assigned-to "agent/worker"; goal "A corrected goal." }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }

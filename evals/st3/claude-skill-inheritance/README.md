@@ -4,7 +4,7 @@ This eval tests project and plugin skill loading in one native Claude Sonnet sea
 
 The graph stores skill discovery, both invocations, effect verification, and the final message receipt.
 
-Each skill owns a secret token that the task and plan do not reveal. Held-out judges verify both effects.
+Each skill owns a secret token that the task and plan do not reveal. Held-out gates verify both effects.
 
 Start the st3 daemon. Then run `st3 eval ./evals/st3/claude-skill-inheritance`.
 

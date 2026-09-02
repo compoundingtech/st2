@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PLAN_RUN:?PLAN_RUN must identify the judged plan run}"
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 work="$(env -u ST_AGENT st3 work ls --all --json)"
-run="plan-run/$PLAN_RUN"
+run="plan-run/$ST_PLAN_RUN"
 
 completed_steps=(
   start-worker
@@ -22,7 +22,7 @@ for step in "${completed_steps[@]}"; do
   test "$count" -eq 1
 done
 
-subject="resource/plan-run/$PLAN_RUN/skill-report"
+subject="resource/plan-run/$ST_PLAN_RUN/skill-report"
 status="$(st3 inspect "$subject" --json)"
 jq -e '
   .status.subjects[0].actual | (.fields // .)

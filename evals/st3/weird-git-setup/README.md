@@ -4,7 +4,7 @@ This eval materializes a linked Git worktree before it starts one Codex worker.
 
 The graph stores checkout discovery, failure reproduction, repair, verification, revision, and report state.
 
-The held-out judges require a feature commit and reject changes to `main` or its sibling worktree.
+The held-out gates require a feature commit and reject changes to `main` or its sibling worktree.
 
 Start the st3 daemon. Then run `st3 eval ./evals/st3/weird-git-setup --graph` from an interactive terminal.
 

@@ -41,7 +41,7 @@ Do not rename `AbortSignal`, `controller.signal`, signal cancellation options, `
 
 Integrate each published lane from `origin/main`. Keep the worktree clean.
 
-The final report must go to `local.morgan` after every held-out judge passes. Send exactly one final report.
+The final report must go to `local.morgan` after every held-out gate passes. Send exactly one final report.
 
 ## Boot ritual
 

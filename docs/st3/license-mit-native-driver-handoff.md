@@ -1,5 +1,7 @@
 # `license-mit` native-driver design
 
+Status: historical st2-to-st3 migration handoff. This document uses the vocabulary of the source st2 eval. It is not the current st3 KDL specification.
+
 The authoritative st2 eval is `evals/st2/license-mit` in this repository. The st2 repository owner maintains this eval.
 
 The eval was copied on 2026-08-26 from `compoundingtech/evals` commit

@@ -1,13 +1,14 @@
 version 2
 
 subgraph {
-  scope "eval/plan-document-lift/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/plan-document-lift/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/plan-document-lift" state="ready" {
+      goal "Complete plan eval/plan-document-lift."
       step "start-planner" timeout="10m" {
         title "The native Codex planner is ready"
         subgraph {
           agent "pdl.agent" {
-            workspace "${WORKSPACE}/repo"
+            workspace "${ST_WORKSPACE}/repo"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -15,7 +16,7 @@ subgraph {
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
+            env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
           }
         }
       }
@@ -28,6 +29,7 @@ subgraph {
         depends-on { step "start-planner" completed }
         produces-plan "eval/plan-document-lift/work"
         plan "work" {
+          goal "Complete plan work."
           step "read-exact-plan-document" {
             title "The exact immutable plan document is loaded"
             goal "Run st3 doc get doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 --output SOURCE-PLAN.md. Verify its SHA-256 and read it. Do not inspect inventory.json or create RESULT.md."
@@ -39,7 +41,7 @@ subgraph {
           }
           step "publish-ready-graph-plan" {
             title "The generated ready plan revision is bound to this attempt"
-            goal "Run st3 work publish-plan ${PARENT_STEP_RUN} lifted-plan.kdl. Record the printed exact plan revision. Do not inspect inventory.json or create RESULT.md."
+            goal "Run st3 work publish-plan ${ST_PARENT_STEP_RUN} lifted-plan.kdl. Record the printed exact plan revision. Do not inspect inventory.json or create RESULT.md."
             depends-on { step "author-complete-graph-plan" completed }
           }
         }
@@ -53,25 +55,23 @@ subgraph {
         uses-plan output-of="lift-plan-document"
       }
 
-      step "held-out-judges" timeout="10m" {
-        title "All plan-document lifting judges pass"
+      step "held-out-gates" timeout="10m" {
+        title "All plan-document lifting gates pass"
         depends-on { step "execute-lifted-plan" completed }
-        judges {
-          judge "the exact pre-published document bytes were used" {
-            exec "set -eu; tmp=$(mktemp); st3 doc get doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 --output \"$tmp\" >/dev/null; cmp repo/PLAN.md \"$tmp\"; rm -f \"$tmp\""
-            host "local"
-            workspace "${WORKSPACE}"
-            time-limit "120000ms"
-          }
-          judge "the generated project result is correct" { exec "cd repo && bash verify.sh"; host "local"; workspace "${WORKSPACE}"; time-limit "120000ms" }
-          judge "the produced plan revision, child run, transitions, and product are exact" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
+        gate "the exact pre-published document bytes were used" {
+          exec "set -eu; tmp=$(mktemp); st3 doc get doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636 --output \"$tmp\" >/dev/null; cmp repo/PLAN.md \"$tmp\"; rm -f \"$tmp\""
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          time-limit "120000ms"
         }
+        gate "the generated project result is correct" { exec "cd repo && bash verify.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+        gate "the produced plan revision, child run, transitions, and product are exact" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
-        subgraph { scope "eval/plan-document-lift/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/plan-document-lift/${PLAN_RUN}" }
+        subgraph { scope "eval/plan-document-lift/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/plan-document-lift/${ST_PLAN_RUN}" }
       }
     }
   }

@@ -1,28 +1,27 @@
 version 2
 
 subgraph {
-  scope "eval/signal-rename-codex/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/signal-rename-codex/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/signal-rename-codex" state="ready" {
+      goal "Complete plan eval/signal-rename-codex."
       step "materialize" timeout="30m" {
         title "The isolated workspace exists"
         subgraph {
-          exec "eval/signal-rename-codex/materialize/${PLAN_RUN}" {
+          exec "eval/signal-rename-codex/materialize/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}"
-            cwd "${WORKSPACE}"
+            workspace "${ST_WORKSPACE}"
+            cwd "${ST_WORKSPACE}"
             command "bash ./materialize.sh"
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
         }
-        judges {
-          field "status" "exec/eval/signal-rename-codex/materialize/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/signal-rename-codex/materialize/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/signal-rename-codex/materialize/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/signal-rename-codex/materialize/${ST_PLAN_RUN}" "is" 0 }
       }
 
       step "start-team" timeout="10m" {
@@ -30,7 +29,7 @@ subgraph {
         depends-on { step "materialize" completed }
         subgraph {
           agent "sig.sup" {
-            workspace "${WORKSPACE}/sup"
+            workspace "${ST_WORKSPACE}/sup"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -39,14 +38,13 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
           agent "sig.base" {
-            workspace "${WORKSPACE}/base"
+            workspace "${ST_WORKSPACE}/base"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -55,14 +53,13 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
           agent "sig.relay" {
-            workspace "${WORKSPACE}/relay"
+            workspace "${ST_WORKSPACE}/relay"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -71,14 +68,13 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
           agent "sig.hub" {
-            workspace "${WORKSPACE}/hub"
+            workspace "${ST_WORKSPACE}/hub"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -87,10 +83,9 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
         }
@@ -103,6 +98,7 @@ subgraph {
         depends-on { step "start-team" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "inspect-product-surface" {
             title "Classify every base product identifier"
             goal "Inspect the base package, CLI, protocol, tests, and documentation. Separate product identifiers from unrelated runtime primitives."
@@ -119,10 +115,10 @@ subgraph {
           }
           step "publish-base-compatibility" {
             title "The base compatibility revision is published"
-            goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/base-compatibility resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-compatibility resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-base-compatibility" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/base-compatibility" {
+              resource "plan-run/${ST_PLAN_RUN}/base-compatibility" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -138,6 +134,7 @@ subgraph {
         depends-on { step "open-base-compatibility" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "sync-base-compatibility" {
             title "The relay clone contains the base compatibility revision"
             goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the relay."
@@ -159,10 +156,10 @@ subgraph {
           }
           step "publish-relay-revision" {
             title "The relay revision is published"
-            goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/relay-revision resource.binding --actor agent/sig.relay --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/relay-revision resource.binding --actor agent/sig.relay --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-relay" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/relay-revision" {
+              resource "plan-run/${ST_PLAN_RUN}/relay-revision" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -178,6 +175,7 @@ subgraph {
         depends-on { step "open-base-compatibility" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "sync-base-compatibility" {
             title "The hub clone contains the base compatibility revision"
             goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the hub."
@@ -199,10 +197,10 @@ subgraph {
           }
           step "publish-hub-revision" {
             title "The hub revision is published"
-            goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/hub-revision resource.binding --actor agent/sig.hub --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/hub-revision resource.binding --actor agent/sig.hub --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-hub" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/hub-revision" {
+              resource "plan-run/${ST_PLAN_RUN}/hub-revision" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -221,6 +219,7 @@ subgraph {
         }
 
         plan "work" {
+          goal "Complete plan work."
           step "sync-consumer-revisions" {
             title "The supervisor clone contains both consumer revisions"
             goal "Fetch and integrate origin/main. Confirm that the relay and hub revision resources match changes present in the clone."
@@ -232,10 +231,10 @@ subgraph {
           }
           step "publish-config-revision" {
             title "The root and config revision is published"
-            goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/config-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/config-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "rename-root-and-config" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/config-revision" {
+              resource "plan-run/${ST_PLAN_RUN}/config-revision" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -251,6 +250,7 @@ subgraph {
         depends-on { step "update-root-and-config" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "sync-complete-consumer-cutover" {
             title "The base clone contains every consumer and config revision"
             goal "Fetch and integrate origin/main. Confirm that the relay, hub, root, and config all use Beacon before removing compatibility."
@@ -267,10 +267,10 @@ subgraph {
           }
           step "publish-final-base-revision" {
             title "The alias-free base revision is published"
-            goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/base-final-revision resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-final-revision resource.binding --actor agent/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "test-final-base" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/base-final-revision" {
+              resource "plan-run/${ST_PLAN_RUN}/base-final-revision" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -286,6 +286,7 @@ subgraph {
         depends-on { step "close-base-compatibility" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "sync-final-origin" {
             title "The supervisor clone matches final origin/main"
             goal "Fetch and fast-forward to the final base revision. Confirm that all four published revision resources are represented in history."
@@ -302,10 +303,10 @@ subgraph {
           }
           step "publish-integrated-revision" {
             title "The integrated revision is published"
-            goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/integrated-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+            goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/integrated-revision resource.binding --actor agent/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
             depends-on { step "verify-clean-product-cutover" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/integrated-revision" {
+              resource "plan-run/${ST_PLAN_RUN}/integrated-revision" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -314,75 +315,74 @@ subgraph {
         }
       }
 
-      step "held-out-judges" timeout="30m" {
-        title "All held-out judges pass on the integrated revision"
+      step "held-out-gates" timeout="30m" {
+        title "All held-out gates pass on the integrated revision"
         depends-on { step "integrate-and-verify" completed }
-        judges {
-          judge "ISOLATION — every commit stayed in its author's package lane" {
-            exec "bash ./judges/isolation.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "30m"
-          }
-          judge "SUITE GREEN — node --test passes in every package" {
-            exec "bash ./judges/suite-green.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "30m"
-          }
-          judge "RENAME — the product is fully renamed to Beacon" {
-            exec "bash ./judges/rename.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "30m"
-          }
-          judge "PRIMITIVE INTACT — runtime signal primitives remain unchanged" {
-            exec "bash ./judges/primitive.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "30m"
-          }
-          judge "HELD-OUT E2E — the renamed stack resolves end to end" {
-            exec "bash ./judges/e2e.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "30m"
-          }
-          judge "the graph proves the sequence and integrated result" type="llm" {
-            model "gpt-5.6-sol"
-            host "local"
-            workspace "${WORKSPACE}"
-            tools "shell" "git"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            token-budget 98304
-            time-limit "3m"
-            prompt "Run exactly one evidence command before judgement: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the plan claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
-          }
+        gate "ISOLATION — every commit stayed in its author's package lane" {
+          exec "bash ./judges/isolation.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "30m"
+        }
+        gate "SUITE GREEN — node --test passes in every package" {
+          exec "bash ./judges/suite-green.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "30m"
+        }
+        gate "RENAME — the product is fully renamed to Beacon" {
+          exec "bash ./judges/rename.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "30m"
+        }
+        gate "PRIMITIVE INTACT — runtime signal primitives remain unchanged" {
+          exec "bash ./judges/primitive.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "30m"
+        }
+        gate "HELD-OUT E2E — the renamed stack resolves end to end" {
+          exec "bash ./judges/e2e.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "30m"
+        }
+        gate "the graph proves the sequence and integrated result" type="llm" {
+          model "gpt-5.6-sol"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          tools "shell" "git"
+
+          token-budget 98304
+          time-limit "3m"
+          prompt "Run exactly one evidence command before gate result: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the plan claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
         }
       }
 
       step "publish-final-report" timeout="10m" {
         title "The supervisor publishes one final report"
-        goal "Send local.morgan exactly one final message after every held-out judge passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
+        goal "Send local.morgan exactly one final message after every held-out gate passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
         assigned-to "agent/sig.sup"
-        depends-on { step "held-out-judges" completed }
+        depends-on { step "held-out-gates" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "send-final-report" {
             title "Morgan receives the final result"
-            goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=plan-run:$PLAN_RUN -m=\"Plan $PLAN_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
+            goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=plan-run:$ST_PLAN_RUN -m=\"Plan $ST_PLAN_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
           }
           step "publish-report-receipt" {
             title "The final report receipt is published"
-            goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$PLAN_RUN/final-report resource.binding --actor agent/sig.sup --field kind=coordination.report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
+            goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.binding --actor agent/sig.sup --field kind=coordination.report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
             depends-on { step "send-final-report" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/final-report" {
+              resource "plan-run/${ST_PLAN_RUN}/final-report" {
                 kind "coordination.report"
                 state "published"
                 recipient "agent/local.morgan"
@@ -391,23 +391,21 @@ subgraph {
           }
         }
 
-        judges {
-          judge "Morgan received exactly one final supervisor report" {
-            exec "bash ./judges/final-report.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
+        gate "Morgan received exactly one final supervisor report" {
+          exec "bash ./judges/final-report.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+
+          time-limit "2m"
         }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
         subgraph {
-          scope "eval/signal-rename-codex/${PLAN_RUN}" { stop }
+          scope "eval/signal-rename-codex/${ST_PLAN_RUN}" { stop }
         }
-        judges { empty "scope/eval/signal-rename-codex/${PLAN_RUN}" }
+        gate "condition" { empty "scope/eval/signal-rename-codex/${ST_PLAN_RUN}" }
       }
     }
   }

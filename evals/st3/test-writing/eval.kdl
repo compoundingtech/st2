@@ -1,13 +1,14 @@
 version 2
 
 subgraph {
-  scope "eval/test-writing/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/test-writing/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/test-writing" state="ready" {
+      goal "Complete plan eval/test-writing."
       step "start-team" timeout="10m" {
         title "The native Codex test team is ready"
         subgraph {
           agent "tw.sup" {
-            workspace "${WORKSPACE}/sup"
+            workspace "${ST_WORKSPACE}/sup"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -16,14 +17,13 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
           agent "tw.dev" {
-            workspace "${WORKSPACE}/worker"
+            workspace "${ST_WORKSPACE}/worker"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -32,10 +32,9 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
         }
@@ -47,15 +46,16 @@ subgraph {
         assigned-to "agent/tw.sup"
         depends-on { step "start-team" completed }
         plan "work" {
+          goal "Complete plan work."
           step "inspect-module-read-only" {
             title "The exported behavior and error paths are understood"
             goal "Read ../worker/src/grades.js and ../worker/README.md without edits. Identify exact values, every cutoff, both range edges, summary calculations, empty input, and invalid inputs."
           }
           step "send-test-brief" {
             title "The developer receives one complete test brief"
-            goal "Send agent/tw.dev exactly one Small Talk message. Require tests for exact values, boundaries, range edges, aggregation, empty input, and error paths. State that src must not change. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/test-brief resource.binding --actor agent/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send agent/tw.dev exactly one Small Talk message. Require tests for exact values, boundaries, range edges, aggregation, empty input, and error paths. State that src must not change. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-brief resource.binding --actor agent/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "inspect-module-read-only" completed }
-            produces { resource "plan-run/${PLAN_RUN}/test-brief" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/test-brief" { kind "message.receipt"; state "published" } }
           }
         }
       }
@@ -66,6 +66,7 @@ subgraph {
         assigned-to "agent/tw.dev"
         depends-on { step "prepare-test-brief" completed }
         plan "work" {
+          goal "Complete plan work."
           step "read-test-brief" {
             title "The supervisor test contract is understood"
             goal "Drain and archive the supervisor brief. Inspect src/grades.js and README.md. Do not edit src."
@@ -87,15 +88,15 @@ subgraph {
           }
           step "publish-test-revision" {
             title "The test revision is published"
-            goal "Commit the test-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/test-revision resource.binding --actor agent/tw.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+            goal "Commit the test-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-revision resource.binding --actor agent/tw.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
             depends-on { step "run-complete-suite" completed }
-            produces { resource "plan-run/${PLAN_RUN}/test-revision" { kind "vcs.revision"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/test-revision" { kind "vcs.revision"; state "published" } }
           }
           step "report-test-result" {
             title "The supervisor receives the committed test result"
-            goal "Send agent/tw.sup exactly one Small Talk message. Include the revision, test count, covered behavior, green command, and unchanged src evidence. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/developer-report resource.binding --actor agent/tw.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send agent/tw.sup exactly one Small Talk message. Include the revision, test count, covered behavior, green command, and unchanged src evidence. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/developer-report resource.binding --actor agent/tw.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "publish-test-revision" completed }
-            produces { resource "plan-run/${PLAN_RUN}/developer-report" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/developer-report" { kind "message.receipt"; state "published" } }
           }
         }
       }
@@ -106,6 +107,7 @@ subgraph {
         assigned-to "agent/tw.sup"
         depends-on { step "write-regression-suite" completed }
         plan "work" {
+          goal "Complete plan work."
           step "read-developer-report" {
             title "The developer report is understood"
             goal "Drain and archive the one developer report. Record its revision, test count, coverage summary, and commands."
@@ -117,28 +119,26 @@ subgraph {
           }
           step "confirm-requester" {
             title "The requester receives one verified assessment"
-            goal "Send person/eval-requester exactly one Small Talk message. Include the revision, test count, coverage summary, green command, unchanged src result, and your assessment. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/final-assessment resource.binding --actor agent/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send person/eval-requester exactly one Small Talk message. Include the revision, test count, coverage summary, green command, unchanged src result, and your assessment. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-assessment resource.binding --actor agent/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "verify-read-only" completed }
-            produces { resource "plan-run/${PLAN_RUN}/final-assessment" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/final-assessment" { kind "message.receipt"; state "published" } }
           }
         }
       }
 
-      step "held-out-judges" timeout="10m" {
-        title "All Test Writing judges pass"
+      step "held-out-gates" timeout="10m" {
+        title "All Test Writing gates pass"
         depends-on { step "verify-test-suite" completed }
-        judges {
-          judge "only the developer authored work and src stayed unchanged" { exec "WORKER_ID=tw.dev bash ./judges/isolation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "a real test suite was added and is green" { exec "bash ./judges/tests-added-green.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the suite kills at least ten of twelve planted mutants" { exec "bash ./judges/mutation-score.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "300000ms" }
-          judge "the graph records the brief, test work, revision, reports, and verification" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
-        }
+        gate "only the developer authored work and src stayed unchanged" { exec "WORKER_ID=tw.dev bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "a real test suite was added and is green" { exec "bash ./judges/tests-added-green.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the suite kills at least ten of twelve planted mutants" { exec "bash ./judges/mutation-score.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "300000ms" }
+        gate "the graph records the brief, test work, revision, reports, and verification" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
-        subgraph { scope "eval/test-writing/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/test-writing/${PLAN_RUN}" }
+        subgraph { scope "eval/test-writing/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/test-writing/${ST_PLAN_RUN}" }
       }
     }
   }

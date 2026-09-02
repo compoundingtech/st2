@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PLAN_RUN:?PLAN_RUN must identify the judged plan run}"
-run="plan-run/$PLAN_RUN"
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+run="plan-run/$ST_PLAN_RUN"
 work="$(env -u ST_AGENT st3 work ls --all --json)"
 
 steps=(
@@ -32,7 +32,7 @@ for step in "${steps[@]}"; do
 done
 
 while read -r name kind; do
-  st3 inspect "resource/plan-run/$PLAN_RUN/$name" --json \
+  st3 inspect "resource/plan-run/$ST_PLAN_RUN/$name" --json \
     | jq -e --arg kind "$kind" '.status.subjects[0].actual | (.fields // .) | .kind == $kind and .state == "published"' >/dev/null
 done <<'PRODUCTS'
 debug-brief message.receipt

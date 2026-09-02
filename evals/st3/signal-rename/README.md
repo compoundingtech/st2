@@ -26,7 +26,7 @@ sig.relay                  sig.hub
                  |
        integrate-and-verify       sig.sup
                  |
-         held-out-judges
+         held-out-gates
                  |
         publish-final-report      sig.sup
 
@@ -55,6 +55,6 @@ The graph screen shows the current root and nested work state. It also shows rec
 
 The script holds the end-to-end test outside every agent workspace. It also copies each persona to its clone as `AGENTS.md`.
 
-Five mechanical judges grade the integrated clone. A bounded Codex judge inspects the plan claims, work state, revision products, and Git history.
+Five mechanical gates grade the integrated clone. A bounded Codex gate inspects the plan claims, work state, revision products, and Git history.
 
 The `receipts/` directory contains historical runs. Each receipt records the exact KDL hash that produced it.

@@ -6,91 +6,80 @@ subgraph {
   }
 
   plan "stabilize-st3" state="ready" {
+    goal "Complete plan stabilize-st3."
     step "free-verification" timeout="30m" {
       title "The deterministic st3 verification passes"
       subgraph {
-        exec "stabilize-st3/free-verification/${PLAN_RUN}" {
+        exec "stabilize-st3/free-verification/${ST_PLAN_RUN}" {
           workspace "."
           command "cargo test -q -p st3 && cargo test -q -p st3-migrate && cargo clippy -p st3 -p st3-migrate --no-deps -- -D warnings && cargo fmt --all -- --check"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/stabilize-st3/free-verification/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/free-verification/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/stabilize-st3/free-verification/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/stabilize-st3/free-verification/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "migration-audit" timeout="5m" {
       title "The migration audit records every opaque provider command"
       depends-on { step "free-verification" completed }
       subgraph {
-        exec "stabilize-st3/migration-audit/${PLAN_RUN}" {
+        exec "stabilize-st3/migration-audit/${ST_PLAN_RUN}" {
           workspace "."
           command "test -f docs/st3/stabilization-report.md && rg 'Opaque Codex evals: 16|Opaque Claude evals: 26' docs/st3/stabilization-report.md"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/stabilize-st3/migration-audit/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/migration-audit/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/stabilize-st3/migration-audit/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/stabilize-st3/migration-audit/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "license-mit" timeout="25m" {
       title "The license MIT Claude eval passes"
       depends-on { step "migration-audit" completed }
       subgraph {
-        exec "stabilize-st3/license-mit/${PLAN_RUN}" {
+        exec "stabilize-st3/license-mit/${ST_PLAN_RUN}" {
           workspace "."
           command "st3 eval ./evals/st3/license-mit"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/stabilize-st3/license-mit/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/license-mit/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/stabilize-st3/license-mit/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/stabilize-st3/license-mit/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "ghost-bug-codex" timeout="25m" {
       title "The ghost bug Codex eval passes"
       depends-on { step "license-mit" completed }
       subgraph {
-        exec "stabilize-st3/ghost-bug-codex/${PLAN_RUN}" {
+        exec "stabilize-st3/ghost-bug-codex/${ST_PLAN_RUN}" {
           workspace "."
           command "st3 eval ./evals/st3/ghost-bug"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/stabilize-st3/ghost-bug-codex/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/ghost-bug-codex/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/stabilize-st3/ghost-bug-codex/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/stabilize-st3/ghost-bug-codex/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "signal-rename-codex" timeout="35m" {
       title "The signal rename Codex eval passes"
       depends-on { step "ghost-bug-codex" completed }
       subgraph {
-        exec "stabilize-st3/signal-rename-codex/${PLAN_RUN}" {
+        exec "stabilize-st3/signal-rename-codex/${ST_PLAN_RUN}" {
           workspace "."
           command "st3 eval ./evals/st3/signal-rename"
           restart "never"
         }
       }
-      judges {
-        field "status" "exec/stabilize-st3/signal-rename-codex/${PLAN_RUN}" "is" "exited"
-        field "exit_code" "exec/stabilize-st3/signal-rename-codex/${PLAN_RUN}" "is" 0
-      }
+      gate "condition-1" { field "status" "exec/stabilize-st3/signal-rename-codex/${ST_PLAN_RUN}" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/stabilize-st3/signal-rename-codex/${ST_PLAN_RUN}" "is" 0 }
     }
 
     step "review" {
       title "A person reviews the stabilization receipts"
       depends-on { step "signal-rename-codex" completed }
-      judges {
-        field "decision" "resource/st3-stabilization-review" "is" "approved"
-      }
+      gate "condition-1" { field "decision" "resource/st3-stabilization-review" "is" "approved" }
     }
   }
 }

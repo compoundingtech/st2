@@ -168,7 +168,13 @@ pub enum ChangePolicy {
 #[serde(tag = "dependency", rename_all = "kebab-case")]
 pub enum DependencySpec {
     Step { step: String, state: String },
-    Predicate { judge: JudgeSpec },
+    Predicate { gate: GateSpec },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BaselineSpec {
+    pub name: String,
+    pub gates: Vec<GateSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -204,12 +210,15 @@ pub struct StepSpec {
     pub id: String,
     pub path: String,
     pub title: Option<String>,
-    pub goal: Option<String>,
+    #[serde(default)]
+    pub goals: Vec<String>,
     pub timeout_ms: Option<u64>,
     pub retry: RetrySpec,
     pub finally: bool,
     pub assigned_to: Option<String>,
     pub dependencies: Vec<DependencySpec>,
+    #[serde(default)]
+    pub baselines: Vec<BaselineSpec>,
     #[serde(default)]
     pub documents: Vec<String>,
     pub subgraph_kdl: Option<String>,
@@ -218,7 +227,7 @@ pub struct StepSpec {
     pub produces_plan: Option<String>,
     #[serde(default)]
     pub uses_plan: Option<UsedPlanSpec>,
-    pub judges: Vec<JudgeSpec>,
+    pub gates: Vec<GateSpec>,
     pub nested_plan: Option<Box<PlanSpec>>,
     pub definition_hash: String,
 }
@@ -232,6 +241,13 @@ pub struct PlanSpec {
     pub scope_template: Option<String>,
     pub change_policy: ChangePolicy,
     pub change_authority: Option<String>,
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub baselines: Vec<BaselineSpec>,
+    #[serde(default)]
+    pub products: Vec<ProductSpec>,
+    #[serde(default)]
+    pub gates: Vec<GateSpec>,
     pub steps: BTreeMap<String, StepSpec>,
     pub display_order: Vec<String>,
 }
@@ -248,7 +264,7 @@ pub struct CheckpointSpec {
     pub sequence: String,
     pub name: String,
     pub ordinal: u32,
-    pub judges: Vec<JudgeSpec>,
+    pub gates: Vec<GateSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -267,6 +283,13 @@ pub struct MessageTemplate {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnderSpec {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduleSpec {
     pub stopped: bool,
     pub host: String,
@@ -279,7 +302,7 @@ pub struct ScheduleSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GateSpec {
+pub struct TerminalControlSpec {
     pub name: String,
     pub driver: String,
     pub contains: Vec<String>,
@@ -290,28 +313,34 @@ pub struct GateSpec {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "predicate", rename_all = "kebab-case")]
-pub enum JudgeSpec {
+pub enum GateSpec {
     Exists {
+        name: String,
         subject: String,
     },
     Empty {
+        name: String,
         subject: String,
     },
     Field {
+        name: String,
         path: String,
         subject: String,
         operator: String,
         value: Value,
     },
     Has {
+        name: String,
         subject: String,
         text: String,
     },
     Lacks {
+        name: String,
         subject: String,
         text: String,
     },
     Deadline {
+        name: String,
         duration_ms: u64,
     },
     Mechanical {
@@ -334,6 +363,7 @@ pub enum JudgeSpec {
         prompt: String,
     },
     Human {
+        name: String,
         reviewer: String,
         #[serde(default)]
         question: Option<String>,
@@ -398,6 +428,91 @@ pub struct PlanResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningSessionStartRequest {
+    pub plan: String,
+    pub request: Vec<u8>,
+    pub workspace: String,
+    #[serde(default)]
+    pub requester: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningCandidateSubmitRequest {
+    pub actor: String,
+    pub markdown: Vec<u8>,
+    pub kdl: Vec<u8>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningRevisionRequest {
+    pub actor: String,
+    pub feedback: Vec<u8>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningApprovalRequest {
+    pub actor: String,
+    pub preview_hash: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningCancelRequest {
+    pub actor: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningCandidateView {
+    pub revision: u32,
+    pub markdown: String,
+    pub kdl: String,
+    pub plan: String,
+    pub plan_revision: String,
+    pub submitted_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningPreviewView {
+    pub hash: String,
+    pub candidate_revision: u32,
+    pub store_index: u64,
+    pub graph: String,
+    pub diff: String,
+    pub plan: PlanResponse,
+    pub created_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningSessionView {
+    pub subject: String,
+    pub id: String,
+    pub plan: String,
+    pub request: String,
+    pub workspace: String,
+    pub requester: String,
+    pub planner: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<PlanningCandidateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PlanningPreviewView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_revision: Option<String>,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApplyRequest {
     pub intent: IntentInput,
     pub expected_subjects: BTreeMap<String, Vec<String>>,
@@ -434,7 +549,7 @@ pub struct DocumentVersion {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct JudgementRequest {
+pub struct GateResultRequest {
     pub operation_capability: String,
     pub verdict: String,
     pub reason: String,
@@ -512,6 +627,8 @@ pub struct SubjectStatus {
     pub gap: Option<String>,
     pub reachability: String,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub under: Vec<UnderSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -580,6 +697,10 @@ pub struct QuickAgentRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<String>,
     #[serde(default)]
     pub expected_subject: Vec<String>,
     pub idempotency_key: String,
@@ -762,7 +883,10 @@ pub struct StepRunView {
     pub attempt: u32,
     pub assignee: Option<String>,
     pub title: Option<String>,
-    pub goal: Option<String>,
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub under: Vec<UnderSpec>,
     pub worker_reported: bool,
     pub lease_owner: Option<String>,
     pub lease_incarnation: Option<String>,

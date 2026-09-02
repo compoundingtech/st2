@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PLAN_RUN:?PLAN_RUN must identify the root plan run}"
-root="plan-run/$PLAN_RUN"
-producer="step-run/$PLAN_RUN/lift-plan-document"
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the root plan run}"
+root="plan-run/$ST_PLAN_RUN"
+producer="step-run/$ST_PLAN_RUN/lift-plan-document"
 publisher="$producer/work/publish-ready-graph-plan"
-consumer="step-run/$PLAN_RUN/execute-lifted-plan"
+consumer="step-run/$ST_PLAN_RUN/execute-lifted-plan"
 work="$(env -u ST_AGENT st3 work ls --all --json)"
 
 for step in \

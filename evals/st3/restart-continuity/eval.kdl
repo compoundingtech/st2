@@ -1,13 +1,14 @@
 version 2
 
 subgraph {
-  scope "eval/restart-continuity/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/restart-continuity/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/restart-continuity" state="ready" {
+      goal "Complete plan eval/restart-continuity."
       step "start-team" timeout="10m" {
         title "The native Claude team is ready"
         subgraph {
           agent "rc.sup" {
-            workspace "${WORKSPACE}/sup"
+            workspace "${ST_WORKSPACE}/sup"
             harness "claude" {
               model "claude-sonnet-5"
               effort "medium"
@@ -17,14 +18,13 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
           agent "rc.dev" {
-            workspace "${WORKSPACE}/worker"
+            workspace "${ST_WORKSPACE}/worker"
             harness "claude" {
               model "claude-sonnet-5"
               effort "medium"
@@ -40,17 +40,14 @@ subgraph {
               mode "delay"
             }
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
         }
-        judges {
-          exists "agent/rc.sup"
-          exists "agent/rc.dev"
-        }
+        gate "condition-1" { exists "agent/rc.sup" }
+        gate "condition-2" { exists "agent/rc.dev" }
       }
 
       step "process-before-restart" timeout="20m" {
@@ -60,6 +57,7 @@ subgraph {
         depends-on { step "start-team" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "inspect-durable-state" {
             title "The initial batch state is understood"
             goal "Read items.json, PROGRESS.md, git log, and the tests. Confirm that no item is complete."
@@ -76,10 +74,10 @@ subgraph {
           }
           step "publish-pre-restart-revision" {
             title "The pre-restart revision is published"
-            goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/pre-restart resource.binding --actor agent/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
+            goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/pre-restart resource.binding --actor agent/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
             depends-on { step "process-item-2" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/pre-restart" {
+              resource "plan-run/${ST_PLAN_RUN}/pre-restart" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -92,28 +90,25 @@ subgraph {
         title "The worker cold-restarts and receives repeated work"
         depends-on { step "process-before-restart" completed }
         subgraph {
-          exec "eval/restart-continuity/inject/${PLAN_RUN}" {
+          exec "eval/restart-continuity/inject/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}/inj"
-            cwd "${WORKSPACE}/inj"
+            workspace "${ST_WORKSPACE}/inj"
+            cwd "${ST_WORKSPACE}/inj"
             command "bash ./restart-injector.sh"
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
+              CATALOG "${ST_WORKSPACE}"
             }
           }
         }
         produces {
-          resource "plan-run/${PLAN_RUN}/restart" {
+          resource "plan-run/${ST_PLAN_RUN}/restart" {
             kind "cold-restart"
             state "injected"
           }
         }
-        judges {
-          field "status" "exec/eval/restart-continuity/inject/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/restart-continuity/inject/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/restart-continuity/inject/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/restart-continuity/inject/${ST_PLAN_RUN}" "is" 0 }
       }
 
       step "process-after-restart" timeout="20m" {
@@ -123,6 +118,7 @@ subgraph {
         depends-on { step "inject-cold-restart" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "inspect-recovered-state" {
             title "The restarted worker finds the durable boundary"
             goal "Read the graph work, PROGRESS.md, and git log. Confirm that items 1 and 2 are complete exactly once. Archive the repeated delivery without redoing either item."
@@ -144,10 +140,10 @@ subgraph {
           }
           step "publish-batch-revision" {
             title "The complete batch revision is published"
-            goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/batch resource.binding --actor agent/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
+            goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/batch resource.binding --actor agent/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
             depends-on { step "verify-complete-batch" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/batch" {
+              resource "plan-run/${ST_PLAN_RUN}/batch" {
                 kind "vcs.revision"
                 state "published"
               }
@@ -155,10 +151,10 @@ subgraph {
           }
           step "report-to-supervisor" {
             title "The worker reports one result to the supervisor"
-            goal #"Send rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$PLAN_RUN/worker-report resource.binding --actor agent/rc.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+            goal #"Send rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.binding --actor agent/rc.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
             depends-on { step "publish-batch-revision" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/worker-report" {
+              resource "plan-run/${ST_PLAN_RUN}/worker-report" {
                 kind "message.receipt"
                 state "published"
               }
@@ -174,6 +170,7 @@ subgraph {
         depends-on { step "process-after-restart" completed }
 
         plan "work" {
+          goal "Complete plan work."
           step "inspect-graph-history" {
             title "The restart and work phases are visible in the graph"
             goal "Inspect the plan run and the pre-restart, restart, batch, and worker-report resources. Confirm that the two work phases completed around the restart."
@@ -185,10 +182,10 @@ subgraph {
           }
           step "confirm-requester" {
             title "The requester receives one verified confirmation"
-            goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$PLAN_RUN/verification resource.binding --actor agent/rc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+            goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/verification resource.binding --actor agent/rc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
             depends-on { step "verify-ledger-read-only" completed }
             produces {
-              resource "plan-run/${PLAN_RUN}/verification" {
+              resource "plan-run/${ST_PLAN_RUN}/verification" {
                 kind "message.receipt"
                 state "published"
               }
@@ -197,66 +194,64 @@ subgraph {
         }
       }
 
-      step "held-out-judges" timeout="10m" {
-        title "All restart continuity judges pass"
+      step "held-out-gates" timeout="10m" {
+        title "All restart continuity gates pass"
         depends-on { step "verify-and-confirm" completed }
-        judges {
-          judge "the cold restart straddles the item commits" {
-            exec "bash ./judges/resumed.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "every stable item completed exactly once" {
-            exec "bash ./judges/no-double-act.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "every item has a durable progress record and working handler" {
-            exec "bash ./judges/no-skip.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "the final artifact is not corrupt" {
-            exec "bash ./judges/no-corruption.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "only rc.dev changed the ledger repository" {
-            exec "bash ./judges/isolation.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "the graph has one product for each stable result" {
-            exec "bash ./judges/graph-state.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
-          judge "Small Talk has two work assignments, one duplicate, one report, and one confirmation" {
-            exec "bash ./judges/coordination.sh"
-            host "local"
-            workspace "${WORKSPACE}"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }
-            time-limit "2m"
-          }
+        gate "the cold restart straddles the item commits" {
+          exec "bash ./judges/resumed.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "every stable item completed exactly once" {
+          exec "bash ./judges/no-double-act.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "every item has a durable progress record and working handler" {
+          exec "bash ./judges/no-skip.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "the final artifact is not corrupt" {
+          exec "bash ./judges/no-corruption.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "only rc.dev changed the ledger repository" {
+          exec "bash ./judges/isolation.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "the graph has one product for each stable result" {
+          exec "bash ./judges/graph-state.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
+        }
+        gate "Small Talk has two work assignments, one duplicate, one report, and one confirmation" {
+          exec "bash ./judges/coordination.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          env { CATALOG "${ST_WORKSPACE}" }
+          time-limit "2m"
         }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
-        subgraph { scope "eval/restart-continuity/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/restart-continuity/${PLAN_RUN}" }
+        subgraph { scope "eval/restart-continuity/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/restart-continuity/${ST_PLAN_RUN}" }
       }
     }
   }

@@ -1,44 +1,41 @@
 version 2
 
 subgraph {
-  scope "eval/pty-send-peek/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/pty-send-peek/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/pty-send-peek" state="ready" {
+      goal "Complete plan eval/pty-send-peek."
       step "contract" timeout="1m" {
         title "PTY send and peek make a real byte round trip"
         subgraph {
-          pty "psp/${PLAN_RUN}" {
+          pty "psp/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}"
+            workspace "${ST_WORKSPACE}"
             command "bash -c 'echo READY; while IFS= read -r line; do echo ACK:$line; done'"
             restart "never"
           }
-          exec "eval/pty-send-peek/probe/${PLAN_RUN}" {
+          exec "eval/pty-send-peek/probe/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}/fixture"
-            cwd "${WORKSPACE}/fixture"
+            workspace "${ST_WORKSPACE}/fixture"
+            cwd "${ST_WORKSPACE}/fixture"
             command "bash ./run.sh"
             restart "never"
-            env { PLAN_RUN "${PLAN_RUN}" }
+
           }
         }
-        judges {
-          field "status" "exec/eval/pty-send-peek/probe/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/pty-send-peek/probe/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/pty-send-peek/probe/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/pty-send-peek/probe/${ST_PLAN_RUN}" "is" 0 }
       }
-      step "judge" timeout="1m" {
+      step "gate" timeout="1m" {
         depends-on { step "contract" completed }
-        judges {
-          judge "the acknowledgement appears only after send" {
-            exec "grep -Fq READY pre.txt && ! grep -Fq ACK:PSP-9f3a7c2e pre.txt && grep -Fq ACK:PSP-9f3a7c2e post.txt"
-            host "local"
-            workspace "${WORKSPACE}/fixture"
-          }
+        gate "the acknowledgement appears only after send" {
+          exec "grep -Fq READY pre.txt && ! grep -Fq ACK:PSP-9f3a7c2e pre.txt && grep -Fq ACK:PSP-9f3a7c2e post.txt"
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
         }
       }
       step "cleanup" finally=#true {
-        subgraph { scope "eval/pty-send-peek/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/pty-send-peek/${PLAN_RUN}" }
+        subgraph { scope "eval/pty-send-peek/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/pty-send-peek/${ST_PLAN_RUN}" }
       }
     }
   }

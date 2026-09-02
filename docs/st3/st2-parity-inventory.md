@@ -187,7 +187,8 @@ They do not have direct st2 command contracts.
 | st3 command | Purpose |
 |---|---|
 | `claude` and `codex` | Publishes one quick native agent and attaches to its terminal. |
-| `plan` and `run` | Plans and applies explicit version-2 intent with subject tokens. |
+| `preview` and `run` | Previews or applies explicit version-2 intent with subject tokens. |
+| `plan start`, `show`, `preview`, `submit`, `revise`, `approve`, and `cancel` | Operates a durable Codex planning session and exact-hash review. |
 | `import` | Combines and applies one version-2 KDL tree and its staged documents. |
 | `exec` and `logs` | Runs one graph exec member and reads its current or prior log. |
 | `inspect` and `trace` | Reads one subject and its immutable claim history. |
@@ -197,7 +198,7 @@ They do not have direct st2 command contracts.
 | `review approve`, `reject`, and `revise` | Records a human review decision on a resource. |
 | `work ls`, `show`, `claim`, `renew`, `progress`, `complete`, `fail`, and `release` | Operates durable plan-step leases and results. |
 | `work publish-plan` and `work revise` | Publishes a produced plan or a reviewed plan revision. |
-| `judgement` | Posts a capability-bound running judge result. |
+| `gate-result` | Posts a capability-bound running gate result. |
 
 ## Declaration format gaps
 
@@ -262,11 +263,11 @@ These surfaces are additions, not st2 parity gaps.
 | `scope` | Groups desired members and gives them one explicit stop boundary. |
 | Standalone `exec` and `pty` | Runs a member without an aggregate agent declaration. |
 | Root `resource`, `person`, and `account` | Declares observed graph subjects and actor identities. |
-| `supervisor` and `gate` | Applies declared screen gates and durable supervision decisions. |
+| `supervisor` and `terminal-control` | Applies declared bounded screen input and durable supervision decisions. |
 | `link` | Holds or voids work when a required subject is unreachable. |
 | `plan` and plan steps | Runs durable work graphs with claims, leases, reviews, and nested plans. |
 | `message` and `schedule` | Declares graph messages and clock-triggered messages. |
-| Checkpoints and judges | Controls ordered readiness, completion, and eval verdicts. |
+| Checkpoints and gates | Controls ordered readiness, completion, and eval verdicts. |
 
 ## Render and materialization gaps
 
@@ -330,7 +331,7 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 | Native driver delivery | Claude and Codex implemented | Parity | Pi and OpenCode need provider proofs. | M |
 | Generic PTY delivery | Incomplete | Unfinished | Apply the full DING safety contract described above. | L |
 | Message acceptance | Read records acceptance | Deliberate | st2 read does not add the same lifecycle claim. Preserve this richer state in st3. | None |
-| Message close judges | Implemented | New | This st3 lifecycle is not an st2 replacement requirement. | None |
+| Message close lifecycle | Implemented | New | This st3 lifecycle is not an st2 replacement requirement. | None |
 | Peer replication | Configured HTTP peers | New | st2 has no claims peer protocol. st3 v1 trusts configured peers and has no TLS or ACLs. | Security decision |
 | Partition behavior | Local claims continue | Unfinished | Complete conflict, replay, reachability, and recovery tests across partitions. Add transport authentication before untrusted networks. | XL |
 
@@ -351,7 +352,7 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 | Retired state | Generic stop | Deliberate | Add a distinct terminal declaration state if roster and audit readers need it. | M |
 | Explicit teardown | Stop intent and scope stop | Parity | st3 does not kill members when the daemon exits. This matches the durable runtime direction. | None |
 | st2 supervisor crash recipient | No direct equivalent | Unfinished | Publish a typed crash alert message to an explicit agent or supervision policy. | M |
-| st3 supervisor gates | Implemented | New | Screen gates can send controlled input and record decisions. | None |
+| st3 terminal controls | Implemented | New | Terminal controls can send bounded input and record decisions. | None |
 | Required links | Implemented | New | A link can hold work or void an eval when a dependency is unreachable. | None |
 | Health repair | Claim-driven observation | Unfinished | Add periodic or external observation for provider sockets, stale presence, and leaked child processes. | M |
 | Cross-host reachability | Peer claims | Unfinished | Prove duplicate, delayed, missing, and conflicting peer batches. Define indeterminate status during a partition. | L |

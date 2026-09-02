@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PLAN_RUN:?PLAN_RUN must identify the judged plan run}"
-run_tag="plan-run:$PLAN_RUN"
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+run_tag="plan-run:$ST_PLAN_RUN"
 latest_critique=0
 
 for recipient in fd.a fd.b fd.c; do

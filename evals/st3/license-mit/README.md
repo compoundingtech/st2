@@ -9,9 +9,9 @@ This st3 eval runs the license MIT task with two native Claude Sonnet agents.
   confirms. The KDL records delegation, implementation, verification, and products as nested plans.
   Every eval starts from the frozen `worker/_git` snapshot, rehydrated as `.git` only inside
   the throwaway catalog.
-- **Judges** (all held-out): structural isolation (sup owns no repo), the coordination loop on the bus
+- **Gates** (all held-out): structural isolation (sup owns no repo), the coordination loop on the bus
   (delegate → report → verified-confirm post-dating the report), `LICENSE` is canonical MIT, `package.json`
-  declares MIT, the change is committed with a clean worktree, and a Codex judge that the confirmation
+  declares MIT, the change is committed with a clean worktree, and a Codex gate that the confirmation
   cites real evidence (not a bare "done!").
 
 Start the daemon with `st3 up`. Run the eval with `st3 eval ./evals/st3/license-mit`.

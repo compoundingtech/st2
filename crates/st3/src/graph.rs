@@ -5,9 +5,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    CheckpointActivation, CheckpointSpec, DesiredSubject, GateSpec, JudgeSpec, LaunchSpec,
-    LinkSpec, MemberKind, MemberLifecycle, MemberSpec, MessageTemplate, NormalizedIntent,
-    RestartIntensity, RestartType, ScheduleSpec, St3Error,
+    CheckpointActivation, CheckpointSpec, DesiredSubject, GateSpec, LaunchSpec, LinkSpec,
+    MemberKind, MemberLifecycle, MemberSpec, MessageTemplate, NormalizedIntent, RestartIntensity,
+    RestartType, ScheduleSpec, St3Error,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -392,12 +392,14 @@ fn parse_agent(
         });
     }
 
+    let mut desired = canonical_node(node)?;
+    normalize_agent_under(&mut desired, &host);
     insert_subject(
         context,
         DesiredSubject {
             subject: subject.clone(),
             kind: "agent".into(),
-            desired: canonical_node(node)?,
+            desired,
             member: primary,
             activation: context.checkpoint.clone(),
             scopes: context.scopes.clone(),
@@ -647,25 +649,36 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
             .iter()
             .filter(|child| child.name().value() == "subgraph")
             .collect::<Vec<_>>();
-        let judges_nodes = body
+        let gate_nodes = body
             .nodes()
             .iter()
-            .filter(|child| child.name().value() == "judges")
+            .filter(|child| child.name().value() == "gate")
             .collect::<Vec<_>>();
-        if subgraphs.len() > 1 || judges_nodes.len() != 1 || body.nodes().len() > 2 {
+        if subgraphs.len() > 1
+            || gate_nodes.is_empty()
+            || body.nodes().len() != subgraphs.len() + gate_nodes.len()
+        {
             return Err(St3Error::new(
                 "invalid-checkpoint-shape",
                 format!(
-                    "checkpoint `{checkpoint_name}` needs one judges block and at most one subgraph"
+                    "checkpoint `{checkpoint_name}` needs one or more gates and at most one subgraph"
                 ),
             ));
         }
-        let judges = parse_judges(judges_nodes[0], &context.default_host)?;
-        if judges.is_empty() {
-            return Err(St3Error::new(
-                "empty-judges",
-                format!("checkpoint `{checkpoint_name}` has no judges"),
-            ));
+        let mut gates = Vec::new();
+        let mut gate_names = HashSet::new();
+        for gate_node in gate_nodes {
+            let gate = parse_gate(gate_node, &context.default_host)?;
+            if !gate_names.insert(gate_name(&gate).to_owned()) {
+                return Err(St3Error::new(
+                    "duplicate-gate",
+                    format!(
+                        "checkpoint `{checkpoint_name}` repeats gate `{}`",
+                        gate_name(&gate)
+                    ),
+                ));
+            }
+            gates.push(gate);
         }
         let activation = CheckpointActivation {
             sequence: sequence.clone(),
@@ -701,7 +714,7 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
             sequence: sequence.clone(),
             name: checkpoint_name,
             ordinal: ordinal as u32,
-            judges,
+            gates,
         };
         insert_subject(
             context,
@@ -721,202 +734,181 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
     Ok(())
 }
 
-pub(crate) fn parse_judges(node: &KdlNode, default_host: &str) -> Result<Vec<JudgeSpec>, St3Error> {
-    ensure_bare(node)?;
-    let children = node.children().ok_or_else(|| {
-        St3Error::new(
-            "empty-judges",
-            "a judges block must contain at least one judge",
-        )
-    })?;
-    let mut output = Vec::new();
-    let mut running_names = HashSet::new();
-    let mut has_deadline = false;
-    for child in children.nodes() {
-        reject_type(child)?;
-        match child.name().value() {
-            "exists" => {
-                ensure_no_properties(child)?;
-                let subject = one_string(child)?;
-                validate_full_subject(&subject)?;
-                output.push(JudgeSpec::Exists { subject });
-            }
-            "empty" => {
-                ensure_no_properties(child)?;
-                let subject = one_string(child)?;
-                if !subject.starts_with("scope/") {
-                    return Err(St3Error::new(
-                        "invalid-empty-subject",
-                        "empty requires a full scope subject",
-                    ));
-                }
-                validate_full_subject(&subject)?;
-                output.push(JudgeSpec::Empty { subject });
-            }
-            "has" | "lacks" => {
-                let values = positional_strings(child)?;
-                if values.len() != 2 {
-                    return Err(St3Error::new(
-                        "invalid-text-predicate",
-                        "has and lacks require a subject and text",
-                    ));
-                }
-                validate_full_subject(&values[0])?;
-                if !matches!(
-                    values[0].split('/').next(),
-                    Some("file" | "doc" | "message")
-                ) {
-                    return Err(St3Error::new(
-                        "unsupported-predicate-subject",
-                        "has and lacks require a file, document, or message subject",
-                    ));
-                }
-                let judge = if child.name().value() == "has" {
-                    JudgeSpec::Has {
-                        subject: values[0].clone(),
-                        text: values[1].clone(),
-                    }
-                } else {
-                    JudgeSpec::Lacks {
-                        subject: values[0].clone(),
-                        text: values[1].clone(),
-                    }
-                };
-                output.push(judge);
-            }
-            "field" => {
-                ensure_no_properties(child)?;
-                let entries = child
-                    .entries()
-                    .iter()
-                    .filter(|entry| entry.name().is_none())
-                    .map(|entry| entry.value())
-                    .collect::<Vec<_>>();
-                if entries.len() != 4 {
-                    return Err(St3Error::new(
-                        "invalid-field-predicate",
-                        "field requires path, subject, operator, and value",
-                    ));
-                }
-                let path = value_string(entries[0])?;
-                if !valid_field_path(&path) {
-                    return Err(St3Error::new(
-                        "invalid-field-path",
-                        format!("invalid field path `{path}`"),
-                    ));
-                }
-                let operator = value_string(entries[2])?;
-                if !matches!(operator.as_str(), "is" | "starts-with" | "contains") {
-                    return Err(St3Error::new(
-                        "invalid-field-operator",
-                        format!("invalid field operator `{operator}`"),
-                    ));
-                }
-                let subject = value_string(entries[1])?;
-                validate_full_subject(&subject)?;
-                output.push(JudgeSpec::Field {
-                    path,
-                    subject,
-                    operator,
-                    value: json_value(entries[3])?,
-                });
-            }
-            "deadline" => {
-                if has_deadline {
-                    return Err(St3Error::new(
-                        "duplicate-deadline",
-                        "a judges block can contain one deadline",
-                    ));
-                }
-                has_deadline = true;
-                let duration = one_duration(child)?;
-                output.push(JudgeSpec::Deadline {
-                    duration_ms: duration,
-                });
-            }
-            "judge" => {
-                let name = first_string(child)?;
-                if !running_names.insert(name.clone()) {
-                    return Err(St3Error::new(
-                        "duplicate-judge",
-                        format!("running judge `{name}` repeats"),
-                    ));
-                }
-                output.push(parse_running_judge(child, name, default_host)?);
-            }
-            "human" => {
-                ensure_no_properties(child)?;
-                let reviewer = one_string_with_children(child)?;
-                if !reviewer.starts_with("person/") {
-                    return Err(St3Error::new(
-                        "invalid-human-reviewer",
-                        "a human judge needs a full person subject",
-                    ));
-                }
-                let mut question = None;
-                let mut review_targets = Vec::new();
-                let mut seen_targets = HashSet::new();
-                if let Some(contract) = child.children() {
-                    for field in contract.nodes() {
-                        ensure_no_properties(field)?;
-                        match field.name().value() {
-                            "question" => {
-                                if question.is_some() {
-                                    return Err(St3Error::new(
-                                        "duplicate-human-question",
-                                        "a human judge can contain one question",
-                                    ));
-                                }
-                                question = Some(one_string(field)?);
-                            }
-                            "review" => {
-                                let target = one_string(field)?;
-                                validate_full_subject(&target)?;
-                                if !seen_targets.insert(target.clone()) {
-                                    return Err(St3Error::new(
-                                        "duplicate-human-review-target",
-                                        format!("human review target `{target}` repeats"),
-                                    ));
-                                }
-                                review_targets.push(target);
-                            }
-                            other => {
-                                return Err(St3Error::new(
-                                    "unknown-human-review-field",
-                                    format!("a human judge cannot contain `{other}`"),
-                                ));
-                            }
-                        }
-                    }
-                }
-                output.push(JudgeSpec::Human {
-                    reviewer,
-                    question,
-                    review_targets,
-                });
-            }
-            other => {
-                return Err(St3Error::new(
-                    "unknown-judge",
-                    format!("unknown judge `{other}`"),
-                ));
-            }
-        }
+pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["type"])?;
+    let name = one_string_with_children(node)?;
+    if name.is_empty() || name.len() > 160 {
+        return Err(St3Error::new(
+            "invalid-gate-name",
+            "a gate name must contain 1 through 160 bytes",
+        ));
     }
-    Ok(output)
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
+    let gate_type = property_string(node, "type")?;
+    if gate_type
+        .as_deref()
+        .is_some_and(|kind| matches!(kind, "llm" | "human"))
+        || body
+            .nodes()
+            .iter()
+            .any(|child| child.name().value() == "exec")
+    {
+        return parse_running_gate(node, name, default_host);
+    }
+    if gate_type.is_some() {
+        return Err(St3Error::new(
+            "invalid-gate-type",
+            format!("gate `{name}` has an invalid type"),
+        ));
+    }
+    if body.nodes().len() != 1 {
+        return Err(St3Error::new(
+            "invalid-gate-shape",
+            format!("gate `{name}` needs exactly one predicate"),
+        ));
+    }
+    parse_predicate_gate(&body.nodes()[0], name)
 }
 
-fn parse_running_judge(
+pub(crate) fn gate_name(gate: &GateSpec) -> &str {
+    match gate {
+        GateSpec::Exists { name, .. }
+        | GateSpec::Empty { name, .. }
+        | GateSpec::Field { name, .. }
+        | GateSpec::Has { name, .. }
+        | GateSpec::Lacks { name, .. }
+        | GateSpec::Deadline { name, .. }
+        | GateSpec::Mechanical { name, .. }
+        | GateSpec::Llm { name, .. }
+        | GateSpec::Human { name, .. } => name,
+    }
+}
+
+pub(crate) fn parse_baseline_gate(node: &KdlNode, name: String) -> Result<GateSpec, St3Error> {
+    reject_type(node)?;
+    ensure_no_properties(node)?;
+    parse_predicate_gate(node, name)
+}
+
+fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Error> {
+    reject_type(child)?;
+    match child.name().value() {
+        "exists" => {
+            ensure_no_properties(child)?;
+            let subject = one_string(child)?;
+            validate_full_subject(&subject)?;
+            Ok(GateSpec::Exists { name, subject })
+        }
+        "empty" => {
+            ensure_no_properties(child)?;
+            let subject = one_string(child)?;
+            if !subject.starts_with("scope/") {
+                return Err(St3Error::new(
+                    "invalid-empty-subject",
+                    "empty requires a full scope subject",
+                ));
+            }
+            validate_full_subject(&subject)?;
+            Ok(GateSpec::Empty { name, subject })
+        }
+        "has" | "lacks" => {
+            let values = positional_strings(child)?;
+            if values.len() != 2 {
+                return Err(St3Error::new(
+                    "invalid-text-predicate",
+                    "has and lacks require a subject and text",
+                ));
+            }
+            validate_full_subject(&values[0])?;
+            if !matches!(
+                values[0].split('/').next(),
+                Some("file" | "doc" | "message")
+            ) {
+                return Err(St3Error::new(
+                    "unsupported-predicate-subject",
+                    "has and lacks require a file, document, or message subject",
+                ));
+            }
+            Ok(if child.name().value() == "has" {
+                GateSpec::Has {
+                    name,
+                    subject: values[0].clone(),
+                    text: values[1].clone(),
+                }
+            } else {
+                GateSpec::Lacks {
+                    name,
+                    subject: values[0].clone(),
+                    text: values[1].clone(),
+                }
+            })
+        }
+        "field" => {
+            ensure_no_properties(child)?;
+            let entries = child
+                .entries()
+                .iter()
+                .filter(|entry| entry.name().is_none())
+                .map(|entry| entry.value())
+                .collect::<Vec<_>>();
+            if entries.len() != 4 {
+                return Err(St3Error::new(
+                    "invalid-field-predicate",
+                    "field requires path, subject, operator, and value",
+                ));
+            }
+            let path = value_string(entries[0])?;
+            if !valid_field_path(&path) {
+                return Err(St3Error::new(
+                    "invalid-field-path",
+                    format!("invalid field path `{path}`"),
+                ));
+            }
+            let operator = value_string(entries[2])?;
+            if !matches!(operator.as_str(), "is" | "starts-with" | "contains") {
+                return Err(St3Error::new(
+                    "invalid-field-operator",
+                    format!("invalid field operator `{operator}`"),
+                ));
+            }
+            let subject = value_string(entries[1])?;
+            validate_full_subject(&subject)?;
+            Ok(GateSpec::Field {
+                name,
+                path,
+                subject,
+                operator,
+                value: json_value(entries[3])?,
+            })
+        }
+        "deadline" => {
+            let duration = one_duration(child)?;
+            Ok(GateSpec::Deadline {
+                name,
+                duration_ms: duration,
+            })
+        }
+        other => Err(St3Error::new(
+            "unknown-gate",
+            format!("unknown gate predicate `{other}`"),
+        )),
+    }
+}
+
+fn parse_running_gate(
     node: &KdlNode,
     name: String,
     default_host: &str,
-) -> Result<JudgeSpec, St3Error> {
+) -> Result<GateSpec, St3Error> {
     ensure_only_properties(node, &["type"])?;
-    let body = node.children().ok_or_else(|| {
-        St3Error::new("missing-judge-body", format!("judge `{name}` has no body"))
-    })?;
-    let judge_type = property_string(node, "type")?;
-    let allowed: &[&str] = match judge_type.as_deref() {
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
+    let gate_type = property_string(node, "type")?;
+    let allowed: &[&str] = match gate_type.as_deref() {
         None => &["exec", "host", "workspace", "env", "time-limit"],
         Some("llm") => &[
             "model",
@@ -928,16 +920,49 @@ fn parse_running_judge(
             "time-limit",
             "prompt",
         ],
+        Some("human") => &["reviewer", "question", "review"],
         Some(other) => {
             return Err(St3Error::new(
-                "invalid-judge-type",
-                format!("judge `{name}` has invalid type `{other}`"),
+                "invalid-gate-type",
+                format!("gate `{name}` has invalid type `{other}`"),
             ));
         }
     };
-    reject_unknown_children(body, allowed, "judge", &name)?;
-    for child in allowed {
+    reject_unknown_children(body, allowed, "gate", &name)?;
+    for child in allowed.iter().filter(|child| **child != "review") {
         unique_child(body, child)?;
+    }
+    if gate_type.as_deref() == Some("human") {
+        let reviewer = required_child_string(body, "reviewer", &name)?;
+        if !reviewer.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-human-reviewer",
+                "a human gate needs a full person subject",
+            ));
+        }
+        let question = child_string(body, "question")?;
+        let mut review_targets = Vec::new();
+        for field in body
+            .nodes()
+            .iter()
+            .filter(|field| field.name().value() == "review")
+        {
+            let target = one_string(field)?;
+            validate_full_subject(&target)?;
+            if review_targets.contains(&target) {
+                return Err(St3Error::new(
+                    "duplicate-human-review-target",
+                    format!("human review target `{target}` repeats"),
+                ));
+            }
+            review_targets.push(target);
+        }
+        return Ok(GateSpec::Human {
+            name,
+            reviewer,
+            question,
+            review_targets,
+        });
     }
     let host = placement_host(required_child_string(body, "host", &name)?, default_host);
     let workspace = required_child_string(body, "workspace", &name)?;
@@ -945,13 +970,13 @@ fn parse_running_judge(
     if let Some(env) = unique_child(body, "env")? {
         validate_string_map(env, true)?;
     }
-    match judge_type.as_deref() {
+    match gate_type.as_deref() {
         None => {
             let time_limit_ms = child_string(body, "time-limit")?
                 .map(|value| parse_duration(&value, true))
                 .transpose()?
                 .unwrap_or(120_000);
-            Ok(JudgeSpec::Mechanical {
+            Ok(GateSpec::Mechanical {
                 name: name.clone(),
                 command: required_child_string(body, "exec", &name)?,
                 host,
@@ -962,12 +987,12 @@ fn parse_running_judge(
         }
         Some("llm") => {
             let tools = child_strings(body, "tools")?.ok_or_else(|| {
-                St3Error::new("missing-judge-field", format!("judge `{name}` needs tools"))
+                St3Error::new("missing-gate-field", format!("gate `{name}` needs tools"))
             })?;
             let token_budget = child_integer(body, "token-budget")?.ok_or_else(|| {
                 St3Error::new(
-                    "missing-judge-field",
-                    format!("judge `{name}` needs token-budget"),
+                    "missing-gate-field",
+                    format!("gate `{name}` needs token-budget"),
                 )
             })?;
             if token_budget <= 0 {
@@ -980,19 +1005,19 @@ fn parse_running_judge(
                 if !matches!(tool.as_str(), "shell" | "git" | "gh" | "network") {
                     return Err(St3Error::new(
                         "unsupported-capability",
-                        format!("judge tool `{tool}` is not registered"),
+                        format!("gate tool `{tool}` is not registered"),
                     ));
                 }
             }
             let time_limit_ms = child_string(body, "time-limit")?
                 .ok_or_else(|| {
                     St3Error::new(
-                        "missing-judge-field",
-                        format!("judge `{name}` needs time-limit"),
+                        "missing-gate-field",
+                        format!("gate `{name}` needs time-limit"),
                     )
                 })
                 .and_then(|value| parse_duration(&value, true))?;
-            Ok(JudgeSpec::Llm {
+            Ok(GateSpec::Llm {
                 name: name.clone(),
                 model: required_child_string(body, "model", &name)?,
                 host,
@@ -1004,7 +1029,8 @@ fn parse_running_judge(
                 prompt: required_child_string(body, "prompt", &name)?,
             })
         }
-        Some(_) => unreachable!("judge type was validated"),
+        Some("human") => unreachable!("human gates return above"),
+        Some(_) => unreachable!("gate type was validated"),
     }
 }
 
@@ -1298,6 +1324,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "host",
         "workspace",
         "supervisor",
+        "under",
         "keep",
         "lifecycle",
         "restart",
@@ -1338,6 +1365,24 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "harness",
     ] {
         unique_child(document, child)?;
+    }
+    for under in document
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "under")
+    {
+        ensure_only_properties(under, &["reason"])?;
+        let target = one_string(under)?;
+        let target = target.strip_prefix("agent/").unwrap_or(&target);
+        validate_name(target, false)?;
+        if let Some(reason) = property_string(under, "reason")?
+            && (reason.is_empty() || reason.len() > 500)
+        {
+            return Err(St3Error::new(
+                "invalid-under-reason",
+                "an under reason must contain 1 through 500 bytes",
+            ));
+        }
     }
     validate_restart_forms(document)?;
     if let Some(value) = child_string(document, "type")?
@@ -1765,36 +1810,39 @@ fn validate_supervisor(node: &KdlNode) -> Result<(), St3Error> {
     let Some(body) = node.children() else {
         return Ok(());
     };
-    reject_unknown_children(body, &["gate"], "supervisor", "supervisor")?;
+    reject_unknown_children(body, &["terminal-control"], "supervisor", "supervisor")?;
     let mut names = HashSet::new();
     for gate in body.nodes() {
         let name = first_string(gate)?;
         if !names.insert(name.clone()) {
             return Err(St3Error::new(
-                "duplicate-gate",
-                format!("gate `{name}` repeats"),
+                "duplicate-terminal-control",
+                format!("terminal control `{name}` repeats"),
             ));
         }
         ensure_only_properties(gate, &["driver"])?;
         let driver = property_string(gate, "driver")?.ok_or_else(|| {
             St3Error::new(
-                "missing-gate-driver",
-                format!("gate `{name}` needs a driver"),
+                "missing-terminal-control-driver",
+                format!("terminal control `{name}` needs a driver"),
             )
         })?;
         if !matches!(driver.as_str(), "claude" | "codex" | "pi" | "opencode") {
             return Err(St3Error::new(
-                "invalid-gate-driver",
-                format!("invalid gate driver `{driver}`"),
+                "invalid-terminal-control-driver",
+                format!("invalid terminal control driver `{driver}`"),
             ));
         }
-        let children = gate
-            .children()
-            .ok_or_else(|| St3Error::new("empty-gate", format!("gate `{name}` is empty")))?;
+        let children = gate.children().ok_or_else(|| {
+            St3Error::new(
+                "empty-terminal-control",
+                format!("terminal control `{name}` is empty"),
+            )
+        })?;
         reject_unknown_children(
             children,
             &["contains", "selected", "key", "max-inputs"],
-            "gate",
+            "terminal control",
             &name,
         )?;
         unique_child(children, "selected")?;
@@ -1811,8 +1859,8 @@ fn validate_supervisor(node: &KdlNode) -> Result<(), St3Error> {
             .collect::<Vec<_>>();
         if matchers == 0 || keys.is_empty() {
             return Err(St3Error::new(
-                "invalid-gate",
-                format!("gate `{name}` needs a matcher and a key"),
+                "invalid-terminal-control",
+                format!("terminal control `{name}` needs a matcher and a key"),
             ));
         }
         for key in &keys {
@@ -1822,16 +1870,16 @@ fn validate_supervisor(node: &KdlNode) -> Result<(), St3Error> {
                 "enter" | "escape" | "tab" | "space" | "up" | "down" | "left" | "right"
             ) {
                 return Err(St3Error::new(
-                    "invalid-gate-key",
-                    format!("invalid gate key `{key}`"),
+                    "invalid-terminal-control-key",
+                    format!("invalid terminal control key `{key}`"),
                 ));
             }
         }
         let max_inputs = child_integer(children, "max-inputs")?.unwrap_or(keys.len() as i128);
         if max_inputs < keys.len() as i128 || max_inputs > u32::MAX as i128 {
             return Err(St3Error::new(
-                "invalid-gate-limit",
-                format!("gate `{name}` has an invalid max-inputs value"),
+                "invalid-terminal-control-limit",
+                format!("terminal control `{name}` has an invalid max-inputs value"),
             ));
         }
     }
@@ -2052,8 +2100,26 @@ fn validate_string_map(node: &KdlNode, environment: bool) -> Result<(), St3Error
         }
         if environment {
             validate_environment_name(name)?;
+            if crate::plan::is_reserved_context_name(name) {
+                return Err(St3Error::new(
+                    "reserved-context-variable",
+                    format!("environment cannot override `{name}`"),
+                ));
+            }
         }
         one_string(child)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_deferred_environment(node: &KdlNode) -> Result<(), St3Error> {
+    if node.name().value() == "env" {
+        validate_string_map(node, true)?;
+    }
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            validate_deferred_environment(child)?;
+        }
     }
     Ok(())
 }
@@ -2216,13 +2282,13 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     })
 }
 
-pub fn supervisor_gates(value: &Value) -> Vec<GateSpec> {
+pub fn supervisor_terminal_controls(value: &Value) -> Vec<crate::model::TerminalControlSpec> {
     let Some(children) = value.get("children").and_then(Value::as_array) else {
         return Vec::new();
     };
     children
         .iter()
-        .filter(|child| child.get("name").and_then(Value::as_str) == Some("gate"))
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some("terminal-control"))
         .filter_map(|gate| {
             let name = gate
                 .get("arguments")?
@@ -2257,7 +2323,7 @@ pub fn supervisor_gates(value: &Value) -> Vec<GateSpec> {
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(keys.len() as u32);
-            Some(GateSpec {
+            Some(crate::model::TerminalControlSpec {
                 name,
                 driver,
                 contains,
@@ -2267,6 +2333,57 @@ pub fn supervisor_gates(value: &Value) -> Vec<GateSpec> {
             })
         })
         .collect()
+}
+
+pub fn agent_under(value: &Value) -> Vec<crate::model::UnderSpec> {
+    let Some(children) = value.get("children").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some("under"))
+        .filter_map(|under| {
+            let target = under.get("arguments")?.as_array()?.first()?.as_str()?;
+            let agent = if target.starts_with("agent/") {
+                target.to_owned()
+            } else {
+                format!("agent/{target}")
+            };
+            let reason = under
+                .pointer("/properties/reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Some(crate::model::UnderSpec { agent, reason })
+        })
+        .collect()
+}
+
+fn normalize_agent_under(value: &mut Value, default_host: &str) {
+    let Some(children) = value.get_mut("children").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for child in children
+        .iter_mut()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some("under"))
+    {
+        let Some(target) = child
+            .get_mut("arguments")
+            .and_then(Value::as_array_mut)
+            .and_then(|arguments| arguments.first_mut())
+        else {
+            continue;
+        };
+        let Some(name) = target.as_str() else {
+            continue;
+        };
+        let name = name.strip_prefix("agent/").unwrap_or(name);
+        let identity = if name.contains('.') {
+            name.to_owned()
+        } else {
+            format!("{default_host}.{name}")
+        };
+        *target = Value::String(format!("agent/{identity}"));
+    }
 }
 
 fn canonical_child_value<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -2971,16 +3088,17 @@ subgraph {
 version 2
 subgraph {
   plan "build" state="ready" {
+    goal "Complete plan build."
     step "build" {
       title "The first step passes"
       subgraph { exec "one" { command "true"; restart "never" } }
-      judges { field "status" "exec/one" is "exited" }
+      gate "condition-1" { field "status" "exec/one" is "exited" }
     }
 
     step "review" {
       title "The work is reviewed"
       depends-on { step "build" completed }
-      judges { field "decision" "resource/review" is "approved" }
+      gate "condition-2" { field "decision" "resource/review" is "approved" }
     }
   }
 }
@@ -3007,14 +3125,13 @@ subgraph {
                 command "true"
               }
               plan "proof" state="ready" {
+                goal "Complete plan proof."
                 step "verify" {
-                  title "The local judge passes"
-                  judges {
-                    judge "verify" {
-                      exec "true"
-                      host "local"
-                      workspace "."
-                    }
+                  title "The local gate passes"
+                  gate "verify" {
+                    exec "true"
+                    host "local"
+                    workspace "."
                   }
                 }
               }
@@ -3027,9 +3144,9 @@ subgraph {
             intent.subjects["exec/setup"].member.as_ref().unwrap().host,
             "node-a"
         );
-        let JudgeSpec::Mechanical { host, .. } = &intent.plans["proof"].steps["verify"].judges[0]
+        let GateSpec::Mechanical { host, .. } = &intent.plans["proof"].steps["verify"].gates[0]
         else {
-            panic!("the test judge is not mechanical");
+            panic!("the test gate is not mechanical");
         };
         assert_eq!(host, "node-a");
     }
@@ -3069,6 +3186,58 @@ subgraph {
         assert_eq!(member.restart_intensity.interval_ms, 120_000);
         assert_eq!(member.restart_intensity.delay_ms, 3_000);
         assert_eq!(member.restart_intensity.mode, "fail");
+    }
+
+    #[test]
+    fn under_is_repeatable_non_owning_agent_metadata() {
+        let source = r#"
+version 2
+subgraph {
+  agent "lead" {
+    workspace "/work"
+    under "worker" reason="the worker supplies a specialist view"
+    harness "codex" { prompt "Coordinate only when needed." }
+  }
+  agent "worker" {
+    workspace "/work"
+    under "lead" reason="the lead combines the result"
+    under "missing"
+    harness "codex" { prompt "Do the assigned work." }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let worker = agent_under(&intent.subjects["agent/node.worker"].desired);
+        assert_eq!(worker.len(), 2);
+        assert_eq!(worker[0].agent, "agent/node.lead");
+        assert_eq!(
+            worker[0].reason.as_deref(),
+            Some("the lead combines the result")
+        );
+
+        let store = crate::store::Store::open_memory("node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing agent"))
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("contains a cycle"))
+        );
     }
 
     #[test]

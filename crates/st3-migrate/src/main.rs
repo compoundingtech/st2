@@ -465,7 +465,7 @@ fn transform_eval(
     identities.sort_by_key(|identity| std::cmp::Reverse(identity.len()));
     identities.dedup();
     for identity in identities {
-        let run_identity = format!("{identity}.${{PLAN_RUN}}");
+        let run_identity = format!("{identity}.${{ST_PLAN_RUN}}");
         legacy = legacy.replace(&identity, &run_identity);
         for field in ["agent", "identity", "from", "to"] {
             legacy = legacy.replace(
@@ -474,7 +474,7 @@ fn transform_eval(
             );
         }
     }
-    legacy = legacy.replace("${EVAL_ROOT}", "${WORKSPACE}");
+    legacy = legacy.replace("${EVAL_ROOT}", "${ST_WORKSPACE}");
     let name = cell
         .file_name()
         .and_then(|value| value.to_str())
@@ -547,39 +547,45 @@ fn transform_eval_checkpoint(
             kick.content.clone()
         };
         team_checkpoint.push_str(&format!(
-            "        message \"kickoff/${{PLAN_RUN}}\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
+            "        message \"kickoff/${{ST_PLAN_RUN}}\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
             eval_agent_identity(&kick.from, host),
             eval_agent_identity(&kick.to, host),
             content
         ));
     }
-    team_checkpoint.push_str("      }\n      judges {\n");
+    team_checkpoint.push_str("      }\n");
     let agents = spec
         .agents
         .iter()
         .chain(eval.agents.iter())
         .collect::<Vec<_>>();
     if agents.is_empty() {
-        team_checkpoint.push_str(&format!("        exists {scope:?}\n"));
+        team_checkpoint.push_str(&format!(
+            "      gate \"eval scope exists\" {{ exists {scope:?} }}\n"
+        ));
     } else {
-        for agent in agents {
+        for (ordinal, agent) in agents.into_iter().enumerate() {
             let subject = format!("agent/{}", eval_agent_identity(&agent.id, host));
             if agent.driver.is_some() {
                 // The checkpoint reconciler requires a native driver to reach ready, working, or
                 // idle before it evaluates this explicit existence predicate.
-                team_checkpoint.push_str(&format!("        exists {subject:?}\n"));
+                team_checkpoint.push_str(&format!(
+                    "      gate {:?} {{ exists {subject:?} }}\n",
+                    format!("team member {} is ready", ordinal + 1)
+                ));
             } else {
                 team_checkpoint.push_str(&format!(
-                    "        field \"status\" {subject:?} \"is\" \"running\"\n"
+                    "      gate {:?} {{ field \"status\" {subject:?} \"is\" \"running\" }}\n",
+                    format!("team member {} is running", ordinal + 1)
                 ));
             }
         }
     }
     team_checkpoint.push_str(&format!(
-        "        deadline {:?}\n",
+        "      gate \"eval team startup deadline\" {{ deadline {:?} }}\n",
         format!("{}ms", eval.max_timeout.as_millis())
     ));
-    team_checkpoint.push_str("      }\n    }\n");
+    team_checkpoint.push_str("    }\n");
 
     for (ordinal, step) in eval.run_steps.iter().enumerate() {
         let subject = format!("eval/{name}/run/{ordinal}-{}", step.id);
@@ -592,8 +598,8 @@ fn transform_eval_checkpoint(
         output.push_str(&format!("          host {host:?}\n"));
         output.push_str(&format!(
             "          workspace {:?}\n          cwd {:?}\n          command {:?}\n          restart \"never\"\n",
-            "${EVAL_ROOT}",
-            step.workspace.as_deref().unwrap_or("${EVAL_ROOT}"),
+            "${ST_WORKSPACE}",
+            step.workspace.as_deref().unwrap_or("${ST_WORKSPACE}"),
             rewrite_bus_command(&step.command)
         ));
         output.push_str("          env {\n");
@@ -602,9 +608,9 @@ fn transform_eval_checkpoint(
                 output.push_str(&format!("            {key} {value:?}\n"));
             }
         }
-        output.push_str("            CATALOG \"${EVAL_ROOT}\"\n");
-        output.push_str("            ST_ROOT \"${EVAL_ROOT}/.st3-messages\"\n");
-        output.push_str("            ST3_MESSAGE_ROOT \"${EVAL_ROOT}/.st3-messages\"\n");
+        output.push_str("            CATALOG \"${ST_WORKSPACE}\"\n");
+        output.push_str("            ST_ROOT \"${ST_WORKSPACE}/.st3-messages\"\n");
+        output.push_str("            ST3_MESSAGE_ROOT \"${ST_WORKSPACE}/.st3-messages\"\n");
         output.push_str("          }\n");
         if !step.unset.is_empty() {
             output.push_str("          unset");
@@ -613,22 +619,25 @@ fn transform_eval_checkpoint(
             }
             output.push('\n');
         }
-        output.push_str("        }\n      }\n      judges {\n");
+        output.push_str("        }\n      }\n");
         output.push_str(&format!(
-            "        field \"status\" {:?} \"is\" \"exited\"\n",
+            "      gate {:?} {{ field \"status\" {:?} \"is\" \"exited\" }}\n",
+            format!("run step {} exited", step.id),
             format!("exec/{subject}")
         ));
         if !step.allow_nonzero {
             output.push_str(&format!(
-                "        field \"exit_code\" {:?} \"is\" 0\n",
+                "      gate {:?} {{ field \"exit_code\" {:?} \"is\" 0 }}\n",
+                format!("run step {} succeeded", step.id),
                 format!("exec/{subject}")
             ));
         }
         output.push_str(&format!(
-            "        deadline {:?}\n",
+            "      gate {:?} {{ deadline {:?} }}\n",
+            format!("run step {} deadline", step.id),
             format!("{}ms", eval.max_timeout.as_millis())
         ));
-        output.push_str("      }\n    }\n");
+        output.push_str("    }\n");
     }
 
     output.push_str(&team_checkpoint);
@@ -652,16 +661,16 @@ fn transform_eval_checkpoint(
         );
     }
 
-    output.push_str("    checkpoint \"All held-out judges pass\" {\n");
-    let signal_judges = eval
+    output.push_str("    checkpoint \"All held-out gates pass\" {\n");
+    let signal_gates = eval
         .judges
         .iter()
         .enumerate()
         .filter(|(_, judge)| judge.signal)
         .collect::<Vec<_>>();
-    if !signal_judges.is_empty() {
+    if !signal_gates.is_empty() {
         output.push_str("      subgraph {\n");
-        for (ordinal, judge) in signal_judges {
+        for (ordinal, judge) in signal_gates {
             let command = match &judge.kind {
                 JudgeKind::Bash(command) => rewrite_bus_command(command),
                 JudgeKind::Declarative(checks) => declarative_command(checks),
@@ -673,18 +682,17 @@ fn transform_eval_checkpoint(
                 }
             };
             output.push_str(&format!(
-                "        exec {:?} {{ host {host:?}; workspace \"${{EVAL_ROOT}}\"; command {command:?}; restart \"never\"; env {{ CATALOG \"${{EVAL_ROOT}}\"; ST_ROOT \"${{EVAL_ROOT}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{EVAL_ROOT}}/.st3-messages\" }} }}\n",
+                "        exec {:?} {{ host {host:?}; workspace \"${{ST_WORKSPACE}}\"; command {command:?}; restart \"never\"; env {{ CATALOG \"${{ST_WORKSPACE}}\"; ST_ROOT \"${{ST_WORKSPACE}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{ST_WORKSPACE}}/.st3-messages\" }} }}\n",
                 format!("eval/{name}/signal/{ordinal}")
             ));
         }
         output.push_str("      }\n");
     }
-    output.push_str("      judges {\n");
-    let mut gating_judges = 0usize;
+    let mut gating_gates = 0usize;
     for judge in eval.judges.iter().filter(|judge| !judge.signal) {
-        gating_judges += 1;
+        gating_gates += 1;
         match &judge.kind {
-            JudgeKind::Bash(command) => write_mechanical_judge(
+            JudgeKind::Bash(command) => write_mechanical_gate(
                 &mut output,
                 &judge.name,
                 &rewrite_bus_command(command),
@@ -693,7 +701,7 @@ fn transform_eval_checkpoint(
             ),
             JudgeKind::Declarative(checks) => {
                 let command = declarative_command(checks);
-                write_mechanical_judge(
+                write_mechanical_gate(
                     &mut output,
                     &judge.name,
                     &command,
@@ -708,18 +716,18 @@ fn transform_eval_checkpoint(
                     .find(|candidate| &candidate.id == agent)
                     .and_then(infer_agent_model)
                     .unwrap_or_else(|| "gpt-5.6-sol".into());
-                output.push_str(&format!("        judge {:?} type=\"llm\" {{\n", judge.name));
+                output.push_str(&format!("      gate {:?} type=\"llm\" {{\n", judge.name));
                 output.push_str(&format!(
-                    "          model {model:?}\n          host {host:?}\n          workspace \"${{EVAL_ROOT}}\"\n          tools \"shell\" \"git\"\n          env {{ CATALOG \"${{EVAL_ROOT}}\"; ST_ROOT \"${{EVAL_ROOT}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{EVAL_ROOT}}/.st3-messages\" }}\n          token-budget 8192\n          time-limit {:?}\n          prompt {:?}\n",
+                    "        model {model:?}\n        host {host:?}\n        workspace \"${{ST_WORKSPACE}}\"\n        tools \"shell\" \"git\"\n        env {{ CATALOG \"${{ST_WORKSPACE}}\"; ST_ROOT \"${{ST_WORKSPACE}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{ST_WORKSPACE}}/.st3-messages\" }}\n        token-budget 8192\n        time-limit {:?}\n        prompt {:?}\n",
                     format!("{}ms", judge.timeout.unwrap_or(eval.max_timeout).as_millis()),
                     prompt
                 ));
-                output.push_str("        }\n");
+                output.push_str("      }\n");
             }
         }
     }
-    if gating_judges == 0 {
-        write_mechanical_judge(
+    if gating_gates == 0 {
+        write_mechanical_gate(
             &mut output,
             "The non-gating signals were recorded",
             "true",
@@ -728,17 +736,17 @@ fn transform_eval_checkpoint(
         );
     }
     output.push_str(&format!(
-        "        deadline {:?}\n",
+        "      gate \"held-out gate deadline\" {{ deadline {:?} }}\n",
         format!("{}ms", eval.max_timeout.as_millis())
     ));
-    output.push_str("      }\n    }\n");
+    output.push_str("    }\n");
     output.push_str("    checkpoint \"The temporary eval scope is empty\" {\n      subgraph {\n");
     output.push_str(&format!(
         "        scope {:?} {{ stop }}\n",
         format!("eval/{name}")
     ));
     output.push_str(&format!(
-        "      }}\n      judges {{ empty {scope:?} }}\n    }}\n"
+        "      }}\n      gate \"temporary eval scope is empty\" {{ empty {scope:?} }}\n    }}\n"
     ));
     output.push_str("  }\n}\n");
     let mut formatted: KdlDocument = output
@@ -770,9 +778,10 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n",
-        format!("eval/{name}/${{PLAN_RUN}}"),
-        format!("eval/{name}")
+        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n      goal {:?}\n",
+        format!("eval/{name}/${{ST_PLAN_RUN}}"),
+        format!("eval/{name}"),
+        format!("Complete the migrated {name} eval.")
     );
     let mut prior = None::<String>;
     for (ordinal, checkpoint) in stages.nodes().iter().enumerate() {
@@ -792,25 +801,19 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         let mut body_nodes = Vec::new();
         if let Some(body) = checkpoint.children() {
             for child in body.nodes() {
-                let mut child = child.clone();
-                if child.name().value() == "judges"
-                    && let Some(judges) = child.children_mut()
+                let child = child.clone();
+                if child.name().value() == "gate"
+                    && let Some(gate) = child.children()
+                    && gate.nodes().len() == 1
+                    && gate.nodes()[0].name().value() == "deadline"
                 {
-                    for deadline in judges
-                        .nodes()
+                    timeout = gate.nodes()[0]
+                        .entries()
                         .iter()
-                        .filter(|node| node.name().value() == "deadline")
-                    {
-                        timeout = deadline
-                            .entries()
-                            .iter()
-                            .find(|entry| entry.name().is_none())
-                            .and_then(|entry| entry.value().as_string())
-                            .map(str::to_owned);
-                    }
-                    judges
-                        .nodes_mut()
-                        .retain(|node| node.name().value() != "deadline");
+                        .find(|entry| entry.name().is_none())
+                        .and_then(|entry| entry.value().as_string())
+                        .map(str::to_owned);
+                    continue;
                 }
                 body_nodes.push(child);
             }
@@ -824,19 +827,13 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         }
         output.push_str(" {\n");
         output.push_str(&format!("        title {title:?}\n"));
-        if !cleanup && let Some(prior) = &prior {
+        if let Some(prior) = &prior {
             output.push_str(&format!(
-                "        depends-on {{ step {prior:?} completed }}\n"
+                "        depends-on {{ step {prior:?} {} }}\n",
+                if cleanup { "terminal" } else { "completed" }
             ));
         }
         for child in body_nodes {
-            if child.name().value() == "judges"
-                && child
-                    .children()
-                    .is_some_and(|children| children.nodes().is_empty())
-            {
-                continue;
-            }
             output.push_str(&child.to_string());
             output.push('\n');
         }
@@ -887,10 +884,10 @@ fn write_eval_agent(
     if let Some(workspace) = &agent.workspace {
         output.push_str(&format!(
             "      workspace {:?}\n",
-            format!("${{EVAL_ROOT}}/{workspace}")
+            format!("${{ST_WORKSPACE}}/{workspace}")
         ));
     } else {
-        output.push_str("      workspace \"${EVAL_ROOT}\"\n");
+        output.push_str("      workspace \"${ST_WORKSPACE}\"\n");
     }
     if let Some(supervisor) = supervisor {
         output.push_str(&format!("      supervisor {supervisor:?}\n"));
@@ -911,9 +908,9 @@ fn write_eval_agent(
             output.push_str(&format!("        {key} {:?}\n", rewrite_bus_command(value)));
         }
     }
-    output.push_str("        CATALOG \"${EVAL_ROOT}\"\n");
-    output.push_str("        ST_ROOT \"${EVAL_ROOT}/.st3-messages\"\n");
-    output.push_str("        ST3_MESSAGE_ROOT \"${EVAL_ROOT}/.st3-messages\"\n");
+    output.push_str("        CATALOG \"${ST_WORKSPACE}\"\n");
+    output.push_str("        ST_ROOT \"${ST_WORKSPACE}/.st3-messages\"\n");
+    output.push_str("        ST3_MESSAGE_ROOT \"${ST_WORKSPACE}/.st3-messages\"\n");
     output.push_str("      }\n");
     for exec in &agent.execs {
         if exec.derived {
@@ -931,7 +928,7 @@ fn write_eval_agent(
 fn write_eval_supervisor(output: &mut String, supervisor: &str, development_channel: bool) {
     output.push_str(&format!("        supervisor {supervisor:?} {{\n"));
     output.push_str(
-        "          gate \"claude-workspace-trust\" driver=\"claude\" {\n\
+        "          terminal-control \"claude-workspace-trust\" driver=\"claude\" {\n\
                    contains \"Quick safety check: Is this a project you created or one you trust?\"\n\
                    key \"enter\"\n\
                    max-inputs 1\n\
@@ -939,7 +936,7 @@ fn write_eval_supervisor(output: &mut String, supervisor: &str, development_chan
     );
     if development_channel {
         output.push_str(
-            "          gate \"claude-development-channel\" driver=\"claude\" {\n\
+            "          terminal-control \"claude-development-channel\" driver=\"claude\" {\n\
                        contains \"WARNING: Loading development channels\"\n\
                        contains \"Channels: server:st3\"\n\
                        key \"enter\"\n\
@@ -1013,7 +1010,7 @@ fn write_team_completion_checkpoint(
     timeout_ms: u64,
 ) {
     let mut command = format!(
-        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff/${{PLAN_RUN}}",
+        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff/${{ST_PLAN_RUN}}",
         timeout_ms.div_ceil(1_000),
         shell(requester),
         shell(supervisor)
@@ -1022,23 +1019,23 @@ fn write_team_completion_checkpoint(
         command.push(' ');
         command.push_str(&shell(worker));
     }
-    output.push_str("    checkpoint \"The team reported completion\" {\n      judges {\n");
-    let judge_name = if workers.is_empty() {
+    output.push_str("    checkpoint \"The team reported completion\" {\n");
+    let gate_name = if workers.is_empty() {
         "The supervisor confirmed after kickoff"
     } else {
         "Every worker reported before the supervisor confirmed"
     };
-    write_raw_mechanical_judge(
+    write_raw_mechanical_gate(
         output,
-        judge_name,
+        gate_name,
         &command,
         host,
         timeout_ms.saturating_add(5_000),
     );
-    output.push_str("      }\n    }\n");
+    output.push_str("    }\n");
 }
 
-fn write_mechanical_judge(
+fn write_mechanical_gate(
     output: &mut String,
     name: &str,
     command: &str,
@@ -1046,23 +1043,23 @@ fn write_mechanical_judge(
     timeout_ms: u64,
 ) {
     let command =
-        format!("st3 message export \"${{EVAL_ROOT}}/.st3-messages\" >/dev/null && {command}");
-    write_raw_mechanical_judge(output, name, &command, host, timeout_ms);
+        format!("st3 message export \"${{ST_WORKSPACE}}/.st3-messages\" >/dev/null && {command}");
+    write_raw_mechanical_gate(output, name, &command, host, timeout_ms);
 }
 
-fn write_raw_mechanical_judge(
+fn write_raw_mechanical_gate(
     output: &mut String,
     name: &str,
     command: &str,
     host: &str,
     timeout_ms: u64,
 ) {
-    output.push_str(&format!("        judge {name:?} {{\n"));
+    output.push_str(&format!("      gate {name:?} {{\n"));
     output.push_str(&format!(
-        "          exec {command:?}\n          host {host:?}\n          workspace \"${{EVAL_ROOT}}\"\n          env {{ CATALOG \"${{EVAL_ROOT}}\"; ST_ROOT \"${{EVAL_ROOT}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{EVAL_ROOT}}/.st3-messages\" }}\n          time-limit {:?}\n",
+        "        exec {command:?}\n        host {host:?}\n        workspace \"${{ST_WORKSPACE}}\"\n        env {{ CATALOG \"${{ST_WORKSPACE}}\"; ST_ROOT \"${{ST_WORKSPACE}}/.st3-messages\"; ST3_MESSAGE_ROOT \"${{ST_WORKSPACE}}/.st3-messages\" }}\n        time-limit {:?}\n",
         format!("{timeout_ms}ms")
     ));
-    output.push_str("        }\n");
+    output.push_str("      }\n");
 }
 
 fn declarative_command(checks: &[Check]) -> String {
@@ -1540,21 +1537,24 @@ agent "worker" {
         let plan = intent.plans.values().next().unwrap();
         let team = &plan.steps["00-the-eval-team-is-running"];
         let team_graph = team.subgraph_kdl.as_deref().unwrap();
-        assert!(team_graph.contains("agent \"mix.sup.${PLAN_RUN}\""));
-        assert!(team_graph.contains("identity \"local.judge.${PLAN_RUN}\""));
-        assert!(team_graph.contains("message \"kickoff/${PLAN_RUN}\""));
+        assert!(team_graph.contains("agent \"mix.sup.${ST_PLAN_RUN}\""));
+        assert!(team_graph.contains("identity \"local.judge.${ST_PLAN_RUN}\""));
+        assert!(team_graph.contains("message \"kickoff/${ST_PLAN_RUN}\""));
         assert!(translated.contains("model gpt-5.6-sol"));
-        assert!(team.judges.iter().any(|judge| {
+        assert!(translated.contains("${ST_WORKSPACE}"));
+        assert!(!translated.contains("${EVAL_ROOT}"));
+        assert!(team.gates.iter().any(|gate| {
             matches!(
-                judge,
-                st3::model::JudgeSpec::Exists { subject } if subject == "agent/mix.sup.${PLAN_RUN}"
+                gate,
+                st3::model::GateSpec::Exists { subject, .. }
+                    if subject == "agent/mix.sup.${ST_PLAN_RUN}"
             )
         }));
         assert!(translated.contains("title \"The team reported completion\""));
         assert!(translated.contains(".st3-migration/wait-team-done.sh"));
-        assert!(translated.contains("kickoff/${PLAN_RUN}"));
+        assert!(translated.contains("kickoff/${ST_PLAN_RUN}"));
         assert!(translated.contains("supervisor eval-"));
-        assert!(translated.contains("gate claude-workspace-trust"));
+        assert!(translated.contains("terminal-control claude-workspace-trust"));
         assert!(
             !translated.contains("wait-team-done.sh 'requester' 'mix.sup' kickoff 'local.judge'")
         );
@@ -1567,7 +1567,7 @@ agent "worker" {
     }
 
     #[test]
-    fn eval_run_steps_finish_before_the_team_starts_and_judges_wait_for_completion() {
+    fn eval_run_steps_finish_before_the_team_starts_and_gates_wait_for_completion() {
         let source = r#"
             agent "sup" { command "sleep 60" }
             eval {
@@ -1593,10 +1593,10 @@ agent "worker" {
         let completion = translated
             .find("title \"The team reported completion\"")
             .unwrap();
-        let judges = translated
-            .find("title \"All held-out judges pass\"")
+        let gates = translated
+            .find("title \"All held-out gates pass\"")
             .unwrap();
-        assert!(run < team && team < completion && completion < judges);
+        assert!(run < team && team < completion && completion < gates);
     }
 
     #[test]

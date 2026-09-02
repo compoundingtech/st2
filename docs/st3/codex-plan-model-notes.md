@@ -76,5 +76,5 @@ The small model works because it keeps these concerns separate:
 An st3 planning feature could model each item as a graph subject. Claims could record status changes,
 evidence, blockers, and review decisions without rewriting one shared Markdown file.
 
-The graph should not infer completion from process exit alone. A test receipt, a judge result, or an
+The graph should not infer completion from process exit alone. A test receipt, a gate result, or an
 explicit human claim should provide the completion evidence.

@@ -10,7 +10,7 @@ use sha2::Digest as _;
 use tokio::sync::Notify;
 
 use crate::model::{
-    CheckpointSpec, ClaimInput, DependencySpec, DesiredSubject, JudgeSpec, LaunchSpec, MemberKind,
+    CheckpointSpec, ClaimInput, DependencySpec, DesiredSubject, GateSpec, LaunchSpec, MemberKind,
     MemberLifecycle, MemberSpec, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
     RestartIntensity, RestartType, StepSpec, UsedPlanSpec,
 };
@@ -1155,17 +1155,106 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .map(|step| (step.step.as_str(), step))
             .collect::<HashMap<_, _>>();
-        let normal_failed = flat.iter().any(|step| {
+        if run.phase == "normal" {
+            let admitted = flat.iter().filter(|step| !step.spec.finally).any(|step| {
+                views.get(step.spec.path.as_str()).is_some_and(|view| {
+                    view.attempt > 1
+                        || matches!(
+                            view.status.as_str(),
+                            "ready"
+                                | "claimed"
+                                | "working"
+                                | "verifying"
+                                | "completed"
+                                | "failed"
+                                | "cancelled"
+                        )
+                })
+            });
+            if !admitted {
+                let variables = crate::store::plan_run_variables(run, &run.revision);
+                for baseline in &plan.baselines {
+                    for gate in &baseline.gates {
+                        if !matches!(
+                            self.evaluate_context_gate(
+                                run,
+                                &run.subject,
+                                &plan.id,
+                                &plan.revision,
+                                1,
+                                gate,
+                                &variables,
+                            )?,
+                            GateOutcome::Pass
+                        ) {
+                            changed |= self.store.set_plan_run_state(
+                                &run.id,
+                                "blocked",
+                                "normal",
+                                Some(&format!("plan baseline `{}` does not hold", baseline.name)),
+                            )?;
+                            return Ok(changed);
+                        }
+                    }
+                }
+            }
+            let blocked_by_baseline = run.status == "blocked"
+                && self
+                    .store
+                    .latest_claim(&run.subject, Some("plan-run.state"))?
+                    .and_then(|claim| {
+                        claim
+                            .body
+                            .pointer("/fields/reason")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|reason| reason.starts_with("plan baseline `"));
+            if blocked_by_baseline {
+                changed |= self
+                    .store
+                    .set_plan_run_state(&run.id, "running", "normal", None)?;
+            } else if run.status == "blocked" {
+                return Ok(changed);
+            }
+        }
+        let mut normal_failed = flat.iter().any(|step| {
             !step.spec.finally
-                && views
-                    .get(step.spec.path.as_str())
-                    .is_some_and(|view| view.status == "failed")
+                && views.get(step.spec.path.as_str()).is_some_and(|view| {
+                    view.status == "failed" && view.attempt >= step.spec.retry.attempts
+                })
         });
+        let mut normal_failure_reason = normal_failed.then(|| "a normal step failed".to_owned());
         let normal_complete = flat.iter().filter(|step| !step.spec.finally).all(|step| {
             views
                 .get(step.spec.path.as_str())
                 .is_some_and(|view| view.status == "completed")
         });
+        if run.phase == "normal" && normal_complete && !normal_failed {
+            let variables = crate::store::plan_run_variables(run, &run.revision);
+            if !self.products_hold_with_variables(&plan.products, &variables)? {
+                return Ok(changed);
+            }
+            for gate in &plan.gates {
+                match self.evaluate_context_gate(
+                    run,
+                    &run.subject,
+                    &plan.id,
+                    &plan.revision,
+                    1,
+                    gate,
+                    &variables,
+                )? {
+                    GateOutcome::Pass => {}
+                    GateOutcome::Pending => return Ok(changed),
+                    GateOutcome::Fail(reason) => {
+                        normal_failed = true;
+                        normal_failure_reason = Some(reason);
+                        break;
+                    }
+                }
+            }
+        }
         if run.phase == "normal" && (normal_failed || normal_complete) {
             for step in flat.iter().filter(|step| !step.spec.finally) {
                 let view = views[step.spec.path.as_str()];
@@ -1186,14 +1275,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                     &run.id,
                     "running",
                     "final",
-                    normal_failed.then_some("a normal step failed"),
+                    normal_failure_reason.as_deref(),
                 )?;
             } else {
                 changed |= self.store.set_plan_run_state(
                     &run.id,
                     if normal_failed { "failed" } else { "completed" },
                     "terminal",
-                    normal_failed.then_some("a normal step failed"),
+                    normal_failure_reason.as_deref(),
                 )?;
             }
             return Ok(changed);
@@ -1257,7 +1346,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .blocked_reason
                     .as_deref()
                     .is_some_and(|reason| reason.starts_with("the assigned agent `"));
-            if view.status == "pending" || assignment_blocked {
+            let baseline_blocked = view.status == "blocked"
+                && view
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("step baseline `"));
+            if view.status == "pending" || assignment_blocked || baseline_blocked {
                 if view
                     .not_before_unix_ms
                     .is_some_and(|not_before| not_before > now_ms())
@@ -1266,6 +1360,32 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 if !self.step_dependencies_hold(run, &step, &views)? {
                     continue;
+                }
+                let mut baseline_holds = true;
+                for baseline in &step.spec.baselines {
+                    for gate in &baseline.gates {
+                        if !matches!(
+                            self.evaluate_plan_gate(run, &step, view, gate)?,
+                            GateOutcome::Pass
+                        ) {
+                            changed |= self.store.set_step_state(
+                                &view.subject,
+                                "blocked",
+                                Some(&format!("step baseline `{}` does not hold", baseline.name)),
+                            )?;
+                            baseline_holds = false;
+                            break;
+                        }
+                    }
+                    if !baseline_holds {
+                        break;
+                    }
+                }
+                if !baseline_holds {
+                    continue;
+                }
+                if baseline_blocked {
+                    changed |= self.store.set_step_state(&view.subject, "pending", None)?;
                 }
                 if let Some(assignee) = &view.assignee
                     && self.store.selected_desired_revision(assignee)?.is_none()
@@ -1333,24 +1453,24 @@ impl<R: RuntimeControl> Reconciler<R> {
             if !self.products_hold(run, &step, view)? {
                 continue;
             }
-            let mut judges_pass = true;
-            for judge in &step.spec.judges {
-                match self.evaluate_plan_judge(run, &step, view, judge)? {
-                    JudgeOutcome::Pass => {}
-                    JudgeOutcome::Pending => {
-                        judges_pass = false;
+            let mut gates_pass = true;
+            for gate in &step.spec.gates {
+                match self.evaluate_plan_gate(run, &step, view, gate)? {
+                    GateOutcome::Pass => {}
+                    GateOutcome::Pending => {
+                        gates_pass = false;
                         break;
                     }
-                    JudgeOutcome::Fail(reason) => {
+                    GateOutcome::Fail(reason) => {
                         changed |=
                             self.store
                                 .set_step_state(&view.subject, "failed", Some(&reason))?;
-                        judges_pass = false;
+                        gates_pass = false;
                         break;
                     }
                 }
             }
-            if judges_pass {
+            if gates_pass {
                 changed |= self
                     .store
                     .set_step_state(&view.subject, "completed", None)?;
@@ -1520,7 +1640,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         return Ok(false);
                     }
                 }
-                DependencySpec::Predicate { judge } => {
+                DependencySpec::Predicate { gate } => {
                     let fake = crate::model::StepRunView {
                         subject: format!("step-run/{}/{}", run.id, step.spec.path),
                         run: run.subject.clone(),
@@ -1530,7 +1650,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         attempt: 1,
                         assignee: None,
                         title: None,
-                        goal: None,
+                        goals: Vec::new(),
+                        under: Vec::new(),
                         worker_reported: false,
                         lease_owner: None,
                         lease_incarnation: None,
@@ -1541,8 +1662,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         updated_at_unix_ms: run.updated_at_unix_ms,
                     };
                     if !matches!(
-                        self.evaluate_plan_judge(run, step, &fake, judge)?,
-                        JudgeOutcome::Pass
+                        self.evaluate_plan_gate(run, step, &fake, gate)?,
+                        GateOutcome::Pass
                     ) {
                         return Ok(false);
                     }
@@ -1585,9 +1706,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .to_string_lossy()
                         .into_owned();
                 }
-                member
-                    .environment
-                    .insert("ST3_WORKSPACE".into(), run.workspace.clone());
+                member.environment.extend(variables.clone());
                 member
                     .environment
                     .insert("ST3_RUN_DIR".into(), run.workspace.clone());
@@ -1664,7 +1783,15 @@ impl<R: RuntimeControl> Reconciler<R> {
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
         let variables = run_variables(run, step, view);
-        for product in &step.spec.products {
+        self.products_hold_with_variables(&step.spec.products, &variables)
+    }
+
+    fn products_hold_with_variables(
+        &self,
+        products: &[crate::model::ProductSpec],
+        variables: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        for product in products {
             let subject = crate::plan::interpolate(&product.subject, &variables)?;
             let Some(actual) = self.store.latest_actual_value(&subject)? else {
                 return Ok(false);
@@ -1678,56 +1805,80 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(true)
     }
 
-    fn evaluate_plan_judge(
+    fn evaluate_plan_gate(
         &self,
         run: &PlanRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
-        judge: &JudgeSpec,
-    ) -> Result<JudgeOutcome> {
+        gate: &GateSpec,
+    ) -> Result<GateOutcome> {
         let variables = run_variables(run, step, view);
-        let mut judge = judge.clone();
-        expand_judge(&mut judge, &variables, &run.workspace)?;
-        if let JudgeSpec::Human {
+        self.evaluate_context_gate(
+            run,
+            &view.subject,
+            step.spec.title.as_deref().unwrap_or(&step.spec.path),
+            &view.definition_hash,
+            view.attempt,
+            gate,
+            &variables,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_context_gate(
+        &self,
+        run: &PlanRunView,
+        subject: &str,
+        title: &str,
+        definition_hash: &str,
+        attempt: u32,
+        gate: &GateSpec,
+        variables: &BTreeMap<String, String>,
+    ) -> Result<GateOutcome> {
+        let mut gate = gate.clone();
+        expand_gate(&mut gate, &variables, &run.workspace)?;
+        if let GateSpec::Human {
             reviewer,
             question,
             review_targets,
-        } = &judge
+            ..
+        } = &gate
         {
-            return self.evaluate_plan_human_judge(
+            return self.evaluate_plan_human_gate(
                 run,
-                step,
-                view,
+                subject,
+                title,
+                definition_hash,
+                attempt,
                 reviewer,
                 question.as_deref(),
                 review_targets,
             );
         }
         let stage = CheckpointSpec {
-            subject: view.subject.clone(),
+            subject: subject.to_owned(),
             sequence: run.subject.clone(),
-            name: step.spec.path.clone(),
+            name: title.to_owned(),
             ordinal: 0,
-            judges: vec![judge.clone()],
+            gates: vec![gate.clone()],
         };
-        self.evaluate_judge(&stage, &judge)
+        self.evaluate_gate(&stage, &gate)
     }
 
-    fn evaluate_plan_human_judge(
+    fn evaluate_plan_human_gate(
         &self,
         run: &PlanRunView,
-        step: &RuntimeStep<'_>,
-        view: &crate::model::StepRunView,
+        subject: &str,
+        title: &str,
+        definition_hash: &str,
+        attempt: u32,
         reviewer: &str,
         question: Option<&str>,
         review_targets: &[String],
-    ) -> Result<JudgeOutcome> {
-        let question = question.map(str::to_owned).unwrap_or_else(|| {
-            format!(
-                "Approve {}?",
-                step.spec.title.as_deref().unwrap_or(&step.spec.path)
-            )
-        });
+    ) -> Result<GateOutcome> {
+        let question = question
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Approve {title}?"));
         let fields = BTreeMap::from([
             ("reviewer".into(), Value::String(reviewer.into())),
             ("question".into(), Value::String(question)),
@@ -1747,13 +1898,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             ("plan_revision".into(), Value::String(run.revision.clone())),
             (
                 "step_definition".into(),
-                Value::String(view.definition_hash.clone()),
+                Value::String(definition_hash.to_owned()),
             ),
-            ("attempt".into(), Value::from(view.attempt)),
+            ("attempt".into(), Value::from(attempt)),
         ]);
         let request_hash = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&fields)?));
         let request = self.store.append_claim(&ClaimInput {
-            subject: view.subject.clone(),
+            subject: subject.to_owned(),
             kind: "review.requested".into(),
             actor: None,
             fields,
@@ -1761,13 +1912,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: Some(format!(
                 "review-request:{}:{}",
-                view.subject,
+                subject,
                 &request_hash[..24]
             )),
         })?;
-        let decision = self
-            .store
-            .latest_claim(&view.subject, Some("review.decision"))?;
+        let decision = self.store.latest_claim(subject, Some("review.decision"))?;
         match decision.as_ref().and_then(|claim| {
             (claim.actor.as_deref() == Some(reviewer)
                 && claim
@@ -1783,11 +1932,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             })
             .flatten()
         }) {
-            Some("approved") => Ok(JudgeOutcome::Pass),
-            Some("rejected") => Ok(JudgeOutcome::Fail(
+            Some("approved") => Ok(GateOutcome::Pass),
+            Some("rejected") => Ok(GateOutcome::Fail(
                 "the human reviewer rejected the work".into(),
             )),
-            _ => Ok(JudgeOutcome::Pending),
+            _ => Ok(GateOutcome::Pending),
         }
     }
 
@@ -1864,14 +2013,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             )?;
             let mut all_pass = true;
             let deadline_failure = stage
-                .judges
+                .gates
                 .iter()
-                .filter(|judge| matches!(judge, JudgeSpec::Deadline { .. }))
-                .map(|judge| self.evaluate_judge(&stage, judge))
+                .filter(|gate| matches!(gate, GateSpec::Deadline { .. }))
+                .map(|gate| self.evaluate_gate(&stage, gate))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .find_map(|outcome| match outcome {
-                    JudgeOutcome::Fail(reason) => Some(reason),
+                    GateOutcome::Fail(reason) => Some(reason),
                     _ => None,
                 });
             if let Some(reason) = deadline_failure {
@@ -1881,18 +2030,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             if !self.checkpoint_subgraph_holds(&stage, desired)? {
                 continue;
             }
-            for judge in stage
-                .judges
+            for gate in stage
+                .gates
                 .iter()
-                .filter(|judge| !matches!(judge, JudgeSpec::Deadline { .. }))
+                .filter(|gate| !matches!(gate, GateSpec::Deadline { .. }))
             {
-                match self.evaluate_judge(&stage, judge)? {
-                    JudgeOutcome::Pass => {}
-                    JudgeOutcome::Pending => {
+                match self.evaluate_gate(&stage, gate)? {
+                    GateOutcome::Pass => {}
+                    GateOutcome::Pending => {
                         all_pass = false;
                         break;
                     }
-                    JudgeOutcome::Fail(reason) => {
+                    GateOutcome::Fail(reason) => {
                         self.fail_checkpoint(&stage, &scopes, &reason)?;
                         all_pass = false;
                         break;
@@ -2023,13 +2172,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 break;
             }
             let still_passes = stage
-                .judges
+                .gates
                 .iter()
-                .filter(|judge| !matches!(judge, JudgeSpec::Deadline { .. }))
-                .map(|judge| self.evaluate_judge(&stage, judge))
+                .filter(|gate| !matches!(gate, GateSpec::Deadline { .. }))
+                .map(|gate| self.evaluate_gate(&stage, gate))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
-                .all(|outcome| matches!(outcome, JudgeOutcome::Pass));
+                .all(|outcome| matches!(outcome, GateOutcome::Pass));
             if !still_passes {
                 break;
             }
@@ -2214,7 +2363,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             Err(_) => return Ok(()),
         };
         let normalized = screen.lines().map(str::trim).collect::<Vec<_>>().join("\n");
-        for gate in crate::graph::supervisor_gates(&supervisor.desired)
+        for gate in crate::graph::supervisor_terminal_controls(&supervisor.desired)
             .into_iter()
             .filter(|gate| gate.driver == driver)
         {
@@ -2487,9 +2636,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn evaluate_judge(&self, stage: &CheckpointSpec, judge: &JudgeSpec) -> Result<JudgeOutcome> {
-        Ok(match judge {
-            JudgeSpec::Exists { subject } => {
+    fn evaluate_gate(&self, stage: &CheckpointSpec, gate: &GateSpec) -> Result<GateOutcome> {
+        let outcome = match gate {
+            GateSpec::Exists { subject, .. } => {
                 self.ensure_file_observation(subject)?;
                 if self
                     .store
@@ -2499,12 +2648,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                             != Some("unreadable")
                     })
                 {
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 } else {
-                    JudgeOutcome::Pending
+                    GateOutcome::Pending
                 }
             }
-            JudgeSpec::Empty { subject } => {
+            GateSpec::Empty { subject, .. } => {
                 let members = self
                     .store
                     .desired_subjects()?
@@ -2527,20 +2676,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                 }
                 if empty {
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 } else {
-                    JudgeOutcome::Pending
+                    GateOutcome::Pending
                 }
             }
-            JudgeSpec::Field {
+            GateSpec::Field {
                 path,
                 subject,
                 operator,
                 value,
+                ..
             } => {
                 self.ensure_file_observation(subject)?;
                 let Some(actual) = self.store.latest_actual_value(subject)? else {
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 };
                 let found = if subject.starts_with("file/") {
                     actual_field(&actual, "content")
@@ -2551,37 +2701,37 @@ impl<R: RuntimeControl> Reconciler<R> {
                     actual_field(&actual, path).cloned()
                 };
                 let Some(found) = found.as_ref() else {
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 };
                 if compare_value(found, operator, value) {
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 } else {
-                    JudgeOutcome::Pending
+                    GateOutcome::Pending
                 }
             }
-            JudgeSpec::Has { subject, text } | JudgeSpec::Lacks { subject, text } => {
+            GateSpec::Has { subject, text, .. } | GateSpec::Lacks { subject, text, .. } => {
                 self.ensure_file_observation(subject)?;
                 let Some(content) = self.subject_text(subject)? else {
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 };
                 let contains = content.contains(text);
-                let pass = matches!(judge, JudgeSpec::Has { .. }) == contains;
+                let pass = matches!(gate, GateSpec::Has { .. }) == contains;
                 if pass {
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 } else {
-                    JudgeOutcome::Pending
+                    GateOutcome::Pending
                 }
             }
-            JudgeSpec::Deadline { duration_ms } => {
+            GateSpec::Deadline { duration_ms, .. } => {
                 let Some(active) = self
                     .store
                     .latest_claim(&stage.subject, Some("checkpoint.active"))?
                 else {
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 };
                 let elapsed = now_ms().saturating_sub(active.accepted_at_unix_ms);
                 if elapsed >= *duration_ms as u128 {
-                    JudgeOutcome::Fail(format!("deadline expired after {duration_ms}ms"))
+                    GateOutcome::Fail(format!("deadline expired after {duration_ms}ms"))
                 } else {
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let notify = self.notify.clone();
@@ -2591,10 +2741,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                             notify.notify_one();
                         });
                     }
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 }
             }
-            JudgeSpec::Mechanical {
+            GateSpec::Mechanical {
                 name,
                 command,
                 host,
@@ -2611,7 +2761,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 environment,
                 *time_limit_ms,
             )?,
-            JudgeSpec::Llm {
+            GateSpec::Llm {
                 name,
                 model,
                 host,
@@ -2621,7 +2771,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 token_budget,
                 time_limit_ms,
                 prompt,
-            } => self.run_llm_judge(
+            } => self.run_llm_gate(
                 stage,
                 name,
                 model,
@@ -2633,7 +2783,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 *time_limit_ms,
                 prompt,
             )?,
-            JudgeSpec::Human { reviewer, .. } => {
+            GateSpec::Human { reviewer, .. } => {
                 let decision = self
                     .store
                     .latest_claim(&stage.subject, Some("review.decision"))?;
@@ -2647,14 +2797,39 @@ impl<R: RuntimeControl> Reconciler<R> {
                         })
                         .flatten()
                 }) {
-                    Some("approved") => JudgeOutcome::Pass,
+                    Some("approved") => GateOutcome::Pass,
                     Some("rejected") => {
-                        JudgeOutcome::Fail("the human reviewer rejected the work".into())
+                        GateOutcome::Fail("the human reviewer rejected the work".into())
                     }
-                    _ => JudgeOutcome::Pending,
+                    _ => GateOutcome::Pending,
                 }
             }
-        })
+        };
+        if matches!(outcome, GateOutcome::Pass | GateOutcome::Fail(_)) {
+            let name = crate::graph::gate_name(gate);
+            let digest = hex::encode(sha2::Sha256::digest(
+                format!("{}:{name}", stage.subject).as_bytes(),
+            ));
+            let (verdict, reason) = match &outcome {
+                GateOutcome::Pass => ("pass", None),
+                GateOutcome::Fail(reason) => ("fail", Some(reason.clone())),
+                GateOutcome::Pending => unreachable!(),
+            };
+            let mut fields = BTreeMap::from([
+                ("stage".into(), Value::String(stage.subject.clone())),
+                ("gate".into(), Value::String(name.to_owned())),
+                ("verdict".into(), Value::String(verdict.into())),
+            ]);
+            if let Some(reason) = reason {
+                fields.insert("reason".into(), Value::String(reason));
+            }
+            self.record_once(
+                &format!("gate-result/{}", &digest[..32]),
+                "gate.result",
+                fields,
+            )?;
+        }
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2667,8 +2842,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         workspace: &str,
         environment: &BTreeMap<String, String>,
         time_limit_ms: u64,
-    ) -> Result<JudgeOutcome> {
-        let result_subject = judge_operation_subject(
+    ) -> Result<GateOutcome> {
+        let result_subject = gate_operation_subject(
             stage,
             name,
             &serde_json::json!({
@@ -2683,7 +2858,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let runtime_id = result_subject.replace('/', ".");
         if let Some(result) = self
             .store
-            .latest_claim(&result_subject, Some("judgement.result"))?
+            .latest_claim(&result_subject, Some("gate.result"))?
         {
             let verdict = result
                 .body
@@ -2694,38 +2869,38 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .body
                 .pointer("/fields/reason")
                 .and_then(Value::as_str)
-                .unwrap_or("the mechanical judge failed");
+                .unwrap_or("the mechanical gate failed");
             return Ok(if verdict == "pass" {
-                JudgeOutcome::Pass
+                GateOutcome::Pass
             } else {
-                JudgeOutcome::Fail(reason.into())
+                GateOutcome::Fail(reason.into())
             });
         }
         if host != self.host {
-            return Ok(JudgeOutcome::Pending);
+            return Ok(GateOutcome::Pending);
         }
         if let Some(requested) = self
             .store
-            .latest_claim(&result_subject, Some("judgement.requested"))?
+            .latest_claim(&result_subject, Some("gate.requested"))?
         {
             let elapsed = now_ms().saturating_sub(requested.accepted_at_unix_ms);
             if elapsed >= time_limit_ms as u128 {
-                self.stop_judge_runner(&result_subject, true)?;
-                let reason = format!("mechanical judge `{name}` exceeded {time_limit_ms}ms");
+                self.stop_gate_runner(&result_subject, true)?;
+                let reason = format!("mechanical gate `{name}` exceeded {time_limit_ms}ms");
                 self.record_once(
                     &result_subject,
-                    "judgement.result",
+                    "gate.result",
                     BTreeMap::from([
                         ("verdict".into(), Value::String("fail".into())),
                         ("reason".into(), Value::String(reason.clone())),
                     ]),
                 )?;
-                return Ok(JudgeOutcome::Fail(reason));
+                return Ok(GateOutcome::Fail(reason));
             }
             match self.runtime.observe_exec(&runtime_id)? {
                 Some(observation) if observation.status == "running" => {
-                    self.arm_judge_poll();
-                    return Ok(JudgeOutcome::Pending);
+                    self.arm_gate_poll();
+                    return Ok(GateOutcome::Pending);
                 }
                 Some(observation) if observation.status == "exited" => {
                     let verdict = if observation.exit_code == Some(0) {
@@ -2733,31 +2908,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                     } else {
                         "fail"
                     };
-                    let reason = format!("mechanical judge `{name}` {verdict}");
+                    let reason = format!("mechanical gate `{name}` {verdict}");
                     self.record_once(
                         &result_subject,
-                        "judgement.result",
+                        "gate.result",
                         BTreeMap::from([
                             ("verdict".into(), Value::String(verdict.into())),
                             ("reason".into(), Value::String(reason.clone())),
                         ]),
                     )?;
                     return Ok(if verdict == "pass" {
-                        JudgeOutcome::Pass
+                        GateOutcome::Pass
                     } else {
-                        JudgeOutcome::Fail(reason)
+                        GateOutcome::Fail(reason)
                     });
                 }
                 _ => {
-                    self.arm_judge_poll();
-                    return Ok(JudgeOutcome::Pending);
+                    self.arm_gate_poll();
+                    return Ok(GateOutcome::Pending);
                 }
             }
         }
 
         self.record_once(
             &result_subject,
-            "judgement.requested",
+            "gate.requested",
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("runner".into(), Value::String("exec".into())),
@@ -2778,23 +2953,23 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
-            driver: Some("mechanical-judge".into()),
+            driver: Some("mechanical-gate".into()),
             supervisor: "supervisor/root".into(),
         };
         let desired = DesiredSubject {
             subject: result_subject,
-            kind: "judge".into(),
+            kind: "gate".into(),
             desired: Value::Null,
             member: Some(member.clone()),
             activation: None,
             scopes: Default::default(),
         };
-        self.perform_start(&desired, &member, "the mechanical judge was requested")?;
-        self.arm_judge_poll();
-        Ok(JudgeOutcome::Pending)
+        self.perform_start(&desired, &member, "the mechanical gate was requested")?;
+        self.arm_gate_poll();
+        Ok(GateOutcome::Pending)
     }
 
-    fn arm_judge_poll(&self) {
+    fn arm_gate_poll(&self) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let notify = self.notify.clone();
             handle.spawn(async move {
@@ -2805,7 +2980,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_llm_judge(
+    fn run_llm_gate(
         &self,
         stage: &CheckpointSpec,
         name: &str,
@@ -2817,8 +2992,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         token_budget: u64,
         time_limit_ms: u64,
         prompt: &str,
-    ) -> Result<JudgeOutcome> {
-        let result_subject = judge_operation_subject(
+    ) -> Result<GateOutcome> {
+        let result_subject = gate_operation_subject(
             stage,
             name,
             &serde_json::json!({
@@ -2840,19 +3015,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .unwrap_or("fail");
             let reason = actual_field(&result, "reason")
                 .and_then(Value::as_str)
-                .unwrap_or("the LLM judge failed");
+                .unwrap_or("the LLM gate failed");
             if let Some(token_usage) = actual_field(&result, "token_usage").and_then(Value::as_u64)
             {
-                self.stop_judge_runner(&result_subject, false)?;
+                self.stop_gate_runner(&result_subject, false)?;
                 if token_usage > token_budget {
-                    return Ok(JudgeOutcome::Fail(format!(
-                        "LLM judge `{name}` used {token_usage} tokens, above its {token_budget} token budget"
+                    return Ok(GateOutcome::Fail(format!(
+                        "LLM gate `{name}` used {token_usage} tokens, above its {token_budget} token budget"
                     )));
                 }
                 return Ok(if verdict == "pass" {
-                    JudgeOutcome::Pass
+                    GateOutcome::Pass
                 } else {
-                    JudgeOutcome::Fail(reason.into())
+                    GateOutcome::Fail(reason.into())
                 });
             }
             match self.runtime.observe_exec(&runtime_id)? {
@@ -2864,10 +3039,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                             notify.notify_one();
                         });
                     }
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 }
                 Some(observation) if observation.status == "indeterminate" => {
-                    return Ok(JudgeOutcome::Pending);
+                    return Ok(GateOutcome::Pending);
                 }
                 _ => {}
             }
@@ -2880,20 +3055,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                 Some(token_usage) if token_usage > token_budget => (
                     "fail",
                     format!(
-                        "LLM judge `{name}` used {token_usage} tokens, above its {token_budget} token budget"
+                        "LLM gate `{name}` used {token_usage} tokens, above its {token_budget} token budget"
                     ),
                     token_usage,
                 ),
                 Some(token_usage) => (verdict, reason.into(), token_usage),
                 None => (
                     "fail",
-                    format!("LLM judge `{name}` did not report structured token usage"),
+                    format!("LLM gate `{name}` did not report structured token usage"),
                     0,
                 ),
             };
             self.record_once(
                 &result_subject,
-                "judgement.result",
+                "gate.result",
                 BTreeMap::from([
                     ("verdict".into(), Value::String(verdict.into())),
                     ("reason".into(), Value::String(reason.clone())),
@@ -2901,35 +3076,35 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ]),
             )?;
             return Ok(if verdict == "pass" {
-                JudgeOutcome::Pass
+                GateOutcome::Pass
             } else {
-                JudgeOutcome::Fail(reason)
+                GateOutcome::Fail(reason)
             });
         }
         if host != self.host {
-            return Ok(JudgeOutcome::Pending);
+            return Ok(GateOutcome::Pending);
         }
         if let Some(requested) = self
             .store
-            .latest_claim(&result_subject, Some("judgement.requested"))?
+            .latest_claim(&result_subject, Some("gate.requested"))?
         {
             let elapsed = now_ms().saturating_sub(requested.accepted_at_unix_ms);
             if elapsed >= time_limit_ms as u128 {
-                self.stop_judge_runner(&result_subject, true)?;
+                self.stop_gate_runner(&result_subject, true)?;
                 self.record_once(
                     &result_subject,
-                    "judgement.result",
+                    "gate.result",
                     BTreeMap::from([
                         ("verdict".into(), Value::String("fail".into())),
                         (
                             "reason".into(),
-                            Value::String(format!("LLM judge `{name}` exceeded {time_limit_ms}ms")),
+                            Value::String(format!("LLM gate `{name}` exceeded {time_limit_ms}ms")),
                         ),
                         ("token_usage".into(), Value::from(0)),
                     ]),
                 )?;
-                return Ok(JudgeOutcome::Fail(format!(
-                    "LLM judge `{name}` exceeded {time_limit_ms}ms"
+                return Ok(GateOutcome::Fail(format!(
+                    "LLM gate `{name}` exceeded {time_limit_ms}ms"
                 )));
             }
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -2940,15 +3115,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     notify.notify_one();
                 });
             }
-            return Ok(JudgeOutcome::Pending);
+            return Ok(GateOutcome::Pending);
         }
 
         let (capability, capability_expires_at) =
             self.store
-                .issue_capability("judgement", &result_subject, None, time_limit_ms)?;
+                .issue_capability("gate-result", &result_subject, None, time_limit_ms)?;
         self.record_once(
             &result_subject,
-            "judgement.requested",
+            "gate.requested",
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("model".into(), Value::String(model.into())),
@@ -2968,7 +3143,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         let instruction = format!(
-            "{prompt}\n\nYou are a held-out st3 judge. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  st3 judgement pass --reason 'REASON'\n  st3 judgement fail --reason 'REASON'\nDo not finish without posting a judgement."
+            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  st3 gate-result pass --reason 'REASON'\n  st3 gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
         );
         let argv = if model.starts_with("claude") {
             vec![
@@ -2994,8 +3169,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]
         };
         let mut environment = environment.clone();
-        environment.insert("ST3_JUDGE_SUBJECT".into(), result_subject.clone());
-        environment.insert("ST3_JUDGE_CAPABILITY".into(), capability);
+        environment.insert("ST_GATE_SUBJECT".into(), result_subject.clone());
+        environment.insert("ST_GATE_CAPABILITY".into(), capability);
         environment.insert("ST3_TOKEN_BUDGET".into(), token_budget.to_string());
         let member = MemberSpec {
             kind: MemberKind::Exec,
@@ -3012,22 +3187,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart: RestartType::Never,
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
-            driver: Some("llm-judge".into()),
+            driver: Some("llm-gate".into()),
             supervisor: "supervisor/root".into(),
         };
         let desired = DesiredSubject {
             subject: result_subject,
-            kind: "judge".into(),
+            kind: "gate".into(),
             desired: Value::Null,
             member: Some(member.clone()),
             activation: None,
             scopes: Default::default(),
         };
-        self.perform_start(&desired, &member, "the LLM judge was requested")?;
-        Ok(JudgeOutcome::Pending)
+        self.perform_start(&desired, &member, "the LLM gate was requested")?;
+        Ok(GateOutcome::Pending)
     }
 
-    fn stop_judge_runner(&self, subject: &str, hard: bool) -> Result<()> {
+    fn stop_gate_runner(&self, subject: &str, hard: bool) -> Result<()> {
         let runtime_id = subject.replace('/', ".");
         let Some(observation) = self.runtime.observe_exec(&runtime_id)? else {
             return Ok(());
@@ -3036,7 +3211,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         let incarnation = observation.incarnation_id.as_deref();
-        let action = if hard { "kill-judge" } else { "stop-judge" };
+        let action = if hard { "kill-gate" } else { "stop-gate" };
         if self
             .store
             .claims_for(subject, Some("action.completed"))?
@@ -3252,28 +3427,28 @@ fn run_variables(
         .unwrap_or_default();
     BTreeMap::from([
         (
-            "PLAN".into(),
+            "ST_PLAN".into(),
             run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
         ),
-        ("PLAN_REVISION".into(), run.revision.clone()),
-        ("PLAN_RUN".into(), run.id.clone()),
+        ("ST_PLAN_REVISION".into(), run.revision.clone()),
+        ("ST_PLAN_RUN".into(), run.id.clone()),
+        ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
+        ("ST_WORKSPACE".into(), run.workspace.clone()),
+        ("ST_STEP".into(), step.spec.path.clone()),
+        ("ST_STEP_RUN".into(), view.subject.clone()),
+        ("ST_ATTEMPT".into(), view.attempt.to_string()),
         (
-            "RUN_SCOPE".into(),
-            run.run_scope.clone().unwrap_or_default(),
+            "ST_ASSIGNEE".into(),
+            view.assignee.clone().unwrap_or_default(),
         ),
-        ("WORKSPACE".into(), run.workspace.clone()),
-        ("STEP".into(), step.spec.path.clone()),
-        ("STEP_RUN".into(), view.subject.clone()),
-        ("ATTEMPT".into(), view.attempt.to_string()),
-        ("ASSIGNEE".into(), view.assignee.clone().unwrap_or_default()),
-        ("REQUESTER".into(), run.requester.clone()),
-        ("PARENT_STEP_RUN".into(), parent_step_run),
-        ("ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
+        ("ST_REQUESTER".into(), run.requester.clone()),
+        ("ST_PARENT_STEP_RUN".into(), parent_step_run),
+        ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
     ])
 }
 
-fn expand_judge(
-    judge: &mut JudgeSpec,
+fn expand_gate(
+    gate: &mut GateSpec,
     variables: &BTreeMap<String, String>,
     run_workspace: &str,
 ) -> Result<()> {
@@ -3281,13 +3456,14 @@ fn expand_judge(
         *value = crate::plan::interpolate(value, variables)?;
         Ok(())
     };
-    match judge {
-        JudgeSpec::Exists { subject }
-        | JudgeSpec::Empty { subject }
-        | JudgeSpec::Field { subject, .. }
-        | JudgeSpec::Has { subject, .. }
-        | JudgeSpec::Lacks { subject, .. } => expand(subject)?,
-        JudgeSpec::Mechanical {
+    match gate {
+        GateSpec::Exists { subject, .. }
+        | GateSpec::Empty { subject, .. }
+        | GateSpec::Field { subject, .. }
+        | GateSpec::Has { subject, .. }
+        | GateSpec::Lacks { subject, .. } => expand(subject)?,
+        GateSpec::Mechanical {
+            name,
             command,
             host,
             workspace,
@@ -3306,9 +3482,11 @@ fn expand_judge(
             for value in environment.values_mut() {
                 expand(value)?;
             }
-            environment.insert("ST3_WORKSPACE".into(), run_workspace.into());
+            environment.extend(variables.clone());
+            environment.insert("ST_GATE".into(), name.clone());
         }
-        JudgeSpec::Llm {
+        GateSpec::Llm {
+            name,
             model,
             host,
             workspace,
@@ -3329,12 +3507,14 @@ fn expand_judge(
             for value in environment.values_mut() {
                 expand(value)?;
             }
-            environment.insert("ST3_WORKSPACE".into(), run_workspace.into());
+            environment.extend(variables.clone());
+            environment.insert("ST_GATE".into(), name.clone());
         }
-        JudgeSpec::Human {
+        GateSpec::Human {
             reviewer,
             question,
             review_targets,
+            ..
         } => {
             expand(reviewer)?;
             if let Some(question) = question {
@@ -3344,7 +3524,7 @@ fn expand_judge(
                 expand(target)?;
             }
         }
-        JudgeSpec::Deadline { .. } => {}
+        GateSpec::Deadline { .. } => {}
     }
     Ok(())
 }
@@ -3419,7 +3599,7 @@ fn token_usage_total(usage: &serde_json::Map<String, Value>) -> Option<u64> {
     found.then_some(total)
 }
 
-enum JudgeOutcome {
+enum GateOutcome {
     Pass,
     Pending,
     Fail(String),
@@ -3499,14 +3679,14 @@ fn compare_value(found: &Value, operator: &str, expected: &Value) -> bool {
     }
 }
 
-fn judge_operation_subject(
+fn gate_operation_subject(
     stage: &CheckpointSpec,
     name: &str,
     definition: &Value,
 ) -> Result<String> {
     let bytes = serde_json::to_vec(&(stage.subject.as_str(), name, definition))?;
     let hash = hex::encode(sha2::Sha256::digest(bytes));
-    Ok(format!("{}/judge/{}", stage.subject, &hash[..24]))
+    Ok(format!("{}/gate/{}", stage.subject, &hash[..24]))
 }
 
 fn now_ms() -> u128 {
@@ -3650,6 +3830,7 @@ mod tests {
 version 2
 subgraph {
   plan "dag" state="ready" {
+    goal "Complete plan dag."
     step "one" { }
     step "two" { }
     step "join" {
@@ -3686,6 +3867,305 @@ subgraph {
         assert!(run.steps.iter().all(|step| step.status == "completed"));
     }
 
+    #[test]
+    fn plan_and_step_baselines_block_before_work_and_recheck_retries() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+            subgraph {
+              plan "baseline" state="ready" {
+                goal "Run only from an admitted baseline."
+                baseline "the release is open" {
+                  field "state" "resource/release" is "open"
+                }
+                step "work" {
+                  baseline "the source is clean" {
+                    field "state" "resource/source" is "clean"
+                  }
+                  retry { attempts 2 }
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "baseline-plan");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "baseline".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "baseline-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        let blocked = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.steps[0].status, "pending");
+
+        for (subject, state, key) in [
+            ("resource/release", "open", "release-open"),
+            ("resource/source", "clean", "source-clean"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "resource.binding".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        }
+        reconciler.reconcile_once().unwrap();
+        let admitted = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(admitted.status, "running");
+        assert_eq!(admitted.steps[0].status, "ready");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/release".into(),
+                kind: "resource.binding".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("closed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("release-closed-after-admission".into()),
+            })
+            .unwrap();
+        store
+            .set_step_state(&admitted.steps[0].subject, "failed", Some("test failure"))
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/source".into(),
+                kind: "resource.binding".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("dirty".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("source-dirty".into()),
+            })
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let retried = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(retried.status, "running");
+        assert_eq!(retried.steps[0].attempt, 2);
+        assert_eq!(retried.steps[0].status, "blocked");
+        assert!(
+            retried.steps[0]
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("source is clean")
+        );
+    }
+
+    #[test]
+    fn plan_products_and_gates_hold_completion_and_record_evidence() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+            subgraph {
+              plan "release" state="ready" {
+                goal "Publish an approved result."
+                produces {
+                  resource "result" { state "published" }
+                }
+                gate "the result is approved" {
+                  field "approval" "resource/result" is "yes"
+                }
+                step "work" { }
+              }
+            }
+        "#;
+        apply_source(&store, source, "release-plan");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "release".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "release-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let waiting = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(waiting.steps[0].status, "completed");
+        assert_eq!(waiting.status, "running");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/result".into(),
+                kind: "resource.binding".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("published".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("result-published".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "running");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/result".into(),
+                kind: "resource.binding".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("published".into())),
+                    ("approval".into(), Value::String("yes".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("result-approved".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().status,
+            "completed"
+        );
+        let evidence = store
+            .claims_page(None, None, 0, None, false, 500)
+            .unwrap()
+            .claims
+            .into_iter()
+            .find(|claim| {
+                claim.kind == "gate.result"
+                    && claim.body.pointer("/fields/gate").and_then(Value::as_str)
+                        == Some("the result is approved")
+            })
+            .expect("the gate did not record evidence");
+        assert_eq!(
+            evidence
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn step_members_and_gates_receive_automatic_st_context() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+            subgraph {
+              plan "context" state="ready" {
+                goal "Expose the run context."
+                step "work" {
+                  subgraph {
+                    exec "task" {
+                      command "true"
+                      env { CUSTOM_RUN "${ST_PLAN_RUN}" }
+                    }
+                  }
+                  gate "verify context" {
+                    exec "true"
+                    host "node"
+                    workspace "."
+                    time-limit "1m"
+                  }
+                }
+              }
+            }
+        "#;
+        apply_source(&store, source, "context-plan");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "context".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "context-run".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let task = runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|member| member.driver.is_none())
+            .cloned()
+            .expect("the step task did not start");
+        for name in [
+            "ST_PLAN",
+            "ST_PLAN_REVISION",
+            "ST_PLAN_RUN",
+            "ST_ROOT_PLAN_RUN",
+            "ST_SCOPE",
+            "ST_WORKSPACE",
+            "ST_REQUESTER",
+            "ST_STEP",
+            "ST_STEP_RUN",
+            "ST_ATTEMPT",
+            "ST_ASSIGNEE",
+            "ST_PARENT_STEP_RUN",
+            "ST_AGENT",
+        ] {
+            assert!(task.environment.contains_key(name), "missing {name}");
+        }
+        assert_eq!(task.environment["CUSTOM_RUN"], run.id);
+
+        runtime.execs.lock().unwrap().insert(
+            task.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: task.runtime_id,
+                terminal: false,
+                status: "exited".into(),
+                exit_code: Some(0),
+                incarnation_id: Some("task-one".into()),
+            },
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let gate = runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|member| member.driver.as_deref() == Some("mechanical-gate"))
+            .cloned()
+            .expect("the mechanical gate did not start");
+        assert_eq!(gate.environment["ST_GATE"], "verify context");
+        assert_eq!(gate.environment["ST_PLAN_RUN"], run.id);
+        assert_eq!(gate.environment["ST_STEP"], "work");
+    }
+
     #[tokio::test]
     async fn a_materialized_step_subgraph_wakes_member_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
@@ -3693,6 +4173,7 @@ subgraph {
 version 2
 subgraph {
   plan "wake" state="ready" {
+    goal "Complete plan wake."
     step "team" {
       subgraph {
         agent "worker" { workspace "/tmp"; command "true"; restart "never" }
@@ -3735,10 +4216,11 @@ version 2
 subgraph {
   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
   plan "product" state="ready" {
+    goal "Complete plan product."
     step "publish" {
       assigned-to "agent/worker"
       produces {
-        resource "plan-run/${PLAN_RUN}/change" {
+        resource "plan-run/${ST_PLAN_RUN}/change" {
           kind "vcs.revision"
           state "published"
         }
@@ -3819,6 +4301,7 @@ version 2
 subgraph {
   agent "planner" { workspace "/tmp"; command "true"; restart "never" }
   plan "bootstrap" state="ready" {
+    goal "Complete plan bootstrap."
     step "compile" {
       assigned-to "agent/planner"
       produces-plan "project/work"
@@ -3835,6 +4318,7 @@ subgraph {
 version 2
 subgraph {
   plan "project/work" state="ready" {
+    goal "Complete plan project/work."
     step "inspect" { title "Inspect the fixture" }
     step "finish" { depends-on { step "inspect" completed } }
   }
@@ -3914,6 +4398,7 @@ subgraph {
 version 2
 subgraph {
   plan "project/work" state="ready" {
+    goal "Complete plan project/work."
     step "replacement" { title "A later plan revision" }
   }
 }
@@ -4054,6 +4539,7 @@ subgraph {
 version 2
 subgraph {
   plan "assignment" state="ready" {
+    goal "Complete plan assignment."
     step "work" { assigned-to "agent/worker" }
   }
 }
@@ -4100,7 +4586,7 @@ subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } 
     }
 
     #[test]
-    fn a_human_judge_accepts_only_the_bound_step_run_review() {
+    fn a_human_gate_accepts_only_the_bound_step_run_review() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
             &store,
@@ -4108,13 +4594,13 @@ subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } 
 version 2
 subgraph {
   plan "review" state="ready" {
+    goal "Complete plan review."
     step "approval" {
       title "The candidate change"
-      judges {
-        human "person/nathan" {
-          question "Is the candidate ready?"
-          review "resource/plan-run/${PLAN_RUN}/candidate"
-        }
+      gate "human-review" type="human" {
+        reviewer "person/nathan"
+        question "Is the candidate ready?"
+        review "resource/plan-run/${ST_PLAN_RUN}/candidate"
       }
     }
   }
@@ -4217,7 +4703,7 @@ subgraph {
 
     #[test]
     fn rejects_an_unstructured_usage_log() {
-        assert_eq!(structured_token_usage("the judge finished"), None);
+        assert_eq!(structured_token_usage("the gate finished"), None);
     }
 
     #[test]
@@ -4228,7 +4714,6 @@ subgraph {
             subgraph {
               agent "worker" {
                 command "true"
-                env { ST_AGENT "ambient.identity" }
               }
             }
         "#;
@@ -4290,12 +4775,13 @@ subgraph {
     }
 
     #[test]
-    fn a_plan_step_waits_for_native_driver_readiness_before_starting_a_judge() {
+    fn a_plan_step_waits_for_native_driver_readiness_before_starting_a_gate() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
               plan "proof" state="ready" {
+                goal "Complete plan proof."
                 step "native-ready" {
                   title "The native agent is ready"
                   subgraph {
@@ -4308,13 +4794,11 @@ subgraph {
                       content "Start."
                     }
                   }
-                  judges {
-                    judge "verify" {
-                      exec "true"
-                      host "node"
-                      workspace "."
-                      time-limit "1m"
-                    }
+                  gate "verify" {
+                    exec "true"
+                    host "node"
+                    workspace "."
+                    time-limit "1m"
                   }
                 }
               }
@@ -4386,7 +4870,7 @@ subgraph {
 
         let starts = runtime.starts.lock().unwrap();
         assert_eq!(starts.len(), 2);
-        assert!(starts[1].contains(".judge."));
+        assert!(starts[1].contains(".gate."));
     }
 
     #[test]
@@ -4397,6 +4881,7 @@ subgraph {
             subgraph {
               scope "eval/simulated-codex" retention="temporary" change-policy="agent" {
                 plan "eval/simulated-codex" state="ready" {
+                  goal "Complete plan eval/simulated-codex."
                 step "team" {
                   title "The Codex team is ready"
                   subgraph {
@@ -4414,10 +4899,8 @@ subgraph {
                       content "Start."
                     }
                   }
-                  judges {
-                    exists "agent/node.sup"
-                    exists "agent/node.worker"
-                  }
+                  gate "condition-1" { exists "agent/node.sup" }
+                  gate "condition-2" { exists "agent/node.worker" }
                 }
                 step "worker-report" {
                   title "The worker report is delivered"
@@ -4442,36 +4925,32 @@ subgraph {
                   }
                 }
                 step "mechanical" {
-                  title "The mechanical judge passes"
+                  title "The mechanical gate passes"
                   depends-on { step "confirmation" completed }
-                  judges {
-                    judge "mechanical" {
-                      exec "true"
-                      host "node"
-                      workspace "."
-                      time-limit "60s"
-                    }
+                  gate "mechanical" {
+                    exec "true"
+                    host "node"
+                    workspace "."
+                    time-limit "60s"
                   }
                 }
                 step "semantic" {
-                  title "The Codex judge passes"
+                  title "The Codex gate passes"
                   depends-on { step "mechanical" completed }
-                  judges {
-                    judge "semantic" type="llm" {
-                      model "gpt-5.6-sol"
-                      host "node"
-                      workspace "."
-                      tools "shell"
-                      token-budget 1000
-                      time-limit "60s"
-                      prompt "Check the result."
-                    }
+                  gate "semantic" type="llm" {
+                    model "gpt-5.6-sol"
+                    host "node"
+                    workspace "."
+                    tools "shell"
+                    token-budget 1000
+                    time-limit "60s"
+                    prompt "Check the result."
                   }
                 }
                 step "cleanup" finally=#true {
                   title "The temporary eval scope is empty"
                   subgraph { scope "eval/simulated-codex" { stop } }
-                  judges { empty "scope/eval/simulated-codex" }
+                  gate "condition-1" { empty "scope/eval/simulated-codex" }
                 }
                 }
               }
@@ -4564,7 +5043,7 @@ subgraph {
             .lock()
             .unwrap()
             .iter()
-            .find(|member| member.driver.as_deref() == Some("mechanical-judge"))
+            .find(|member| member.driver.as_deref() == Some("mechanical-gate"))
             .unwrap()
             .runtime_id
             .clone();
@@ -4582,21 +5061,21 @@ subgraph {
             reconciler.reconcile_once().unwrap();
         }
 
-        let (llm, judge_subject) = {
+        let (llm, gate_subject) = {
             let members = runtime.started_members.lock().unwrap();
             let member = members
                 .iter()
-                .find(|member| member.driver.as_deref() == Some("llm-judge"))
+                .find(|member| member.driver.as_deref() == Some("llm-gate"))
                 .unwrap();
             (
                 member.runtime_id.clone(),
-                member.environment["ST3_JUDGE_SUBJECT"].clone(),
+                member.environment["ST_GATE_SUBJECT"].clone(),
             )
         };
         store
             .append_claim(&ClaimInput {
-                subject: judge_subject,
-                kind: "judgement.result".into(),
+                subject: gate_subject,
+                kind: "gate.result".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
@@ -4646,27 +5125,26 @@ subgraph {
     }
 
     #[test]
-    fn a_mechanical_judge_uses_the_async_exec_runtime() {
+    fn a_mechanical_gate_uses_the_async_exec_runtime() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
               plan "proof" state="ready" {
+                goal "Complete plan proof."
                 step "verify" {
                   title "The command passes"
-                  judges {
-                    judge "verify" {
-                      exec "sleep 60"
-                      host "node"
-                      workspace "."
-                      time-limit "1m"
-                    }
+                  gate "verify" {
+                    exec "sleep 60"
+                    host "node"
+                    workspace "."
+                    time-limit "1m"
                   }
                 }
               }
             }
         "#;
-        apply_source(&store, source, "plan-async-judge");
+        apply_source(&store, source, "plan-async-gate");
         let run = store
             .create_plan_run(&crate::model::PlanRunRequest {
                 plan: "proof".into(),
@@ -4674,7 +5152,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
-                idempotency_key: "run-async-judge".into(),
+                idempotency_key: "run-async-gate".into(),
             })
             .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
@@ -4697,7 +5175,7 @@ subgraph {
                 terminal: false,
                 status: "exited".into(),
                 exit_code: Some(0),
-                incarnation_id: Some("judge-one".into()),
+                incarnation_id: Some("gate-one".into()),
             },
         );
 
@@ -4714,24 +5192,23 @@ subgraph {
     }
 
     #[test]
-    fn an_llm_judge_fails_when_structured_usage_exceeds_its_budget() {
+    fn an_llm_gate_fails_when_structured_usage_exceeds_its_budget() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
               plan "proof" state="ready" {
+                goal "Complete plan proof."
                 step "review" {
-                  title "A held-out judge accepts the result"
-                  judges {
-                    judge "review" type="llm" {
-                      model "claude-sonnet"
-                      host "node"
-                      workspace "."
-                      tools "shell"
-                      token-budget 10
-                      time-limit "1m"
-                      prompt "Inspect the result."
-                    }
+                  title "A held-out gate accepts the result"
+                  gate "review" type="llm" {
+                    model "claude-sonnet"
+                    host "node"
+                    workspace "."
+                    tools "shell"
+                    token-budget 10
+                    time-limit "1m"
+                    prompt "Inspect the result."
                   }
                 }
               }
@@ -4759,19 +5236,19 @@ subgraph {
         reconciler.reconcile_once().unwrap();
         let (runtime_id, result_subject) = {
             let members = runtime.started_members.lock().unwrap();
-            let judge = members
+            let gate = members
                 .iter()
-                .find(|member| member.driver.as_deref() == Some("llm-judge"))
+                .find(|member| member.driver.as_deref() == Some("llm-gate"))
                 .unwrap();
             (
-                judge.runtime_id.clone(),
-                judge.environment["ST3_JUDGE_SUBJECT"].clone(),
+                gate.runtime_id.clone(),
+                gate.environment["ST_GATE_SUBJECT"].clone(),
             )
         };
         store
             .append_claim(&ClaimInput {
                 subject: result_subject.clone(),
-                kind: "judgement.result".into(),
+                kind: "gate.result".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
@@ -4792,7 +5269,7 @@ subgraph {
                 terminal: false,
                 status: "exited".into(),
                 exit_code: Some(0),
-                incarnation_id: Some("judge-run".into()),
+                incarnation_id: Some("gate-run".into()),
             },
         );
         runtime.logs.lock().unwrap().insert(
@@ -4803,7 +5280,7 @@ subgraph {
         reconciler.reconcile_once().unwrap();
 
         let result = store
-            .latest_claim(&result_subject, Some("judgement.result"))
+            .latest_claim(&result_subject, Some("gate.result"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -5416,13 +5893,13 @@ subgraph { schedule "reminder" { stop } }"#,
     }
 
     #[test]
-    fn a_gate_stops_after_its_declared_input_limit() {
+    fn a_terminal_control_stops_after_its_declared_input_limit() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
               supervisor "watch" {
-                gate "confirmation" driver="codex" {
+                terminal-control "confirmation" driver="codex" {
                   contains "Press Enter"
                   key "enter"
                   max-inputs 1
@@ -5477,16 +5954,15 @@ subgraph { schedule "reminder" { stop } }"#,
             subgraph {
               scope "eval/demo" retention="temporary" change-policy="agent" {
                 plan "eval/demo" state="ready" {
+                  goal "Complete plan eval/demo."
                 step "result" timeout="1ms" {
                   title "The result appears"
-                  judges {
-                    field "status" "resource/result" "is" "ok"
-                  }
+                  gate "condition-1" { field "status" "resource/result" "is" "ok" }
                 }
                 step "cleanup" finally=#true {
                   title "The temporary eval scope is empty"
                   subgraph { scope "eval/demo" { stop } }
-                  judges { empty "scope/eval/demo" }
+                  gate "condition-2" { empty "scope/eval/demo" }
                 }
                 }
               }
@@ -5549,6 +6025,7 @@ subgraph { schedule "reminder" { stop } }"#,
               resource "approval" { kind "human.review" }
               agent "worker" { workspace "/tmp"; command "true"; restart "never" }
               plan "release" state="ready" {
+                goal "Complete plan release."
                 step "publish" {
                   assigned-to "agent/worker"
                   depends-on {

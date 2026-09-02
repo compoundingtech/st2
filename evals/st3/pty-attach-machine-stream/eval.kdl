@@ -1,38 +1,35 @@
 version 2
 
 subgraph {
-  scope "eval/pty-attach-machine-stream/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/pty-attach-machine-stream" state="ready" {
+      goal "Complete plan eval/pty-attach-machine-stream."
       step "contract" timeout="2m" {
         title "The installed PTY machine stream reconnects without framing loss"
         subgraph {
-          exec "eval/pty-attach-machine-stream/probe/${PLAN_RUN}" {
+          exec "eval/pty-attach-machine-stream/probe/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}/fixture"
-            cwd "${WORKSPACE}/fixture"
+            workspace "${ST_WORKSPACE}/fixture"
+            cwd "${ST_WORKSPACE}/fixture"
             command "bash -o pipefail -c 'bash ./stream.sh | tee proof.txt'"
             restart "never"
-            env { CATALOG "${WORKSPACE}/fixture" }
+            env { CATALOG "${ST_WORKSPACE}/fixture" }
           }
         }
-        judges {
-          field "status" "exec/eval/pty-attach-machine-stream/probe/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/pty-attach-machine-stream/probe/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/pty-attach-machine-stream/probe/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/pty-attach-machine-stream/probe/${ST_PLAN_RUN}" "is" 0 }
       }
-      step "judge" timeout="1m" {
+      step "gate" timeout="1m" {
         depends-on { step "contract" completed }
-        judges {
-          judge "all machine-stream markers are present" {
-            exec "bash ./judge.sh"
-            host "local"
-            workspace "${WORKSPACE}/fixture"
-          }
+        gate "all machine-stream markers are present" {
+          exec "bash ./judge.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
         }
       }
       step "cleanup" finally=#true {
-        subgraph { scope "eval/pty-attach-machine-stream/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/pty-attach-machine-stream/${PLAN_RUN}" }
+        subgraph { scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/pty-attach-machine-stream/${ST_PLAN_RUN}" }
       }
     }
   }

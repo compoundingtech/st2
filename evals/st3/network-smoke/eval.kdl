@@ -1,37 +1,34 @@
 version 2
 
 subgraph {
-  scope "eval/network-smoke/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/network-smoke/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/network-smoke" state="ready" {
+      goal "Complete plan eval/network-smoke."
       step "contract" timeout="2m" {
         title "An isolated st3 daemon hosts a subject and delivers Small Talk"
         subgraph {
-          exec "eval/network-smoke/contract/${PLAN_RUN}" {
+          exec "eval/network-smoke/contract/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}/fixture"
-            cwd "${WORKSPACE}/fixture"
+            workspace "${ST_WORKSPACE}/fixture"
+            cwd "${ST_WORKSPACE}/fixture"
             command "bash ./run.sh"
             restart "never"
           }
         }
-        judges {
-          field "status" "exec/eval/network-smoke/contract/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/network-smoke/contract/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/network-smoke/contract/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/network-smoke/contract/${ST_PLAN_RUN}" "is" 0 }
       }
-      step "judge" timeout="1m" {
+      step "gate" timeout="1m" {
         depends-on { step "contract" completed }
-        judges {
-          judge "the nested daemon recorded health and delivery" {
-            exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
-            host "local"
-            workspace "${WORKSPACE}/fixture"
-          }
+        gate "the nested daemon recorded health and delivery" {
+          exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
+          host "local"
+          workspace "${ST_WORKSPACE}/fixture"
         }
       }
       step "cleanup" finally=#true {
-        subgraph { scope "eval/network-smoke/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/network-smoke/${PLAN_RUN}" }
+        subgraph { scope "eval/network-smoke/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/network-smoke/${ST_PLAN_RUN}" }
       }
     }
   }

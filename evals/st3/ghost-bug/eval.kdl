@@ -1,13 +1,14 @@
 version 2
 
 subgraph {
-  scope "eval/ghost-bug-codex/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/ghost-bug-codex" state="ready" {
+      goal "Complete plan eval/ghost-bug-codex."
       step "start-team" timeout="10m" {
         title "The native Codex debugging team is ready"
         subgraph {
           agent "gbx.sup" {
-            workspace "${WORKSPACE}/sup"
+            workspace "${ST_WORKSPACE}/sup"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -15,10 +16,10 @@ subgraph {
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
+            env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
           }
           agent "gbx.fix" {
-            workspace "${WORKSPACE}/worker"
+            workspace "${ST_WORKSPACE}/worker"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -26,7 +27,7 @@ subgraph {
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
             restart "never"
-            env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}"; ST_ROOT "${WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages" }
+            env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
           }
         }
       }
@@ -38,12 +39,13 @@ subgraph {
         assigned-to "agent/gbx.sup"
         depends-on { step "start-team" completed }
         plan "work" {
+          goal "Complete plan work."
           step "read-bug-report" { title "The exact immutable bug report is understood"; goal "Read the referenced task document through st3 doc get. Identify the leak reproduction, root-cause requirement, regression-test requirement, and verification contract." }
           step "send-debug-brief" {
             title "The specialist receives one bounded debugging brief"
-            goal "Send gbx.fix exactly one Small Talk message. Require reproduction, root cause, smallest fix, a mutation-valid regression test, green suite, commit, and evidence report. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/debug-brief resource.binding --actor agent/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send gbx.fix exactly one Small Talk message. Require reproduction, root cause, smallest fix, a mutation-valid regression test, green suite, commit, and evidence report. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/debug-brief resource.binding --actor agent/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "read-bug-report" completed }
-            produces { resource "plan-run/${PLAN_RUN}/debug-brief" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/debug-brief" { kind "message.receipt"; state "published" } }
           }
         }
       }
@@ -54,6 +56,7 @@ subgraph {
         assigned-to "agent/gbx.fix"
         depends-on { step "delegate-debug-brief" completed }
         plan "work" {
+          goal "Complete plan work."
           step "read-debug-brief" { title "The supervisor debugging contract is understood"; goal "Drain and archive the one gbx.sup delegation. Identify every required proof and repository boundary." }
           step "reproduce-option-leak" { title "The custom-option leak is reproduced"; goal "Run the supplied custom-then-default reproduction. Confirm that the second format call incorrectly keeps the custom delimiters."; depends-on { step "read-debug-brief" completed } }
           step "identify-root-cause" { title "The shared-default mutation is identified"; goal "Trace the format option merge. Identify the exact mutation that changes imported defaultOptions across calls. Reject a reset, freeze, or symptom-only workaround."; depends-on { step "reproduce-option-leak" completed } }
@@ -62,15 +65,15 @@ subgraph {
           step "verify-regression-and-suite" { title "The regression and complete suite are green"; goal "Run node --test and the direct reproduction. Confirm defaultOptions remains byte-equivalent across a custom call. Inspect the final diff."; depends-on { step "implement-smallest-fix" completed } }
           step "publish-fix-revision" {
             title "The root-cause fix revision is published"
-            goal "Commit the source and regression test with the configured identity. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/fix-revision resource.binding --actor agent/gbx.fix --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+            goal "Commit the source and regression test with the configured identity. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/fix-revision resource.binding --actor agent/gbx.fix --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
             depends-on { step "verify-regression-and-suite" completed }
-            produces { resource "plan-run/${PLAN_RUN}/fix-revision" { kind "vcs.revision"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/fix-revision" { kind "vcs.revision"; state "published" } }
           }
           step "report-fix-evidence" {
             title "The supervisor receives the complete debugging evidence"
-            goal "Send gbx.sup exactly one Small Talk report. Include the root cause, changed files, commit, red-before proof, green suite, direct reproduction, and clean tree. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/worker-report resource.binding --actor agent/gbx.fix --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send gbx.sup exactly one Small Talk report. Include the root cause, changed files, commit, red-before proof, green suite, direct reproduction, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.binding --actor agent/gbx.fix --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "publish-fix-revision" completed }
-            produces { resource "plan-run/${PLAN_RUN}/worker-report" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/worker-report" { kind "message.receipt"; state "published" } }
           }
         }
       }
@@ -81,44 +84,43 @@ subgraph {
         assigned-to "agent/gbx.sup"
         depends-on { step "diagnose-and-fix" completed }
         plan "work" {
+          goal "Complete plan work."
           step "read-worker-report" { title "The worker debugging report is understood"; goal "Drain and archive the one gbx.fix report. Record its root cause, revision, test, and verification evidence." }
           step "verify-fix-read-only" { title "The supervisor independently verifies the root-cause fix"; goal "Without edits, inspect ../worker. Run the complete suite and direct reproduction. Verify the regression test, mutation-free defaultOptions, published HEAD, committed diff, and clean tree."; depends-on { step "read-worker-report" completed } }
           step "confirm-requester" {
             title "The requester receives one verified bug-fix confirmation"
-            goal "Send requester exactly one Small Talk message. Cite the root cause, real commit, regression test, and read-only verification. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/final-confirmation resource.binding --actor agent/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send requester exactly one Small Talk message. Cite the root cause, real commit, regression test, and read-only verification. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-confirmation resource.binding --actor agent/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "verify-fix-read-only" completed }
-            produces { resource "plan-run/${PLAN_RUN}/final-confirmation" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/final-confirmation" { kind "message.receipt"; state "published" } }
           }
         }
       }
 
-      step "held-out-judges" timeout="20m" {
-        title "All Ghost Bug judges pass"
+      step "held-out-gates" timeout="20m" {
+        title "All Ghost Bug gates pass"
         depends-on { step "verify-and-confirm" completed }
-        judges {
-          judge "isolation — only gbx.fix authored the bounded product change" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
-          judge "the visible suite is green on HEAD" { exec "bash ./judges/suite.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the shared-default mutation is gone" { exec "bash ./judges/root-cause.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the regression is red on the buggy base" { exec "bash ./judges/regression.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "delegation, worker report, and final confirmation are visible" { exec "st3 message export \"${WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/coordination.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
-          judge "the graph records the complete debugging plan and products" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
-          judge "the final report explains the root cause and regression proof" type="llm" {
-            model "gpt-5.6-sol"
-            host "local"
-            workspace "${WORKSPACE}"
-            tools "shell" "git"
-            env { CATALOG "${WORKSPACE}"; ST_ROOT "${WORKSPACE}/.st3-messages" }
-            token-budget 65536
-            time-limit "120000ms"
-            prompt "Run one evidence command before judgement: show the worker HEAD diff for src and test files, show git -C worker status --porcelain, and print .st3-messages/requester/inbox/* plus .st3-messages/requester/archive/*. Do not run st3 agents, st3 status, help commands, or broad scans. PASS only if the change fixes the shared-default mutation at its root, adds a real regression test, creates a commit with a clean tree, and the supervisor reports this evidence."
-          }
+        gate "isolation — only gbx.fix authored the bounded product change" { exec "st3 message export \"${ST_WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/isolation.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+        gate "the visible suite is green on HEAD" { exec "bash ./judges/suite.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the shared-default mutation is gone" { exec "bash ./judges/root-cause.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the regression is red on the buggy base" { exec "bash ./judges/regression.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "delegation, worker report, and final confirmation are visible" { exec "st3 message export \"${ST_WORKSPACE}/.st3-messages\" >/dev/null && bash ./judges/coordination.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages" }; time-limit "120000ms" }
+        gate "the graph records the complete debugging plan and products" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
+        gate "the final report explains the root cause and regression proof" type="llm" {
+          model "gpt-5.6-sol"
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          tools "shell" "git"
+          env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages" }
+          token-budget 65536
+          time-limit "120000ms"
+          prompt "Run one evidence command before gate result: show the worker HEAD diff for src and test files, show git -C worker status --porcelain, and print .st3-messages/requester/inbox/* plus .st3-messages/requester/archive/*. Do not run st3 agents, st3 status, help commands, or broad scans. PASS only if the change fixes the shared-default mutation at its root, adds a real regression test, creates a commit with a clean tree, and the supervisor reports this evidence."
         }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
-        subgraph { scope "eval/ghost-bug-codex/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/ghost-bug-codex/${PLAN_RUN}" }
+        subgraph { scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/ghost-bug-codex/${ST_PLAN_RUN}" }
       }
     }
   }

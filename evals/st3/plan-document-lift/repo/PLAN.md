@@ -40,7 +40,7 @@ The final step must declare this graph product:
 
 ```kdl
 produces {
-  resource "${ROOT_PLAN_RUN}/plan-result" {
+  resource "${ROOT_ST_PLAN_RUN}/plan-result" {
     kind "document.result"
     state "published"
   }
@@ -50,5 +50,5 @@ produces {
 Its goal must tell the worker to run this exact command after the verifier passes:
 
 ```sh
-st3 claim resource/${ROOT_PLAN_RUN}/plan-result resource.binding --field kind=document.result --field state=published
+st3 claim resource/${ROOT_ST_PLAN_RUN}/plan-result resource.binding --field kind=document.result --field state=published
 ```

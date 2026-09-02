@@ -8,6 +8,6 @@ The st3 graph owns the complete plan before work starts. It records two assigned
 
 A mechanical injector restarts `rc.dev` after item 2. It sends one repeated Small Talk delivery through the st3 API after the new incarnation becomes ready.
 
-The worker must use the graph, `PROGRESS.md`, and git history to resume with item 3. The judges reject a skipped item, a repeated stable item result, a missing product, incorrect ownership, or an invalid message sequence.
+The worker must use the graph, `PROGRESS.md`, and git history to resume with item 3. The gates reject a skipped item, a repeated stable item result, a missing product, incorrect ownership, or an invalid message sequence.
 
-This migrated form has not had a paid run. Review `eval.kdl`, the personas, the injector, and all judges before the first run.
+This migrated form has not had a paid run. Review `eval.kdl`, the personas, the injector, and all gates before the first run.

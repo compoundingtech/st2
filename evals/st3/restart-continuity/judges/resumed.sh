@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PLAN_RUN:?PLAN_RUN must identify the judged plan run}"
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 root="${CATALOG:-$PWD}"
 ledger="$root/worker"
 log="$root/.stev/restart.log"
@@ -39,7 +39,7 @@ test "$(subject_count "$pre_head..HEAD" 2)" -eq 0
 test "$(subject_count "$pre_head..HEAD" 3)" -eq 1
 test "$(subject_count "$pre_head..HEAD" 4)" -eq 1
 
-restart="$(st3 inspect "resource/plan-run/$PLAN_RUN/restart" --json)"
+restart="$(st3 inspect "resource/plan-run/$ST_PLAN_RUN/restart" --json)"
 jq -e \
   --arg old "$old_incarnation" \
   --arg new "$new_incarnation" \

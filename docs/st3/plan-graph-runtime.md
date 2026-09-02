@@ -1,328 +1,590 @@
 # st3 plan graph runtime
 
-This document describes the implemented st3 plan model on 2026-08-27.
+Status: current language and runtime specification.
 
-The earlier idea and feedback files remain design snapshots. This file records current behavior.
+Every st3 KDL document starts with `version 2`. It contains one untyped `subgraph` root.
 
-Every authored st3 KDL document starts with `version 2`. st3 rejects a missing version because it means st2 version zero.
+A plan is an immutable definition in the claims graph. Publishing a plan does not start it. A plan run binds to one exact plan revision.
 
-st2 accepts version zero or one. This rule lets tools select the correct runtime before they interpret the document body.
+## Core rules
 
-## Core model
+- A plan has `draft`, `ready`, or `retired` state.
+- Only a ready plan can start.
+- A plan needs one through three `goal` nodes.
+- A step accepts zero through three `goal` nodes.
+- Plans and steps can repeat `baseline` and `gate`.
+- Plans and steps can contain one `produces` block.
+- All sibling products must exist. All sibling gates must pass.
+- Every normal step must complete before the plan can complete.
+- `depends-on` defines execution order. Source order defines display order only.
+- A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
+- st3 rejects missing step references and dependency cycles.
+- st3 does not accept `outcome`, `judges`, or `judge`.
 
-A `plan` is a stored definition. A plan does not start when st3 publishes it.
-
-A plan has an explicit `draft`, `ready`, or `retired` state. Only a ready revision can start.
-
-A plan run binds to one immutable plan revision. A revision hash comes from the normalized plan definition.
-
-A `step` is one durable work unit in a plan run. Source order controls display only.
-
-A step without `depends-on` can start immediately. Dependencies form a directed graph and can run concurrently.
-
-The authored st3 grammar does not accept the old `checkpoints` form. Use `st3-migrate` before publication.
-
-## Example
+## Complete example
 
 ```kdl
 version 2
 
 subgraph {
-  scope "signal-rename/${PLAN_RUN}"
-    retention="temporary"
-    change-policy="agent" {
+  scope "release/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+    plan "release" state="ready" {
+      goal "Produce a verified release decision."
+      goal "Keep the source and test evidence visible in the graph."
 
-    plan "signal-rename" state="ready" {
-      step "start-workers" {
-        title "The workers are ready"
+      baseline "the release request is ready" {
+        field "status" "resource/release-request" "is" "ready"
+      }
 
+      produces {
+        resource "plan-run/${ST_PLAN_RUN}/release-decision" {
+          kind "release.decision"
+          state "published"
+        }
+      }
+
+      gate "the requester approves the release" type="human" {
+        reviewer "person/nathan"
+        question "Is this release ready?"
+        review "resource/plan-run/${ST_PLAN_RUN}/release-decision"
+      }
+
+      step "start-team" {
+        title "The release team is ready"
         subgraph {
-          agent "sig.base" {
-            workspace "${WORKSPACE}/base"
+          agent "release.lead" {
+            workspace "${ST_WORKSPACE}/lead"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
-              prompt "Claim assigned st3 work and report progress."
+              prompt "Claim assigned st3 work and publish the release decision."
+            }
+          }
+          agent "release.test" {
+            under "release.lead" reason="the lead combines the test evidence"
+            workspace "${ST_WORKSPACE}/test"
+            harness "codex" {
+              model "gpt-5.6-sol"
+              effort "medium"
+              prompt "Claim assigned st3 work and publish the test evidence."
             }
           }
         }
       }
 
-      step "rename-base" timeout="20m" {
-        title "Rename the base package"
-        goal "Rename the product and preserve runtime primitives."
-        assigned-to "agent/sig.base"
-
-        depends-on {
-          step "start-workers" completed
+      step "inspect" timeout="20m" {
+        title "The source is inspected"
+        goal "Inspect the exact release source and publish an inspection report."
+        assigned-to "agent/release.lead"
+        depends-on { step "start-team" completed }
+        baseline "the source is present" {
+          exists "resource/release-source"
         }
-
-        plan "work" {
-          step "inspect" { }
-          step "change" { depends-on { step "inspect" completed } }
-          step "test" { depends-on { step "change" completed } }
-        }
-
         produces {
-          resource "plan-run/${PLAN_RUN}/base-change" {
-            kind "vcs.revision"
+          resource "plan-run/${ST_PLAN_RUN}/inspection" {
+            kind "release.inspection"
             state "published"
           }
         }
-      }
-
-      step "integrate" {
-        depends-on {
-          step "rename-base" completed
-          step "update-config" completed
+        gate "the report contains a revision" {
+          field "revision" "resource/plan-run/${ST_PLAN_RUN}/inspection" "starts-with" "git:"
         }
       }
 
-      step "nathan-approves" {
-        depends-on { step "integrate" completed }
-        judges { human "person/nathan" }
+      step "verify" timeout="20m" {
+        title "The release decision is verified"
+        goal "Run the tests and publish the final release decision."
+        assigned-to "agent/release.test"
+        depends-on { step "inspect" completed }
+        retry { attempts 2; backoff "30s" }
+        gate "the release tests pass" {
+          exec "./verify-release.sh"
+          host "local"
+          workspace "${ST_WORKSPACE}/test"
+          time-limit "5m"
+        }
       }
 
       step "cleanup" finally=#true {
-        subgraph { scope "signal-rename/${PLAN_RUN}" { stop } }
-        judges { empty "scope/signal-rename/${PLAN_RUN}" }
+        title "The temporary release scope is empty"
+        subgraph { scope "release/${ST_PLAN_RUN}" { stop } }
+        gate "the scope has no live member" {
+          empty "scope/release/${ST_PLAN_RUN}"
+        }
       }
     }
   }
 }
 ```
 
-## Step behavior
+The plan baseline protects the run admission boundary. The inspection product is intermediate step output. The release decision is a final plan product. The human gate is a plan-level acceptance condition.
 
-`depends-on` controls access to a step. It can contain step states or graph predicates.
+## Plan syntax
+
+```kdl
+plan "PLAN_ID" state="ready" {
+  goal "One measurable plan goal."
+  goal "An optional second goal."
+  goal "An optional third goal."
+
+  baseline "NAME" { GRAPH_PREDICATE }
+  produces { PRODUCT... }
+  gate "NAME" { GATE_BODY }
+
+  step "STEP_ID" { ... }
+}
+```
+
+The `state` property is required for a top-level or scoped plan. A nested plan defaults to ready because it is already part of a submitted parent revision.
+
+Plan IDs can contain path separators. Step IDs cannot. IDs cannot be empty, contain whitespace, start or end with `/`, or contain `//`.
+
+Plan goal order is preserved. Each plan must have one, two, or three goals.
+
+A plan can repeat baselines and gates. Their names must be unique within that plan. A plan has at most one `produces` block.
+
+A plan must contain at least one step.
+
+## Step syntax
+
+```kdl
+step "STEP_ID" timeout="20m" finally=#false {
+  title "A display title"
+  goal "One optional goal."
+  goal "A second optional goal."
+  goal "A third optional goal."
+  assigned-to "agent/node.worker"
+  document "doc/project/request@SHA256"
+
+  depends-on {
+    step "earlier-step" completed
+  }
+
+  baseline "NAME" { GRAPH_PREDICATE }
+  subgraph { DESIRED_STATE... }
+  plan "nested-work" { ... }
+  retry { attempts 3; backoff "30s" }
+  produces { PRODUCT... }
+  produces-plan "generated-plan"
+  uses-plan output-of="producer-step"
+  gate "NAME" { GATE_BODY }
+}
+```
+
+`title`, `assigned-to`, `subgraph`, `plan`, `retry`, `produces`, `produces-plan`, and `uses-plan` are single fields.
+
+`goal`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
+
+`timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
+
+`finally=#true` selects final-phase work. Final steps run after normal success, failure, or cancellation. A final step does not make normal work optional.
+
+## Goals
+
+A goal is a concise, falsifiable statement about the result.
+
+Use one `goal` node for one statement. Use up to three nodes when the plan or step has separate required outcomes.
+
+Do not use source order or bullet syntax inside one string to create hidden execution structure. Steps and `depends-on` own execution structure.
+
+## Baselines
+
+A baseline records state that must be true before new work starts.
+
+```kdl
+baseline "the incident is still open" {
+  field "status" "resource/incident" "is" "open"
+  lacks "doc/incident/decision@SHA256" "closed"
+}
+```
+
+A baseline contains one or more graph predicates. Its predicates form an AND relation.
+
+Baselines accept `exists`, `empty`, `field`, `has`, and `lacks`. They do not execute shell, LLM, human, or deadline work.
+
+Plan baselines run before root work admission. A false plan baseline puts the plan run in blocked state, and st3 rechecks it after relevant graph changes while admission remains blocked. Once normal work is admitted, the plan baseline is latched and is not re-evaluated as a continuous gate.
+
+Step baselines run after dependencies hold and before each attempt becomes ready. A false step baseline blocks the step. It does not consume an attempt. A retry checks the baseline again.
+
+A baseline is not historical storage by itself. The plan request or a prior claim must publish the measured state that the predicate names.
+
+## Products
+
+`produces` declares graph state that the work promises to create.
+
+```kdl
+produces {
+  resource "plan-run/${ST_PLAN_RUN}/artifact" {
+    kind "build.artifact"
+    state "published"
+  }
+  message "plan-run/${ST_PLAN_RUN}/handoff" {
+    status "accepted"
+  }
+}
+```
+
+Products can match `resource`, `message`, `agent`, `exec`, `pty`, or `scope` subjects. Each product can require scalar fields.
+
+All products in one block must hold.
+
+A step product is intermediate output for that step. A plan product is a final contract for the complete normal phase.
+
+The worker creates or observes products. st3 verifies them. The `produces` keyword does not perform the action.
+
+A plan product can refer to output created during any step. Do not duplicate a step product at plan level unless the same graph subject is intentionally both an intermediate and final contract.
+
+## Gates
+
+A gate decides whether a completed work boundary can pass.
+
+Plans and steps use repeated flat nodes:
+
+```kdl
+gate "the artifact exists" { exists "resource/build-artifact" }
+gate "the report is green" { field "status" "resource/report" "is" "green" }
+```
+
+Sibling gates form an AND relation. There is no `gates` wrapper.
+
+Step gates run after the subgraph, worker report, nested work, used plan, and products hold. Plan gates run after every normal step and all plan products hold.
+
+Each running gate records `gate.requested` and `gate.result`. The result cites operation evidence. A pass releases the boundary. A failure fails the step or plan. A pending graph or human gate keeps the boundary pending.
+
+### Predicate gates
+
+```kdl
+gate "subject exists" { exists "resource/result" }
+gate "scope is empty" { empty "scope/temporary-work" }
+gate "field matches" { field "status" "resource/result" "is" "green" }
+gate "prefix matches" { field "revision" "resource/result" "starts-with" "git:" }
+gate "text contains value" { has "doc/report@SHA256" "GREEN" }
+gate "text omits value" { lacks "message/report" "UNVERIFIED" }
+```
+
+`field` uses this argument order: path, full subject, operator, value. Operators are `is`, `starts-with`, and `contains`.
+
+`has` and `lacks` accept file, document, or message subjects.
+
+A plan gate or checkpoint gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
+
+### Mechanical gates
+
+```kdl
+gate "the tests pass" {
+  exec "cargo test --workspace"
+  host "local"
+  workspace "${ST_WORKSPACE}"
+  env { RUST_BACKTRACE "1" }
+  time-limit "10m"
+}
+```
+
+A mechanical gate requires `exec`, `host`, and `workspace`. `env` is optional. `time-limit` defaults to two minutes.
+
+The command runs through the supervised exec runtime. Its result is attempt-bound and durable.
+
+### LLM gates
+
+```kdl
+gate "the migration preserves the public contract" type="llm" {
+  model "gpt-5.6-sol"
+  host "local"
+  workspace "${ST_WORKSPACE}"
+  tools "shell" "git"
+  token-budget 12000
+  time-limit "10m"
+  prompt "Inspect the diff and evidence. Return PASS or FAIL with a reason."
+}
+```
+
+An LLM gate requires an explicit model, host, workspace, tool list, positive token budget, time limit, and prompt.
+
+Registered tools are `shell`, `git`, `gh`, and `network`.
+
+The gate fails if its structured usage exceeds the declared token budget.
+
+### Human gates
+
+```kdl
+gate "the release is approved" type="human" {
+  reviewer "person/nathan"
+  question "Is the release ready?"
+  review "resource/release-candidate"
+  review "doc/release/report@SHA256"
+}
+```
+
+A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
+
+st3 creates one `review.requested` claim for the exact plan or step revision and attempt. A review decision must match that request.
+
+## Dependencies
+
+`depends-on` is the only step ordering language.
 
 ```kdl
 depends-on {
   step "build" completed
   step "test" terminal
-  field "decision" "resource/review" "is" "approved"
+  field "status" "resource/change-window" "is" "open"
 }
 ```
 
-Predicate dependencies latch after they pass. A later graph change does not move an active step backwards.
+A step dependency can require `completed`, `failed`, or `terminal`. `completed` is the default when the state is omitted.
 
-`subgraph` declares desired runtime state. st3 materializes the subgraph and waits for convergence.
+Graph predicate dependencies accept the same deterministic predicates as baselines. They latch after they pass. A later graph change does not move active work backward.
 
-`assigned-to` makes the step durable work for one declared agent. The step blocks when the agent is not in the desired graph.
+Dependencies inside a nested plan refer to sibling steps in that nested plan.
 
-The native harness polls the durable work queue. st3 creates one idempotent Small Talk message when an assigned parent becomes ready.
+## Runtime sequence
 
-Inherited nested steps use the parent message. A nested step with a different assignee gets its own message.
+Each run starts with all steps in pending state.
 
-The native driver transports graph messages to the harness. It does not create a second message source.
+For a normal step, st3 performs this sequence:
 
-A work claim acknowledges and closes its Small Talk message. The durable work state remains the source of truth.
+1. Wait for the normal phase.
+2. Wait for the parent nested step, when present.
+3. Wait for every explicit dependency.
+4. Evaluate all step baselines.
+5. Verify that the assignee is present, when present.
+6. Mark the attempt ready.
+7. Materialize its subgraph.
+8. Wait for subgraph convergence.
+9. Wait for the assigned worker report.
+10. Wait for nested plan steps or an exact used plan.
+11. Verify products.
+12. Evaluate gates.
+13. Mark the step completed or failed.
 
-`produces` declares a required graph shape. A worker report enters `verifying` until each product and judge passes.
+When a step fails and its retry policy permits another attempt, st3 increments the attempt, applies backoff, and starts again at dependency and baseline admission. Retryable failure does not terminate the plan before the retry.
 
-`judges` supports graph predicates, mechanical judges, LLM judges, and exact step-run human reviews.
-
-`finally=#true` selects cleanup work after normal success, failure, or cancellation. A plan run waits for final steps.
-
-`retry` controls the attempt count and backoff boundary.
-
-```kdl
-retry {
-  attempts 3
-  backoff "30s"
-}
-```
-
-st3 does not stop retries because two failures have the same text. A later failure-loop design must cover worker, judge, and timeout failures.
-
-A running judge also keeps one operation identity across step retries. The failure-loop work must first make each judge operation attempt-specific.
-
-## Plan completion checks
-
-Every normal step must complete before the plan completes. A final judges-only step is the current plan-level check.
-
-A plan does not accept `judges` or `depends-on`. Step dependencies remain the only work access rules.
-
-Conditional routing could make a final step avoidable. Add plan-level required judges only when that routing exists.
+After all normal steps complete, st3 verifies plan products and plan gates. It then enters the final phase or completes the run.
 
 ## Nested plans
 
-A nested plan is part of the submitted revision. Its first eligible steps start with the parent step.
+A nested `plan` is part of its parent plan revision.
 
-Nested steps inherit the parent assignment unless a child overrides it. Their state stays in st3, not in harness memory.
+The parent step starts the nested roots after the parent is active. Nested steps inherit the parent assignment unless a child overrides it.
+
+Nested work remains durable graph state. It is not stored only in harness memory.
 
 ## Produced and used plans
 
-A step can publish one complete ready plan as its attempt-bound output.
+A step can publish one complete ready plan as an attempt-bound output.
 
 ```kdl
-step "compile-the-repository-plan" {
+step "compile-plan" {
   assigned-to "agent/planner"
-  document "doc/project/plan@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  produces-plan "project/work"
+  document "doc/project/plan@SHA256"
+  produces-plan "project-work"
 }
 ```
 
-The `document` field declares immutable source material for the step. It always needs an exact hash.
-
-The worker must hold the producing step or one of its nested steps before it publishes the plan.
-
-The nested lease must have the same assignee and native runtime incarnation. This rule lets a dedicated nested publication step bind its parent output.
+The worker must hold the producing step or one of its same-assignee nested steps.
 
 ```sh
-st3 work claim step-run/RUN/compile-the-repository-plan --as agent/planner
-st3 work publish-plan step-run/RUN/compile-the-repository-plan ./generated.kdl --as agent/planner
-st3 work complete step-run/RUN/compile-the-repository-plan --as agent/planner
+st3 work publish-plan step-run/RUN/compile-plan generated.kdl --as agent/planner
 ```
 
-`publish-plan` accepts exactly one ready plan. Its ID must match `produces-plan`.
+The published document must contain exactly one ready plan with the declared ID. st3 publishes the immutable revision and binds it to the producing definition and attempt.
 
-The API publishes the immutable plan revision first. It then binds that exact revision to the current step definition and attempt.
-
-A producing step cannot complete verification until that bound ready revision exists.
-
-A later step can use the produced revision.
+A later step can start that exact output:
 
 ```kdl
-step "execute-the-repository-plan" {
+step "execute-plan" {
   assigned-to "agent/planner"
-  depends-on { step "compile-the-repository-plan" completed }
-  uses-plan output-of="compile-the-repository-plan"
+  depends-on { step "compile-plan" completed }
+  uses-plan output-of="compile-plan"
 }
 ```
 
-The `output-of` form requires an explicit completed dependency on the producing step.
+The output form requires an explicit completed dependency on the producer.
 
-The wrapper worker claims and completes the used-plan step. st3 then starts one linked child plan run for the exact output revision.
-
-Unassigned child steps inherit the wrapper assignment. The child run records its root plan run and parent step run.
-
-The wrapper completes only after the child plan completes. A failed or cancelled child plan fails the wrapper.
-
-A step can also use a ready revision that was published earlier.
+A step can also use an already published exact revision:
 
 ```kdl
-uses-plan "project/work@REVISION_HASH"
+uses-plan "project-work@REVISION_SHA256"
 ```
 
-The exact form requires a 64-character revision hash. It never follows the latest plan binding.
+A used plan starts one linked child run. The wrapper completes only after the child completes. A failed or cancelled child fails the wrapper.
 
-## Meta variables
+## Automatic context
 
-st3 expands these variables when it creates a run or materializes a step:
+st3 supplies these exact context names:
 
-| Variable | Value |
+| Name | Value |
 | --- | --- |
-| `${PLAN}` | The plan ID. |
-| `${PLAN_REVISION}` | The active revision hash. |
-| `${PLAN_RUN}` | The plan run ID. |
-| `${ROOT_PLAN_RUN}` | The root `plan-run/...` subject. |
-| `${RUN_SCOPE}` | The expanded run scope, when present. |
-| `${WORKSPACE}` | The run workspace. |
-| `${STEP}` | The step path. |
-| `${STEP_RUN}` | The exact `step-run/...` subject. |
-| `${PARENT_STEP_RUN}` | The parent step-run subject. |
-| `${ATTEMPT}` | The current attempt number. |
-| `${ASSIGNEE}` | The normalized assignee subject. |
-| `${REQUESTER}` | The normalized requester subject. |
+| `ST_PLAN` | Plan ID. |
+| `ST_PLAN_REVISION` | Active plan revision hash. |
+| `ST_PLAN_RUN` | Plan run ID without the `plan-run/` prefix. |
+| `ST_ROOT_PLAN_RUN` | Full root `plan-run/...` subject. |
+| `ST_SCOPE` | Expanded run scope, or an empty value. |
+| `ST_WORKSPACE` | Absolute run workspace. |
+| `ST_REQUESTER` | Normalized requester subject. |
+| `ST_STEP` | Step path in a step context. |
+| `ST_STEP_RUN` | Full step-run subject in a step context. |
+| `ST_ATTEMPT` | Current attempt number in a step context. |
+| `ST_ASSIGNEE` | Normalized assignee, or an empty value. |
+| `ST_PARENT_STEP_RUN` | Parent step-run subject, or an empty value. |
+| `ST_GATE` | Gate name in a running gate context. |
+| `ST_AGENT` | Runtime agent or member identity. |
 
-An unknown variable makes the plan invalid.
+The values are available for `${NAME}` KDL interpolation when the current plan, step, member, or gate context defines them. Step members and running gates receive the same applicable values as environment variables.
 
-Graph subject IDs are global. Use `${PLAN_RUN}` in a message or resource ID when each run needs a new subject.
+For example, use `${ST_PLAN_RUN}` directly. Do not write a manual mapping such as `env { PLAN_RUN "${ST_PLAN_RUN}" }` only to rename the built-in value.
+
+The exact built-in names are reserved in authored `env` maps. st3 rejects an attempt to replace them. Other names, including other `ST_*` names, remain available to applications.
+
+An unknown variable or a variable that is not available in the current phase is an error.
+
+## Agent grouping
+
+`under` is repeatable agent metadata.
+
+```kdl
+agent "researcher" {
+  under "lead" reason="the lead combines the research"
+  under "design-group"
+  workspace "/work/research"
+  command "research"
+}
+```
+
+A bare target uses the local host identity. A full `agent/host.name` target stays full.
+
+The relation is visible in `st3 agents --json`, status, and assigned work. It is suitable for a tree or graph UI.
+
+The relation does not create permission, lifecycle, scheduling, or mandatory reporting behavior.
+
+Missing targets, self-relations, and cycles create warnings during preview. They do not block publication or another agent.
 
 ## Work commands
 
-The work API uses a ten-minute lease. A native harness renews its lease once each minute.
-
-An active lease binds to the agent identity and its supplied incarnation. Another incarnation cannot update that work.
+Assigned work uses a renewable lease bound to the agent identity and runtime incarnation.
 
 ```sh
-st3 work ls --as agent/sig.base
-st3 work show step-run/RUN/rename-base
-st3 work claim step-run/RUN/rename-base --as agent/sig.base
-st3 work progress step-run/RUN/rename-base --summary "The base tests pass."
-st3 work complete step-run/RUN/rename-base --summary "The revision is published."
-st3 work fail step-run/RUN/rename-base --reason "The package cannot compile."
-st3 work release step-run/RUN/rename-base --reason "The agent must hand off this work."
+st3 work ls --as agent/node.worker
+st3 work show step-run/RUN/step
+st3 work claim step-run/RUN/step --as agent/node.worker
+st3 work progress step-run/RUN/step --summary "The tests are running."
+st3 work complete step-run/RUN/step --summary "The product is published."
+st3 work fail step-run/RUN/step --reason "The compiler rejected the source."
+st3 work release step-run/RUN/step --reason "The work needs another owner."
 ```
 
-A completion report is not a correctness result. The declared products and judges decide final completion.
+A worker completion report is not a correctness result. Products and gates still control final completion.
 
-## Revisions and review
+The native driver renews active leases and delivers one idempotent Small Talk assignment for ready parent work.
 
-The default scope change policy is `agent`. An assignee can revise only its assigned step subtree.
+## Plan revisions
 
-`supervisor` and `human-review` policies require a `change-authority`. The actor must match that authority.
+The default scoped change policy is `agent`. An assignee can revise its assigned step subtree.
+
+`supervisor` and `human-review` policies require a `change-authority`.
 
 ```sh
 st3 work revise PLAN_RUN replacement.kdl \
-  --as agent/sig.base \
-  --reason "The package also contains a generated protocol table."
+  --as agent/node.worker \
+  --reason "The generated source adds one verification step."
 ```
 
-An active run adopts an accepted revision. Changed steps and their dependents reset.
+Changed steps and their dependents reset. Unchanged independent steps keep their completed state. The run keeps its original root revision.
 
-Unchanged independent steps keep their completion. The original root revision remains in the run record.
+## Immutable documents
 
-A human judge can declare its question and the graph subjects that a person must review.
-
-```kdl
-judges {
-  human "person/nathan" {
-    question "Is this pull request ready to merge?"
-    review "resource/plan-run/${PLAN_RUN}/pull-request"
-    review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  }
-}
-```
-
-The reconciler creates one durable `review.requested` claim. The claim contains the reviewer, question, review targets, and allowed decisions.
-
-The standard decisions are `approved`, `rejected`, and `revise`. A step timeout supplies an optional deadline and fails closed.
-
-A human decision binds to the exact review request. That request identifies the plan revision, step definition, and attempt.
+`document` on a step always requires `doc/NAME@SHA256`.
 
 ```sh
-st3 review approve step-run/RUN/nathan-approves --actor person/nathan
-st3 review revise step-run/RUN/rename-base --actor person/nathan \
-  --reason "The plan must preserve one more protocol name."
+st3 doc put request.md --as doc/project/request
+st3 doc get doc/project/request@SHA256 --output request.md
+st3 doc list doc/project/request
 ```
 
-A `revise` decision blocks only the selected step. The replacement plan uses the normal revision command.
+Bare document names can appear in an intent before preview. The preview resolves them to the current exact hash. Apply validates the bytes and binds that exact version.
 
-A later UI can list unresolved `review.requested` claims and show their review targets.
+## Preview, publish, and run
 
-These policies are workflow rules. st3 does not authenticate peer identity yet.
+`st3 preview FILE` validates KDL, resolves documents, displays changes, returns subject tokens, and performs no write.
 
-st3 is not secure by default. TLS, authenticated identity, and ACLs remain future work.
+`st3 run FILE` repeats preview, applies the exact tokens, selects one ready plan, starts one run, and follows it unless `--detach` is present.
 
-st3 has no Fabric-specific behavior. A deployment can use Fabric, Tailscale, another VPN, or a VPC.
+If a file contains multiple ready plans, select one with `--plan`.
 
-## Documents
+## Planning mode
 
-Post document bytes before a plan refers to them.
+Planning mode asks one durable Codex harness to author Markdown and KDL for review.
 
 ```sh
-st3 doc put ./task.md --as doc/evals/signal-rename/task
+st3 plan start --id release-plan request.md \
+  --workspace ./project \
+  --as person/nathan \
+  --model gpt-5.6-sol \
+  --effort medium
+
+st3 plan show SESSION
+st3 plan preview SESSION
+st3 plan revise SESSION feedback.md --as person/nathan
+st3 plan approve SESSION PREVIEW_HASH --as person/nathan
+st3 plan cancel SESSION --as person/nathan --reason "The request changed."
 ```
 
-The command prints `doc/NAME@SHA256`. Put that exact name and hash in the KDL.
-
-Publication refuses when the stored binding changed after planning. Older immutable versions remain valid.
-
-## Main commands
+The planner uses this command:
 
 ```sh
-st3 up
-st3 plan plan.kdl
-st3 run plan.kdl
-st3 run plan.kdl --plan signal-rename --workspace ./workspace
-st3 import ./catalog
-st3 eval ./evals/st3/signal-rename
+st3 plan submit SESSION --markdown PLAN.md --kdl plan.kdl
 ```
 
-`st3 run` prints a live plan and step tree. `--detach` returns the durable run record instead.
+The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.
 
-The st3 evals are in `evals/st3/license-mit`, `evals/st3/ghost-bug`, and `evals/st3/signal-rename`.
+The candidate must contain exactly one ready plan with the requested ID.
 
-Their st2 counterparts use the same names under `evals/st2`.
+Preview returns these review values:
+
+- the candidate and plan revisions;
+- a static dependency graph;
+- the graph subject diff;
+- warnings and blockers;
+- exact subject tokens;
+- one hash over the complete preview.
+
+Revision invalidates the prior preview. Approval requires the current preview hash and current subject tokens.
+
+Approval publishes the ready plan and one `plan.documents` claim. It does not start a run. Approval and cancellation stop the planner.
+
+Controllers should wait on `planning-session.*` events. They must not spend an agent turn to poll session status.
+
+## Public gate result
+
+A running mechanical or LLM gate gets a one-use operation capability. Its runner records the terminal result with:
+
+```sh
+st3 gate-result pass \
+  --operation-capability OPERATION_CAPABILITY \
+  --reason "The checks passed." \
+  --evidence claim/EVIDENCE
+```
+
+The API endpoint is `POST /v1/gate-results`. The durable kinds are `gate.requested` and `gate.result`.
+
+## Claims and evidence
+
+Plan execution uses these important claim kinds:
+
+- `plan.published` records an immutable plan revision.
+- `plan.documents` links an approved planning session to Markdown and KDL.
+- `plan-run.created`, `plan-run.revised`, and `plan-run.state` record run history.
+- `step-run.state` and `step-run.retry` record step and attempt history.
+- `plan.produced` binds a generated plan to one producing attempt.
+- `gate.requested` and `gate.result` record gate operations and evidence.
+- `review.requested` and `review.decision` record exact human gates.
+
+Evidence is a list of claim IDs or immutable graph references that support a result. The evidence does not replace the gate. The gate definition says what must be decided; evidence records why the result is trustworthy.
+
+## Eval contract
+
+`st3 eval DIRECTORY` archives the explicit directory, posts staged documents, applies its version 2 intent, and starts the selected eval plan.
+
+The planning-mode eval uses one real Codex planner. A controller waits on the event stream and directly approves the first valid candidate. Mechanical gates prove that the plan was hidden before approval, the preview graph and diff were rendered, the exact hash was approved, one ready plan was published, no run started, immutable documents were linked, the planner stopped, and the workspace did not change.
+
+The revision and stale-preview path is a deterministic API test. It does not spend a model run.

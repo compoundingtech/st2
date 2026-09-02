@@ -143,7 +143,7 @@ The 2026-08-30 proof showed these changes:
 - The worker claimed its parent work at `00:27`.
 - The graph expanded six nested steps under the parent work.
 - Each nested step moved through ready, claimed, and completed states.
-- The held-out judges and cleanup completed at `03:15`.
+- The held-out gates and cleanup completed at `03:15`.
 
 The final frame showed this summary:
 

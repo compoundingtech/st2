@@ -6,24 +6,34 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    ChangePolicy, DependencySpec, JudgeSpec, PlanSpec, PlanState, ProductSpec, RetrySpec, St3Error,
-    StepSpec, UsedPlanSpec,
+    BaselineSpec, ChangePolicy, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec,
+    RetrySpec, St3Error, StepSpec, UsedPlanSpec,
 };
 
 const VARIABLES: &[&str] = &[
-    "PLAN",
-    "PLAN_REVISION",
-    "PLAN_RUN",
-    "RUN_SCOPE",
-    "WORKSPACE",
-    "STEP",
-    "STEP_RUN",
-    "ATTEMPT",
-    "ASSIGNEE",
-    "REQUESTER",
-    "PARENT_STEP_RUN",
-    "ROOT_PLAN_RUN",
+    "ST_PLAN",
+    "ST_PLAN_REVISION",
+    "ST_PLAN_RUN",
+    "ST_ROOT_PLAN_RUN",
+    "ST_SCOPE",
+    "ST_WORKSPACE",
+    "ST_REQUESTER",
+    "ST_STEP",
+    "ST_STEP_RUN",
+    "ST_ATTEMPT",
+    "ST_ASSIGNEE",
+    "ST_PARENT_STEP_RUN",
+    "ST_GATE",
+    "ST_AGENT",
 ];
+
+pub(crate) fn is_reserved_context_name(name: &str) -> bool {
+    VARIABLES.contains(&name)
+}
+
+pub(crate) fn validate_plan_id(value: &str) -> Result<(), St3Error> {
+    validate_id(value, "plan")
+}
 
 pub fn parse_plans(
     root: &KdlNode,
@@ -159,24 +169,70 @@ fn parse_plan(
     let children = node
         .children()
         .ok_or_else(|| St3Error::new("empty-plan", format!("plan `{id}` has no steps")))?;
+    let mut goals = Vec::new();
+    let mut baselines = Vec::new();
+    let mut products = Vec::new();
+    let mut gates = Vec::new();
     let mut steps = BTreeMap::new();
     let mut display_order = Vec::new();
+    let mut produces_seen = false;
+    let mut baseline_names = BTreeSet::new();
+    let mut gate_names = BTreeSet::new();
     for child in children.nodes() {
-        if child.name().value() != "step" {
-            return Err(St3Error::new(
-                "invalid-plan-child",
-                format!("plan `{id}` cannot contain `{}`", child.name().value()),
-            ));
+        match child.name().value() {
+            "goal" => goals.push(plain_string(child)?),
+            "baseline" => {
+                let baseline = parse_baseline(child)?;
+                if !baseline_names.insert(baseline.name.clone()) {
+                    return Err(St3Error::new(
+                        "duplicate-baseline",
+                        format!("plan `{id}` repeats baseline `{}`", baseline.name),
+                    ));
+                }
+                baselines.push(baseline);
+            }
+            "produces" if !produces_seen => {
+                products = parse_products(child)?;
+                produces_seen = true;
+            }
+            "produces" => {
+                return Err(St3Error::new(
+                    "duplicate-plan-field",
+                    format!("plan `{id}` repeats `produces`"),
+                ));
+            }
+            "gate" => {
+                let gate = crate::graph::parse_gate(child, default_host)?;
+                if !gate_names.insert(crate::graph::gate_name(&gate).to_owned()) {
+                    return Err(St3Error::new(
+                        "duplicate-gate",
+                        format!(
+                            "plan `{id}` repeats gate `{}`",
+                            crate::graph::gate_name(&gate)
+                        ),
+                    ));
+                }
+                gates.push(gate);
+            }
+            "step" => {
+                let step = parse_step(child, "", default_host)?;
+                if steps.insert(step.id.clone(), step.clone()).is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-step",
+                        format!("plan `{id}` repeats step `{}`", step.id),
+                    ));
+                }
+                display_order.push(step.id);
+            }
+            other => {
+                return Err(St3Error::new(
+                    "invalid-plan-child",
+                    format!("plan `{id}` cannot contain `{other}`"),
+                ));
+            }
         }
-        let step = parse_step(child, "", default_host)?;
-        if steps.insert(step.id.clone(), step.clone()).is_some() {
-            return Err(St3Error::new(
-                "duplicate-step",
-                format!("plan `{id}` repeats step `{}`", step.id),
-            ));
-        }
-        display_order.push(step.id);
     }
+    validate_goal_count(&format!("plan `{id}`"), &goals, true)?;
     if steps.is_empty() {
         return Err(St3Error::new(
             "empty-plan",
@@ -192,6 +248,10 @@ fn parse_plan(
         scope_template: scope.map(str::to_owned),
         change_policy: inherited_policy.unwrap_or(ChangePolicy::Agent),
         change_authority: inherited_authority,
+        goals,
+        baselines,
+        products,
+        gates,
         steps,
         display_order,
     };
@@ -214,22 +274,29 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         .transpose()?;
     let finally = property_bool(node, "finally")?.unwrap_or(false);
     let mut title = None;
-    let mut goal = None;
+    let mut goals = Vec::new();
     let mut assigned_to = None;
     let mut dependencies = Vec::new();
+    let mut baselines = Vec::new();
     let mut documents = Vec::new();
     let mut subgraph_kdl = None;
     let mut products = Vec::new();
     let mut produces_plan = None;
     let mut uses_plan = None;
-    let mut judges = Vec::new();
+    let mut gates = Vec::new();
     let mut nested_plan = None;
     let mut retry = RetrySpec::default();
     if let Some(children) = node.children() {
         let mut names = BTreeSet::new();
+        let mut baseline_names = BTreeSet::new();
+        let mut gate_names = BTreeSet::new();
         for child in children.nodes() {
             let name = child.name().value();
-            if !matches!(name, "depends-on" | "document") && !names.insert(name.to_owned()) {
+            if !matches!(
+                name,
+                "goal" | "baseline" | "gate" | "depends-on" | "document"
+            ) && !names.insert(name.to_owned())
+            {
                 return Err(St3Error::new(
                     "duplicate-step-field",
                     format!("step `{path}` repeats `{name}`"),
@@ -237,7 +304,17 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
             }
             match name {
                 "title" => title = Some(first_string(child)?),
-                "goal" => goal = Some(first_string(child)?),
+                "goal" => goals.push(plain_string(child)?),
+                "baseline" => {
+                    let baseline = parse_baseline(child)?;
+                    if !baseline_names.insert(baseline.name.clone()) {
+                        return Err(St3Error::new(
+                            "duplicate-baseline",
+                            format!("step `{path}` repeats baseline `{}`", baseline.name),
+                        ));
+                    }
+                    baselines.push(baseline);
+                }
                 "assigned-to" => {
                     assigned_to = Some(normalize_assignee(&first_string(child)?, default_host))
                 }
@@ -251,22 +328,31 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                             format!("step `{path}` has an empty subgraph"),
                         ));
                     }
-                    subgraph_kdl = Some(format!("version 2\n{child}\n"));
+                    let source = format!("version 2\n{child}\n");
+                    crate::graph::validate_deferred_environment(child)?;
+                    subgraph_kdl = Some(source);
                 }
                 "produces" => products = parse_products(child)?,
                 "produces-plan" => produces_plan = Some(parse_produced_plan(child)?),
                 "uses-plan" => uses_plan = Some(parse_used_plan(child)?),
-                "judges" => {
-                    judges = crate::graph::parse_judges(child, default_host)?;
-                    if judges
-                        .iter()
-                        .any(|judge| matches!(judge, JudgeSpec::Deadline { .. }))
-                    {
+                "gate" => {
+                    let gate = crate::graph::parse_gate(child, default_host)?;
+                    if matches!(gate, GateSpec::Deadline { .. }) {
                         return Err(St3Error::new(
                             "invalid-plan-deadline",
                             format!("step `{path}` must use its timeout property"),
                         ));
                     }
+                    if !gate_names.insert(crate::graph::gate_name(&gate).to_owned()) {
+                        return Err(St3Error::new(
+                            "duplicate-gate",
+                            format!(
+                                "step `{path}` repeats gate `{}`",
+                                crate::graph::gate_name(&gate)
+                            ),
+                        ));
+                    }
+                    gates.push(gate);
                 }
                 "plan" => {
                     let mut plan = parse_plan(child, None, None, None, default_host, false)?;
@@ -283,28 +369,90 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
             }
         }
     }
+    validate_goal_count(&format!("step `{path}`"), &goals, false)?;
     let mut step = StepSpec {
         id,
         path,
         title,
-        goal,
+        goals,
         timeout_ms,
         retry,
         finally,
         assigned_to,
         dependencies,
+        baselines,
         documents,
         subgraph_kdl,
         products,
         produces_plan,
         uses_plan,
-        judges,
+        gates,
         nested_plan,
         definition_hash: String::new(),
     };
     validate_variables(&serde_json::to_value(&step).map_err(internal)?)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
+}
+
+fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Result<(), St3Error> {
+    if (required && goals.is_empty()) || goals.len() > 3 {
+        return Err(St3Error::new(
+            "invalid-goal-count",
+            format!(
+                "{context} needs {} through 3 goals",
+                if required { 1 } else { 0 }
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_baseline(node: &KdlNode) -> Result<BaselineSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let name = first_string(node)?;
+    if name.is_empty() || name.len() > 160 {
+        return Err(St3Error::new(
+            "invalid-baseline-name",
+            "a baseline name must contain 1 through 160 bytes",
+        ));
+    }
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "missing-baseline-body",
+            format!("baseline `{name}` has no predicates"),
+        )
+    })?;
+    if body.nodes().is_empty() {
+        return Err(St3Error::new(
+            "empty-baseline",
+            format!("baseline `{name}` has no predicates"),
+        ));
+    }
+    let mut gates = Vec::new();
+    for (index, predicate) in body.nodes().iter().enumerate() {
+        let gate_name = if body.nodes().len() == 1 {
+            name.clone()
+        } else {
+            format!("{name}/{}", index + 1)
+        };
+        let gate = crate::graph::parse_baseline_gate(predicate, gate_name)?;
+        if matches!(
+            gate,
+            GateSpec::Deadline { .. }
+                | GateSpec::Mechanical { .. }
+                | GateSpec::Llm { .. }
+                | GateSpec::Human { .. }
+        ) {
+            return Err(St3Error::new(
+                "invalid-baseline-gate",
+                "a baseline accepts only graph predicates",
+            ));
+        }
+        gates.push(gate);
+    }
+    Ok(BaselineSpec { name, gates })
 }
 
 fn parse_step_document(node: &KdlNode) -> Result<String, St3Error> {
@@ -355,7 +503,10 @@ fn rewrite_nested_paths(plan: &mut PlanSpec, parent: &str) -> Result<(), St3Erro
     Ok(())
 }
 
-fn parse_dependencies(node: &KdlNode, default_host: &str) -> Result<Vec<DependencySpec>, St3Error> {
+fn parse_dependencies(
+    node: &KdlNode,
+    _default_host: &str,
+) -> Result<Vec<DependencySpec>, St3Error> {
     reject_type(node)?;
     let mut output = positional_strings(node)?
         .into_iter()
@@ -386,28 +537,23 @@ fn parse_dependencies(node: &KdlNode, default_host: &str) -> Result<Vec<Dependen
                     state,
                 });
             } else {
-                let mut judges = KdlNode::new("judges");
-                let mut body = KdlDocument::new();
-                body.nodes_mut().push(child.clone());
-                judges.set_children(body);
-                let parsed = crate::graph::parse_judges(&judges, default_host)?;
-                if parsed.len() != 1
-                    || matches!(
-                        parsed[0],
-                        JudgeSpec::Deadline { .. }
-                            | JudgeSpec::Mechanical { .. }
-                            | JudgeSpec::Llm { .. }
-                            | JudgeSpec::Human { .. }
-                    )
-                {
+                let parsed = crate::graph::parse_baseline_gate(
+                    child,
+                    format!("dependency/{}", output.len() + 1),
+                )?;
+                if matches!(
+                    parsed,
+                    GateSpec::Deadline { .. }
+                        | GateSpec::Mechanical { .. }
+                        | GateSpec::Llm { .. }
+                        | GateSpec::Human { .. }
+                ) {
                     return Err(St3Error::new(
                         "invalid-dependency-predicate",
                         "depends-on accepts only graph predicates and step states",
                     ));
                 }
-                output.push(DependencySpec::Predicate {
-                    judge: parsed[0].clone(),
-                });
+                output.push(DependencySpec::Predicate { gate: parsed });
             }
         }
     }
@@ -863,6 +1009,18 @@ fn first_string(node: &KdlNode) -> Result<String, St3Error> {
     Ok(values[0].clone())
 }
 
+fn plain_string(node: &KdlNode) -> Result<String, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    if node.children().is_some() {
+        return Err(St3Error::new(
+            "invalid-node",
+            format!("`{}` cannot contain a block", node.name().value()),
+        ));
+    }
+    first_string(node)
+}
+
 fn positional_strings(node: &KdlNode) -> Result<Vec<String>, St3Error> {
     node.entries()
         .iter()
@@ -967,27 +1125,28 @@ mod tests {
         let source = r#"
 version 2
 subgraph {
-  scope "eval/demo/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/demo/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "demo" state="ready" {
+      goal "Complete plan demo."
       step "start" {
         subgraph {
-          agent "worker.${PLAN_RUN}" {
+          agent "worker.${ST_PLAN_RUN}" {
             workspace "."
             harness "codex" { prompt "Run durable work." }
           }
         }
       }
       step "one" {
-        assigned-to "agent/worker.${PLAN_RUN}"
+        assigned-to "agent/worker.${ST_PLAN_RUN}"
         depends-on { step "start" completed }
-        plan "work" { step "inspect" { } }
+        plan "work" { goal "Complete plan work."; step "inspect" { } }
         produces {
-          resource "plan-run/${PLAN_RUN}/change" { kind "vcs.revision"; state "published" }
+          resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.revision"; state "published" }
         }
       }
       step "two" { depends-on { step "start" completed } }
       step "join" { depends-on { step "one" completed; step "two" completed } }
-      step "cleanup" finally=#true { subgraph { scope "eval/demo/${PLAN_RUN}" { stop } } }
+      step "cleanup" finally=#true { subgraph { scope "eval/demo/${ST_PLAN_RUN}" { stop } } }
     }
   }
 }
@@ -997,12 +1156,12 @@ subgraph {
         assert_eq!(plan.steps.len(), 5);
         assert_eq!(
             plan.scope_template.as_deref(),
-            Some("scope/eval/demo/${PLAN_RUN}")
+            Some("scope/eval/demo/${ST_PLAN_RUN}")
         );
         assert!(plan.steps["one"].nested_plan.is_some());
         assert_eq!(
             plan.steps["one"].products[0].subject,
-            "resource/plan-run/${PLAN_RUN}/change"
+            "resource/plan-run/${ST_PLAN_RUN}/change"
         );
     }
 
@@ -1013,7 +1172,7 @@ subgraph {
                 .unwrap_err();
         assert_eq!(old.code, "unknown-node");
         let cycle = crate::graph::parse_intent(
-            "version 2\nsubgraph {\n  plan \"cycle\" state=\"ready\" {\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n}\n",
+            "version 2\nsubgraph {\n  plan \"cycle\" state=\"ready\" {\n    goal \"The cycle is rejected.\"\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n}\n",
             "node",
         )
         .unwrap_err();
@@ -1027,13 +1186,13 @@ subgraph {
 version 2
 subgraph {
   plan "review" state="ready" {
+    goal "Complete plan review."
     step "approval" {
-      judges {
-        human "person/nathan" {
-          question "Is this change ready to merge?"
-          review "resource/plan-run/${PLAN_RUN}/pull-request"
-          review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
+      gate "human-review" type="human" {
+        reviewer "person/nathan"
+        question "Is this change ready to merge?"
+        review "resource/plan-run/${ST_PLAN_RUN}/pull-request"
+        review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     }
   }
@@ -1042,21 +1201,22 @@ subgraph {
             "node",
         )
         .unwrap();
-        let judge = &intent.plans["review"].steps["approval"].judges[0];
-        let crate::model::JudgeSpec::Human {
+        let gate = &intent.plans["review"].steps["approval"].gates[0];
+        let crate::model::GateSpec::Human {
             reviewer,
             question,
             review_targets,
-        } = judge
+            ..
+        } = gate
         else {
-            panic!("the judge is not human");
+            panic!("the gate is not human");
         };
         assert_eq!(reviewer, "person/nathan");
         assert_eq!(question.as_deref(), Some("Is this change ready to merge?"));
         assert_eq!(
             review_targets,
             &[
-                "resource/plan-run/${PLAN_RUN}/pull-request",
+                "resource/plan-run/${ST_PLAN_RUN}/pull-request",
                 "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]
         );
@@ -1070,6 +1230,7 @@ subgraph {
 version 2
 subgraph {{
   plan "bootstrap" state="ready" {{
+    goal "Complete plan bootstrap."
     step "compile" {{
       document "doc/project/plan@{}"
       produces-plan "project/work"
@@ -1118,7 +1279,7 @@ subgraph {{
     fn rejects_unpinned_or_unordered_plan_use() {
         let unpinned = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "bad" state="ready" { step "use" { uses-plan "work" } } }"#,
+subgraph { plan "bad" state="ready" { goal "Use a plan."; step "use" { uses-plan "work" } } }"#,
             "node",
         )
         .unwrap_err();
@@ -1126,7 +1287,7 @@ subgraph { plan "bad" state="ready" { step "use" { uses-plan "work" } } }"#,
 
         let unpinned_document = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "bad" state="ready" { step "use" { document "doc/project/plan" } } }"#,
+subgraph { plan "bad" state="ready" { goal "Use a document."; step "use" { document "doc/project/plan" } } }"#,
             "node",
         )
         .unwrap_err();
@@ -1136,6 +1297,7 @@ subgraph { plan "bad" state="ready" { step "use" { document "doc/project/plan" }
             r#"version 2
 subgraph {
   plan "bad" state="ready" {
+    goal "Complete plan bad."
     step "compile" { produces-plan "work" }
     step "use" { uses-plan output-of="compile" }
   }
@@ -1144,5 +1306,106 @@ subgraph {
         )
         .unwrap_err();
         assert_eq!(unordered.code, "missing-plan-output-dependency");
+    }
+
+    #[test]
+    fn plan_and_step_contracts_accept_the_new_flat_language() {
+        let intent = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "release" state="ready" {
+    goal "Publish the release."
+    goal "Keep the workspace clean."
+    baseline "release is open" { field "state" "resource/release" is "open" }
+    produces { resource "release" { state "published" } }
+    gate "release is approved" { field "approval" "resource/release" is "yes" }
+    step "build" {
+      goal "Build the artifact."
+      goal "Record the checksum."
+      baseline "source exists" { exists "resource/source" }
+      produces { resource "artifact" { state "published" } }
+      gate "artifact is valid" { field "valid" "resource/artifact" is #true }
+    }
+    step "publish" { depends-on { step "build" completed } }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let plan = &intent.plans["release"];
+        assert_eq!(plan.goals.len(), 2);
+        assert_eq!(plan.baselines.len(), 1);
+        assert_eq!(plan.products.len(), 1);
+        assert_eq!(plan.gates.len(), 1);
+        assert_eq!(plan.steps["build"].goals.len(), 2);
+        assert_eq!(plan.steps["build"].baselines.len(), 1);
+        assert_eq!(plan.steps["build"].products.len(), 1);
+        assert_eq!(plan.steps["build"].gates.len(), 1);
+        assert!(plan.steps["publish"].goals.is_empty());
+    }
+
+    #[test]
+    fn goal_limits_and_removed_plan_language_are_strict() {
+        for source in [
+            r#"version 2
+subgraph { plan "none" state="ready" { step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "four" state="ready" { goal "1"; goal "2"; goal "3"; goal "4"; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "step-four" state="ready" { goal "Run."; step "work" { goal "1"; goal "2"; goal "3"; goal "4" } } }"#,
+        ] {
+            assert_eq!(
+                crate::graph::parse_intent(source, "node").unwrap_err().code,
+                "invalid-goal-count"
+            );
+        }
+        for removed in [
+            r#"version 2
+subgraph { plan "old" state="ready" { goal "Run."; outcome { } ; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "old" state="ready" { goal "Run."; judges { } ; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } }"#,
+        ] {
+            assert!(crate::graph::parse_intent(removed, "node").is_err());
+        }
+    }
+
+    #[test]
+    fn reserved_context_variables_cannot_be_authored() {
+        let reserved = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "reserved" state="ready" {
+    goal "Reject a context override."
+    step "work" {
+      subgraph { exec "task" { command "true"; env { ST_PLAN_RUN "forged" } } }
+    }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(reserved.code, "reserved-context-variable");
+
+        crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "allowed" state="ready" {
+    goal "Allow an application variable."
+    step "work" {
+      subgraph { exec "task" { command "true"; env { ST_ROOT "allowed" } } }
+    }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
     }
 }

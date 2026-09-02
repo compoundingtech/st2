@@ -6,7 +6,7 @@ The graph assigns three distinct drafts in parallel.
 It then assigns six peer critiques, three revisions, and one synthesis stage.
 The graph stores each proposal revision and the final message receipt.
 
-The held-out judges check ownership, distinct designs, privacy analysis, Small Talk debate, graph products, and the final recommendation.
+The held-out gates check ownership, distinct designs, privacy analysis, Small Talk debate, graph products, and the final recommendation.
 
 Start the daemon with `st3 up`.
 Run the eval with `st3 eval ./evals/st3/fork-in-the-road`.

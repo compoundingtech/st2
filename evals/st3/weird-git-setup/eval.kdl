@@ -1,24 +1,23 @@
 version 2
 
 subgraph {
-  scope "eval/weird-git-setup/${PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/weird-git-setup/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/weird-git-setup" state="ready" {
+      goal "Complete plan eval/weird-git-setup."
       step "materialize-megarepo" timeout="5m" {
         title "The linked worktree fixture exists"
         subgraph {
-          exec "eval/weird-git-setup/materialize/${PLAN_RUN}" {
+          exec "eval/weird-git-setup/materialize/${ST_PLAN_RUN}" {
             host "local"
-            workspace "${WORKSPACE}"
-            cwd "${WORKSPACE}"
+            workspace "${ST_WORKSPACE}"
+            cwd "${ST_WORKSPACE}"
             command "bash ./setup-megarepo.sh"
             restart "never"
-            env { CATALOG "${WORKSPACE}" }
+            env { CATALOG "${ST_WORKSPACE}" }
           }
         }
-        judges {
-          field "status" "exec/eval/weird-git-setup/materialize/${PLAN_RUN}" "is" "exited"
-          field "exit_code" "exec/eval/weird-git-setup/materialize/${PLAN_RUN}" "is" 0
-        }
+        gate "condition-1" { field "status" "exec/eval/weird-git-setup/materialize/${ST_PLAN_RUN}" "is" "exited" }
+        gate "condition-2" { field "exit_code" "exec/eval/weird-git-setup/materialize/${ST_PLAN_RUN}" "is" 0 }
       }
 
       step "start-worker" timeout="10m" {
@@ -26,7 +25,7 @@ subgraph {
         depends-on { step "materialize-megarepo" completed }
         subgraph {
           agent "wg.dev" {
-            workspace "${WORKSPACE}/wt/feature"
+            workspace "${ST_WORKSPACE}/wt/feature"
             harness "codex" {
               model "gpt-5.6-sol"
               effort "medium"
@@ -35,10 +34,9 @@ subgraph {
             }
             restart "never"
             env {
-              CATALOG "${WORKSPACE}"
-              PLAN_RUN "${PLAN_RUN}"
-              ST_ROOT "${WORKSPACE}/.st3-messages"
-              ST3_MESSAGE_ROOT "${WORKSPACE}/.st3-messages"
+              CATALOG "${ST_WORKSPACE}"
+              ST_ROOT "${ST_WORKSPACE}/.st3-messages"
+              ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
             }
           }
         }
@@ -50,6 +48,7 @@ subgraph {
         assigned-to "agent/wg.dev"
         depends-on { step "start-worker" completed }
         plan "work" {
+          goal "Complete plan work."
           step "resolve-checkout" {
             title "The linked worktree context is understood"
             goal "Inspect pwd, git status, git rev-parse --show-toplevel, git rev-parse --git-dir, git branch --show-current, and the .git file. Identify the current branch and shared worktree layout."
@@ -71,36 +70,34 @@ subgraph {
           }
           step "publish-feature-revision" {
             title "The feature worktree revision is published"
-            goal "Commit on the current feature branch with the configured identity. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$PLAN_RUN/feature-revision resource.binding --actor agent/wg.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+            goal "Commit on the current feature branch with the configured identity. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/feature-revision resource.binding --actor agent/wg.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
             depends-on { step "verify-complete-suite" completed }
-            produces { resource "plan-run/${PLAN_RUN}/feature-revision" { kind "vcs.revision"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/feature-revision" { kind "vcs.revision"; state "published" } }
           }
           step "report-requester" {
             title "The requester receives the verified worktree result"
-            goal "Send person/eval-requester exactly one Small Talk message. Include the revision, branch, linked-worktree evidence, and green test command. Use tag plan-run:$PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$PLAN_RUN/final-report resource.binding --actor agent/wg.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+            goal "Send person/eval-requester exactly one Small Talk message. Include the revision, branch, linked-worktree evidence, and green test command. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.binding --actor agent/wg.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
             depends-on { step "publish-feature-revision" completed }
-            produces { resource "plan-run/${PLAN_RUN}/final-report" { kind "message.receipt"; state "published" } }
+            produces { resource "plan-run/${ST_PLAN_RUN}/final-report" { kind "message.receipt"; state "published" } }
           }
         }
       }
 
-      step "held-out-judges" timeout="10m" {
-        title "All Weird Git Setup judges pass"
+      step "held-out-gates" timeout="10m" {
+        title "All Weird Git Setup gates pass"
         depends-on { step "repair-feature-worktree" completed }
-        judges {
-          judge "the checkout is a linked feature worktree" { exec "bash ./judges/worktree-resolved.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the complete suite is green" { exec "bash ./judges/suite-green.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the fix is committed on feature" { exec "bash ./judges/fix-on-feature.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "main and the sibling worktree are unchanged" { exec "bash ./judges/no-leak.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the seeded regression remains effective" { exec "bash ./judges/regression-test.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}" }; time-limit "120000ms" }
-          judge "the graph records the worktree plan, revision, and report" { exec "bash ./judges/graph.sh"; host "local"; workspace "${WORKSPACE}"; env { CATALOG "${WORKSPACE}"; PLAN_RUN "${PLAN_RUN}" }; time-limit "120000ms" }
-        }
+        gate "the checkout is a linked feature worktree" { exec "bash ./judges/worktree-resolved.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the complete suite is green" { exec "bash ./judges/suite-green.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the fix is committed on feature" { exec "bash ./judges/fix-on-feature.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "main and the sibling worktree are unchanged" { exec "bash ./judges/no-leak.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the seeded regression remains effective" { exec "bash ./judges/regression-test.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
+        gate "the graph records the worktree plan, revision, and report" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
       }
 
       step "cleanup" finally=#true {
         title "The temporary eval scope is empty"
-        subgraph { scope "eval/weird-git-setup/${PLAN_RUN}" { stop } }
-        judges { empty "scope/eval/weird-git-setup/${PLAN_RUN}" }
+        subgraph { scope "eval/weird-git-setup/${ST_PLAN_RUN}" { stop } }
+        gate "condition" { empty "scope/eval/weird-git-setup/${ST_PLAN_RUN}" }
       }
     }
   }

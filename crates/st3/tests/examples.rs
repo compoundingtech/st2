@@ -57,21 +57,21 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
     counts
 }
 
-fn authored_model_judges(source: &str) -> Vec<String> {
+fn authored_model_gates(source: &str) -> Vec<String> {
     fn visit(document: &kdl::KdlDocument, models: &mut Vec<String>) {
         for node in document.nodes() {
-            let is_llm_judge = node.name().value() == "judge"
+            let is_llm_gate = node.name().value() == "gate"
                 && node.entries().iter().any(|entry| {
                     entry.name().map(|name| name.value()) == Some("type")
                         && entry.value().as_string() == Some("llm")
                 });
-            if is_llm_judge {
+            if is_llm_gate {
                 let model = node
                     .children()
                     .and_then(|body| body.get("model"))
                     .and_then(|model| model.entries().first())
                     .and_then(|entry| entry.value().as_string())
-                    .expect("a model judge must declare its model");
+                    .expect("a model gate must declare its model");
                 models.push(model.to_owned());
             }
             if let Some(children) = node.children() {
@@ -80,10 +80,28 @@ fn authored_model_judges(source: &str) -> Vec<String> {
         }
     }
 
-    let document: kdl::KdlDocument = source.parse().expect("parse model judge KDL");
+    let document: kdl::KdlDocument = source.parse().expect("parse model gate KDL");
     let mut models = Vec::new();
     visit(&document, &mut models);
     models
+}
+
+#[test]
+fn planning_mode_eval_uses_one_dynamic_codex_planner() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/planning-mode");
+    let source = fs::read_to_string(root.join("eval.kdl")).expect("read planning mode eval");
+    assert_eq!(
+        authored_harness_counts(&source, "planning-mode/eval.kdl"),
+        (0, 0),
+        "the planning API, not the eval KDL, owns the durable planner"
+    );
+    let controller =
+        fs::read_to_string(root.join("controller.sh")).expect("read planning controller");
+    assert!(controller.contains("plan start"));
+    assert!(controller.contains("--model gpt-5.6-sol"));
+    assert!(!controller.contains("claude"));
 }
 
 #[test]
@@ -212,8 +230,8 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
                 st3_file.display()
             );
             assert!(
-                authored_model_judges(&st3_source).is_empty(),
-                "{} must not use an LLM judge",
+                authored_model_gates(&st3_source).is_empty(),
+                "{} must not use an LLM gate",
                 st3_file.display()
             );
         } else {
@@ -252,7 +270,7 @@ fn selected_eval_harness_counts_match_the_inventory() {
         ("weird-git-setup", (0, 1), (0, 1)),
         ("claude-skill-inheritance", (1, 0), (1, 0)),
     ];
-    let mut model_judges = Vec::new();
+    let mut model_gates = Vec::new();
 
     for (name, st2_expected, st3_expected) in expected {
         let st2_source = fs::read_to_string(root.join("st2").join(name).join("eval.kdl")).unwrap();
@@ -282,19 +300,19 @@ fn selected_eval_harness_counts_match_the_inventory() {
         let st3_source = fs::read_to_string(root.join("st3").join(name).join("eval.kdl")).unwrap();
         let st3_counts = authored_harness_counts(&st3_source, &format!("st3 {name}"));
         assert_eq!(st3_counts, st3_expected, "st3 {name}");
-        model_judges.extend(authored_model_judges(&st3_source));
+        model_gates.extend(authored_model_gates(&st3_source));
     }
     let plan_lift = fs::read_to_string(root.join("st3/plan-document-lift/eval.kdl")).unwrap();
     assert_eq!(
         authored_harness_counts(&plan_lift, "st3 plan-document-lift"),
         (0, 1)
     );
-    model_judges.extend(authored_model_judges(&plan_lift));
-    model_judges.sort();
+    model_gates.extend(authored_model_gates(&plan_lift));
+    model_gates.sort();
     assert_eq!(
-        model_judges,
+        model_gates,
         ["gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-sol"],
-        "the model judge inventory changed; update evals/README.md"
+        "the model gate inventory changed; update evals/README.md"
     );
 }
 
@@ -314,10 +332,10 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             ]
             .as_slice(),
             [
-                "resource/plan-run/${PLAN_RUN}/license-brief",
-                "resource/plan-run/${PLAN_RUN}/license-revision",
-                "resource/plan-run/${PLAN_RUN}/worker-report",
-                "resource/plan-run/${PLAN_RUN}/final-confirmation",
+                "resource/plan-run/${ST_PLAN_RUN}/license-brief",
+                "resource/plan-run/${ST_PLAN_RUN}/license-revision",
+                "resource/plan-run/${ST_PLAN_RUN}/worker-report",
+                "resource/plan-run/${ST_PLAN_RUN}/final-confirmation",
             ]
             .as_slice(),
         ),
@@ -331,10 +349,10 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             ]
             .as_slice(),
             [
-                "resource/plan-run/${PLAN_RUN}/debug-brief",
-                "resource/plan-run/${PLAN_RUN}/fix-revision",
-                "resource/plan-run/${PLAN_RUN}/worker-report",
-                "resource/plan-run/${PLAN_RUN}/final-confirmation",
+                "resource/plan-run/${ST_PLAN_RUN}/debug-brief",
+                "resource/plan-run/${ST_PLAN_RUN}/fix-revision",
+                "resource/plan-run/${ST_PLAN_RUN}/worker-report",
+                "resource/plan-run/${ST_PLAN_RUN}/final-confirmation",
             ]
             .as_slice(),
         ),
@@ -466,7 +484,7 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
             "update-root-and-config",
             "close-base-compatibility",
             "integrate-and-verify",
-            "held-out-judges",
+            "held-out-gates",
             "publish-final-report",
             "cleanup",
         ]
@@ -514,34 +532,37 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
         dependencies("integrate-and-verify"),
         ["close-base-compatibility"]
     );
-    assert_eq!(dependencies("held-out-judges"), ["integrate-and-verify"]);
-    assert_eq!(dependencies("publish-final-report"), ["held-out-judges"]);
+    assert_eq!(dependencies("held-out-gates"), ["integrate-and-verify"]);
+    assert_eq!(dependencies("publish-final-report"), ["held-out-gates"]);
 
     let required_products = [
         (
             "open-base-compatibility",
-            "resource/plan-run/${PLAN_RUN}/base-compatibility",
+            "resource/plan-run/${ST_PLAN_RUN}/base-compatibility",
         ),
         (
             "migrate-relay",
-            "resource/plan-run/${PLAN_RUN}/relay-revision",
+            "resource/plan-run/${ST_PLAN_RUN}/relay-revision",
         ),
-        ("migrate-hub", "resource/plan-run/${PLAN_RUN}/hub-revision"),
+        (
+            "migrate-hub",
+            "resource/plan-run/${ST_PLAN_RUN}/hub-revision",
+        ),
         (
             "update-root-and-config",
-            "resource/plan-run/${PLAN_RUN}/config-revision",
+            "resource/plan-run/${ST_PLAN_RUN}/config-revision",
         ),
         (
             "close-base-compatibility",
-            "resource/plan-run/${PLAN_RUN}/base-final-revision",
+            "resource/plan-run/${ST_PLAN_RUN}/base-final-revision",
         ),
         (
             "integrate-and-verify",
-            "resource/plan-run/${PLAN_RUN}/integrated-revision",
+            "resource/plan-run/${ST_PLAN_RUN}/integrated-revision",
         ),
         (
             "publish-final-report",
-            "resource/plan-run/${PLAN_RUN}/final-report",
+            "resource/plan-run/${ST_PLAN_RUN}/final-report",
         ),
     ];
     for (parent, product) in required_products {
@@ -577,7 +598,7 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
             "inject-cold-restart",
             "process-after-restart",
             "verify-and-confirm",
-            "held-out-judges",
+            "held-out-gates",
             "cleanup",
         ]
     );
@@ -616,14 +637,14 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
         dependencies("verify-and-confirm"),
         ["process-after-restart"]
     );
-    assert_eq!(dependencies("held-out-judges"), ["verify-and-confirm"]);
+    assert_eq!(dependencies("held-out-gates"), ["verify-and-confirm"]);
 
     let required_products = [
-        "resource/plan-run/${PLAN_RUN}/pre-restart",
-        "resource/plan-run/${PLAN_RUN}/restart",
-        "resource/plan-run/${PLAN_RUN}/batch",
-        "resource/plan-run/${PLAN_RUN}/worker-report",
-        "resource/plan-run/${PLAN_RUN}/verification",
+        "resource/plan-run/${ST_PLAN_RUN}/pre-restart",
+        "resource/plan-run/${ST_PLAN_RUN}/restart",
+        "resource/plan-run/${ST_PLAN_RUN}/batch",
+        "resource/plan-run/${ST_PLAN_RUN}/worker-report",
+        "resource/plan-run/${ST_PLAN_RUN}/verification",
     ];
     for product in required_products {
         assert!(plan.steps.values().any(|step| {
@@ -665,7 +686,7 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
             "revise-shared",
             "revise-federated",
             "synthesize",
-            "held-out-judges",
+            "held-out-gates",
             "cleanup",
         ]
     );
@@ -715,7 +736,7 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
         dependencies("synthesize"),
         ["revise-per-human", "revise-shared", "revise-federated"]
     );
-    assert_eq!(dependencies("held-out-judges"), ["synthesize"]);
+    assert_eq!(dependencies("held-out-gates"), ["synthesize"]);
 
     let products = plan
         .steps
@@ -726,14 +747,14 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
         .map(|product| product.subject.as_str())
         .collect::<Vec<_>>();
     for product in [
-        "resource/plan-run/${PLAN_RUN}/proposal-a-draft",
-        "resource/plan-run/${PLAN_RUN}/proposal-b-draft",
-        "resource/plan-run/${PLAN_RUN}/proposal-c-draft",
-        "resource/plan-run/${PLAN_RUN}/proposal-a-final",
-        "resource/plan-run/${PLAN_RUN}/proposal-b-final",
-        "resource/plan-run/${PLAN_RUN}/proposal-c-final",
-        "resource/plan-run/${PLAN_RUN}/recommendation",
-        "resource/plan-run/${PLAN_RUN}/final-report",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-a-draft",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-b-draft",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-c-draft",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-a-final",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-b-final",
+        "resource/plan-run/${ST_PLAN_RUN}/proposal-c-final",
+        "resource/plan-run/${ST_PLAN_RUN}/recommendation",
+        "resource/plan-run/${ST_PLAN_RUN}/final-report",
     ] {
         assert!(products.contains(&product));
     }
@@ -755,7 +776,7 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
             "start-team",
             "review-pull-request",
             "assess-review",
-            "held-out-judges",
+            "held-out-gates",
             "cleanup",
         ]
     );
@@ -778,8 +799,8 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
         .flat_map(|step| &step.products)
         .map(|product| product.subject.as_str())
         .collect::<Vec<_>>();
-    assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/reviewer-report"));
-    assert!(products.contains(&"resource/plan-run/${PLAN_RUN}/final-verdict"));
+    assert!(products.contains(&"resource/plan-run/${ST_PLAN_RUN}/reviewer-report"));
+    assert!(products.contains(&"resource/plan-run/${ST_PLAN_RUN}/final-verdict"));
 }
 
 #[test]
@@ -798,10 +819,10 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
             ]
             .as_slice(),
             [
-                "resource/plan-run/${PLAN_RUN}/test-brief",
-                "resource/plan-run/${PLAN_RUN}/test-revision",
-                "resource/plan-run/${PLAN_RUN}/developer-report",
-                "resource/plan-run/${PLAN_RUN}/final-assessment",
+                "resource/plan-run/${ST_PLAN_RUN}/test-brief",
+                "resource/plan-run/${ST_PLAN_RUN}/test-revision",
+                "resource/plan-run/${ST_PLAN_RUN}/developer-report",
+                "resource/plan-run/${ST_PLAN_RUN}/final-assessment",
             ]
             .as_slice(),
         ),
@@ -810,8 +831,8 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
             "eval/weird-git-setup",
             [("repair-feature-worktree", "agent/wg.dev")].as_slice(),
             [
-                "resource/plan-run/${PLAN_RUN}/feature-revision",
-                "resource/plan-run/${PLAN_RUN}/final-report",
+                "resource/plan-run/${ST_PLAN_RUN}/feature-revision",
+                "resource/plan-run/${ST_PLAN_RUN}/final-report",
             ]
             .as_slice(),
         ),
@@ -819,7 +840,7 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
             "claude-skill-inheritance",
             "eval/claude-skill-inheritance",
             [("exercise-skill-union", "agent/si.agent")].as_slice(),
-            ["resource/plan-run/${PLAN_RUN}/skill-report"].as_slice(),
+            ["resource/plan-run/${ST_PLAN_RUN}/skill-report"].as_slice(),
         ),
     ];
 
