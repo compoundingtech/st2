@@ -751,8 +751,10 @@ Credential omission delegates account choice to the native driver. Anonymous
 readiness has at least one model; lowering sorts and deduplicates the model set,
 and `harness` must equal the effective native driver. A legacy `deliver` value
 must match that same explicit driver. No command-basename inference is
-admitted. A managed driver, readiness, or native delivery transport cannot
-coexist with Ding; Ding remains only for opaque non-harness PTYs.
+admitted. A managed driver, readiness, or native delivery transport takes
+precedence over an obsolete `ding` entry. Lowering omits the DING sidecar, so
+only the native owner can deliver to the session. Ding remains active only for
+opaque non-harness PTYs.
 
 `st2 catalog graph --json` schema `st2.catalog-graph.v2` publishes
 `effectiveSessionDriver` and `deliveryReadiness` separately from `runtime`. It
