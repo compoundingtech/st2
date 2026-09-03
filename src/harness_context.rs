@@ -33,10 +33,13 @@
 //! signal used by roster consumers; the raw readings remain advisory for a human, a roster, and
 //! Doctor.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::harness_state::{lock_exclusive, write_json_atomic};
@@ -44,6 +47,7 @@ use crate::harness_state::{lock_exclusive, write_json_atomic};
 const SCHEMA: &str = "st2.harness-context.v1";
 const LOCK_NAME: &str = ".harness-context.lock";
 const TMP_PREFIX: &str = ".harness-context";
+const STAGING_DIR_NAME: &str = "harness-context-staging";
 
 /// The record's file name inside an agent directory.
 pub const RECORD_NAME: &str = "harness-context";
@@ -273,32 +277,132 @@ impl Compaction {
     }
 }
 
-/// Where a temporary name may live for an agent's record (HC-R05): the agent directory's parent —
-/// one level up in the catalog, `<catalog>/agents/<host>/` for the layout st2 publishes.
+/// Return the dedicated control-plane directory where harness-context writes may stage (HC-R05).
 ///
-/// Both halves of HC-R05 fail silently in production. A record the transport does not carry is
-/// invisible to exactly the remote readers a catalog record exists for; and a staged temporary
-/// name *inside* the replicated subtree is propagated as a real key and restored after a later
-/// local delete. So the writer stages outside the agent's own subtree, on the same filesystem by
-/// construction, and renames only the canonical path in.
+/// The writer is handed an agent directory, not a catalog root, so it derives the root only from
+/// the exact canonical `<catalog>/agents/<host>/<identity>` shape and validates every catalog
+/// component as a real directory. This is intentionally not an upward search: a nearby unrelated
+/// `.st2` must never capture a write. The staging directory lives below this catalog's `.st2`, out
+/// of the identity namespace and the replicated `agents` subtree.
 ///
-/// The parent is chosen over searching upward for the catalog's control directory
-/// (`<catalog>/.st2`), which reads better and is wrong: the search escapes into whatever
-/// unrelated `.st2` happens to sit above the agent — a bare working directory under `/tmp` on a
-/// host that has a stray `/tmp/.st2` stages into a foreign tree, and possibly a foreign
-/// filesystem, which costs the rename its atomicity. The parent needs no discovery, cannot
-/// escape, holds nothing the transport replicates (only agent directories, and a dotted temporary
-/// name matches no include entry), and is correct for a flat catalog as well as a published one.
-///
-/// An agent directory with no parent at all has nowhere safe to stage; that is an error rather
-/// than a quiet write inside the subtree.
+/// The device check makes the atomic-rename precondition explicit. A catalog with `.st2` mounted
+/// separately is rejected rather than degrading publication to a copy or a non-atomic fallback.
 fn staging_dir(agent_dir: &Path) -> anyhow::Result<PathBuf> {
-    agent_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no staging directory outside the agent subtree for {}",
-            agent_dir.display()
-        )
-    })
+    let host_dir = agent_dir
+        .parent()
+        .context("canonical agent directory has no host parent")?;
+    let agents_dir = host_dir
+        .parent()
+        .context("canonical host directory has no agents parent")?;
+    anyhow::ensure!(
+        agents_dir.file_name() == Some(OsStr::new("agents")),
+        "agent directory is not under a canonical agents path: {}",
+        agent_dir.display()
+    );
+    let catalog = agents_dir
+        .parent()
+        .context("canonical agents directory has no catalog parent")?;
+    for (path, label) in [
+        (catalog, "catalog root"),
+        (agents_dir, "canonical agents directory"),
+        (host_dir, "canonical host directory"),
+        (agent_dir, "canonical identity directory"),
+    ] {
+        ensure_real_directory(path, label)?;
+    }
+    let canonical_catalog = catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog root {}", catalog.display()))?;
+    let canonical_agent = agent_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize agent directory {}", agent_dir.display()))?;
+    anyhow::ensure!(
+        canonical_agent
+            == canonical_catalog
+                .join("agents")
+                .join(host_dir.file_name().context("canonical host has no name")?)
+                .join(
+                    agent_dir
+                        .file_name()
+                        .context("canonical identity has no name")?,
+                ),
+        "agent directory ancestry is not canonical: {}",
+        agent_dir.display()
+    );
+
+    let control = canonical_catalog.join(crate::catalog_lock::CONTROL_DIR);
+    create_or_validate_directory(&control, "catalog control directory")?;
+    let staging = control.join(STAGING_DIR_NAME);
+    create_or_validate_directory(&staging, "harness-context staging directory")?;
+    let agent_device = fs::metadata(&canonical_agent)?.dev();
+    let staging_device = fs::metadata(&staging)?.dev();
+    anyhow::ensure!(
+        agent_device == staging_device,
+        "harness-context staging directory is not on the agent filesystem: {}",
+        staging.display()
+    );
+    Ok(staging)
+}
+
+fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "{label} is not a real directory: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn create_or_validate_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {label} {}", path.display()));
+        }
+    }
+    ensure_real_directory(path, label)
+}
+
+/// Whether a host child is the exact regular-file shape emitted by legacy harness-context writers.
+///
+/// Current-catalog walkers may overlook only this one compatibility residue. Exact-name
+/// directories, symlinks, and special files are errors; generic dotfiles and near misses remain
+/// ordinary identity candidates and therefore fail the canonical topology checks.
+pub(crate) fn is_legacy_harness_context_staging_file(
+    entry: &fs::DirEntry,
+) -> anyhow::Result<bool> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    if !is_legacy_staging_name(name) {
+        return Ok(false);
+    }
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect legacy staging file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "legacy harness-context staging path is not a real regular file: {}",
+        path.display()
+    );
+    Ok(true)
+}
+
+fn is_legacy_staging_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(".harness-context.tmp-") else {
+        return false;
+    };
+    let Some((pid, counter)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The writer a driver process owns over one agent's context record. Several driver processes of
@@ -1141,50 +1245,100 @@ mod tests {
         assert!(Writer::new(&agent_dir, "hetz.worker", Harness::Unrecognized).is_err());
     }
 
-    /// HC-R05, staging half: a write leaves nothing non-canonical behind in the agent directory.
-    /// A temporary name inside the replicated subtree is propagated as a real key and restored
-    /// after a later local delete, so the staged file lives in the catalog's control directory —
-    /// outside every agent subtree, on the same filesystem.
+    /// HC-R05: publication stages below this catalog's control directory, never in `agents`, and
+    /// both successful and failed renames consume or clean their temporary file.
     #[test]
-    fn writes_stage_outside_the_agent_subtree_and_leave_nothing_behind() {
+    fn writes_stage_in_catalog_control_and_clean_up_after_success_or_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
         let staging = staging_dir(&agent_dir).unwrap();
-        assert_eq!(staging, tmp.path().join("agents").join("hetz"));
+        assert_eq!(
+            staging,
+            tmp.path()
+                .join(crate::catalog_lock::CONTROL_DIR)
+                .join(STAGING_DIR_NAME)
+        );
         assert!(
-            !staging.starts_with(&agent_dir),
-            "outside the agent subtree"
+            !staging.starts_with(tmp.path().join("agents")),
+            "staging must be outside the complete identity namespace"
+        );
+        assert_eq!(
+            fs::metadata(&staging).unwrap().dev(),
+            fs::metadata(&agent_dir).unwrap().dev(),
+            "rename must remain on one filesystem"
         );
 
         let mut writer = writer(&agent_dir);
         writer.observe(reading(85_000, 33.0)).unwrap();
-        writer.observe(reading(90_000, 35.0)).unwrap();
-        writer
-            .compacted(Compaction::new(CompactionTrigger::Auto))
-            .unwrap();
+        assert!(harness_context_path(&agent_dir).is_file());
+        assert!(
+            fs::read_dir(&staging).unwrap().next().is_none(),
+            "a successful rename consumes its staging file"
+        );
 
-        // The permanent siblings this record is entitled to, and nothing else.
-        let mut left: Vec<String> = fs::read_dir(&agent_dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec![LOCK_NAME.to_string(), RECORD_NAME.to_string()]);
+        fs::remove_file(harness_context_path(&agent_dir)).unwrap();
+        fs::create_dir(harness_context_path(&agent_dir)).unwrap();
+        assert!(writer.observe(reading(90_000, 35.0)).is_err());
+        assert!(
+            fs::read_dir(&staging).unwrap().next().is_none(),
+            "a failed rename cleans its staging file"
+        );
+    }
 
-        // Nothing was left in the staging directory either: a landed rename consumes its
-        // temporary name, and a failed one cleans it up.
-        let staged: Vec<String> = fs::read_dir(&staging)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(TMP_PREFIX))
-            .collect();
-        assert!(staged.is_empty(), "{staged:?}");
+    #[cfg(unix)]
+    #[test]
+    fn staging_requires_real_canonical_catalog_ancestry() {
+        use std::os::unix::fs::symlink;
 
-        // A directory with no parent has nowhere safe to stage, and says so rather than writing
-        // a temporary name inside the subtree.
-        assert!(staging_dir(Path::new("/")).is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let noncanonical = tmp.path().join("other/host/worker");
+        fs::create_dir_all(&noncanonical).unwrap();
+        assert!(staging_dir(&noncanonical).is_err());
+
+        let real = tmp.path().join("real-worker");
+        fs::create_dir(&real).unwrap();
+        let linked = tmp.path().join("agents/host/worker");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        symlink(&real, &linked).unwrap();
+        assert!(staging_dir(&linked).is_err());
+        assert!(
+            !tmp.path()
+                .join(crate::catalog_lock::CONTROL_DIR)
+                .exists(),
+            "rejected ancestry must not create control state"
+        );
+    }
+
+
+    #[test]
+    fn only_the_exact_legacy_regular_file_shape_is_reserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path();
+        for (name, reserved) in [
+            (".harness-context.tmp-123-0", true),
+            (".harness-context.tmp-001-002", true),
+            (".harness-context.tmp--1", false),
+            (".harness-context.tmp-1-", false),
+            (".harness-context.tmp-1-2-extra", false),
+            (".harness-context.tmp-pid-2", false),
+            (".other.tmp-1-2", false),
+        ] {
+            let path = host.join(name);
+            fs::write(&path, "stale").unwrap();
+            let entry = fs::read_dir(host)
+                .unwrap()
+                .find_map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name() == OsStr::new(name)).then_some(entry)
+                })
+                .unwrap();
+            assert_eq!(
+                is_legacy_harness_context_staging_file(&entry).unwrap(),
+                reserved,
+                "{name}"
+            );
+            fs::remove_file(path).unwrap();
+        }
     }
 
     /// HC-R05, naming half: the exact record names st2 expects the transport's include list to

@@ -1261,6 +1261,31 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
     assert_eq!(second["status"], "unchanged");
     assert_eq!(second["rootSha256"], first["rootSha256"]);
 }
+
+#[test]
+fn snapshot_ignores_and_preserves_an_exact_legacy_harness_context_staging_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let first_output = temp.path().join("snapshot-before-legacy-stage");
+    let first = snapshot(&catalog, &first_output);
+    let legacy = catalog
+        .join("agents/host")
+        .join(".harness-context.tmp-123-456");
+    fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+
+    let second_output = temp.path().join("snapshot-after-legacy-stage");
+    let second = snapshot(&catalog, &second_output);
+
+    assert_eq!(second["rootSha256"], first["rootSha256"]);
+    assert!(!second_output.join("agents/host/.harness-context.tmp-123-456").exists());
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        b"stale legacy staging bytes",
+        "snapshotting must not clean another process's file"
+    );
+}
+
 #[test]
 fn snapshot_projects_relative_profile_modules_once_and_hashes_their_bytes() {
     let temp = tempfile::tempdir().unwrap();

@@ -1952,6 +1952,11 @@ fn collect_canonical_specs(
         ensure_safe_component(&host_entry.file_name(), "host")?;
         ensure_real_dir(&host_path, "canonical host directory")?;
         for identity_entry in sorted_entries(&host_path)? {
+            if source == ProjectionSource::Current
+                && crate::harness_context::is_legacy_harness_context_staging_file(&identity_entry)?
+            {
+                continue;
+            }
             let identity_path = identity_entry.path();
             ensure_safe_component(&identity_entry.file_name(), "identity")?;
             ensure_real_dir(&identity_path, "canonical identity directory")?;
@@ -2558,6 +2563,9 @@ fn cleanup_writer_temporaries(catalog: &Path) -> Result<()> {
             ensure_safe_component(&host.file_name(), "host")?;
             ensure_real_dir(&host.path(), "canonical host directory")?;
             for identity in sorted_entries(&host.path())? {
+                if crate::harness_context::is_legacy_harness_context_staging_file(&identity)? {
+                    continue;
+                }
                 ensure_safe_component(&identity.file_name(), "identity")?;
                 ensure_real_dir(&identity.path(), "canonical identity directory")?;
                 cleanup_writer_temporaries_in(&identity.path(), true, true)?;
@@ -3748,4 +3756,81 @@ mod tests {
             joined.display()
         );
     }
+
+    fn catalog_with_worker(root: &Path) -> PathBuf {
+        let agent = root.join("agents/host/worker");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" { host \"host\"; command \"true\" }\n",
+        )
+        .unwrap();
+        agent
+    }
+
+    #[test]
+    fn current_projection_ignores_and_preserves_an_exact_legacy_staging_file() {
+        let root = tempfile::tempdir().unwrap();
+        catalog_with_worker(root.path());
+        let before = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+        let legacy = root
+            .path()
+            .join("agents/host/.harness-context.tmp-123-456");
+        fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+
+        let after = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+        cleanup_writer_temporaries(root.path()).unwrap();
+
+        assert_eq!(after, before, "runtime residue cannot alter the digest");
+        assert_eq!(
+            fs::read(&legacy).unwrap(),
+            b"stale legacy staging bytes",
+            "the compatibility reader must not clean another process's file"
+        );
+        assert!(
+            project(root.path(), ProjectionSource::Prepared, root.path()).is_err(),
+            "prepared topology remains strict"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_projection_rejects_legacy_shape_type_confusion_and_near_misses() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["directory", "symlink", "near-miss"] {
+            let root = tempfile::tempdir().unwrap();
+            catalog_with_worker(root.path());
+            let host = root.path().join("agents/host");
+            match kind {
+                "directory" => {
+                    fs::create_dir(host.join(".harness-context.tmp-123-456")).unwrap();
+                }
+                "symlink" => {
+                    symlink(
+                        host.join("worker"),
+                        host.join(".harness-context.tmp-123-456"),
+                    )
+                    .unwrap();
+                }
+                "near-miss" => {
+                    fs::write(host.join(".harness-context.tmp-123-nope"), b"stale").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                project(root.path(), ProjectionSource::Current, root.path()).is_err(),
+                "{kind} must not enter the reserved compatibility exception"
+            );
+            assert!(
+                cleanup_writer_temporaries(root.path()).is_err(),
+                "{kind} must remain strict during writer-temporary cleanup"
+            );
+        }
+    }
+
 }

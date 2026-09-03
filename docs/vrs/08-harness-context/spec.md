@@ -363,19 +363,19 @@ Two obligations follow on st2's side:
   and renames only the canonical path in. Measured free: p50 0.217 ms staged
   outside versus 0.222 ms as a sibling.
 
-  **Where, decided during implementation (2026-08-29): the agent directory's
-  parent** — `<catalog>/agents/<host>/` for the layout st2 publishes. The
-  obvious alternative, walking up for the catalog's control directory and
-  staging in `<catalog>/.st2/staging`, reads better and is wrong: the search has
-  no way to tell *this* catalog's control directory from any unrelated one above
-  the agent, and it was caught doing exactly that in a test — an agent directory
-  under `/tmp` on a host carrying a stray `/tmp/.st2` staged into a foreign
-  tree, and potentially a foreign filesystem, which costs the rename its
-  atomicity. The parent needs no discovery, cannot escape, holds nothing the
-  transport replicates (only agent directories, and a dotted temporary name
-  matches no include entry), and is correct for a flat catalog as well as a
-  published one. An agent directory with no parent is an error rather than a
-  quiet write inside the subtree.
+  **Where:** `<catalog>/.st2/harness-context-staging`, derived only from the
+  exact canonical `<catalog>/agents/<host>/<identity>` ancestry. Every ancestry
+  component and the staging directory must be a real directory, and the staging
+  and agent directories must report the same filesystem device; otherwise the
+  writer fails rather than searching upward, following a symlink, or degrading
+  atomic publication to a copy.
+
+  Earlier writers staged at `<catalog>/agents/<host>` and could leave
+  `.harness-context.tmp-<numeric-pid>-<numeric-counter>` behind after a crash.
+  Current-catalog identity walkers overlook only an exact legacy name that is a
+  regular non-symlink file, and leave it untouched for a possibly-live old
+  writer. Directories, symlinks, special files, generic dotfiles, near misses,
+  and prepared-catalog topology remain strict.
 
   `harness-state` keeps staging beside itself for now. The two records share the
   extracted `write_json_atomic` helper, which takes the staging directory as an
@@ -1058,10 +1058,11 @@ each only once a real test proves it (per `CLAUDE.md`):
 - **Replicated-path discipline** (new row, once proved) — st2 pins the exact
   driver-record names it expects the transport's include list to carry, and no
   staging file is ever created inside the replicated subtree. Both are silent
-  failures in production, so both need a test that asserts the names and paths
-  themselves: one pinning `harness-state` and `harness-context` as the names
-  st2 publishes for replication, one asserting that a write leaves no
-  non-canonical file behind in the agent directory.
+  failures in production, so tests pin `harness-state` and `harness-context`,
+  assert staging below the catalog control directory with same-filesystem
+  atomic publication and cleanup, and bound legacy-reader compatibility to the
+  exact regular-file shape without changing a digest, snapshot, or message
+  address.
 - **Status-line slot chaining** (HC-R18) — a rendered status-line registration
   invokes the operator's downstream renderer. The slot is single-valued and the
   winner replaces rather than merges, so a test that only checks st2's command
