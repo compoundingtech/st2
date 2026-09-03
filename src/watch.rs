@@ -463,11 +463,11 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
-        let agent_dir = dir.path();
+        let agent_dir = dir.path().join("agents/h/worker");
         std::fs::create_dir_all(agent_dir.join("resources/inbox")).unwrap();
 
         let (tx, rx) = channel();
-        let _watcher = watch_delivery_inputs(agent_dir, tx).expect("start inotify watcher");
+        let _watcher = watch_delivery_inputs(&agent_dir, tx).expect("start inotify watcher");
 
         // Runtime records the pump's own process group writes must stay silent: the observed
         // harness state and the harness context beside it, their locks and atomic temp siblings,
@@ -481,7 +481,7 @@ mod tests {
         std::fs::write(agent_dir.join("resources/streams/s/state.json"), "{}").unwrap();
         // …and a real harness-context write through its own writer, staging outside the agent
         // subtree and renaming the record in, which is the shape a producer actually produces.
-        st2_harness_context_write(agent_dir);
+        st2_harness_context_write(&agent_dir);
         assert!(
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "runtime-record writes must not wake the delivery pump"
