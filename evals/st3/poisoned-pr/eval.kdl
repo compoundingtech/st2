@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/poisoned-pr/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/poisoned-pr/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/poisoned-pr" state="ready" {
       goal "Complete plan eval/poisoned-pr."
       step "start-team" timeout="10m" {

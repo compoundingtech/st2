@@ -34,8 +34,10 @@ use crate::model::{
     MessageLifecycleRequest, MessageSendRequest, MessageView, PlanOutputView,
     PlanProductionRequest, PlanRequest, PlanResponse, PlanRevisionRequest, PlanRunRequest,
     PlanRunView, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse, ReviewRequest,
+    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicationBatch, ReplicationQuery,
+    ReplicationResponse, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
     SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
     SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest,
 };
@@ -125,8 +127,24 @@ pub fn router(state: AppState) -> Router {
             post(submit_planning_candidate),
         )
         .route(
+            "/v1/planning-sessions/{id}/variants/{variant}/submit",
+            post(submit_named_planning_candidate),
+        )
+        .route(
             "/v1/planning-sessions/{id}/preview",
             post(preview_planning_candidate),
+        )
+        .route(
+            "/v1/planning-sessions/{id}/variants/{variant}/preview",
+            post(preview_named_planning_candidate),
+        )
+        .route(
+            "/v1/planning-sessions/{id}/variants/{left}/compare/{right}",
+            get(compare_planning_variants),
+        )
+        .route(
+            "/v1/planning-sessions/{id}/variants/{variant}/propose",
+            post(propose_planning_variant),
         )
         .route(
             "/v1/planning-sessions/{id}/revise",
@@ -157,7 +175,25 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/evals/{*scope}", get(get_eval))
         .route("/v1/plan-runs", get(list_plan_runs).post(start_plan_run))
         .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
+        .route("/v1/plan-runs/{run}/generations", get(list_run_generations))
+        .route(
+            "/v1/plan-runs/{run}/revision-proposal",
+            get(get_run_revision_proposal),
+        )
         .route("/v1/plan-runs/{run}", get(get_plan_run))
+        .route("/v1/run-generations/{generation}", get(get_run_generation))
+        .route(
+            "/v1/revision-proposals/{proposal}",
+            get(get_revision_proposal),
+        )
+        .route(
+            "/v1/revision-proposals/{proposal}/approve",
+            post(approve_revision_proposal),
+        )
+        .route(
+            "/v1/revision-proposals/{proposal}/cancel",
+            post(cancel_revision_proposal),
+        )
         .route("/v1/work", get(list_work))
         .route("/v1/work/plan/{*subject}", post(publish_work_plan))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
@@ -528,7 +564,37 @@ async fn start_planning_session(
             "a planning request cannot be empty",
         )));
     }
-    crate::plan::validate_plan_id(&request.plan).map_err(ApiError::bad)?;
+    let target_run = request
+        .run
+        .as_deref()
+        .map(|run| state.store.plan_run(run))
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten();
+    if request.run.is_some() && target_run.is_none() {
+        return Err(ApiError::not_found("the target plan run does not exist"));
+    }
+    if let Some(run) = &target_run
+        && (!matches!(run.status.as_str(), "running" | "blocked") || run.phase != "normal")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "plan-run-not-revisable",
+            format!(
+                "plan run `{}` is {} in its {} phase",
+                run.subject, run.status, run.phase
+            ),
+        )));
+    }
+    let plan_id = target_run
+        .as_ref()
+        .map(|run| {
+            run.plan
+                .strip_prefix("plan/")
+                .unwrap_or(&run.plan)
+                .to_owned()
+        })
+        .unwrap_or_else(|| request.plan.clone());
+    crate::plan::validate_plan_id(&plan_id).map_err(ApiError::bad)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..24].to_owned();
     let request_name = format!("doc/planning/{id}/request");
     let request_document = state
@@ -544,15 +610,38 @@ async fn start_planning_session(
         normalize_planning_reviewer(request.requester.as_deref().unwrap_or("person/requester"));
     let planner = format!("agent/{}.planner.{}", state.node, &id[..10]);
     let request_reference = format!("{}@{}", request_document.name, request_document.hash);
+    let context_reference = if let Some(run) = &target_run {
+        let plan = state
+            .store
+            .plan_spec(&plan_id, Some(&run.revision))
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal("the target plan revision is unavailable"))?;
+        let context = serde_json::to_vec_pretty(&json!({"plan_run": run, "plan": plan}))
+            .map_err(ApiError::internal)?;
+        let document = state
+            .store
+            .put_document(
+                &format!("doc/planning/{id}/run-context"),
+                &context,
+                &None,
+                &format!("{}:run-context", request.idempotency_key),
+            )
+            .map_err(ApiError::bad)?;
+        Some(format!("{}@{}", document.name, document.hash))
+    } else {
+        None
+    };
     let session = state
         .store
         .create_planning_session(
             &id,
-            &request.plan,
+            &plan_id,
             &request_reference,
             &request.workspace,
             &requester,
             &planner,
+            target_run.as_ref().map(|run| run.subject.as_str()),
+            target_run.as_ref().map(|run| run.generation.as_str()),
         )
         .map_err(ApiError::bad)?;
     let expected_subject = state
@@ -562,8 +651,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` to read the immutable document reference in the message content. Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{}` and its state must be ready. Submit both files with `st3 plan submit {id} --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay available for revision messages until approval or cancellation.",
-        request.plan
+        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{plan_id}` and its state must be ready. You can submit named variants with `st3 plan submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay available for revision messages until approval or cancellation."
     );
     quick_agent(
         &state,
@@ -588,7 +676,10 @@ async fn start_planning_session(
         &format!("planning-request:{id}"),
         &requester,
         &planner,
-        &request_reference,
+        &context_reference
+            .as_ref()
+            .map(|context| format!("{request_reference}\n{context}"))
+            .unwrap_or_else(|| request_reference.clone()),
         "Planning request",
     )?;
     record_planning_event(
@@ -628,6 +719,24 @@ async fn submit_planning_candidate(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PlanningCandidateSubmitRequest>,
 ) -> Result<Json<PlanningSessionView>, ApiError> {
+    submit_planning_variant(state, id, "default".into(), request).await
+}
+
+async fn submit_named_planning_candidate(
+    State(state): State<AppState>,
+    AxumPath((id, variant)): AxumPath<(String, String)>,
+    Json(request): Json<PlanningCandidateSubmitRequest>,
+) -> Result<Json<PlanningSessionView>, ApiError> {
+    submit_planning_variant(state, id, variant, request).await
+}
+
+async fn submit_planning_variant(
+    state: AppState,
+    id: String,
+    variant: String,
+    request: PlanningCandidateSubmitRequest,
+) -> Result<Json<PlanningSessionView>, ApiError> {
+    validate_planning_variant(&variant)?;
     let session = required_planning_session(&state, &id)?;
     let markdown = std::str::from_utf8(&request.markdown).map_err(|_| {
         ApiError::bad(St3Error::new(
@@ -703,14 +812,17 @@ async fn submit_planning_candidate(
         .add_planning_candidate(
             &session.id,
             &request.actor,
+            &variant,
             &format!("{}@{}", markdown_document.name, markdown_document.hash),
             &format!("{}@{}", kdl_document.name, kdl_document.hash),
             &plan.revision,
         )
         .map_err(ApiError::bad)?;
     let candidate = response
-        .candidate
-        .as_ref()
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)
+        .map(|variant| &variant.candidate)
         .expect("the submitted planning candidate is visible");
     record_planning_event(
         &state,
@@ -718,6 +830,7 @@ async fn submit_planning_candidate(
         "planning-session.candidate-submitted",
         Some(&request.actor),
         BTreeMap::from([
+            ("variant".into(), Value::String(variant.clone())),
             ("candidate_revision".into(), Value::from(candidate.revision)),
             ("markdown".into(), Value::String(candidate.markdown.clone())),
             ("kdl".into(), Value::String(candidate.kdl.clone())),
@@ -726,7 +839,10 @@ async fn submit_planning_candidate(
                 Value::String(candidate.plan_revision.clone()),
             ),
         ]),
-        &format!("planning-candidate:{}:{}", response.id, candidate.revision),
+        &format!(
+            "planning-candidate:{}:{variant}:{}",
+            response.id, candidate.revision
+        ),
     )?;
     signal_changed(&state);
     Ok(Json(response))
@@ -736,6 +852,22 @@ async fn preview_planning_candidate(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PlanningSessionView>, ApiError> {
+    preview_planning_variant(state, id, "default".into()).await
+}
+
+async fn preview_named_planning_candidate(
+    State(state): State<AppState>,
+    AxumPath((id, variant)): AxumPath<(String, String)>,
+) -> Result<Json<PlanningSessionView>, ApiError> {
+    preview_planning_variant(state, id, variant).await
+}
+
+async fn preview_planning_variant(
+    state: AppState,
+    id: String,
+    variant: String,
+) -> Result<Json<PlanningSessionView>, ApiError> {
+    validate_planning_variant(&variant)?;
     let session = required_planning_session(&state, &id)?;
     if session.status != "review" {
         return Err(ApiError::bad(St3Error::new(
@@ -743,12 +875,17 @@ async fn preview_planning_candidate(
             format!("planning session `{}` is {}", session.id, session.status),
         )));
     }
-    let candidate = session.candidate.as_ref().ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "missing-planning-candidate",
-            "the planning session has no candidate",
-        ))
-    })?;
+    let candidate = session
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)
+        .map(|variant| &variant.candidate)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-planning-candidate",
+                "the planning session has no candidate",
+            ))
+        })?;
     let kdl = planning_document_text(&state, &candidate.kdl)?;
     let (intent, plan_response) = plan_source(&state, &kdl, None)?;
     let plan = &intent.plans[&session.plan];
@@ -770,6 +907,7 @@ async fn preview_planning_candidate(
         .store
         .save_planning_preview(
             &session.id,
+            &variant,
             candidate.revision,
             &hash,
             &graph,
@@ -778,8 +916,10 @@ async fn preview_planning_candidate(
         )
         .map_err(ApiError::bad)?;
     let preview = response
-        .preview
-        .as_ref()
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)
+        .and_then(|variant| variant.preview.as_ref())
         .expect("the saved planning preview is visible");
     record_planning_event(
         &state,
@@ -787,6 +927,7 @@ async fn preview_planning_candidate(
         "planning-session.previewed",
         Some(&response.requester),
         BTreeMap::from([
+            ("variant".into(), Value::String(variant.clone())),
             (
                 "candidate_revision".into(),
                 Value::from(preview.candidate_revision),
@@ -798,6 +939,172 @@ async fn preview_planning_candidate(
     )?;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn compare_planning_variants(
+    State(state): State<AppState>,
+    AxumPath((id, left, right)): AxumPath<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = required_planning_session(&state, &id)?;
+    let variant = |name: &str| {
+        session
+            .variants
+            .iter()
+            .find(|variant| variant.name == name)
+            .ok_or_else(|| ApiError::not_found(format!("planning variant `{name}` does not exist")))
+    };
+    let left = variant(&left)?;
+    let right = variant(&right)?;
+    Ok(Json(json!({
+        "session": session.subject,
+        "source_generation": session.source_generation,
+        "left": left,
+        "right": right,
+    })))
+}
+
+async fn propose_planning_variant(
+    State(state): State<AppState>,
+    AxumPath((id, variant)): AxumPath<(String, String)>,
+    Json(request): Json<PlanningProposalRequest>,
+) -> Result<Json<RevisionSubmissionView>, ApiError> {
+    if let Some(cached) = cached_revision_submission(
+        &state,
+        &format!("{}:cutover", request.idempotency_key),
+        &format!("{}:proposal", request.idempotency_key),
+    )? {
+        return Ok(Json(cached));
+    }
+    let session = required_planning_session(&state, &id)?;
+    let run_subject = session.target_plan_run.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "planning-session-has-no-run",
+            "this planning session creates a new plan and cannot propose a run revision",
+        ))
+    })?;
+    let current = state
+        .store
+        .plan_run(run_subject)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("the target plan run does not exist"))?;
+    if session.source_generation.as_deref() != Some(current.generation.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-planning-generation",
+            "the planning variants target a superseded generation",
+        )));
+    }
+    let variant = session
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("planning variant `{variant}` does not exist"))
+        })?;
+    let preview = variant.preview.as_ref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-planning-preview",
+            "preview the named variant before proposal",
+        ))
+    })?;
+    if !preview.plan.blockers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "planning-preview-blocked",
+            preview.plan.blockers.join("; "),
+        )));
+    }
+    let intent =
+        parse_intent(&preview.plan.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
+    let plan = &intent.plans[&session.plan];
+    let old = state
+        .store
+        .plan_spec(&session.plan, Some(&current.revision))
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("the current plan revision is unavailable"))?;
+    let (_, reviewers) = crate::store::analyze_plan_revision(
+        &old,
+        plan,
+        &request.actor,
+        &current.requester,
+        &crate::store::plan_run_variables(&current, &plan.revision),
+    )
+    .map_err(ApiError::bad)?;
+    state
+        .store
+        .apply(
+            &intent,
+            &preview.plan.subject_tokens,
+            &format!("{}:publish", request.idempotency_key),
+        )
+        .map_err(ApiError::bad)?;
+    let result =
+        if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
+            RevisionSubmissionView {
+                status: "applied".into(),
+                plan_run: state
+                    .store
+                    .adopt_plan_revision(
+                        run_subject,
+                        plan,
+                        &request.actor,
+                        &request.reason,
+                        &format!("{}:cutover", request.idempotency_key),
+                    )
+                    .map_err(ApiError::bad)?,
+                proposal: None,
+            }
+        } else {
+            let proposal = state
+                .store
+                .create_revision_proposal(
+                    run_subject,
+                    plan,
+                    &request.actor,
+                    &request.reason,
+                    &format!("{}:proposal", request.idempotency_key),
+                )
+                .map_err(ApiError::bad)?;
+            RevisionSubmissionView {
+                status: proposal.status.clone(),
+                plan_run: state
+                    .store
+                    .plan_run(run_subject)
+                    .map_err(ApiError::internal)?
+                    .expect("the target plan run exists"),
+                proposal: Some(proposal),
+            }
+        };
+    record_planning_event(
+        &state,
+        &session,
+        "planning-session.variant-proposed",
+        Some(&request.actor),
+        BTreeMap::from([
+            ("variant".into(), Value::String(variant.name.clone())),
+            (
+                "source_generation".into(),
+                Value::String(current.generation),
+            ),
+            ("plan_revision".into(), Value::String(plan.revision.clone())),
+        ]),
+        &format!("{}:event", request.idempotency_key),
+    )?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+fn validate_planning_variant(variant: &str) -> Result<(), ApiError> {
+    if variant.is_empty()
+        || variant.len() > 80
+        || !variant
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-planning-variant",
+            "a planning variant must use 1 through 80 letters, digits, dots, dashes, or underscores",
+        )));
+    }
+    Ok(())
 }
 
 async fn revise_planning_session(
@@ -2021,7 +2328,14 @@ async fn revise_plan_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
     Json(request): Json<PlanRevisionRequest>,
-) -> Result<Json<PlanRunView>, ApiError> {
+) -> Result<Json<RevisionSubmissionView>, ApiError> {
+    if let Some(cached) = cached_revision_submission(
+        &state,
+        &format!("{}:adopt", request.idempotency_key),
+        &format!("{}:propose", request.idempotency_key),
+    )? {
+        return Ok(Json(cached));
+    }
     let current = state
         .store
         .plan_run(&run)
@@ -2037,11 +2351,12 @@ async fn revise_plan_run(
     let initial_plan = initial.plans.values().next().expect("one plan was checked");
     let allowed_scope = initial_plan.scope_template.as_deref();
     if initial.subjects.iter().any(|(subject, desired)| {
-        Some(subject.as_str()) != allowed_scope || desired.kind != "scope"
+        desired.kind != "agent"
+            && (Some(subject.as_str()) != allowed_scope || desired.kind != "scope")
     }) {
         return Err(ApiError::bad(St3Error::new(
             "invalid-plan-revision-intent",
-            "a run revision can contain only its plan and its enclosing scope",
+            "a run revision can contain only its plan, adjacent agents, and its enclosing scope",
         )));
     }
     let bindings = state
@@ -2072,29 +2387,22 @@ async fn revise_plan_run(
                 "the current plan revision is unavailable",
             ))
         })?;
-    if old.scope_template != replacement.scope_template
-        || old.change_policy != replacement.change_policy
-        || old.change_authority != replacement.change_authority
-    {
+    if old.scope_template != replacement.scope_template {
         return Err(ApiError::bad(St3Error::new(
-            "change-policy-mutation",
-            "a run revision cannot change its scope, change policy, or authority",
+            "run-scope-mutation",
+            "a run revision cannot change its enclosing scope",
         )));
     }
-    let default_kind = if matches!(old.change_policy, crate::model::ChangePolicy::HumanReview) {
-        "person"
-    } else {
-        "agent"
-    };
     let actor = if request.actor.contains('/') {
         request.actor.clone()
     } else {
-        format!("{default_kind}/{}", request.actor)
+        format!("agent/{}", request.actor)
     };
-    crate::store::authorize_plan_revision(
+    let (_, reviewers) = crate::store::analyze_plan_revision(
         &old,
         replacement,
         &actor,
+        &current.requester,
         &crate::store::plan_run_variables(&current, &replacement.revision),
     )
     .map_err(ApiError::bad)?;
@@ -2124,18 +2432,173 @@ async fn revise_plan_run(
             &format!("{}:publish", request.idempotency_key),
         )
         .map_err(ApiError::bad)?;
-    let revised = state
+    let revised =
+        if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
+            let plan_run = state
+                .store
+                .adopt_plan_revision(
+                    &run,
+                    replacement,
+                    &actor,
+                    &request.reason,
+                    &format!("{}:adopt", request.idempotency_key),
+                )
+                .map_err(ApiError::bad)?;
+            RevisionSubmissionView {
+                status: "applied".into(),
+                plan_run,
+                proposal: None,
+            }
+        } else {
+            let proposal = state
+                .store
+                .create_revision_proposal(
+                    &run,
+                    replacement,
+                    &actor,
+                    &request.reason,
+                    &format!("{}:propose", request.idempotency_key),
+                )
+                .map_err(ApiError::bad)?;
+            RevisionSubmissionView {
+                status: proposal.status.clone(),
+                plan_run: state
+                    .store
+                    .plan_run(&run)
+                    .map_err(ApiError::internal)?
+                    .expect("the revised plan run exists"),
+                proposal: Some(proposal),
+            }
+        };
+    signal_changed(&state);
+    Ok(Json(revised))
+}
+
+fn cached_revision_submission(
+    state: &AppState,
+    direct_key: &str,
+    proposal_key: &str,
+) -> Result<Option<RevisionSubmissionView>, ApiError> {
+    if let Some(plan_run) = state
         .store
-        .adopt_plan_revision(
-            &run,
-            replacement,
-            &actor,
-            &request.reason,
-            &format!("{}:adopt", request.idempotency_key),
+        .cached_idempotency_response::<PlanRunView>(direct_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Some(RevisionSubmissionView {
+            status: "applied".into(),
+            plan_run,
+            proposal: None,
+        }));
+    }
+    let Some(cached) = state
+        .store
+        .cached_idempotency_response::<RevisionProposalView>(proposal_key)
+        .map_err(ApiError::internal)?
+    else {
+        return Ok(None);
+    };
+    let proposal = state
+        .store
+        .revision_proposal(&cached.id)
+        .map_err(ApiError::internal)?
+        .unwrap_or(cached);
+    let plan_run = state
+        .store
+        .plan_run(&proposal.run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("the proposal plan run is unavailable"))?;
+    Ok(Some(RevisionSubmissionView {
+        status: proposal.status.clone(),
+        plan_run,
+        proposal: Some(proposal),
+    }))
+}
+
+async fn list_run_generations(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+) -> Result<Json<Vec<RunGenerationView>>, ApiError> {
+    state
+        .store
+        .run_generations(&run)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn get_run_generation(
+    State(state): State<AppState>,
+    AxumPath(generation): AxumPath<String>,
+) -> Result<Json<RunGenerationView>, ApiError> {
+    state
+        .store
+        .run_generation(&generation)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("run generation `{generation}` does not exist")))
+}
+
+async fn get_run_revision_proposal(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+) -> Result<Json<RevisionProposalView>, ApiError> {
+    state
+        .store
+        .revision_proposal_for_run(&run)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("plan run `{run}` has no pending revision proposal"))
+        })
+}
+
+async fn get_revision_proposal(
+    State(state): State<AppState>,
+    AxumPath(proposal): AxumPath<String>,
+) -> Result<Json<RevisionProposalView>, ApiError> {
+    state
+        .store
+        .revision_proposal(&proposal)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("revision proposal `{proposal}` does not exist"))
+        })
+}
+
+async fn approve_revision_proposal(
+    State(state): State<AppState>,
+    AxumPath(proposal): AxumPath<String>,
+    Json(request): Json<RevisionApprovalRequest>,
+) -> Result<Json<RevisionSubmissionView>, ApiError> {
+    let result = state
+        .store
+        .approve_revision_proposal(
+            &proposal,
+            &request.actor,
+            &request.preview_hash,
+            &request.idempotency_key,
         )
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    Ok(Json(revised))
+    Ok(Json(result))
+}
+
+async fn cancel_revision_proposal(
+    State(state): State<AppState>,
+    AxumPath(proposal): AxumPath<String>,
+    Json(request): Json<RevisionCancelRequest>,
+) -> Result<Json<RevisionProposalView>, ApiError> {
+    let result = state
+        .store
+        .cancel_revision_proposal(
+            &proposal,
+            &request.actor,
+            request.reason.as_deref(),
+            &request.idempotency_key,
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
@@ -3402,6 +3865,7 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
             "/v1/planning-sessions",
             serde_json::to_value(PlanningSessionStartRequest {
                 plan: "planned/work".into(),
+                run: None,
                 request: b"Plan a two-step release without changing this workspace.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("nathan".into()),
@@ -3742,6 +4206,184 @@ subgraph {
     }
 
     #[tokio::test]
+    async fn planning_compares_named_variants_and_proposes_from_one_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+subgraph {
+  plan "variants" state="ready" {
+    goal "Use the initial plan."
+    step "work" { goal "Use the initial goal." }
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "variant-initial-plan")
+            .unwrap();
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "variants".into(),
+                revision: None,
+                workspace: workspace.display().to_string(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                idempotency_key: "variant-run".into(),
+            })
+            .unwrap();
+        let app = router(state);
+        let (status, started) = json_request(
+            app.clone(),
+            "/v1/planning-sessions",
+            serde_json::to_value(PlanningSessionStartRequest {
+                plan: "ignored-when-run-is-present".into(),
+                run: Some(run.subject.clone()),
+                request: b"Compare a compact plan with an extended plan.".to_vec(),
+                workspace: workspace.display().to_string(),
+                requester: Some("person/nathan".into()),
+                model: None,
+                effort: None,
+                idempotency_key: "variant-session".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        assert_eq!(started["target_plan_run"], run.subject);
+        assert_eq!(started["source_generation"], run.generation);
+        let session = started["id"].as_str().unwrap();
+        let planner = started["planner"].as_str().unwrap();
+        let compact = br#"
+version 2
+subgraph {
+  plan "variants" state="ready" {
+    goal "Use the compact plan."
+    step "work" { goal "Use the compact goal." }
+  }
+}
+"#;
+        let extended = br#"
+version 2
+subgraph {
+  plan "variants" state="ready" {
+    goal "Use the extended plan."
+    step "work" { goal "Use the extended goal." }
+    step "verify" {
+      depends-on { step "work" completed }
+      goal "Verify the extended result."
+    }
+  }
+}
+"#;
+        for (index, (name, kdl)) in [
+            ("compact", compact.as_slice()),
+            ("extended", extended.as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, submitted) = json_request(
+                app.clone(),
+                &format!("/v1/planning-sessions/{session}/variants/{name}/submit"),
+                serde_json::to_value(PlanningCandidateSubmitRequest {
+                    actor: planner.into(),
+                    markdown: format!("# {name} plan\n").into_bytes(),
+                    kdl: kdl.to_vec(),
+                    idempotency_key: format!("variant-submit-{name}"),
+                })
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{submitted}");
+            assert_eq!(submitted["variants"].as_array().unwrap().len(), index + 1);
+            let (status, previewed) = json_request(
+                app.clone(),
+                &format!("/v1/planning-sessions/{session}/variants/{name}/preview"),
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{previewed}");
+        }
+        assert_eq!(
+            store
+                .claims_for(
+                    &format!("planning-session/{session}"),
+                    Some("planning-session.candidate-submitted"),
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+        let (status, compared) = get_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{session}/variants/compact/compare/extended"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{compared}");
+        assert_eq!(compared["left"]["name"], "compact");
+        assert_eq!(compared["right"]["name"], "extended");
+
+        let (status, proposed) = json_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{session}/variants/extended/propose"),
+            serde_json::to_value(PlanningProposalRequest {
+                actor: "person/nathan".into(),
+                reason: "the extended variant has the required check".into(),
+                idempotency_key: "variant-propose-extended".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        assert_eq!(proposed["status"], "applied");
+        assert_ne!(proposed["plan_run"]["generation"], run.generation);
+
+        let (status, retried) = json_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{session}/variants/extended/propose"),
+            serde_json::to_value(PlanningProposalRequest {
+                actor: "person/nathan".into(),
+                reason: "the extended variant has the required check".into(),
+                idempotency_key: "variant-propose-extended".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retried}");
+        assert_eq!(
+            retried["plan_run"]["generation"],
+            proposed["plan_run"]["generation"]
+        );
+
+        let (status, stale) = json_request(
+            app,
+            &format!("/v1/planning-sessions/{session}/variants/compact/propose"),
+            serde_json::to_value(PlanningProposalRequest {
+                actor: "person/nathan".into(),
+                reason: "try the stale compact variant".into(),
+                idempotency_key: "variant-propose-compact".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{stale}");
+        assert_eq!(stale["code"], "stale-planning-generation");
+    }
+
+    #[tokio::test]
     async fn message_ingress_rejects_empty_content_before_it_enters_the_fifo() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -3778,7 +4420,7 @@ subgraph {
                 r#"
 version 2
 subgraph {{
-  scope "eval/demo/${{ST_PLAN_RUN}}" retention="temporary" change-policy="agent" {{
+  scope "eval/demo/${{ST_PLAN_RUN}}" retention="temporary" {{
     plan "eval/demo" state="ready" {{
       goal "Complete plan eval/demo."
       baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
@@ -3858,9 +4500,10 @@ subgraph {{
         let source = r#"
 version 2
 subgraph {
-  scope "revision/${ST_PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
+  scope "revision/${ST_PLAN_RUN}" {
     plan "revision" state="ready" {
       goal "Complete plan revision."
+      subgraph { agent "sup" { workspace "."; command "true" } }
       step "work" { goal "First goal." }
     }
   }
@@ -3896,9 +4539,10 @@ subgraph {
         let replacement = r#"
 version 2
 subgraph {
-  scope "revision/${ST_PLAN_RUN}" change-policy="supervisor" change-authority="agent/sup" {
+  scope "revision/${ST_PLAN_RUN}" {
     plan "revision" state="ready" {
       goal "Complete plan revision."
+      subgraph { agent "sup" { workspace "."; command "true" } }
       step "work" { goal "Corrected goal." }
     }
   }
@@ -3912,7 +4556,7 @@ subgraph {
                     kdl: replacement.into(),
                     source_name: None,
                 },
-                actor: "agent/sup".into(),
+                actor: "agent/node.sup".into(),
                 reason: "the first goal was incomplete".into(),
                 idempotency_key: "revision-two".into(),
             })
@@ -3920,9 +4564,10 @@ subgraph {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{revised}");
-        assert_ne!(revised["revision"], run.revision);
-        assert_eq!(revised["root_revision"], run.root_revision);
-        assert_eq!(revised["steps"][0]["status"], "pending");
+        assert_eq!(revised["status"], "applied");
+        assert_ne!(revised["plan_run"]["revision"], run.revision);
+        assert_eq!(revised["plan_run"]["root_revision"], run.root_revision);
+        assert_eq!(revised["plan_run"]["steps"][0]["status"], "pending");
         assert_eq!(
             state
                 .store

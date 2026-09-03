@@ -1,0 +1,28 @@
+version 2
+
+subgraph {
+  plan "generation-proof" state="ready" revisions="human-only" {
+    goal "Prove a live plan revision."
+
+    step "stable" {
+      goal "Record the stable result."
+      gate "the stable result exists" { field "state" "resource/generation-proof/${ST_PLAN_RUN}/stable" "is" "done" }
+    }
+
+    step "changed" {
+      goal "Use the corrected work definition."
+      depends-on { step "stable" completed }
+      gate "the changed result exists" { field "state" "resource/generation-proof/${ST_PLAN_RUN}/changed" "is" "done" }
+    }
+
+    step "generation-environment" {
+      goal "Record the automatic successor generation variable."
+      gate "the successor generation variable is present" {
+        exec "test -n \"$ST_RUN_GENERATION\" && printf '%s\\n' \"$ST_RUN_GENERATION\" > observed-generation.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        time-limit "30s"
+      }
+    }
+  }
+}

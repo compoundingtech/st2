@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/crash-escalation/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/crash-escalation/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/crash-escalation" state="ready" {
       goal "Complete plan eval/crash-escalation."
       step "faults" timeout="1m" {

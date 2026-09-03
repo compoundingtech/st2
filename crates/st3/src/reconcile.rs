@@ -1129,6 +1129,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let runs = self.store.active_plan_runs()?;
         let mut changed = false;
         for run in runs {
+            if run.phase == "revision-draining"
+                && self.store.apply_drained_revision(&run.id)?.is_some()
+            {
+                changed = true;
+                continue;
+            }
             let plan_id = run.plan.strip_prefix("plan/").unwrap_or(&run.plan);
             let Some(plan) = self.store.plan_spec(plan_id, Some(&run.revision))? else {
                 changed |= self.store.set_plan_run_state(
@@ -1149,6 +1155,8 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn evaluate_plan_run(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
         let mut changed = false;
+        changed |= self.retire_predecessor_generation(run)?;
+        changed |= self.materialize_plan_subgraph(run, plan)?;
         let flat = flatten_plan_steps(plan);
         let views = run
             .steps
@@ -1312,9 +1320,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             let Some(view) = views.get(step.spec.path.as_str()).copied() else {
                 continue;
             };
-            let eligible_phase = (run.phase == "normal" && !step.spec.finally)
+            let eligible_phase = ((run.phase == "normal" || run.phase == "revision-draining")
+                && !step.spec.finally)
                 || (run.phase == "final" && step.spec.finally);
             if !eligible_phase {
+                continue;
+            }
+            if run.phase == "revision-draining"
+                && matches!(
+                    view.status.as_str(),
+                    "pending" | "ready" | "blocked" | "failed" | "completed" | "cancelled"
+                )
+            {
                 continue;
             }
             if view.status == "failed" {
@@ -1642,8 +1659,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
                 DependencySpec::Predicate { gate } => {
                     let fake = crate::model::StepRunView {
-                        subject: format!("step-run/{}/{}", run.id, step.spec.path),
+                        subject: format!(
+                            "step-run/{}/{}",
+                            run.generation
+                                .strip_prefix("run-generation/")
+                                .unwrap_or(&run.generation),
+                            step.spec.path
+                        ),
                         run: run.subject.clone(),
+                        generation: run.generation.clone(),
                         step: step.spec.path.clone(),
                         definition_hash: step.spec.definition_hash.clone(),
                         status: "pending".into(),
@@ -1686,8 +1710,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         let source = crate::plan::interpolate(source, &variables)?;
         let mut intent = crate::graph::parse_intent(&source, &self.host)?;
         let step_scope = format!("scope/{}", view.subject);
+        let generation_scope = format!("scope/{}", run.generation);
         for subject in intent.subjects.values_mut() {
             subject.scopes.insert(step_scope.clone());
+            subject.scopes.insert(generation_scope.clone());
             if let Some(scope) = &run.run_scope {
                 subject.scopes.insert(scope.clone());
             }
@@ -1735,6 +1761,77 @@ impl<R: RuntimeControl> Reconciler<R> {
             &intent,
             &format!("materialize:{}:{}", view.subject, view.attempt),
         )?;
+        Ok(response.changed)
+    }
+
+    fn retire_predecessor_generation(&self, run: &PlanRunView) -> Result<bool> {
+        let Some(predecessor) = self
+            .store
+            .run_generation(&run.generation)?
+            .and_then(|generation| generation.predecessor)
+        else {
+            return Ok(false);
+        };
+        let mut generations = vec![predecessor.clone()];
+        generations.extend(self.store.descendant_run_generations(&predecessor)?);
+        generations.sort();
+        generations.dedup();
+        let stops = generations
+            .iter()
+            .map(|generation| format!("scope {generation:?} {{ stop }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = format!("version 2\nsubgraph {{\n{stops}\n}}");
+        let intent = crate::graph::parse_intent(&source, &self.host)?;
+        let response = self
+            .store
+            .apply_internal(&intent, &format!("retire-generation:{}", run.generation))?;
+        Ok(response.changed)
+    }
+
+    fn materialize_plan_subgraph(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
+        let Some(source) = &plan.subgraph_kdl else {
+            return Ok(false);
+        };
+        let variables = crate::store::plan_run_variables(run, &plan.revision);
+        let source = crate::plan::interpolate(source, &variables)?;
+        let mut intent = crate::graph::parse_intent(&source, &self.host)?;
+        let generation_scope = format!("scope/{}", run.generation);
+        for subject in intent.subjects.values_mut() {
+            subject.scopes.insert(generation_scope.clone());
+            if let Some(scope) = &run.run_scope {
+                subject.scopes.insert(scope.clone());
+            }
+            if let Some(member) = subject.member.as_mut() {
+                let workspace = PathBuf::from(&member.workspace);
+                if workspace.is_relative() {
+                    member.workspace = Path::new(&run.workspace)
+                        .join(&workspace)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                let cwd = PathBuf::from(&member.cwd);
+                if cwd.is_relative() {
+                    member.cwd = Path::new(&run.workspace)
+                        .join(&cwd)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                member.environment.extend(variables.clone());
+                member
+                    .environment
+                    .insert("ST3_RUN_DIR".into(), run.workspace.clone());
+                member
+                    .environment
+                    .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
+                member
+                    .environment
+                    .insert("ST_AGENT".into(), member.runtime_id.clone());
+            }
+        }
+        let response = self
+            .store
+            .apply_internal(&intent, &format!("materialize:{}", run.generation))?;
         Ok(response.changed)
     }
 
@@ -1792,7 +1889,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         variables: &BTreeMap<String, String>,
     ) -> Result<bool> {
         for product in products {
-            let subject = crate::plan::interpolate(&product.subject, &variables)?;
+            let subject = crate::plan::interpolate(&product.subject, variables)?;
             let Some(actual) = self.store.latest_actual_value(&subject)? else {
                 return Ok(false);
             };
@@ -1836,7 +1933,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         variables: &BTreeMap<String, String>,
     ) -> Result<GateOutcome> {
         let mut gate = gate.clone();
-        expand_gate(&mut gate, &variables, &run.workspace)?;
+        expand_gate(&mut gate, variables, &run.workspace)?;
         if let GateSpec::Human {
             reviewer,
             question,
@@ -1865,6 +1962,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.evaluate_gate(&stage, &gate)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_plan_human_gate(
         &self,
         run: &PlanRunView,
@@ -3422,7 +3520,15 @@ fn run_variables(
     let parent_step_run = step
         .parent
         .as_ref()
-        .map(|path| format!("step-run/{}/{}", run.id, path))
+        .map(|path| {
+            format!(
+                "step-run/{}/{}",
+                run.generation
+                    .strip_prefix("run-generation/")
+                    .unwrap_or(&run.generation),
+                path
+            )
+        })
         .or_else(|| run.parent_step_run.clone())
         .unwrap_or_default();
     BTreeMap::from([
@@ -3432,6 +3538,13 @@ fn run_variables(
         ),
         ("ST_PLAN_REVISION".into(), run.revision.clone()),
         ("ST_PLAN_RUN".into(), run.id.clone()),
+        (
+            "ST_RUN_GENERATION".into(),
+            run.generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&run.generation)
+                .into(),
+        ),
         ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_STEP".into(), step.spec.path.clone()),
@@ -4125,6 +4238,7 @@ subgraph {
             "ST_PLAN",
             "ST_PLAN_REVISION",
             "ST_PLAN_RUN",
+            "ST_RUN_GENERATION",
             "ST_ROOT_PLAN_RUN",
             "ST_SCOPE",
             "ST_WORKSPACE",
@@ -4206,6 +4320,174 @@ subgraph {
         tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
             .await
             .expect("the materialized subgraph did not request another reconcile pass");
+    }
+
+    #[test]
+    fn a_successor_generation_retires_members_left_in_its_predecessor() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let publish = |source: &str, key: &str| {
+            let intent = parse_intent(source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent
+                .plans
+                .values()
+                .next()
+                .expect("the fixture has one plan")
+                .clone()
+        };
+        let first = publish(
+            r#"
+version 2
+subgraph {
+  plan "retire" state="ready" {
+    goal "Retire superseded generation members."
+    step "team" {
+      goal "Use the first team."
+      subgraph {
+        agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+      }
+    }
+  }
+}
+"#,
+            "retire-first",
+        );
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "retire-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let predecessor_scope = format!("scope/{}", run.generation);
+        let worker = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == "agent/node.worker")
+            .expect("the first generation member is materialized");
+        assert!(worker.scopes.contains(&predecessor_scope));
+
+        let child_plan = publish(
+            r#"
+version 2
+subgraph {
+  plan "child" state="ready" {
+    goal "Keep one child run active."
+    step "work" { goal "Wait for child work." }
+  }
+}
+"#,
+            "retire-child",
+        );
+        let child = store
+            .create_child_plan_run(
+                &crate::model::PlanRunRequest {
+                    plan: child_plan.id,
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    idempotency_key: "retire-child-run".into(),
+                },
+                &run,
+                &run.steps[0].subject,
+                None,
+            )
+            .unwrap();
+        let grandchild_plan = publish(
+            r#"
+version 2
+subgraph {
+  plan "grandchild" state="ready" {
+    goal "Keep one grandchild run active."
+    step "work" { goal "Wait for grandchild work." }
+  }
+}
+"#,
+            "retire-grandchild",
+        );
+        let grandchild = store
+            .create_child_plan_run(
+                &crate::model::PlanRunRequest {
+                    plan: grandchild_plan.id,
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    idempotency_key: "retire-grandchild-run".into(),
+                },
+                &child,
+                &child.steps[0].subject,
+                None,
+            )
+            .unwrap();
+
+        let second = publish(
+            r#"
+version 2
+subgraph {
+  plan "retire" state="ready" {
+    goal "Retire superseded generation members."
+    step "team" { goal "Use the replacement team." }
+  }
+}
+"#,
+            "retire-second",
+        );
+        let revised = store
+            .adopt_plan_revision(
+                &run.id,
+                &second,
+                "person/test",
+                "the old team is no longer part of the plan",
+                "retire-cutover",
+            )
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+
+        let desired = store.desired_subjects().unwrap();
+        for scope in [
+            predecessor_scope,
+            format!("scope/{}", child.generation),
+            format!("scope/{}", grandchild.generation),
+        ] {
+            let stop = desired
+                .iter()
+                .find(|subject| subject.subject == scope)
+                .expect("the predecessor lineage has a teardown scope");
+            assert_eq!(stop.kind, "scope-stop");
+        }
+        assert_eq!(
+            store.plan_run(&child.id).unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            store.plan_run(&grandchild.id).unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert_ne!(revised.generation, run.generation);
     }
 
     #[test]
@@ -4879,7 +5161,7 @@ subgraph {
         let source = r#"
             version 2
             subgraph {
-              scope "eval/simulated-codex" retention="temporary" change-policy="agent" {
+              scope "eval/simulated-codex" retention="temporary" {
                 plan "eval/simulated-codex" state="ready" {
                   goal "Complete plan eval/simulated-codex."
                 step "team" {
@@ -5952,7 +6234,7 @@ subgraph { schedule "reminder" { stop } }"#,
         let source = r#"
             version 2
             subgraph {
-              scope "eval/demo" retention="temporary" change-policy="agent" {
+              scope "eval/demo" retention="temporary" {
                 plan "eval/demo" state="ready" {
                   goal "Complete plan eval/demo."
                 step "result" timeout="1ms" {

@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/restart-continuity/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/restart-continuity/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/restart-continuity" state="ready" {
       goal "Complete plan eval/restart-continuity."
       step "start-team" timeout="10m" {

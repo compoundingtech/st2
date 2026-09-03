@@ -23,10 +23,11 @@ use st3::model::{
     MessageSendRequest, MessageView, PlanOutputView, PlanProductionRequest, PlanRequest,
     PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState,
     PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReviewRequest, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
-    StepRunView, WorkRequest,
+    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReviewRequest,
+    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -177,17 +178,21 @@ struct FileArgs {
 enum PlanCommand {
     Start(PlanStartArgs),
     Show(PlanSessionArgs),
-    Preview(PlanSessionArgs),
+    Preview(PlanPreviewArgs),
     Submit(PlanSubmitArgs),
     Revise(PlanReviseArgs),
     Approve(PlanApproveArgs),
     Cancel(PlanCancelArgs),
+    Compare(PlanCompareArgs),
+    Propose(PlanProposeArgs),
 }
 
 #[derive(Args)]
 struct PlanStartArgs {
+    #[arg(long, required_unless_present = "run", conflicts_with = "run")]
+    id: Option<String>,
     #[arg(long)]
-    id: String,
+    run: Option<String>,
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -205,14 +210,40 @@ struct PlanSessionArgs {
 }
 
 #[derive(Args)]
+struct PlanPreviewArgs {
+    session: String,
+    #[arg(long)]
+    variant: Option<String>,
+}
+
+#[derive(Args)]
 struct PlanSubmitArgs {
     session: String,
+    #[arg(long, default_value = "default")]
+    variant: String,
     #[arg(long)]
     markdown: PathBuf,
     #[arg(long)]
     kdl: PathBuf,
     #[arg(long = "as", env = "ST_AGENT")]
     actor: String,
+}
+
+#[derive(Args)]
+struct PlanCompareArgs {
+    session: String,
+    left: String,
+    right: String,
+}
+
+#[derive(Args)]
+struct PlanProposeArgs {
+    session: String,
+    variant: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -521,6 +552,36 @@ enum WorkCommand {
     /// Publish the exact ready plan produced by one claimed step.
     PublishPlan(WorkPublishPlanArgs),
     Revise(WorkReviseArgs),
+    Revision {
+        #[command(subcommand)]
+        command: WorkRevisionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkRevisionCommand {
+    Show {
+        run: String,
+    },
+    Generations {
+        run: String,
+    },
+    Generation {
+        generation: String,
+    },
+    Approve {
+        proposal: String,
+        preview_hash: String,
+        #[arg(long = "as", env = "ST_AGENT")]
+        actor: Option<String>,
+    },
+    Cancel {
+        proposal: String,
+        #[arg(long = "as", env = "ST_AGENT")]
+        actor: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -914,7 +975,8 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 .post::<_, PlanningSessionView>(
                     "/v1/planning-sessions",
                     &PlanningSessionStartRequest {
-                        plan: args.id,
+                        plan: args.id.unwrap_or_default(),
+                        run: args.run,
                         request: request.into_bytes(),
                         workspace: workspace.to_string_lossy().into_owned(),
                         requester: args.requester,
@@ -934,22 +996,32 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 .await?
         }
         PlanCommand::Preview(args) => {
-            client
-                .post::<_, PlanningSessionView>(
-                    &format!(
+            let path = args.variant.as_deref().map_or_else(
+                || {
+                    format!(
                         "/v1/planning-sessions/{}/preview",
                         urlencoding::encode(&args.session)
-                    ),
-                    &json!({}),
-                )
+                    )
+                },
+                |variant| {
+                    format!(
+                        "/v1/planning-sessions/{}/variants/{}/preview",
+                        urlencoding::encode(&args.session),
+                        urlencoding::encode(variant)
+                    )
+                },
+            );
+            client
+                .post::<_, PlanningSessionView>(&path, &json!({}))
                 .await?
         }
         PlanCommand::Submit(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
-                        "/v1/planning-sessions/{}/submit",
-                        urlencoding::encode(&args.session)
+                        "/v1/planning-sessions/{}/variants/{}/submit",
+                        urlencoding::encode(&args.session),
+                        urlencoding::encode(&args.variant)
                     ),
                     &PlanningCandidateSubmitRequest {
                         actor: args.actor,
@@ -1009,6 +1081,37 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                     },
                 )
                 .await?
+        }
+        PlanCommand::Compare(args) => {
+            let response: Value = client
+                .get(&format!(
+                    "/v1/planning-sessions/{}/variants/{}/compare/{}",
+                    urlencoding::encode(&args.session),
+                    urlencoding::encode(&args.left),
+                    urlencoding::encode(&args.right)
+                ))
+                .await?;
+            return print_value(&response, json_output);
+        }
+        PlanCommand::Propose(args) => {
+            let actor = args
+                .actor
+                .context("a planning proposal needs --as or ST_AGENT")?;
+            let response: RevisionSubmissionView = client
+                .post(
+                    &format!(
+                        "/v1/planning-sessions/{}/variants/{}/propose",
+                        urlencoding::encode(&args.session),
+                        urlencoding::encode(&args.variant)
+                    ),
+                    &PlanningProposalRequest {
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: format!("planning-propose:{nonce}"),
+                    },
+                )
+                .await?;
+            return print_value(&response, json_output);
         }
     };
     if json_output {
@@ -1704,6 +1807,10 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
     let matches = match condition {
         "running" => matches!(actual_status, Some("running" | "ready")),
         "ready" => actual_status == Some("ready"),
+        "completed" => actual_status == Some("completed"),
+        "failed" => actual_status == Some("failed"),
+        "cancelled" => actual_status == Some("cancelled"),
+        "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
         "exited" => actual_status == Some("exited"),
         "stopped" => {
             item.is_none_or(|item| item.actual.is_none())
@@ -1716,11 +1823,20 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
 
 fn validate_wait_condition(condition: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(condition, "running" | "ready" | "exited" | "stopped")
-            || matches!(
-                condition.strip_prefix("verdict="),
-                Some("pass" | "fail" | "void")
-            ),
+        matches!(
+            condition,
+            "running"
+                | "ready"
+                | "completed"
+                | "failed"
+                | "cancelled"
+                | "terminal"
+                | "exited"
+                | "stopped"
+        ) || matches!(
+            condition.strip_prefix("verdict="),
+            Some("pass" | "fail" | "void")
+        ),
         "unknown wait condition `{condition}`"
     );
     Ok(())
@@ -2475,7 +2591,7 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
             let kdl = fs::read_to_string(&args.file)
                 .with_context(|| format!("read KDL {}", args.file.display()))?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let response: PlanRunView = client
+            let response: RevisionSubmissionView = client
                 .post(
                     &format!("/v1/plan-runs/{}/revision", urlencoding::encode(&args.run)),
                     &PlanRevisionRequest {
@@ -2486,6 +2602,87 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                         actor,
                         reason: args.reason,
                         idempotency_key: format!("plan-revision:{}:{nonce}", args.run),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkCommand::Revision { command } => run_work_revision(client, command, json_output).await,
+    }
+}
+
+async fn run_work_revision(
+    client: &Client,
+    command: WorkRevisionCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        WorkRevisionCommand::Show { run } => {
+            let proposal: RevisionProposalView = client
+                .get(&format!(
+                    "/v1/plan-runs/{}/revision-proposal",
+                    urlencoding::encode(&run)
+                ))
+                .await?;
+            print_value(&proposal, json_output)
+        }
+        WorkRevisionCommand::Generations { run } => {
+            let generations: Vec<RunGenerationView> = client
+                .get(&format!(
+                    "/v1/plan-runs/{}/generations",
+                    urlencoding::encode(&run)
+                ))
+                .await?;
+            print_value(&generations, json_output)
+        }
+        WorkRevisionCommand::Generation { generation } => {
+            let generation: RunGenerationView = client
+                .get(&format!(
+                    "/v1/run-generations/{}",
+                    urlencoding::encode(&generation)
+                ))
+                .await?;
+            print_value(&generation, json_output)
+        }
+        WorkRevisionCommand::Approve {
+            proposal,
+            preview_hash,
+            actor,
+        } => {
+            let actor = actor.context("a revision approval needs --as or ST_AGENT")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: RevisionSubmissionView = client
+                .post(
+                    &format!(
+                        "/v1/revision-proposals/{}/approve",
+                        urlencoding::encode(&proposal)
+                    ),
+                    &RevisionApprovalRequest {
+                        actor,
+                        preview_hash,
+                        idempotency_key: format!("revision-approve:{proposal}:{nonce}"),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        WorkRevisionCommand::Cancel {
+            proposal,
+            actor,
+            reason,
+        } => {
+            let actor = actor.context("a revision cancellation needs --as or ST_AGENT")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: RevisionProposalView = client
+                .post(
+                    &format!(
+                        "/v1/revision-proposals/{}/cancel",
+                        urlencoding::encode(&proposal)
+                    ),
+                    &RevisionCancelRequest {
+                        actor,
+                        reason,
+                        idempotency_key: format!("revision-cancel:{proposal}:{nonce}"),
                     },
                 )
                 .await?;
@@ -4087,7 +4284,7 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
         let Some((step_subject, attempt)) = work_message_target(message) else {
             continue;
         };
-        if !work_message_was_acknowledged(&work, step_subject, attempt) {
+        if !work_message_should_close(&work, step_subject, attempt) {
             continue;
         }
         if message.status == "delivered" {
@@ -4144,6 +4341,13 @@ fn work_message_was_acknowledged(work: &[StepRunView], step_subject: &str, attem
                 "claimed" | "working" | "completed" | "failed" | "cancelled"
             )
     })
+}
+
+fn work_message_should_close(work: &[StepRunView], step_subject: &str, attempt: u32) -> bool {
+    let current = work
+        .iter()
+        .any(|step| step.subject == step_subject && step.attempt == attempt);
+    !current || work_message_was_acknowledged(work, step_subject, attempt)
 }
 
 fn work_message_request(
@@ -4817,6 +5021,7 @@ mod tests {
         let mut step = StepRunView {
             subject: "step-run/run-1/build".into(),
             run: "plan-run/run-1".into(),
+            generation: "run-generation/run-1".into(),
             step: "build".into(),
             definition_hash: "definition".into(),
             status: "ready".into(),
@@ -4879,6 +5084,16 @@ mod tests {
             "step-run/run-1/build",
             2
         ));
+        assert!(!work_message_should_close(
+            std::slice::from_ref(&step),
+            "step-run/run-1/build",
+            2
+        ));
+        assert!(work_message_should_close(
+            std::slice::from_ref(&step),
+            "step-run/old-generation/build",
+            2
+        ));
         step.status = "claimed".into();
         assert!(work_message_was_acknowledged(
             &[step],
@@ -4892,6 +5107,7 @@ mod tests {
         let step = |subject: &str, path: &str, assignee: &str| StepRunView {
             subject: subject.into(),
             run: "plan-run/run-1".into(),
+            generation: "run-generation/run-1".into(),
             step: path.into(),
             definition_hash: "definition".into(),
             status: "ready".into(),
@@ -5040,6 +5256,8 @@ mod tests {
             subject: subject.into(),
             id: subject.strip_prefix("plan-run/").unwrap_or(subject).into(),
             plan: "plan/work".into(),
+            generation: "run-generation/current".into(),
+            initial_revision: "initial-revision".into(),
             revision: "revision".into(),
             root_revision: "root-revision".into(),
             root_plan_run: root.into(),
@@ -5066,6 +5284,7 @@ mod tests {
         StepRunView {
             subject: subject.into(),
             run: run.into(),
+            generation: "run-generation/current".into(),
             step: step.into(),
             definition_hash: "definition".into(),
             status: status.into(),

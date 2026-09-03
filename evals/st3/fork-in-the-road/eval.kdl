@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/fork-in-the-road/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/fork-in-the-road/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/fork-in-the-road" state="ready" {
       goal "Complete plan eval/fork-in-the-road."
       step "start-team" timeout="10m" {

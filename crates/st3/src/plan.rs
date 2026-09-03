@@ -6,14 +6,15 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, ChangePolicy, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec,
-    RetrySpec, St3Error, StepSpec, UsedPlanSpec,
+    BaselineSpec, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec, RetrySpec,
+    RevisionCutover, St3Error, StepSpec, UsedPlanSpec,
 };
 
 const VARIABLES: &[&str] = &[
     "ST_PLAN",
     "ST_PLAN_REVISION",
     "ST_PLAN_RUN",
+    "ST_RUN_GENERATION",
     "ST_ROOT_PLAN_RUN",
     "ST_SCOPE",
     "ST_WORKSPACE",
@@ -43,11 +44,12 @@ pub fn parse_plans(
     let Some(children) = root.children() else {
         return Ok(plans);
     };
+    let outer_owners = direct_agent_owners(children, default_host)?;
     for node in children.nodes() {
         match node.name().value() {
             "plan" => insert_plan(
                 &mut plans,
-                parse_plan(node, None, None, None, default_host, true)?,
+                parse_plan(node, None, outer_owners.clone(), default_host, true)?,
             )?,
             "scope" => parse_scope_plans(node, default_host, &mut plans)?,
             _ => {}
@@ -100,18 +102,9 @@ fn parse_scope_plans(
     } else {
         format!("scope/{scope_name}")
     };
-    let policy = property_string(node, "change-policy")?
-        .map(|value| parse_change_policy(&value))
-        .transpose()?
-        .unwrap_or(ChangePolicy::Agent);
-    let authority = property_string(node, "change-authority")?;
-    if !matches!(policy, ChangePolicy::Agent) && authority.is_none() {
-        return Err(St3Error::new(
-            "missing-change-authority",
-            format!("scope `{scope}` needs change-authority for its selected change policy"),
-        ));
-    }
+    ensure_only_properties(node, &["retention"])?;
     if let Some(children) = node.children() {
+        let owners = direct_agent_owners(children, default_host)?;
         for child in children
             .nodes()
             .iter()
@@ -119,14 +112,7 @@ fn parse_scope_plans(
         {
             insert_plan(
                 plans,
-                parse_plan(
-                    child,
-                    Some(&scope),
-                    Some(policy.clone()),
-                    authority.clone(),
-                    default_host,
-                    true,
-                )?,
+                parse_plan(child, Some(&scope), owners.clone(), default_host, true)?,
             )?;
         }
     }
@@ -146,13 +132,20 @@ fn insert_plan(plans: &mut BTreeMap<String, PlanSpec>, plan: PlanSpec) -> Result
 fn parse_plan(
     node: &KdlNode,
     scope: Option<&str>,
-    inherited_policy: Option<ChangePolicy>,
-    inherited_authority: Option<String>,
+    outer_owners: Vec<String>,
     default_host: &str,
     require_state: bool,
 ) -> Result<PlanSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["state"])?;
+    ensure_only_properties(
+        node,
+        &[
+            "state",
+            "revisions",
+            "revision-reviewer",
+            "revision-cutover",
+        ],
+    )?;
     let id = first_string(node)?;
     validate_id(&id, "plan")?;
     let authored_state = property_string(node, "state")?;
@@ -166,6 +159,18 @@ fn parse_plan(
         .map(|value| parse_plan_state(&value))
         .transpose()?
         .unwrap_or(PlanState::Ready);
+    let revisions_human_only = parse_revision_protection(node)?;
+    let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
+    let revision_cutover = match property_string(node, "revision-cutover")?.as_deref() {
+        None | Some("restart-active") => RevisionCutover::RestartActive,
+        Some("when-idle") => RevisionCutover::WhenIdle,
+        Some(value) => {
+            return Err(St3Error::new(
+                "invalid-revision-cutover",
+                format!("plan `{id}` has invalid revision cutover `{value}`"),
+            ));
+        }
+    };
     let children = node
         .children()
         .ok_or_else(|| St3Error::new("empty-plan", format!("plan `{id}` has no steps")))?;
@@ -178,6 +183,8 @@ fn parse_plan(
     let mut produces_seen = false;
     let mut baseline_names = BTreeSet::new();
     let mut gate_names = BTreeSet::new();
+    let mut subgraph_kdl = None;
+    let mut revision_owners = outer_owners;
     for child in children.nodes() {
         match child.name().value() {
             "goal" => goals.push(plain_string(child)?),
@@ -224,6 +231,32 @@ fn parse_plan(
                 }
                 display_order.push(step.id);
             }
+            "subgraph" => {
+                if subgraph_kdl.is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `subgraph`"),
+                    ));
+                }
+                ensure_bare(child)?;
+                let body = child.children().ok_or_else(|| {
+                    St3Error::new(
+                        "empty-plan-subgraph",
+                        format!("plan `{id}` has an empty subgraph"),
+                    )
+                })?;
+                if body.nodes().is_empty() {
+                    return Err(St3Error::new(
+                        "empty-plan-subgraph",
+                        format!("plan `{id}` has an empty subgraph"),
+                    ));
+                }
+                crate::graph::validate_deferred_environment(child)?;
+                revision_owners.extend(direct_agent_owners(body, default_host)?);
+                revision_owners.sort();
+                revision_owners.dedup();
+                subgraph_kdl = Some(format!("version 2\n{child}\n"));
+            }
             other => {
                 return Err(St3Error::new(
                     "invalid-plan-child",
@@ -246,8 +279,11 @@ fn parse_plan(
         state,
         revision: String::new(),
         scope_template: scope.map(str::to_owned),
-        change_policy: inherited_policy.unwrap_or(ChangePolicy::Agent),
-        change_authority: inherited_authority,
+        revision_owners,
+        revisions_human_only,
+        revision_reviewer,
+        revision_cutover,
+        subgraph_kdl,
         goals,
         baselines,
         products,
@@ -261,7 +297,10 @@ fn parse_plan(
 
 fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<StepSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["timeout", "finally"])?;
+    ensure_only_properties(
+        node,
+        &["timeout", "finally", "revisions", "revision-reviewer"],
+    )?;
     let id = first_string(node)?;
     validate_id(&id, "step")?;
     let path = if parent_path.is_empty() {
@@ -273,6 +312,8 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         .map(|value| parse_duration(&value))
         .transpose()?;
     let finally = property_bool(node, "finally")?.unwrap_or(false);
+    let revisions_human_only = parse_revision_protection(node)?;
+    let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let mut title = None;
     let mut goals = Vec::new();
     let mut assigned_to = None;
@@ -286,6 +327,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     let mut gates = Vec::new();
     let mut nested_plan = None;
     let mut retry = RetrySpec::default();
+    let mut revision_owners = Vec::new();
     if let Some(children) = node.children() {
         let mut names = BTreeSet::new();
         let mut baseline_names = BTreeSet::new();
@@ -330,6 +372,10 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                     }
                     let source = format!("version 2\n{child}\n");
                     crate::graph::validate_deferred_environment(child)?;
+                    revision_owners = direct_agent_owners(
+                        child.children().expect("the subgraph body was checked"),
+                        default_host,
+                    )?;
                     subgraph_kdl = Some(source);
                 }
                 "produces" => products = parse_products(child)?,
@@ -355,7 +401,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                     gates.push(gate);
                 }
                 "plan" => {
-                    let mut plan = parse_plan(child, None, None, None, default_host, false)?;
+                    let mut plan = parse_plan(child, None, Vec::new(), default_host, false)?;
                     rewrite_nested_paths(&mut plan, &path)?;
                     nested_plan = Some(Box::new(plan));
                 }
@@ -379,6 +425,9 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         retry,
         finally,
         assigned_to,
+        revision_owners,
+        revisions_human_only,
+        revision_reviewer,
         dependencies,
         baselines,
         documents,
@@ -393,6 +442,79 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     validate_variables(&serde_json::to_value(&step).map_err(internal)?)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
+}
+
+fn parse_revision_protection(node: &KdlNode) -> Result<bool, St3Error> {
+    match property_string(node, "revisions")?.as_deref() {
+        None => Ok(false),
+        Some("human-only") => Ok(true),
+        Some(value) => Err(St3Error::new(
+            "invalid-revision-protection",
+            format!("`revisions` cannot be `{value}`"),
+        )),
+    }
+}
+
+fn parse_revision_reviewer(node: &KdlNode, human_only: bool) -> Result<Option<String>, St3Error> {
+    let reviewer = property_string(node, "revision-reviewer")?;
+    if reviewer.is_some() && !human_only {
+        return Err(St3Error::new(
+            "revision-reviewer-without-protection",
+            "`revision-reviewer` requires revisions=\"human-only\"",
+        ));
+    }
+    if reviewer
+        .as_deref()
+        .is_some_and(|value| !value.starts_with("person/"))
+    {
+        return Err(St3Error::new(
+            "invalid-revision-reviewer",
+            "a revision reviewer must be a full person subject",
+        ));
+    }
+    Ok(reviewer)
+}
+
+fn direct_agent_owners(
+    document: &KdlDocument,
+    default_host: &str,
+) -> Result<Vec<String>, St3Error> {
+    let mut owners = document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "agent")
+        .map(|node| agent_owner(node, default_host))
+        .collect::<Result<Vec<_>, _>>()?;
+    owners.sort();
+    owners.dedup();
+    Ok(owners)
+}
+
+fn agent_owner(node: &KdlNode, default_host: &str) -> Result<String, St3Error> {
+    let name = first_string(node)?;
+    let children = node.children().ok_or_else(|| {
+        St3Error::new("missing-agent-body", format!("agent `{name}` has no body"))
+    })?;
+    let identity = children
+        .nodes()
+        .iter()
+        .find(|child| child.name().value() == "identity")
+        .map(first_string)
+        .transpose()?
+        .unwrap_or(name);
+    let host = children
+        .nodes()
+        .iter()
+        .find(|child| child.name().value() == "host")
+        .map(first_string)
+        .transpose()?
+        .unwrap_or_else(|| default_host.to_owned());
+    let identity = if identity.contains('.') {
+        identity
+    } else {
+        format!("{host}.{identity}")
+    };
+    Ok(format!("agent/{identity}"))
 }
 
 fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Result<(), St3Error> {
@@ -875,18 +997,6 @@ fn parse_plan_state(value: &str) -> Result<PlanState, St3Error> {
     }
 }
 
-fn parse_change_policy(value: &str) -> Result<ChangePolicy, St3Error> {
-    match value {
-        "agent" => Ok(ChangePolicy::Agent),
-        "supervisor" => Ok(ChangePolicy::Supervisor),
-        "human-review" => Ok(ChangePolicy::HumanReview),
-        _ => Err(St3Error::new(
-            "invalid-change-policy",
-            format!("change policy `{value}` is not registered"),
-        )),
-    }
-}
-
 fn normalize_subject(value: &str, kind: &str) -> String {
     if value.starts_with(&format!("{kind}/")) {
         value.to_owned()
@@ -1125,7 +1235,7 @@ mod tests {
         let source = r#"
 version 2
 subgraph {
-  scope "eval/demo/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/demo/${ST_PLAN_RUN}" retention="temporary" {
     plan "demo" state="ready" {
       goal "Complete plan demo."
       step "start" {
@@ -1368,9 +1478,51 @@ subgraph { plan "old" state="ready" { goal "Run."; outcome { } ; step "work" { }
 subgraph { plan "old" state="ready" { goal "Run."; judges { } ; step "work" { } } }"#,
             r#"version 2
 subgraph { plan "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } }"#,
+            r#"version 2
+subgraph { plan "old" state="ready" change-policy="agent" { goal "Run."; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "old" state="ready" change-authority="agent/worker" { goal "Run."; step "work" { } } }"#,
         ] {
             assert!(crate::graph::parse_intent(removed, "node").is_err());
         }
+    }
+
+    #[test]
+    fn revision_authority_comes_from_graph_placement() {
+        let intent = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  agent "outer" { workspace "."; command "true" }
+  plan "placed" state="ready" revisions="human-only" revision-reviewer="person/plan" revision-cutover="when-idle" {
+    goal "Test revision placement."
+    subgraph { agent "plan-owner" { workspace "."; command "true" } }
+    step "work" revisions="human-only" revision-reviewer="person/step" {
+      assigned-to "agent/assignee"
+      subgraph { agent "step-owner" { workspace "."; command "true" } }
+    }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let plan = &intent.plans["placed"];
+        assert_eq!(
+            plan.revision_owners,
+            vec!["agent/node.outer", "agent/node.plan-owner"]
+        );
+        assert!(plan.revisions_human_only);
+        assert_eq!(plan.revision_reviewer.as_deref(), Some("person/plan"));
+        assert_eq!(
+            plan.revision_cutover,
+            crate::model::RevisionCutover::WhenIdle
+        );
+        let step = &plan.steps["work"];
+        assert_eq!(step.revision_owners, vec!["agent/node.step-owner"]);
+        assert!(step.revisions_human_only);
+        assert_eq!(step.revision_reviewer.as_deref(), Some("person/step"));
+        assert!(!step.revision_owners.contains(&"agent/assignee".into()));
     }
 
     #[test]

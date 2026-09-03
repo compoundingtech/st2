@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/license-mit/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/license-mit/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/license-mit" state="ready" {
       goal "Complete plan eval/license-mit."
       step "team" timeout="20m" {

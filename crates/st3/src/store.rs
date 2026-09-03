@@ -6,17 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    ApplyResponse, Capability, ChangePolicy, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
-    DesiredSubject, DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent,
-    PlanOutputView, PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction,
-    PlanningCandidateView, PlanningPreviewView, PlanningSessionView, ReplicaBatch, ReplicaRange,
-    ReplicationBatch, ReplicationResponse, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, WorkRequest,
+    ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
+    DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent, PlanOutputView,
+    PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction,
+    PlanningCandidateView, PlanningPreviewView, PlanningSessionView, PlanningVariantView,
+    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, St3Error, StatusResponse,
+    StepRunView, SubjectChange, SubjectStatus, WorkRequest,
 };
 
 const SCHEMA: &str = r#"
@@ -133,7 +134,8 @@ CREATE TABLE IF NOT EXISTS plan_definitions (
 CREATE TABLE IF NOT EXISTS plan_runs (
     id TEXT PRIMARY KEY,
     plan_id TEXT NOT NULL,
-    revision TEXT NOT NULL,
+    initial_revision TEXT NOT NULL,
+    current_generation_id TEXT NOT NULL,
     root_revision TEXT NOT NULL,
     root_run_id TEXT NOT NULL,
     parent_step_run TEXT,
@@ -148,9 +150,24 @@ CREATE TABLE IF NOT EXISTS plan_runs (
 );
 CREATE INDEX IF NOT EXISTS plan_runs_plan_index ON plan_runs(plan_id, created_at_unix_ms);
 
+CREATE TABLE IF NOT EXISTS run_generations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    revision TEXT NOT NULL,
+    predecessor_id TEXT,
+    status TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at_unix_ms TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL,
+    UNIQUE(run_id, id)
+);
+CREATE INDEX IF NOT EXISTS run_generations_run_index ON run_generations(run_id, created_at_unix_ms);
+
 CREATE TABLE IF NOT EXISTS step_runs (
     subject TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    generation_id TEXT NOT NULL REFERENCES run_generations(id),
     step_path TEXT NOT NULL,
     definition_hash TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -167,10 +184,29 @@ CREATE TABLE IF NOT EXISTS step_runs (
     activated_at_unix_ms TEXT,
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL,
-    UNIQUE(run_id, step_path)
+    UNIQUE(generation_id, step_path)
 );
-CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, step_path);
+CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
+CREATE TABLE IF NOT EXISTS revision_proposals (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    source_generation_id TEXT NOT NULL REFERENCES run_generations(id),
+    candidate_revision TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cutover TEXT NOT NULL,
+    compatible_steps TEXT NOT NULL,
+    reviewers TEXT NOT NULL,
+    approvals TEXT NOT NULL,
+    preview_hash TEXT,
+    successor_generation_id TEXT,
+    created_at_unix_ms TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS revision_proposals_one_pending
+ON revision_proposals(run_id) WHERE status IN ('pending-approval','draining');
 CREATE TABLE IF NOT EXISTS planning_sessions (
     id TEXT PRIMARY KEY,
     plan_id TEXT NOT NULL,
@@ -179,30 +215,35 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     requester TEXT NOT NULL,
     planner TEXT NOT NULL,
     status TEXT NOT NULL,
+    target_run_id TEXT,
+    source_generation_id TEXT,
     published_revision TEXT,
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS planning_candidates (
     session_id TEXT NOT NULL REFERENCES planning_sessions(id),
+    variant TEXT NOT NULL,
     revision INTEGER NOT NULL,
     markdown_ref TEXT NOT NULL,
     kdl_ref TEXT NOT NULL,
     plan_revision TEXT NOT NULL,
     submitted_at_unix_ms TEXT NOT NULL,
-    PRIMARY KEY(session_id, revision)
+    PRIMARY KEY(session_id, variant, revision)
 );
 CREATE TABLE IF NOT EXISTS planning_previews (
-    session_id TEXT PRIMARY KEY REFERENCES planning_sessions(id),
+    session_id TEXT NOT NULL REFERENCES planning_sessions(id),
+    variant TEXT NOT NULL,
     candidate_revision INTEGER NOT NULL,
     hash TEXT NOT NULL,
     store_index INTEGER NOT NULL,
     graph TEXT NOT NULL,
     diff TEXT NOT NULL,
     plan_response TEXT NOT NULL,
-    created_at_unix_ms TEXT NOT NULL
+    created_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 "#;
 
 pub struct Store {
@@ -225,11 +266,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 5,
-        "this database uses an unsupported pre-plan st3 schema; start with a new state directory"
+        table_count == 0 || version == 6,
+        "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 5,
+        version == 0 || version == 6,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -269,6 +310,23 @@ impl Store {
         current_index(&connection)
     }
 
+    pub(crate) fn cached_idempotency_response<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT response FROM idempotency WHERE key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|response| serde_json::from_str(&response))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     pub fn plan_spec(&self, plan_id: &str, revision: Option<&str>) -> Result<Option<PlanSpec>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let body = if let Some(revision) = revision {
@@ -302,14 +360,16 @@ impl Store {
         workspace: &str,
         requester: &str,
         planner: &str,
+        target_run: Option<&str>,
+        source_generation: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
         let now = now_ms().to_string();
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT OR IGNORE INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?7)",
-                params![id, plan, request_ref, workspace, requester, planner, now],
+                "INSERT OR IGNORE INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
+                params![id, plan, request_ref, workspace, requester, planner, target_run.map(|run| run.strip_prefix("plan-run/").unwrap_or(run)), source_generation.map(generation_id_from_subject), now],
             )
             .map_err(internal)?;
         planning_session_view_tx(&connection, id)
@@ -332,6 +392,7 @@ impl Store {
         &self,
         id: &str,
         actor: &str,
+        variant: &str,
         markdown_ref: &str,
         kdl_ref: &str,
         plan_revision: &str,
@@ -371,8 +432,8 @@ impl Store {
         let current = transaction
             .query_row(
                 "SELECT markdown_ref, kdl_ref, plan_revision FROM planning_candidates
-                 WHERE session_id=?1 ORDER BY revision DESC LIMIT 1",
-                [id],
+                 WHERE session_id=?1 AND variant=?2 ORDER BY revision DESC LIMIT 1",
+                params![id, variant],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -399,21 +460,24 @@ impl Store {
         }
         let revision: u32 = transaction
             .query_row(
-                "SELECT COALESCE(MAX(revision), 0) + 1 FROM planning_candidates WHERE session_id=?1",
-                [id],
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM planning_candidates WHERE session_id=?1 AND variant=?2",
+                params![id, variant],
                 |row| row.get(0),
             )
             .map_err(internal)?;
         let now = now_ms().to_string();
         transaction
             .execute(
-                "INSERT INTO planning_candidates(session_id, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, revision, markdown_ref, kdl_ref, plan_revision, now],
+                "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, variant, revision, markdown_ref, kdl_ref, plan_revision, now],
             )
             .map_err(internal)?;
         transaction
-            .execute("DELETE FROM planning_previews WHERE session_id=?1", [id])
+            .execute(
+                "DELETE FROM planning_previews WHERE session_id=?1 AND variant=?2",
+                params![id, variant],
+            )
             .map_err(internal)?;
         transaction
             .execute(
@@ -431,9 +495,11 @@ impl Store {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save_planning_preview(
         &self,
         id: &str,
+        variant: &str,
         candidate_revision: u32,
         hash: &str,
         graph: &str,
@@ -445,13 +511,14 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT INTO planning_previews(session_id, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(session_id) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
+                "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
                    store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
                    plan_response=excluded.plan_response, created_at_unix_ms=excluded.created_at_unix_ms",
                 params![
                     id,
+                    variant,
                     candidate_revision,
                     hash,
                     plan.store_index,
@@ -622,6 +689,11 @@ impl Store {
         ))[..32]
             .to_owned();
         let subject = format!("plan-run/{run_id}");
+        let generation_id = hex::encode(Sha256::digest(
+            format!("{}:{}:generation:1", self.origin, request.idempotency_key).as_bytes(),
+        ))[..32]
+            .to_owned();
+        let generation_subject = format!("run-generation/{generation_id}");
         let root_revision = child
             .as_ref()
             .map(|child| child.root_revision.clone())
@@ -650,6 +722,7 @@ impl Store {
             ("ST_PLAN".into(), plan.id.clone()),
             ("ST_PLAN_REVISION".into(), plan.revision.clone()),
             ("ST_PLAN_RUN".into(), run_id.clone()),
+            ("ST_RUN_GENERATION".into(), generation_id.clone()),
             ("ST_REQUESTER".into(), requester.clone()),
             ("ST_ROOT_PLAN_RUN".into(), root_plan_run.clone()),
             ("ST_WORKSPACE".into(), request.workspace.clone()),
@@ -680,9 +753,16 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO plan_runs(id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', 'normal', ?11, ?11)",
-                params![run_id, plan.id, plan.revision, root_revision, root_run_id, parent_step_run, request.workspace, requester, run_scope, mode, now.to_string()],
+                "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
+                params![run_id, plan.id, plan.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, run_scope, mode, now.to_string()],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
+                params![generation_id, run_id, plan.revision, requester, now.to_string()],
             )
             .map_err(internal)?;
         let mut flat = Vec::new();
@@ -692,7 +772,7 @@ impl Store {
             let assignee = assignee
                 .map(|value| crate::plan::interpolate(value, &variables))
                 .transpose()?;
-            let step_subject = format!("step-run/{run_id}/{}", step.path);
+            let step_subject = format!("step-run/{generation_id}/{}", step.path);
             let mut step_variables = variables.clone();
             step_variables.insert("ST_STEP".into(), step.path.clone());
             step_variables.insert("ST_STEP_RUN".into(), step_subject.clone());
@@ -701,7 +781,7 @@ impl Store {
             step_variables.insert(
                 "ST_PARENT_STEP_RUN".into(),
                 crate::plan::parent_step_path(&plan, &step.path)
-                    .map(|path| format!("step-run/{run_id}/{path}"))
+                    .map(|path| format!("step-run/{generation_id}/{path}"))
                     .or_else(|| parent_step_run.clone())
                     .unwrap_or_default(),
             );
@@ -713,9 +793,9 @@ impl Store {
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                    params![step_subject, run_id, step.path, step.definition_hash, assignee, title, goals, now.to_string()],
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?9)",
+                    params![step_subject, run_id, generation_id, step.path, step.definition_hash, assignee, title, goals, now.to_string()],
                 )
                 .map_err(internal)?;
         }
@@ -724,6 +804,8 @@ impl Store {
                 "status": "running",
                 "plan": plan.subject,
                 "revision": plan.revision,
+                "initial_revision": plan.revision,
+                "current_generation": generation_subject,
                 "root_revision": root_revision,
                 "root_plan_run": root_plan_run,
                 "parent_step_run": parent_step_run,
@@ -741,6 +823,22 @@ impl Store {
             "plan-run.created",
             Some(&requester),
             &body,
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &generation_subject,
+            "run-generation.created",
+            Some(&requester),
+            &json!({"fields": {
+                "run": subject,
+                "revision": plan.revision,
+                "status": "running",
+                "reason": "initial plan run"
+            }}),
             &[],
             None,
         )
@@ -800,6 +898,12 @@ impl Store {
                     format!("step run `{subject}` does not exist"),
                 )
             })?;
+        if !step_generation_is_current(&transaction, &current).map_err(internal)? {
+            return Err(St3Error::new(
+                "stale-run-generation",
+                format!("step run `{subject}` belongs to a superseded generation"),
+            ));
+        }
         if !plan_output_authority(&transaction, &current, &actor, incarnation, now)
             .map_err(internal)?
         {
@@ -892,7 +996,8 @@ impl Store {
         current
             .as_ref()
             .map(|current| {
-                plan_output_authority(&connection, current, &actor, incarnation, now_ms())
+                Ok(step_generation_is_current(&connection, current)?
+                    && plan_output_authority(&connection, current, &actor, incarnation, now_ms())?)
             })
             .transpose()
             .map(|authorized| authorized.unwrap_or(false))
@@ -934,6 +1039,634 @@ impl Store {
         Ok(plan_run_view_tx(&connection, run).optional()?)
     }
 
+    pub fn run_generations(&self, run: &str) -> Result<Vec<RunGenerationView>> {
+        let run = run.strip_prefix("plan-run/").unwrap_or(run);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
+        )?;
+        let ids = statement
+            .query_map([run], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| run_generation_view_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn run_generation(&self, generation: &str) -> Result<Option<RunGenerationView>> {
+        let generation = generation_id_from_subject(generation);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        Ok(run_generation_view_tx(&connection, generation).optional()?)
+    }
+
+    pub fn descendant_run_generations(&self, generation: &str) -> Result<Vec<String>> {
+        let generation = generation_id_from_subject(generation);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        descendant_plan_run_ids_tx(&connection, generation)?
+            .into_iter()
+            .map(|run| {
+                connection
+                    .query_row(
+                        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                        [run],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map(|id| format!("run-generation/{id}"))
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub fn revision_proposal_for_run(&self, run: &str) -> Result<Option<RevisionProposalView>> {
+        let run = run.strip_prefix("plan-run/").unwrap_or(run);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let id = connection
+            .query_row(
+                "SELECT id FROM revision_proposals WHERE run_id=?1 AND status IN ('pending-approval','draining') ORDER BY created_at_unix_ms DESC LIMIT 1",
+                [run],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        id.map(|id| revision_proposal_view_tx(&connection, &id))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn revision_proposal(&self, proposal: &str) -> Result<Option<RevisionProposalView>> {
+        let proposal = proposal
+            .strip_prefix("revision-proposal/")
+            .unwrap_or(proposal);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        Ok(revision_proposal_view_tx(&connection, proposal).optional()?)
+    }
+
+    pub fn create_revision_proposal(
+        &self,
+        run: &str,
+        plan: &PlanSpec,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<RevisionProposalView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+        let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-plan-run",
+                format!("plan run `{run}` does not exist"),
+            )
+        })?;
+        if !matches!(current.status.as_str(), "running" | "blocked") || current.phase != "normal" {
+            return Err(St3Error::new(
+                "plan-run-not-revisable",
+                format!(
+                    "plan run `{run}` is {} in its {} phase",
+                    current.status, current.phase
+                ),
+            ));
+        }
+        let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+        let old = self
+            .plan_spec(plan_id, Some(&current.revision))
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-plan-revision",
+                    "the current plan revision is unavailable",
+                )
+            })?;
+        if plan.id != plan_id || plan.state != PlanState::Ready {
+            return Err(St3Error::new(
+                "wrong-plan-revision",
+                format!("the proposal does not contain ready plan `{plan_id}`"),
+            ));
+        }
+        if old.scope_template != plan.scope_template {
+            return Err(St3Error::new(
+                "run-scope-mutation",
+                "a run revision cannot change its enclosing scope",
+            ));
+        }
+        let actor = normalize_actor(actor, "agent");
+        let variables = plan_run_variables(&current, &plan.revision);
+        let (compatible, reviewers) =
+            analyze_plan_revision(&old, plan, &actor, &current.requester, &variables)?;
+        let cutover = old.revision_cutover.clone();
+        let status = if reviewers.is_empty() {
+            match &cutover {
+                RevisionCutover::RestartActive => {
+                    return Err(St3Error::new(
+                        "revision-does-not-need-proposal",
+                        "this revision can cut over immediately",
+                    ));
+                }
+                RevisionCutover::WhenIdle => "draining",
+            }
+        } else {
+            "pending-approval"
+        };
+        let proposal_id = hex::encode(Sha256::digest(
+            format!("{}:{}:revision-proposal", self.origin, idempotency_key).as_bytes(),
+        ))[..32]
+            .to_owned();
+        let preview_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "source_generation": current.generation,
+                "candidate_revision": plan.revision,
+                "compatible_steps": compatible,
+                "reviewers": reviewers,
+                "cutover": cutover,
+            }))
+            .map_err(internal)?,
+        ));
+        let now = now_ms();
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        if let Some(response) = connection
+            .query_row(
+                "SELECT response FROM idempotency WHERE key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        if connection
+            .query_row(
+                "SELECT 1 FROM revision_proposals WHERE run_id=?1 AND status IN ('pending-approval','draining')",
+                [run_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(St3Error::new(
+                "revision-proposal-already-pending",
+                "the plan run already has one pending revision proposal",
+            ));
+        }
+        let transaction = connection.transaction().map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO revision_proposals(id, run_id, source_generation_id, candidate_revision, actor, reason, status, cutover, compatible_steps, reviewers, approvals, preview_hash, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
+                params![
+                    proposal_id,
+                    run_id,
+                    generation_id_from_subject(&current.generation),
+                    plan.revision,
+                    actor,
+                    reason,
+                    status,
+                    revision_cutover_name(&cutover),
+                    serde_json::to_string(&compatible).map_err(internal)?,
+                    serde_json::to_string(&reviewers).map_err(internal)?,
+                    preview_hash,
+                    now.to_string(),
+                ],
+            )
+            .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, now.to_string()],
+                )
+                .map_err(internal)?;
+        }
+        let subject = format!("revision-proposal/{proposal_id}");
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &subject,
+            "revision-proposal.created",
+            Some(&actor),
+            &json!({"fields": {
+                "run": current.subject,
+                "source_generation": current.generation,
+                "candidate_revision": plan.revision,
+                "reason": reason,
+                "status": status,
+                "cutover": revision_cutover_name(&cutover),
+                "compatible_steps": compatible,
+                "reviewers": reviewers,
+                "preview_hash": preview_hash,
+            }}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        let view = revision_proposal_view_tx(&transaction, &proposal_id).map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(view)
+    }
+
+    pub fn approve_revision_proposal(
+        &self,
+        proposal: &str,
+        actor: &str,
+        preview_hash: &str,
+        idempotency_key: &str,
+    ) -> Result<RevisionSubmissionView, St3Error> {
+        let proposal_id = proposal
+            .strip_prefix("revision-proposal/")
+            .unwrap_or(proposal);
+        let actor = normalize_actor(actor, "person");
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        if let Some(response) = connection
+            .query_row(
+                "SELECT response FROM idempotency WHERE key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let transaction = connection.transaction().map_err(internal)?;
+        let mut proposal =
+            revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
+        if proposal.status == "applied"
+            && proposal.preview_hash.as_deref() == Some(preview_hash)
+            && proposal.approvals.contains(&actor)
+        {
+            let run = plan_run_view_tx(
+                &transaction,
+                proposal
+                    .run
+                    .strip_prefix("plan-run/")
+                    .unwrap_or(&proposal.run),
+            )
+            .map_err(internal)?;
+            let response = RevisionSubmissionView {
+                status: "applied".into(),
+                plan_run: run,
+                proposal: Some(proposal),
+            };
+            transaction
+                .execute(
+                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                    params![
+                        idempotency_key,
+                        serde_json::to_string(&response).map_err(internal)?
+                    ],
+                )
+                .map_err(internal)?;
+            transaction.commit().map_err(internal)?;
+            return Ok(response);
+        }
+        if proposal.status != "pending-approval" {
+            return Err(St3Error::new(
+                "revision-proposal-not-reviewable",
+                format!("revision proposal `{proposal_id}` is {}", proposal.status),
+            ));
+        }
+        if proposal.preview_hash.as_deref() != Some(preview_hash) {
+            return Err(St3Error::new(
+                "stale-revision-preview",
+                "the approval does not name the current revision preview",
+            ));
+        }
+        if !proposal.reviewers.contains(&actor) {
+            return Err(St3Error::new(
+                "revision-approval-not-authorized",
+                format!("`{actor}` is not a reviewer for `{proposal_id}`"),
+            ));
+        }
+        if !proposal.approvals.contains(&actor) {
+            proposal.approvals.push(actor.clone());
+            proposal.approvals.sort();
+        }
+        let all_approved = proposal
+            .reviewers
+            .iter()
+            .all(|reviewer| proposal.approvals.contains(reviewer));
+        let status = if all_approved && matches!(proposal.cutover, RevisionCutover::WhenIdle) {
+            "draining"
+        } else {
+            "pending-approval"
+        };
+        let now = now_ms();
+        transaction
+            .execute(
+                "UPDATE revision_proposals SET approvals=?2, status=?3, updated_at_unix_ms=?4 WHERE id=?1",
+                params![
+                    proposal_id,
+                    serde_json::to_string(&proposal.approvals).map_err(internal)?,
+                    status,
+                    now.to_string(),
+                ],
+            )
+            .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![proposal.run.strip_prefix("plan-run/").unwrap_or(&proposal.run), now.to_string()],
+                )
+                .map_err(internal)?;
+        }
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &proposal.subject,
+            "revision-proposal.approved",
+            Some(&actor),
+            &json!({"fields": {"reviewer": actor, "preview_hash": preview_hash, "all_approved": all_approved}}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        drop(connection);
+
+        if all_approved && matches!(proposal.cutover, RevisionCutover::RestartActive) {
+            let run = self.finish_proposal_cutover(proposal_id, &actor, idempotency_key)?;
+            let applied = self
+                .revision_proposal(proposal_id)
+                .map_err(internal)?
+                .expect("the applied proposal exists");
+            let response = RevisionSubmissionView {
+                status: "applied".into(),
+                plan_run: run,
+                proposal: Some(applied),
+            };
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            connection
+                .execute(
+                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                    params![
+                        idempotency_key,
+                        serde_json::to_string(&response).map_err(internal)?
+                    ],
+                )
+                .map_err(internal)?;
+            return Ok(response);
+        }
+
+        let proposal = self
+            .revision_proposal(proposal_id)
+            .map_err(internal)?
+            .expect("the proposal exists");
+        let run = self
+            .plan_run(&proposal.run)
+            .map_err(internal)?
+            .expect("the proposal plan run exists");
+        let response = RevisionSubmissionView {
+            status: proposal.status.clone(),
+            plan_run: run,
+            proposal: Some(proposal),
+        };
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .execute(
+                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&response).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        Ok(response)
+    }
+
+    pub fn cancel_revision_proposal(
+        &self,
+        proposal: &str,
+        actor: &str,
+        reason: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<RevisionProposalView, St3Error> {
+        let proposal_id = proposal
+            .strip_prefix("revision-proposal/")
+            .unwrap_or(proposal);
+        let actor = normalize_actor(
+            actor,
+            if actor.starts_with("person/") {
+                "person"
+            } else {
+                "agent"
+            },
+        );
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        if let Some(response) = connection
+            .query_row(
+                "SELECT response FROM idempotency WHERE key=?1",
+                [idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let transaction = connection.transaction().map_err(internal)?;
+        let current = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
+        let run_id = current
+            .run
+            .strip_prefix("plan-run/")
+            .unwrap_or(&current.run);
+        let requester: String = transaction
+            .query_row(
+                "SELECT requester FROM plan_runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if actor != current.actor && actor != requester && !current.reviewers.contains(&actor) {
+            return Err(St3Error::new(
+                "revision-cancel-not-authorized",
+                format!("`{actor}` cannot cancel `{proposal_id}`"),
+            ));
+        }
+        if !matches!(current.status.as_str(), "pending-approval" | "draining") {
+            return Err(St3Error::new(
+                "revision-proposal-not-cancellable",
+                format!("revision proposal `{proposal_id}` is {}", current.status),
+            ));
+        }
+        let now = now_ms();
+        transaction
+            .execute(
+                "UPDATE revision_proposals SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
+                params![proposal_id, now.to_string()],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "UPDATE plan_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
+                params![run_id, now.to_string()],
+            )
+            .map_err(internal)?;
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &current.subject,
+            "revision-proposal.cancelled",
+            Some(&actor),
+            &json!({"fields": {"status": "cancelled", "reason": reason}}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        let view = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(view)
+    }
+
+    pub fn apply_drained_revision(
+        &self,
+        run: &str,
+    ) -> Result<Option<RevisionSubmissionView>, St3Error> {
+        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+        let proposal = {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            let active: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM step_runs
+                     WHERE generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)
+                       AND status IN ('claimed','working','verifying')",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if active != 0 {
+                return Ok(None);
+            }
+            let current_generation: String = connection
+                .query_row(
+                    "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            for descendant in
+                descendant_plan_run_ids_tx(&connection, &current_generation).map_err(internal)?
+            {
+                let active: u32 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM step_runs
+                         WHERE run_id=?1
+                           AND generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)
+                           AND status IN ('claimed','working','verifying')",
+                        [descendant],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if active != 0 {
+                    return Ok(None);
+                }
+            }
+            let proposal_id = connection
+                .query_row(
+                    "SELECT id FROM revision_proposals WHERE run_id=?1 AND status='draining' ORDER BY created_at_unix_ms LIMIT 1",
+                    [run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            proposal_id
+                .map(|id| revision_proposal_view_tx(&connection, &id))
+                .transpose()
+                .map_err(internal)?
+        };
+        let Some(proposal) = proposal else {
+            return Ok(None);
+        };
+        let run = self.finish_proposal_cutover(
+            &proposal.id,
+            &proposal.actor,
+            &format!("revision-proposal:{}:drained", proposal.id),
+        )?;
+        let proposal = self
+            .revision_proposal(&proposal.id)
+            .map_err(internal)?
+            .expect("the applied proposal exists");
+        Ok(Some(RevisionSubmissionView {
+            status: "applied".into(),
+            plan_run: run,
+            proposal: Some(proposal),
+        }))
+    }
+
+    fn finish_proposal_cutover(
+        &self,
+        proposal_id: &str,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<PlanRunView, St3Error> {
+        let proposal = self
+            .revision_proposal(proposal_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-revision-proposal",
+                    format!("revision proposal `{proposal_id}` does not exist"),
+                )
+            })?;
+        let run_id = proposal
+            .run
+            .strip_prefix("plan-run/")
+            .unwrap_or(&proposal.run);
+        let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
+            St3Error::new(
+                "missing-plan-run",
+                format!("plan run `{run_id}` does not exist"),
+            )
+        })?;
+        if current.generation != proposal.source_generation {
+            return Err(St3Error::new(
+                "stale-revision-proposal",
+                "the revision proposal does not target the current generation",
+            ));
+        }
+        let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+        let plan = self
+            .plan_spec(plan_id, Some(&proposal.candidate_revision))
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-plan-revision",
+                    "the proposed plan revision is unavailable",
+                )
+            })?;
+        self.adopt_approved_plan_revision(
+            run_id,
+            &plan,
+            actor,
+            &proposal.reason,
+            &format!("{idempotency_key}:cutover"),
+            &proposal.source_generation,
+            &proposal,
+        )
+    }
+
     pub fn plan_run_for_scope(&self, scope: &str) -> Result<Option<PlanRunView>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let run_id = connection
@@ -973,22 +1706,69 @@ impl Store {
         reason: &str,
         idempotency_key: &str,
     ) -> Result<PlanRunView, St3Error> {
-        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
-        let actor = normalize_actor(
+        self.adopt_plan_revision_inner(run, plan, actor, reason, idempotency_key, None, false, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_approved_plan_revision(
+        &self,
+        run: &str,
+        plan: &PlanSpec,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+        source_generation: &str,
+        proposal: &RevisionProposalView,
+    ) -> Result<PlanRunView, St3Error> {
+        self.adopt_plan_revision_inner(
+            run,
+            plan,
             actor,
-            if matches!(plan.change_policy, ChangePolicy::HumanReview) {
-                "person"
-            } else {
-                "agent"
-            },
-        );
+            reason,
+            idempotency_key,
+            Some(source_generation),
+            true,
+            Some(proposal),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_plan_revision_inner(
+        &self,
+        run: &str,
+        plan: &PlanSpec,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+        expected_generation: Option<&str>,
+        protected_approved: bool,
+        proposal: Option<&RevisionProposalView>,
+    ) -> Result<PlanRunView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+        let actor = normalize_actor(actor, "agent");
         let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
             St3Error::new(
                 "missing-plan-run",
                 format!("plan run `{run}` does not exist"),
             )
         })?;
-        if !matches!(current.status.as_str(), "running" | "blocked") || current.phase != "normal" {
+        if expected_generation.is_some_and(|expected| {
+            generation_id_from_subject(expected) != generation_id_from_subject(&current.generation)
+        }) {
+            return Err(St3Error::new(
+                "stale-revision-proposal",
+                "the revision proposal does not target the current generation",
+            ));
+        }
+        let phase_allows_cutover = current.phase == "normal"
+            || (proposal.is_some() && current.phase == "revision-draining");
+        if !matches!(current.status.as_str(), "running" | "blocked") || !phase_allows_cutover {
             return Err(St3Error::new(
                 "plan-run-not-revisable",
                 format!(
@@ -1019,47 +1799,37 @@ impl Store {
                     "the current plan revision is unavailable",
                 )
             })?;
-        if old.scope_template != plan.scope_template
-            || old.change_policy != plan.change_policy
-            || old.change_authority != plan.change_authority
-        {
+        if old.scope_template != plan.scope_template {
             return Err(St3Error::new(
-                "change-policy-mutation",
-                "a run revision cannot change its scope, change policy, or authority",
+                "run-scope-mutation",
+                "a run revision cannot change its enclosing scope",
             ));
         }
 
         let variables = plan_run_variables(&current, &plan.revision);
-        authorize_plan_revision(&old, plan, &actor, &variables)?;
+        let (compatible, reviewers) = if protected_approved {
+            (compatible_step_paths(&old, plan), BTreeSet::new())
+        } else {
+            analyze_plan_revision(&old, plan, &actor, &current.requester, &variables)?
+        };
+        if !protected_approved && matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
+            return Err(St3Error::new(
+                "revision-needs-drained-cutover",
+                "the current plan revision requires a drained cutover",
+            ));
+        }
+        if !reviewers.is_empty() && !protected_approved {
+            return Err(St3Error::new(
+                "revision-needs-human-approval",
+                format!(
+                    "the revision needs approval from {}",
+                    reviewers.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
 
-        let mut old_steps = Vec::new();
-        flatten_steps(&old, None, &mut old_steps);
-        let old_hashes = old_steps
-            .into_iter()
-            .map(|(step, _)| (step.path.clone(), step.definition_hash.clone()))
-            .collect::<BTreeMap<_, _>>();
         let mut new_steps = Vec::new();
         flatten_steps(plan, None, &mut new_steps);
-        let dependencies = flattened_dependencies(plan);
-        let mut reset = new_steps
-            .iter()
-            .filter(|(step, _)| old_hashes.get(&step.path) != Some(&step.definition_hash))
-            .map(|(step, _)| step.path.clone())
-            .collect::<BTreeSet<_>>();
-        loop {
-            let additions = dependencies
-                .iter()
-                .filter(|(path, deps)| {
-                    !reset.contains(*path)
-                        && deps.iter().any(|dependency| reset.contains(dependency))
-                })
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>();
-            if additions.is_empty() {
-                break;
-            }
-            reset.extend(additions);
-        }
 
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -1074,82 +1844,166 @@ impl Store {
             return serde_json::from_str(&response).map_err(internal);
         }
         let transaction = connection.transaction().map_err(internal)?;
-        let retained = new_steps
-            .iter()
-            .map(|(step, _)| step.path.clone())
-            .collect::<BTreeSet<_>>();
-        let existing = current
-            .steps
-            .iter()
-            .map(|step| step.step.clone())
-            .collect::<Vec<_>>();
-        for path in existing.into_iter().filter(|path| !retained.contains(path)) {
-            transaction
-                .execute(
-                    "DELETE FROM step_runs WHERE run_id=?1 AND step_path=?2",
-                    params![run_id, path],
-                )
-                .map_err(internal)?;
-        }
         let now = now_ms();
+        let predecessor_id = generation_id_from_subject(&current.generation).to_owned();
+        let generation_id = hex::encode(Sha256::digest(
+            format!("{}:{}:generation", self.origin, idempotency_key).as_bytes(),
+        ))[..32]
+            .to_owned();
+        let generation_subject = format!("run-generation/{generation_id}");
+        let predecessor_subject = current.generation.clone();
+        let mut successor_variables = variables.clone();
+        successor_variables.insert("ST_RUN_GENERATION".into(), generation_id.clone());
+        transaction
+            .execute(
+                "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?7)",
+                params![generation_id, run_id, plan.revision, predecessor_id, actor, reason, now.to_string()],
+            )
+            .map_err(internal)?;
         for (step, inherited_assignee) in new_steps {
             let assignee = step
                 .assigned_to
                 .as_ref()
                 .or(inherited_assignee.as_ref())
-                .map(|value| crate::plan::interpolate(value, &variables))
+                .map(|value| crate::plan::interpolate(value, &successor_variables))
                 .transpose()?;
-            let subject = format!("step-run/{run_id}/{}", step.path);
-            let mut step_variables = variables.clone();
+            let subject = format!("step-run/{generation_id}/{}", step.path);
+            let mut step_variables = successor_variables.clone();
             step_variables.insert("ST_STEP".into(), step.path.clone());
             step_variables.insert("ST_STEP_RUN".into(), subject.clone());
-            step_variables.insert("ST_ATTEMPT".into(), "1".into());
             step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
                 "ST_PARENT_STEP_RUN".into(),
                 crate::plan::parent_step_path(plan, &step.path)
-                    .map(|path| format!("step-run/{run_id}/{path}"))
+                    .map(|path| format!("step-run/{generation_id}/{path}"))
                     .or_else(|| current.parent_step_run.clone())
                     .unwrap_or_default(),
             );
+            let carried = compatible
+                .contains(&step.path)
+                .then(|| current.steps.iter().find(|old| old.step == step.path))
+                .flatten();
+            let attempt = carried.map(|old| old.attempt).unwrap_or(1);
+            step_variables.insert("ST_ATTEMPT".into(), attempt.to_string());
             let title = step
                 .title
                 .as_deref()
                 .map(|value| crate::plan::interpolate(value, &step_variables))
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
-            if reset.contains(&step.path) {
-                transaction
-                    .execute(
-                        "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, created_at_unix_ms, updated_at_unix_ms)
-                         VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, 0, ?8, ?8)
-                         ON CONFLICT(subject) DO UPDATE SET definition_hash=excluded.definition_hash, status='pending', attempt=1,
-                           assignee=excluded.assignee, title=excluded.title, goals=excluded.goals, worker_reported=0,
-                           lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
-                           blocked_reason=?9, not_before_unix_ms=NULL, activated_at_unix_ms=NULL, updated_at_unix_ms=?8",
-                        params![subject, run_id, step.path, step.definition_hash, assignee, title, goals, now.to_string(), reason],
-                    )
-                    .map_err(internal)?;
+            let status = carried
+                .map(|old| match old.status.as_str() {
+                    "claimed" | "working" | "verifying" => "ready",
+                    status => status,
+                })
+                .unwrap_or("pending");
+            let worker_reported =
+                carried.is_some_and(|old| old.worker_reported && status != "ready");
+            let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
+            let not_before = carried
+                .and_then(|old| old.not_before_unix_ms)
+                .map(|value| value.to_string());
+            transaction
+                .execute(
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, title, goals, worker_reported, blocked_reason, not_before, now.to_string()],
+                )
+                .map_err(internal)?;
+            if let Some(old) = carried {
+                append_claim_tx(
+                    &transaction,
+                    &self.origin,
+                    &subject,
+                    "step-run.carried",
+                    Some(&actor),
+                    &json!({"fields": {
+                        "source_step_run": old.subject,
+                        "source_generation": predecessor_subject,
+                        "status": status,
+                        "attempt": attempt,
+                        "worker_reported": worker_reported
+                    }}),
+                    &[],
+                    None,
+                )
+                .map_err(internal)?;
             }
         }
+        cancel_descendant_plan_runs_tx(&transaction, &self.origin, &predecessor_id, &actor, now)?;
         transaction
             .execute(
-                "UPDATE plan_runs SET revision=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
-                params![run_id, plan.revision, now.to_string()],
+                "UPDATE run_generations SET status='superseded', updated_at_unix_ms=?2 WHERE id=?1",
+                params![predecessor_id, now.to_string()],
             )
             .map_err(internal)?;
-        let body = json!({"fields": {"revision": plan.revision, "replaces": current.revision, "reason": reason}});
+        transaction
+            .execute(
+                "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+                params![run_id, generation_id, now.to_string()],
+            )
+            .map_err(internal)?;
         append_claim_tx(
             &transaction,
             &self.origin,
-            &current.subject,
-            "plan-run.revised",
+            &predecessor_subject,
+            "run-generation.superseded",
             Some(&actor),
-            &body,
+            &json!({"fields": {"status": "superseded", "successor": generation_subject, "reason": reason}}),
             &[],
             None,
         )
         .map_err(internal)?;
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &generation_subject,
+            "run-generation.created",
+            Some(&actor),
+            &json!({"fields": {
+                "run": current.subject,
+                "revision": plan.revision,
+                "predecessor": predecessor_subject,
+                "status": "running",
+                "reason": reason,
+                "compatible_steps": compatible
+            }}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        if let Some(proposal) = proposal {
+            let changed = transaction
+                .execute(
+                    "UPDATE revision_proposals
+                     SET status='applied', successor_generation_id=?2, updated_at_unix_ms=?3
+                     WHERE id=?1 AND source_generation_id=?4
+                       AND status IN ('pending-approval','draining')",
+                    params![proposal.id, generation_id, now.to_string(), predecessor_id],
+                )
+                .map_err(internal)?;
+            if changed != 1 {
+                return Err(St3Error::new(
+                    "stale-revision-proposal",
+                    "the revision proposal changed before the cutover",
+                ));
+            }
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                &proposal.subject,
+                "revision-proposal.applied",
+                Some(&actor),
+                &json!({"fields": {
+                    "status": "applied",
+                    "successor_generation": generation_subject
+                }}),
+                &[],
+                None,
+            )
+            .map_err(internal)?;
+        }
         let view = plan_run_view_tx(&transaction, run_id).map_err(internal)?;
         transaction
             .execute(
@@ -1199,6 +2053,11 @@ impl Store {
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
              FROM step_runs
              WHERE (?1 IS NULL OR assignee=?1)
+               AND generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=step_runs.run_id)
+               AND (
+                 (SELECT phase FROM plan_runs WHERE id=step_runs.run_id) != 'revision-draining'
+                 OR status IN ('claimed','working','verifying')
+               )
                AND (?2 OR status NOT IN ('completed','failed','cancelled'))
              ORDER BY created_at_unix_ms, step_path",
         )?;
@@ -1259,6 +2118,38 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
+        let current_generation: String = transaction
+            .query_row(
+                "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                [current
+                    .run
+                    .strip_prefix("plan-run/")
+                    .unwrap_or(&current.run)],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if generation_id_from_subject(&current.generation) != current_generation {
+            return Err(St3Error::new(
+                "stale-run-generation",
+                format!("step run `{subject}` belongs to a superseded generation"),
+            ));
+        }
+        let run_phase: String = transaction
+            .query_row(
+                "SELECT phase FROM plan_runs WHERE id=?1",
+                [current
+                    .run
+                    .strip_prefix("plan-run/")
+                    .unwrap_or(&current.run)],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if action == "claim" && run_phase == "revision-draining" {
+            return Err(St3Error::new(
+                "run-generation-draining",
+                "the current generation is draining for a revision cutover",
+            ));
+        }
         if current.assignee.as_deref() != Some(actor.as_str()) {
             return Err(St3Error::new(
                 "wrong-assignee",
@@ -1398,14 +2289,20 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<String> = transaction
+        let current: Option<(String, bool)> = transaction
             .query_row(
-                "SELECT status FROM step_runs WHERE subject=?1",
+                "SELECT step_runs.status,
+                        step_runs.generation_id=plan_runs.current_generation_id
+                 FROM step_runs JOIN plan_runs ON plan_runs.id=step_runs.run_id
+                 WHERE step_runs.subject=?1",
                 [&subject],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if current.as_deref() == Some(status) || current.is_none() {
+        let Some((current, is_current)) = current else {
+            return Ok(false);
+        };
+        if !is_current || current == status {
             return Ok(false);
         }
         let now = now_ms();
@@ -1437,17 +2334,20 @@ impl Store {
         let subject = normalize_step_run(subject);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
-        let current: Option<(String, u32)> = transaction
+        let current: Option<(String, u32, bool)> = transaction
             .query_row(
-                "SELECT status, attempt FROM step_runs WHERE subject=?1",
+                "SELECT step_runs.status, step_runs.attempt,
+                        step_runs.generation_id=plan_runs.current_generation_id
+                 FROM step_runs JOIN plan_runs ON plan_runs.id=step_runs.run_id
+                 WHERE step_runs.subject=?1",
                 [&subject],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((status, attempt)) = current else {
+        let Some((status, attempt, is_current)) = current else {
             return Ok(false);
         };
-        if status != "failed" {
+        if !is_current || status != "failed" {
             return Ok(false);
         }
         let now = now_ms();
@@ -1502,12 +2402,32 @@ impl Store {
             "UPDATE plan_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
             params![run, status, phase, now.to_string()],
         )?;
+        transaction.execute(
+            "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3
+             WHERE id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)",
+            params![run, status, now.to_string()],
+        )?;
         let body = json!({"fields": {"status": status, "phase": phase, "reason": reason}});
         append_claim_tx(
             &transaction,
             &self.origin,
             &subject,
             "plan-run.state",
+            None,
+            &body,
+            &[],
+            None,
+        )?;
+        let generation: String = transaction.query_row(
+            "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+            [run],
+            |row| row.get(0),
+        )?;
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &format!("run-generation/{generation}"),
+            "run-generation.state",
             None,
             &body,
             &[],
@@ -3454,7 +4374,6 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "message.delivered",
         "message.sent",
         "plan-run.created",
-        "plan-run.revised",
         "plan-run.state",
         "plan.documents",
         "plan.published",
@@ -3464,6 +4383,7 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "planning-session.previewed",
         "planning-session.revision-requested",
         "planning-session.started",
+        "planning-session.variant-proposed",
         "presence.observed",
         "pid.observed",
         "reachability.changed",
@@ -3473,8 +4393,16 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "resource.session-bound",
         "review.decision",
         "review.requested",
+        "revision-proposal.applied",
+        "revision-proposal.approved",
+        "revision-proposal.cancelled",
+        "revision-proposal.created",
+        "run-generation.created",
+        "run-generation.state",
+        "run-generation.superseded",
         "session.signal.requested",
         "session.signal.result",
+        "step-run.carried",
         "step-run.state",
         "step-run.retry",
         "scope.members",
@@ -4136,7 +5064,9 @@ fn project_replicated_plan_runs(transaction: &Transaction<'_>) -> Result<(), St3
         .prepare(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
              FROM claims
-             WHERE kind IN ('plan-run.created','plan-run.revised','plan-run.state','step-run.state','step-run.retry',
+             WHERE kind IN ('plan-run.created','plan-run.state','run-generation.created','run-generation.state','run-generation.superseded',
+                            'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
+                            'step-run.carried','step-run.state','step-run.retry',
                             'work.claim','work.renew','work.progress','work.complete','work.fail','work.release')
              ORDER BY store_index",
         )
@@ -4228,11 +5158,28 @@ fn project_plan_run_created(
         .get("default_assignee")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let generation_subject = fields
+        .get("current_generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            St3Error::new(
+                "invalid-plan-run-claim",
+                format!("claim `{}` has no initial generation", claim.id),
+            )
+        })?;
+    let generation_id = generation_id_from_subject(generation_subject);
     transaction
         .execute(
-            "INSERT OR IGNORE INTO plan_runs(id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', 'normal', ?11, ?11)",
-            params![run_id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, claim.accepted_at_unix_ms.to_string()],
+            "INSERT OR IGNORE INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
+            params![run_id, plan_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, claim.accepted_at_unix_ms.to_string()],
+        )
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
+            params![generation_id, run_id, revision, requester, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
     let view = plan_run_view_tx(transaction, run_id).map_err(internal)?;
@@ -4246,7 +5193,7 @@ fn project_plan_run_created(
             .or(inherited_assignee.as_ref())
             .map(|value| crate::plan::interpolate(value, &variables))
             .transpose()?;
-        let subject = format!("step-run/{run_id}/{}", step.path);
+        let subject = format!("step-run/{generation_id}/{}", step.path);
         let mut step_variables = variables.clone();
         step_variables.insert("ST_STEP".into(), step.path.clone());
         step_variables.insert("ST_STEP_RUN".into(), subject.clone());
@@ -4255,7 +5202,7 @@ fn project_plan_run_created(
         step_variables.insert(
             "ST_PARENT_STEP_RUN".into(),
             crate::plan::parent_step_path(&plan, &step.path)
-                .map(|path| format!("step-run/{run_id}/{path}"))
+                .map(|path| format!("step-run/{generation_id}/{path}"))
                 .or_else(|| parent_step_run.map(str::to_owned))
                 .unwrap_or_default(),
         );
@@ -4267,9 +5214,9 @@ fn project_plan_run_created(
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
             .execute(
-                "INSERT OR IGNORE INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, ?8, ?8)",
-                params![subject, run_id, step.path, step.definition_hash, assignee, title, goals, claim.accepted_at_unix_ms.to_string()],
+                "INSERT OR IGNORE INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, title, goals, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?9)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, title, goals, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
     }
@@ -4281,20 +5228,28 @@ fn project_plan_run_update(
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
-    if claim.kind == "plan-run.revised" {
-        let Some(run_id) = claim.subject.strip_prefix("plan-run/") else {
+    if claim.kind.starts_with("revision-proposal.") {
+        project_revision_proposal(transaction, claim, fields)?;
+        return Ok(());
+    }
+    if claim.kind == "run-generation.created" {
+        project_run_generation_created(transaction, claim)?;
+        return Ok(());
+    }
+    if claim.kind == "run-generation.superseded" || claim.kind == "run-generation.state" {
+        let Some(generation_id) = claim.subject.strip_prefix("run-generation/") else {
             return Ok(());
         };
-        let Some(revision) = fields.get("revision").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        project_plan_revision(
-            transaction,
-            run_id,
-            revision,
-            fields.get("reason").and_then(Value::as_str),
-            claim.accepted_at_unix_ms,
-        )?;
+        let status = fields
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("superseded");
+        transaction
+            .execute(
+                "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3 WHERE id=?1",
+                params![generation_id, status, claim.accepted_at_unix_ms.to_string()],
+            )
+            .map_err(internal)?;
         return Ok(());
     }
     if claim.kind == "plan-run.state" {
@@ -4384,13 +5339,198 @@ fn project_plan_run_update(
     Ok(())
 }
 
-fn project_plan_revision(
+fn project_revision_proposal(
     transaction: &Transaction<'_>,
-    run_id: &str,
-    revision: &str,
-    reason: Option<&str>,
-    now: u128,
+    claim: &ClaimRecord,
+    fields: &Value,
 ) -> Result<(), St3Error> {
+    let Some(proposal_id) = claim.subject.strip_prefix("revision-proposal/") else {
+        return Ok(());
+    };
+    let now = claim.accepted_at_unix_ms.to_string();
+    if claim.kind == "revision-proposal.created" {
+        let Some(run) = fields.get("run").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(source) = fields.get("source_generation").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(revision) = fields.get("candidate_revision").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let actor = claim.actor.as_deref().unwrap_or("requester");
+        let reason = fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let status = fields
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending-approval");
+        let cutover = fields
+            .get("cutover")
+            .and_then(Value::as_str)
+            .unwrap_or("restart-active");
+        let compatible = fields
+            .get("compatible_steps")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let reviewers = fields
+            .get("reviewers")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO revision_proposals(
+                   id, run_id, source_generation_id, candidate_revision, actor, reason, status,
+                   cutover, compatible_steps, reviewers, approvals, preview_hash,
+                   created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
+                params![
+                    proposal_id,
+                    run.strip_prefix("plan-run/").unwrap_or(run),
+                    generation_id_from_subject(source),
+                    revision,
+                    actor,
+                    reason,
+                    status,
+                    cutover,
+                    serde_json::to_string(&compatible).map_err(internal)?,
+                    serde_json::to_string(&reviewers).map_err(internal)?,
+                    fields.get("preview_hash").and_then(Value::as_str),
+                    now,
+                ],
+            )
+            .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run.strip_prefix("plan-run/").unwrap_or(run), now],
+                )
+                .map_err(internal)?;
+        }
+        return Ok(());
+    }
+    if claim.kind == "revision-proposal.approved" {
+        let Some(reviewer) = fields.get("reviewer").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let mut approvals = transaction
+            .query_row(
+                "SELECT approvals FROM revision_proposals WHERE id=?1",
+                [proposal_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .map(|value| serde_json::from_str::<BTreeSet<String>>(&value))
+            .transpose()
+            .map_err(internal)?
+            .unwrap_or_default();
+        approvals.insert(reviewer.to_owned());
+        let draining = fields
+            .get("all_approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && transaction
+                .query_row(
+                    "SELECT cutover='when-idle' FROM revision_proposals WHERE id=?1",
+                    [proposal_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .unwrap_or(false);
+        transaction
+            .execute(
+                "UPDATE revision_proposals SET approvals=?2,
+                   status=CASE WHEN ?3 THEN 'draining' ELSE status END,
+                   updated_at_unix_ms=?4 WHERE id=?1",
+                params![
+                    proposal_id,
+                    serde_json::to_string(&approvals).map_err(internal)?,
+                    draining,
+                    now
+                ],
+            )
+            .map_err(internal)?;
+        if draining {
+            transaction
+                .execute(
+                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2
+                     WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
+                    params![proposal_id, now],
+                )
+                .map_err(internal)?;
+        }
+        return Ok(());
+    }
+    let (status, successor) = match claim.kind.as_str() {
+        "revision-proposal.cancelled" => ("cancelled", None),
+        "revision-proposal.applied" => (
+            "applied",
+            fields
+                .get("successor_generation")
+                .and_then(Value::as_str)
+                .map(generation_id_from_subject),
+        ),
+        _ => return Ok(()),
+    };
+    transaction
+        .execute(
+            "UPDATE revision_proposals SET status=?2, successor_generation_id=?3,
+               updated_at_unix_ms=?4 WHERE id=?1",
+            params![proposal_id, status, successor, now],
+        )
+        .map_err(internal)?;
+    if status == "cancelled" {
+        transaction
+            .execute(
+                "UPDATE plan_runs SET phase='normal', updated_at_unix_ms=?2
+                 WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
+                params![proposal_id, now],
+            )
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+fn project_run_generation_created(
+    transaction: &Transaction<'_>,
+    claim: &ClaimRecord,
+) -> Result<(), St3Error> {
+    let Some(generation_id) = claim.subject.strip_prefix("run-generation/") else {
+        return Ok(());
+    };
+    if transaction
+        .query_row(
+            "SELECT 1 FROM run_generations WHERE id=?1",
+            [generation_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(internal)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let Some(run_subject) = fields.get("run").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let run_id = run_subject.strip_prefix("plan-run/").unwrap_or(run_subject);
+    let Some(revision) = fields.get("revision").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let predecessor = fields
+        .get("predecessor")
+        .and_then(Value::as_str)
+        .map(generation_id_from_subject);
+    let reason = fields
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("replicated generation");
     let current = match plan_run_view_tx(transaction, run_id) {
         Ok(current) => current,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
@@ -4409,75 +5549,74 @@ fn project_plan_revision(
         return Ok(());
     };
     let plan = serde_json::from_str::<PlanSpec>(&body).map_err(internal)?;
-    let variables = plan_run_variables(&current, revision);
-    let old_hashes = current
-        .steps
-        .iter()
-        .map(|step| (step.step.clone(), step.definition_hash.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let mut variables = plan_run_variables(&current, revision);
+    variables.insert("ST_RUN_GENERATION".into(), generation_id.to_owned());
+    let compatible = fields
+        .get("compatible_steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    transaction
+        .execute(
+            "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?7)",
+            params![generation_id, run_id, revision, predecessor, claim.actor, reason, claim.accepted_at_unix_ms.to_string()],
+        )
+        .map_err(internal)?;
     let mut new_steps = Vec::new();
     flatten_steps(&plan, None, &mut new_steps);
-    let dependencies = flattened_dependencies(&plan);
-    let mut reset = new_steps
-        .iter()
-        .filter(|(step, _)| old_hashes.get(&step.path) != Some(&step.definition_hash))
-        .map(|(step, _)| step.path.clone())
-        .collect::<BTreeSet<_>>();
-    loop {
-        let additions = dependencies
-            .iter()
-            .filter(|(path, dependencies)| {
-                !reset.contains(*path)
-                    && dependencies
-                        .iter()
-                        .any(|dependency| reset.contains(dependency))
-            })
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        if additions.is_empty() {
-            break;
-        }
-        reset.extend(additions);
-    }
-    let retained = new_steps
-        .iter()
-        .map(|(step, _)| step.path.clone())
-        .collect::<BTreeSet<_>>();
-    for path in old_hashes.keys().filter(|path| !retained.contains(*path)) {
-        transaction
-            .execute(
-                "DELETE FROM step_runs WHERE run_id=?1 AND step_path=?2",
-                params![run_id, path],
-            )
-            .map_err(internal)?;
-    }
     for (step, inherited_assignee) in new_steps {
-        if !reset.contains(&step.path) {
-            continue;
-        }
         let assignee = step
             .assigned_to
             .as_ref()
             .or(inherited_assignee.as_ref())
             .map(|value| crate::plan::interpolate(value, &variables))
             .transpose()?;
-        let subject = format!("step-run/{run_id}/{}", step.path);
+        let subject = format!("step-run/{generation_id}/{}", step.path);
+        let carried = compatible
+            .contains(step.path.as_str())
+            .then(|| current.steps.iter().find(|old| old.step == step.path))
+            .flatten();
+        let status = carried
+            .map(|old| match old.status.as_str() {
+                "claimed" | "working" | "verifying" => "ready",
+                status => status,
+            })
+            .unwrap_or("pending");
+        let attempt = carried.map(|old| old.attempt).unwrap_or(1);
+        let worker_reported = carried.is_some_and(|old| old.worker_reported && status != "ready");
+        let mut step_variables = variables.clone();
+        step_variables.insert("ST_STEP".into(), step.path.clone());
+        step_variables.insert("ST_STEP_RUN".into(), subject.clone());
+        step_variables.insert("ST_ATTEMPT".into(), attempt.to_string());
+        step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+        step_variables.insert(
+            "ST_PARENT_STEP_RUN".into(),
+            crate::plan::parent_step_path(&plan, &step.path)
+                .map(|path| format!("step-run/{generation_id}/{path}"))
+                .or_else(|| current.parent_step_run.clone())
+                .unwrap_or_default(),
+        );
+        let title = step
+            .title
+            .as_deref()
+            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .transpose()?;
+        let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?7, 0, ?8, ?8)
-                 ON CONFLICT(subject) DO UPDATE SET definition_hash=excluded.definition_hash, status='pending', attempt=1,
-                   assignee=excluded.assignee, title=excluded.title, goals=excluded.goals, worker_reported=0,
-                   lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
-                   blocked_reason=?9, not_before_unix_ms=NULL, activated_at_unix_ms=NULL, updated_at_unix_ms=?8",
-                params![subject, run_id, step.path, step.definition_hash, assignee, step.title, interpolate_goals(&step.goals, &variables)?, now.to_string(), reason],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, title, goals, worker_reported, carried.and_then(|old| old.blocked_reason.as_deref()), carried.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
     }
     transaction
         .execute(
-            "UPDATE plan_runs SET revision=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
-            params![run_id, revision, now.to_string()],
+            "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+            params![run_id, generation_id, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
     Ok(())
@@ -4674,6 +5813,10 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
         ),
         ("ST_PLAN_REVISION".into(), revision.into()),
         ("ST_PLAN_RUN".into(), run.id.clone()),
+        (
+            "ST_RUN_GENERATION".into(),
+            generation_id_from_subject(&run.generation).into(),
+        ),
         ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_REQUESTER".into(), run.requester.clone()),
@@ -4696,83 +5839,218 @@ fn interpolate_goals(
     serde_json::to_string(&goals).map_err(internal)
 }
 
-pub(crate) fn authorize_plan_revision(
+pub(crate) fn analyze_plan_revision(
     old: &PlanSpec,
     new: &PlanSpec,
     actor: &str,
+    requester: &str,
     variables: &BTreeMap<String, String>,
-) -> Result<(), St3Error> {
-    match old.change_policy {
-        ChangePolicy::Supervisor | ChangePolicy::HumanReview => {
-            let default_kind = if matches!(old.change_policy, ChangePolicy::HumanReview) {
-                "person"
-            } else {
-                "agent"
-            };
-            let authority = old.change_authority.as_deref().ok_or_else(|| {
-                St3Error::new(
-                    "missing-change-authority",
-                    "the plan has no change authority",
-                )
-            })?;
-            if normalize_actor(authority, default_kind) != actor {
+) -> Result<(BTreeSet<String>, BTreeSet<String>), St3Error> {
+    let old_hashes = step_hashes(old);
+    let new_hashes = step_hashes(new);
+    let mut changed = old_hashes
+        .keys()
+        .chain(new_hashes.keys())
+        .filter(|path| old_hashes.get(*path) != new_hashes.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if plan_header_hash(old)? != plan_header_hash(new)? {
+        changed.insert(String::new());
+    }
+    if changed.is_empty() {
+        return Err(St3Error::new(
+            "unchanged-plan-revision",
+            "the proposed plan revision does not change the plan",
+        ));
+    }
+
+    let actor = normalize_actor(
+        actor,
+        if actor.starts_with("person/") {
+            "person"
+        } else {
+            "agent"
+        },
+    );
+    let requester = normalize_actor(requester, "person");
+    let metadata = revision_metadata(old, &requester, variables)?;
+    if actor != requester {
+        for path in &changed {
+            let meta = metadata_for_changed_path(&metadata, path);
+            if !meta.owners.contains(&actor) {
                 return Err(St3Error::new(
-                    "revision-not-authorized",
-                    format!("`{actor}` is not the plan change authority"),
-                ));
-            }
-        }
-        ChangePolicy::Agent => {
-            let hashes = |plan: &PlanSpec| {
-                let mut flat = Vec::new();
-                flatten_steps(plan, None, &mut flat);
-                flat.into_iter()
-                    .map(|(step, _)| (step.path.clone(), step.definition_hash.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            };
-            let old_hashes = hashes(old);
-            let new_hashes = hashes(new);
-            let changed = old_hashes
-                .keys()
-                .chain(new_hashes.keys())
-                .filter(|path| old_hashes.get(*path) != new_hashes.get(*path))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if changed.is_empty() {
-                return Err(St3Error::new(
-                    "unchanged-plan-revision",
-                    "the proposed plan revision does not change a step",
-                ));
-            }
-            let mut owned = Vec::new();
-            for plan in [old, new] {
-                let mut flat = Vec::new();
-                flatten_steps(plan, None, &mut flat);
-                for (step, inherited) in flat {
-                    let assignee = step.assigned_to.as_ref().or(inherited.as_ref());
-                    if assignee
-                        .map(|value| crate::plan::interpolate(value, variables))
-                        .transpose()?
-                        .as_deref()
-                        == Some(actor)
-                    {
-                        owned.push(step.path.clone());
-                    }
-                }
-            }
-            if changed.iter().any(|path| {
-                !owned
-                    .iter()
-                    .any(|root| path == root || path.starts_with(&format!("{root}/")))
-            }) {
-                return Err(St3Error::new(
-                    "revision-outside-assignment",
-                    format!("`{actor}` can revise only its assigned step subtree"),
+                    "revision-outside-graph-location",
+                    format!(
+                        "`{actor}` cannot revise `{}` from its current graph location",
+                        if path.is_empty() {
+                            old.id.as_str()
+                        } else {
+                            path
+                        }
+                    ),
                 ));
             }
         }
     }
-    Ok(())
+    let mut reviewers = BTreeSet::new();
+    for path in &changed {
+        reviewers.extend(
+            metadata_for_changed_path(&metadata, path)
+                .reviewers
+                .iter()
+                .cloned(),
+        );
+    }
+    Ok((compatible_step_paths(old, new), reviewers))
+}
+
+#[derive(Clone, Default)]
+struct RevisionMetadata {
+    owners: BTreeSet<String>,
+    reviewers: BTreeSet<String>,
+}
+
+fn revision_metadata(
+    plan: &PlanSpec,
+    requester: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, RevisionMetadata>, St3Error> {
+    fn collect(
+        plan: &PlanSpec,
+        requester: &str,
+        variables: &BTreeMap<String, String>,
+        inherited: RevisionMetadata,
+        output: &mut BTreeMap<String, RevisionMetadata>,
+    ) -> Result<(), St3Error> {
+        let mut plan_meta = inherited;
+        for owner in &plan.revision_owners {
+            plan_meta
+                .owners
+                .insert(crate::plan::interpolate(owner, variables)?);
+        }
+        if plan.revisions_human_only {
+            plan_meta.reviewers.insert(
+                plan.revision_reviewer
+                    .as_deref()
+                    .unwrap_or(requester)
+                    .to_owned(),
+            );
+        }
+        output.insert(String::new(), plan_meta.clone());
+        for id in &plan.display_order {
+            let step = &plan.steps[id];
+            let mut step_meta = plan_meta.clone();
+            for owner in &step.revision_owners {
+                step_meta
+                    .owners
+                    .insert(crate::plan::interpolate(owner, variables)?);
+            }
+            if step.revisions_human_only {
+                step_meta.reviewers.insert(
+                    step.revision_reviewer
+                        .as_deref()
+                        .unwrap_or(requester)
+                        .to_owned(),
+                );
+            }
+            output.insert(step.path.clone(), step_meta.clone());
+            if let Some(nested) = &step.nested_plan {
+                let mut nested_meta = BTreeMap::new();
+                collect(nested, requester, variables, step_meta, &mut nested_meta)?;
+                for (path, meta) in nested_meta {
+                    if !path.is_empty() {
+                        output.insert(path, meta);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut output = BTreeMap::new();
+    collect(
+        plan,
+        requester,
+        variables,
+        RevisionMetadata::default(),
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+fn metadata_for_changed_path<'a>(
+    metadata: &'a BTreeMap<String, RevisionMetadata>,
+    path: &str,
+) -> &'a RevisionMetadata {
+    metadata
+        .iter()
+        .filter(|(candidate, _)| {
+            candidate.is_empty()
+                || path == candidate.as_str()
+                || path.starts_with(&format!("{candidate}/"))
+        })
+        .max_by_key(|(candidate, _)| candidate.len())
+        .map(|(_, meta)| meta)
+        .expect("the plan metadata is always present")
+}
+
+fn step_hashes(plan: &PlanSpec) -> BTreeMap<String, String> {
+    let mut flat = Vec::new();
+    flatten_steps(plan, None, &mut flat);
+    flat.into_iter()
+        .map(|(step, _)| (step.path.clone(), step.definition_hash.clone()))
+        .collect()
+}
+
+fn plan_header_hash(plan: &PlanSpec) -> Result<String, St3Error> {
+    let value = json!({
+        "id": plan.id,
+        "state": plan.state,
+        "scope": plan.scope_template,
+        "owners": plan.revision_owners,
+        "human_only": plan.revisions_human_only,
+        "reviewer": plan.revision_reviewer,
+        "cutover": plan.revision_cutover,
+        "subgraph": plan.subgraph_kdl,
+        "goals": plan.goals,
+        "baselines": plan.baselines,
+        "products": plan.products,
+        "gates": plan.gates,
+    });
+    serde_json::to_vec(&value)
+        .map(|bytes| hex::encode(Sha256::digest(bytes)))
+        .map_err(internal)
+}
+
+fn compatible_step_paths(old: &PlanSpec, new: &PlanSpec) -> BTreeSet<String> {
+    let old_hashes = step_hashes(old);
+    let new_hashes = step_hashes(new);
+    let dependencies = flattened_dependencies(new);
+    let mut incompatible = new_hashes
+        .iter()
+        .filter(|(path, hash)| old_hashes.get(*path) != Some(*hash))
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let additions = dependencies
+            .iter()
+            .filter(|(path, dependencies)| {
+                !incompatible.contains(*path)
+                    && dependencies
+                        .iter()
+                        .any(|dependency| incompatible.contains(dependency))
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            break;
+        }
+        incompatible.extend(additions);
+    }
+    new_hashes
+        .keys()
+        .filter(|path| !incompatible.contains(*path))
+        .cloned()
+        .collect()
 }
 
 fn flattened_dependencies(plan: &PlanSpec) -> BTreeMap<String, BTreeSet<String>> {
@@ -4818,9 +6096,16 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
     let not_before: Option<String> = row.get(14)?;
     let created: String = row.get(15)?;
     let updated: String = row.get(16)?;
+    let subject: String = row.get(0)?;
+    let generation = subject
+        .split('/')
+        .nth(1)
+        .map(|id| format!("run-generation/{id}"))
+        .unwrap_or_default();
     Ok(StepRunView {
-        subject: row.get(0)?,
+        subject,
         run: format!("plan-run/{}", row.get::<_, String>(1)?),
+        generation,
         step: row.get(2)?,
         definition_hash: row.get(3)?,
         status: row.get(4)?,
@@ -4847,7 +6132,7 @@ fn planning_session_view_tx(
     let row = connection
         .query_row(
             "SELECT plan_id, request_ref, workspace, requester, planner, status, published_revision,
-                    created_at_unix_ms, updated_at_unix_ms
+                    target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms
              FROM planning_sessions WHERE id=?1",
             [id],
             |row| {
@@ -4859,8 +6144,10 @@ fn planning_session_view_tx(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
@@ -4873,69 +6160,73 @@ fn planning_session_view_tx(
         planner,
         status,
         published_revision,
+        target_run_id,
+        source_generation_id,
         created,
         updated,
     )) = row
     else {
         return Ok(None);
     };
-    let candidate = connection
-        .query_row(
-            "SELECT revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms
-             FROM planning_candidates WHERE session_id=?1 ORDER BY revision DESC LIMIT 1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(revision, markdown, kdl, plan_revision, submitted)| {
-            Ok::<_, anyhow::Error>(PlanningCandidateView {
-                revision,
-                markdown,
-                kdl,
+    let mut candidate_statement = connection.prepare(
+        "SELECT candidate.variant, candidate.revision, candidate.markdown_ref, candidate.kdl_ref,
+                candidate.plan_revision, candidate.submitted_at_unix_ms
+         FROM planning_candidates candidate
+         JOIN (
+           SELECT variant, MAX(revision) revision FROM planning_candidates
+           WHERE session_id=?1 GROUP BY variant
+         ) latest ON latest.variant=candidate.variant AND latest.revision=candidate.revision
+         WHERE candidate.session_id=?1 ORDER BY candidate.variant",
+    )?;
+    let candidates = candidate_statement
+        .query_map([id], |row| {
+            let variant: String = row.get(0)?;
+            let submitted: String = row.get(5)?;
+            Ok(PlanningCandidateView {
+                variant,
+                revision: row.get(1)?,
+                markdown: row.get(2)?,
+                kdl: row.get(3)?,
                 plan: format!("plan/{plan}"),
-                plan_revision,
+                plan_revision: row.get(4)?,
                 submitted_at_unix_ms: submitted.parse().unwrap_or(0),
             })
-        })
-        .transpose()?;
-    let preview = connection
-        .query_row(
-            "SELECT candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms
-             FROM planning_previews WHERE session_id=?1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(candidate_revision, hash, store_index, graph, diff, response, created)| {
-            Ok::<_, anyhow::Error>(PlanningPreviewView {
-                hash,
-                candidate_revision,
-                store_index,
-                graph,
-                diff,
-                plan: serde_json::from_str(&response)?,
-                created_at_unix_ms: created.parse().unwrap_or(0),
-            })
-        })
-        .transpose()?;
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut variants = Vec::new();
+    for candidate in candidates {
+        let preview = connection
+            .query_row(
+                "SELECT candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms
+                 FROM planning_previews WHERE session_id=?1 AND variant=?2",
+                params![id, candidate.variant],
+                |row| {
+                    let created: String = row.get(6)?;
+                    Ok(PlanningPreviewView {
+                        variant: candidate.variant.clone(),
+                        candidate_revision: row.get(0)?,
+                        hash: row.get(1)?,
+                        store_index: row.get(2)?,
+                        graph: row.get(3)?,
+                        diff: row.get(4)?,
+                        plan: serde_json::from_str(&row.get::<_, String>(5)?).unwrap(),
+                        created_at_unix_ms: created.parse().unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?;
+        variants.push(PlanningVariantView {
+            name: candidate.variant.clone(),
+            candidate,
+            preview,
+        });
+    }
+    let selected = variants
+        .iter()
+        .find(|variant| variant.name == "default")
+        .or_else(|| variants.first());
+    let candidate = selected.map(|variant| variant.candidate.clone());
+    let preview = selected.and_then(|variant| variant.preview.clone());
     Ok(Some(PlanningSessionView {
         subject: format!("planning-session/{id}"),
         id: id.to_owned(),
@@ -4945,8 +6236,11 @@ fn planning_session_view_tx(
         requester,
         planner,
         status,
+        target_plan_run: target_run_id.map(|id| format!("plan-run/{id}")),
+        source_generation: source_generation_id.map(|id| format!("run-generation/{id}")),
         candidate,
         preview,
+        variants,
         published_revision,
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
@@ -5016,30 +6310,164 @@ fn plan_output_authority(
     }))
 }
 
+fn descendant_plan_run_ids_tx(
+    connection: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE descendant_runs(id) AS (
+           SELECT child.id
+           FROM plan_runs child
+           JOIN step_runs parent_step ON parent_step.subject=child.parent_step_run
+           WHERE parent_step.generation_id=?1
+           UNION
+           SELECT child.id
+           FROM plan_runs child
+           JOIN step_runs parent_step ON parent_step.subject=child.parent_step_run
+           JOIN descendant_runs parent_run ON parent_step.run_id=parent_run.id
+         )
+         SELECT id FROM descendant_runs ORDER BY id",
+    )?;
+    statement
+        .query_map([generation_id], |row| row.get::<_, String>(0))?
+        .collect()
+}
+
+fn cancel_descendant_plan_runs_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    generation_id: &str,
+    actor: &str,
+    now: u128,
+) -> Result<(), St3Error> {
+    let reason = "the parent run generation was superseded";
+    for run_id in descendant_plan_run_ids_tx(transaction, generation_id).map_err(internal)? {
+        let (status, child_generation): (String, String) = transaction
+            .query_row(
+                "SELECT status, current_generation_id FROM plan_runs WHERE id=?1",
+                [&run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(internal)?;
+        if !matches!(status.as_str(), "running" | "blocked") {
+            continue;
+        }
+        let mut statement = transaction
+            .prepare(
+                "SELECT subject FROM step_runs
+                 WHERE generation_id=?1 AND status NOT IN ('completed','failed','cancelled')
+                 ORDER BY subject",
+            )
+            .map_err(internal)?;
+        let steps = statement
+            .query_map([&child_generation], |row| row.get::<_, String>(0))
+            .map_err(internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        drop(statement);
+        for subject in steps {
+            transaction
+                .execute(
+                    "UPDATE step_runs
+                     SET status='cancelled', blocked_reason=?2, lease_owner=NULL,
+                         lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                         updated_at_unix_ms=?3
+                     WHERE subject=?1",
+                    params![subject, reason, now.to_string()],
+                )
+                .map_err(internal)?;
+            append_claim_tx(
+                transaction,
+                origin,
+                &subject,
+                "step-run.state",
+                Some(actor),
+                &json!({"fields": {"status": "cancelled", "reason": reason}}),
+                &[],
+                None,
+            )
+            .map_err(internal)?;
+        }
+        transaction
+            .execute(
+                "UPDATE plan_runs
+                 SET status='cancelled', phase='terminal', updated_at_unix_ms=?2
+                 WHERE id=?1",
+                params![run_id, now.to_string()],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "UPDATE run_generations
+                 SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
+                params![child_generation, now.to_string()],
+            )
+            .map_err(internal)?;
+        let body = json!({"fields": {
+            "status": "cancelled",
+            "phase": "terminal",
+            "reason": reason,
+        }});
+        append_claim_tx(
+            transaction,
+            origin,
+            &format!("plan-run/{run_id}"),
+            "plan-run.state",
+            Some(actor),
+            &body,
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        append_claim_tx(
+            transaction,
+            origin,
+            &format!("run-generation/{child_generation}"),
+            "run-generation.state",
+            Some(actor),
+            &body,
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
 fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<PlanRunView> {
     let mut view = connection.query_row(
-        "SELECT id, plan_id, revision, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase,
-                created_at_unix_ms, updated_at_unix_ms FROM plan_runs WHERE id=?1",
+        "SELECT plan_runs.id, plan_runs.plan_id, plan_runs.initial_revision,
+                plan_runs.current_generation_id, run_generations.revision,
+                plan_runs.root_revision, plan_runs.root_run_id, plan_runs.parent_step_run,
+                plan_runs.workspace, plan_runs.requester, plan_runs.run_scope, plan_runs.mode,
+                plan_runs.status, plan_runs.phase, plan_runs.created_at_unix_ms,
+                plan_runs.updated_at_unix_ms
+         FROM plan_runs JOIN run_generations
+           ON run_generations.id=plan_runs.current_generation_id
+         WHERE plan_runs.id=?1",
         [run_id],
         |row| {
             let id: String = row.get(0)?;
-            let root_run_id: String = row.get(4)?;
-            let created: String = row.get(12)?;
-            let updated: String = row.get(13)?;
+            let generation_id: String = row.get(3)?;
+            let root_run_id: String = row.get(6)?;
+            let created: String = row.get(14)?;
+            let updated: String = row.get(15)?;
             Ok(PlanRunView {
                 subject: format!("plan-run/{id}"),
                 id,
                 plan: format!("plan/{}", row.get::<_, String>(1)?),
-                revision: row.get(2)?,
-                root_revision: row.get(3)?,
+                generation: format!("run-generation/{generation_id}"),
+                initial_revision: row.get(2)?,
+                revision: row.get(4)?,
+                root_revision: row.get(5)?,
                 root_plan_run: format!("plan-run/{root_run_id}"),
-                parent_step_run: row.get(5)?,
-                workspace: row.get(6)?,
-                requester: row.get(7)?,
-                run_scope: row.get(8)?,
-                mode: row.get(9)?,
-                status: row.get(10)?,
-                phase: row.get(11)?,
+                parent_step_run: row.get(7)?,
+                workspace: row.get(8)?,
+                requester: row.get(9)?,
+                run_scope: row.get(10)?,
+                mode: row.get(11)?,
+                status: row.get(12)?,
+                phase: row.get(13)?,
                 created_at_unix_ms: created.parse().unwrap_or(0),
                 updated_at_unix_ms: updated.parse().unwrap_or(0),
                 steps: Vec::new(),
@@ -5049,12 +6477,122 @@ fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<P
     let mut statement = connection.prepare(
         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
                 lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
-         FROM step_runs WHERE run_id=?1 ORDER BY created_at_unix_ms, step_path",
+         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
     )?;
     view.steps = statement
-        .query_map([run_id], step_run_from_row)?
+        .query_map(
+            [generation_id_from_subject(&view.generation)],
+            step_run_from_row,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(view)
+}
+
+fn run_generation_view_tx(
+    connection: &Connection,
+    generation_id: &str,
+) -> rusqlite::Result<RunGenerationView> {
+    let mut view = connection.query_row(
+        "SELECT id, run_id, revision, predecessor_id, status, actor, reason,
+                created_at_unix_ms, updated_at_unix_ms
+         FROM run_generations WHERE id=?1",
+        [generation_id],
+        |row| {
+            let id: String = row.get(0)?;
+            let run_id: String = row.get(1)?;
+            let predecessor: Option<String> = row.get(3)?;
+            let created: String = row.get(7)?;
+            let updated: String = row.get(8)?;
+            Ok(RunGenerationView {
+                subject: format!("run-generation/{id}"),
+                id,
+                run: format!("plan-run/{run_id}"),
+                revision: row.get(2)?,
+                predecessor: predecessor.map(|id| format!("run-generation/{id}")),
+                status: row.get(4)?,
+                actor: row.get(5)?,
+                reason: row.get(6)?,
+                created_at_unix_ms: created.parse().unwrap_or(0),
+                updated_at_unix_ms: updated.parse().unwrap_or(0),
+                steps: Vec::new(),
+            })
+        },
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms
+         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
+    )?;
+    view.steps = statement
+        .query_map([generation_id], step_run_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(view)
+}
+
+fn revision_proposal_view_tx(
+    connection: &Connection,
+    proposal_id: &str,
+) -> rusqlite::Result<RevisionProposalView> {
+    connection.query_row(
+        "SELECT id, run_id, source_generation_id, candidate_revision, actor, reason, status,
+                cutover, compatible_steps, reviewers, approvals, preview_hash,
+                successor_generation_id, created_at_unix_ms, updated_at_unix_ms
+         FROM revision_proposals WHERE id=?1",
+        [proposal_id],
+        |row| {
+            let id: String = row.get(0)?;
+            let run_id: String = row.get(1)?;
+            let source: String = row.get(2)?;
+            let successor: Option<String> = row.get(12)?;
+            let created: String = row.get(13)?;
+            let updated: String = row.get(14)?;
+            Ok(RevisionProposalView {
+                subject: format!("revision-proposal/{id}"),
+                id,
+                run: format!("plan-run/{run_id}"),
+                source_generation: format!("run-generation/{source}"),
+                candidate_revision: row.get(3)?,
+                actor: row.get(4)?,
+                reason: row.get(5)?,
+                status: row.get(6)?,
+                cutover: match row.get::<_, String>(7)?.as_str() {
+                    "when-idle" => RevisionCutover::WhenIdle,
+                    _ => RevisionCutover::RestartActive,
+                },
+                compatible_steps: serde_json::from_str(&row.get::<_, String>(8)?)
+                    .unwrap_or_default(),
+                reviewers: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                approvals: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+                preview_hash: row.get(11)?,
+                successor_generation: successor.map(|id| format!("run-generation/{id}")),
+                created_at_unix_ms: created.parse().unwrap_or(0),
+                updated_at_unix_ms: updated.parse().unwrap_or(0),
+            })
+        },
+    )
+}
+
+fn revision_cutover_name(cutover: &RevisionCutover) -> &'static str {
+    match cutover {
+        RevisionCutover::RestartActive => "restart-active",
+        RevisionCutover::WhenIdle => "when-idle",
+    }
+}
+
+fn generation_id_from_subject(subject: &str) -> &str {
+    subject.strip_prefix("run-generation/").unwrap_or(subject)
+}
+
+fn step_generation_is_current(
+    connection: &Connection,
+    step: &StepRunView,
+) -> rusqlite::Result<bool> {
+    let current: String = connection.query_row(
+        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+        [step.run.strip_prefix("plan-run/").unwrap_or(&step.run)],
+        |row| row.get(0),
+    )?;
+    Ok(generation_id_from_subject(&step.generation) == current)
 }
 
 #[cfg(test)]
@@ -5375,6 +6913,200 @@ subgraph {
         assert_eq!(
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
+        );
+    }
+
+    #[test]
+    fn replication_carries_run_generation_lineage() {
+        let source = Store::open_memory("source").unwrap();
+        let publish = |goal: &str, key: &str| {
+            let kdl = format!(
+                r#"
+version 2
+subgraph {{
+  agent "owner" {{ workspace "."; command "true" }}
+  plan "lineage" state="ready" {{
+    goal "Replicate generation lineage."
+    step "work" {{
+      title "Work ${{ST_STEP}} in ${{ST_RUN_GENERATION}}"
+      goal {goal:?}
+    }}
+    step "stable" {{ goal "Carry stable work." }}
+  }}
+}}
+"#
+            );
+            let intent = parse_intent(&kdl, "source").unwrap();
+            let planned = source
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            source.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["lineage"].clone()
+        };
+        let first = publish("Use the first goal for ${ST_STEP_RUN}.", "lineage-one");
+        let run = source
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "lineage-run".into(),
+            })
+            .unwrap();
+        let stable = run.steps.iter().find(|step| step.step == "stable").unwrap();
+        source
+            .set_step_state(&stable.subject, "completed", None)
+            .unwrap();
+        let second = publish("Use the second goal for ${ST_STEP_RUN}.", "lineage-two");
+        let revised = source
+            .adopt_plan_revision(
+                &run.id,
+                &second,
+                "agent/source.owner",
+                "replicate a successor generation",
+                "lineage-cutover",
+            )
+            .unwrap();
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        let replicated = target.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(replicated.generation, revised.generation);
+        assert_eq!(replicated.revision, second.revision);
+        assert_eq!(target.run_generations(&run.id).unwrap().len(), 2);
+        assert_eq!(
+            replicated
+                .steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .title,
+            revised
+                .steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .title
+        );
+        assert_eq!(
+            replicated
+                .steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .goals,
+            revised
+                .steps
+                .iter()
+                .find(|step| step.step == "work")
+                .unwrap()
+                .goals
+        );
+        assert_eq!(
+            replicated
+                .steps
+                .iter()
+                .find(|step| step.step == "stable")
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn replication_carries_revision_proposal_lifecycle() {
+        let source = Store::open_memory("source").unwrap();
+        let publish = |goal: &str, key: &str| {
+            let kdl = format!(
+                r#"
+version 2
+subgraph {{
+  agent "owner" {{ workspace "."; command "true" }}
+  plan "proposal" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
+    goal "Replicate a revision proposal."
+    step "work" {{ goal {goal:?} }}
+  }}
+}}
+"#
+            );
+            let intent = parse_intent(&kdl, "source").unwrap();
+            let planned = source
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            source.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["proposal"].clone()
+        };
+        let first = publish("Use the first goal.", "proposal-one");
+        let run = source
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                idempotency_key: "proposal-run".into(),
+            })
+            .unwrap();
+        let second = publish("Use the second goal.", "proposal-two");
+        let proposal = source
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "agent/source.owner",
+                "replicate the proposal lifecycle",
+                "proposal-create",
+            )
+            .unwrap();
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            target
+                .revision_proposal(&proposal.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending-approval"
+        );
+
+        source
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/reviewer",
+                proposal.preview_hash.as_deref().unwrap(),
+                "proposal-approve",
+            )
+            .unwrap();
+        target
+            .import_replication(
+                "source",
+                &source
+                    .export_replication_for_heads(&target.replica_heads().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let replicated = target.revision_proposal(&proposal.id).unwrap().unwrap();
+        assert_eq!(replicated.status, "applied");
+        assert!(replicated.approvals.contains(&"person/reviewer".into()));
+        assert_eq!(
+            replicated.successor_generation,
+            Some(target.plan_run(&run.id).unwrap().unwrap().generation)
         );
     }
 
@@ -5702,11 +7434,15 @@ subgraph {
         let error = Store::open(&path, "node")
             .err()
             .expect("the old schema must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported pre-plan st3 schema")
-        );
+        assert!(error.to_string().contains("unsupported st3 schema"));
+    }
+
+    #[test]
+    fn the_current_schema_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        drop(Store::open(&path, "node").unwrap());
+        Store::open(&path, "node").unwrap();
     }
 
     #[test]
@@ -5963,6 +7699,7 @@ subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } 
             r#"
 version 2
 subgraph {
+  agent "worker" { workspace "."; command "true" }
   plan "revision" state="ready" {
     goal "Complete plan revision."
     step "owned" { assigned-to "agent/worker"; goal "First goal." }
@@ -5992,6 +7729,7 @@ subgraph {
             r#"
 version 2
 subgraph {
+  agent "worker" { workspace "."; command "true" }
   plan "revision" state="ready" {
     goal "Complete plan revision."
     step "owned" { assigned-to "agent/worker"; goal "A corrected goal." }
@@ -6021,5 +7759,617 @@ subgraph {
         assert_eq!(states["unrelated"], "completed");
         assert_eq!(revised.root_revision, run.root_revision);
         assert_eq!(revised.revision, second.revision);
+    }
+
+    #[test]
+    fn a_revision_keeps_the_old_generation_and_fences_its_work() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |source: &str, key: &str| {
+            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["generation"].clone()
+        };
+        let first = publish(
+            r#"
+version 2
+subgraph {
+  agent "worker" { workspace "."; command "true" }
+  plan "generation" state="ready" {
+    goal "Test immutable generations."
+    step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
+    step "stable" { goal "Carry this result." }
+    step "changed" { goal "Use the first definition." }
+    step "dependent" {
+      depends-on { step "changed" completed }
+      goal "Depend on the changed step."
+    }
+  }
+}
+"#,
+            "generation-one",
+        );
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "generation-run".into(),
+            })
+            .unwrap();
+        let active = run
+            .steps
+            .iter()
+            .find(|step| step.step == "active")
+            .unwrap()
+            .subject
+            .clone();
+        store.set_step_state(&active, "ready", None).unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&active, "claim", &request("generation-claim"))
+            .unwrap();
+        store
+            .work_action(&active, "progress", &request("generation-progress"))
+            .unwrap();
+        for path in ["stable", "changed", "dependent"] {
+            let subject = &run
+                .steps
+                .iter()
+                .find(|step| step.step == path)
+                .unwrap()
+                .subject;
+            store.set_step_state(subject, "completed", None).unwrap();
+        }
+        let second = publish(
+            r#"
+version 2
+subgraph {
+  agent "worker" { workspace "."; command "true" }
+  plan "generation" state="ready" {
+    goal "Test immutable generations."
+    step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
+    step "stable" { goal "Carry this result." }
+    step "changed" { goal "Use the second definition." }
+    step "dependent" {
+      depends-on { step "changed" completed }
+      goal "Depend on the changed step."
+    }
+  }
+}
+"#,
+            "generation-two",
+        );
+        let revised = store
+            .adopt_plan_revision(
+                &run.id,
+                &second,
+                "agent/node.worker",
+                "the work now needs the second definition",
+                "generation-cutover",
+            )
+            .unwrap();
+
+        assert_ne!(revised.generation, run.generation);
+        assert_eq!(revised.initial_revision, run.revision);
+        let generations = store.run_generations(&run.id).unwrap();
+        assert_eq!(generations.len(), 2);
+        assert_eq!(generations[0].subject, run.generation);
+        assert_eq!(generations[0].status, "superseded");
+        assert_eq!(
+            generations[0]
+                .steps
+                .iter()
+                .find(|step| step.step == "active")
+                .unwrap()
+                .status,
+            "working"
+        );
+        assert_eq!(
+            generations[1].predecessor.as_deref(),
+            Some(run.generation.as_str())
+        );
+        let states = revised
+            .steps
+            .iter()
+            .map(|step| (step.step.as_str(), step.status.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states["active"], "ready");
+        assert_eq!(states["stable"], "completed");
+        assert_eq!(states["changed"], "pending");
+        assert_eq!(states["dependent"], "pending");
+        assert!(
+            revised
+                .steps
+                .iter()
+                .all(|step| step.generation == revised.generation)
+        );
+        let error = store
+            .work_action(&active, "complete", &request("stale-generation-complete"))
+            .unwrap_err();
+        assert_eq!(error.code, "stale-run-generation");
+        assert!(!store.set_step_state(&active, "completed", None).unwrap());
+        assert_eq!(store.step_run(&active).unwrap().unwrap().status, "working");
+        let retried = store
+            .adopt_plan_revision(
+                &run.id,
+                &second,
+                "agent/node.worker",
+                "the work now needs the second definition",
+                "generation-cutover",
+            )
+            .unwrap();
+        assert_eq!(retried.generation, revised.generation);
+    }
+
+    #[test]
+    fn assigned_work_does_not_grant_revision_authority() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |source: &str, key: &str| {
+            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["authority"].clone()
+        };
+        let first = publish(
+            r#"
+version 2
+subgraph {
+  plan "authority" state="ready" {
+    goal "Keep revision authority structural."
+    step "work" { assigned-to "agent/node.worker"; goal "Use the first goal." }
+  }
+}
+"#,
+            "authority-one",
+        );
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "authority-run".into(),
+            })
+            .unwrap();
+        let escalated = publish(
+            r#"
+version 2
+subgraph {
+  plan "authority" state="ready" {
+    goal "Keep revision authority structural."
+    step "work" {
+      assigned-to "agent/node.worker"
+      goal "Use the second goal."
+      subgraph { agent "worker" { workspace "."; command "true" } }
+    }
+  }
+}
+"#,
+            "authority-two",
+        );
+        let error = store
+            .adopt_plan_revision(
+                &run.id,
+                &escalated,
+                "agent/node.worker",
+                "grant authority in the candidate graph",
+                "authority-cutover",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "revision-outside-graph-location");
+    }
+
+    #[test]
+    fn all_affected_human_reviewers_approve_the_exact_revision_preview() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |goal: &str, key: &str| {
+            let source = format!(
+                r#"
+version 2
+subgraph {{
+  plan "protected" state="ready" revisions="human-only" revision-reviewer="person/plan-reviewer" {{
+    goal "Test protected revision."
+    subgraph {{ agent "worker" {{ workspace "."; command "true" }} }}
+    step "work" revisions="human-only" revision-reviewer="person/step-reviewer" {{
+      assigned-to "agent/worker"
+      goal {goal:?}
+    }}
+  }}
+}}
+"#
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["protected"].clone()
+        };
+        let first = publish("Use the first goal.", "protected-one");
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                idempotency_key: "protected-run".into(),
+            })
+            .unwrap();
+        let second = publish("Use the second goal.", "protected-two");
+        let proposal = store
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "agent/node.worker",
+                "the first goal is incomplete",
+                "protected-proposal",
+            )
+            .unwrap();
+        assert_eq!(proposal.status, "pending-approval");
+        assert_eq!(
+            proposal.reviewers,
+            vec!["person/plan-reviewer", "person/step-reviewer"]
+        );
+        let error = store
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/plan-reviewer",
+                "wrong-preview",
+                "protected-wrong-preview",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "stale-revision-preview");
+        let first_approval = store
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/plan-reviewer",
+                proposal.preview_hash.as_deref().unwrap(),
+                "protected-first-approval",
+            )
+            .unwrap();
+        assert_eq!(first_approval.status, "pending-approval");
+        assert_eq!(first_approval.plan_run.generation, run.generation);
+        let applied = store
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/step-reviewer",
+                proposal.preview_hash.as_deref().unwrap(),
+                "protected-final-approval",
+            )
+            .unwrap();
+        assert_eq!(applied.status, "applied");
+        assert_ne!(applied.plan_run.generation, run.generation);
+        assert_eq!(
+            applied
+                .proposal
+                .as_ref()
+                .unwrap()
+                .successor_generation
+                .as_deref(),
+            Some(applied.plan_run.generation.as_str())
+        );
+        let retried = store
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/step-reviewer",
+                proposal.preview_hash.as_deref().unwrap(),
+                "protected-final-approval-retry",
+            )
+            .unwrap();
+        assert_eq!(retried.plan_run.generation, applied.plan_run.generation);
+    }
+
+    #[test]
+    fn cancelling_a_revision_proposal_reopens_the_run_for_one_replacement() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |goal: &str, key: &str| {
+            let source = format!(
+                r#"
+version 2
+subgraph {{
+  plan "protected" state="ready" revisions="human-only" {{
+    goal "Test revision cancellation."
+    step "work" {{ goal {goal:?} }}
+  }}
+}}
+"#
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["protected"].clone()
+        };
+        let first = publish("Use the first goal.", "cancel-one");
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                idempotency_key: "cancel-run".into(),
+            })
+            .unwrap();
+        let second = publish("Use the second goal.", "cancel-two");
+        let proposal = store
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "person/requester",
+                "the first goal is incomplete",
+                "cancel-proposal",
+            )
+            .unwrap();
+
+        let error = store
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "person/requester",
+                "replace the pending proposal",
+                "cancel-second-pending",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "revision-proposal-already-pending");
+        let error = store
+            .cancel_revision_proposal(
+                &proposal.id,
+                "agent/node.outsider",
+                Some("not authorized"),
+                "cancel-unauthorized",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "revision-cancel-not-authorized");
+
+        let cancelled = store
+            .cancel_revision_proposal(
+                &proposal.id,
+                "person/requester",
+                Some("the replacement needs another edit"),
+                "cancel-authorized",
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().phase, "normal");
+        assert_eq!(store.run_generations(&run.id).unwrap().len(), 1);
+
+        let replacement = store
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "person/requester",
+                "the edited replacement is ready",
+                "cancel-replacement",
+            )
+            .unwrap();
+        assert_eq!(replacement.status, "pending-approval");
+        assert_ne!(replacement.id, proposal.id);
+    }
+
+    #[test]
+    fn a_when_idle_revision_drains_without_polling_for_new_work() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |cutover: Option<&str>, goal: &str, key: &str| {
+            let cutover = cutover
+                .map(|value| format!(" revision-cutover={value:?}"))
+                .unwrap_or_default();
+            let source = format!(
+                r#"
+version 2
+subgraph {{
+  agent "worker" {{ workspace "."; command "true" }}
+  plan "drain" state="ready"{cutover} {{
+    goal "Test a drained cutover."
+    step "active" {{ assigned-to "agent/worker"; goal "Keep active work." }}
+    step "waiting" {{ assigned-to "agent/worker"; goal {goal:?} }}
+  }}
+}}
+"#
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = store
+                .plan(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            intent.plans["drain"].clone()
+        };
+        let first = publish(Some("when-idle"), "Use the first goal.", "drain-one");
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                idempotency_key: "drain-run".into(),
+            })
+            .unwrap();
+        let active = run.steps.iter().find(|step| step.step == "active").unwrap();
+        let waiting = run
+            .steps
+            .iter()
+            .find(|step| step.step == "waiting")
+            .unwrap();
+        store
+            .set_step_state(&active.subject, "ready", None)
+            .unwrap();
+        store
+            .set_step_state(&waiting.subject, "ready", None)
+            .unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let child_source = r#"
+version 2
+subgraph {
+  agent "worker" { workspace "."; command "true" }
+  plan "drain-child" state="ready" {
+    goal "Keep descendant work in the idle boundary."
+    step "active" { assigned-to "agent/worker" }
+  }
+}
+"#;
+        let child_intent = crate::graph::parse_intent(child_source, "node").unwrap();
+        let child_planned = store
+            .plan(
+                &child_intent,
+                IntentInput {
+                    kdl: child_source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&child_intent, &child_planned.subject_tokens, "drain-child")
+            .unwrap();
+        let child = store
+            .create_child_plan_run(
+                &PlanRunRequest {
+                    plan: "drain-child".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/test".into()),
+                    mode: Some("run".into()),
+                    idempotency_key: "drain-child-run".into(),
+                },
+                &run,
+                &waiting.subject,
+                None,
+            )
+            .unwrap();
+        let child_active = &child.steps[0];
+        store
+            .set_step_state(&child_active.subject, "ready", None)
+            .unwrap();
+        store
+            .work_action(
+                &child_active.subject,
+                "claim",
+                &request("drain-child-claim"),
+            )
+            .unwrap();
+        store
+            .work_action(
+                &child_active.subject,
+                "progress",
+                &request("drain-child-progress"),
+            )
+            .unwrap();
+        store
+            .work_action(&active.subject, "claim", &request("drain-claim"))
+            .unwrap();
+        store
+            .work_action(&active.subject, "progress", &request("drain-progress"))
+            .unwrap();
+        let second = publish(Some("restart-active"), "Use the second goal.", "drain-two");
+        let error = store
+            .adopt_plan_revision(
+                &run.id,
+                &second,
+                "agent/node.worker",
+                "skip the current cutover rule",
+                "drain-direct-adopt",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "revision-needs-drained-cutover");
+        let proposal = store
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                "agent/node.worker",
+                "wait for active work",
+                "drain-proposal",
+            )
+            .unwrap();
+        assert_eq!(proposal.status, "draining");
+        assert_eq!(proposal.cutover, RevisionCutover::WhenIdle);
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().phase,
+            "revision-draining"
+        );
+        assert_eq!(store.work(None, false).unwrap().len(), 2);
+        let error = store
+            .work_action(&waiting.subject, "claim", &request("drain-blocked-claim"))
+            .unwrap_err();
+        assert_eq!(error.code, "run-generation-draining");
+        assert!(store.apply_drained_revision(&run.id).unwrap().is_none());
+        store
+            .work_action(&active.subject, "complete", &request("drain-complete"))
+            .unwrap();
+        assert!(store.apply_drained_revision(&run.id).unwrap().is_none());
+        store
+            .set_step_state(&active.subject, "completed", None)
+            .unwrap();
+        assert!(store.apply_drained_revision(&run.id).unwrap().is_none());
+        store
+            .work_action(
+                &child_active.subject,
+                "complete",
+                &request("drain-child-complete"),
+            )
+            .unwrap();
+        store
+            .set_step_state(&child_active.subject, "completed", None)
+            .unwrap();
+        let applied = store
+            .apply_drained_revision(&run.id)
+            .unwrap()
+            .expect("the completion event permits cutover");
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.plan_run.phase, "normal");
+        assert_ne!(applied.plan_run.generation, run.generation);
     }
 }

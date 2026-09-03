@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/pty-send-peek/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/pty-send-peek/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/pty-send-peek" state="ready" {
       goal "Complete plan eval/pty-send-peek."
       step "contract" timeout="1m" {

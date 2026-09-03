@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/resource-cold-start/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/resource-cold-start/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/resource-cold-start" state="ready" {
       goal "Complete plan eval/resource-cold-start."
       step "contract" timeout="1m" {

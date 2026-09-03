@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/test-writing/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/test-writing/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/test-writing" state="ready" {
       goal "Complete plan eval/test-writing."
       step "start-team" timeout="10m" {

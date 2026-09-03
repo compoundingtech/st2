@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/network-smoke/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/network-smoke/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/network-smoke" state="ready" {
       goal "Complete plan eval/network-smoke."
       step "contract" timeout="2m" {

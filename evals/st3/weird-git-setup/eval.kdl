@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/weird-git-setup/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/weird-git-setup/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/weird-git-setup" state="ready" {
       goal "Complete plan eval/weird-git-setup."
       step "materialize-megarepo" timeout="5m" {

@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/pty-attach-machine-stream" state="ready" {
       goal "Complete plan eval/pty-attach-machine-stream."
       step "contract" timeout="2m" {

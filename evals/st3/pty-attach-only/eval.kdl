@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/pty-attach-only/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/pty-attach-only/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/pty-attach-only" state="ready" {
       goal "Complete plan eval/pty-attach-only."
       step "contract" timeout="2m" {

@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/context-resource-continuity/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/context-resource-continuity/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/context-resource-continuity" state="ready" {
       goal "Complete plan eval/context-resource-continuity."
       step "contract" timeout="2m" {

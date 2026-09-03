@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/claude-skill-inheritance/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/claude-skill-inheritance/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/claude-skill-inheritance" state="ready" {
       goal "Complete plan eval/claude-skill-inheritance."
       step "start-worker" timeout="10m" {

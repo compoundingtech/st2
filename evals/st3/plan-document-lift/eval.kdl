@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/plan-document-lift/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/plan-document-lift/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/plan-document-lift" state="ready" {
       goal "Complete plan eval/plan-document-lift."
       baseline "the exact source plan exists before planning starts" {

@@ -5,7 +5,7 @@ subgraph {
     kind "human.review"
   }
 
-  scope "release-example" retention="temporary" change-policy="agent" {
+  scope "release-example" retention="temporary" {
     plan "release" state="ready" {
       goal "Complete plan release."
       step "build" timeout="20m" {

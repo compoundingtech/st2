@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/signal-rename-codex/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/signal-rename-codex/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/signal-rename-codex" state="ready" {
       goal "Complete plan eval/signal-rename-codex."
       step "materialize" timeout="30m" {

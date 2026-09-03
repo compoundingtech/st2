@@ -4,7 +4,9 @@ Status: current language and runtime specification.
 
 Every st3 KDL document starts with `version 2`. It contains one untyped `subgraph` root.
 
-A plan is an immutable definition in the claims graph. Publishing a plan does not start it. A plan run binds to one exact plan revision.
+A plan is an immutable definition in the claims graph. Publishing a plan does not start it.
+
+A plan run has one stable subject. Each immutable run generation binds that run to one exact plan revision.
 
 ## Core rules
 
@@ -20,6 +22,7 @@ A plan is an immutable definition in the claims graph. Publishing a plan does no
 - A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
 - st3 rejects missing step references and dependency cycles.
 - st3 does not accept `outcome`, `judges`, or `judge`.
+- `assigned-to` assigns work and does not grant revision authority.
 
 ## Complete example
 
@@ -27,10 +30,30 @@ A plan is an immutable definition in the claims graph. Publishing a plan does no
 version 2
 
 subgraph {
-  scope "release/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
-    plan "release" state="ready" {
+  scope "release/${ST_PLAN_RUN}" retention="temporary" {
+    plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
       goal "Produce a verified release decision."
       goal "Keep the source and test evidence visible in the graph."
+
+      subgraph {
+        agent "release.lead" {
+          workspace "${ST_WORKSPACE}/lead"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            prompt "Claim assigned st3 work and publish the release decision."
+          }
+        }
+        agent "release.test" {
+          under "release.lead" reason="the lead combines the test evidence"
+          workspace "${ST_WORKSPACE}/test"
+          harness "codex" {
+            model "gpt-5.6-sol"
+            effort "medium"
+            prompt "Claim assigned st3 work and publish the test evidence."
+          }
+        }
+      }
 
       baseline "the release request is ready" {
         field "status" "resource/release-request" "is" "ready"
@@ -51,25 +74,8 @@ subgraph {
 
       step "start-team" {
         title "The release team is ready"
-        subgraph {
-          agent "release.lead" {
-            workspace "${ST_WORKSPACE}/lead"
-            harness "codex" {
-              model "gpt-5.6-sol"
-              effort "medium"
-              prompt "Claim assigned st3 work and publish the release decision."
-            }
-          }
-          agent "release.test" {
-            under "release.lead" reason="the lead combines the test evidence"
-            workspace "${ST_WORKSPACE}/test"
-            harness "codex" {
-              model "gpt-5.6-sol"
-              effort "medium"
-              prompt "Claim assigned st3 work and publish the test evidence."
-            }
-          }
-        }
+        gate "the lead exists" { exists "agent/release.lead" }
+        gate "the test agent exists" { exists "agent/release.test" }
       }
 
       step "inspect" timeout="20m" {
@@ -117,12 +123,20 @@ subgraph {
 }
 ```
 
-The plan baseline protects the run admission boundary. The inspection product is intermediate step output. The release decision is a final plan product. The human gate is a plan-level acceptance condition.
+The plan subgraph owns the complete plan revision. Its agents start for each run generation.
+
+The plan baseline protects the run admission boundary. The inspection product is intermediate step output.
+
+The release decision is a final plan product. The human gate is a plan-level acceptance condition.
 
 ## Plan syntax
 
 ```kdl
-plan "PLAN_ID" state="ready" {
+plan "PLAN_ID"
+  state="ready"
+  revisions="human-only"
+  revision-reviewer="person/reviewer"
+  revision-cutover="when-idle" {
   goal "One measurable plan goal."
   goal "An optional second goal."
   goal "An optional third goal."
@@ -130,6 +144,8 @@ plan "PLAN_ID" state="ready" {
   baseline "NAME" { GRAPH_PREDICATE }
   produces { PRODUCT... }
   gate "NAME" { GATE_BODY }
+
+  subgraph { PLAN_AGENTS... }
 
   step "STEP_ID" { ... }
 }
@@ -143,12 +159,18 @@ Plan goal order is preserved. Each plan must have one, two, or three goals.
 
 A plan can repeat baselines and gates. Their names must be unique within that plan. A plan has at most one `produces` block.
 
+`revisions="human-only"` is optional and inherited by child steps. `revision-reviewer` requires that protection.
+
+The reviewer defaults to the plan run requester. `revision-cutover` is `restart-active` by default or `when-idle` when declared. The value in the current generation controls how its successor starts; a candidate cannot select its own cutover.
+
+A plan can contain one direct subgraph. Direct agents in that subgraph can revise the complete plan.
+
 A plan must contain at least one step.
 
 ## Step syntax
 
 ```kdl
-step "STEP_ID" timeout="20m" finally=#false {
+step "STEP_ID" timeout="20m" finally=#false revisions="human-only" revision-reviewer="person/reviewer" {
   title "A display title"
   goal "One optional goal."
   goal "A second optional goal."
@@ -178,6 +200,8 @@ step "STEP_ID" timeout="20m" finally=#false {
 `timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
 
 `finally=#true` selects final-phase work. Final steps run after normal success, failure, or cancellation. A final step does not make normal work optional.
+
+Step revision protection adds to inherited plan protection. Direct agents in the step subgraph can revise that step subtree.
 
 ## Goals
 
@@ -384,7 +408,7 @@ step "compile-plan" {
 The worker must hold the producing step or one of its same-assignee nested steps.
 
 ```sh
-st3 work publish-plan step-run/RUN/compile-plan generated.kdl --as agent/planner
+st3 work publish-plan step-run/GENERATION/compile-plan generated.kdl --as agent/planner
 ```
 
 The published document must contain exactly one ready plan with the declared ID. st3 publishes the immutable revision and binds it to the producing definition and attempt.
@@ -417,7 +441,8 @@ st3 supplies these exact context names:
 | --- | --- |
 | `ST_PLAN` | Plan ID. |
 | `ST_PLAN_REVISION` | Active plan revision hash. |
-| `ST_PLAN_RUN` | Plan run ID without the `plan-run/` prefix. |
+| `ST_PLAN_RUN` | Stable plan run ID without the `plan-run/` prefix. |
+| `ST_RUN_GENERATION` | Current generation ID without the `run-generation/` prefix. |
 | `ST_ROOT_PLAN_RUN` | Full root `plan-run/...` subject. |
 | `ST_SCOPE` | Expanded run scope, or an empty value. |
 | `ST_WORKSPACE` | Absolute run workspace. |
@@ -465,12 +490,12 @@ Assigned work uses a renewable lease bound to the agent identity and runtime inc
 
 ```sh
 st3 work ls --as agent/node.worker
-st3 work show step-run/RUN/step
-st3 work claim step-run/RUN/step --as agent/node.worker
-st3 work progress step-run/RUN/step --summary "The tests are running."
-st3 work complete step-run/RUN/step --summary "The product is published."
-st3 work fail step-run/RUN/step --reason "The compiler rejected the source."
-st3 work release step-run/RUN/step --reason "The work needs another owner."
+st3 work show step-run/GENERATION/step
+st3 work claim step-run/GENERATION/step --as agent/node.worker
+st3 work progress step-run/GENERATION/step --summary "The tests are running."
+st3 work complete step-run/GENERATION/step --summary "The product is published."
+st3 work fail step-run/GENERATION/step --reason "The compiler rejected the source."
+st3 work release step-run/GENERATION/step --reason "The work needs another owner."
 ```
 
 A worker completion report is not a correctness result. Products and gates still control final completion.
@@ -479,17 +504,62 @@ The native driver renews active leases and delivers one idempotent Small Talk as
 
 ## Plan revisions
 
-The default scoped change policy is `agent`. An assignee can revise its assigned step subtree.
+Revision authority comes from agent placement in the current generation.
 
-`supervisor` and `human-review` policies require a `change-authority`.
+- A direct agent in a step subgraph can revise that step subtree.
+- A direct agent in a plan subgraph can revise the complete plan.
+- A direct agent adjacent to plans can revise those plans.
+
+The run requester can propose any revision. `assigned-to` does not grant revision authority.
+
+st3 checks the current generation. A candidate cannot add itself as an owner and use that new authority.
+
+`revisions="human-only"` protects a plan or step. The protection is inherited by nested steps.
+
+`revision-reviewer="person/NAME"` selects the human reviewer. The run requester is the reviewer when this property is absent.
+
+All distinct reviewers for the changed paths must approve. Each approval names the exact proposal preview hash.
 
 ```sh
 st3 work revise PLAN_RUN replacement.kdl \
   --as agent/node.worker \
   --reason "The generated source adds one verification step."
+
+st3 work revision show PLAN_RUN
+st3 work revision approve PROPOSAL PREVIEW_HASH --as person/reviewer
+st3 work revision cancel PROPOSAL --as person/reviewer --reason "The request changed."
 ```
 
-Changed steps and their dependents reset. Unchanged independent steps keep their completed state. The run keeps its original root revision.
+A run can have one pending proposal. A second proposal fails until the first proposal is applied or cancelled.
+
+### Immutable generations
+
+Each accepted revision creates one immutable successor generation. The stable plan-run subject points to the current generation.
+
+The cutover transaction creates generation-specific step-run subjects. It also marks the old generation as superseded.
+
+```sh
+st3 work revision generations PLAN_RUN
+st3 work revision generation RUN_GENERATION
+```
+
+st3 compares normalized step definition hashes. A changed step and every transitive dependent start without prior completion.
+
+Every compatible state carries to the successor. Compatible claimed, working, or verifying work restarts in ready state.
+
+The old generation remains readable. A late work action against it fails with `stale-run-generation`.
+
+Plan and step members belong to an internal generation scope. The reconciler stops members left only in the superseded generation lineage. A member used by the successor moves to its new generation scope.
+
+A cutover cancels active descendant plan runs that started from predecessor steps. `when-idle` also waits for claimed, working, or verifying descendant work before cutover.
+
+The default `restart-active` cutover creates the successor after approval. Open work messages for the old generation close as superseded.
+
+`revision-cutover="when-idle"` changes the run phase to `revision-draining`. Existing active work can settle, but no new work can claim.
+
+The reconciler creates the successor after the active work reaches a stable state. Cancellation returns the run to its normal phase.
+
+The run keeps its initial revision and root revision. Its current revision is the revision of its current generation.
 
 ## Immutable documents
 
@@ -529,15 +599,34 @@ st3 plan approve SESSION PREVIEW_HASH --as person/nathan
 st3 plan cancel SESSION --as person/nathan --reason "The request changed."
 ```
 
+Planning can also prepare a revision for one current plan run:
+
+```sh
+st3 plan start --run PLAN_RUN request.md \
+  --workspace ./project \
+  --as person/nathan
+
+st3 plan preview SESSION --variant compact
+st3 plan preview SESSION --variant extended
+st3 plan compare SESSION compact extended
+st3 plan propose SESSION extended \
+  --as person/nathan \
+  --reason "The extended variant covers the discovered risk."
+```
+
 The planner uses this command:
 
 ```sh
-st3 plan submit SESSION --markdown PLAN.md --kdl plan.kdl
+st3 plan submit SESSION --variant compact --markdown PLAN.md --kdl plan.kdl
 ```
 
 The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.
 
-The candidate must contain exactly one ready plan with the requested ID.
+Each named candidate must contain exactly one ready plan with the requested ID.
+
+A run-targeted session stores the exact source generation and an immutable run context document.
+
+The session can hold multiple draft variants. Proposing one variant rejects a stale source generation.
 
 Preview returns these review values:
 
@@ -573,8 +662,10 @@ Plan execution uses these important claim kinds:
 
 - `plan.published` records an immutable plan revision.
 - `plan.documents` links an approved planning session to Markdown and KDL.
-- `plan-run.created`, `plan-run.revised`, and `plan-run.state` record run history.
-- `step-run.state` and `step-run.retry` record step and attempt history.
+- `plan-run.created` and `plan-run.state` record stable run history.
+- `run-generation.created`, `run-generation.superseded`, and `run-generation.state` record revision lineage.
+- `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied` record revision review.
+- `step-run.carried`, `step-run.state`, and `step-run.retry` record generation-specific step history.
 - `plan.produced` binds a generated plan to one producing attempt.
 - `gate.requested` and `gate.result` record gate operations and evidence.
 - `review.requested` and `review.decision` record exact human gates.
@@ -587,4 +678,6 @@ Evidence is a list of claim IDs or immutable graph references that support a res
 
 The planning-mode eval uses one real Codex planner. A controller waits on the event stream and directly approves the first valid candidate. Mechanical gates prove that the plan was hidden before approval, the preview graph and diff were rendered, the exact hash was approved, one ready plan was published, no run started, immutable documents were linked, the planner stopped, and the workspace did not change.
 
-The revision and stale-preview path is a deterministic API test. It does not spend a model run.
+The planning variant and stale-generation paths are deterministic API tests. They do not spend a model run.
+
+The run-generation revision eval proves an approved cutover, lineage, state carry-over, and automatic generation context. It uses no model run.

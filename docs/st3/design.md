@@ -14,14 +14,16 @@ st3 gives a person or an agent one durable graph for these objects:
 
 - desired agents, processes, scopes, messages, and observed resources;
 - immutable documents and plan revisions;
-- plan runs, step attempts, products, gates, and reviews;
+- plan runs, immutable run generations, revision proposals, products, gates, and reviews;
 - Small Talk delivery and work ownership;
 - runtime observations and operation evidence;
 - peer replication and historical reads.
 
 An intent changes only the subjects that it names. Omission never means deletion or stop. An explicit `stop` declaration changes a subject or scope to stopped state.
 
-A published plan is a definition. Publication does not start a run. A run always binds to one immutable plan revision.
+A published plan is a definition. Publication does not start a run.
+
+A plan run has one immutable initial revision and one current generation. Each generation binds to one immutable plan revision.
 
 The daemon does not watch a catalog folder. `st3 import`, `st3 eval`, and other explicit client commands read local files and post their bytes to the API.
 
@@ -31,7 +33,7 @@ The daemon does not watch a catalog folder. `st3 import`, `st3 eval`, and other 
 
 st3 uses one graph for desired state, observations, work, and evidence.
 
-Every graph item has a stable subject such as `agent/node.builder`, `plan/release`, `plan-run/abc`, `step-run/abc/test`, or `resource/release-candidate`.
+Every graph item has a stable subject such as `agent/node.builder`, `plan/release`, `plan-run/abc`, `run-generation/def`, or `step-run/def/test`.
 
 A scope groups subjects for observation and teardown. It is not a second graph namespace.
 
@@ -62,7 +64,7 @@ SQLite provides these required properties:
 - crash recovery;
 - fixed-snapshot reads;
 - indexed status and history queries;
-- durable plan runs and planning sessions.
+- durable plan runs, run generations, revision proposals, and planning sessions.
 
 Documents and other byte content use content hashes. The database stores the binding from a document name to each immutable version.
 
@@ -73,6 +75,8 @@ Documents and other byte content use content hashes. The database stores the bin
 `POST /v1/intent/apply` must return those exact tokens. A changed token causes a `stale-subject` conflict. Independent subjects do not conflict.
 
 A plan preview uses the same rule. Planning approval also names the exact preview hash. A new candidate or graph head makes an older approval stale.
+
+A revision approval names the exact proposal preview hash. A proposal also names its source generation.
 
 ### Event-driven reconciliation
 
@@ -186,6 +190,16 @@ The origin names the host that accepted a claim. The actor names the person, age
 
 Per-subject writers and causal predecessor heads control graph updates. A plan step lease also binds work changes to one assignee and runtime incarnation.
 
+Plan revision authority comes only from graph placement in the current generation.
+
+- An agent in a step subgraph can revise that step subtree.
+- An agent in a plan subgraph can revise that plan.
+- An agent adjacent to direct plans can revise those plans.
+
+`assigned-to` does not grant revision authority. The candidate revision cannot grant authority to its own author.
+
+`revisions="human-only"` adds a human approval boundary. `revision-reviewer` selects a reviewer, or the run requester reviews by default.
+
 `under` does not participate in authority. `supervisor` remains the lifecycle and policy relation for controlled members.
 
 ## Runtime reconciliation
@@ -210,7 +224,9 @@ Nonterminal runtime exits follow the declared restart type and intensity. The st
 
 A ready plan starts only through `POST /v1/plan-runs` or `st3 run`.
 
-A plan run records its plan revision, root revision, root run, parent step when present, workspace, requester, run scope, status, and phase.
+A plan run records its initial revision, current generation, root revision, root run, workspace, requester, status, and phase.
+
+A run generation records one plan revision, its predecessor, its actor, its reason, and its generation-specific step runs.
 
 Normal execution has these boundaries:
 
@@ -228,21 +244,47 @@ Normal execution has these boundaries:
 
 A false baseline blocks. It does not fail the plan or spend an attempt. A failed running gate fails its step or plan. A pending predicate gate keeps the current boundary pending.
 
+## Run revisions and generations
+
+A plan revision does not mutate an active generation. st3 creates one successor generation in an atomic transaction.
+
+The transaction marks the old generation as superseded. It creates new step-run subjects and moves the plan run pointer to the successor.
+
+Plan and step members carry an internal generation scope. After cutover, the reconciler stops members that remain only in the predecessor lineage. A member reused by the successor moves to the successor scope.
+
+A restart cutover cancels active descendant plan runs that started from predecessor steps. An idle cutover waits for active descendant work before it makes the same cancellation.
+
+Exact compatible step definitions carry their state. A changed step and every transitive dependent restart without prior completion.
+
+Compatible active work restarts in ready state. Late work updates against the superseded generation fail with `stale-run-generation`.
+
+The default cutover is `restart-active`. `revision-cutover="when-idle"` stops new claims and waits for active work to settle. The current generation selects this rule. A candidate revision cannot select its own cutover.
+
+The event-driven reconciler performs an idle cutover. It does not use a polling worker or a wall-clock selection rule.
+
+A plan run accepts one pending revision proposal. Each proposal binds the source generation, candidate revision, compatible step set, reviewers, and preview hash.
+
+All distinct affected reviewers must approve the exact preview. Cancellation returns a draining run to its normal phase.
+
 ## Planning mode
 
 Planning mode is a durable review workflow. It is not a plan run.
 
 `st3 plan start` creates one planning session, stores the request as an immutable document, starts one Codex planner, and sends the request through Small Talk.
 
-The planner submits one Markdown document and one complete ready KDL plan. The candidate remains outside the published plan graph.
+The planner can submit multiple named variants. Each variant contains one Markdown document and one complete ready KDL plan.
 
-`st3 plan preview` validates the exact KDL bytes, renders a static dependency graph, renders the subject diff, and records one preview hash.
+`st3 plan preview` validates one named variant, renders a dependency graph and diff, and records one preview hash.
+
+A planning session can target a current plan run. The session stores the exact source generation and rejects proposal after that generation changes.
 
 The requester can revise, approve, or cancel:
 
 - Revision stores feedback as an immutable document, sends it through Small Talk, and invalidates the old preview.
 - Approval requires the current preview hash and current subject tokens. It publishes one ready plan and links the Markdown and KDL document references. It never starts a run.
 - Cancellation publishes no plan.
+
+The requester can compare named variants. The requester can then propose one previewed variant as a revision of the target run.
 
 Approval and cancellation stop the planner. Planning lifecycle changes emit registered `planning-session.*` events.
 
@@ -254,7 +296,7 @@ Main endpoint groups are:
 
 - intent: `/v1/intent/plan`, `/v1/intent/apply`;
 - planning: `/v1/planning-sessions` and its session actions;
-- plans and work: `/v1/plan-runs`, `/v1/work`, `/v1/gate-results`;
+- plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
 - graph data: `/v1/claims`, `/v1/status`, `/v1/events`;
 - documents: `/v1/documents` and `/v1/documents/content`;
 - Small Talk: `/v1/messages` and message lifecycle actions;
@@ -271,11 +313,14 @@ The claim registry defines accepted kinds and whether they wake reconciliation.
 Important plan and gate kinds include:
 
 - `plan.published`, `plan.documents`, and `plan.produced`;
-- `plan-run.created`, `plan-run.revised`, and `plan-run.state`;
-- `step-run.state` and `step-run.retry`;
+- `plan-run.created` and `plan-run.state`;
+- `run-generation.created`, `run-generation.superseded`, and `run-generation.state`;
+- `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied`;
+- `step-run.carried`, `step-run.state`, and `step-run.retry`;
 - `gate.requested` and `gate.result`;
 - `review.requested` and `review.decision`;
-- `planning-session.started`, `planning-session.candidate-submitted`, `planning-session.previewed`, `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`.
+- `planning-session.started`, `planning-session.candidate-submitted`, `planning-session.previewed`, and `planning-session.variant-proposed`;
+- `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`.
 
 An unknown replicated claim remains in history and makes its subject indeterminate. A node does not silently interpret an unknown kind.
 
@@ -293,6 +338,8 @@ A network partition does not stop local work. Each host continues from the last 
 
 - The local API uses a user-owned Unix socket.
 - Apply, revision, review, work, terminal, and gate operations use explicit authority or one-use capabilities.
+- Revision authority uses the current graph placement and cannot come from a candidate revision.
+- Human revision approval binds one source generation and one preview hash.
 - Plan work leases bind to one agent incarnation.
 - Terminal input and signals cite the expected incarnation.
 - Mechanical and LLM gates have bounded execution time. LLM gates also require a positive token budget and an explicit tool set.
@@ -304,7 +351,7 @@ The configured peer transport is for a trusted network. Authentication, encrypti
 
 ## Failure handling
 
-st3 fails closed on malformed intent, missing document bytes, stale subject tokens, stale preview hashes, invalid capabilities, unknown plan revisions, and invalid work leases.
+st3 fails closed on malformed intent, missing documents, stale generations, stale preview hashes, invalid capabilities, unknown revisions, and invalid work leases.
 
 Runtime failure stays visible as claims. It is not removed from history after retry or recovery.
 
@@ -328,6 +375,8 @@ This sequence preserves one working control plane during migration. It does not 
 - No implicit stop by omission.
 - No implicit step order.
 - No ownership or permission effect from `under`.
+- No revision authority from `assigned-to`.
+- No mutable plan revision inside a run generation.
 - No automatic plan run after planning approval.
 - No alias for removed st3 plan syntax.
 - No unrestricted gate runner.

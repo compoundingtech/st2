@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/ghost-bug-codex" state="ready" {
       goal "Complete plan eval/ghost-bug-codex."
       step "start-team" timeout="10m" {

@@ -1,0 +1,18 @@
+version 2
+
+subgraph {
+  plan "generation-proof" state="ready" revisions="human-only" {
+    goal "Prove a live plan revision."
+
+    step "stable" {
+      goal "Record the stable result."
+      gate "the stable result exists" { field "state" "resource/generation-proof/${ST_PLAN_RUN}/stable" "is" "done" }
+    }
+
+    step "changed" {
+      goal "Use the first work definition."
+      depends-on { step "stable" completed }
+      gate "the changed result exists" { field "state" "resource/generation-proof/${ST_PLAN_RUN}/changed" "is" "done" }
+    }
+  }
+}

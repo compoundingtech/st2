@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/planning-mode/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/planning-mode/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/planning-mode" state="ready" {
       goal "Prove one Codex planning session from request through direct approval."
       goal "Keep the proposed plan unpublished until its exact preview is approved."

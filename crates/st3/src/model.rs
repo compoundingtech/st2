@@ -156,12 +156,12 @@ pub enum PlanState {
     Retired,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ChangePolicy {
-    Agent,
-    Supervisor,
-    HumanReview,
+pub enum RevisionCutover {
+    #[default]
+    RestartActive,
+    WhenIdle,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -216,6 +216,12 @@ pub struct StepSpec {
     pub retry: RetrySpec,
     pub finally: bool,
     pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub revision_owners: Vec<String>,
+    #[serde(default)]
+    pub revisions_human_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_reviewer: Option<String>,
     pub dependencies: Vec<DependencySpec>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
@@ -239,8 +245,16 @@ pub struct PlanSpec {
     pub state: PlanState,
     pub revision: String,
     pub scope_template: Option<String>,
-    pub change_policy: ChangePolicy,
-    pub change_authority: Option<String>,
+    #[serde(default)]
+    pub revision_owners: Vec<String>,
+    #[serde(default)]
+    pub revisions_human_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_reviewer: Option<String>,
+    #[serde(default)]
+    pub revision_cutover: RevisionCutover,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgraph_kdl: Option<String>,
     pub goals: Vec<String>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
@@ -430,6 +444,8 @@ pub struct PlanResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanningSessionStartRequest {
     pub plan: String,
+    #[serde(default)]
+    pub run: Option<String>,
     pub request: Vec<u8>,
     pub workspace: String,
     #[serde(default)]
@@ -473,6 +489,7 @@ pub struct PlanningCancelRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanningCandidateView {
+    pub variant: String,
     pub revision: u32,
     pub markdown: String,
     pub kdl: String,
@@ -483,6 +500,7 @@ pub struct PlanningCandidateView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanningPreviewView {
+    pub variant: String,
     pub hash: String,
     pub candidate_revision: u32,
     pub store_index: u64,
@@ -503,13 +521,34 @@ pub struct PlanningSessionView {
     pub planner: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_plan_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<PlanningCandidateView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<PlanningPreviewView>,
+    #[serde(default)]
+    pub variants: Vec<PlanningVariantView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_revision: Option<String>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningVariantView {
+    pub name: String,
+    pub candidate: PlanningCandidateView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PlanningPreviewView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlanningProposalRequest {
+    pub actor: String,
+    pub reason: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -856,6 +895,8 @@ pub struct PlanRunView {
     pub subject: String,
     pub id: String,
     pub plan: String,
+    pub generation: String,
+    pub initial_revision: String,
     pub revision: String,
     pub root_revision: String,
     pub root_plan_run: String,
@@ -877,6 +918,7 @@ pub struct PlanRunView {
 pub struct StepRunView {
     pub subject: String,
     pub run: String,
+    pub generation: String,
     pub step: String,
     pub definition_hash: String,
     pub status: String,
@@ -917,6 +959,71 @@ pub struct PlanRevisionRequest {
     pub intent: IntentInput,
     pub actor: String,
     pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RunGenerationView {
+    pub subject: String,
+    pub id: String,
+    pub run: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
+    pub status: String,
+    pub actor: String,
+    pub reason: String,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+    #[serde(default)]
+    pub steps: Vec<StepRunView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevisionProposalView {
+    pub subject: String,
+    pub id: String,
+    pub run: String,
+    pub source_generation: String,
+    pub candidate_revision: String,
+    pub actor: String,
+    pub reason: String,
+    pub status: String,
+    pub cutover: RevisionCutover,
+    #[serde(default)]
+    pub compatible_steps: Vec<String>,
+    #[serde(default)]
+    pub reviewers: Vec<String>,
+    #[serde(default)]
+    pub approvals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_generation: Option<String>,
+    pub created_at_unix_ms: u128,
+    pub updated_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevisionSubmissionView {
+    pub status: String,
+    pub plan_run: PlanRunView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<RevisionProposalView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevisionApprovalRequest {
+    pub actor: String,
+    pub preview_hash: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RevisionCancelRequest {
+    pub actor: String,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub idempotency_key: String,
 }
 

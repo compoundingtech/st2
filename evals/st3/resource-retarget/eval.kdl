@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/resource-retarget/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/resource-retarget/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/resource-retarget" state="ready" {
       goal "Complete plan eval/resource-retarget."
       step "contract" timeout="1m" {

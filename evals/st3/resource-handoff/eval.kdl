@@ -1,7 +1,7 @@
 version 2
 
 subgraph {
-  scope "eval/resource-handoff/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
+  scope "eval/resource-handoff/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/resource-handoff" state="ready" {
       goal "Complete plan eval/resource-handoff."
       step "contract" timeout="1m" {
