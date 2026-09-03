@@ -413,8 +413,10 @@ and either reports `unchanged` for exact equality or creates a durable
 content-addressed stage before publishing the marker. Version 1 requires an
 explicit PTY root outside the canonical catalog. Hash-CAS permits declared live
 workspace facts and their real ancestry to contain content. It changes
-declaration leaves only; desired workspace facts must already exist, and
-workspace content and canonical state are never traversed, deleted, or hashed.
+declaration leaves only; a desired workspace fact is runtime-only, so the
+prepared plane need not carry its directory — a raw preimage captures none of
+them — and the transaction publishes any missing one as an empty directory.
+Workspace content and canonical state are never traversed, deleted, or hashed.
 When an identity path is absent, its complete bundle uses an exclusive
 directory rename. When its declared workspace skeleton already exists, the
 durable marker fences declaration readers and marker-time state routing until
