@@ -647,6 +647,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
+The linker can exhaust a small temporary filesystem during a complete gate. A space or quota error
+is an environment failure, not a compile failure. Set `CARGO_TARGET_DIR` to a filesystem with enough
+space, reduce parallel jobs or debug information if necessary, and rerun the same gate. Use
+`cargo clean --target-dir <path>` to remove the temporary build artifacts after the run.
+
 ## Eval contract
 
 The sole canonical agent contract is
