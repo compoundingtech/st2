@@ -3781,12 +3781,12 @@ subgraph {{
   scope "eval/demo/${{ST_PLAN_RUN}}" retention="temporary" change-policy="agent" {{
     plan "eval/demo" state="ready" {{
       goal "Complete plan eval/demo."
+      baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
       step "document" {{
         title "The document exists"
       subgraph {{
         message "task" {{ to "person/worker"; content "doc/evals/demo/task@{hash}" }}
       }}
-      gate "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
       }}
       step "cleanup" finally=#true {{
         subgraph {{ scope "eval/demo/${{ST_PLAN_RUN}}" {{ stop }} }}

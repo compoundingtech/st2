@@ -2,6 +2,8 @@
 
 This st3 eval runs a four-agent design panel with native Codex seats.
 
+The three proposal agents are grouped under the synthesis agent for visualization only.
+
 The graph assigns three distinct drafts in parallel.
 It then assigns six peer critiques, three revisions, and one synthesis stage.
 The graph stores each proposal revision and the final message receipt.

@@ -390,6 +390,11 @@ fn plan_document_lift_produces_and_uses_one_exact_plan_output() {
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
     let intent = st3::parse_intent(&source, "local").unwrap();
     let plan = &intent.plans["eval/plan-document-lift"];
+    assert_eq!(plan.baselines.len(), 1);
+    assert_eq!(
+        plan.baselines[0].name,
+        "the exact source plan exists before planning starts"
+    );
     assert_eq!(
         plan.steps["lift-plan-document"].produces_plan.as_deref(),
         Some("eval/plan-document-lift/work")
@@ -672,6 +677,23 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
 
     let intent = st3::parse_intent(&source, "local").expect("parse Fork in the road eval");
     let plan = &intent.plans["eval/fork-in-the-road"];
+    let team = st3::parse_intent(
+        plan.steps["start-team"]
+            .subgraph_kdl
+            .as_deref()
+            .expect("team subgraph"),
+        "local",
+    )
+    .expect("parse Fork in the road team");
+    for member in ["fd.a", "fd.b", "fd.c"] {
+        let under = st3::graph::agent_under(&team.subjects[&format!("agent/{member}")].desired);
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].agent, "agent/fd.sup");
+        assert_eq!(
+            under[0].reason.as_deref(),
+            Some("the supervisor combines the panel recommendation")
+        );
+    }
     assert_eq!(
         plan.display_order,
         [

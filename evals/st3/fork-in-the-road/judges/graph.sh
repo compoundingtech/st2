@@ -3,7 +3,17 @@ set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 work="$(env -u ST_AGENT st3 work ls --all --json)"
+agents="$(env -u ST_AGENT st3 agents --json)"
 run="plan-run/$ST_PLAN_RUN"
+grouping_reason="the supervisor combines the panel recommendation"
+
+for member in fd.a fd.b fd.c; do
+  jq -e --arg subject "agent/$member" --arg reason "$grouping_reason" '
+    [.[] | select(.subject == $subject)] as $agents
+    | ($agents | length) == 1
+      and ($agents[0].under == [{"agent":"agent/fd.sup","reason":$reason}])
+  ' <<<"$agents" >/dev/null
+done
 
 completed_steps=(
   start-team
@@ -60,4 +70,4 @@ c proposal-c-final
 sup recommendation
 FINAL_REVISIONS
 
-echo "PASS: the graph records each panel stage and each required product"
+echo "PASS: the graph records each panel stage, required product, and panel grouping"

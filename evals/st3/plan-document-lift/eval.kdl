@@ -4,6 +4,10 @@ subgraph {
   scope "eval/plan-document-lift/${ST_PLAN_RUN}" retention="temporary" change-policy="agent" {
     plan "eval/plan-document-lift" state="ready" {
       goal "Complete plan eval/plan-document-lift."
+      baseline "the exact source plan exists before planning starts" {
+        has "doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636" "# Deployment summary plan"
+      }
+
       step "start-planner" timeout="10m" {
         title "The native Codex planner is ready"
         subgraph {
