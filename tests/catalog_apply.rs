@@ -1287,6 +1287,54 @@ fn snapshot_ignores_and_preserves_an_exact_legacy_harness_context_staging_file()
 }
 
 #[test]
+fn harness_runtime_records_never_change_the_declaration_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    let agent = agent_dir(&catalog, "worker");
+    let baseline_output = temp.path().join("snapshot-before-runtime");
+    let baseline = snapshot(&catalog, &baseline_output);
+    let runtime_names = [
+        "harness-context",
+        "harness-state",
+        ".harness-state.seq",
+        ".harness-state.lock",
+        ".harness-context.lock",
+    ];
+
+    for name in runtime_names {
+        fs::write(agent.join(name), format!("first {name}\n")).unwrap();
+    }
+    let first_runtime_output = temp.path().join("snapshot-with-runtime");
+    let first_runtime = snapshot(&catalog, &first_runtime_output);
+    assert_eq!(first_runtime["rootSha256"], baseline["rootSha256"]);
+    for name in runtime_names {
+        assert!(
+            !first_runtime_output.join("agents/host/worker").join(name).exists(),
+            "{name} must not enter the declaration snapshot"
+        );
+        fs::write(agent.join(name), format!("changed {name}\n")).unwrap();
+    }
+
+    let changed_runtime = snapshot(&catalog, &temp.path().join("snapshot-changed-runtime"));
+    assert_eq!(changed_runtime["rootSha256"], baseline["rootSha256"]);
+
+    let near_miss = agent.join("harness-context.backup");
+    fs::write(&near_miss, b"declaration-owned bytes").unwrap();
+    let with_near_miss_output = temp.path().join("snapshot-with-near-miss");
+    let with_near_miss = snapshot(&catalog, &with_near_miss_output);
+    assert_ne!(with_near_miss["rootSha256"], baseline["rootSha256"]);
+    assert_eq!(
+        fs::read(
+            with_near_miss_output.join("agents/host/worker/harness-context.backup")
+        )
+        .unwrap(),
+        b"declaration-owned bytes"
+    );
+}
+
+
+#[test]
 fn snapshot_projects_relative_profile_modules_once_and_hashes_their_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");

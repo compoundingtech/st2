@@ -2022,8 +2022,18 @@ fn collect_bundle_files(
         if canonical_workspace || workspace_dirs.contains(&relative) {
             continue;
         }
-        let state = matches!(name_text, "resources" | "archive" | "inbox" | "status")
-            || name_text.starts_with(".status.tmp-");
+        let state = matches!(
+            name_text,
+            "resources"
+                | "archive"
+                | "inbox"
+                | "status"
+                | "harness-context"
+                | "harness-state"
+                | ".harness-state.seq"
+                | ".harness-state.lock"
+                | ".harness-context.lock"
+        ) || name_text.starts_with(".status.tmp-");
         if first.is_some() && relative_to_bundle.components().count() == 1 && state {
             if source == ProjectionSource::Prepared {
                 anyhow::bail!(
