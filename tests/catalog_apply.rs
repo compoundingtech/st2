@@ -1868,6 +1868,94 @@ fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
 }
 
 #[test]
+fn raw_preimage_repairs_a_catalog_whose_declared_workspace_fact_is_runtime_only() {
+    // The deployer's repair path: raw-snapshot the invalid live plane, publish valid declaration
+    // bytes into that snapshot, then bind the apply to the opaque preimage. A raw preimage
+    // captures no runtime directory, so the prepared plane it produces has none for a declared
+    // workspace fact — admission must not demand one.
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    write_agent(&catalog, "worker", false);
+    ensure_external_pty_config(&catalog);
+    let dir = agent_dir(&catalog, "worker");
+    fs::write(
+        dir.join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  desired-state \"running\" because=\"unsupported\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let workspace = dir.join(".workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("session.txt"), "live runtime state").unwrap();
+
+    let strict_snapshot = st2()
+        .args([
+            "catalog",
+            "snapshot",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--output",
+            temp.path().join("strict-invalid").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !strict_snapshot.status.success(),
+        "invalid live plane unexpectedly passed the strict projection"
+    );
+
+    let prepared = temp.path().join("raw-capture");
+    let raw_capture = raw_snapshot(&catalog, &prepared);
+    assert!(
+        raw_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw_capture.stderr)
+    );
+    let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+    assert_eq!(
+        raw_capture["schema"],
+        "st2.catalog-raw-preimage-snapshot.v1"
+    );
+    assert!(!prepared.join("agents/host/worker/.workspace").exists());
+
+    fs::write(
+        prepared.join("agents/host/worker/agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  retired #false\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+
+    let repaired = raw_apply(
+        &catalog,
+        &prepared,
+        raw_capture["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(repaired["status"], "applied");
+    assert_eq!(repaired["beforeSha256"], raw_capture["rootSha256"]);
+    assert!(
+        !fs::read_to_string(dir.join("agent.kdl"))
+            .unwrap()
+            .contains("because=\"unsupported\"")
+    );
+    assert!(workspace.is_dir());
+    assert_eq!(
+        fs::read_to_string(workspace.join("session.txt")).unwrap(),
+        "live runtime state"
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+
+    // The repaired plane is strictly projectable again, workspace fact included.
+    let strict = snapshot(&catalog, &temp.path().join("strict-repaired"));
+    assert!(strict["rootSha256"].as_str().unwrap().len() == 64);
+}
+
+#[test]
 fn raw_preimage_migrates_legacy_argv_profile_to_a_component_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -2422,36 +2510,49 @@ fn workspace_facts_are_empty_in_prepared_admitted_against_live_and_never_applied
     )
     .unwrap();
 
-    for case in ["missing", "content"] {
-        let invalid = temp.path().join(format!("invalid-{case}"));
-        let current = snapshot(&catalog, &invalid);
-        let fact = invalid.join("agents/host/worker/.workspace");
-        if case == "missing" {
-            fs::remove_dir(&fact).unwrap();
-        } else {
-            let secret = temp.path().join("workspace-secret");
-            fs::write(&secret, "must never be opened or copied").unwrap();
-            std::os::unix::fs::symlink(&secret, fact.join("forbidden-link")).unwrap();
-        }
-        let rejected = apply(&catalog, &invalid, current["rootSha256"].as_str().unwrap());
-        assert!(
-            !rejected.status.success(),
-            "prepared workspace {case} unexpectedly succeeded"
-        );
-        if case == "content" {
-            assert!(
-                String::from_utf8_lossy(&rejected.stderr)
-                    .contains("prepared workspace fact must be empty"),
-                "{}",
-                String::from_utf8_lossy(&rejected.stderr)
-            );
-        }
-        assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
-        assert_eq!(
-            fs::read_to_string(workspace.join("live.txt")).unwrap(),
-            "preserve"
-        );
-    }
+    // A declared workspace fact is runtime-only: the agent owns its contents, a raw preimage
+    // captures none of them, and the transaction republishes the fact as an empty directory.
+    // A prepared plane that carries no directory for it is therefore admitted, and the live
+    // contents survive.
+    let absent = temp.path().join("prepared-absent-fact");
+    let current = snapshot(&catalog, &absent);
+    fs::remove_dir(absent.join("agents/host/worker/.workspace")).unwrap();
+    let admitted = apply(&catalog, &absent, current["rootSha256"].as_str().unwrap());
+    assert!(
+        admitted.status.success(),
+        "prepared plane without a declared workspace fact was rejected: {}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    assert!(workspace.is_dir());
+    assert!(task_workspace.is_dir());
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("live.txt")).unwrap(),
+        "preserve"
+    );
+
+    // Runtime bytes still may not ride into the declaration plane through the fact.
+    let invalid = temp.path().join("invalid-content");
+    let current = snapshot(&catalog, &invalid);
+    let fact = invalid.join("agents/host/worker/.workspace");
+    let secret = temp.path().join("workspace-secret");
+    fs::write(&secret, "must never be opened or copied").unwrap();
+    std::os::unix::fs::symlink(&secret, fact.join("forbidden-link")).unwrap();
+    let rejected = apply(&catalog, &invalid, current["rootSha256"].as_str().unwrap());
+    assert!(
+        !rejected.status.success(),
+        "prepared workspace content unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("prepared workspace fact must be empty"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("live.txt")).unwrap(),
+        "preserve"
+    );
 
     let prepared = temp.path().join("prepared");
     let before = snapshot(&catalog, &prepared);

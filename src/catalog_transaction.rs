@@ -2084,15 +2084,36 @@ fn catalog_workspace_dirs(
     Ok(facts)
 }
 
+/// Admit the prepared plane's canonical workspace facts.
+///
+/// `.workspace` is a runtime-only directory: the agent creates it, nothing declares its contents,
+/// and a raw preimage deliberately captures none of them. A prepared plane built from such a
+/// preimage therefore legitimately has no directory for a declared fact, and demanding one made
+/// every repair transaction over a raw preimage unreachable. The fact stays in the projection
+/// either way — `materialize_projection` publishes it as an empty directory — so the applied
+/// catalog still satisfies the live invariant that a declared workspace fact is present.
+///
+/// A directory that IS there still has to be a real, empty one: prepared state may not smuggle
+/// runtime bytes through the declaration plane.
 fn validate_prepared_workspace_facts(root: &Path, facts: &BTreeSet<String>) -> Result<()> {
     for relative in facts {
         let path = root.join(relative);
-        ensure_real_dir_chain_present(root, &path, "prepared workspace fact")?;
-        anyhow::ensure!(
-            sorted_entries(&path)?.is_empty(),
-            "prepared workspace fact must be an empty directory: {}",
-            path.display()
-        );
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure_real_dir_chain_present(root, &path, "prepared workspace fact")?;
+                anyhow::ensure!(
+                    sorted_entries(&path)?.is_empty(),
+                    "prepared workspace fact must be an empty directory: {}",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect prepared workspace fact {}", path.display())
+                });
+            }
+        }
     }
     Ok(())
 }
