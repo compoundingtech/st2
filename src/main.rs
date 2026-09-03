@@ -1965,6 +1965,22 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             continue;
         }
         let bus_id = spec.bus_id(&this_host);
+        if let Some(dir) = spec.path.parent() {
+            match message::inspect_sent(dir, false) {
+                Ok(_) => report_check(
+                    &mut problems,
+                    true,
+                    &format!("{bus_id} outbound message ledger"),
+                    "",
+                ),
+                Err(error) => report_check(
+                    &mut problems,
+                    false,
+                    &format!("{bus_id} outbound message ledger"),
+                    &format!("cannot send: {error:#}"),
+                ),
+            }
+        }
         if spec.desired_state.is_retired() {
             let still_present = spec
                 .tasks

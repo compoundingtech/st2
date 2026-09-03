@@ -61,7 +61,8 @@ delivery.
   recipient materialization succeeded at least once. st2 makes no cross-directory atomicity claim.
 - **MESSAGE-R06 Resumable intent:** A later sender operation resumes durable pending intents with
   their original filename and bytes. Interruption cannot create a second recipient filename or a
-  second sender row for the same intent.
+  second sender row for the same intent. An exact pending duplicate of the current committed head tip
+  is cleanup state. A read reports completed coverage, and the next sender operation removes it.
 - **MESSAGE-R07 Exact keyed retry:** An idempotency key is scoped by `(canonical sender, canonical
   recipient, idempotency key)`. Reusing one scoped key with the same message returns the original
   filename after any publication or response boundary. Reusing that scoped key with different

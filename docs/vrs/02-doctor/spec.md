@@ -29,6 +29,9 @@ It performs these check groups:
   ([probe source](../../../src/run.rs#L443-L458); [tests](../../../tests/doctor.rs#L95-L194)).
 - **Presence:** Each active local declaration has maintained presence
   ([source](../../../src/main.rs#L1103-L1121)).
+- **Outbound messages:** Each local declaration has a valid sender ledger. An unavailable ledger is
+  healthy because the agent has not sent a message. An invalid ledger reports that the agent cannot
+  send. Doctor does not create or repair sender state.
 - **Retirement:** Every task record for a retired local declaration is absent
   ([source](../../../src/main.rs#L1068-L1089); [tests](../../../tests/doctor.rs#L196-L302)).
 - **Suspension:** No task of a suspended local declaration is alive. A dead
