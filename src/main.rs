@@ -547,8 +547,8 @@ enum CatalogCmd {
         /// Destination directory. It must be outside the live catalog.
         #[arg(long, value_name = "DIR")]
         output: PathBuf,
-        /// Hash and capture the declaration plane without parsing it. Only for repairing an
-        /// invalid catalog; the captured directory remains unvalidated.
+        /// Hash and capture the declaration plane without parsing it. The captured directory
+        /// remains unvalidated and is suitable only as an exact-byte CAS preimage.
         #[arg(long)]
         raw_preimage: bool,
         /// Emit the typed snapshot receipt as JSON.
@@ -582,7 +582,7 @@ enum CatalogCmd {
         )]
         expect_sha256: Option<String>,
         /// Match the current declaration plane without parsing it. The prepared catalog is still
-        /// fully validated, and this mode refuses an already-valid current catalog.
+        /// fully validated; use this mode only when the current parser cannot admit the preimage.
         #[arg(long, conflicts_with = "resume")]
         raw_preimage: bool,
         /// Resume the durable incomplete marker and internal stage without the original source.

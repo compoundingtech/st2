@@ -90,12 +90,6 @@ pub struct CatalogConfig {
     pub profiles: Vec<DeclaredProfile>,
 }
 
-/// The catalog fields that raw-preimage repair may interpret from an otherwise invalid catalog.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct CatalogEnvelope {
-    pub pty_root: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedProfileModule {
     CatalogRelative(PathBuf),
@@ -146,27 +140,6 @@ pub fn parse(text: &str) -> anyhow::Result<CatalogConfig> {
         }
     }
     Ok(config)
-}
-
-/// Parse only the catalog envelope while treating every other top-level declaration as opaque.
-///
-/// Raw-preimage repair uses this parser so an obsolete profile or agent grammar cannot prevent
-/// replacement, while the PTY-root boundary remains subject to the ordinary catalog semantics.
-pub(crate) fn parse_envelope(text: &str) -> anyhow::Result<CatalogEnvelope> {
-    let doc = KdlDocument::parse(text).map_err(|e| anyhow::anyhow!("KDL parse error: {e}"))?;
-    let mut envelope = CatalogEnvelope::default();
-    let mut seen_catalog = false;
-    for node in doc.nodes() {
-        if node.name().value() != "catalog" {
-            continue;
-        }
-        if seen_catalog {
-            anyhow::bail!("catalog block declared more than once");
-        }
-        seen_catalog = true;
-        envelope.pty_root = parse_catalog_node(node)?;
-    }
-    Ok(envelope)
 }
 
 fn parse_catalog_node(node: &kdl::KdlNode) -> anyhow::Result<Option<String>> {
@@ -544,17 +517,6 @@ pub fn load(catalog_root: &Path) -> anyhow::Result<CatalogConfig> {
     }
 }
 
-/// Read only the envelope of `<catalog>/catalog.kdl`.
-///
-/// A missing file is the default envelope, matching [`load`]. Non-envelope declarations must be
-/// syntactically valid KDL but are otherwise left uninterpreted for raw-preimage repair.
-pub(crate) fn load_envelope(catalog_root: &Path) -> anyhow::Result<CatalogEnvelope> {
-    match std::fs::read_to_string(config_path(catalog_root)) {
-        Ok(text) => parse_envelope(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CatalogEnvelope::default()),
-        Err(e) => Err(e.into()),
-    }
-}
 /// Resolve one declared module using the same expansion as runtime registry construction while
 /// preserving whether the module belongs to the catalog transaction.
 pub(crate) fn resolve_profile_module(

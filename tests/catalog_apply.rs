@@ -1990,31 +1990,98 @@ profile "dev.example.observe" {{
 }
 
 #[test]
-fn raw_preimage_refuses_valid_catalogs_and_wrong_cas_without_declaration_writes() {
+fn raw_preimage_accepts_valid_bytes_and_wrong_cas_preserves_declarations() {
     let temp = tempfile::tempdir().unwrap();
     let valid = temp.path().join("valid");
     write_agent(&valid, "worker", false);
+    fs::write(
+        agent_dir(&valid, "worker").join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let workspace = agent_dir(&valid, "worker").join(".workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(valid.join("resolvers")).unwrap();
+    fs::copy(DEMO_WASM_SRC, valid.join("resolvers/observe.wasm")).unwrap();
+    fs::write(
+        valid.join("catalog.kdl"),
+        profile_catalog_config(&[("dev.example.observe", "resolvers/observe.wasm")]),
+    )
+    .unwrap();
     let valid_prepared = temp.path().join("valid-prepared");
-    let valid_snapshot = snapshot(&valid, &valid_prepared);
+    snapshot(&valid, &valid_prepared);
     let valid_raw_snapshot = raw_snapshot(&valid, &temp.path().join("valid-raw"));
-    assert!(!valid_raw_snapshot.status.success());
     assert!(
+        valid_raw_snapshot.status.success(),
+        "{}",
         String::from_utf8_lossy(&valid_raw_snapshot.stderr)
-            .contains("refuses an already-valid catalog")
     );
+    let valid_raw_snapshot: Value = serde_json::from_slice(&valid_raw_snapshot.stdout).unwrap();
+    let generation_before = fs::read(valid.join(".st2/catalog-generation")).ok();
     let valid_raw_apply = raw_apply(
         &valid,
         &valid_prepared,
-        valid_snapshot["rootSha256"].as_str().unwrap(),
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
     );
-    assert!(!valid_raw_apply.status.success());
     assert!(
+        valid_raw_apply.status.success(),
+        "{}",
         String::from_utf8_lossy(&valid_raw_apply.stderr)
-            .contains("refuses an already-valid catalog")
+    );
+    let valid_raw_apply: Value = serde_json::from_slice(&valid_raw_apply.stdout).unwrap();
+    assert_eq!(valid_raw_apply["status"], "unchanged");
+    assert!(!valid.join(".st2/catalog-apply-incomplete").exists());
+    assert_eq!(
+        fs::read(valid.join(".st2/catalog-generation")).ok(),
+        generation_before
+    );
+    assert!(workspace.is_dir());
+
+    fs::write(valid.join("resolvers/observe.wasm"), b"stale module").unwrap();
+    let stale_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        stale_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_module_apply.stderr)
+    );
+    let stale_module_apply: Value =
+        serde_json::from_slice(&stale_module_apply.stdout).unwrap();
+    assert_eq!(stale_module_apply["status"], "applied");
+    assert_eq!(
+        fs::read(valid.join("resolvers/observe.wasm")).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
+    );
+    assert!(workspace.is_dir());
+
+    let live_module = valid.join("resolvers/observe.wasm");
+    let module_alias = temp.path().join("observe-alias.wasm");
+    fs::hard_link(&live_module, &module_alias).unwrap();
+    let hard_linked_module_apply = raw_apply(
+        &valid,
+        &valid_prepared,
+        valid_raw_snapshot["rootSha256"].as_str().unwrap(),
+    );
+    assert!(
+        hard_linked_module_apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hard_linked_module_apply.stderr)
+    );
+    let hard_linked_module_apply: Value =
+        serde_json::from_slice(&hard_linked_module_apply.stdout).unwrap();
+    assert_eq!(hard_linked_module_apply["status"], "applied");
+    fs::write(&module_alias, b"mutated alias").unwrap();
+    assert_eq!(
+        fs::read(&live_module).unwrap(),
+        fs::read(DEMO_WASM_SRC).unwrap()
     );
 
     let invalid = temp.path().join("invalid");
     write_invalid_agent(&invalid, "worker");
+    fs::create_dir(agent_dir(&invalid, "worker").join(".workspace")).unwrap();
     ensure_external_pty_config(&invalid);
     let declaration = agent_dir(&invalid, "worker").join("agent.kdl");
     let context = agent_dir(&invalid, "worker").join("resources/context/now.md");
@@ -2063,41 +2130,24 @@ fn raw_preimage_rejects_hard_linked_declarations() {
 }
 
 #[test]
-fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
+fn raw_preimage_treats_the_live_envelope_and_pty_root_as_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    for (case, envelope) in [
-        ("malformed", "catalog {"),
-        (
-            "duplicate-catalog",
-            "catalog { pty-root \"/tmp/a\" }\ncatalog { pty-root \"/tmp/a\" }\n",
-        ),
-        (
-            "duplicate-pty-root",
-            "catalog { pty-root \"/tmp/a\"; pty-root \"/tmp/a\" }\n",
-        ),
-    ] {
-        let malformed_envelope = temp.path().join(format!("{case}-envelope"));
-        write_invalid_agent(&malformed_envelope, "worker");
-        fs::write(malformed_envelope.join("catalog.kdl"), envelope).unwrap();
-        let rejected = raw_snapshot(
-            &malformed_envelope,
-            &temp.path().join(format!("{case}-capture")),
-        );
-        assert!(!rejected.status.success(), "{case}");
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr)
-                .contains("requires a valid incumbent catalog envelope"),
-            "{case}: {}",
-            String::from_utf8_lossy(&rejected.stderr)
-        );
-    }
 
     let catalog = temp.path().join("catalog");
     write_invalid_agent(&catalog, "worker");
-    ensure_external_pty_config(&catalog);
-    let raw_capture = raw_snapshot(&catalog, &temp.path().join("raw-capture"));
-    assert!(raw_capture.status.success());
+    fs::write(catalog.join("catalog.kdl"), "catalog {").unwrap();
+    let raw_capture_dir = temp.path().join("raw-capture");
+    let raw_capture = raw_snapshot(&catalog, &raw_capture_dir);
+    assert!(
+        raw_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw_capture.stderr)
+    );
     let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
+    assert_eq!(
+        fs::read_to_string(raw_capture_dir.join("catalog.kdl")).unwrap(),
+        "catalog {"
+    );
 
     let desired_source = temp.path().join("desired-source");
     write_agent(&desired_source, "worker", false);
@@ -2108,19 +2158,19 @@ fn raw_preimage_requires_a_readable_envelope_and_an_unchanged_pty_root() {
     .unwrap();
     let prepared = temp.path().join("prepared");
     snapshot(&desired_source, &prepared);
-    let declaration = fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap();
-    let rejected = raw_apply(
+    let applied = raw_apply(
         &catalog,
         &prepared,
         raw_capture["rootSha256"].as_str().unwrap(),
     );
-    assert!(!rejected.status.success());
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("refuses an effective pty-root change")
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
     );
     assert_eq!(
-        fs::read(agent_dir(&catalog, "worker").join("agent.kdl")).unwrap(),
-        declaration
+        fs::read(catalog.join("catalog.kdl")).unwrap(),
+        fs::read(prepared.join("catalog.kdl")).unwrap()
     );
     assert!(!catalog.join(".st2/catalog-apply-incomplete").exists());
 }

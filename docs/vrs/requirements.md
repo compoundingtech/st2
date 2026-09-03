@@ -219,12 +219,13 @@ accepted.
   caller-supplied input digest before locking or mutation, rechecks the incumbent
   root digest under the exclusive lock, durably stages the desired bytes, and resumes
   after interruption solely from a closed marker and its content-addressed
-  stage. A distinct raw-preimage projection may bind a repair to the exact
-  structural declaration bytes of an invalid incumbent without interpreting
-  those bytes. It has a separate hash and receipt type, refuses a strictly valid
-  incumbent, admits only a fully valid prepared result, and persists its mode in
-  the recovery marker. Version 1 requires one explicit external PTY root and
-  rejects effective PTY-root changes. Fresh-catalog bootstrap is a distinct create transaction,
+  stage. A distinct raw-preimage projection may bind a repair or migration to
+  the exact structural declaration bytes of any incumbent without interpreting
+  those bytes. It has a separate hash and receipt type, admits only a fully
+  valid prepared result, and persists its mode in the recovery marker. Raw mode
+  makes no semantic assertion about the incumbent, including its validity or
+  effective PTY root; the caller's exact raw-domain digest is the complete live
+  precondition. Fresh-catalog bootstrap is a distinct create transaction,
   not a catalog-apply mode: it binds an exact captured prepared projection to a
   caller-supplied digest, initializes the persistent authoring lock and first
   catalog generation before visibility, and publishes the complete catalog by

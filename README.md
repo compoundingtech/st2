@@ -156,8 +156,8 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --input-sha256 <afterRootSha256> --expect-sha256 <rootSha256> --json
 ```
 
-If the incumbent Agent Specs cannot be parsed, bind a one-time repair to their
-exact structural declaration bytes instead:
+If the incumbent declarations cannot be parsed or must remain opaque to the
+current parser, bind a one-time repair to their exact structural bytes instead:
 
 ```sh
 st2 catalog snapshot --catalog "$CATALOG" --output ./invalid-preimage \
@@ -169,11 +169,12 @@ st2 catalog apply --catalog "$CATALOG" --prepared ./prepared \
   --raw-preimage --json
 ```
 
-Raw-preimage mode has its own hash and receipt schemas. It refuses a
-strictly-valid incumbent, still fully validates the prepared and applied
-catalogs, and requires a readable external PTY-root declaration that remains
-unchanged. It is a generic invalid-preimage transaction, not a validation
-bypass or migration-policy engine.
+Raw-preimage mode has its own hash and receipt schemas. It makes no semantic
+assertion about the live bytes—including validity, profiles, the catalog
+envelope, or effective PTY root—while still fully validating the prepared and
+applied catalogs. The caller-supplied raw-domain digest is the exact live
+precondition. This is a byte-oriented transaction, not a validation bypass or
+migration-policy engine.
 
 To publish that exact snapshot as a new, absent catalog:
 
@@ -182,18 +183,19 @@ st2 catalog bootstrap --catalog "$NEW_CATALOG" --prepared ./prepared \
   --input-sha256 <rootSha256> --json
 ```
 
-`catalog apply` is policy-free. It rejects state/control content, symlinks,
-unprojected workspace facts, catalog-local/default PTY roots, and effective
-PTY-root changes. Bootstrap is a separate create-only declaration transaction,
-not an apply mode. It atomically publishes absence or the complete catalog,
-initializes its persistent lock and generation before visibility, and never
-reads or writes the external PTY registry. Process adoption and PTY-root
-migration remain separate because that registry has independent producers. A
-crash during apply leaves a durable marker and content-addressed stage;
-`st2 catalog apply --catalog "$CATALOG" --resume --json` resumes without the
-original prepared source. Snapshots own the complete bounded `_templates`
-library and empty canonical per-agent `.workspace` directory facts, but never
-traverse, hash, copy, or delete workspace content.
+Ordinary `catalog apply` is policy-free. It rejects state/control content,
+symlinks, unprojected workspace facts, catalog-local/default PTY roots, and
+effective PTY-root changes. Raw-preimage apply replaces those live semantic
+checks with its exact byte-domain CAS. Bootstrap is a separate create-only
+declaration transaction, not an apply mode. It atomically publishes absence or
+the complete catalog, initializes its persistent lock and generation before
+visibility, and never reads or writes the external PTY registry. Process
+adoption and PTY-root migration remain separate because that registry has
+independent producers. A crash during apply leaves a durable marker and
+content-addressed stage. `st2 catalog apply --catalog "$CATALOG" --resume --json`
+resumes without the original prepared source. Snapshots own the complete
+bounded `_templates` library and empty canonical per-agent `.workspace`
+directory facts, but never traverse, hash, copy, or delete workspace content.
 
 The compact declaration shape is:
 
@@ -687,9 +689,10 @@ evals retain their flat bus and completion semantics.
 declaration-plane writer. Each admits the complete prospective catalog under a
 compare-and-swap lock before making one atomic change.
 `st2 catalog digest --catalog ROOT --prepared DIR` computes the exact desired
-projection digest consumed by apply, including for raw-preimage repair where the
-invalid incumbent cannot support semantic diff. Ordinary valid-catalog workflows
-reuse `afterRootSha256` from the required policy-inspection diff instead.
+projection digest consumed by apply. Raw-preimage repair uses it for the fully
+validated successor while binding the opaque incumbent through the separate
+raw-domain digest. Ordinary valid-catalog workflows reuse `afterRootSha256`
+from the required policy-inspection diff instead.
 `st2 catalog bootstrap --catalog ROOT --prepared DIR --input-sha256 ROOT_HEX`
 is the create-only writer for an absent catalog. An exact completed replay is
 `unchanged`; any different or incomplete existing target fails closed.
