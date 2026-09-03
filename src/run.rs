@@ -2790,21 +2790,13 @@ fn wait_for_reconcile(rx: &Receiver<()>, interval: Duration, stop: &AtomicBool) 
     }
 }
 
-/// Best-effort supervisor watch: installation failure is diagnosed once, then reconciliation
-/// continues on the timer alone instead of silently losing immediate wakeups forever.
+/// Install independent commit and declaration wake channels. Each channel diagnoses and retries
+/// its own setup failure while the timer remains the correctness fallback for both.
 fn best_effort_catalog_watcher(
     root: &Path,
     tx: Sender<()>,
-) -> Option<crate::watch::CatalogDeclarationWatcher> {
-    match crate::watch::watch_catalog_declarations(root, tx) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            tracing::warn!(
-                "st2: cannot watch catalog declarations: {error}; immediate catalog changes are unavailable, continuing with timer polling."
-            );
-            None
-        }
-    }
+) -> Option<crate::watch::CatalogReconcileWatcher> {
+    Some(crate::watch::watch_catalog_reconcile_inputs(root, tx))
 }
 
 /// Suppresses warnings that persist across passes while still re-surfacing one that clears and
@@ -2852,7 +2844,7 @@ fn up_loop_until(
     runner: &dyn Runner,
     interval: Duration,
     stop: &AtomicBool,
-    install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogDeclarationWatcher>,
+    install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogReconcileWatcher>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
@@ -3431,62 +3423,53 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn supervisor_still_wakes_on_declaration_change_with_live_watcher() {
+    fn supervisor_wakes_and_launches_a_new_direct_declaration() {
         let catalog = tempfile::tempdir().unwrap();
         let agent = catalog.path().join("agents/test-host/live");
-        std::fs::create_dir_all(&agent).unwrap();
-        let spec = agent.join("agent.kdl");
-        std::fs::write(&spec, r#"agent "live" { host "test-host"; command "x" }"#).unwrap();
         let stop = AtomicBool::new(false);
-        let passes = std::sync::Arc::new(AtomicUsize::new(0));
-        let observed = passes.clone();
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let started = Instant::now();
+        let runner = SpawnCountingRunner::default();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let mut passes = 0usize;
 
         std::thread::scope(|scope| {
+            let watchdog_stop = &stop;
             scope.spawn(move || {
-                started_rx.recv().unwrap();
-                std::thread::sleep(Duration::from_millis(200));
-                std::fs::write(
-                    &spec,
-                    r#"agent "live" { host "test-host"; command "changed" }"#,
-                )
-                .unwrap();
-            });
-            scope.spawn({
-                let stop = &stop;
-                let passes = &passes;
-                move || {
-                    let deadline = Instant::now() + Duration::from_secs(10);
-                    while passes.load(Ordering::SeqCst) < 2
-                        && !stop.load(Ordering::SeqCst)
-                        && Instant::now() < deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    stop.store(true, Ordering::SeqCst);
+                if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                    watchdog_stop.store(true, Ordering::SeqCst);
                 }
             });
             up_loop_until(
                 catalog.path(),
                 "test-host",
-                &SpawnCountingRunner::default(),
+                &runner,
                 Duration::from_secs(60),
                 &stop,
                 best_effort_catalog_watcher,
-                |_| {
-                    passes.fetch_add(1, Ordering::SeqCst);
-                    let _ = started_tx.try_send(());
+                |report| {
+                    passes += 1;
+                    match passes {
+                        1 => {
+                            std::fs::create_dir_all(&agent).unwrap();
+                            std::fs::write(
+                                agent.join("agent.kdl"),
+                                r#"agent "live" { host "test-host"; command "x" }"#,
+                            )
+                            .unwrap();
+                        }
+                        2 => {
+                            assert_eq!(report.launched, ["test-host.live"]);
+                            let _ = done_tx.send(());
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        _ => panic!("one direct declaration must cause exactly one prompt pass"),
+                    }
                 },
             )
             .unwrap();
         });
 
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "a declaration mutation must wake the supervisor long before the 60s timer"
-        );
-        assert!(observed.load(Ordering::SeqCst) >= 2);
+        assert_eq!(passes, 2, "the 60s timer must not be the publication path");
+        assert_eq!(runner.spawned.borrow().as_slice(), ["test-host.live"]);
     }
 
     #[test]

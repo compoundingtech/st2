@@ -257,6 +257,17 @@ conservatively advancing the generation before clearing it. A crash after the
 advance but before intent removal may therefore skip a generation on recovery;
 the contract is monotonic change detection, not an exactly-once counter.
 
+The resident supervisor watches the parent of `catalog-generation` through a
+dedicated non-recursive backend instance. Atomic replacement of the generation
+file queues one unit wake only after the transaction has made its declaration
+durable. The shared catalog lock still fences the following pass from an
+in-progress writer. This constant-cost commit channel is independent of the
+declaration-space watcher, so declaration subscription volume or failure cannot
+delay a successful st2 publication until the full-audit timer.
+The supervisor records the control-directory identity for that subscription.
+If the directory is replaced, the next pass diagnoses the stale subscription
+and installs a watcher on the replacement directory.
+
 The lock file is a persistent real inode: replacing or removing it would split
 the lock domain for a process that already has it open. Consequently, the first
 coherent declaration reader may initialize exactly `.st2` and this lock even
@@ -1131,30 +1142,42 @@ the modal case, is recorded in
 the ruling is
 [decision 0005](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
 
-## Event contracts (R13–R15)
+## Event contracts (R13–R15, R40)
 
-An event is evidence, not permission to run the world. The reconciler retains
-path and kind, maps them to the affected identity or template dependency set,
-and computes the smallest desired-versus-actual delta. One declaration affects
-only that agent; a template affects only its dependents. A no-op performs zero
-PTY queries, launches, teardowns, materialization, or writes.
+An event is evidence, not permission to mutate runtime state. The classifier
+maps each accepted path and kind to one consumer. A resident catalog wake
+starts one serialized full-catalog pass; discovery and runtime observation then
+compute the desired-versus-actual delta, and an empty plan performs no launch,
+teardown, materialization, or catalog write.
 
 Watchers are deny-by-default. The classifier/action contract is:
 
 | Event | Minimal action |
 | --- | --- |
-| declaration-space `**/agent.kdl` create/modify/remove | validate, materialize, and converge that agent and derived tasks |
-| referenced `_templates/**` mutation | converge dependent agents only |
+| `.st2/catalog-generation` create/modify/replace | queue one serialized full-catalog reconcile after a cooperative commit |
+| root `catalog.kdl` create/modify/remove | queue one serialized full-catalog reconcile |
+| declaration-space `**/agent.kdl` create/modify/remove or declaration-directory topology change | queue one serialized full-catalog reconcile |
+| referenced `_templates/**` mutation | queue one serialized full-catalog reconcile |
 | inbox create/archive/remove | DING consumer only; supervisor no-op |
 | plan/resource/status mutation | specialized consumer only; supervisor no-op |
 | PTY/exec/log/PID/socket/lock/temp/backup/read/open/unknown | no-op |
 
-Startup, timer, watcher overflow/loss, and ambiguity are bounded full-audit
-fallbacks. Accepted streams use head/tail coalescing: immediate head response,
-one quiet tail after a burst, and a hard maximum. Executable proof covers
-positive declaration/template wakes, negative runtime/bus events, bounded
-discovery/materialization/PTY queries and writes, continuous-event starvation,
-and no-op desired-equals-actual behavior.
+The catalog-generation watcher owns a separate backend instance and one
+non-recursive control-directory subscription. It revalidates that directory's
+identity after every pass and reinstalls a stale subscription. The declaration
+watcher owns shallow subscriptions only for declaration-space directories; it
+prunes `.git`, `.st2`, PTY state, inboxes, archives, and Resource payloads. Both
+channels forward unit wakes to the same single-threaded loop. A burst is drained
+before one pass, and a pass never overlaps another pass.
+
+Watcher setup or callback failure is diagnosed and queues a conservative audit
+when a callback exists. The independent channel remains live. Startup, timer,
+watcher overflow/loss, and ambiguity are bounded full-audit fallbacks.
+Executable proof covers a post-commit generation replacement, generation-watch
+reinstallation after control-directory replacement, direct atomic bundle
+publication at production catalog scale, root configuration and declaration
+wakes, negative runtime/bus events, disconnected-channel cadence, and an idle
+supervisor that does not wake on its own reads.
 
 ## Quiet coordination after events (R22)
 
