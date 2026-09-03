@@ -14,7 +14,7 @@ use exports::st2::resource_provider::provider_api;
 
 const SNAPSHOT_SCHEMA: &str = "dev.schickling.vista.snapshot.v1";
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
-const MAX_VERSION: u64 = 9_999_999_999_999_999_999;
+const MAX_VERSION: u64 = 9_007_199_254_740_991;
 const TOPICS: [&str; 4] = ["ready", "updated", "failed", "expired"];
 const SELECTOR_SCHEMA: &str = r#"{
   "type": "object",
@@ -372,18 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn vista_uri_accepts_the_canonical_nineteen_digit_contract() {
+    fn vista_uri_accepts_only_backend_safe_integer_versions() {
         assert_eq!(
-            parse_uri("vista://release-notes/v9999999999999999999"),
+            parse_uri("vista://release-notes/v9007199254740991"),
             Some(("release-notes", MAX_VERSION))
-        );
-        assert_eq!(
-            parse_uri("vista://release-notes/v9007199254740992"),
-            Some(("release-notes", 9_007_199_254_740_992))
         );
         for invalid in [
             "vista://release-notes/v0",
             "vista://release-notes/v01",
+            "vista://release-notes/v9007199254740992",
+            "vista://release-notes/v9999999999999999999",
             "vista://release-notes/v10000000000000000000",
             "vista://-release/v1",
             "vista://release-/v1",
