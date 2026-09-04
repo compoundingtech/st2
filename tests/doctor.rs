@@ -6,6 +6,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest as _, Sha256};
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -47,6 +49,33 @@ fn doctor(catalog: &Path, bin: &Path, state: &Path) -> std::process::Output {
         .env("PTY_ROOT", state.join("pty"))
         .output()
         .unwrap()
+}
+
+fn running_agent(catalog: &Path, identity: &str) {
+    let directory = catalog.join("agents/h").join(identity);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("agent.kdl"),
+        format!("agent \"{identity}\" {{ host \"h\"; command \"true\" }}\n"),
+    )
+    .unwrap();
+    fs::write(directory.join("status"), "available\n").unwrap();
+}
+
+fn send_message(catalog: &Path, from: &str, to: &str, body: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", to, "--root"])
+        .arg(catalog)
+        .args(["--host", "h", "--as", from, "-m", body])
+        .output()
+        .unwrap()
+}
+
+fn bytes_digest(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[test]
@@ -100,6 +129,64 @@ fn manual_mode_is_healthy_without_a_host_lock_but_can_require_one() {
     assert!(!stale.status.success());
     assert!(
         String::from_utf8_lossy(&stale.stdout).contains("stale host-lock from a dead supervisor")
+    );
+}
+
+#[test]
+fn doctor_reports_a_sender_ledger_that_blocks_outbound_messages_without_mutating_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    running_agent(&catalog, "sender");
+    running_agent(&catalog, "recipient");
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.sender\",\"status\":\"running\"},{\"name\":\"h.recipient\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+    assert!(
+        send_message(&catalog, "sender", "recipient", "older")
+            .status
+            .success()
+    );
+    assert!(
+        send_message(&catalog, "sender", "recipient", "newer")
+            .status
+            .success()
+    );
+
+    let sender_root = catalog.join("agents/h/sender/resources/sent");
+    let mut rows = fs::read_dir(sender_root.join("messages"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    rows.sort();
+    let older = fs::read(&rows[0]).unwrap();
+    let pending_path = sender_root
+        .join("pending")
+        .join(format!("{}.json", bytes_digest(&older)));
+    fs::write(&pending_path, &older).unwrap();
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "blocked sender passed doctor:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "✗ h.sender outbound message ledger — cannot send: committed pending intent is missing its active marker"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ h.recipient outbound message ledger"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read(&pending_path).unwrap(), older);
+    assert!(
+        !catalog.join("agents/h/recipient/resources/sent").exists(),
+        "doctor must not create sender state while it inspects an unused ledger"
     );
 }
 

@@ -502,6 +502,23 @@ pub fn list_sent(agent_dir: &Path, include_body: bool) -> anyhow::Result<SentMes
     list_sent_unlocked(&root, include_body)
 }
 
+/// Inspect one sender's ledger without creating sender state.
+///
+/// Doctor uses this read-only path. If a sender starts its first publication during the initial
+/// unlocked read, the second lock check repeats the read under that sender's persistent lock.
+pub fn inspect_sent(agent_dir: &Path, include_body: bool) -> anyhow::Result<SentMessages> {
+    let root = sent_dir(agent_dir);
+    if let Some(_lock) = SentLock::shared_existing(&root)? {
+        return list_sent_unlocked(&root, include_body);
+    }
+    let snapshot = list_sent_unlocked(&root, include_body);
+    if let Some(_lock) = SentLock::shared_existing(&root)? {
+        list_sent_unlocked(&root, include_body)
+    } else {
+        snapshot
+    }
+}
+
 fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMessages> {
     let head_path = root.join(SENT_HEAD);
     let head: SentHead = match fs::read(&head_path) {
@@ -536,14 +553,18 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
         (Some(_), []) => {}
         _ => unreachable!(),
     }
-    if active.is_none()
+    let committed_pending_cleanup = if active.is_none()
         && let [record] = pending.as_slice()
+        && sent_record_exists(root, &record.filename)?
     {
         anyhow::ensure!(
-            !sent_record_exists(root, &record.filename)?,
+            head_tip_commits_record(root, &head, record)?,
             "committed pending intent is missing its active marker"
         );
-    }
+        true
+    } else {
+        false
+    };
 
     let rows = read_sent_records(&root.join(SENT_MESSAGES))?
         .into_iter()
@@ -644,7 +665,11 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
                 anyhow::ensure!(
                     active
                         .as_ref()
-                        .is_some_and(|active| active.filename == *filename),
+                        .is_some_and(|active| active.filename == *filename)
+                        || (committed_pending_cleanup
+                            && pending
+                                .first()
+                                .is_some_and(|record| record.filename == *filename)),
                     "committed sent row is missing its idempotency receipt"
                 );
             }
@@ -661,7 +686,8 @@ fn list_sent_unlocked(root: &Path, include_body: bool) -> anyhow::Result<SentMes
             .cmp(&right.ts)
             .then_with(|| left.filename.cmp(&right.filename))
     });
-    let incomplete = usize::from(!pending.is_empty() || active.is_some());
+    let incomplete =
+        usize::from((!pending.is_empty() && !committed_pending_cleanup) || active.is_some());
     let coverage = if incomplete == 0 {
         SentCoverage::Since { since: head.since }
     } else {
@@ -1730,6 +1756,18 @@ fn recover_active(
         remove_if_exists(&root.join(SENT_ACTIVE))?;
         return Ok(Vec::new());
     }
+    if active.is_none()
+        && let [record] = pending.as_slice()
+        && sent_record_exists(root, &record.filename)?
+    {
+        anyhow::ensure!(
+            head_tip_commits_record(root, head, record)?,
+            "committed pending intent is missing its active marker"
+        );
+        publish_key(root, record)?;
+        remove_if_exists(&root.join(SENT_PENDING).join(pending_record_name(record)?))?;
+        return Ok(Vec::new());
+    }
     let record = match (active, pending.as_slice()) {
         (None, []) => return Ok(Vec::new()),
         (None, [record]) => {
@@ -1962,9 +2000,9 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
     Ok(Some(record))
 }
 
-fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Result<bool> {
+fn head_tip_commit(root: &Path, head: &SentHead) -> anyhow::Result<Option<SentCommit>> {
     let Some(digest) = &head.tip else {
-        return Ok(false);
+        return Ok(None);
     };
     let path = root.join(SENT_COMMITS).join(format!("{digest}.json"));
     let node: SentCommit = serde_json::from_slice(&fs::read(path)?)?;
@@ -1981,7 +2019,36 @@ fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Res
         "sent commit digest mismatch"
     );
     anyhow::ensure!(node.ordinal == head.count, "sent commit ordinal mismatch");
-    Ok(node.filename == filename)
+    Ok(Some(node))
+}
+
+fn head_tip_commits(root: &Path, head: &SentHead, filename: &str) -> anyhow::Result<bool> {
+    Ok(head_tip_commit(root, head)?.is_some_and(|node| node.filename == filename))
+}
+
+fn head_tip_commits_record(
+    root: &Path,
+    head: &SentHead,
+    record: &SentRecord,
+) -> anyhow::Result<bool> {
+    let Some(node) = head_tip_commit(root, head)? else {
+        return Ok(false);
+    };
+    if node.filename != record.filename {
+        return Ok(false);
+    }
+    let pending_digest = digest_json(record)?;
+    anyhow::ensure!(
+        node.row_digest == pending_digest,
+        "committed pending intent differs from head tip"
+    );
+    let committed = read_sent_record(root, &record.filename)
+        .context("committed pending intent has no sender row")?;
+    anyhow::ensure!(
+        digest_json(&committed)? == pending_digest,
+        "committed pending intent differs from sender row"
+    );
+    Ok(true)
 }
 
 fn digest_json(value: &impl Serialize) -> anyhow::Result<String> {
@@ -2053,6 +2120,18 @@ impl SentLock {
     fn exclusive(root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
         Self::acquire(root, libc::LOCK_EX)
+    }
+
+    fn shared_existing(root: &Path) -> anyhow::Result<Option<Self>> {
+        use std::os::fd::AsRawFd as _;
+        let file = match OpenOptions::new().read(true).open(root.join(SENT_LOCK)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+        anyhow::ensure!(result == 0, "locking sent-message ledger failed");
+        Ok(Some(Self { file: Some(file) }))
     }
 
     fn acquire(root: &Path, operation: libc::c_int) -> anyhow::Result<Self> {

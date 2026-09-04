@@ -124,7 +124,11 @@ from steps 4 through 10 leaves enough sender-owned state to resume. A pending re
 active publication is an explicit recoverable partial state. An active pointer without pending fails
 unless the head proves that intent already committed. A row or commit node before head publication is
 explained only by the active intent and is not completed Sent. A head-advanced publication with stale
-active or pending state is recoverable cleanup. No recovery mutates an immutable row or node.
+active or pending state is recoverable cleanup. A pending-only cleanup record must match the current
+head-tip filename, the tip row digest, and the immutable sender row digest. A shared-lock read reports
+that exact record as completed coverage but does not clean it. The next exclusive sender operation
+publishes a missing key receipt and removes the pending record. No recovery mutates an immutable row
+or node. A pending record for an older committed row still fails closed.
 
 ## Retry identity
 

@@ -818,22 +818,119 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
     let interrupted = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["message", "send", "recipient", "--root"])
         .arg(tmp.path())
-        .args(["--host", "h", "--as", "sender", "-m", "committed"])
+        .args([
+            "--host",
+            "h",
+            "--as",
+            "sender",
+            "-m",
+            "committed",
+            "--idempotency-key",
+            "committed-key",
+        ])
         .env("ST2_TEST_MESSAGE_SEND_FAIL_AFTER", "head")
         .output()
         .unwrap();
     assert!(!interrupted.status.success());
-    fs::remove_file(tmp.path().join("h/sender/resources/sent/active.json")).unwrap();
+    let sent_root = tmp.path().join("h/sender/resources/sent");
+    fs::remove_file(sent_root.join("active.json")).unwrap();
+    let key = fs::read_dir(sent_root.join("keys"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::remove_file(key).unwrap();
+
+    // This test used to require failure here. That was wrong. The head, current tip, and immutable
+    // row prove that the send completed. The message specification requires cleanup recovery.
+    let output = sent(tmp.path(), "sender", &["--json"]);
+    assert!(
+        output.status.success(),
+        "an exact committed head-tip pending row is cleanup, not an incomplete send: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(view["coverage"]["_tag"], "since");
+    assert_eq!(view["messages"].as_array().unwrap().len(), 1);
+    let committed_filename = view["messages"][0]["filename"].as_str().unwrap();
+    assert_eq!(fs::read_dir(sent_root.join("pending")).unwrap().count(), 1);
+    assert!(
+        !sent_root
+            .join("keys")
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry.is_ok()),
+        "the shared-lock read must not repair the missing key receipt"
+    );
+
+    let retry = send_message(
+        tmp.path(),
+        "sender",
+        "recipient",
+        "committed",
+        &["--idempotency-key", "committed-key"],
+    );
+    assert!(
+        retry.status.success(),
+        "the next exclusive sender operation must finish cleanup: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&retry.stdout).trim(),
+        committed_filename
+    );
+    assert_eq!(fs::read_dir(sent_root.join("pending")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(sent_root.join("keys")).unwrap().count(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &sent(tmp.path(), "sender", &["--json"]).stdout
+        )
+        .unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "cleanup recovery must not commit the same row twice"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_agent(tmp.path(), "sender");
+    write_agent(tmp.path(), "recipient");
+    assert!(
+        send_message(tmp.path(), "sender", "recipient", "committed", &[])
+            .status
+            .success()
+    );
+    let sent_root = tmp.path().join("h/sender/resources/sent");
+    let row_path = fs::read_dir(sent_root.join("messages"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let row = fs::read_to_string(row_path).unwrap();
+    let substituted = row.replace("committed", "substituted committed body");
+    assert_ne!(substituted, row);
+    let substituted = substituted.into_bytes();
+    fs::create_dir_all(sent_root.join("pending")).unwrap();
+    fs::write(
+        sent_root
+            .join("pending")
+            .join(format!("{}.json", bytes_digest(&substituted))),
+        substituted,
+    )
+    .unwrap();
     let output = sent(tmp.path(), "sender", &["--json"]);
     assert!(
         !output.status.success(),
-        "committed pending without active must fail closed"
+        "a current-tip filename with different bytes must fail closed"
     );
-    assert!(output.stdout.is_empty());
-    let retry = send_message(tmp.path(), "sender", "recipient", "committed", &[]);
     assert!(
-        !retry.status.success(),
-        "recovery must not commit the same row twice"
+        String::from_utf8_lossy(&output.stderr)
+            .contains("committed pending intent differs from head tip"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let tmp = tempfile::tempdir().unwrap();
