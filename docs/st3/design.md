@@ -68,6 +68,24 @@ SQLite provides these required properties:
 
 Documents and other byte content use content hashes. The database stores the binding from a document name to each immutable version.
 
+### One authority for each fact
+
+The st3 database stores each authoritative fact once.
+
+A projection can repeat a fact only when claims or blobs can rebuild it exactly. A projection never accepts an independent write.
+
+Each schema field must have one declared class: authority, reference, derived projection, local cursor, or short-lived capability.
+
+The data review must prove these conditions:
+
+- Every repeated value names its authority and derivation.
+- A clean database can rebuild every durable projection from claims and blobs.
+- The rebuilt public snapshot equals the original public snapshot.
+- Public mutations append an authority record before they change a projection.
+- `doctor` detects a projection that differs from its authority.
+
+[data-authority-review.md](./data-authority-review.md) records the current risk areas and the required proof.
+
 ### Per-subject compare-and-swap
 
 `POST /v1/intent/plan` returns the current leaf claim IDs for each named subject and plan definition.
@@ -144,6 +162,18 @@ Exact built-in names are reserved. An authored `env` block cannot replace them. 
 
 The complete table is in [plan-graph-runtime.md](./plan-graph-runtime.md#automatic-context).
 
+### External resource subscriptions
+
+An external resource watch contains a resource, one supervised observer, and one or more delivery subscriptions.
+
+The observer normalizes provider facts without using an agent turn. A subscription selects fields and a message target.
+
+The first observation establishes a baseline. A later selected change creates one observation claim and one idempotent message.
+
+Providers can use webhooks, streams, or conditional requests with one-shot deadlines. st3 does not use a periodic discovery sweep.
+
+[resource-subscriptions.md](./resource-subscriptions.md) defines the provider contract, graph shape, lifecycle, and acceptance proof.
+
 ## System boundary
 
 st3 has these components:
@@ -170,7 +200,7 @@ Every st3 intent starts with `version 2` and contains exactly one untyped `subgr
 The root can contain these subject nodes:
 
 - controlled members: `agent`, `exec`, and `pty`;
-- structural nodes: `scope`, `host`, `supervisor`, `link`, `message`, `schedule`, and `plan`;
+- structural nodes: `scope`, `host`, `supervisor`, `link`, `message`, `schedule`, `plan`, `observer`, and `subscription`;
 - observed nodes: `resource`, `person`, and `account`;
 - explicit `stop` state.
 
@@ -297,7 +327,7 @@ Main endpoint groups are:
 - intent: `/v1/intent/plan`, `/v1/intent/apply`;
 - planning: `/v1/planning-sessions` and its session actions;
 - plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
-- graph data: `/v1/claims`, `/v1/status`, `/v1/events`;
+- graph data: `/v1/claims`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
 - documents: `/v1/documents` and `/v1/documents/content`;
 - Small Talk: `/v1/messages` and message lifecycle actions;
 - sessions: `/v1/sessions/...` for logs, screens, input, signals, and attach;
@@ -321,6 +351,7 @@ Important plan and gate kinds include:
 - `review.requested` and `review.decision`;
 - `planning-session.started`, `planning-session.candidate-submitted`, `planning-session.previewed`, and `planning-session.variant-proposed`;
 - `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`.
+- `observer.desired`, `observer.health`, `resource.observed`, and `subscription.desired`.
 
 An unknown replicated claim remains in history and makes its subject indeterminate. A node does not silently interpret an unknown kind.
 
