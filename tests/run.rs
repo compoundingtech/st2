@@ -1717,6 +1717,11 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 /// fails the identical bind every time, so acting on that advice restarts the storm rather than
 /// recovering anything. The notice says what has to change instead. The recoverable case keeps
 /// the recovery verb, which is what makes this a distinction rather than a removal.
+///
+/// Both notices land in one inbox, and two sends inside the same millisecond are ordered by their
+/// random filename suffix, so the notice under test is selected by which file is NEW rather than
+/// by position. Reading the last entry made this test a coin flip that failed roughly a third of
+/// the time.
 #[test]
 fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1730,8 +1735,26 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
         "agents/hetz/cos/agent.toml",
         "identity=\"cos\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
     );
+
+    // The recoverable case must be UNABLE to cross the bound under any resolved pty root, not
+    // merely short enough under this one. Asserting it with the shipped predicate keeps the
+    // control from being contaminated by the very condition under test: a root long enough to
+    // blow even this id would otherwise make the control silently structural.
+    let resolved_root = st2::run::effective_pty_root(tmp.path());
+    assert!(
+        st2::run::session_socket_overage(&resolved_root, "hetz.demo").is_none(),
+        "fixture precondition: the recoverable task must be bindable under the resolved pty root \
+         {}, or this test cannot tell the two notices apart",
+        resolved_root.display()
+    );
+
     let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos"));
     let notify = |pty_id: &str| {
+        let before = message::list_dir(&inbox)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.filename)
+            .collect::<Vec<_>>();
         surface_crash_loop(
             tmp.path(),
             "hetz",
@@ -1742,8 +1765,13 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
                 supervisor: Some("cos".to_string()),
             },
         );
-        let msgs = message::list_dir(&inbox).unwrap();
-        msgs.last().expect("the supervisor was notified").body.clone()
+        let mut fresh = message::list_dir(&inbox)
+            .unwrap()
+            .into_iter()
+            .filter(|message| !before.contains(&message.filename))
+            .collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 1, "one park sends exactly one notice");
+        fresh.pop().expect("the notice was just counted").body
     };
 
     // Long enough that no resolved pty root can bring it under the limit.
