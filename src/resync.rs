@@ -501,6 +501,20 @@ struct WatchRefresh {
     live_task_ids: BTreeSet<String>,
 }
 
+/// What one publication attempt settled, and therefore what happens to its reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationOutcome {
+    Published,
+    /// The attempt may pass later: retry the reserved bytes on the carrier's class deadline.
+    Retry,
+    /// The recipient is declared but not running. Keep the reservation, schedule nothing, and
+    /// re-arm it when that recipient's desired state returns to running. Dropping it instead
+    /// would lose a resync the agent should see on resume.
+    Parked,
+    /// No retry can admit this publication. Drop the reservation after one diagnostic.
+    Refused,
+}
+
 enum Msg {
     WatchSet(WatchRefresh),
     Install(AgentWatchSet, Sender<()>),
@@ -512,7 +526,7 @@ enum Msg {
     Emitted {
         bus_id: String,
         label: String,
-        published: bool,
+        outcome: PublicationOutcome,
     },
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
     /// would stay unreachable while `join` waits.
@@ -901,6 +915,10 @@ struct Entry {
     /// off the worker thread, so the worker must not hand off the same subscription twice or
     /// advance its baseline before the outcome returns.
     in_flight: bool,
+    /// True once the recipient refused because it is not running. A parked subscription captures
+    /// nothing and schedules nothing; the next refresh that carries the recipient again — which
+    /// only happens while it is running — clears this and re-arms its retained reservation.
+    parked: bool,
     dirty: bool,
 }
 /// Recipient-scoped subscription identity. A declaration or carrier may move without changing
@@ -958,6 +976,10 @@ struct EmitQueue {
 struct EmitQueueState {
     jobs: std::collections::VecDeque<EmitJob>,
     stopped: bool,
+    /// Publications ever handed off. A refusal that is retried at a cadence shows up here as
+    /// volume, which is what the tests for terminal-refusal classification measure.
+    #[cfg(test)]
+    handed_off: usize,
 }
 
 impl EmitQueue {
@@ -968,8 +990,19 @@ impl EmitQueue {
     }
 
     fn push(&self, job: EmitJob) {
-        self.lock().jobs.push_back(job);
+        let mut state = self.lock();
+        #[cfg(test)]
+        {
+            state.handed_off += 1;
+        }
+        state.jobs.push_back(job);
+        drop(state);
         self.ready.notify_one();
+    }
+
+    #[cfg(test)]
+    fn handed_off(&self) -> usize {
+        self.lock().handed_off
     }
 
     /// Drop every queued publication for one recipient. A publication already taken by the
@@ -1027,12 +1060,12 @@ impl EmitQueue {
 
 fn emitter_loop(root: PathBuf, this_host: String, queue: Arc<EmitQueue>, outcomes: Sender<Msg>) {
     while let Some(job) = queue.next() {
-        let published = emit_resync(&root, &this_host, &job.bus_id, &job.transition);
+        let outcome = emit_resync(&root, &this_host, &job.bus_id, &job.transition);
         if outcomes
             .send(Msg::Emitted {
                 bus_id: job.bus_id,
                 label: job.label,
-                published,
+                outcome,
             })
             .is_err()
         {
@@ -1049,6 +1082,11 @@ struct Worker {
     /// Inactive subscriptions stay here so a reinstall cannot collide with an earlier occurrence.
     /// Its lifetime is the worker's and its cardinality is bounded by identities observed there.
     subscription_sequences: BTreeMap<SubscriptionIdentity, u64>,
+    /// Reservations retained for recipients that refused because they are not running. A refresh
+    /// drops a suspended recipient's subscription entirely, so the reservation has to outlive the
+    /// subscription to survive until that recipient resumes. Like `subscription_sequences`, this
+    /// is worker-lifetime state bounded by the identities it has observed.
+    parked_transitions: BTreeMap<SubscriptionIdentity, PendingTransition>,
     deadlines: BTreeMap<CarrierClass, Instant>,
     watched: BTreeMap<PathBuf, Option<DirIdentity>>,
     /// `None` degrades to digest polling at refresh cadence (each reconcile pass) instead of
@@ -1098,6 +1136,7 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
         this_host,
         carriers: BTreeMap::new(),
         subscription_sequences: BTreeMap::new(),
+        parked_transitions: BTreeMap::new(),
         deadlines: BTreeMap::new(),
         watched: BTreeMap::new(),
         watcher,
@@ -1125,8 +1164,8 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             Ok(Msg::Emitted {
                 bus_id,
                 label,
-                published,
-            }) => worker.record_publication(&bus_id, &label, published),
+                outcome,
+            }) => worker.record_publication(&bus_id, &label, outcome),
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1159,6 +1198,7 @@ fn rebuild_carriers(
     mut previous: BTreeMap<PathBuf, Vec<Entry>>,
     refresh: WatchRefresh,
     subscription_sequences: &BTreeMap<SubscriptionIdentity, u64>,
+    parked_transitions: &mut BTreeMap<SubscriptionIdentity, PendingTransition>,
 ) -> BTreeMap<PathBuf, Vec<Entry>> {
     let mut next: BTreeMap<PathBuf, Vec<Entry>> = BTreeMap::new();
     for set in refresh.sets {
@@ -1171,6 +1211,9 @@ fn rebuild_carriers(
             // metadata become current. A bus-id change intentionally seeds a new
             // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
+            // Every recipient in a refresh set is running, so this is where a reservation parked
+            // against a not-running recipient re-arms.
+            let restored = parked_transitions.remove(&identity);
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
             let (
                 state,
@@ -1213,6 +1256,7 @@ fn rebuild_carriers(
                     )
                 },
             );
+            let restored_reservation = restored.is_some();
             let entry = Entry {
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
@@ -1222,9 +1266,10 @@ fn rebuild_carriers(
                 state,
                 declaration_summary,
                 occurrence_sequence,
-                pending_transition,
+                pending_transition: pending_transition.or(restored),
                 in_flight,
-                dirty,
+                parked: false,
+                dirty: dirty || restored_reservation,
             };
             next.entry(carrier.path).or_default().push(entry);
         }
@@ -1322,7 +1367,12 @@ impl Worker {
     fn apply_watch_sets(&mut self, refresh: WatchRefresh) {
         let previous = std::mem::take(&mut self.carriers);
         let previous_paths = self.prepare_carrier_update(&previous);
-        self.carriers = rebuild_carriers(previous, refresh, &self.subscription_sequences);
+        self.carriers = rebuild_carriers(
+            previous,
+            refresh,
+            &self.subscription_sequences,
+            &mut self.parked_transitions,
+        );
         // A subscription this refresh dropped — a suspended, retired or no-longer-live seat —
         // must not have a queued publication published afterwards.
         let active = self
@@ -1360,6 +1410,7 @@ impl Worker {
                 live_task_ids: BTreeSet::new(),
             },
             &self.subscription_sequences,
+            &mut self.parked_transitions,
         );
         for (path, entries) in replacement {
             unaffected.entry(path).or_default().extend(entries);
@@ -1413,6 +1464,11 @@ impl Worker {
                 continue;
             };
             for entry in entries {
+                if entry.parked {
+                    // A parked recipient is not running: observing its carrier would only
+                    // schedule work whose answer is already known.
+                    continue;
+                }
                 let changed = entry.pending_transition.is_some()
                     || match read_state(&path, entry.containment_root.as_deref()) {
                         Ok(observed) => entry.state.as_ref() != Some(&observed),
@@ -1534,6 +1590,9 @@ impl Worker {
                     continue;
                 }
                 for entry in entries.iter_mut() {
+                    if entry.parked {
+                        continue;
+                    }
                     if !entry.dirty {
                         let deadline = now + entry.class.window();
                         self.deadlines
@@ -1621,6 +1680,13 @@ impl Worker {
         let mut handoffs = Vec::new();
         for entry in entries.iter_mut() {
             if due_class.is_some_and(|class| entry.class != class) {
+                continue;
+            }
+            if entry.parked {
+                // No capture and no publication while the recipient is not running. Its
+                // reservation waits in `parked_transitions`; the carrier baseline is unchanged,
+                // so a change during the parked window is still observed after it re-arms.
+                entry.dirty = false;
                 continue;
             }
             if entry.in_flight {
@@ -1722,31 +1788,52 @@ impl Worker {
     /// Apply one handed-off publication's outcome. The worker stays the only writer of carrier
     /// baselines and retry deadlines, so the emitter reports back here instead of touching state.
     ///
-    /// A published transition is completed; a refused one is left pending. Re-observing the
-    /// carrier afterwards is what schedules the next attempt in both cases: a retained pending
-    /// transition re-arms its own class, and a completed one re-arms only if the carrier moved
-    /// on while the publication was outstanding.
+    /// The outcome decides what happens to the reservation:
+    ///
+    /// - `Published` completes it and advances the baseline.
+    /// - `Retry` leaves it pending; re-observing the carrier re-arms its class.
+    /// - `Parked` moves it out of the subscription and schedules nothing. It re-arms when the
+    ///   recipient is carried by a refresh again, which only happens while it is running.
+    /// - `Refused` drops it and advances the baseline anyway, because a reservation no retry can
+    ///   admit must not be re-captured from the same carrier transition on the next observation.
     ///
     /// An outcome whose subscription is gone — deactivated or refreshed away while the
     /// publication was outstanding — matches nothing and is discarded.
-    fn record_publication(&mut self, bus_id: &str, label: &str, published: bool) {
+    fn record_publication(&mut self, bus_id: &str, label: &str, outcome: PublicationOutcome) {
         let mut touched = Vec::new();
+        let mut parked = Vec::new();
         for (path, entries) in &mut self.carriers {
             for entry in entries
                 .iter_mut()
                 .filter(|entry| entry.bus_id == bus_id && entry.label == label)
             {
                 entry.in_flight = false;
-                if published
-                    && let Some(completed) = entry.pending_transition.take()
-                {
-                    entry.state = Some(completed.new_state);
-                    if completed.binding == "declaration" {
-                        entry.declaration_summary = completed.new_declaration_summary;
+                match outcome {
+                    PublicationOutcome::Published | PublicationOutcome::Refused => {
+                        if let Some(settled) = entry.pending_transition.take() {
+                            entry.state = Some(settled.new_state);
+                            if settled.binding == "declaration" {
+                                entry.declaration_summary = settled.new_declaration_summary;
+                            }
+                        }
+                    }
+                    PublicationOutcome::Retry => {}
+                    PublicationOutcome::Parked => {
+                        entry.parked = true;
+                        entry.dirty = false;
+                        if let Some(reservation) = entry.pending_transition.take() {
+                            parked.push((
+                                (entry.bus_id.clone(), entry.label.clone()),
+                                reservation,
+                            ));
+                        }
                     }
                 }
                 touched.push(path.clone());
             }
+        }
+        for (identity, reservation) in parked {
+            self.parked_transitions.insert(identity, reservation);
         }
         self.poll_paths(touched);
     }
@@ -1764,7 +1851,7 @@ fn emit_resync(
     this_host: &str,
     bus_id: &str,
     transition: &PendingTransition,
-) -> bool {
+) -> PublicationOutcome {
     let subject = crate::resource_profile_supervisor::resource_change_subject(
         &transition.binding,
         &transition.facts,
@@ -1781,13 +1868,27 @@ fn emit_resync(
         &transition.body,
         true,
     ) {
-        Ok(_) => true,
+        Ok(_) => PublicationOutcome::Published,
         Err(error) => {
-            eprintln!(
-                "st2: resync emit for '{}' failed: {error:#}",
-                transition.path.display()
-            );
-            false
+            let path = transition.path.display();
+            match crate::event::refusal_kind(&error) {
+                Some(crate::event::RefusalKind::RecipientNotRunning) => {
+                    eprintln!(
+                        "st2: resync for '{path}' is parked until '{bus_id}' is running again: {error:#}"
+                    );
+                    PublicationOutcome::Parked
+                }
+                Some(crate::event::RefusalKind::Permanent) => {
+                    eprintln!(
+                        "st2: resync for '{path}' dropped; no retry can admit it: {error:#}"
+                    );
+                    PublicationOutcome::Refused
+                }
+                None => {
+                    eprintln!("st2: resync emit for '{path}' failed: {error:#}");
+                    PublicationOutcome::Retry
+                }
+            }
         }
     }
 }
@@ -2152,6 +2253,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2319,6 +2421,7 @@ mod tests {
                     occurrence_sequence: 4,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                 },
                 Entry {
@@ -2331,6 +2434,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 9,
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                     pending_transition: None,
                 },
@@ -2363,7 +2467,7 @@ mod tests {
             },
         ];
 
-        let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new());
+        let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new(), &mut BTreeMap::new());
         let entries = rebuilt.get(&shared).expect("shared path remains watched");
         assert_eq!(entries.len(), 2);
         for (bus_id, digest) in [
@@ -2420,11 +2524,12 @@ mod tests {
                 occurrence_sequence: 3,
                 pending_transition: None,
                 in_flight: false,
+                parked: false,
                 dirty: true,
             }],
         )]);
 
-        let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]), &BTreeMap::new());
+        let rebuilt = rebuild_carriers(previous, refresh_for(vec![current]), &BTreeMap::new(), &mut BTreeMap::new());
         assert!(!rebuilt.contains_key(&old_path));
         let entry = rebuilt[&goal]
             .iter()
@@ -2444,6 +2549,7 @@ mod tests {
             this_host: "alias".to_owned(),
             carriers: rebuilt,
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2492,10 +2598,12 @@ mod tests {
                     occurrence_sequence: 0,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2571,10 +2679,12 @@ mod tests {
                     occurrence_sequence: 0,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: false,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::from([(parent.clone(), dir_identity(&parent))]),
             watcher: None,
@@ -2625,10 +2735,12 @@ mod tests {
                     occurrence_sequence: 0,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::from([(CarrierClass::Immediate, old_deadline)]),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2690,6 +2802,7 @@ mod tests {
                         1,
                     )),
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                 }],
             )])
@@ -2704,6 +2817,7 @@ mod tests {
                 live_task_ids: BTreeSet::from(["custom-worker-seat".to_owned()]),
             },
             &BTreeMap::new(),
+            &mut BTreeMap::new(),
         );
         let entry = &retained[&declaration][0];
         assert_eq!(
@@ -2726,6 +2840,7 @@ mod tests {
                 live_task_ids: BTreeSet::new(),
             },
             &BTreeMap::new(),
+            &mut BTreeMap::new(),
         );
         assert!(
             dropped.is_empty(),
@@ -2776,10 +2891,12 @@ mod tests {
                         1,
                     )),
                     in_flight: false,
+                    parked: false,
                     dirty: false,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2835,10 +2952,12 @@ mod tests {
                     occurrence_sequence: 0,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: false,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2895,6 +3014,7 @@ mod tests {
             this_host: "hetz".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -2977,8 +3097,10 @@ mod tests {
                 BTreeMap::new(),
                 refresh_for(vec![live_set.clone()]),
                 &BTreeMap::new(),
+                &mut BTreeMap::new(),
             ),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: make_watcher(tx),
@@ -3048,6 +3170,7 @@ mod tests {
                 occurrence_sequence: 0,
                 pending_transition: None,
                 in_flight: false,
+                parked: false,
                 dirty: true,
             })
             .collect();
@@ -3057,6 +3180,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::from([(carrier, entries)]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::from([(CarrierClass::Immediate, now)]),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3152,6 +3276,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3221,6 +3346,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3273,6 +3399,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::from([(resources.clone(), dir_identity(&resources))]),
             watcher: None,
@@ -3324,6 +3451,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3402,6 +3530,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::new(),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3490,6 +3619,7 @@ mod tests {
                 occurrence_sequence: 0,
                 pending_transition: None,
                 in_flight: false,
+                parked: false,
                 dirty: true,
             })
             .collect();
@@ -3498,6 +3628,7 @@ mod tests {
             this_host: "host".to_owned(),
             carriers: BTreeMap::from([(carrier.clone(), entries)]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3561,10 +3692,12 @@ mod tests {
                     occurrence_sequence: 0,
                     pending_transition: None,
                     in_flight: false,
+                    parked: false,
                     dirty: true,
                 }],
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
@@ -3619,16 +3752,319 @@ mod tests {
                         occurrence_sequence: 0,
                         pending_transition: None,
                         in_flight: false,
+                        parked: false,
                         dirty: true,
                     })
                     .collect(),
             )]),
             subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
             emit: Arc::new(EmitQueue::default()),
         }
+    }
+
+    /// One agent declaration plus its goal carrier, and a subscription to that carrier whose
+    /// baseline is stale, so the next flush captures exactly one transition for it.
+    ///
+    /// A subscription exists only for a canonical seat a pass proved alive, so a subscription
+    /// addressed to a declaration that says `suspended` IS the suspended-and-running state — the
+    /// one that produced ~2010 refusals per seat in #431. A seat whose task had already exited
+    /// produces no subscription at all, which is why a fixture built on one proves nothing.
+    fn declared_recipient_worker(root: &Path, identity: &str, declaration_extra: &str) -> Worker {
+        crate::event::publish_owner_binding_for_test(root, "host").unwrap();
+        let agent_dir = root.join("agents/host").join(identity);
+        std::fs::create_dir_all(agent_dir.join("resources")).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(
+                "agent \"{identity}\" {{\n  host \"host\"\n  command \"agent\"\n{declaration_extra}  resource \"goal\" uri=\"resources/goal.md\" reason=\"Mission.\"\n}}"
+            ),
+        )
+        .unwrap();
+        let goal = agent_dir.join("resources/goal.md");
+        std::fs::write(&goal, "current bytes").unwrap();
+        Worker {
+            root: root.to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                goal,
+                vec![Entry {
+                    bus_id: format!("host.{identity}"),
+                    seat_id: None,
+                    label: "goal".to_owned(),
+                    class: CarrierClass::Immediate,
+                    containment_root: None,
+                    state: Some(CarrierState::Present("stale-digest".to_owned())),
+                    declaration_summary: None,
+                    occurrence_sequence: 0,
+                    pending_transition: None,
+                    in_flight: false,
+                    parked: false,
+                    dirty: true,
+                }],
+            )]),
+            subscription_sequences: BTreeMap::new(),
+            parked_transitions: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+            emit: Arc::new(EmitQueue::default()),
+        }
+    }
+
+    /// A recipient that refuses because it is not running keeps its reservation and is attempted
+    /// exactly once. Retrying it cannot make it admissible: eligibility was resolved under the
+    /// catalog-authoring lock, and each attempt re-resolves the whole catalog to reach the same
+    /// answer. That retry is the CPU burn and the shared-lock coverage of #431.
+    #[test]
+    fn a_not_running_recipient_parks_its_reservation_and_is_attempted_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = declared_recipient_worker(
+            root.path(),
+            "worker",
+            "  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+        );
+        let goal = worker.carriers.keys().next().unwrap().clone();
+
+        worker.flush_path_publishing(&goal, None);
+
+        let entry = &worker.carriers[&goal][0];
+        assert!(entry.parked, "the subscription must be parked");
+        assert!(
+            entry.pending_transition.is_none(),
+            "the reservation moves out of the subscription, which a refresh will drop"
+        );
+        assert!(
+            worker
+                .parked_transitions
+                .contains_key(&("host.worker".to_owned(), "goal".to_owned())),
+            "the reservation must be retained, not dropped: {:?}",
+            worker.parked_transitions.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            worker.deadlines.is_empty(),
+            "a not-running recipient must schedule no retry deadline: {:?}",
+            worker.deadlines
+        );
+
+        // Each source that would ordinarily re-arm this carrier, checked on its own: a parked
+        // subscription must schedule nothing, not merely publish nothing.
+        std::fs::write(&goal, "changed while the recipient is suspended\n").unwrap();
+        worker.mark_mutated(vec![goal.clone()]);
+        assert!(
+            worker.deadlines.is_empty() && !worker.carriers[&goal][0].dirty,
+            "a mutation wakeup must not schedule a parked subscription: {:?}",
+            worker.deadlines
+        );
+        worker.rescan_all();
+        assert!(
+            worker.deadlines.is_empty() && !worker.carriers[&goal][0].dirty,
+            "a rescan must not schedule a parked subscription: {:?}",
+            worker.deadlines
+        );
+        worker.flush_path_publishing(&goal, None);
+        worker.flush_due_publishing(Instant::now() + COALESCED_WINDOW + Duration::from_secs(1));
+        assert!(worker.deadlines.is_empty(), "{:?}", worker.deadlines);
+        assert_eq!(
+            worker.emit.handed_off(),
+            1,
+            "a parked reservation must not be attempted again"
+        );
+    }
+
+    /// The reservation re-arms when its recipient is running again, and replays the exact bytes
+    /// it reserved. Dropping it at the refusal would lose a resync the agent should see on
+    /// resume; a refresh drops the suspended subscription itself, so the reservation has to
+    /// outlive it.
+    #[test]
+    fn a_parked_reservation_re_arms_and_replays_when_its_recipient_runs_again() {
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = declared_recipient_worker(
+            root.path(),
+            "worker",
+            "  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+        );
+        let goal = worker.carriers.keys().next().unwrap().clone();
+        let agent_dir = root.path().join("agents/host/worker");
+
+        worker.flush_path_publishing(&goal, None);
+        let reserved = worker
+            .parked_transitions
+            .values()
+            .next()
+            .expect("the refusal retains its reservation")
+            .clone();
+
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            "agent \"worker\" {\n  host \"host\"\n  command \"agent\"\n  resource \"goal\" uri=\"resources/goal.md\" reason=\"Mission.\"\n}",
+        )
+        .unwrap();
+        let resumed = watch_set_for(
+            &discover(root.path()),
+            "host",
+            &ResourceProfileRegistry::empty(),
+        );
+        worker.apply_watch_sets(refresh_for(vec![resumed]));
+
+        let entry = &worker.carriers[&goal][0];
+        assert!(!entry.parked, "a carried recipient is running");
+        assert_eq!(
+            entry.pending_transition.as_ref().map(|held| &held.event_id),
+            Some(&reserved.event_id),
+            "the restored reservation must be the reserved one"
+        );
+        assert!(
+            worker.deadlines.contains_key(&CarrierClass::Immediate),
+            "re-arming must schedule the carrier's class: {:?}",
+            worker.deadlines
+        );
+        assert!(worker.parked_transitions.is_empty());
+
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        let event = resync_inbox_event(&agent_dir);
+        assert!(
+            event.contains(&format!("event-id: {}", reserved.event_id)),
+            "{event}"
+        );
+        assert!(event.contains(&reserved.body), "{event}");
+    }
+
+    /// A refusal no retry can admit drops its reservation and advances the baseline, so the same
+    /// carrier transition is not captured again on the next observation. Without advancing it,
+    /// "drop" would only mean "re-capture and refuse again".
+    #[test]
+    fn a_permanently_refused_reservation_is_dropped_and_not_recaptured() {
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = declared_recipient_worker(root.path(), "worker", "");
+        // A second declaration of the same identity makes the recipient ambiguous. No retry can
+        // resolve that from the publisher's side.
+        let twin = root.path().join("agents/host/worker-copy");
+        std::fs::create_dir_all(&twin).unwrap();
+        std::fs::write(
+            twin.join("agent.kdl"),
+            "agent \"worker\" {\n  host \"host\"\n  command \"agent\"\n}",
+        )
+        .unwrap();
+        let goal = worker.carriers.keys().next().unwrap().clone();
+
+        worker.flush_path_publishing(&goal, None);
+
+        let entry = &worker.carriers[&goal][0];
+        assert!(
+            entry.pending_transition.is_none(),
+            "a permanent refusal drops its reservation"
+        );
+        assert!(!entry.parked, "a permanent refusal is not parked");
+        assert!(worker.parked_transitions.is_empty());
+        assert!(
+            worker.deadlines.is_empty(),
+            "a permanent refusal must schedule no retry: {:?}",
+            worker.deadlines
+        );
+
+        worker.rescan_all();
+        worker.flush_due_publishing(Instant::now() + COALESCED_WINDOW + Duration::from_secs(1));
+        assert_eq!(
+            worker.emit.handed_off(),
+            1,
+            "the dropped transition must not be recaptured"
+        );
+    }
+
+    /// Every refusal the catalog can return, classified. `RecipientNotRunning` is the only one a
+    /// resume can admit; the rest never become admissible. An unknown recipient and a catalog
+    /// mid-edit stay retryable on purpose: a declaration being replaced by rename is briefly
+    /// absent, and dropping the reservation there would lose a resync nothing was wrong with.
+    #[test]
+    fn refusals_are_classified_by_what_could_admit_them_later() {
+        use crate::event::{RefusalKind, refusal_kind};
+
+        let root = tempfile::tempdir().unwrap();
+        crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
+        let write = |identity: &str, body: &str| {
+            let dir = root.path().join("agents/host").join(identity);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.kdl"), body).unwrap();
+        };
+        let emit = |recipient: &str| {
+            crate::event::emit_builtin_resync(
+                root.path(),
+                "host",
+                recipient,
+                "eventid",
+                Some("goal"),
+                Some("subject"),
+                "{}",
+                true,
+            )
+            .expect_err("every recipient in this fixture refuses")
+        };
+
+        write(
+            "suspended",
+            "agent \"suspended\" {\n  host \"host\"\n  command \"agent\"\n  desired-state \"suspended\" reason=\"Waiting\"\n}",
+        );
+        write(
+            "foreign",
+            "agent \"foreign\" {\n  host \"elsewhere\"\n  command \"agent\"\n}",
+        );
+        write("plain", "agent \"plain\" {\n  host \"host\"\n  command \"agent\"\n}");
+        write(
+            "twin",
+            "agent \"plain\" {\n  host \"host\"\n  command \"agent\"\n}",
+        );
+        write("solo", "agent \"solo\" {\n  host \"host\"\n  command \"agent\"\n}");
+
+        let suspended = emit("host.suspended");
+        assert!(
+            suspended.to_string().contains("eyes are closed"),
+            "{suspended:#}"
+        );
+        assert_eq!(
+            refusal_kind(&suspended),
+            Some(RefusalKind::RecipientNotRunning)
+        );
+
+        // A foreign spec is only reachable under its own host-qualified bus id; by local identity
+        // it is simply not in this host's namespace.
+        let foreign = emit("elsewhere.foreign");
+        assert!(
+            foreign
+                .to_string()
+                .contains("event publication must run on that host"),
+            "{foreign:#}"
+        );
+        assert_eq!(refusal_kind(&foreign), Some(RefusalKind::Permanent));
+
+        let ambiguous = emit("host.plain");
+        assert!(ambiguous.to_string().contains("is ambiguous"), "{ambiguous:#}");
+        assert_eq!(refusal_kind(&ambiguous), Some(RefusalKind::Permanent));
+
+        let undeclared = crate::event::emit(
+            root.path(),
+            "host",
+            "host.solo",
+            "other",
+            "eventid",
+            None,
+            None,
+            "{}",
+            true,
+        )
+        .expect_err("an undeclared stream is refused");
+        assert_eq!(refusal_kind(&undeclared), Some(RefusalKind::Permanent));
+
+        let unknown = emit("host.absent");
+        assert!(unknown.to_string().contains("no agent"), "{unknown:#}");
+        assert_eq!(
+            refusal_kind(&unknown),
+            None,
+            "an absent declaration may be a rename in flight, so it stays retryable"
+        );
     }
 
     /// One outstanding publication per subscription. Flushing again while a publication is still

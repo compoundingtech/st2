@@ -255,6 +255,50 @@ fn validate_owner_binding(
     read_valid_owner_binding(root, host, lock).map(|_| ())
 }
 
+/// A publication the catalog refuses, as distinct from a failure that may pass later.
+///
+/// Eligibility is resolved under the shared catalog-authoring lock, so a refusal follows from the
+/// declaration rather than from timing. Retrying one at a cadence is pure cost: it re-resolves the
+/// whole catalog and discards the answer. The two kinds differ in what could change the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalKind {
+    /// The recipient is declared but not running. Its desired state returning to running admits
+    /// the same publication, so the reservation is worth keeping.
+    RecipientNotRunning,
+    /// Nothing about the recipient makes this admissible later: it is ambiguous, owned by another
+    /// host, or does not declare the stream.
+    Permanent,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl StreamRefusal {
+    fn new(kind: RefusalKind, message: String) -> anyhow::Error {
+        anyhow::Error::new(Self { kind, message })
+    }
+}
+
+impl std::fmt::Display for StreamRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamRefusal {}
+
+/// Classify a publication error. A `None` is a failure whose answer may differ next time — a
+/// catalog mid-edit, an unreadable owner binding, a lock or I/O error — and stays retryable.
+pub(crate) fn refusal_kind(error: &anyhow::Error) -> Option<RefusalKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StreamRefusal>())
+        .map(|refusal| refusal.kind)
+}
+
 fn resolve_stream(
     root: &Path,
     this_host: &str,
@@ -286,42 +330,60 @@ fn resolve_stream(
         "no agent '{recipient}' found in catalog {}",
         root.display()
     );
-    anyhow::ensure!(
-        matches.len() == 1,
-        "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
-        matches.len(),
-        matches
-            .iter()
-            .map(|spec| spec.path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    if matches.len() > 1 {
+        return Err(StreamRefusal::new(
+            RefusalKind::Permanent,
+            format!(
+                "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|spec| spec.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     let spec = matches
         .pop()
         .context("exactly one matching agent expected")?;
-    anyhow::ensure!(
-        spec.resolved_host(this_host) == this_host,
-        "agent '{}' is owned by host '{}'; event publication must run on that host",
-        spec.bus_id(this_host),
-        spec.resolved_host(this_host)
-    );
+    if spec.resolved_host(this_host) != this_host {
+        return Err(StreamRefusal::new(
+            RefusalKind::Permanent,
+            format!(
+                "agent '{}' is owned by host '{}'; event publication must run on that host",
+                spec.bus_id(this_host),
+                spec.resolved_host(this_host)
+            ),
+        ));
+    }
     match admission {
-        StreamAdmission::Declared => anyhow::ensure!(
-            spec.streams.iter().any(|declared| declared.name == stream),
-            "agent '{}' does not declare stream '{stream}'",
-            spec.bus_id(this_host),
-        ),
+        StreamAdmission::Declared => {
+            if !spec.streams.iter().any(|declared| declared.name == stream) {
+                return Err(StreamRefusal::new(
+                    RefusalKind::Permanent,
+                    format!(
+                        "agent '{}' does not declare stream '{stream}'",
+                        spec.bus_id(this_host)
+                    ),
+                ));
+            }
+        }
         StreamAdmission::BuiltinResync => anyhow::ensure!(
             stream == crate::resync::RESYNC_STREAM,
             "built-in resync admission requires the reserved resync stream"
         ),
     }
-    anyhow::ensure!(
-        spec.desired_state.is_running(),
-        "agent '{}' is {}; refusing event while its eyes are closed",
-        spec.bus_id(this_host),
-        spec.desired_state.as_str()
-    );
+    if !spec.desired_state.is_running() {
+        return Err(StreamRefusal::new(
+            RefusalKind::RecipientNotRunning,
+            format!(
+                "agent '{}' is {}; refusing event while its eyes are closed",
+                spec.bus_id(this_host),
+                spec.desired_state.as_str()
+            ),
+        ));
+    }
     Ok(ResolvedStream {
         recipient: spec.bus_id(this_host),
     })
