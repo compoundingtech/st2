@@ -1199,7 +1199,7 @@ fn addressable_agent_dirs(
     let mut result = Vec::new();
     for host in sorted_real_entries(&agents, "host")? {
         let host_name = safe_entry_name(&host, "host")?;
-        for identity in sorted_real_entries(&host.path(), "identity")? {
+        for identity in sorted_real_identity_entries(&host.path())? {
             let identity_name = safe_entry_name(&identity, "identity")?;
             let key = crate::catalog_transaction::AgentKey {
                 host: host_name.clone(),
@@ -1236,6 +1236,25 @@ fn sorted_real_entries(dir: &Path, label: &str) -> anyhow::Result<Vec<fs::DirEnt
         );
     }
     Ok(entries)
+}
+
+fn sorted_real_identity_entries(dir: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    let mut identities = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if crate::harness_context::is_legacy_harness_context_staging_file(&entry)? {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "canonical identity path is not a real directory: {}",
+            entry.path().display()
+        );
+        identities.push(entry);
+    }
+    Ok(identities)
 }
 
 fn safe_entry_name(entry: &fs::DirEntry, label: &str) -> anyhow::Result<String> {
@@ -2516,6 +2535,76 @@ mod tests {
         );
         assert!(resolve_inbox_with_external(root, "missing", "h", Some(&external)).is_err());
     }
+
+    fn addressable_catalog(root: &Path) -> PathBuf {
+        let agent = root.join("agents/host/worker");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" { identity \"worker\"; host \"host\"; command \"true\" }\n",
+        )
+        .unwrap();
+        agent
+    }
+
+    #[test]
+    fn transition_addressability_ignores_and_preserves_exact_legacy_staging_files() {
+        let root = tempfile::tempdir().unwrap();
+        addressable_catalog(root.path());
+        let legacy = root
+            .path()
+            .join("agents/host/.harness-context.tmp-123-456");
+        fs::write(&legacy, b"stale legacy staging bytes").unwrap();
+        let transition = crate::catalog_transaction::CatalogTransition {
+            original_agents: BTreeSet::new(),
+        };
+
+        let agents = addressable_agent_dirs(root.path(), "host", Some(&transition)).unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].bus_id, "host.worker");
+        assert_eq!(
+            fs::read(&legacy).unwrap(),
+            b"stale legacy staging bytes",
+            "address resolution must not clean another process's file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transition_addressability_rejects_legacy_type_confusion_and_near_misses() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["directory", "symlink", "near-miss"] {
+            let root = tempfile::tempdir().unwrap();
+            addressable_catalog(root.path());
+            let host = root.path().join("agents/host");
+            match kind {
+                "directory" => {
+                    fs::create_dir(host.join(".harness-context.tmp-123-456")).unwrap();
+                }
+                "symlink" => {
+                    symlink(
+                        host.join("worker"),
+                        host.join(".harness-context.tmp-123-456"),
+                    )
+                    .unwrap();
+                }
+                "near-miss" => {
+                    fs::write(host.join(".harness-context.tmp-123-nope"), b"stale").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let transition = crate::catalog_transaction::CatalogTransition {
+                original_agents: BTreeSet::new(),
+            };
+            assert!(
+                addressable_agent_dirs(root.path(), "host", Some(&transition)).is_err(),
+                "{kind} must not enter the reserved compatibility exception"
+            );
+        }
+    }
+
 
     #[test]
     fn external_inbox_rejects_unsafe_or_nested_identities() {
