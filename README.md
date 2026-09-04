@@ -76,6 +76,32 @@ systemd unit was installed with an ambient `PTY_ROOT`, reinstall the unit withou
 (`st2 service install`) — the export still wins, and leaving it pins the supervisor to the old
 registry while everything else follows the catalog.
 
+### A catalog may declare how long retirement is kept
+
+`st2 up` archives retired, quiescent seats itself, so a long-lived catalog stays bounded without
+anyone remembering the chore. The grace period is `archive-after`, declared beside the registry:
+
+```kdl
+catalog {
+  pty-root "/run/agents/pty"
+  archive-after "7d"
+}
+```
+
+It accepts the usual duration spellings (`90`, `30m`, `12h`, `7d`; a bare number is seconds) and
+defaults to `7d`. `archive-after "0"` disables the automatic step without disabling
+`st2 catalog archive`. A value st2 cannot parse fails `st2 validate` rather than falling back to the
+default: archiving on a clock the operator did not write is the one outcome this setting exists to
+prevent.
+
+Each pass archives at most 25 seats, so a catalog holding hundreds of retirements drains over
+several passes, and it never queues for the authoring lock — a pass blocked behind
+`st2 catalog apply` would stall every live agent's reconciliation, and a due seat is still due next
+pass. Because st2 records no timestamp for a desired-state edit, the clock starts when the
+supervisor first observes the retirement; it keeps that observation in
+`<catalog>/.st2/retired-observed.json`, never in the spec, and drops a seat's row as soon as it
+stops being retired — so un-retiring and retiring again serves a fresh grace period.
+
 Lifecycle hooks are installed only by the explicit `st2 hooks install` command. The installer
 publishes an immutable content-addressed set, then atomically selects it with a receipt. `st2 up`
 verifies its own immutable set for Codex launches; any local workspace render that actually
@@ -221,6 +247,9 @@ have no live or dead record for any declared task (the rule `st2 doctor` already
 retirement), and be named as `supervisor` by no declaration that stays behind. `--identity` refuses
 the whole run if any named identity is ineligible; `--all-retired` reports the ineligible ones and
 archives the rest. `st2 catalog unarchive` is the exact reverse move.
+
+`st2 up` applies exactly this gate on its own once a retirement outlives `archive-after`, so these
+verbs are for the seats you do not want to wait out and for putting one back.
 
 The compact declaration shape is:
 

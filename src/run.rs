@@ -1195,6 +1195,9 @@ pub struct UpReport {
     pub other_host: Vec<String>,
     /// identities with no runnable task (unrendered).
     pub unrunnable: Vec<String>,
+    /// bus ids archived out of the live catalog this pass because their retirement outlived
+    /// `archive-after`.
+    pub archived: Vec<String>,
     /// discovery warnings (mismatches, …).
     pub warnings: Vec<String>,
     /// discovery + execution errors (non-fatal; collected).
@@ -1216,6 +1219,7 @@ impl UpReport {
         self.adopted.append(&mut other.adopted);
         self.other_host.append(&mut other.other_host);
         self.unrunnable.append(&mut other.unrunnable);
+        self.archived.append(&mut other.archived);
         self.warnings.append(&mut other.warnings);
         self.errors.append(&mut other.errors);
     }
@@ -1229,6 +1233,7 @@ impl UpReport {
             || !self.gc.is_empty()
             || !self.flapping.is_empty()
             || !self.unparked.is_empty()
+            || !self.archived.is_empty()
             || !self.warnings.is_empty()
             || !self.errors.is_empty()
     }
@@ -1730,7 +1735,7 @@ fn reconcile_pass(
     resync: Option<&crate::resync::ResyncSupervisor>,
     resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
 ) -> UpReport {
-    let _catalog_lock = {
+    let catalog_lock = {
         let span = catalog_lock_span();
         let entered = span.as_ref().map(tracing::Span::enter);
         let result = crate::CatalogLock::shared(root);
@@ -2021,7 +2026,77 @@ fn reconcile_pass(
             ));
         }
     }
+    // Auto-archive is an authoring mutation, so it needs the exclusive lock this pass's shared
+    // guard blocks. Release the read fence first: the archive step re-discovers under its own
+    // exclusive lock, which is what makes its eligibility decision current rather than a snapshot
+    // this pass took before it launched anything.
+    drop(catalog_lock);
+    archive_expired_retirements(root, this_host, &found.specs, &mut report);
     report
+}
+
+/// Most seats one auto-archive step may move. A catalog holding hundreds of retirements drains
+/// over several passes instead of one pass holding the exclusive authoring lock through all of
+/// them — the same bound `MAX_PRESENTATION_PATCHES_PER_PASS` puts on presentation repair.
+const MAX_AUTO_ARCHIVED_PER_PASS: usize = 25;
+
+/// Archive retired seats whose grace period expired — the supervisor's half of
+/// `st2 catalog archive` (dotfiles#2411, Q11).
+///
+/// `archive-after "0"` in `catalog.kdl` disables the step entirely. It never queues for the
+/// exclusive lock: a pass blocked behind `st2 catalog apply` would stall every live agent's
+/// reconciliation, and a due seat is still due next pass. Failures land as warnings, not errors —
+/// maintenance must not fail a pass that reconciled correctly.
+fn archive_expired_retirements(
+    root: &Path,
+    this_host: &str,
+    specs: &[agent_spec::spec::AgentSpec],
+    report: &mut UpReport,
+) {
+    let grace = match crate::catalog::load(root) {
+        Ok(config) => crate::catalog::archive_after(&config),
+        Err(error) => {
+            report
+                .warnings
+                .push(format!("read archive-after from catalog.kdl: {error:#}"));
+            return;
+        }
+    };
+    if grace.is_zero() || !crate::catalog_archive::pass_has_work(root, this_host, specs, grace) {
+        return;
+    }
+
+    let attempt =
+        crate::catalog_archive::auto_archive(crate::catalog_archive::AutoArchiveRequest {
+            catalog: root.to_path_buf(),
+            host: this_host.to_owned(),
+            grace,
+            limit: MAX_AUTO_ARCHIVED_PER_PASS,
+        });
+    match attempt {
+        // Contended: someone is authoring the catalog right now, and the seats stay due.
+        Ok(None) => {}
+        Ok(Some(result)) => {
+            for entry in result.archived {
+                tracing::info!(
+                    target: "st2",
+                    id = %entry.id,
+                    to = %entry.to,
+                    "archived a retired agent out of the live catalog"
+                );
+                report.archived.push(entry.id);
+            }
+            for refusal in result.refused {
+                report.warnings.push(format!(
+                    "auto-archive skipped {} [{}] {}",
+                    refusal.id, refusal.code, refusal.message
+                ));
+            }
+        }
+        Err(error) => report
+            .warnings
+            .push(format!("auto-archive retired agents: {error:#}")),
+    }
 }
 
 /// A missing Codex, pi, or omp agent must not launch against stale lifecycle hooks. Suppress the

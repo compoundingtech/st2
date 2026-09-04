@@ -865,6 +865,23 @@ records are not observable: canonical path, retired in either spelling, no live
 or dead record for any declared task, and no remaining declaration naming the
 identity as `supervisor`. `st2 catalog unarchive` is the exact reverse move.
 
+The supervisor closes the same edge without an operator. Each `st2 up` reconcile
+pass ends by archiving every local seat whose retirement outlived the catalog's
+`archive-after` grace period (default `7d`; `"0"` disables the step), applying
+the same fail-closed eligibility as the verb and archiving at most 25 seats per
+pass so one pass stays bounded. The step runs after the pass releases its shared
+lock and takes the exclusive lock non-blockingly: a contended lock skips the
+step, because a pass queued behind `st2 catalog apply` would stall every live
+agent's reconciliation and a due seat is still due next pass. st2 records no
+timestamp for a desired-state edit, so the grace period is measured from the
+supervisor's first observation of the retirement, kept in
+`.st2/retired-observed.json` (`st2.catalog-retired-observed.v1`) as host →
+identity → epoch millis and never in the spec. That ledger is reconciled to
+exactly the currently retired seats on every pass it runs, so a seat that comes
+back drops its row and a second retirement serves a fresh grace period; an
+absent or unreadable ledger restarts every clock, which errs toward keeping
+seats in the live catalog.
+
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:
 every client request and server notification arm st2 uses, the exact
