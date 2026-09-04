@@ -1674,8 +1674,13 @@ impl LivenessDebounce {
     }
 }
 
-/// Specs whose canonical agent seat this pass proved live. Desired state and whole-spec adoption
-/// are not evidence: the canonical task itself must have been observed alive or spawned successfully.
+/// Specs whose canonical agent seat this pass proved live AND whose desired state is `running`.
+/// Positive liveness is never inferred from desired state or whole-spec adoption — the canonical
+/// task itself must have been observed alive or spawned successfully. But a non-running desired
+/// state is a NEGATIVE gate: a suspended or retired agent owns no live subscription work even while
+/// its seat is still alive mid-teardown, so its resync installs and resource-Profile subscriptions
+/// are stripped this pass rather than lingering until the seat dies (dotfiles#1535). The declaration
+/// and its `resources/` are untouched; only the runtime work stops.
 fn live_resync_specs(
     specs: &[agent_spec::spec::AgentSpec],
     this_host: &str,
@@ -1692,6 +1697,9 @@ fn live_resync_specs(
     specs
         .iter()
         .filter(|spec| {
+            if !spec.desired_state.is_running() {
+                return false;
+            }
             spec.tasks.iter().any(|task| {
                 if task.name != "agent" {
                     return false;
@@ -4070,6 +4078,60 @@ mod tests {
             .map(|spec| spec.identity)
             .collect::<Vec<_>>();
         assert_eq!(eligible, vec!["observed-live", "launched", "restarted"]);
+    }
+
+    #[test]
+    fn subscription_eligibility_excludes_non_running_agents_even_with_a_live_seat() {
+        // A retired or suspended agent whose canonical seat is still alive mid-teardown owns no
+        // live subscription work: its resync installs and resource-Profile bindings must be
+        // stripped this pass, not left running until the seat dies (dotfiles#1535). The declaration
+        // (including its `resource` bindings) is untouched — only the runtime work stops.
+        let seat = || Task {
+            kind: TaskKind::Pty,
+            derived: false,
+            name: "agent".into(),
+            id: None,
+            command: Some("agent".into()),
+            argv: None,
+            cwd: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+            lifecycle: TaskLifecycle::Service,
+        };
+        let with_state = |identity: &str, state: crate::AgentDesiredState| {
+            let mut spec = spec_fixture();
+            spec.identity = identity.to_owned();
+            spec.tasks = vec![seat()];
+            spec.desired_state = state;
+            spec
+        };
+        let specs = vec![
+            with_state("running", crate::AgentDesiredState::Running),
+            with_state(
+                "retired",
+                crate::AgentDesiredState::Retired {
+                    reason: Some("Mission complete".into()),
+                },
+            ),
+            with_state(
+                "suspended",
+                crate::AgentDesiredState::Suspended {
+                    reason: "Waiting for capacity".into(),
+                },
+            ),
+        ];
+        // Every seat is observed alive, so only desired state can distinguish them.
+        let sessions = vec![
+            sess("hetz.running.agent", true),
+            sess("hetz.retired.agent", true),
+            sess("hetz.suspended.agent", true),
+        ];
+        let eligible = live_resync_specs(&specs, "hetz", &sessions, &UpReport::default())
+            .into_iter()
+            .map(|spec| spec.identity)
+            .collect::<Vec<_>>();
+        assert_eq!(eligible, vec!["running"]);
     }
 
     struct BlockingLaunchRunner {
