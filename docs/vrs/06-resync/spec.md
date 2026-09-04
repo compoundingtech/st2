@@ -120,6 +120,16 @@ meaningful.
   acknowledged upsert at the exact live transition before execution advances
   to any later task. Both paths resolve supervisor-chain carriers against the
   complete discovered spec vector, never a one-spec view.
+- Publication runs on a dedicated thread, never the thread that answers a pass's
+  acknowledged upserts, so a pass completes while publications are pending,
+  refused, or blocked on another process's lock. The watcher thread captures a
+  transition, hands it off, and applies the outcome when it returns, remaining
+  the only writer of carrier state; re-observing the carrier after an outcome is
+  what schedules the next attempt. One publication is outstanding per
+  subscription at a time. A queued publication is dropped when its subscription
+  is deactivated or removed by a refresh, while one the emitter already started
+  completes with its outcome discarded, so nothing is published to a seat whose
+  subscription the pass has already removed.
 - After lifecycle execution, each reconcile pass atomically refreshes the watch
   set through separate catalog and subscription inputs. The catalog input is
   every valid discovered declaration, including suspended and retired topology
