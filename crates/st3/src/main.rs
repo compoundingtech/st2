@@ -1372,6 +1372,7 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
             return Err(CommandExit(130).into());
         }
     };
+    let final_chunk = wait_for_exec_exit_status(client, &subject, final_chunk).await?;
     if json_output {
         print_value(&final_chunk, true)?;
     }
@@ -1384,6 +1385,29 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
         return Err(CommandExit(code.clamp(1, 255) as u8).into());
     }
     Ok(())
+}
+
+async fn wait_for_exec_exit_status(
+    client: &Client,
+    subject: &str,
+    mut chunk: SessionLogChunk,
+) -> Result<SessionLogChunk> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while chunk.exit_code.is_none() && chunk.exit_signal.is_none() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the exec exited before its status became available"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        chunk = client
+            .get(&format!(
+                "/v1/sessions/logs/{}?after={}&limit=1&previous=false&wait=false",
+                urlencoding::encode(subject),
+                u64::MAX
+            ))
+            .await?;
+    }
+    Ok(chunk)
 }
 
 fn exec_intent(
@@ -1484,7 +1508,15 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
             .subjects
             .first()
             .and_then(|item| item.actual.as_ref())
-            .is_some()
+            .is_some_and(|actual| {
+                let fields = actual.get("fields").unwrap_or(actual);
+                fields.get("runtime_id").and_then(Value::as_str).is_some()
+                    && fields
+                        .get("incarnation_id")
+                        .and_then(Value::as_str)
+                        .is_some()
+                    && fields.get("terminal").and_then(Value::as_bool).is_some()
+            })
         {
             return Ok(());
         }

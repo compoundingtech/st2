@@ -12,6 +12,23 @@ use st2::eval_spec::{Check, JsonScalar, JudgeKind, Spec as EvalSpec};
 use walkdir::WalkDir;
 
 const WAIT_TEAM_DONE: &[u8] = include_bytes!("../assets/wait-team-done.sh");
+const ST3_CONTEXT_VARIABLES: &[&str] = &[
+    "ST_PLAN",
+    "ST_PLAN_REVISION",
+    "ST_PLAN_RUN",
+    "ST_RUN_GENERATION",
+    "ST_ROOT_PLAN_RUN",
+    "ST_SCOPE",
+    "ST_WORKSPACE",
+    "ST_REQUESTER",
+    "ST_STEP",
+    "ST_STEP_RUN",
+    "ST_ATTEMPT",
+    "ST_ASSIGNEE",
+    "ST_PARENT_STEP_RUN",
+    "ST_GATE",
+    "ST_AGENT",
+];
 
 #[derive(Parser)]
 #[command(
@@ -277,6 +294,8 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
         });
         rewrite_harness_nodes(body);
         remove_legacy_context_hooks(body);
+        remove_legacy_lifecycle_metadata(body);
+        remove_reserved_context_envs(body);
         let has_restart_type = body.nodes().iter().any(|child| {
             child.name().value() == "restart"
                 && child.children().is_none()
@@ -340,6 +359,36 @@ fn remove_legacy_context_hooks(document: &mut KdlDocument) {
             remove_legacy_context_hooks(children);
         }
     }
+}
+
+fn remove_reserved_context_envs(document: &mut KdlDocument) {
+    for node in document.nodes_mut() {
+        if node.name().value() == "env"
+            && let Some(environment) = node.children_mut()
+        {
+            environment
+                .nodes_mut()
+                .retain(|entry| !is_reserved_context_variable(entry.name().value()));
+        }
+        if let Some(children) = node.children_mut() {
+            remove_reserved_context_envs(children);
+        }
+    }
+}
+
+fn remove_legacy_lifecycle_metadata(document: &mut KdlDocument) {
+    document
+        .nodes_mut()
+        .retain(|node| node.name().value() != "lifecycle" || node.children().is_none());
+    for node in document.nodes_mut() {
+        if let Some(children) = node.children_mut() {
+            remove_legacy_lifecycle_metadata(children);
+        }
+    }
+}
+
+fn is_reserved_context_variable(name: &str) -> bool {
+    ST3_CONTEXT_VARIABLES.contains(&name)
 }
 
 fn clean_claude_hook_json(content: &str) -> Option<String> {
@@ -604,7 +653,11 @@ fn transform_eval_checkpoint(
         ));
         output.push_str("          env {\n");
         for (key, value) in &step.env {
-            if key != "ST_ROOT" && key != "CATALOG" && key != "ST3_MESSAGE_ROOT" {
+            if key != "ST_ROOT"
+                && key != "CATALOG"
+                && key != "ST3_MESSAGE_ROOT"
+                && !is_reserved_context_variable(key)
+            {
                 output.push_str(&format!("            {key} {value:?}\n"));
             }
         }
@@ -778,7 +831,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" change-policy=\"agent\" {{\n    plan {:?} state=\"ready\" {{\n      goal {:?}\n",
+        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" {{\n    plan {:?} state=\"ready\" {{\n      goal {:?}\n",
         format!("eval/{name}/${{ST_PLAN_RUN}}"),
         format!("eval/{name}"),
         format!("Complete the migrated {name} eval.")
@@ -904,7 +957,11 @@ fn write_eval_agent(
     output.push_str(&format!("      restart {restart:?}\n"));
     output.push_str("      env {\n");
     for (key, value) in &agent.env {
-        if key != "ST_ROOT" && key != "CATALOG" && key != "ST3_MESSAGE_ROOT" {
+        if key != "ST_ROOT"
+            && key != "CATALOG"
+            && key != "ST3_MESSAGE_ROOT"
+            && !is_reserved_context_variable(key)
+        {
             output.push_str(&format!("        {key} {:?}\n", rewrite_bus_command(value)));
         }
     }
@@ -1387,7 +1444,13 @@ esac
     fn catalog_translation_wraps_old_agents_and_adds_restart_policy() {
         let translated = transform_declaration(
             r#"version 1
-agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
+agent "worker" {
+  host "host-a"
+  workspace "/work"
+  command "true"
+  lifecycle { lifetime "standing" }
+  env { ST_AGENT "host-a.worker"; PATH "/bin" }
+}"#,
             Some(true),
         )
         .unwrap();
@@ -1398,6 +1461,18 @@ agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
             worker.member.as_ref().unwrap().restart,
             st3::model::RestartType::Always
         );
+        assert_eq!(
+            worker
+                .member
+                .as_ref()
+                .unwrap()
+                .environment
+                .get("PATH")
+                .map(String::as_str),
+            Some("/bin")
+        );
+        assert!(!translated.contains("ST_AGENT"));
+        assert!(!translated.contains("lifetime"));
     }
 
     #[test]
