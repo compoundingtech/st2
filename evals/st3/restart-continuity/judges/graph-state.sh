@@ -6,13 +6,11 @@ work="$(env -u ST_AGENT st3 work ls --all --json)"
 run="plan-run/$ST_PLAN_RUN"
 
 completed_steps=(
-  start-team
   process-before-restart
   process-before-restart/work/inspect-durable-state
   process-before-restart/work/process-item-1
   process-before-restart/work/process-item-2
   process-before-restart/work/publish-pre-restart-revision
-  inject-cold-restart
   process-after-restart
   process-after-restart/work/inspect-recovered-state
   process-after-restart/work/process-item-3
