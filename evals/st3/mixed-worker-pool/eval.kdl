@@ -13,7 +13,7 @@ subgraph {
           agent "pool.codex" {
             workspace "${ST_WORKSPACE}"
             harness "codex" {
-              prompt "Use only st3 Small Talk. Drain and archive each message. Claim exactly one ready pool step. Write the requested marker with your ST_AGENT value. Complete that step. Do not claim another pool step."
+              prompt "Use only st3 Small Talk. Read and archive each message. Run st3 work ls after a work notice. Claim one ready pool step. If another agent wins it, claim the other ready step. Follow its goal, complete it, and claim no second step."
               args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
           }
@@ -22,13 +22,13 @@ subgraph {
             under "agent/pool.codex" reason="share one bounded work pool"
             harness "claude" {
               dev-channels #true
-              prompt "Use only st3 Small Talk. Drain and archive each message. Claim exactly one ready pool step. Write the requested marker with your ST_AGENT value. Complete that step. Do not claim another pool step."
+              prompt "Use only st3 Small Talk. Read and archive each message. Run st3 work ls after a work notice. Claim one ready pool step. If another agent wins it, claim the other ready step. Follow its goal, complete it, and claim no second step."
               args "--permission-mode" "bypassPermissions"
             }
           }
         }
-        gate "Codex is ready" { field "status" "agent/pool.codex" "is" "ready" }
-        gate "Claude is ready" { field "status" "agent/pool.claude" "is" "ready" }
+        gate "Codex is reachable" { field "reachability" "agent/pool.codex" "is" "reachable" }
+        gate "Claude is reachable" { field "reachability" "agent/pool.claude" "is" "reachable" }
       }
 
       step "pool-a" timeout="10m" {
