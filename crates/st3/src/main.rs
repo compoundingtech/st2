@@ -24,10 +24,11 @@ use st3::model::{
     PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState,
     PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
     PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ResourceUnwatchRequest,
+    ResourceWatchRequest, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -484,6 +485,10 @@ enum ResourceCommand {
     Ls(ResourceIdentityArgs),
     Read(ResourceReadArgs),
     Remove(ResourceReadArgs),
+    /// Send a message when selected external resource facts change.
+    Watch(ResourceWatchArgs),
+    /// Stop one resource subscription.
+    Unwatch(ResourceUnwatchArgs),
 }
 
 #[derive(Args)]
@@ -514,6 +519,23 @@ struct ResourceReadArgs {
 }
 
 #[derive(Args)]
+struct ResourceWatchArgs {
+    provider: String,
+    locator: String,
+    #[arg(long = "on", required = true)]
+    fields: Vec<String>,
+    #[arg(long = "to", alias = "as", env = "ST_AGENT")]
+    target: Option<String>,
+}
+
+#[derive(Args)]
+struct ResourceUnwatchArgs {
+    subscription: String,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
 struct ClaimArgs {
     subject: String,
     kind: String,
@@ -536,7 +558,7 @@ enum ReviewCommand {
 enum WorkCommand {
     Ls {
         #[arg(long = "as", env = "ST_AGENT")]
-        assignee: Option<String>,
+        actor: Option<String>,
         #[arg(long)]
         all: bool,
     },
@@ -2451,6 +2473,62 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 .await?;
             print_value(&record, json_output)
         }
+        ResourceCommand::Watch(args) => {
+            let target = args
+                .target
+                .context("a resource watch needs --to or ST_AGENT")?;
+            let stable = serde_json::to_vec(&json!({
+                "provider": args.provider,
+                "locator": args.locator,
+                "fields": args.fields,
+                "target": target,
+            }))?;
+            let key = hex::encode(Sha256::digest(stable));
+            let response: ResourceWatchView = client
+                .post(
+                    "/v1/resource-watches",
+                    &ResourceWatchRequest {
+                        provider: args.provider,
+                        locator: args.locator,
+                        fields: args.fields,
+                        to: Some(target),
+                        idempotency_key: format!("resource-watch:{key}"),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!(
+                    "{}\t{}\t{}",
+                    response.resource, response.observer, response.subscription
+                );
+                Ok(())
+            }
+        }
+        ResourceCommand::Unwatch(args) => {
+            let actor = args
+                .actor
+                .context("a resource unwatch needs --as or ST_AGENT")?;
+            let subscription = args
+                .subscription
+                .strip_prefix("subscription/")
+                .unwrap_or(&args.subscription);
+            let response: Value = client
+                .post(
+                    &format!("/v1/resource-watches/{}", urlencoding::encode(subscription)),
+                    &ResourceUnwatchRequest {
+                        actor: Some(normalize_agent_subject(&actor)),
+                        idempotency_key: format!(
+                            "resource-unwatch:{}:{}",
+                            subscription,
+                            normalize_agent_subject(&actor)
+                        ),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
     }
 }
 
@@ -2550,11 +2628,11 @@ async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) 
 
 async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
     match command {
-        WorkCommand::Ls { assignee, all } => {
-            let path = if let Some(assignee) = assignee {
+        WorkCommand::Ls { actor, all } => {
+            let path = if let Some(actor) = actor {
                 format!(
-                    "/v1/work?assignee={}&include_terminal={all}",
-                    urlencoding::encode(&assignee)
+                    "/v1/work?actor={}&include_terminal={all}",
+                    urlencoding::encode(&actor)
                 )
             } else {
                 format!("/v1/work?include_terminal={all}")
@@ -2567,7 +2645,7 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 println!(
                     "{}\t{}\t{}\t{}",
                     step.status,
-                    step.assignee.as_deref().unwrap_or("-"),
+                    work_actor_label(&step),
                     step.subject,
                     step.title.as_deref().unwrap_or(&step.step)
                 );
@@ -2591,7 +2669,7 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 println!(
                     "{}\t{}\t{}",
                     step.status,
-                    step.assignee.as_deref().unwrap_or("-"),
+                    work_actor_label(&step),
                     step.subject
                 );
                 if let Some(title) = step.title {
@@ -3298,7 +3376,7 @@ fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNode
                 GraphNodeState {
                     label: step.title.clone().unwrap_or_else(|| step.step.clone()),
                     state: format!("{}{attempt}", step.status),
-                    assignee: step.assignee.as_deref().map(short_actor).map(str::to_owned),
+                    assignee: work_actor(step).map(short_actor).map(str::to_owned),
                 },
             );
         }
@@ -3510,9 +3588,7 @@ fn render_plan_steps(
 fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str) {
     use std::fmt::Write as _;
 
-    let actor = step
-        .assignee
-        .as_deref()
+    let actor = work_actor(step)
         .map(short_actor)
         .map(|actor| format!(" · {actor}"))
         .unwrap_or_default();
@@ -3559,6 +3635,27 @@ fn is_active_graph_state(status: &str) -> bool {
 
 fn short_actor(actor: &str) -> &str {
     actor.strip_prefix("agent/").unwrap_or(actor)
+}
+
+fn work_actor(step: &StepRunView) -> Option<&str> {
+    step.claimant
+        .as_deref()
+        .or(step.assigned_to.as_deref())
+        .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
+}
+
+fn work_actor_label(step: &StepRunView) -> String {
+    if let Some(actor) = work_actor(step) {
+        short_actor(actor).to_owned()
+    } else if !step.available_to.is_empty() {
+        step.available_to
+            .iter()
+            .map(|actor| short_actor(actor))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "-".into()
+    }
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -4291,6 +4388,8 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
 
 async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
     const TAG_PREFIX: &str = "st3-work:";
+    let incarnation = current_agent_incarnation(client, subject).await?;
+    let incarnation_key = work_incarnation_key(incarnation.as_deref());
     let messages: Vec<MessageView> = client
         .get(&format!(
             "/v1/messages?to={}&include_closed=true",
@@ -4305,7 +4404,7 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
         .collect::<BTreeSet<_>>();
     let work: Vec<StepRunView> = client
         .get(&format!(
-            "/v1/work?assignee={}&include_terminal=true",
+            "/v1/work?actor={}&include_terminal=true",
             urlencoding::encode(subject)
         ))
         .await?;
@@ -4313,10 +4412,19 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
         .iter()
         .filter(|message| matches!(message.status.as_str(), "delivered" | "accepted"))
     {
-        let Some((step_subject, attempt)) = work_message_target(message) else {
+        let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
+            work_message_target(message)
+        else {
             continue;
         };
-        if !work_message_should_close(&work, step_subject, attempt) {
+        if !work_message_should_close(
+            &work,
+            step_subject,
+            attempt,
+            readiness_epoch,
+            message_incarnation,
+            &incarnation_key,
+        ) {
             continue;
         }
         if message.status == "delivered" {
@@ -4328,7 +4436,10 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
         .iter()
         .filter(|step| step.status == "ready" && should_notify_work_message(step, &work))
     {
-        let tag_value = format!("{}@{}", step.subject, step.attempt);
+        let tag_value = format!(
+            "{}@{}@{}@{}",
+            step.subject, step.attempt, step.readiness_epoch, incarnation_key
+        );
         if present.contains(&tag_value) {
             continue;
         }
@@ -4345,29 +4456,34 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
 fn should_notify_work_message(step: &StepRunView, work: &[StepRunView]) -> bool {
     !work.iter().any(|candidate| {
         candidate.run == step.run
-            && candidate.assignee == step.assignee
+            && candidate.assigned_to == step.assigned_to
+            && candidate.available_to == step.available_to
             && candidate.step.len() < step.step.len()
             && step.step.starts_with(&format!("{}/", candidate.step))
     })
 }
 
-fn work_message_target(message: &MessageView) -> Option<(&str, u32)> {
+fn work_message_target(message: &MessageView) -> Option<(&str, u32, u32, &str)> {
     message.tags.iter().find_map(|tag| {
-        tag.strip_prefix("st3-work:")
-            .and_then(|value| value.rsplit_once('@'))
-            .and_then(|(step_subject, attempt)| {
-                attempt
-                    .parse::<u32>()
-                    .ok()
-                    .map(|attempt| (step_subject, attempt))
-            })
+        let mut parts = tag.strip_prefix("st3-work:")?.rsplitn(4, '@');
+        let incarnation = parts.next()?;
+        let readiness_epoch = parts.next()?.parse::<u32>().ok()?;
+        let attempt = parts.next()?.parse::<u32>().ok()?;
+        let step_subject = parts.next()?;
+        Some((step_subject, attempt, readiness_epoch, incarnation))
     })
 }
 
-fn work_message_was_acknowledged(work: &[StepRunView], step_subject: &str, attempt: u32) -> bool {
+fn work_message_was_acknowledged(
+    work: &[StepRunView],
+    step_subject: &str,
+    attempt: u32,
+    readiness_epoch: u32,
+) -> bool {
     work.iter().any(|step| {
         step.subject == step_subject
             && step.attempt == attempt
+            && step.readiness_epoch == readiness_epoch
             && matches!(
                 step.status.as_str(),
                 "claimed" | "working" | "completed" | "failed" | "cancelled"
@@ -4375,11 +4491,29 @@ fn work_message_was_acknowledged(work: &[StepRunView], step_subject: &str, attem
     })
 }
 
-fn work_message_should_close(work: &[StepRunView], step_subject: &str, attempt: u32) -> bool {
-    let current = work
-        .iter()
-        .any(|step| step.subject == step_subject && step.attempt == attempt);
-    !current || work_message_was_acknowledged(work, step_subject, attempt)
+fn work_message_should_close(
+    work: &[StepRunView],
+    step_subject: &str,
+    attempt: u32,
+    readiness_epoch: u32,
+    message_incarnation: &str,
+    current_incarnation: &str,
+) -> bool {
+    let current = work.iter().any(|step| {
+        step.subject == step_subject
+            && step.attempt == attempt
+            && step.readiness_epoch == readiness_epoch
+    });
+    !current
+        || message_incarnation != current_incarnation
+        || work_message_was_acknowledged(work, step_subject, attempt, readiness_epoch)
+}
+
+fn work_incarnation_key(incarnation: Option<&str>) -> String {
+    incarnation.map_or_else(
+        || "unknown".into(),
+        |value| hex::encode(Sha256::digest(value.as_bytes()))[..12].to_owned(),
+    )
 }
 
 fn work_message_request(
@@ -4388,7 +4522,7 @@ fn work_message_request(
     tag_value: String,
 ) -> MessageSendRequest {
     MessageSendRequest {
-        idempotency_key: format!("work-message:{}:{}", step.subject, step.attempt),
+        idempotency_key: format!("work-message:{subject}:{tag_value}"),
         from: "st3/runtime".into(),
         to: subject.into(),
         content: work_notification(step),
@@ -4440,21 +4574,18 @@ fn work_notification(step: &StepRunView) -> String {
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
     let work: Vec<StepRunView> = client
-        .get(&format!(
-            "/v1/work?assignee={}",
-            urlencoding::encode(subject)
-        ))
+        .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
         .await?;
     for step in work.into_iter().filter(|step| {
         matches!(step.status.as_str(), "claimed" | "working")
-            && step.lease_owner.as_deref() == Some(subject)
+            && step.claimant.as_deref() == Some(subject)
     }) {
         let _: StepRunView = client
             .post(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
                 &WorkRequest {
                     actor: Some(subject.into()),
-                    incarnation: step.lease_incarnation,
+                    incarnation: step.claim_incarnation,
                     summary: None,
                     reason: None,
                     evidence: Vec::new(),
@@ -5058,31 +5189,41 @@ mod tests {
             definition_hash: "definition".into(),
             status: "ready".into(),
             attempt: 2,
-            assignee: Some("agent/worker".into()),
+            assigned_to: Some("agent/worker".into()),
+            available_to: Vec::new(),
+            agentless: false,
             title: Some("Build the change".into()),
             goals: vec!["Implement and test the requested change.".into()],
             under: Vec::new(),
             worker_reported: false,
-            lease_owner: None,
-            lease_incarnation: None,
-            lease_expires_at_unix_ms: None,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         };
 
-        let request = work_message_request("agent/worker", &step, "step-run/run-1/build@2".into());
+        let request = work_message_request(
+            "agent/worker",
+            &step,
+            "step-run/run-1/build@2@1@incarnation".into(),
+        );
 
         assert_eq!(request.from, "st3/runtime");
         assert_eq!(request.to, "agent/worker");
         assert_eq!(
             request.idempotency_key,
-            "work-message:step-run/run-1/build:2"
+            "work-message:agent/worker:step-run/run-1/build@2@1@incarnation"
         );
         assert_eq!(
             request.tags,
-            ["st3-work:step-run/run-1/build@2", "plan-run:plan-run/run-1"]
+            [
+                "st3-work:step-run/run-1/build@2@1@incarnation",
+                "plan-run:plan-run/run-1"
+            ]
         );
         assert!(
             request
@@ -5109,28 +5250,36 @@ mod tests {
         };
         assert_eq!(
             work_message_target(&message),
-            Some(("step-run/run-1/build", 2))
+            Some(("step-run/run-1/build", 2, 1, "incarnation"))
         );
         assert!(!work_message_was_acknowledged(
             std::slice::from_ref(&step),
             "step-run/run-1/build",
-            2
+            2,
+            1,
         ));
         assert!(!work_message_should_close(
             std::slice::from_ref(&step),
             "step-run/run-1/build",
-            2
+            2,
+            1,
+            "incarnation",
+            "incarnation",
         ));
         assert!(work_message_should_close(
             std::slice::from_ref(&step),
             "step-run/old-generation/build",
-            2
+            2,
+            1,
+            "incarnation",
+            "incarnation",
         ));
         step.status = "claimed".into();
         assert!(work_message_was_acknowledged(
             &[step],
             "step-run/run-1/build",
-            2
+            2,
+            1,
         ));
     }
 
@@ -5144,14 +5293,17 @@ mod tests {
             definition_hash: "definition".into(),
             status: "ready".into(),
             attempt: 1,
-            assignee: Some(assignee.into()),
+            assigned_to: Some(assignee.into()),
+            available_to: Vec::new(),
+            agentless: false,
             title: None,
             goals: Vec::new(),
             under: Vec::new(),
             worker_reported: false,
-            lease_owner: None,
-            lease_incarnation: None,
-            lease_expires_at_unix_ms: None,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,
             created_at_unix_ms: 1,
@@ -5321,7 +5473,9 @@ mod tests {
             definition_hash: "definition".into(),
             status: status.into(),
             attempt: 1,
-            assignee: assignee.map(str::to_owned),
+            assigned_to: assignee.map(str::to_owned),
+            available_to: Vec::new(),
+            agentless: assignee.is_none(),
             title: Some(match step.rsplit('/').next().unwrap_or(step) {
                 "rename" | "change" => "Change the package".into(),
                 "inspect" => "Inspect the package".into(),
@@ -5330,9 +5484,10 @@ mod tests {
             goals: Vec::new(),
             under: Vec::new(),
             worker_reported: false,
-            lease_owner: None,
-            lease_incarnation: None,
-            lease_expires_at_unix_ms: None,
+            claimant: None,
+            claim_incarnation: None,
+            claim_expires_at_unix_ms: None,
+            readiness_epoch: 1,
             blocked_reason: None,
             not_before_unix_ms: None,
             created_at_unix_ms: 1,

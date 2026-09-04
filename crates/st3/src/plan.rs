@@ -6,8 +6,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec, RetrySpec,
-    RevisionCutover, St3Error, StepSpec, UsedPlanSpec,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec,
+    RetrySpec, RevisionCutover, St3Error, StepSpec, UsedPlanSpec, WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
@@ -180,6 +180,11 @@ fn parse_plan(
     let mut gates = Vec::new();
     let mut steps = BTreeMap::new();
     let mut display_order = Vec::new();
+    let mut assigned_to = None;
+    let mut available_to = Vec::new();
+    let mut agentless = false;
+    let mut completion = None;
+    let mut finally_seen = false;
     let mut produces_seen = false;
     let mut baseline_names = BTreeSet::new();
     let mut gate_names = BTreeSet::new();
@@ -188,6 +193,35 @@ fn parse_plan(
     for child in children.nodes() {
         match child.name().value() {
             "goal" => goals.push(plain_string(child)?),
+            "assigned-to" => {
+                if assigned_to.is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `assigned-to`"),
+                    ));
+                }
+                assigned_to = Some(normalize_assignee(&first_string(child)?, default_host));
+            }
+            "available-to" => {
+                let agent = normalize_assignee(&first_string(child)?, default_host);
+                if available_to.contains(&agent) {
+                    return Err(St3Error::new(
+                        "duplicate-work-agent",
+                        format!("plan `{id}` repeats available agent `{agent}`"),
+                    ));
+                }
+                available_to.push(agent);
+            }
+            "agentless" => {
+                if agentless {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `agentless`"),
+                    ));
+                }
+                ensure_bare(child)?;
+                agentless = true;
+            }
             "baseline" => {
                 let baseline = parse_baseline(child)?;
                 if !baseline_names.insert(baseline.name.clone()) {
@@ -222,7 +256,7 @@ fn parse_plan(
                 gates.push(gate);
             }
             "step" => {
-                let step = parse_step(child, "", default_host)?;
+                let step = parse_step(child, "", default_host, false)?;
                 if steps.insert(step.id.clone(), step.clone()).is_some() {
                     return Err(St3Error::new(
                         "duplicate-step",
@@ -230,6 +264,56 @@ fn parse_plan(
                     ));
                 }
                 display_order.push(step.id);
+            }
+            "completion" => {
+                if completion.is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `completion`"),
+                    ));
+                }
+                completion = Some(parse_completion(child, default_host)?);
+            }
+            "finally" => {
+                if finally_seen {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `finally`"),
+                    ));
+                }
+                ensure_bare(child)?;
+                let body = child.children().ok_or_else(|| {
+                    St3Error::new(
+                        "empty-finally",
+                        format!("plan `{id}` has an empty finally block"),
+                    )
+                })?;
+                if body.nodes().is_empty() {
+                    return Err(St3Error::new(
+                        "empty-finally",
+                        format!("plan `{id}` has an empty finally block"),
+                    ));
+                }
+                for final_node in body.nodes() {
+                    if final_node.name().value() != "step" {
+                        return Err(St3Error::new(
+                            "invalid-finally-child",
+                            format!(
+                                "plan `{id}` finally cannot contain `{}`",
+                                final_node.name().value()
+                            ),
+                        ));
+                    }
+                    let step = parse_step(final_node, "", default_host, true)?;
+                    if steps.insert(step.id.clone(), step.clone()).is_some() {
+                        return Err(St3Error::new(
+                            "duplicate-step",
+                            format!("plan `{id}` repeats step `{}`", step.id),
+                        ));
+                    }
+                    display_order.push(step.id);
+                }
+                finally_seen = true;
             }
             "subgraph" => {
                 if subgraph_kdl.is_some() {
@@ -266,13 +350,26 @@ fn parse_plan(
         }
     }
     validate_goal_count(&format!("plan `{id}`"), &goals, true)?;
-    if steps.is_empty() {
-        return Err(St3Error::new(
-            "empty-plan",
-            format!("plan `{id}` has no steps"),
-        ));
-    }
+    let work_selector = build_work_selector(
+        &format!("plan `{id}`"),
+        assigned_to,
+        available_to,
+        agentless,
+    )?;
     validate_dependencies(&id, &steps)?;
+    if let Some(CompletionSpec::Dependencies { dependencies }) = &completion {
+        validate_dependency_targets(&id, "completion", dependencies, &steps)?;
+        for dependency in dependencies {
+            if let DependencySpec::Step { step, .. } = dependency
+                && steps[step].finally
+            {
+                return Err(St3Error::new(
+                    "completion-depends-on-final-step",
+                    format!("completion in plan `{id}` cannot depend on final step `{step}`"),
+                ));
+            }
+        }
+    }
     let mut plan = PlanSpec {
         subject: format!("plan/{id}"),
         id,
@@ -284,6 +381,8 @@ fn parse_plan(
         revision_reviewer,
         revision_cutover,
         subgraph_kdl,
+        work_selector,
+        completion,
         goals,
         baselines,
         products,
@@ -295,12 +394,14 @@ fn parse_plan(
     Ok(plan)
 }
 
-fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<StepSpec, St3Error> {
+fn parse_step(
+    node: &KdlNode,
+    parent_path: &str,
+    default_host: &str,
+    finally: bool,
+) -> Result<StepSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(
-        node,
-        &["timeout", "finally", "revisions", "revision-reviewer"],
-    )?;
+    ensure_only_properties(node, &["timeout", "revisions", "revision-reviewer"])?;
     let id = first_string(node)?;
     validate_id(&id, "step")?;
     let path = if parent_path.is_empty() {
@@ -311,12 +412,13 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     let timeout_ms = property_string(node, "timeout")?
         .map(|value| parse_duration(&value))
         .transpose()?;
-    let finally = property_bool(node, "finally")?.unwrap_or(false);
     let revisions_human_only = parse_revision_protection(node)?;
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let mut title = None;
     let mut goals = Vec::new();
     let mut assigned_to = None;
+    let mut available_to = Vec::new();
+    let mut agentless = false;
     let mut dependencies = Vec::new();
     let mut baselines = Vec::new();
     let mut documents = Vec::new();
@@ -336,7 +438,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
             let name = child.name().value();
             if !matches!(
                 name,
-                "goal" | "baseline" | "gate" | "depends-on" | "document"
+                "goal" | "baseline" | "gate" | "depends-on" | "document" | "available-to"
             ) && !names.insert(name.to_owned())
             {
                 return Err(St3Error::new(
@@ -359,6 +461,20 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
                 }
                 "assigned-to" => {
                     assigned_to = Some(normalize_assignee(&first_string(child)?, default_host))
+                }
+                "available-to" => {
+                    let agent = normalize_assignee(&first_string(child)?, default_host);
+                    if available_to.contains(&agent) {
+                        return Err(St3Error::new(
+                            "duplicate-work-agent",
+                            format!("step `{path}` repeats available agent `{agent}`"),
+                        ));
+                    }
+                    available_to.push(agent);
+                }
+                "agentless" => {
+                    ensure_bare(child)?;
+                    agentless = true;
                 }
                 "depends-on" => dependencies.extend(parse_dependencies(child, default_host)?),
                 "document" => documents.push(parse_step_document(child)?),
@@ -416,6 +532,12 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         }
     }
     validate_goal_count(&format!("step `{path}`"), &goals, false)?;
+    let work_selector = build_work_selector(
+        &format!("step `{path}`"),
+        assigned_to,
+        available_to,
+        agentless,
+    )?;
     let mut step = StepSpec {
         id,
         path,
@@ -424,7 +546,7 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
         timeout_ms,
         retry,
         finally,
-        assigned_to,
+        work_selector,
         revision_owners,
         revisions_human_only,
         revision_reviewer,
@@ -442,6 +564,84 @@ fn parse_step(node: &KdlNode, parent_path: &str, default_host: &str) -> Result<S
     validate_variables(&serde_json::to_value(&step).map_err(internal)?)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
+}
+
+fn build_work_selector(
+    context: &str,
+    assigned_to: Option<String>,
+    mut available_to: Vec<String>,
+    agentless: bool,
+) -> Result<Option<WorkSelector>, St3Error> {
+    let selected = usize::from(assigned_to.is_some())
+        + usize::from(!available_to.is_empty())
+        + usize::from(agentless);
+    if selected > 1 {
+        return Err(St3Error::new(
+            "conflicting-work-selector",
+            format!("{context} must use only one of `assigned-to`, `available-to`, or `agentless`"),
+        ));
+    }
+    available_to.sort();
+    Ok(if let Some(agent) = assigned_to {
+        Some(WorkSelector::Assigned { agent })
+    } else if !available_to.is_empty() {
+        Some(WorkSelector::Available {
+            agents: available_to,
+        })
+    } else if agentless {
+        Some(WorkSelector::Agentless)
+    } else {
+        None
+    })
+}
+
+fn parse_completion(node: &KdlNode, default_host: &str) -> Result<CompletionSpec, St3Error> {
+    ensure_bare(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-completion", "completion is empty"))?;
+    let mut when = None;
+    let mut dependencies = None;
+    for child in body.nodes() {
+        match child.name().value() {
+            "when" if when.is_none() => when = Some(plain_string(child)?),
+            "depends-on" if dependencies.is_none() => {
+                dependencies = Some(parse_dependencies(child, default_host)?)
+            }
+            "when" | "depends-on" => {
+                return Err(St3Error::new(
+                    "duplicate-completion-field",
+                    format!("completion repeats `{}`", child.name().value()),
+                ));
+            }
+            other => {
+                return Err(St3Error::new(
+                    "invalid-completion-field",
+                    format!("completion cannot contain `{other}`"),
+                ));
+            }
+        }
+    }
+    match (when, dependencies) {
+        (Some(value), None) if value == "all-steps-exhausted" => {
+            Ok(CompletionSpec::AllStepsExhausted)
+        }
+        (Some(value), None) => Err(St3Error::new(
+            "invalid-completion-condition",
+            format!("completion condition `{value}` is not registered"),
+        )),
+        (None, Some(dependencies)) if !dependencies.is_empty() => {
+            Ok(CompletionSpec::Dependencies { dependencies })
+        }
+        (Some(_), Some(_)) => Err(St3Error::new(
+            "conflicting-completion-condition",
+            "completion cannot contain both `when` and `depends-on`",
+        )),
+        _ => Err(St3Error::new(
+            "empty-completion",
+            "completion needs `when` or `depends-on`",
+        )),
+    }
 }
 
 fn parse_revision_protection(node: &KdlNode) -> Result<bool, St3Error> {
@@ -829,14 +1029,20 @@ fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
 
 fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Result<(), St3Error> {
     for step in steps.values() {
+        validate_dependency_targets(
+            plan,
+            &format!("step `{}`", step.id),
+            &step.dependencies,
+            steps,
+        )?;
         for dependency in &step.dependencies {
             if let DependencySpec::Step { step: target, .. } = dependency
-                && !steps.contains_key(target)
+                && steps[target].finally != step.finally
             {
                 return Err(St3Error::new(
-                    "unknown-step-dependency",
+                    "cross-phase-dependency",
                     format!(
-                        "step `{}` in plan `{plan}` depends on unknown step `{target}`",
+                        "step `{}` in plan `{plan}` cannot depend on step `{target}` from another phase",
                         step.id
                     ),
                 ));
@@ -912,6 +1118,25 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
     let mut visited = BTreeSet::new();
     for id in steps.keys() {
         visit(id, steps, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn validate_dependency_targets(
+    plan: &str,
+    context: &str,
+    dependencies: &[DependencySpec],
+    steps: &BTreeMap<String, StepSpec>,
+) -> Result<(), St3Error> {
+    for dependency in dependencies {
+        if let DependencySpec::Step { step: target, .. } = dependency
+            && !steps.contains_key(target)
+        {
+            return Err(St3Error::new(
+                "unknown-step-dependency",
+                format!("{context} in plan `{plan}` depends on unknown step `{target}`"),
+            ));
+        }
     }
     Ok(())
 }
@@ -1156,17 +1381,6 @@ fn property_string(node: &KdlNode, name: &str) -> Result<Option<String>, St3Erro
     }
 }
 
-fn property_bool(node: &KdlNode, name: &str) -> Result<Option<bool>, St3Error> {
-    match node.get(name) {
-        None => Ok(None),
-        Some(KdlValue::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(St3Error::new(
-            "invalid-property",
-            format!("property `{name}` must be a boolean"),
-        )),
-    }
-}
-
 fn child_string(document: &KdlDocument, name: &str) -> Result<Option<String>, St3Error> {
     let nodes = document
         .nodes()
@@ -1256,7 +1470,10 @@ subgraph {
       }
       step "two" { depends-on { step "start" completed } }
       step "join" { depends-on { step "one" completed; step "two" completed } }
-      step "cleanup" finally=#true { subgraph { scope "eval/demo/${ST_PLAN_RUN}" { stop } } }
+      completion { when "all-steps-exhausted" }
+      finally {
+        step "cleanup" { subgraph { scope "eval/demo/${ST_PLAN_RUN}" { stop } } }
+      }
     }
   }
 }
@@ -1437,6 +1654,7 @@ subgraph {
       produces { resource "artifact" { state "published" } }
       gate "artifact is valid" { field "valid" "resource/artifact" is #true }
     }
+
     step "publish" { depends-on { step "build" completed } }
   }
 }
@@ -1454,6 +1672,82 @@ subgraph {
         assert_eq!(plan.steps["build"].products.len(), 1);
         assert_eq!(plan.steps["build"].gates.len(), 1);
         assert!(plan.steps["publish"].goals.is_empty());
+    }
+
+    #[test]
+    fn selectors_completion_and_finally_use_the_explicit_language() {
+        let intent = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "pool" state="ready" {
+    goal "Complete the pool work."
+    available-to "agent/node.one"
+    available-to "agent/node.two"
+    completion { depends-on { step "assigned" completed } }
+    step "inherited" { }
+    step "assigned" {
+      assigned-to "agent/node.one"
+      depends-on { step "inherited" completed }
+    }
+    finally { step "cleanup" { agentless } }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let plan = &intent.plans["pool"];
+        assert_eq!(
+            plan.work_selector,
+            Some(crate::model::WorkSelector::Available {
+                agents: vec!["agent/node.one".into(), "agent/node.two".into()]
+            })
+        );
+        assert_eq!(plan.steps["inherited"].work_selector, None);
+        assert_eq!(
+            plan.steps["assigned"].work_selector,
+            Some(crate::model::WorkSelector::Assigned {
+                agent: "agent/node.one".into()
+            })
+        );
+        assert!(plan.steps["cleanup"].finally);
+        assert_eq!(
+            plan.steps["cleanup"].work_selector,
+            Some(crate::model::WorkSelector::Agentless)
+        );
+        assert!(matches!(
+            plan.completion,
+            Some(crate::model::CompletionSpec::Dependencies { .. })
+        ));
+
+        for source in [
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Reject selectors."; assigned-to "agent/node.one"; agentless; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Reject selectors."; available-to "agent/node.one"; available-to "agent/node.one"; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Reject completion."; completion { when "all-steps-exhausted"; depends-on { step "work" completed } }; step "work" { } } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Reject a final completion dependency."; completion { depends-on { step "cleanup" completed } }; finally { step "cleanup" { } } } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } }"#,
+        ] {
+            assert!(crate::graph::parse_intent(source, "node").is_err());
+        }
+    }
+
+    #[test]
+    fn a_zero_step_plan_is_valid_and_has_no_implicit_completion() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+subgraph { plan "standing" state="ready" { goal "Keep the agent available."; agentless } }"#,
+            "node",
+        )
+        .unwrap();
+        let plan = &intent.plans["standing"];
+        assert!(plan.steps.is_empty());
+        assert!(plan.completion.is_none());
     }
 
     #[test]

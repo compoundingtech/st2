@@ -196,7 +196,7 @@ They do not have direct st2 command contracts.
 | `doc put`, `doc get`, and `doc list` | Manages immutable document versions and selected name bindings. |
 | `claim` | Publishes one registered typed observation. |
 | `review approve`, `reject`, and `revise` | Records a human review decision on a resource. |
-| `work ls`, `show`, `claim`, `renew`, `progress`, `complete`, `fail`, and `release` | Operates durable plan-step leases and results. |
+| `work ls`, `show`, `claim`, `renew`, `progress`, `complete`, `fail`, and `release` | Operates durable plan-step claims and results. |
 | `work publish-plan` and `work revise` | Publishes a produced plan or a reviewed plan revision. |
 | `gate-result` | Posts a capability-bound running gate result. |
 
@@ -265,7 +265,7 @@ These surfaces are additions, not st2 parity gaps.
 | Root `resource`, `person`, and `account` | Declares observed graph subjects and actor identities. |
 | `supervisor` and `terminal-control` | Applies declared bounded screen input and durable supervision decisions. |
 | `link` | Holds or voids work when a required subject is unreachable. |
-| `plan` and plan steps | Runs durable work graphs with claims, leases, reviews, and nested plans. |
+| `plan` and plan steps | Runs durable work graphs with claims, reviews, and nested plans. |
 | `message` and `schedule` | Declares graph messages and clock-triggered messages. |
 | Checkpoints and gates | Controls ordered readiness, completion, and eval verdicts. |
 

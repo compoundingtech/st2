@@ -196,6 +196,21 @@ pub struct RetrySpec {
     pub backoff_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WorkSelector {
+    Assigned { agent: String },
+    Available { agents: Vec<String> },
+    Agentless,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CompletionSpec {
+    AllStepsExhausted,
+    Dependencies { dependencies: Vec<DependencySpec> },
+}
+
 impl Default for RetrySpec {
     fn default() -> Self {
         Self {
@@ -215,7 +230,8 @@ pub struct StepSpec {
     pub timeout_ms: Option<u64>,
     pub retry: RetrySpec,
     pub finally: bool,
-    pub assigned_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_selector: Option<WorkSelector>,
     #[serde(default)]
     pub revision_owners: Vec<String>,
     #[serde(default)]
@@ -255,6 +271,10 @@ pub struct PlanSpec {
     pub revision_cutover: RevisionCutover,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subgraph_kdl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_selector: Option<WorkSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<CompletionSpec>,
     pub goals: Vec<String>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
@@ -394,8 +414,68 @@ pub struct NormalizedIntent {
     pub checkpoints: Vec<CheckpointSpec>,
     #[serde(default)]
     pub plans: BTreeMap<String, PlanSpec>,
+    #[serde(default)]
+    pub plan_run_cancellations: Vec<PlanRunCancellation>,
     pub document_refs: BTreeSet<String>,
     pub normalized: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanRunCancellation {
+    pub run: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ObserverSpec {
+    pub resource: String,
+    pub provider: String,
+    pub locator: String,
+    pub fields: Vec<String>,
+    pub stopped: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionSpec {
+    pub observer: String,
+    pub to: String,
+    pub fields: Vec<String>,
+    pub delivery: String,
+    pub stopped: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceWatchRequest {
+    pub provider: String,
+    pub locator: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceUnwatchRequest {
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceWatchView {
+    pub resource: String,
+    pub observer: String,
+    pub subscription: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceObservationOutcome {
+    pub baseline: bool,
+    pub changed_fields: Vec<String>,
+    #[serde(default)]
+    pub observation_claim: Option<String>,
+    pub message_subjects: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -748,6 +828,9 @@ pub struct QuickAgentRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuickAgentResponse {
     pub subject: String,
+    pub plan: String,
+    pub plan_run: String,
+    pub generation: String,
     pub runtime_id: String,
     pub event_cursor: u64,
     pub incarnation_id: Option<String>,
@@ -923,16 +1006,20 @@ pub struct StepRunView {
     pub definition_hash: String,
     pub status: String,
     pub attempt: u32,
-    pub assignee: Option<String>,
+    pub assigned_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_to: Vec<String>,
+    pub agentless: bool,
     pub title: Option<String>,
     #[serde(default)]
     pub goals: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
     pub worker_reported: bool,
-    pub lease_owner: Option<String>,
-    pub lease_incarnation: Option<String>,
-    pub lease_expires_at_unix_ms: Option<u128>,
+    pub claimant: Option<String>,
+    pub claim_incarnation: Option<String>,
+    pub claim_expires_at_unix_ms: Option<u128>,
+    pub readiness_epoch: u32,
     pub blocked_reason: Option<String>,
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,

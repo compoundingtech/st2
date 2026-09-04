@@ -10,6 +10,8 @@ The request is durable graph state. A supervised observer checks the external re
 
 The first provider for this design observes a GitHub pull request. The graph model does not depend on GitHub.
 
+The GitHub provider supports `head`, `state`, `review`, and `checks`.
+
 ## Agent command
 
 This command creates one watch operation:
@@ -62,6 +64,8 @@ The subscription stores the selected changes and delivery intent. The agent decl
 
 A provider locator is an opaque provider value. st3 does not assign meaning to it outside the registered provider.
 
+The GitHub provider reads `GH_TOKEN` first and `GITHUB_TOKEN` second. It uses public API access when both values are absent.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.
@@ -93,6 +97,8 @@ A daemon restart can repeat an external request. It cannot create a duplicate ob
 The normalized observation is the resource authority. A raw provider response can be immutable evidence, but it cannot accept a separate resource mutation.
 
 A missing delivery target creates a warning and keeps the subscription pending. It does not block the observer or another subscription.
+
+The subscription becomes active when its delivery target appears.
 
 ## Lifecycle
 

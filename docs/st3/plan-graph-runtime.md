@@ -17,12 +17,14 @@ A plan run has one stable subject. Each immutable run generation binds that run 
 - Plans and steps can repeat `baseline` and `gate`.
 - Plans and steps can contain one `produces` block.
 - All sibling products must exist. All sibling gates must pass.
-- Every normal step must complete before the plan can complete.
+- A plan completes only through its explicit `completion` block.
+- A plan without `completion` stays open after its available work is exhausted.
 - `depends-on` defines execution order. Source order defines display order only.
 - A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
 - st3 rejects missing step references and dependency cycles.
 - st3 does not accept `outcome`, `judges`, or `judge`.
-- `assigned-to` assigns work and does not grant revision authority.
+- `assigned-to`, `available-to`, and `agentless` select who can claim work.
+- A selector does not grant revision authority.
 
 ## Complete example
 
@@ -34,6 +36,8 @@ subgraph {
     plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
       goal "Produce a verified release decision."
       goal "Keep the source and test evidence visible in the graph."
+      agentless
+      completion { when "all-steps-exhausted" }
 
       subgraph {
         agent "release.lead" {
@@ -111,11 +115,13 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
-        title "The temporary release scope is empty"
-        subgraph { scope "release/${ST_PLAN_RUN}" { stop } }
-        gate "the scope has no live member" {
-          empty "scope/release/${ST_PLAN_RUN}"
+      finally {
+        step "cleanup" {
+          title "The temporary release scope is empty"
+          subgraph { scope "release/${ST_PLAN_RUN}" { stop } }
+          gate "the scope has no live member" {
+            empty "scope/release/${ST_PLAN_RUN}"
+          }
         }
       }
     }
@@ -141,6 +147,12 @@ plan "PLAN_ID"
   goal "An optional second goal."
   goal "An optional third goal."
 
+  assigned-to "agent/node.owner"
+  // Or repeat available-to, or use bare agentless.
+
+  completion { when "all-steps-exhausted" }
+  // Or: completion { depends-on { step "publish" completed } }
+
   baseline "NAME" { GRAPH_PREDICATE }
   produces { PRODUCT... }
   gate "NAME" { GATE_BODY }
@@ -148,6 +160,7 @@ plan "PLAN_ID"
   subgraph { PLAN_AGENTS... }
 
   step "STEP_ID" { ... }
+  finally { step "CLEANUP_ID" { ... } }
 }
 ```
 
@@ -165,17 +178,28 @@ The reviewer defaults to the plan run requester. `revision-cutover` is `restart-
 
 A plan can contain one direct subgraph. Direct agents in that subgraph can revise the complete plan.
 
-A plan must contain at least one step.
+A plan can contain zero steps. A zero-step plan without `completion` becomes standing after reconciliation.
+
+`completion` accepts one shortcut or one dependency block. The two forms cannot appear together.
+
+`when "all-steps-exhausted"` selects all normal steps without listing them. Failed retryable work is not exhausted.
+
+The dependency form uses the same explicit dependency language as a step. It can select a smaller completion frontier.
+
+A completion dependency cannot reference a final step.
+
+Without `completion`, the plan never becomes terminal because it exhausted its steps.
 
 ## Step syntax
 
 ```kdl
-step "STEP_ID" timeout="20m" finally=#false revisions="human-only" revision-reviewer="person/reviewer" {
+step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/reviewer" {
   title "A display title"
   goal "One optional goal."
   goal "A second optional goal."
   goal "A third optional goal."
-  assigned-to "agent/node.worker"
+  available-to "agent/node.worker-a"
+  available-to "agent/node.worker-b"
   document "doc/project/request@SHA256"
 
   depends-on {
@@ -193,13 +217,17 @@ step "STEP_ID" timeout="20m" finally=#false revisions="human-only" revision-revi
 }
 ```
 
-`title`, `assigned-to`, `subgraph`, `plan`, `retry`, `produces`, `produces-plan`, and `uses-plan` are single fields.
+`title`, `assigned-to`, `agentless`, `subgraph`, `plan`, `retry`, `produces`, `produces-plan`, and `uses-plan` are single fields.
 
-`goal`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
+`available-to`, `goal`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
 
 `timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
 
-`finally=#true` selects final-phase work. Final steps run after normal success, failure, or cancellation. A final step does not make normal work optional.
+`finally {}` contains final-phase steps. Final steps run after normal success, failure, or cancellation.
+
+A plan can have one `finally` block. Final steps can depend on other final steps.
+
+Dependencies cannot cross the normal and final phases. A final step does not make normal work optional.
 
 Step revision protection adds to inherited plan protection. Direct agents in the step subgraph can revise that step subtree.
 
@@ -371,25 +399,30 @@ For a normal step, st3 performs this sequence:
 2. Wait for the parent nested step, when present.
 3. Wait for every explicit dependency.
 4. Evaluate all step baselines.
-5. Verify that the assignee is present, when present.
-6. Mark the attempt ready.
-7. Materialize its subgraph.
-8. Wait for subgraph convergence.
-9. Wait for the assigned worker report.
-10. Wait for nested plan steps or an exact used plan.
-11. Verify products.
-12. Evaluate gates.
-13. Mark the step completed or failed.
+5. Resolve the nearest work selector.
+6. Verify that at least one eligible agent is present, when the selector names agents.
+7. Mark the attempt ready and increment its readiness epoch.
+8. Materialize its subgraph.
+9. Wait for subgraph convergence.
+10. Wait for a worker report when an agent claimed the step.
+11. Wait for nested plan steps or an exact used plan.
+12. Verify products.
+13. Evaluate gates.
+14. Mark the step completed or failed.
 
 When a step fails and its retry policy permits another attempt, st3 increments the attempt, applies backoff, and starts again at dependency and baseline admission. Retryable failure does not terminate the plan before the retry.
 
-After all normal steps complete, st3 verifies plan products and plan gates. It then enters the final phase or completes the run.
+The `completion` frontier selects when st3 checks plan products and gates. st3 then enters the final phase when one exists.
+
+The run reaches `completed` after successful final work. A final failure makes the run failed.
+
+A plan without `completion` stays open. It is `standing` when no step can move and no failure blocks movement.
 
 ## Nested plans
 
 A nested `plan` is part of its parent plan revision.
 
-The parent step starts the nested roots after the parent is active. Nested steps inherit the parent assignment unless a child overrides it.
+The parent step starts the nested roots after the parent is active. Nested steps inherit the nearest work selector unless a child overrides it.
 
 Nested work remains durable graph state. It is not stored only in harness memory.
 
@@ -405,7 +438,7 @@ step "compile-plan" {
 }
 ```
 
-The worker must hold the producing step or one of its same-assignee nested steps.
+The worker must hold the producing step or one of its nested steps with the same assigned agent.
 
 ```sh
 st3 work publish-plan step-run/GENERATION/compile-plan generated.kdl --as agent/planner
@@ -450,7 +483,7 @@ st3 supplies these exact context names:
 | `ST_STEP` | Step path in a step context. |
 | `ST_STEP_RUN` | Full step-run subject in a step context. |
 | `ST_ATTEMPT` | Current attempt number in a step context. |
-| `ST_ASSIGNEE` | Normalized assignee, or an empty value. |
+| `ST_ASSIGNEE` | Fixed `assigned-to` agent, or an empty value for pools and agentless work. |
 | `ST_PARENT_STEP_RUN` | Parent step-run subject, or an empty value. |
 | `ST_GATE` | Gate name in a running gate context. |
 | `ST_AGENT` | Runtime agent or member identity. |
@@ -484,9 +517,44 @@ The relation does not create permission, lifecycle, scheduling, or mandatory rep
 
 Missing targets, self-relations, and cycles create warnings during preview. They do not block publication or another agent.
 
+## Work selection
+
+A plan or step can declare exactly one selector kind.
+
+```kdl
+assigned-to "agent/node.only-worker"
+```
+
+`assigned-to` means that only the named agent can claim the work.
+
+```kdl
+available-to "agent/node.worker-a"
+available-to "agent/node.worker-b"
+```
+
+`available-to` creates an explicit pool. The first eligible claim wins one step atomically.
+
+The same agent can claim multiple ready steps. A pool does not impose a one-step limit.
+
+```kdl
+agentless
+```
+
+`agentless` means that the reconciler performs the work without an agent claim. Subgraphs and gates can complete an agentless step.
+
+A local selector replaces the inherited selector. It does not add to it.
+
+The inheritance order is the step, its plan, its parent step, and its parent plan. The nearest selector wins.
+
+A plan or step without an explicit or inherited selector is agentless.
+
+A duplicate pool member is invalid. Combining selector kinds in one scope is invalid.
+
+A missing eligible agent creates a preview warning. A step blocks only when none of its eligible agents exist in desired state.
+
 ## Work commands
 
-Assigned work uses a renewable lease bound to the agent identity and runtime incarnation.
+Claimed work uses a renewable claim bound to the agent identity and runtime incarnation.
 
 ```sh
 st3 work ls --as agent/node.worker
@@ -500,7 +568,52 @@ st3 work release step-run/GENERATION/step --reason "The work needs another owner
 
 A worker completion report is not a correctness result. Products and gates still control final completion.
 
-The native driver renews active leases and delivers one idempotent Small Talk assignment for ready parent work.
+The native driver renews active claims. It delivers one Small Talk message for each readiness epoch and harness incarnation.
+
+A pool message closes when another agent wins the claim. Release or expiry creates a new readiness epoch and a new message.
+
+The work queue is authoritative. A notification only tells an agent that the queue might contain new work.
+
+The reconciler does not send periodic reminders. A future harness-stall policy can create a new explicit epoch after a measured timeout.
+
+The MVP does not implement that harness-stall timeout.
+
+## Standing runs and cancellation
+
+All plan runs use the same state machine. There is no separate standing plan type.
+
+An open plan becomes `standing` when it has no next step and has no explicit completion result.
+
+An open plan still asserts its plan subgraph. This rule lets a standing conversation plan keep its agent present.
+
+`st3 codex` and `st3 claude` publish a deterministic zero-step standing plan. The first command for an agent starts one run.
+
+An exact retry returns the same run. A later configuration change creates a new generation in that run.
+
+The quick command returns the plan, plan run, run generation, and agent subjects.
+
+A plan run does not stop because a controller deletes its runtime. The graph must publish cancellation.
+
+```kdl
+version 2
+subgraph {
+  plan-run "RUN_ID" {
+    cancel reason="The request was withdrawn."
+  }
+}
+```
+
+Cancellation revokes active claims and cancels normal work. It then runs the adjacent `finally` graph.
+
+Cancellation also cancels active descendant plan runs. Each descendant uses its own final phase.
+
+The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
+
+After a run becomes terminal, st3 stops the desired subjects in its generation scope.
+
+An exact repeated cancellation is idempotent. The old run and its immutable generations remain readable.
+
+st3 sends a cancellation message to each active claimant. The message tells the agent to stop that step.
 
 ## Plan revisions
 
@@ -510,7 +623,7 @@ Revision authority comes from agent placement in the current generation.
 - A direct agent in a plan subgraph can revise the complete plan.
 - A direct agent adjacent to plans can revise those plans.
 
-The run requester can propose any revision. `assigned-to` does not grant revision authority.
+The run requester can propose any revision. A work selector does not grant revision authority.
 
 st3 checks the current generation. A candidate cannot add itself as an owner and use that new authority.
 

@@ -6,8 +6,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     CheckpointActivation, CheckpointSpec, DesiredSubject, GateSpec, LaunchSpec, LinkSpec,
-    MemberKind, MemberLifecycle, MemberSpec, MessageTemplate, NormalizedIntent, RestartIntensity,
-    RestartType, ScheduleSpec, St3Error,
+    MemberKind, MemberLifecycle, MemberSpec, MessageTemplate, NormalizedIntent, ObserverSpec,
+    PlanRunCancellation, RestartIntensity, RestartType, ScheduleSpec, St3Error, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -17,11 +17,14 @@ const ROOT_NODES: &[&str] = &[
     "scope",
     "host",
     "resource",
+    "observer",
+    "subscription",
     "person",
     "account",
     "supervisor",
     "link",
     "plan",
+    "plan-run",
     "message",
     "schedule",
     "stop",
@@ -34,6 +37,7 @@ struct ParseContext {
     document_refs: BTreeSet<String>,
     checkpoint: Option<CheckpointActivation>,
     scopes: BTreeSet<String>,
+    plan_run_cancellations: Vec<PlanRunCancellation>,
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
@@ -86,6 +90,7 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         document_refs: BTreeSet::new(),
         checkpoint: None,
         scopes: BTreeSet::new(),
+        plan_run_cancellations: Vec::new(),
     };
     for node in children.nodes() {
         parse_desired_node(node, None, &mut context)?;
@@ -106,6 +111,7 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         subjects: context.subjects,
         checkpoints: context.checkpoints,
         plans,
+        plan_run_cancellations: context.plan_run_cancellations,
         document_refs: context.document_refs,
         normalized,
     })
@@ -163,9 +169,68 @@ fn parse_desired_node(
         "agent" => parse_agent(node, enclosing_host, context),
         "exec" | "pty" => parse_standalone_member(node, kind, enclosing_host, context),
         "plan" => Ok(()),
+        "plan-run" => parse_plan_run_action(node, context),
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
+}
+
+fn parse_plan_run_action(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let run = one_string_with_children(node)?;
+    let run = if run.starts_with("plan-run/") {
+        run
+    } else {
+        format!("plan-run/{run}")
+    };
+    let body = node.children().ok_or_else(|| {
+        St3Error::new("empty-plan-run-action", "a plan-run action needs `cancel`")
+    })?;
+    let [cancel] = body.nodes() else {
+        return Err(St3Error::new(
+            "invalid-plan-run-action",
+            "a plan-run action must contain exactly one `cancel`",
+        ));
+    };
+    if cancel.name().value() != "cancel" || cancel.ty().is_some() || cancel.children().is_some() {
+        return Err(St3Error::new(
+            "invalid-plan-run-action",
+            "a plan-run action must contain one bare `cancel` node",
+        ));
+    }
+    ensure_only_properties(cancel, &["reason"])?;
+    if !cancel.entries().iter().all(|entry| entry.name().is_some()) {
+        return Err(St3Error::new(
+            "invalid-plan-run-action",
+            "`cancel` cannot contain positional values",
+        ));
+    }
+    let reason = property_string(cancel, "reason")?.ok_or_else(|| {
+        St3Error::new(
+            "missing-cancel-reason",
+            "a plan-run cancellation needs a reason",
+        )
+    })?;
+    if reason.trim().is_empty() {
+        return Err(St3Error::new(
+            "missing-cancel-reason",
+            "a plan-run cancellation needs a non-empty reason",
+        ));
+    }
+    if context
+        .plan_run_cancellations
+        .iter()
+        .any(|cancellation| cancellation.run == run)
+    {
+        return Err(St3Error::new(
+            "duplicate-plan-run-action",
+            format!("plan run `{run}` repeats"),
+        ));
+    }
+    context
+        .plan_run_cancellations
+        .push(PlanRunCancellation { run, reason });
+    Ok(())
 }
 
 fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
@@ -523,6 +588,8 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     validate_name(&name, false)?;
     match kind {
         "resource" => validate_resource(node)?,
+        "observer" => validate_observer(node)?,
+        "subscription" => validate_subscription(node)?,
         "person" => {
             ensure_no_properties(node)?;
             one_string(node)?;
@@ -1780,6 +1847,98 @@ fn validate_resource(node: &KdlNode) -> Result<(), St3Error> {
     Ok(())
 }
 
+fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    one_string_with_children(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-observer-body", "an observer needs a body"))?;
+    if body.nodes().len() == 1 && body.nodes()[0].name().value() == "stop" {
+        ensure_bare(&body.nodes()[0])?;
+        return Ok(());
+    }
+    reject_unknown_children(
+        body,
+        &["resource", "provider", "locator", "field"],
+        "observer",
+        "observer",
+    )?;
+    let resource = required_child_string(body, "resource", "observer")?;
+    validate_full_subject(&resource)?;
+    if !resource.starts_with("resource/") {
+        return Err(St3Error::new(
+            "invalid-observer-resource",
+            "an observer resource must use a `resource/` subject",
+        ));
+    }
+    for required in ["provider", "locator"] {
+        required_child_string(body, required, "observer")?;
+    }
+    let fields = repeated_child_strings(body, "field")?;
+    if fields.is_empty() {
+        return Err(St3Error::new(
+            "missing-observer-field",
+            "an observer needs at least one field",
+        ));
+    }
+    if fields.iter().collect::<BTreeSet<_>>().len() != fields.len() {
+        return Err(St3Error::new(
+            "duplicate-observer-field",
+            "an observer field repeats",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    one_string_with_children(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-subscription-body", "a subscription needs a body"))?;
+    if body.nodes().len() == 1 && body.nodes()[0].name().value() == "stop" {
+        ensure_bare(&body.nodes()[0])?;
+        return Ok(());
+    }
+    reject_unknown_children(
+        body,
+        &["observer", "to", "on", "delivery"],
+        "subscription",
+        "subscription",
+    )?;
+    let observer = required_child_string(body, "observer", "subscription")?;
+    validate_full_subject(&observer)?;
+    if !observer.starts_with("observer/") {
+        return Err(St3Error::new(
+            "invalid-subscription-observer",
+            "a subscription observer must use an `observer/` subject",
+        ));
+    }
+    let target = required_child_string(body, "to", "subscription")?;
+    validate_full_subject(&target)?;
+    required_child_string(body, "delivery", "subscription")?;
+    let fields = repeated_child_strings(body, "on")?;
+    if fields.is_empty() {
+        return Err(St3Error::new(
+            "missing-subscription-field",
+            "a subscription needs at least one `on` field",
+        ));
+    }
+    if fields.iter().collect::<BTreeSet<_>>().len() != fields.len() {
+        return Err(St3Error::new(
+            "duplicate-subscription-field",
+            "a subscription field repeats",
+        ));
+    }
+    if required_child_string(body, "delivery", "subscription")? != "message" {
+        return Err(St3Error::new(
+            "unsupported-subscription-delivery",
+            "a subscription delivery must be `message`",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
     one_string_with_children(node)?;
@@ -2282,6 +2441,56 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     })
 }
 
+pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
+    let children = value.get("children")?.as_array()?;
+    if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
+        return Some(ObserverSpec {
+            resource: String::new(),
+            provider: String::new(),
+            locator: String::new(),
+            fields: Vec::new(),
+            stopped: true,
+        });
+    }
+    Some(ObserverSpec {
+        resource: canonical_child_value(value, "resource")?
+            .as_str()?
+            .to_owned(),
+        provider: canonical_child_value(value, "provider")?
+            .as_str()?
+            .to_owned(),
+        locator: canonical_child_value(value, "locator")?
+            .as_str()?
+            .to_owned(),
+        fields: canonical_child_values(value, "field"),
+        stopped: false,
+    })
+}
+
+pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
+    let children = value.get("children")?.as_array()?;
+    if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
+        return Some(SubscriptionSpec {
+            observer: String::new(),
+            to: String::new(),
+            fields: Vec::new(),
+            delivery: String::new(),
+            stopped: true,
+        });
+    }
+    Some(SubscriptionSpec {
+        observer: canonical_child_value(value, "observer")?
+            .as_str()?
+            .to_owned(),
+        to: canonical_child_value(value, "to")?.as_str()?.to_owned(),
+        fields: canonical_child_values(value, "on"),
+        delivery: canonical_child_value(value, "delivery")?
+            .as_str()?
+            .to_owned(),
+        stopped: false,
+    })
+}
+
 pub fn supervisor_terminal_controls(value: &Value) -> Vec<crate::model::TerminalControlSpec> {
     let Some(children) = value.get("children").and_then(Value::as_array) else {
         return Vec::new();
@@ -2395,6 +2604,24 @@ fn canonical_child_value<'a>(value: &'a Value, name: &str) -> Option<&'a Value> 
         .get("arguments")?
         .as_array()?
         .first()
+}
+
+fn canonical_child_values(value: &Value, name: &str) -> Vec<String> {
+    value
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some(name))
+        .filter_map(|child| {
+            child
+                .get("arguments")
+                .and_then(Value::as_array)
+                .and_then(|arguments| arguments.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn one_bool(node: &KdlNode) -> Result<bool, St3Error> {
@@ -2803,6 +3030,15 @@ fn child_strings(document: &KdlDocument, name: &str) -> Result<Option<Vec<String
     unique_child(document, name)?
         .map(positional_strings)
         .transpose()
+}
+
+fn repeated_child_strings(document: &KdlDocument, name: &str) -> Result<Vec<String>, St3Error> {
+    document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == name)
+        .map(|node| one_string(node))
+        .collect()
 }
 
 fn child_integer(document: &KdlDocument, name: &str) -> Result<Option<i128>, St3Error> {
@@ -3238,6 +3474,31 @@ subgraph {
                 .iter()
                 .any(|warning| warning.contains("contains a cycle"))
         );
+    }
+
+    #[test]
+    fn observer_fields_are_provider_neutral() {
+        let intent = parse_intent(
+            r#"
+version 2
+subgraph {
+  resource "queue" { kind "file" }
+  observer "queue-watch" {
+    resource "resource/queue"
+    provider "example.queue"
+    locator "jobs/ready"
+    field "priority"
+  }
+}
+"#,
+            "node",
+        )
+        .expect("a provider defines its own fields");
+
+        let observer = observer_spec(&intent.subjects["observer/queue-watch"].desired)
+            .expect("the observer has a valid specification");
+        assert_eq!(observer.provider, "example.queue");
+        assert_eq!(observer.fields, ["priority"]);
     }
 
     #[test]

@@ -218,7 +218,7 @@ Each runtime start has a new incarnation ID. A restart does not change the membe
 
 The origin names the host that accepted a claim. The actor names the person, agent, or external identity that performed the action.
 
-Per-subject writers and causal predecessor heads control graph updates. A plan step lease also binds work changes to one assignee and runtime incarnation.
+Per-subject writers and causal predecessor heads control graph updates. A claimed step binds work changes to one agent and runtime incarnation.
 
 Plan revision authority comes only from graph placement in the current generation.
 
@@ -226,7 +226,7 @@ Plan revision authority comes only from graph placement in the current generatio
 - An agent in a plan subgraph can revise that plan.
 - An agent adjacent to direct plans can revise those plans.
 
-`assigned-to` does not grant revision authority. The candidate revision cannot grant authority to its own author.
+A work selector does not grant revision authority. The candidate revision cannot grant authority to its own author.
 
 `revisions="human-only"` adds a human approval boundary. `revision-reviewer` selects a reviewer, or the run requester reviews by default.
 
@@ -258,21 +258,43 @@ A plan run records its initial revision, current generation, root revision, root
 
 A run generation records one plan revision, its predecessor, its actor, its reason, and its generation-specific step runs.
 
+A plan or step selects work with `assigned-to`, repeated `available-to`, or bare `agentless`.
+
+The nearest selector wins. A local selector replaces its inherited selector.
+
+The first eligible pool claim wins one step atomically. One agent can claim multiple ready steps.
+
+An absent selector means agentless work. A missing eligible agent creates a warning instead of a publication blocker.
+
 Normal execution has these boundaries:
 
 1. Plan baselines must hold before root steps can start.
 2. Step dependencies must hold.
 3. Step baselines must hold before each attempt becomes ready.
-4. The step subgraph converges.
-5. An assigned worker reports completion when required.
-6. Declared step products must exist.
-7. All step gates must pass.
-8. Every normal step must complete.
-9. Plan products must exist.
-10. All plan gates must pass.
-11. Final steps run after success, failure, or cancellation.
+4. At least one eligible desired agent exists when the step needs an agent.
+5. The step becomes ready with a new readiness epoch.
+6. The step subgraph converges.
+7. A claimant reports completion when the step needs an agent.
+8. Declared step products must exist.
+9. All step gates must pass.
+10. The explicit completion frontier holds.
+11. Plan products must exist.
+12. All plan gates must pass.
+13. Steps in the adjacent `finally` block run after success, failure, or cancellation.
 
 A false baseline blocks. It does not fail the plan or spend an attempt. A failed running gate fails its step or plan. A pending predicate gate keeps the current boundary pending.
+
+`completion { when "all-steps-exhausted" }` is the common completion shortcut. A completion block can use explicit dependencies instead.
+
+A plan without a completion block remains open. It becomes `standing` when no step can move and no failure blocks movement.
+
+All plans use this state machine. st3 has no separate standing plan type.
+
+The quick Codex and Claude commands publish deterministic zero-step plans. Their runs become standing and continue to assert their agents.
+
+Graph cancellation revokes active claims and enters `finally`. The run becomes cancelled after successful final work.
+
+Cancellation cascades to descendant runs. A terminal run retires the desired subjects in its generation scope.
 
 ## Run revisions and generations
 
@@ -350,8 +372,8 @@ Important plan and gate kinds include:
 - `gate.requested` and `gate.result`;
 - `review.requested` and `review.decision`;
 - `planning-session.started`, `planning-session.candidate-submitted`, `planning-session.previewed`, and `planning-session.variant-proposed`;
-- `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`.
-- `observer.desired`, `observer.health`, `resource.observed`, and `subscription.desired`.
+- `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`;
+- `observer.observed`, `observer.health`, `resource.observed`, and `subscription.health`.
 
 An unknown replicated claim remains in history and makes its subject indeterminate. A node does not silently interpret an unknown kind.
 
@@ -371,7 +393,7 @@ A network partition does not stop local work. Each host continues from the last 
 - Apply, revision, review, work, terminal, and gate operations use explicit authority or one-use capabilities.
 - Revision authority uses the current graph placement and cannot come from a candidate revision.
 - Human revision approval binds one source generation and one preview hash.
-- Plan work leases bind to one agent incarnation.
+- Plan work claims bind to one agent incarnation.
 - Terminal input and signals cite the expected incarnation.
 - Mechanical and LLM gates have bounded execution time. LLM gates also require a positive token budget and an explicit tool set.
 - Immutable document references use exact SHA-256 hashes.
@@ -382,7 +404,7 @@ The configured peer transport is for a trusted network. Authentication, encrypti
 
 ## Failure handling
 
-st3 fails closed on malformed intent, missing documents, stale generations, stale preview hashes, invalid capabilities, unknown revisions, and invalid work leases.
+st3 fails closed on malformed intent, missing documents, stale generations, stale preview hashes, invalid capabilities, unknown revisions, and invalid work claims.
 
 Runtime failure stays visible as claims. It is not removed from history after retry or recovery.
 
@@ -406,7 +428,8 @@ This sequence preserves one working control plane during migration. It does not 
 - No implicit stop by omission.
 - No implicit step order.
 - No ownership or permission effect from `under`.
-- No revision authority from `assigned-to`.
+- No revision authority from a work selector.
+- No implicit plan completion after step exhaustion.
 - No mutable plan revision inside a run generation.
 - No automatic plan run after planning approval.
 - No alias for removed st3 plan syntax.

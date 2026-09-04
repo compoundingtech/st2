@@ -11,6 +11,7 @@ pub mod plan;
 pub mod projection;
 pub mod reconcile;
 pub mod render;
+pub mod resource;
 pub mod service;
 pub mod store;
 
