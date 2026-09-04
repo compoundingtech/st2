@@ -14,6 +14,7 @@ subgraph {
             workspace "${ST_WORKSPACE}"
             harness "codex" {
               prompt "Use only st3 Small Talk. Drain and archive each message. Claim exactly one ready pool step. Write the requested marker with your ST_AGENT value. Complete that step. Do not claim another pool step."
+              args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
             }
           }
           agent "pool.claude" {
@@ -22,6 +23,7 @@ subgraph {
             harness "claude" {
               dev-channels #true
               prompt "Use only st3 Small Talk. Drain and archive each message. Claim exactly one ready pool step. Write the requested marker with your ST_AGENT value. Complete that step. Do not claim another pool step."
+              args "--permission-mode" "bypassPermissions"
             }
           }
         }
