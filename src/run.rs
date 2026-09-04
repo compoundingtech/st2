@@ -4934,6 +4934,116 @@ mod tests {
         assert!(event.contains(r#""binding":"goal""#), "{event}");
     }
 
+    /// A publication the resync worker cannot finish must not hold up a reconcile pass.
+    ///
+    /// Every per-seat `install_live` handshake is answered by the same worker thread that runs
+    /// publications, so a publication in progress serializes the whole pass behind it. That is the
+    /// coupling which let a terminal-refusal loop keep every pass from completing for two hours
+    /// (#431): the refusals only had power because they denied the pass that would have ended
+    /// them. Blocking one real publication on the recipient's stream lock is the sharpest form of
+    /// the same coupling — a slow publication makes a pass late, a stuck one makes it never
+    /// finish — and it holds the pass at exactly the point `emit_admitted` serializes.
+    #[test]
+    fn reconcile_pass_completes_while_a_resync_publication_is_blocked() {
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let catalog = tempfile::tempdir().unwrap();
+        let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
+        crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        let runner = SpawnCountingRunner {
+            sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+            ..Default::default()
+        };
+        let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
+        let resync =
+            crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        let mut cap = FlappingCap::default();
+        let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
+        let mut presentation_cursor = PresentationPatchCursor::default();
+
+        let seeded = reconcile_pass(
+            catalog.path(),
+            "hetz",
+            &task_context,
+            &runner,
+            &mut cap,
+            &mut debounce,
+            &mut presentation_cursor,
+            Some(&resync),
+            None,
+        );
+        assert!(
+            seeded.adopted.iter().any(|identity| identity == "worker"),
+            "{seeded:#?}"
+        );
+
+        // One completed publication first: it creates the recipient's resync stream state
+        // directory, whose `.lock` is the gate below, and proves the publication path is live.
+        std::fs::write(&goal, "changed before the gate closes\n").unwrap();
+        let published = wait_for_resync_event(&agent_dir)
+            .expect("the live seat must observe its first carrier transition");
+
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(agent_dir.join("resources/streams/resync/.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) },
+            0,
+            "the test must own the stream lock the publication path takes"
+        );
+        let gate_fd = gate.as_raw_fd();
+
+        // The worker has no other work and `IMMEDIATE_WINDOW` is 500 ms, so it is inside the
+        // blocked publication well before this wait ends; the unchanged event is the positive
+        // evidence that the publication has not completed.
+        std::fs::write(&goal, "changed while the gate is closed\n").unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            current_resync_event(&agent_dir).as_deref(),
+            Some(published.as_str()),
+            "the gate must hold the second publication open"
+        );
+
+        // The watchdog releases the gate only when the pass fails to complete on its own, which
+        // is what separates a decoupled pass from one that merely finished after the rescue.
+        let rescued = AtomicBool::new(false);
+        let rescued_flag = &rescued;
+        let (finished_tx, finished_rx) = mpsc::channel::<()>();
+        let pass = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if finished_rx.recv_timeout(Duration::from_secs(20)).is_err() {
+                    rescued_flag.store(true, AtomicOrdering::SeqCst);
+                    unsafe { libc::flock(gate_fd, libc::LOCK_UN) };
+                }
+            });
+            let pass = reconcile_pass(
+                catalog.path(),
+                "hetz",
+                &task_context,
+                &runner,
+                &mut cap,
+                &mut debounce,
+                &mut presentation_cursor,
+                Some(&resync),
+                None,
+            );
+            let _ = finished_tx.send(());
+            pass
+        });
+        assert!(
+            !rescued.load(AtomicOrdering::SeqCst),
+            "the pass only completed after the blocked publication was released: {pass:#?}"
+        );
+        assert!(
+            pass.adopted.iter().any(|identity| identity == "worker"),
+            "{pass:#?}"
+        );
+        drop(gate);
+    }
+
     #[test]
     fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
         let catalog = tempfile::tempdir().unwrap();

@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -506,6 +507,13 @@ enum Msg {
     Deactivate(String, Sender<()>),
     Mutations(Vec<PathBuf>),
     Rescan,
+    /// One handed-off publication finished. Outcomes return through the worker's own mailbox so
+    /// the worker remains the only writer of carrier baselines and retry deadlines.
+    Emitted {
+        bus_id: String,
+        label: String,
+        published: bool,
+    },
     /// Explicit stop: the worker's own watcher holds the last `Sender`, so `Disconnected`
     /// would stay unreachable while `join` waits.
     Shutdown,
@@ -889,6 +897,10 @@ struct Entry {
     /// Immutable publication snapshot retained after a failed emit. Metadata refresh may change
     /// the current route, path, or class, but a reserved event identity must keep its exact bytes.
     pending_transition: Option<PendingTransition>,
+    /// True while a handed-off publication for this subscription is outstanding. Publishing runs
+    /// off the worker thread, so the worker must not hand off the same subscription twice or
+    /// advance its baseline before the outcome returns.
+    in_flight: bool,
     dirty: bool,
 }
 /// Recipient-scoped subscription identity. A declaration or carrier may move without changing
@@ -920,6 +932,115 @@ fn is_mutation(event: &notify::Event) -> bool {
     )
 }
 
+/// One publication handed to the emitter thread.
+struct EmitJob {
+    bus_id: String,
+    label: String,
+    transition: PendingTransition,
+}
+
+/// The handoff between the worker thread and the emitter thread.
+///
+/// Publishing does not run on the worker thread. A reconcile pass answers its own progress on
+/// that thread — `install_live` and `deactivate` block on a worker acknowledgement — so a
+/// publication executed there serializes the whole pass behind it. A publication is neither
+/// bounded nor cheap: it takes the shared catalog-authoring lock, re-resolves the catalog, and
+/// takes the recipient's stream lock, any of which can block on another process. Handing
+/// publication to its own thread is what keeps a pass able to complete while publications are
+/// pending, refused, or stuck (#431).
+#[derive(Default)]
+struct EmitQueue {
+    state: std::sync::Mutex<EmitQueueState>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct EmitQueueState {
+    jobs: std::collections::VecDeque<EmitJob>,
+    stopped: bool,
+}
+
+impl EmitQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EmitQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push(&self, job: EmitJob) {
+        self.lock().jobs.push_back(job);
+        self.ready.notify_one();
+    }
+
+    /// Drop every queued publication for one recipient. A publication already taken by the
+    /// emitter is left alone: it was in flight while the subscription was still active, and its
+    /// outcome is discarded by the worker when the subscription is gone.
+    fn cancel(&self, bus_id: &str) {
+        self.lock().jobs.retain(|job| job.bus_id != bus_id);
+    }
+
+    /// Drop every queued publication whose recipient is no longer an active subscription.
+    fn retain_recipients(&self, active: &BTreeSet<String>) {
+        self.lock().jobs.retain(|job| active.contains(&job.bus_id));
+    }
+
+    /// Pop one queued publication without waiting. Only the synchronous test drive uses this;
+    /// the emitter thread blocks in [`Self::next`].
+    #[cfg(test)]
+    fn take_queued(&self) -> Option<EmitJob> {
+        self.lock().jobs.pop_front()
+    }
+
+    /// Recipients of every queued publication, in queue order.
+    #[cfg(test)]
+    fn queued_recipients(&self) -> Vec<String> {
+        self.lock()
+            .jobs
+            .iter()
+            .map(|job| job.bus_id.clone())
+            .collect()
+    }
+
+    fn stop(&self) {
+        let mut state = self.lock();
+        state.stopped = true;
+        state.jobs.clear();
+        self.ready.notify_all();
+    }
+
+    fn next(&self) -> Option<EmitJob> {
+        let mut state = self.lock();
+        loop {
+            if state.stopped {
+                return None;
+            }
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+fn emitter_loop(root: PathBuf, this_host: String, queue: Arc<EmitQueue>, outcomes: Sender<Msg>) {
+    while let Some(job) = queue.next() {
+        let published = emit_resync(&root, &this_host, &job.bus_id, &job.transition);
+        if outcomes
+            .send(Msg::Emitted {
+                bus_id: job.bus_id,
+                label: job.label,
+                published,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 struct Worker {
     root: PathBuf,
     this_host: String,
@@ -933,6 +1054,8 @@ struct Worker {
     /// `None` degrades to digest polling at refresh cadence (each reconcile pass) instead of
     /// evented watching — diagnosed once by the absence of immediacy, never a hard error.
     watcher: Option<notify::RecommendedWatcher>,
+    /// Publications handed off to the emitter thread. See [`EmitQueue`].
+    emit: Arc<EmitQueue>,
 }
 
 fn forward_watch_result(forward: &Sender<Msg>, result: notify::Result<notify::Event>) {
@@ -958,6 +1081,17 @@ fn make_watcher(forward: Sender<Msg>) -> Option<notify::RecommendedWatcher> {
 }
 
 fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sender<Msg>) {
+    let emit = Arc::new(EmitQueue::default());
+    let emitter = std::thread::Builder::new()
+        .name("resync-emit".to_owned())
+        .spawn({
+            let root = root.clone();
+            let this_host = this_host.clone();
+            let emit = Arc::clone(&emit);
+            let outcomes = forward.clone();
+            move || emitter_loop(root, this_host, emit, outcomes)
+        })
+        .ok();
     let watcher = make_watcher(forward);
     let mut worker = Worker {
         root,
@@ -967,6 +1101,7 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
         deadlines: BTreeMap::new(),
         watched: BTreeMap::new(),
         watcher,
+        emit: Arc::clone(&emit),
     };
     loop {
         let timeout = worker
@@ -987,12 +1122,21 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             }
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
             Ok(Msg::Rescan) => worker.rescan_all(),
+            Ok(Msg::Emitted {
+                bus_id,
+                label,
+                published,
+            }) => worker.record_publication(&bus_id, &label, published),
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         worker.flush_due(Instant::now());
     }
+    // Stop the emitter without joining it. A publication blocked on another process's lock must
+    // not hold up supervisor teardown, and the emitter owns no worker state to hand back.
+    emit.stop();
+    drop(emitter);
 }
 
 fn take_retained_entry(
@@ -1028,37 +1172,47 @@ fn rebuild_carriers(
             // recipient-scoped namespace.
             let identity = (set.bus_id.clone(), carrier.label.clone());
             let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
-            let (state, declaration_summary, occurrence_sequence, pending_transition, dirty) =
-                retained.map_or_else(
-                    || {
-                        let (state, dirty) =
-                            match read_state(&carrier.path, carrier.containment_root.as_deref()) {
-                                Ok(state) => (Some(state), false),
-                                Err(error) => {
-                                    diagnose_read_error(&carrier.path, &error);
-                                    (None, true)
-                                }
-                            };
-                        (
-                            state,
-                            (carrier.label == "declaration")
-                                .then(|| seeded_declaration_summary.clone())
-                                .flatten(),
-                            subscription_sequences.get(&identity).copied().unwrap_or(0),
-                            None,
-                            dirty,
-                        )
-                    },
-                    |entry| {
-                        (
-                            entry.state,
-                            entry.declaration_summary,
-                            entry.occurrence_sequence,
-                            entry.pending_transition,
-                            entry.dirty,
-                        )
-                    },
-                );
+            let (
+                state,
+                declaration_summary,
+                occurrence_sequence,
+                pending_transition,
+                in_flight,
+                dirty,
+            ) = retained.map_or_else(
+                || {
+                    let (state, dirty) =
+                        match read_state(&carrier.path, carrier.containment_root.as_deref()) {
+                            Ok(state) => (Some(state), false),
+                            Err(error) => {
+                                diagnose_read_error(&carrier.path, &error);
+                                (None, true)
+                            }
+                        };
+                    (
+                        state,
+                        (carrier.label == "declaration")
+                            .then(|| seeded_declaration_summary.clone())
+                            .flatten(),
+                        subscription_sequences.get(&identity).copied().unwrap_or(0),
+                        None,
+                        false,
+                        dirty,
+                    )
+                },
+                |entry| {
+                    (
+                        entry.state,
+                        entry.declaration_summary,
+                        entry.occurrence_sequence,
+                        entry.pending_transition,
+                        // A rebuilt subscription is the same subscription: its outstanding
+                        // publication is still outstanding, and its outcome still applies.
+                        entry.in_flight,
+                        entry.dirty,
+                    )
+                },
+            );
             let entry = Entry {
                 bus_id: set.bus_id.clone(),
                 seat_id: set.seat_id.clone(),
@@ -1069,6 +1223,7 @@ fn rebuild_carriers(
                 declaration_summary,
                 occurrence_sequence,
                 pending_transition,
+                in_flight,
                 dirty,
             };
             next.entry(carrier.path).or_default().push(entry);
@@ -1168,6 +1323,15 @@ impl Worker {
         let previous = std::mem::take(&mut self.carriers);
         let previous_paths = self.prepare_carrier_update(&previous);
         self.carriers = rebuild_carriers(previous, refresh, &self.subscription_sequences);
+        // A subscription this refresh dropped — a suspended, retired or no-longer-live seat —
+        // must not have a queued publication published afterwards.
+        let active = self
+            .carriers
+            .values()
+            .flatten()
+            .map(|entry| entry.bus_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.emit.retain_recipients(&active);
         self.finish_carrier_update(&previous_paths);
     }
 
@@ -1205,6 +1369,8 @@ impl Worker {
     }
 
     fn deactivate_watch_set(&mut self, bus_id: &str) {
+        // Nothing may start publishing to this recipient once the acknowledgement returns.
+        self.emit.cancel(bus_id);
         let previous = std::mem::take(&mut self.carriers);
         let previous_paths = self.prepare_carrier_update(&previous);
         self.carriers = previous
@@ -1386,6 +1552,32 @@ impl Worker {
         }
     }
 
+    /// Drive one flush and every publication it hands off to completion on this thread.
+    ///
+    /// In production the worker and the emitter are two threads of one loop; a unit test asserts
+    /// on settled carrier state, so it runs both halves here in the order the loop runs them.
+    #[cfg(test)]
+    fn flush_path_publishing(&mut self, path: &Path, due_class: Option<CarrierClass>) {
+        self.flush_path(path, due_class);
+        self.drain_publications();
+    }
+
+    /// [`Self::flush_due`] with its handed-off publications driven to completion. See
+    /// [`Self::flush_path_publishing`].
+    #[cfg(test)]
+    fn flush_due_publishing(&mut self, now: Instant) {
+        self.flush_due(now);
+        self.drain_publications();
+    }
+
+    #[cfg(test)]
+    fn drain_publications(&mut self) {
+        while let Some(job) = self.emit.take_queued() {
+            let published = emit_resync(&self.root, &self.this_host, &job.bus_id, &job.transition);
+            self.record_publication(&job.bus_id, &job.label, published);
+        }
+    }
+
     fn flush_due(&mut self, now: Instant) {
         let due: Vec<CarrierClass> = self
             .deadlines
@@ -1426,44 +1618,30 @@ impl Worker {
             return;
         };
         let mut retries = Vec::new();
+        let mut handoffs = Vec::new();
         for entry in entries.iter_mut() {
             if due_class.is_some_and(|class| entry.class != class) {
+                continue;
+            }
+            if entry.in_flight {
+                // One outstanding publication per subscription. Its outcome re-reads this
+                // carrier, so a transition that arrives meanwhile is observed then, not lost.
+                entry.dirty = false;
                 continue;
             }
             entry.dirty = false;
             let observed = read_state(path, entry.containment_root.as_deref());
 
             if let Some(pending) = entry.pending_transition.as_ref() {
-                if emit_resync(&self.root, &self.this_host, &entry.bus_id, pending) {
-                    let completed = entry
-                        .pending_transition
-                        .take()
-                        .expect("pending transition was just observed");
-                    entry.state = Some(completed.new_state);
-                    if completed.binding == "declaration" {
-                        entry.declaration_summary = completed.new_declaration_summary;
-                    }
-                    // The current carrier may have advanced or rebound while the immutable
-                    // transition was pending. Complete it first, then schedule current state.
-                    match observed {
-                        Ok(observed) if entry.state.as_ref() != Some(&observed) => {
-                            entry.dirty = true;
-                            retries.push(entry.class);
-                        }
-                        Err(error) => {
-                            diagnose_read_error(path, &error);
-                            entry.dirty = true;
-                            retries.push(entry.class);
-                        }
-                        Ok(_) => {}
-                    }
-                } else {
-                    if let Err(error) = observed {
-                        diagnose_read_error(path, &error);
-                    }
-                    entry.dirty = true;
-                    retries.push(entry.class);
+                if let Err(error) = observed {
+                    diagnose_read_error(path, &error);
                 }
+                entry.in_flight = true;
+                handoffs.push(EmitJob {
+                    bus_id: entry.bus_id.clone(),
+                    label: entry.label.clone(),
+                    transition: pending.clone(),
+                });
                 continue;
             }
 
@@ -1516,16 +1694,20 @@ impl Worker {
                 )
             };
             entry.occurrence_sequence = sequence;
-            if emit_resync(&self.root, &self.this_host, &entry.bus_id, &transition) {
-                entry.state = Some(target_state);
-                if transition.binding == "declaration" {
-                    entry.declaration_summary = transition.new_declaration_summary;
-                }
-            } else {
-                entry.pending_transition = Some(transition);
-                entry.dirty = true;
-                retries.push(entry.class);
-            }
+            entry.in_flight = true;
+            handoffs.push(EmitJob {
+                bus_id: entry.bus_id.clone(),
+                label: entry.label.clone(),
+                transition: transition.clone(),
+            });
+            // The captured transition stays pending until its outcome returns: its exact bytes
+            // and reserved event identity are what a retry must reuse.
+            entry.pending_transition = Some(transition);
+        }
+        // Queue outside the carrier borrow. Publishing itself happens on the emitter thread, so
+        // nothing below this point waits for a catalog lock, a stream lock, or a refusal.
+        for job in handoffs {
+            self.emit.push(job);
         }
         let now = Instant::now();
         for class in retries {
@@ -1535,6 +1717,38 @@ impl Worker {
                 .and_modify(|existing| *existing = (*existing).min(deadline))
                 .or_insert(deadline);
         }
+    }
+
+    /// Apply one handed-off publication's outcome. The worker stays the only writer of carrier
+    /// baselines and retry deadlines, so the emitter reports back here instead of touching state.
+    ///
+    /// A published transition is completed; a refused one is left pending. Re-observing the
+    /// carrier afterwards is what schedules the next attempt in both cases: a retained pending
+    /// transition re-arms its own class, and a completed one re-arms only if the carrier moved
+    /// on while the publication was outstanding.
+    ///
+    /// An outcome whose subscription is gone — deactivated or refreshed away while the
+    /// publication was outstanding — matches nothing and is discarded.
+    fn record_publication(&mut self, bus_id: &str, label: &str, published: bool) {
+        let mut touched = Vec::new();
+        for (path, entries) in &mut self.carriers {
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| entry.bus_id == bus_id && entry.label == label)
+            {
+                entry.in_flight = false;
+                if published
+                    && let Some(completed) = entry.pending_transition.take()
+                {
+                    entry.state = Some(completed.new_state);
+                    if completed.binding == "declaration" {
+                        entry.declaration_summary = completed.new_declaration_summary;
+                    }
+                }
+                touched.push(path.clone());
+            }
+        }
+        self.poll_paths(touched);
     }
 }
 
@@ -1941,10 +2155,11 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![set]));
         std::fs::write(&declaration, "not an Agent Spec").unwrap();
-        worker.flush_path(&declaration, None);
+        worker.flush_path_publishing(&declaration, None);
         let pending = worker.carriers[&declaration][0]
             .pending_transition
             .as_ref()
@@ -1954,7 +2169,7 @@ mod tests {
         assert_eq!(pending.topics, ["declaration"]);
         assert_eq!(event_body(&pending.body)["facts"].as_array().unwrap().len(), 1);
         std::fs::write(&declaration, valid).unwrap();
-        worker.flush_path(&declaration, None);
+        worker.flush_path_publishing(&declaration, None);
         let delivered = resync_inbox_event(&agent_dir);
         let body = event_body(&delivered);
         assert_eq!(body["binding"], "declaration");
@@ -2103,6 +2318,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 4,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: true,
                 },
                 Entry {
@@ -2114,6 +2330,7 @@ mod tests {
                     state: Some(CarrierState::Present("beta-before".to_owned())),
                     declaration_summary: None,
                     occurrence_sequence: 9,
+                    in_flight: false,
                     dirty: true,
                     pending_transition: None,
                 },
@@ -2202,6 +2419,7 @@ mod tests {
                 declaration_summary: None,
                 occurrence_sequence: 3,
                 pending_transition: None,
+                in_flight: false,
                 dirty: true,
             }],
         )]);
@@ -2229,8 +2447,9 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
-        worker.flush_path(&goal, Some(CarrierClass::Immediate));
+        worker.flush_path_publishing(&goal, Some(CarrierClass::Immediate));
 
         let entry = worker.carriers[&goal]
             .iter()
@@ -2272,6 +2491,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: true,
                 }],
             )]),
@@ -2279,9 +2499,10 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
 
-        worker.flush_path(&old_path, None);
+        worker.flush_path_publishing(&old_path, None);
         let pending = worker.carriers[&old_path][0]
             .pending_transition
             .clone()
@@ -2299,7 +2520,7 @@ mod tests {
             watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
 
         worker.apply_watch_sets(refresh_for(vec![current]));
-        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
 
         let event = std::fs::read_dir(resources.join("inbox"))
             .unwrap()
@@ -2349,6 +2570,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: false,
                 }],
             )]),
@@ -2356,6 +2578,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::from([(parent.clone(), dir_identity(&parent))]),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
 
         worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
@@ -2401,6 +2624,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: true,
                 }],
             )]),
@@ -2408,6 +2632,7 @@ mod tests {
             deadlines: BTreeMap::from([(CarrierClass::Immediate, old_deadline)]),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         let refresh = |class| {
             refresh_for(vec![AgentWatchSet {
@@ -2464,6 +2689,7 @@ mod tests {
                         owner_incarnation(1),
                         1,
                     )),
+                    in_flight: false,
                     dirty: true,
                 }],
             )])
@@ -2549,6 +2775,7 @@ mod tests {
                         owner_incarnation(1),
                         1,
                     )),
+                    in_flight: false,
                     dirty: false,
                 }],
             )]),
@@ -2556,6 +2783,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         let now = Instant::now();
         worker.apply_watch_sets(refresh_for(vec![set]));
@@ -2563,7 +2791,7 @@ mod tests {
             !resources.join("inbox").exists(),
             "degraded polling must schedule rather than emit during refresh"
         );
-        worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
 
         let event = std::fs::read_dir(resources.join("inbox"))
             .unwrap()
@@ -2606,6 +2834,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: false,
                 }],
             )]),
@@ -2613,6 +2842,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         std::fs::write(&carrier, "after").unwrap();
         let now = Instant::now();
@@ -2629,12 +2859,12 @@ mod tests {
             declaration_summary: None,
         }]));
 
-        worker.flush_due(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(now + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.state, baseline);
         assert!(entry.pending_transition.is_none(), "coalesced emit ran too early");
 
-        worker.flush_due(now + COALESCED_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(now + COALESCED_WINDOW + Duration::from_secs(1));
         assert!(
             worker.carriers[&carrier][0].pending_transition.is_some(),
             "the coalesced transition must be attempted after its full window"
@@ -2668,6 +2898,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![watch_set_for(
             &discover(root.path()),
@@ -2682,7 +2913,7 @@ mod tests {
             Msg::Rescan => worker.rescan_all(),
             _ => panic!("a notify backend error must request a full digest rescan"),
         }
-        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW);
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW);
 
         let inbox = resources.join("inbox");
         let events = std::fs::read_dir(inbox)
@@ -2751,6 +2982,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: make_watcher(tx),
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.watched = worker
             .carriers
@@ -2764,7 +2996,7 @@ mod tests {
         // The joining seat contributes directories the backend has not seen, so this refresh
         // changes the registration set without touching the live subscription's own paths.
         worker.apply_watch_sets(refresh_for(vec![live_set, joining_set]));
-        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
 
         let event = resync_inbox_event(&live_dir);
         assert_eq!(event_field(&event, "binding"), "goal");
@@ -2815,6 +3047,7 @@ mod tests {
                 declaration_summary: None,
                 occurrence_sequence: 0,
                 pending_transition: None,
+                in_flight: false,
                 dirty: true,
             })
             .collect();
@@ -2827,9 +3060,10 @@ mod tests {
             deadlines: BTreeMap::from([(CarrierClass::Immediate, now)]),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
 
-        worker.flush_due(now);
+        worker.flush_due_publishing(now);
         let entries = worker.carriers.values().next().unwrap();
         assert!(!entries[0].dirty);
         assert!(entries[1].dirty, "coalesced subscriber must wait for its own deadline");
@@ -2921,11 +3155,12 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![set]));
 
         std::fs::remove_file(&carrier).unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let deletion = resync_inbox_events(&agent_dir);
         assert_eq!(deletion.len(), 1);
         assert_eq!(
@@ -2939,7 +3174,7 @@ mod tests {
             Some(CarrierState::Missing)
         );
 
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         assert_eq!(
             resync_inbox_events(&agent_dir).len(),
             1,
@@ -2947,7 +3182,7 @@ mod tests {
         );
 
         std::fs::write(&carrier, "same bytes").unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let events = resync_inbox_events(&agent_dir);
         assert_eq!(
             events.len(),
@@ -2989,13 +3224,14 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![set]));
         let baseline = worker.carriers[&carrier][0].state.clone();
 
         let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
         std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.state, baseline);
         assert!(entry.pending_transition.is_none());
@@ -3004,7 +3240,7 @@ mod tests {
 
         std::fs::set_permissions(&carrier, original_permissions).unwrap();
         std::fs::write(&carrier, "after").unwrap();
-        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let event = resync_inbox_event(&agent_dir);
         assert_ne!(event_field(&event, "new"), "missing");
     }
@@ -3040,6 +3276,7 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::from([(resources.clone(), dir_identity(&resources))]),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
 
         worker.apply_watch_sets(refresh_for(vec![set]));
@@ -3052,7 +3289,7 @@ mod tests {
         assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
 
         std::fs::set_permissions(&carrier, original_permissions).unwrap();
-        worker.flush_due(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
+        worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
         let entry = worker.carriers[&carrier]
             .iter()
             .find(|entry| entry.label == "goal")
@@ -3090,11 +3327,12 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![set.clone()]));
 
         std::fs::write(&carrier, "B").unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let before_suspend = resync_inbox_event(&agent_dir);
 
         // Suspension removes every carrier and watch, while retaining one scalar sequence floor
@@ -3118,7 +3356,7 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.occurrence_sequence, 1);
         std::fs::write(&carrier, "B").unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let after_resume = resync_inbox_event(&agent_dir);
 
         assert_eq!(
@@ -3167,11 +3405,12 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         worker.apply_watch_sets(refresh_for(vec![set.clone()]));
 
         std::fs::write(&original_carrier, "B").unwrap();
-        worker.flush_path(&original_carrier, None);
+        worker.flush_path_publishing(&original_carrier, None);
         let first_a_to_b = resync_inbox_event(&agent_dir);
 
         std::fs::write(&relocated_carrier, "A").unwrap();
@@ -3195,14 +3434,14 @@ mod tests {
             read_state(&original_carrier, None).ok()
         );
 
-        worker.flush_path(&relocated_carrier, None);
+        worker.flush_path_publishing(&relocated_carrier, None);
         let back_to_a = resync_inbox_event(&agent_dir);
         assert_eq!(event_field(&back_to_a, "old"), event_field(&first_a_to_b, "new"));
         assert_eq!(event_field(&back_to_a, "new"), event_field(&first_a_to_b, "old"));
         assert!(event_field(&back_to_a, "occurrence").ends_with(":2"));
 
         std::fs::write(&relocated_carrier, "B").unwrap();
-        worker.flush_path(&relocated_carrier, None);
+        worker.flush_path_publishing(&relocated_carrier, None);
         let second_a_to_b = resync_inbox_event(&agent_dir);
         assert_eq!(
             event_field(&first_a_to_b, "old"),
@@ -3250,6 +3489,7 @@ mod tests {
                 declaration_summary: None,
                 occurrence_sequence: 0,
                 pending_transition: None,
+                in_flight: false,
                 dirty: true,
             })
             .collect();
@@ -3261,9 +3501,10 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
 
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
 
         let entries = &worker.carriers[&carrier];
         assert_eq!(entries[0].occurrence_sequence, 1);
@@ -3319,6 +3560,7 @@ mod tests {
                     declaration_summary: None,
                     occurrence_sequence: 0,
                     pending_transition: None,
+                    in_flight: false,
                     dirty: true,
                 }],
             )]),
@@ -3326,10 +3568,11 @@ mod tests {
             deadlines: BTreeMap::new(),
             watched: BTreeMap::new(),
             watcher: None,
+            emit: Arc::new(EmitQueue::default()),
         };
         std::fs::remove_file(&carrier).unwrap();
 
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let pending_transition = worker.carriers[&carrier][0]
             .pending_transition
             .clone()
@@ -3339,7 +3582,7 @@ mod tests {
         assert_eq!(event_field(&pending_transition.body, "new"), "missing");
         assert_eq!(worker.carriers[&carrier][0].occurrence_sequence, 1);
         std::fs::write(&carrier, "old bytes").unwrap();
-        worker.flush_path(&carrier, None);
+        worker.flush_path_publishing(&carrier, None);
         let entry = &worker.carriers[&carrier][0];
         assert_eq!(entry.occurrence_sequence, 1);
         assert_eq!(
@@ -3353,6 +3596,101 @@ mod tests {
         );
         assert!(entry.dirty);
         assert!(worker.deadlines.contains_key(&CarrierClass::Immediate));
+    }
+
+    fn handoff_worker(root: &Path, carrier: &Path, recipients: &[&str]) -> Worker {
+        crate::event::publish_owner_binding_for_test(root, "host").unwrap();
+        std::fs::write(carrier, "current bytes").unwrap();
+        Worker {
+            root: root.to_path_buf(),
+            this_host: "host".to_owned(),
+            carriers: BTreeMap::from([(
+                carrier.to_path_buf(),
+                recipients
+                    .iter()
+                    .map(|bus_id| Entry {
+                        bus_id: (*bus_id).to_owned(),
+                        seat_id: None,
+                        label: "goal".to_owned(),
+                        class: CarrierClass::Immediate,
+                        containment_root: None,
+                        state: Some(CarrierState::Present("stale-digest".to_owned())),
+                        declaration_summary: None,
+                        occurrence_sequence: 0,
+                        pending_transition: None,
+                        in_flight: false,
+                        dirty: true,
+                    })
+                    .collect(),
+            )]),
+            subscription_sequences: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            watched: BTreeMap::new(),
+            watcher: None,
+            emit: Arc::new(EmitQueue::default()),
+        }
+    }
+
+    /// One outstanding publication per subscription. Flushing again while a publication is still
+    /// in flight must not hand off the same subscription twice: whether its reserved event
+    /// identity is spent is decided by an outcome that has not returned yet.
+    #[test]
+    fn a_flush_never_hands_off_a_subscription_whose_publication_is_outstanding() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        let mut worker = handoff_worker(root.path(), &carrier, &["host.missing"]);
+
+        worker.flush_path(&carrier, None);
+        assert_eq!(worker.emit.queued_recipients(), ["host.missing"]);
+        assert!(worker.carriers[&carrier][0].in_flight);
+
+        std::fs::write(&carrier, "newer bytes while the publication is outstanding").unwrap();
+        worker.mark_mutated(vec![carrier.clone()]);
+        worker.flush_path(&carrier, None);
+        assert_eq!(
+            worker.emit.queued_recipients(),
+            ["host.missing"],
+            "an outstanding publication must not be handed off a second time"
+        );
+    }
+
+    /// A deactivation acknowledgement is the reconcile pass's guarantee that nothing starts
+    /// publishing to that recipient afterwards. A publication still queued when the seat is
+    /// deactivated is dropped, and only that recipient's.
+    #[test]
+    fn deactivation_drops_only_that_recipients_queued_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        let mut worker = handoff_worker(root.path(), &carrier, &["host.leaving", "host.staying"]);
+
+        worker.flush_path(&carrier, None);
+        assert_eq!(
+            worker.emit.queued_recipients(),
+            ["host.leaving", "host.staying"]
+        );
+
+        worker.deactivate_watch_set("host.leaving");
+        assert_eq!(worker.emit.queued_recipients(), ["host.staying"]);
+    }
+
+    /// A refresh that drops a subscription — the suspended recipient of #431 — must drop its
+    /// queued publication too. The pass has already decided that seat receives no events, and a
+    /// queued refusal published afterwards is work no outcome can apply.
+    #[test]
+    fn a_refresh_drops_a_queued_publication_for_a_subscription_it_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let carrier = root.path().join("carrier.md");
+        let mut worker = handoff_worker(root.path(), &carrier, &["host.missing"]);
+
+        worker.flush_path(&carrier, None);
+        assert_eq!(worker.emit.queued_recipients(), ["host.missing"]);
+
+        worker.apply_watch_sets(refresh_for(Vec::new()));
+        assert!(worker.carriers.is_empty());
+        assert!(
+            worker.emit.queued_recipients().is_empty(),
+            "a dropped subscription's queued publication must not survive the refresh"
+        );
     }
 
     #[test]
