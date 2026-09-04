@@ -209,6 +209,22 @@ supervisor restart changes the incarnation namespace and silently seeds new
 subscription sequences. The durable dedup horizon remains the stream receipt
 ring.
 
+A failed publication is classified by what could admit it later, because eligibility is resolved
+under the catalog-authoring lock and a refusal therefore follows from the declaration rather than
+from timing. Retrying one is pure cost: every attempt re-resolves the catalog to reach the same
+answer.
+
+- A recipient that is declared but not running parks its reservation. The subscription captures
+  nothing and schedules nothing while parked, and the reservation is retained beyond the
+  subscription itself, which the next refresh drops. It re-arms with its exact reserved bytes when
+  a refresh carries that recipient again, which happens only while it is running. Dropping it at
+  the refusal would instead lose a resync the agent should see on resume.
+- An ambiguous recipient, a recipient owned by another host, and a recipient that does not declare
+  the stream are refused permanently. The reservation is dropped after one diagnostic, and the
+  carrier baseline advances so the same transition is not captured again.
+- Everything else is retryable, including an absent declaration and a catalog mid-edit: a
+  declaration being replaced by rename is briefly absent, so its reservation is kept.
+
 ## What this does not do
 
 - No `notify` attribute on resource bindings (deferred until volume data
