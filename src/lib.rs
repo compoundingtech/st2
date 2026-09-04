@@ -8,6 +8,7 @@ pub mod agent_author;
 pub mod agent_publish;
 pub mod agents;
 pub mod catalog;
+pub mod catalog_archive;
 pub mod catalog_graph;
 pub mod catalog_lock;
 pub mod catalog_transaction;

@@ -846,6 +846,25 @@ removed from the inbox. An existing archive file wins byte-for-byte, so replay
 and a sync-restored duplicate converge without overwriting the receipt.
 Suspended reconciliation never performs this settlement.
 
+Retirement is where the lifecycle stops being about runtime and starts being
+about catalog size, so `st2 catalog archive` adds one step past it:
+`running → suspended → retired → archived`. Archival moves the whole identity
+directory from `agents/<host>/<identity>` into the catalog control plane at
+`.st2/archive/<host>/<identity>`, under the exclusive authoring lock and inside
+one generation commit, as a same-filesystem rename. `.st2` is excluded from
+catalog space at any depth, so an archived declaration is structurally
+undiscoverable and is never projected by a whole-catalog transaction — it is
+absent from the declaration plane, not filtered out of it. A tombstone file
+beside the moved directory carries `{id, host, identity, archivedAt, reason,
+archiveRoot}` and is published as one additive `archived` row in the
+`st2.catalog-graph.v2` envelope; an ordinary archived identity therefore leaves
+`complete: true` untouched, while an archived directory with no readable
+tombstone is unexplained control-plane state and makes the envelope incomplete.
+Eligibility is fail-closed and local-host only, because another host's runtime
+records are not observable: canonical path, retired in either spelling, no live
+or dead record for any declared task, and no remaining declaration naming the
+identity as `supervisor`. `st2 catalog unarchive` is the exact reverse move.
+
 Before starting a Codex provider, st2 asks that binary to generate its
 app-server JSON schemas and fingerprints only the delivery-critical projection:
 every client request and server notification arm st2 uses, the exact

@@ -19,9 +19,24 @@ pub struct CatalogGraph {
     pub complete: bool,
     pub roots: GraphRoots,
     pub agents: Vec<GraphAgent>,
+    /// Identities moved out of the live catalog by `st2 catalog archive`, newest field in the
+    /// envelope and additive: an archived identity is a tombstone row, never an `agents` member.
+    pub archived: Vec<GraphArchived>,
     pub declarations: Vec<GraphDeclaration>,
     pub conflicts: Vec<GraphConflict>,
     pub issues: Vec<GraphIssue>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphArchived {
+    pub id: String,
+    pub host: String,
+    pub identity: String,
+    pub archived_at: u64,
+    pub reason: Option<String>,
+    /// Catalog-relative location of the moved identity directory.
+    pub archive_root: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,8 +180,9 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
         .collect();
 
     let conflicts = duplicate_identity_conflicts(&root, this_host, &found.specs);
-    let complete = report.errors() == 0;
-    let issues = report
+    let observation = crate::catalog_archive::observe(&root)?;
+    let complete = report.errors() == 0 && observation.issues.is_empty();
+    let mut issues = report
         .issues
         .into_iter()
         .map(|issue| GraphIssue {
@@ -175,6 +191,27 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
             path: issue.path,
             agent: issue.agent,
             message: issue.message,
+        })
+        .collect::<Vec<_>>();
+    // Unexplained control-plane state in the archive root is a real fault: it means an identity
+    // left the live catalog without a readable trace, so the envelope must not read complete.
+    issues.extend(observation.issues.into_iter().map(|issue| GraphIssue {
+        severity: crate::validate::Severity::Error.tag(),
+        code: "archive-unexplained",
+        path: issue.path,
+        agent: None,
+        message: issue.message,
+    }));
+    let archived = observation
+        .archived
+        .into_iter()
+        .map(|tombstone| GraphArchived {
+            id: tombstone.id,
+            host: tombstone.host,
+            identity: tombstone.identity,
+            archived_at: tombstone.archived_at,
+            reason: tombstone.reason,
+            archive_root: tombstone.archive_root,
         })
         .collect();
 
@@ -188,6 +225,7 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
             pty_root: crate::run::effective_pty_root(&root),
         },
         agents,
+        archived,
         declarations,
         conflicts,
         issues,
