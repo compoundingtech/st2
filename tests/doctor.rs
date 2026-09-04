@@ -8,38 +8,21 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
+mod support;
+
+use support::RETIRED_RESOURCES;
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn retired_catalog(root: &Path) -> Child {
+fn retired_catalog(root: &Path, retirement: &str, extra: &str) -> Child {
     let declaration = root.join("agents/h/gone/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
     fs::write(
         declaration,
-        "agent \"gone\" { host \"h\"; retired #true; command \"true\" }\n",
-    )
-    .unwrap();
-    let owner = Command::new("sleep").arg("30").spawn().unwrap();
-    fs::write(root.join(".st2.h.lock"), format!("{}\n", owner.id())).unwrap();
-    owner
-}
-
-fn retired_catalog_with_resources(root: &Path) -> Child {
-    let declaration = root.join("agents/h/gone/agent.kdl");
-    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
-    fs::write(
-        declaration,
-        concat!(
-            "agent \"gone\" {\n",
-            "  host \"h\"\n",
-            "  desired-state \"retired\" reason=\"Mission complete\"\n",
-            "  resource \"work\" uri=\"work://h/current-task\" reason=\"Current implementation task.\"\n",
-            "  resource \"issue\" uri=\"github-issue://example/project/41\" reason=\"Tracking issue.\"\n",
-            "  command \"true\"\n",
-            "}\n",
-        ),
+        format!("agent \"gone\" {{\n  host \"h\"\n  {retirement}\n{extra}  command \"true\"\n}}\n"),
     )
     .unwrap();
     let owner = Command::new("sleep").arg("30").spawn().unwrap();
@@ -323,7 +306,7 @@ fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -359,7 +342,11 @@ fn retired_declaration_with_resources_is_healthy_when_tasks_are_absent() {
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
     );
     let declaration = catalog.join("agents/h/gone/agent.kdl");
-    let mut owner = retired_catalog_with_resources(&catalog);
+    let mut owner = retired_catalog(
+        &catalog,
+        "desired-state \"retired\" reason=\"Mission complete\"",
+        RETIRED_RESOURCES,
+    );
     let before = fs::read(&declaration).unwrap();
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
@@ -395,7 +382,7 @@ fn retired_declaration_is_unhealthy_while_a_declared_task_is_alive() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"running\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();
@@ -433,7 +420,7 @@ fn retired_declaration_is_unhealthy_while_a_dead_task_record_remains() {
         &bin.join("pty"),
         "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.gone\",\"status\":\"exited\"}]\\n'; fi\n",
     );
-    let mut owner = retired_catalog(&catalog);
+    let mut owner = retired_catalog(&catalog, "retired #true", "");
 
     let output = doctor(&catalog, &bin, &tmp.path().join("state"));
     let _ = owner.kill();

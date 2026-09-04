@@ -2,6 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod support;
+
+use support::RETIRED_RESOURCES;
+
 fn write(root: &Path, relative: &str, contents: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -250,12 +254,8 @@ fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
 fn legacy_retirement_reads_and_authoring_preserves_resources() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let resources = concat!(
-        "  resource \"work\" uri=\"work://h/current-task\" reason=\"Current implementation task.\"\n",
-        "  resource \"issue\" uri=\"github-issue://example/project/41\" reason=\"Tracking issue.\"\n",
-    );
     let legacy = format!(
-        "agent \"worker\" {{\n  host \"h\"\n  retired #true\n{resources}  command \"true\"\n}}\n"
+        "agent \"worker\" {{\n  host \"h\"\n  retired #true\n{RETIRED_RESOURCES}  command \"true\"\n}}\n"
     );
     write(root, "h/worker/agent.kdl", &legacy);
 
