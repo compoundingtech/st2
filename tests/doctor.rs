@@ -26,6 +26,27 @@ fn retired_catalog(root: &Path) -> Child {
     owner
 }
 
+fn retired_catalog_with_resources(root: &Path) -> Child {
+    let declaration = root.join("agents/h/gone/agent.kdl");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::write(
+        declaration,
+        concat!(
+            "agent \"gone\" {\n",
+            "  host \"h\"\n",
+            "  desired-state \"retired\" reason=\"Mission complete\"\n",
+            "  resource \"work\" uri=\"work://h/current-task\" reason=\"Current implementation task.\"\n",
+            "  resource \"issue\" uri=\"github-issue://example/project/41\" reason=\"Tracking issue.\"\n",
+            "  command \"true\"\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let owner = Command::new("sleep").arg("30").spawn().unwrap();
+    fs::write(root.join(".st2.h.lock"), format!("{}\n", owner.id())).unwrap();
+    owner
+}
+
 fn suspended_catalog(root: &Path, keep: bool) {
     let declaration = root.join("agents/h/idle/agent.kdl");
     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
@@ -322,6 +343,46 @@ fn retired_declaration_is_healthy_when_tasks_and_presence_are_absent() {
         !stdout.contains("h.gone presence"),
         "retired declarations must not require presence:\n{stdout}"
     );
+}
+
+/// dotfiles#1535: `st2 doctor` for a retired agent requires runtime-record absence only. Declared
+/// `resource` bindings (including a `work://` URI) are declaration metadata that survive retirement
+/// byte-identical, so they must NOT make retirement incomplete or add any resource-specific check.
+#[test]
+fn retired_declaration_with_resources_is_healthy_when_tasks_are_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[]\\n'; fi\n",
+    );
+    let declaration = catalog.join("agents/h/gone/agent.kdl");
+    let mut owner = retired_catalog_with_resources(&catalog);
+    let before = fs::read(&declaration).unwrap();
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let _ = owner.kill();
+    let _ = owner.wait();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "resources must not fail retirement health:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("✓ h.gone retirement complete (all declared tasks absent)"),
+        "{stdout}"
+    );
+    // Doctor is read-only and adds no resource-specific line for a retired agent.
+    assert!(
+        !stdout.contains("resource") && !stdout.contains("work://"),
+        "retired doctor must not check resources:\n{stdout}"
+    );
+    // The declaration — including its resources — is untouched by the read-only check.
+    assert_eq!(fs::read(&declaration).unwrap(), before);
 }
 
 #[test]

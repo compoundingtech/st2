@@ -241,3 +241,75 @@ fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
             .any(|spec| spec.identity == "worker" && spec.desired_state.is_running())
     );
 }
+
+/// dotfiles#1535: retirement is runtime teardown only. Legacy `retired #true` keeps reading as
+/// retired, an agent may carry `resource` bindings (including a `work://` URI) while retired, and
+/// authoring across the lifecycle collapses to the canonical `desired-state` form on the write path
+/// while leaving every resource byte-identical — un-retiring restores the exact resources.
+#[test]
+fn legacy_retirement_reads_and_authoring_preserves_resources() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let resources = concat!(
+        "  resource \"work\" uri=\"work://h/current-task\" reason=\"Current implementation task.\"\n",
+        "  resource \"issue\" uri=\"github-issue://example/project/41\" reason=\"Tracking issue.\"\n",
+    );
+    let legacy = format!(
+        "agent \"worker\" {{\n  host \"h\"\n  retired #true\n{resources}  command \"true\"\n}}\n"
+    );
+    write(root, "h/worker/agent.kdl", &legacy);
+
+    // Read compatibility: legacy `retired #true` is retired and its resources parse.
+    let found = st2::discover(root);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_retired());
+    assert_eq!(worker.resources.len(), 2);
+
+    // Un-retire: the write path drops the legacy node without touching the resources.
+    let running = author(root, "running", None);
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
+    assert!(!authored.contains("retired"), "{authored}");
+    assert!(!authored.contains("desired-state"), "{authored}");
+    assert!(authored.contains("resource \"work\" uri=\"work://h/current-task\""));
+    assert!(authored.contains("resource \"issue\" uri=\"github-issue://example/project/41\""));
+    let running_spec = st2::discover(root);
+    let worker = running_spec
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_running());
+    assert_eq!(worker.resources.len(), 2);
+
+    // Re-retire: new authoring writes the canonical `desired-state` form, resources still intact.
+    let retired = author(root, "retired", Some("Mission complete"));
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let authored = fs::read_to_string(root.join("h/worker/agent.kdl")).unwrap();
+    assert!(authored.contains("desired-state \"retired\" reason=\"Mission complete\""));
+    assert!(!authored.contains("retired #true"), "{authored}");
+    assert!(authored.contains("resource \"work\" uri=\"work://h/current-task\""));
+    assert!(authored.contains("resource \"issue\" uri=\"github-issue://example/project/41\""));
+    let found = st2::discover(root);
+    let worker = found
+        .specs
+        .iter()
+        .find(|spec| spec.identity == "worker")
+        .unwrap();
+    assert!(worker.desired_state.is_retired());
+    assert_eq!(worker.desired_state.reason(), Some("Mission complete"));
+    assert_eq!(worker.resources.len(), 2);
+}
