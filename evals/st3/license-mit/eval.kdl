@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/license-mit/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/license-mit" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/license-mit."
       step "start-team" timeout="10m" {
         title "The native Claude Sonnet license team is ready"
@@ -41,6 +43,7 @@ subgraph {
         assigned-to "agent/lmc.sup"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-request" { title "The exact immutable license request is understood"; goal "Read the referenced task document through st3 doc get. Confirm that the widget library must become MIT licensed." }
           step "send-worker-brief" {
@@ -58,6 +61,7 @@ subgraph {
         assigned-to "agent/lmc.worker"
         depends-on { step "delegate-license-change" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-license-brief" { title "The supervisor brief is understood"; goal "Drain and archive the one lmc.sup delegation. Identify every required license surface and verification." }
           step "inspect-license-surface" { title "The current proprietary license surface is identified"; goal "Inspect LICENSE, package.json, README.md, and repository status. Do not change source behavior."; depends-on { step "read-license-brief" completed } }
@@ -84,6 +88,7 @@ subgraph {
         assigned-to "agent/lmc.sup"
         depends-on { step "implement-license-change" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-worker-report" { title "The worker evidence report is understood"; goal "Drain and archive the one lmc.worker report. Record its revision and verification claims." }
           step "verify-worker-revision-read-only" { title "The supervisor independently verifies the MIT revision"; goal "Without edits, inspect ../worker. Verify canonical MIT LICENSE text, package.json MIT, no proprietary text, the published HEAD, its commit diff, and a clean tree."; depends-on { step "read-worker-report" completed } }
@@ -117,10 +122,12 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/license-mit/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/license-mit/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

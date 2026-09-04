@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/restart-continuity/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/restart-continuity" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/restart-continuity."
       step "start-team" timeout="10m" {
         title "The native Claude team is ready"
@@ -57,6 +59,8 @@ subgraph {
         depends-on { step "start-team" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "inspect-durable-state" {
             title "The initial batch state is understood"
@@ -118,6 +122,8 @@ subgraph {
         depends-on { step "inject-cold-restart" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "inspect-recovered-state" {
             title "The restarted worker finds the durable boundary"
@@ -170,6 +176,8 @@ subgraph {
         depends-on { step "process-after-restart" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "inspect-graph-history" {
             title "The restart and work phases are visible in the graph"
@@ -248,10 +256,12 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/restart-continuity/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/restart-continuity/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

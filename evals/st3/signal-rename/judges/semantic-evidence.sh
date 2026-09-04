@@ -10,7 +10,7 @@ st3 inspect "plan-run/$ST_PLAN_RUN" --json \
 printf '\n### durable work state\n'
 env -u ST_AGENT st3 work ls --all --json \
   | jq -c --arg run "plan-run/$ST_PLAN_RUN" \
-      '[.[] | select(.run == $run) | {step, status, assignee, updated_at_unix_ms}]'
+      '[.[] | select(.run == $run) | {step, status, assigned_to, available_to, claimant, updated_at_unix_ms}]'
 
 for product in \
   base-compatibility \

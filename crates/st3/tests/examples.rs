@@ -3,6 +3,13 @@ use std::path::PathBuf;
 
 use agent_spec::spec::Driver;
 
+fn assigned_to(step: &st3::model::StepSpec) -> Option<&str> {
+    match &step.work_selector {
+        Some(st3::model::WorkSelector::Assigned { agent }) => Some(agent),
+        _ => None,
+    }
+}
+
 fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
     fn visit(document: &kdl::KdlDocument, source_name: &str, counts: &mut (usize, usize)) {
         for node in document.nodes() {
@@ -365,7 +372,7 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
         let intent = st3::parse_intent(&source, "local").unwrap();
         let plan = &intent.plans[plan_id];
         for (step, assignee) in assignments {
-            assert_eq!(plan.steps[*step].assigned_to.as_deref(), Some(*assignee));
+            assert_eq!(assigned_to(&plan.steps[*step]), Some(*assignee));
             assert!(plan.steps[*step].nested_plan.is_some());
         }
         let declared = plan
@@ -506,7 +513,7 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
     ];
     for (step, assignee) in expected_assignments {
         let step = &plan.steps[step];
-        assert_eq!(step.assigned_to.as_deref(), Some(assignee));
+        assert_eq!(assigned_to(step), Some(assignee));
         assert!(step.nested_plan.is_some());
     }
 
@@ -613,7 +620,7 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
         ("process-after-restart", "agent/rc.dev"),
         ("verify-and-confirm", "agent/rc.sup"),
     ] {
-        assert_eq!(plan.steps[step].assigned_to.as_deref(), Some(assignee));
+        assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
         assert!(plan.steps[step].nested_plan.is_some());
     }
 
@@ -725,7 +732,7 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
         ("revise-federated", "agent/fd.c"),
         ("synthesize", "agent/fd.sup"),
     ] {
-        assert_eq!(plan.steps[step].assigned_to.as_deref(), Some(assignee));
+        assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
         assert!(plan.steps[step].nested_plan.is_some());
     }
 
@@ -803,11 +810,11 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
         ]
     );
     assert_eq!(
-        plan.steps["review-pull-request"].assigned_to.as_deref(),
+        assigned_to(&plan.steps["review-pull-request"]),
         Some("agent/prx.rev")
     );
     assert_eq!(
-        plan.steps["assess-review"].assigned_to.as_deref(),
+        assigned_to(&plan.steps["assess-review"]),
         Some("agent/prx.sup")
     );
     assert!(plan.steps["review-pull-request"].nested_plan.is_some());
@@ -872,7 +879,7 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
         let intent = st3::parse_intent(&source, "local").unwrap();
         let plan = &intent.plans[plan_id];
         for (step, assignee) in assignments {
-            assert_eq!(plan.steps[*step].assigned_to.as_deref(), Some(*assignee));
+            assert_eq!(assigned_to(&plan.steps[*step]), Some(*assignee));
             assert!(plan.steps[*step].nested_plan.is_some());
         }
         let products = plan

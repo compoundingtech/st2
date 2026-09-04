@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/pty-attach-machine-stream" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/pty-attach-machine-stream."
       step "contract" timeout="2m" {
         title "The installed PTY machine stream reconnects without framing loss"
@@ -27,9 +29,11 @@ subgraph {
           workspace "${ST_WORKSPACE}/fixture"
         }
       }
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         subgraph { scope "eval/pty-attach-machine-stream/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/pty-attach-machine-stream/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/crash-escalation/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/crash-escalation" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/crash-escalation."
       step "faults" timeout="1m" {
         title "The runtime classifies abnormal and clean exits"
@@ -36,9 +38,11 @@ subgraph {
           time-limit "1m"
         }
       }
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         subgraph { scope "eval/crash-escalation/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/crash-escalation/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

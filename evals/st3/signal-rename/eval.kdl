@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/signal-rename-codex/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/signal-rename-codex" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/signal-rename-codex."
       step "materialize" timeout="30m" {
         title "The isolated workspace exists"
@@ -98,6 +100,8 @@ subgraph {
         depends-on { step "start-team" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "inspect-product-surface" {
             title "Classify every base product identifier"
@@ -134,6 +138,8 @@ subgraph {
         depends-on { step "open-base-compatibility" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "sync-base-compatibility" {
             title "The relay clone contains the base compatibility revision"
@@ -175,6 +181,8 @@ subgraph {
         depends-on { step "open-base-compatibility" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "sync-base-compatibility" {
             title "The hub clone contains the base compatibility revision"
@@ -219,6 +227,8 @@ subgraph {
         }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "sync-consumer-revisions" {
             title "The supervisor clone contains both consumer revisions"
@@ -250,6 +260,8 @@ subgraph {
         depends-on { step "update-root-and-config" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "sync-complete-consumer-cutover" {
             title "The base clone contains every consumer and config revision"
@@ -286,6 +298,8 @@ subgraph {
         depends-on { step "close-base-compatibility" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "sync-final-origin" {
             title "The supervisor clone matches final origin/main"
@@ -372,6 +386,8 @@ subgraph {
         depends-on { step "held-out-gates" completed }
 
         plan "work" {
+
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "send-final-report" {
             title "Morgan receives the final result"
@@ -400,12 +416,14 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph {
           scope "eval/signal-rename-codex/${ST_PLAN_RUN}" { stop }
         }
         gate "condition" { empty "scope/eval/signal-rename-codex/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

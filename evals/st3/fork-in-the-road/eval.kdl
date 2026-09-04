@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/fork-in-the-road/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/fork-in-the-road" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/fork-in-the-road."
       step "start-team" timeout="10m" {
         title "The native Codex design panel is ready"
@@ -79,6 +81,7 @@ subgraph {
         assigned-to "agent/fd.a"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "analyze" {
             title "The per-human design tradeoffs are explicit"
@@ -106,6 +109,7 @@ subgraph {
         assigned-to "agent/fd.b"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "analyze" {
             title "The shared design tradeoffs are explicit"
@@ -133,6 +137,7 @@ subgraph {
         assigned-to "agent/fd.c"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "analyze" {
             title "The federated design tradeoffs are explicit"
@@ -164,6 +169,7 @@ subgraph {
           step "draft-federated" completed
         }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
           step "send-critiques" { title "Both peers receive a per-human critique"; goal "Send one direct st3 Small Talk critique to fd.b and one to fd.c. Use tags plan-run:$ST_PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
@@ -180,6 +186,7 @@ subgraph {
           step "draft-federated" completed
         }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
           step "send-critiques" { title "Both peers receive a shared-model critique"; goal "Send one direct st3 Small Talk critique to fd.a and one to fd.c. Use tags plan-run:$ST_PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
@@ -196,6 +203,7 @@ subgraph {
           step "draft-federated" completed
         }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "compare" { title "Both alternative proposals are compared"; goal "Read both alternatives and identify their strongest point, weakest point, and one unresolved human choice." }
           step "send-critiques" { title "Both peers receive a federated critique"; goal "Send one direct st3 Small Talk critique to fd.a and one to fd.b. Use tags plan-run:$ST_PLAN_RUN,panel-critique. Do not send routine progress."; depends-on { step "compare" completed } }
@@ -208,6 +216,7 @@ subgraph {
         assigned-to "agent/fd.a"
         depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.a." }
           step "publish-final" {
@@ -225,6 +234,7 @@ subgraph {
         assigned-to "agent/fd.b"
         depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.b." }
           step "publish-final" {
@@ -242,6 +252,7 @@ subgraph {
         assigned-to "agent/fd.c"
         depends-on { step "critique-per-human" completed; step "critique-shared" completed; step "critique-federated" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.c." }
           step "publish-final" {
@@ -259,6 +270,7 @@ subgraph {
         assigned-to "agent/fd.sup"
         depends-on { step "revise-per-human" completed; step "revise-shared" completed; step "revise-federated" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "compare-final-proposals" { title "The final option set and tradeoffs are compared"; goal "Read ../a/PROPOSAL.md, ../b/PROPOSAL.md, and ../c/PROPOSAL.md. Confirm that each contains a real design, privacy boundary, weaknesses, and debate response." }
           step "write-recommendation" { title "The recommendation is committed"; goal "Write RECOMMENDATION.md with the option set, key tradeoffs, a justified recommendation, a prototype sequence, privacy consequences, and explicit human decisions. Commit it with author fd.sup."; depends-on { step "compare-final-proposals" completed } }
@@ -289,10 +301,12 @@ subgraph {
         gate "the graph records every plan stage, product, and panel grouping" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/fork-in-the-road/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/fork-in-the-road/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

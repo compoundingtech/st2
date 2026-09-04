@@ -45,7 +45,7 @@ test "$(jq -r '.store_index' <<<"$created")" -gt "$output_index"
 
 for step in inspect-inventory write-result verify-result publish-result; do
   jq -e --arg run "$child" --arg step "$step" \
-    'any(.[]; .run == $run and .step == $step and .status == "completed" and .assignee == "agent/pdl.agent" and (.title | length > 0) and (.goal | length > 0))' \
+    'any(.[]; .run == $run and .step == $step and .status == "completed" and .assigned_to == "agent/pdl.agent" and (.title | length > 0) and (.goals | length > 0))' \
     <<<"$work" >/dev/null
 done
 

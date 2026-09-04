@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/network-isolation/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/network-isolation" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/network-isolation."
       step "contract" timeout="2m" {
         title "Two nested st3 networks remain isolated"
@@ -26,9 +28,11 @@ subgraph {
           workspace "${ST_WORKSPACE}/fixture"
         }
       }
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         subgraph { scope "eval/network-isolation/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/network-isolation/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

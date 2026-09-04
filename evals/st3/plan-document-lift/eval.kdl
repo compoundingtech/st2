@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/plan-document-lift/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/plan-document-lift" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/plan-document-lift."
       baseline "the exact source plan exists before planning starts" {
         has "doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636" "# Deployment summary plan"
@@ -33,6 +35,7 @@ subgraph {
         depends-on { step "start-planner" completed }
         produces-plan "eval/plan-document-lift/work"
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-exact-plan-document" {
             title "The exact immutable plan document is loaded"
@@ -72,10 +75,12 @@ subgraph {
         gate "the produced plan revision, child run, transitions, and product are exact" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; time-limit "120000ms" }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/plan-document-lift/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/plan-document-lift/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

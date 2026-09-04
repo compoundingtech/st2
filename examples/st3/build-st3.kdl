@@ -5,6 +5,8 @@ subgraph {
   resource "st3-full-corpus-review" { kind "human.review" }
 
   plan "build-st3" state="ready" {
+
+    completion { when "all-steps-exhausted" }
     goal "Complete plan build-st3."
     step "automated-tests" timeout="30m" {
       title "The implementation and automated tests pass"

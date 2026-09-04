@@ -29,7 +29,8 @@ peek_has() { pty_at peek --plain ms.target 2>/dev/null | grep -Fq "$1"; }
 
 pty_at run -d --id ms.target --no-display-name -- bash "$assets/target.sh"
 wait_for "target output" peek_has INITIAL_COLOR_61e8
-env -u PTY_SESSION PTY_ROOT="$PTY_ROOT" pty remote-serve --socket "$remote_socket" >"$root/remote.log" 2>&1 &
+export PTY_REMOTE_ROOT="$PTY_ROOT"
+socat UNIX-LISTEN:"$remote_socket",fork EXEC:"bash $assets/remote-stdio.sh" >"$root/remote.log" 2>&1 &
 remote_pid="$!"
 wait_for "remote socket" test -S "$remote_socket"
 node "$assets/drop-proxy.mjs" "$proxy_socket" "$remote_socket" "$root/drop-first" >"$root/proxy.log" 2>&1 &

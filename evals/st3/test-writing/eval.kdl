@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/test-writing/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/test-writing" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/test-writing."
       step "start-team" timeout="10m" {
         title "The native Codex test team is ready"
@@ -46,6 +48,7 @@ subgraph {
         assigned-to "agent/tw.sup"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "inspect-module-read-only" {
             title "The exported behavior and error paths are understood"
@@ -66,6 +69,7 @@ subgraph {
         assigned-to "agent/tw.dev"
         depends-on { step "prepare-test-brief" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-test-brief" {
             title "The supervisor test contract is understood"
@@ -107,6 +111,7 @@ subgraph {
         assigned-to "agent/tw.sup"
         depends-on { step "write-regression-suite" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-developer-report" {
             title "The developer report is understood"
@@ -135,10 +140,12 @@ subgraph {
         gate "the graph records the brief, test work, revision, reports, and verification" { exec "bash ./judges/graph.sh"; host "local"; workspace "${ST_WORKSPACE}"; env { CATALOG "${ST_WORKSPACE}" }; time-limit "120000ms" }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/test-writing/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/test-writing/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

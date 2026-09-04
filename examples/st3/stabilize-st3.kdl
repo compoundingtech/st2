@@ -6,6 +6,8 @@ subgraph {
   }
 
   plan "stabilize-st3" state="ready" {
+
+    completion { when "all-steps-exhausted" }
     goal "Complete plan stabilize-st3."
     step "free-verification" timeout="30m" {
       title "The deterministic st3 verification passes"

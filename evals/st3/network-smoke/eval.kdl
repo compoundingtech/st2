@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/network-smoke/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/network-smoke" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/network-smoke."
       step "contract" timeout="2m" {
         title "An isolated st3 daemon hosts a subject and delivers Small Talk"
@@ -26,9 +28,11 @@ subgraph {
           workspace "${ST_WORKSPACE}/fixture"
         }
       }
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         subgraph { scope "eval/network-smoke/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/network-smoke/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

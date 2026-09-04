@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/license-mit/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/license-mit" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/license-mit."
       step "team" timeout="20m" {
         title "The eval team is running"
@@ -53,12 +55,14 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph {
           scope "eval/license-mit/${ST_PLAN_RUN}" { stop }
         }
         gate "condition" { empty "scope/eval/license-mit/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

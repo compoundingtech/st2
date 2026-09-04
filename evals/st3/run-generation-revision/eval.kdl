@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/run-generation-revision/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/run-generation-revision" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Prove an approved plan revision creates one immutable successor generation."
       goal "Prove compatible state and automatic run environment move to the successor."
 
@@ -31,10 +33,12 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/run-generation-revision/${ST_PLAN_RUN}" { stop } }
         gate "the eval scope has no live member" { empty "scope/eval/run-generation-revision/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

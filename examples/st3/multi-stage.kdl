@@ -7,6 +7,8 @@ subgraph {
 
   scope "release-example" retention="temporary" {
     plan "release" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan release."
       step "build" timeout="20m" {
         title "The build command passes"
@@ -27,12 +29,14 @@ subgraph {
         gate "condition-1" { field "decision" "resource/release-review" "is" "approved" }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary release scope is empty"
         subgraph {
           scope "release-example" { stop }
         }
         gate "condition-1" { empty "scope/release-example" }
+      }
       }
     }
   }

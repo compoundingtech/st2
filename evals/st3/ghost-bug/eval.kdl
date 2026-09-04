@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/ghost-bug-codex" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/ghost-bug-codex."
       step "start-team" timeout="10m" {
         title "The native Codex debugging team is ready"
@@ -39,6 +41,7 @@ subgraph {
         assigned-to "agent/gbx.sup"
         depends-on { step "start-team" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-bug-report" { title "The exact immutable bug report is understood"; goal "Read the referenced task document through st3 doc get. Identify the leak reproduction, root-cause requirement, regression-test requirement, and verification contract." }
           step "send-debug-brief" {
@@ -56,6 +59,7 @@ subgraph {
         assigned-to "agent/gbx.fix"
         depends-on { step "delegate-debug-brief" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-debug-brief" { title "The supervisor debugging contract is understood"; goal "Drain and archive the one gbx.sup delegation. Identify every required proof and repository boundary." }
           step "reproduce-option-leak" { title "The custom-option leak is reproduced"; goal "Run the supplied custom-then-default reproduction. Confirm that the second format call incorrectly keeps the custom delimiters."; depends-on { step "read-debug-brief" completed } }
@@ -84,6 +88,7 @@ subgraph {
         assigned-to "agent/gbx.sup"
         depends-on { step "diagnose-and-fix" completed }
         plan "work" {
+          completion { when "all-steps-exhausted" }
           goal "Complete plan work."
           step "read-worker-report" { title "The worker debugging report is understood"; goal "Drain and archive the one gbx.fix report. Record its root cause, revision, test, and verification evidence." }
           step "verify-fix-read-only" { title "The supervisor independently verifies the root-cause fix"; goal "Without edits, inspect ../worker. Run the complete suite and direct reproduction. Verify the regression test, mutation-free defaultOptions, published HEAD, committed diff, and clean tree."; depends-on { step "read-worker-report" completed } }
@@ -117,10 +122,12 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/ghost-bug-codex/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/ghost-bug-codex/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/context-resource-continuity/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/context-resource-continuity" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Complete plan eval/context-resource-continuity."
       step "contract" timeout="2m" {
         title "Context and resources survive two daemon restarts"
@@ -27,9 +29,11 @@ subgraph {
           time-limit "1m"
         }
       }
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         subgraph { scope "eval/context-resource-continuity/${ST_PLAN_RUN}" { stop } }
         gate "condition" { empty "scope/eval/context-resource-continuity/${ST_PLAN_RUN}" }
+      }
       }
     }
   }

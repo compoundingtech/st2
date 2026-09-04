@@ -3,6 +3,8 @@ version 2
 subgraph {
   scope "eval/planning-mode/${ST_PLAN_RUN}" retention="temporary" {
     plan "eval/planning-mode" state="ready" {
+      agentless
+      completion { when "all-steps-exhausted" }
       goal "Prove one Codex planning session from request through direct approval."
       goal "Keep the proposed plan unpublished until its exact preview is approved."
 
@@ -34,10 +36,12 @@ subgraph {
         }
       }
 
-      step "cleanup" finally=#true {
+      finally {
+        step "cleanup" {
         title "The temporary eval scope is empty"
         subgraph { scope "eval/planning-mode/${ST_PLAN_RUN}" { stop } }
         gate "the eval scope has no live member" { empty "scope/eval/planning-mode/${ST_PLAN_RUN}" }
+      }
       }
     }
   }
