@@ -388,6 +388,40 @@ pub(crate) fn validate_discovered(
             ));
         }
 
+        // A pty task whose session socket path exceeds the portable `sun_path` bound can never
+        // spawn: `pty` refuses the bind, so the failure repeats on every reconcile pass forever
+        // and makes the pass result useless as a health signal. Admission is the only place where
+        // it is cheap, attributable, and fixable by the author. Host-scoped, because the bound
+        // comes from the pty root resolved on the host that would run the task.
+        if let (Some(host), Some(Ok(compiled))) = (this_host, &compiled)
+            && runs_on_selected_host
+        {
+            let pty_root = crate::run::effective_pty_root(root);
+            let bus_id = compiled.bus_id(host);
+            for task in &compiled.tasks {
+                if task.kind != agent_spec::spec::TaskKind::Pty {
+                    continue;
+                }
+                let id = crate::reconcile::resolve_task_id(&bus_id, &task.name, task.id.as_deref());
+                if let Some((socket, over)) = crate::run::session_socket_overage(&pty_root, &id) {
+                    issues.push(Issue::error(
+                        "socket-path-too-long",
+                        rp.clone(),
+                        ag.clone(),
+                        format!(
+                            "task '{id}' would bind a {bytes}-byte session socket at {socket}, \
+                             exceeding the {limit}-byte portable limit by {over}; shorten the \
+                             identity or task id by at least {over} bytes, or declare a shorter \
+                             pty root",
+                            bytes = crate::run::PORTABLE_SOCKET_PATH_LIMIT + over,
+                            socket = socket.display(),
+                            limit = crate::run::PORTABLE_SOCKET_PATH_LIMIT,
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Path fields must be absolute, $CATALOG-rooted, or the one canonical relative workspace.
         for (field, raw) in path_fields(s) {
             if let Some(issue) = check_path(

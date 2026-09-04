@@ -428,6 +428,33 @@ fn effective_pty_root_from(catalog_root: &Path, ambient: Option<std::ffi::OsStri
     }
 }
 
+/// The portable bound on a unix socket address. Darwin caps `sun_path` at 104 bytes and Linux at
+/// 108, so a declaration has to satisfy the smaller one to be admissible on either.
+pub const PORTABLE_SOCKET_PATH_LIMIT: usize = 104;
+
+/// The socket `pty` binds for one session: `<PTY_ROOT>/<session-id>.sock`.
+///
+/// Measured against the pty binary rather than assumed: for a 21-byte root and a 78-byte id it
+/// reports a 105-byte path exceeding the limit by 1, which is `root + '/' + id + ".sock"`.
+pub fn session_socket_path(pty_root: &Path, session_id: &str) -> PathBuf {
+    pty_root.join(format!("{session_id}.sock"))
+}
+
+/// The resolved socket path and its overage, when a task's session socket cannot be bound.
+///
+/// `pty` refuses the bind rather than truncating, so such a task can never spawn: it fails
+/// identically on every reconcile pass, forever. The bound is not a constant — the usable identity
+/// length is what remains of the limit after the resolved pty root — so it is always derived from
+/// the root actually in use.
+pub fn session_socket_overage(pty_root: &Path, session_id: &str) -> Option<(PathBuf, usize)> {
+    let path = session_socket_path(pty_root, session_id);
+    let bytes = path.as_os_str().as_encoded_bytes().len();
+    bytes
+        .checked_sub(PORTABLE_SOCKET_PATH_LIMIT)
+        .filter(|over| *over > 0)
+        .map(|over| (path, over))
+}
+
 impl PtyCli {
     /// A `PtyCli` rooted at `catalog_root` (used for `$CATALOG` expansion).
     pub fn new(catalog_root: PathBuf) -> Self {
@@ -3001,13 +3028,33 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         return;
     };
     let subject = format!("crash-loop: {agent} parked");
-    let body = format!(
-        "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its restart{{}} \
-         policy (mode=fail) and is parked. Its last dead session is left as evidence, and `st2 tasks` \
-         reports the park. Investigate the cause, then `st2 unpark {id}` to recover just this task — \
-         restarting st2 is not required and would cold-boot every task on the host.",
-        id = cl.pty_id
-    );
+    // `st2 unpark` relaunches into the identical failure when the cause is structural, so the
+    // notice must not offer it as a recovery verb: acting on that advice restarts the storm. The
+    // test is the same predicate admission uses, not the wording of a spawn error.
+    let unbindable_socket =
+        session_socket_overage(&effective_pty_root(catalog_root), &cl.pty_id);
+    let body = match &unbindable_socket {
+        Some((socket, over)) => format!(
+            "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
+             restart{{}} policy (mode=fail) and is parked. The cause is structural and `st2 \
+             unpark` cannot recover it: the task's session socket path {socket} is {bytes} bytes, \
+             exceeding the {limit}-byte portable limit by {over}, so every launch fails the same \
+             way. Shorten the identity or task id by at least {over} bytes, or declare a shorter \
+             pty root; the declaration has to change before this task can run.",
+            id = cl.pty_id,
+            socket = socket.display(),
+            bytes = PORTABLE_SOCKET_PATH_LIMIT + over,
+            limit = PORTABLE_SOCKET_PATH_LIMIT,
+        ),
+        None => format!(
+            "st2 gave up restarting task '{id}' (agent {agent}) — it crash-looped past its \
+             restart{{}} policy (mode=fail) and is parked. Its last dead session is left as \
+             evidence, and `st2 tasks` reports the park. Investigate the cause, then `st2 unpark \
+             {id}` to recover just this task — restarting st2 is not required and would cold-boot \
+             every task on the host.",
+            id = cl.pty_id
+        ),
+    };
     let from = format!("st2.{this_host}"); // the runner is the sender
     let tags = ["crash-loop".to_string()];
     if let Err(e) = message::send_to_inbox(
@@ -3052,6 +3099,44 @@ mod tests {
     use std::ffi::OsStr;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
+
+
+    /// The bound is derived from the resolved pty root, never a fixed maximum identity length.
+    ///
+    /// `pty` binds `<PTY_ROOT>/<session-id>.sock`, so the separator plus the five-byte suffix is
+    /// the fixed overhead and the usable identity length is whatever remains of the limit. These
+    /// numbers are measured against the pty binary itself: with a 21-byte root it accepts a
+    /// 77-byte id and refuses a 78-byte one as "a socket path of 105 bytes, which exceeds the
+    /// 104-byte kernel limit by 1".
+    #[test]
+    fn session_socket_overage_is_derived_from_the_resolved_root() {
+        let short_root = Path::new("/tmp/ptyprobe-1960953");
+        let fits = "a".repeat(77);
+        let over = "a".repeat(78);
+
+        assert_eq!(
+            session_socket_path(short_root, &fits)
+                .as_os_str()
+                .as_encoded_bytes()
+                .len(),
+            PORTABLE_SOCKET_PATH_LIMIT,
+            "the accepted id must land exactly on the limit"
+        );
+        assert!(session_socket_overage(short_root, &fits).is_none());
+
+        let (path, overage) =
+            session_socket_overage(short_root, &over).expect("one byte over is refused");
+        assert_eq!(overage, 1);
+        assert_eq!(path, short_root.join(format!("{over}.sock")));
+
+        // A deeper root shrinks every identity's budget on that host: the same id that fitted
+        // above is now 26 bytes over.
+        let deep_root = Path::new("/home/user/.local/state/st2/default/catalog/pty");
+        assert_eq!(
+            session_socket_overage(deep_root, &fits).map(|(_, over)| over),
+            Some(26)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn linux_process_state(pid: i32) -> Option<char> {
