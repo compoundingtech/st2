@@ -1000,3 +1000,71 @@ fn a_hand_authored_native_catalog_validates_without_errors() {
         result.issues
     );
 }
+
+/// A pty task whose session socket path exceeds the portable `sun_path` bound is rejected when the
+/// declaration is admitted, not on every reconcile pass forever.
+///
+/// The identity here is long enough that no resolved pty root can bring it under the limit, so the
+/// assertion does not depend on where this catalog happens to live. The byte arithmetic itself,
+/// including both sides of the boundary, is covered by
+/// `src/run.rs::session_socket_overage_is_derived_from_the_resolved_root`.
+#[test]
+fn an_unbindable_session_socket_path_is_rejected_at_admission() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("hetz/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "hetz"; pty "agent" {{ command "x" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        has(&r, "socket-path-too-long", Severity::Error),
+        "unbindable socket path must fail admission: {:?}",
+        r.issues
+    );
+    let issue = r
+        .issues
+        .iter()
+        .find(|issue| issue.code == "socket-path-too-long")
+        .expect("the issue was just asserted");
+    assert!(
+        issue.message.contains(".sock") && issue.message.contains("exceeding the 104-byte"),
+        "the diagnostic must name the resolved path and the overage: {}",
+        issue.message
+    );
+}
+
+/// An exec task binds no session socket, so its id is not subject to the bound.
+#[test]
+fn a_long_exec_task_id_is_not_a_socket_path_issue() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("hetz/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "hetz"; exec "job" {{ command "true" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        !has(&r, "socket-path-too-long", Severity::Error),
+        "an exec task never binds a session socket: {:?}",
+        r.issues
+    );
+}
+
+/// The bound comes from the pty root resolved on the host that would run the task, so a synced
+/// multi-host catalog must not fail admission for another machine's task against this host's root.
+#[test]
+fn another_hosts_long_identity_is_not_judged_against_this_hosts_pty_root() {
+    let long_identity = "a".repeat(200);
+    let c = catalog(&[(
+        &format!("elsewhere/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#),
+    )]);
+
+    let r = validate_for_host(c.path(), "hetz");
+    assert!(
+        !has(&r, "socket-path-too-long", Severity::Error),
+        "only the selected host's tasks are judged against its pty root: {:?}",
+        r.issues
+    );
+}

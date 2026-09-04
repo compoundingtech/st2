@@ -273,6 +273,21 @@ stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
 
+Host-scoped validation rejects a pty task whose session socket path would exceed the
+portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a
+bind over the limit, so such a task can never spawn and fails identically on every
+reconcile pass, which also makes the pass result useless as a health signal for that
+host. The bound is derived from the pty root resolved for the selected host, never a
+fixed maximum identity length: the usable identity length is what remains of the limit
+after that root. The portable 104-byte bound applies so a declaration admitted on Linux
+does not fail on Darwin, and the diagnostic states the resolved path and the byte
+overage so the author can shorten the identity rather than discover the failure as a
+spawn error later.
+
+A park notice whose cause is structurally unrecoverable says so instead of offering
+`st2 unpark`, which would relaunch into the identical failure. The test is the same
+predicate admission uses, not the wording of a spawn error.
+
 Before returning success, publication reads the exact live declaration back
 under the catalog lock, verifies its digest and bytes, and re-admits the live
 catalog. `st2 validate --json` emits `st2.validate.v2`; successful JSON
