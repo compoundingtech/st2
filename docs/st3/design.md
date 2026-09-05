@@ -178,7 +178,15 @@ Providers can use webhooks, streams, or conditional requests with one-shot deadl
 
 [resource-subscriptions.md](./resource-subscriptions.md) defines the provider contract, graph shape, lifecycle, and acceptance proof.
 
-[account-usage-reactions.md](./account-usage-reactions.md) proposes the missing account contract and condition-to-subgraph action path. It does not define implemented behavior.
+### Accounts
+
+`account/NAME` is an observed subject in the st3 design. An agent records its selected account with an `agent.account` claim.
+
+The account contract still needs claims and facts for usage windows, used percentages, reset times, observation freshness, and provider status.
+
+The authoritative schema registry currently omits the existing account family and its claims. A later account design iteration must reconcile this omission.
+
+An external tool will observe usage and send alerts until st3 implements account-driven changes.
 
 ## System boundary
 
