@@ -137,7 +137,7 @@ const terminalProviderError = (event: AgentEndFrame): ProviderError | undefined 
  * build whose telemetry surface moved still loads and still delivers mail, and a widened cast alone
  * would make that tolerance absolute and silent. Erased at runtime.
  *
- * Note what this can and cannot prove for omp. It pins the SHAPE against pi 0.84.2's typings, which
+ * Note what this can and cannot prove for omp. It pins the SHAPE against pi 0.84.4's typings, which
  * is all this asset compiles against — omp ships no typings of its own. It cannot prove omp's
  * `tokens` still means prompt-only input, because that is a meaning and not a shape; the
  * version-pinned fixture in `src/pi_channel.rs` is what bounds that (HC-R13, HC-T03).
