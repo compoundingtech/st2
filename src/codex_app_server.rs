@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, driver_diagnostic, harness_context, harness_state, message, run, status};
+use crate::{
+    delivery_ledger, ding, driver_diagnostic, harness_context, harness_state, message, run, status,
+};
 
 const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
@@ -91,7 +93,6 @@ const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
-const DELIVERY_STATE_SCHEMA: &str = "st2.codex-delivery-state.v1";
 const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
@@ -464,51 +465,13 @@ struct PendingCodexDelivery {
     method: CodexDeliveryMethod,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum CodexDeliveryPhase {
-    Attempted,
-    Accepted,
-}
-
-/// One durable FIFO delivery attempt.
-///
-/// `Attempted` is written before transport. A replacement control connection reconciles that
-/// ambiguous attempt against the resumed thread before it may send the client ID again. `Accepted`
-/// is written only after the exact completed typed user-message event and remains until normal
-/// message archive precedence removes the inbox entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CodexDeliveryState {
-    schema: String,
-    agent: String,
-    runtime_id: String,
-    runtime_incarnation: String,
-    thread_id: String,
-    filename: String,
-    client_id: String,
-    phase: CodexDeliveryPhase,
-}
-
-impl CodexDeliveryState {
-    fn attempted(
-        runtime: &CodexRuntime,
-        thread_id: String,
-        filename: String,
-        client_id: String,
-    ) -> Self {
-        Self {
-            schema: DELIVERY_STATE_SCHEMA.to_string(),
-            agent: runtime.agent.clone(),
-            runtime_id: runtime.runtime_id.clone(),
-            runtime_incarnation: runtime.incarnation.clone(),
-            thread_id,
-            filename,
-            client_id,
-            phase: CodexDeliveryPhase::Attempted,
-        }
-    }
-}
+// One durable FIFO delivery attempt lives in the shared `crate::delivery_ledger`, which grades
+// Codex's two receipts honestly: the JSON-RPC result of `turn/start`/`turn/steer` is
+// `transportAccepted`, and only the exact completed typed user message — live, or found in a
+// resumed thread's history — is `consumed`. Codex has no storage receipt and no scheduler
+// admission signal, so it can never write the phases in between, and consumption is its true
+// ceiling: reaching it releases FIFO ownership. Ordinary message archive precedence, which is the
+// recipient agent's own act, still removes the inbox entry.
 
 /// The exact codex-cli version whose Rust source settled the occupancy arithmetic below, read at
 /// tag `rust-v0.151.0` (tag object `d8673cb68e349c208659b986697773d3145dbb14`) because the Nix
@@ -799,7 +762,6 @@ struct RejectedCodexDelivery {
 
 struct CodexInboxDelivery {
     config: CodexDeliveryConfig,
-    state_path: PathBuf,
     runtime: CodexRuntime,
     wake: Receiver<()>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -807,7 +769,7 @@ struct CodexInboxDelivery {
     next_presence_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
-    state: Option<CodexDeliveryState>,
+    ledger: delivery_ledger::Ledger,
     pending: Option<PendingCodexDelivery>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
@@ -831,7 +793,7 @@ struct CodexInboxDelivery {
 impl CodexInboxDelivery {
     fn new(
         config: CodexDeliveryConfig,
-        state_path: PathBuf,
+        legacy_path: PathBuf,
         runtime: CodexRuntime,
     ) -> Result<Self> {
         fs::create_dir_all(&config.inbox).with_context(|| {
@@ -844,7 +806,18 @@ impl CodexInboxDelivery {
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
-        let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        // The ledger's authority is `delivery-ledger.json`; the v1 path beside it is the one-shot
+        // adoption source and the rollback floor, never read as authority again. Codex's v1
+        // `Accepted` was written only from the typed completed user message, so it adopts as
+        // `consumed` — the one adoption that may suppress a duplicate on its own evidence.
+        let identity = config.identity.clone();
+        let ledger = delivery_ledger::Ledger::open(
+            &legacy_path,
+            delivery_ledger::Harness::Codex.profile(),
+            &config.identity,
+            runtime.runtime_id(),
+            |thread, filename| stable_client_user_message_id(&identity, thread, filename),
+        );
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
@@ -907,7 +880,6 @@ impl CodexInboxDelivery {
         );
         Ok(Self {
             config,
-            state_path,
             runtime,
             wake,
             _watcher: watcher,
@@ -915,7 +887,7 @@ impl CodexInboxDelivery {
             next_presence_refresh: Instant::now(),
             head: None,
             suppressed: false,
-            state,
+            ledger,
             pending: None,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
@@ -1000,16 +972,15 @@ impl CodexInboxDelivery {
         }
     }
 
-    fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
-        atomic_json(&self.state_path, &state)?;
-        self.state = Some(state);
-        Ok(())
-    }
-
-    fn clear_state(&mut self) -> Result<()> {
-        remove_state_file(&self.state_path)?;
-        self.state = None;
-        Ok(())
+    /// Reconcile the ledger to what the recipient still has unread, then re-assert the rollback
+    /// floor. Archive precedence is the recipient agent's act and the only settlement authority:
+    /// an entry whose file left the inbox releases ownership, and this pump never moves a file.
+    fn reconcile_inbox(&mut self, unread: &[message::Message]) -> Result<()> {
+        self.ledger
+            .prune(|filename| unread.iter().any(|message| message.filename == filename))?;
+        // Re-asserted on every pass while an entry is outstanding: a crash exactly at the floor
+        // write would otherwise leave a landing with no v1-readable lower bound.
+        self.ledger.reassert_floor()
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -1037,13 +1008,7 @@ impl CodexInboxDelivery {
             return Ok(());
         }
         let unread = message::list_inbox(&self.config.inbox)?;
-        if self.state.as_ref().is_some_and(|state| {
-            unread
-                .iter()
-                .all(|message| message.filename != state.filename)
-        }) {
-            self.clear_state()?;
-        }
+        self.reconcile_inbox(&unread)?;
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
                 .iter()
@@ -1063,20 +1028,48 @@ impl CodexInboxDelivery {
         if self.pending.is_some() || !state.subscribed || self.suppressed {
             return Ok(None);
         }
-        if let Some(delivery_state) = self.state.as_ref() {
-            if delivery_state.thread_id == state.thread_id {
-                return Ok(None);
-            }
-            // A newly selected thread is a different delivery binding. An old binding's receipt
-            // must neither suppress nor acknowledge delivery to this thread.
-            self.clear_state()?;
+        // Fail closed: an unreadable ledger holds and surfaces rather than guessing. It never
+        // refuses to start — a control connection that will not start delivers nothing at all.
+        // The operator-visible surface is the existing typed boundary — the transport is
+        // unavailable — and the raw reason stays in tracing, so no unbounded prose reaches the
+        // record. Restating it is coalesced by the publisher, so a held pass costs no write.
+        if let Some(reason) = self.ledger.quarantined().map(str::to_string) {
+            tracing::warn!("st2 codex: delivery ledger is quarantined: {reason}");
+            self.diagnostics.publish(
+                driver_diagnostic::Stage::Delivery,
+                driver_diagnostic::Reason::DeliveryUnavailable,
+                driver_diagnostic::Source::PromptTransport,
+            );
+            return Ok(None);
         }
-        let Some(head) = self.head.as_ref() else {
+        // A newly selected thread is a different delivery binding. An old binding's receipt must
+        // neither suppress nor acknowledge delivery to this thread.
+        if self
+            .ledger
+            .binding()
+            .is_some_and(|binding| binding != state.thread_id())
+        {
+            self.ledger.rebind(state.thread_id())?;
+        }
+        let Some(head) = self.head.clone() else {
             return Ok(None);
         };
         if self.rejected.as_ref().is_some_and(|rejected| {
             rejected.filename == head.filename && rejected.observed == state.observed
         }) {
+            return Ok(None);
+        }
+        // Exactly one delivery is outstanding at a time on this transport: an entry bound to some
+        // other file holds the pump until archive precedence resolves it, so a message arriving
+        // out of filename order can never open a second concurrent delivery.
+        if !self.ledger.entries().is_empty() && self.ledger.entry(&head.filename).is_none() {
+            return Ok(None);
+        }
+        // An attempt this pump already owns is held until evidence settles or refuses it. Only an
+        // authoritative "no" — a rejected request, or a resumed history proving the client ID
+        // never landed — authorizes sending the same identity again; a carried-forward v1 record
+        // never does.
+        if self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry {
             return Ok(None);
         }
         let method = match &state.observed {
@@ -1102,16 +1095,28 @@ impl CodexInboxDelivery {
             &self.config.catalog_root,
             &self.config.this_host,
             &self.config.identity,
-            head,
+            &head,
         );
         let request =
             codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
-        self.write_state(CodexDeliveryState::attempted(
-            &self.runtime,
-            state.thread_id().to_string(),
-            filename.clone(),
-            client_id,
-        ))?;
+        // Durable ownership before transport: the v1-readable floor first, then the ledger's own
+        // `attempted`.
+        self.ledger.begin(delivery_ledger::Begin {
+            filename: filename.clone(),
+            binding: state.thread_id().to_string(),
+            correlation: delivery_ledger::Correlation::native(client_id.clone()),
+            // Codex's typed receipt is a live frame, so an attempt is acknowledged only by the
+            // incarnation that made it; an older one is settled by the resume sweep instead.
+            incarnation: Some(self.runtime.incarnation().to_string()),
+            legacy_floor: delivery_ledger::codex_floor(
+                &self.config.identity,
+                self.runtime.runtime_id(),
+                self.runtime.incarnation(),
+                state.thread_id(),
+                &filename,
+                &client_id,
+            ),
+        })?;
         self.pending = Some(PendingCodexDelivery {
             request_id,
             filename,
@@ -1134,13 +1139,13 @@ impl CodexInboxDelivery {
             .take()
             .context("Codex delivery is not pending")?;
         if message.get("error").is_some() {
-            if !self
-                .state
-                .as_ref()
-                .is_some_and(|state| state.phase == CodexDeliveryPhase::Accepted)
-            {
-                self.clear_state()?;
-            }
+            // The request itself was refused: an authoritative negative acknowledgement about
+            // this attempt, and the only thing that re-authorizes the same client ID here. A
+            // delivery that already reached its ceiling cannot be un-settled by a late error.
+            self.ledger.negative(
+                &pending.filename,
+                delivery_ledger::NegativeReceipt::Rejected,
+            )?;
             self.rejected = Some(RejectedCodexDelivery {
                 filename: pending.filename,
                 observed: observed.clone(),
@@ -1159,6 +1164,12 @@ impl CodexInboxDelivery {
                 );
             }
         }
+        // The request returned a well-formed result. That is a fact about the call, never about
+        // the model, so it grades no higher than `transportAccepted`.
+        self.ledger.record(
+            &pending.filename,
+            delivery_ledger::Evidence::TransportAccepted,
+        )?;
         self.rejected = None;
         Ok(true)
     }
@@ -1169,26 +1180,37 @@ impl CodexInboxDelivery {
         {
             return Ok(false);
         }
-        let Some(delivery_state) = self.state.as_ref() else {
+        let Some(client_id) = message
+            .pointer("/params/item/clientId")
+            .and_then(Value::as_str)
+        else {
             return Ok(false);
         };
         if message.pointer("/params/threadId").and_then(Value::as_str) != Some(state.thread_id())
-            || delivery_state.thread_id != state.thread_id()
-            || delivery_state.runtime_incarnation != self.runtime.incarnation()
             || state.runtime_incarnation != self.runtime.incarnation()
-            || message
-                .pointer("/params/item/clientId")
-                .and_then(Value::as_str)
-                != Some(delivery_state.client_id.as_str())
         {
             return Ok(false);
         }
-        if delivery_state.phase == CodexDeliveryPhase::Accepted {
-            return Ok(true);
+        // One correlation may carry several inbox files, so one typed receipt settles every entry
+        // it delivered — each on its own monotone entry.
+        let settled: Vec<String> = self
+            .ledger
+            .correlated(client_id)
+            .into_iter()
+            .filter(|filename| {
+                self.ledger.entry(filename).is_some_and(|entry| {
+                    entry.binding == state.thread_id()
+                        && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
+                })
+            })
+            .collect();
+        if settled.is_empty() {
+            return Ok(false);
         }
-        let mut accepted = delivery_state.clone();
-        accepted.phase = CodexDeliveryPhase::Accepted;
-        self.write_state(accepted)?;
+        for filename in &settled {
+            self.ledger
+                .record(filename, delivery_ledger::Evidence::Consumed)?;
+        }
         Ok(true)
     }
 
@@ -1198,12 +1220,17 @@ impl CodexInboxDelivery {
         if message.get("error").is_some() {
             return Ok(());
         }
-        let Some(delivery_state) = self.state.as_ref() else {
-            return Ok(());
-        };
-        if delivery_state.thread_id != state.thread_id()
-            || delivery_state.phase == CodexDeliveryPhase::Accepted
-        {
+        let unsettled: Vec<(String, String)> = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.binding == state.thread_id()
+                    && entry.phase < delivery_ledger::Phase::Consumed
+            })
+            .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
+            .collect();
+        if unsettled.is_empty() {
             return Ok(());
         }
         let turns = message
@@ -1212,70 +1239,30 @@ impl CodexInboxDelivery {
             .context(
                 "Codex thread/resume response has no typed turn history for delivery recovery",
             )?;
-        let accepted = turns.iter().any(|turn| {
-            turn.get("items")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("userMessage")
-                            && item.get("clientId").and_then(Value::as_str)
-                                == Some(delivery_state.client_id.as_str())
+        for (filename, client_id) in unsettled {
+            let accepted = turns.iter().any(|turn| {
+                turn.get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("userMessage")
+                                && item.get("clientId").and_then(Value::as_str)
+                                    == Some(client_id.as_str())
+                        })
                     })
-                })
-        });
-        if accepted {
-            let mut state = delivery_state.clone();
-            state.phase = CodexDeliveryPhase::Accepted;
-            self.write_state(state)
-        } else {
-            self.clear_state()
+            });
+            if accepted {
+                self.ledger
+                    .record(&filename, delivery_ledger::Evidence::Consumed)?;
+            } else {
+                // An authoritative resumed history without the client ID proves the pre-crash
+                // attempt never landed. That absence is the receipt — retained, not erased —
+                // and only it may authorize sending the same stable ID again.
+                self.ledger
+                    .negative(&filename, delivery_ledger::NegativeReceipt::Absent)?;
+            }
         }
-    }
-}
-
-fn load_delivery_state(
-    path: &Path,
-    identity: &str,
-    runtime_id: &str,
-) -> Result<Option<CodexDeliveryState>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let state: CodexDeliveryState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("reading Codex delivery state {}", path.display()))?;
-    anyhow::ensure!(
-        state.schema == DELIVERY_STATE_SCHEMA,
-        "Codex delivery state has unsupported schema '{}'",
-        state.schema
-    );
-    anyhow::ensure!(
-        state.agent == identity && state.runtime_id == runtime_id,
-        "Codex delivery state belongs to a different runtime"
-    );
-    anyhow::ensure!(
-        !state.runtime_incarnation.is_empty()
-            && !state.thread_id.is_empty()
-            && message::is_message_filename(&state.filename),
-        "Codex delivery state has an invalid runtime binding or filename"
-    );
-    anyhow::ensure!(
-        state.client_id
-            == stable_client_user_message_id(identity, &state.thread_id, &state.filename),
-        "Codex delivery state client ID does not match its binding"
-    );
-    Ok(Some(state))
-}
-
-fn remove_state_file(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            File::open(path.parent().context("state file has no parent")?)?.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Ok(())
     }
 }
 
@@ -2801,7 +2788,7 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_state_path = control_state_path.with_file_name("delivery-state.json");
+        let delivery_state_path = control_state_path.with_file_name(delivery_ledger::LEGACY_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
@@ -5318,10 +5305,24 @@ mod tests {
     fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDelivery {
         CodexInboxDelivery::new(
             config,
-            root.join("state/delivery-state.json"),
+            root.join("state").join(delivery_ledger::LEGACY_FILE),
             CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
         )
         .unwrap()
+    }
+
+    /// Read the ledger back through its own loader and the real correlation derivation: a test
+    /// that read the bytes directly would not notice a record the pump itself would refuse.
+    fn ledger_entry(root: &Path, filename: &str) -> Option<delivery_ledger::Entry> {
+        delivery_ledger::Ledger::open(
+            &root.join("state").join(delivery_ledger::LEGACY_FILE),
+            delivery_ledger::Harness::Codex.profile(),
+            "h.worker",
+            "h.worker",
+            |thread, file| stable_client_user_message_id("h.worker", thread, file),
+        )
+        .entry(filename)
+        .cloned()
     }
 
     fn acknowledge_tui_thread_loaded(events: &Receiver<ControlEvent>) {
@@ -5930,8 +5931,8 @@ mod tests {
         let idle = subscribed_state(CodexObservedState::Idle);
         let request = delivery.maybe_request(&idle).unwrap().unwrap();
         assert_eq!(
-            delivery.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Attempted,
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Attempted,
             "submission ownership is durable before transport"
         );
         assert!(
@@ -5943,9 +5944,9 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            delivery.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Attempted,
-            "JSON success is not typed acceptance"
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::TransportAccepted,
+            "a well-formed JSON result is transport, never typed acceptance"
         );
         assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
@@ -6023,11 +6024,12 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            load_delivery_state(&state_path, "h.worker", "h.worker")
-                .unwrap()
-                .unwrap()
-                .phase,
-            CodexDeliveryPhase::Accepted
+            ledger_entry(tmp.path(), &filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
+        );
+        assert!(
+            !state_path.exists(),
+            "consumption released the v1 rollback floor"
         );
         assert!(config.inbox.join(&filename).is_file());
 
@@ -6049,7 +6051,11 @@ mod tests {
         assert_eq!(replacement.maybe_request(&idle).unwrap(), None);
         assert!(
             !state_path.exists(),
-            "archive precedence clears the receipt"
+            "no outstanding delivery, no rollback floor"
+        );
+        assert!(
+            ledger_entry(tmp.path(), &filename).is_none(),
+            "archive precedence — the recipient agent's own act — releases the ledger entry"
         );
     }
 
@@ -6100,21 +6106,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            recovered.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Accepted
+            recovered.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed,
+            "a resumed history carrying the client ID is the same typed receipt, found late"
         );
         assert_eq!(recovered.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
 
-        // An authoritative resumed history without the client ID proves that the pre-send record
-        // did not reach typed acceptance. Only then may the same stable ID be retried.
-        recovered.state.as_mut().unwrap().phase = CodexDeliveryPhase::Attempted;
-        atomic_json(
-            &tmp.path().join("state/delivery-state.json"),
-            recovered.state.as_ref().unwrap(),
+        // An authoritative resumed history WITHOUT the client ID proves the pre-crash attempt
+        // never landed. Only that absence may re-authorize the same stable ID — so it needs its
+        // own scenario, because the delivery above is settled and can never be un-settled.
+        let absent_tmp = tempfile::tempdir().unwrap();
+        let absent_config = delivery_config(absent_tmp.path());
+        let absent_filename = message::send_to_inbox(
+            &absent_config.inbox,
+            "h.sender",
+            Some("absent"),
+            None,
+            &[],
+            "body",
         )
         .unwrap();
-        recovered
+        let mut attempted = inbox_delivery(absent_tmp.path(), absent_config.clone());
+        let absent_client_id = attempted.maybe_request(&idle).unwrap().unwrap()
+            ["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(attempted);
+
+        let mut replacement = inbox_delivery(absent_tmp.path(), absent_config);
+        assert_eq!(
+            replacement.maybe_request(&idle).unwrap(),
+            None,
+            "an ambiguous attempt is held and surfaced, never replayed on its own"
+        );
+        replacement
             .reconcile_resume(
                 &json!({
                     "id": CONTROL_SUBSCRIBE_REQUEST_ID,
@@ -6123,20 +6150,35 @@ mod tests {
                 &idle,
             )
             .unwrap();
-        assert!(recovered.state.is_none());
-        let retry = recovered.maybe_request(&idle).unwrap().unwrap();
-        assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+        assert_eq!(
+            replacement
+                .ledger
+                .entry(&absent_filename)
+                .unwrap()
+                .negative,
+            Some(delivery_ledger::NegativeReceipt::Absent),
+            "the absence is retained as evidence, not erased"
+        );
+        let retry = replacement.maybe_request(&idle).unwrap().unwrap();
+        assert_eq!(retry["params"]["clientUserMessageId"], absent_client_id);
     }
 
+    /// v1 refused to START on a record whose client ID contradicted its own binding, which is the
+    /// worst available failure: the control connection never comes up and nothing is delivered at
+    /// all. The ledger fails closed instead — it starts, authorizes no transport, retains the
+    /// reason, and destroys no evidence.
     #[test]
-    fn malformed_delivery_state_fails_closed() {
+    fn a_tampered_v1_record_fails_closed_without_refusing_to_start() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                .unwrap();
         let state_path = tmp.path().join("state/delivery-state.json");
         atomic_json(
             &state_path,
             &json!({
-                "schema": DELIVERY_STATE_SCHEMA,
+                "schema": delivery_ledger::CODEX_LEGACY_SCHEMA,
                 "agent": "h.worker",
                 "runtimeId": "h.worker",
                 "runtimeIncarnation": "incarnation-test",
@@ -6147,15 +6189,36 @@ mod tests {
             }),
         )
         .unwrap();
-        let error = match CodexInboxDelivery::new(
-            config,
-            state_path,
-            CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
-        ) {
-            Ok(_) => panic!("accepted malformed delivery state"),
-            Err(error) => error,
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+        assert!(
+            delivery
+                .ledger
+                .quarantined()
+                .is_some_and(|reason| reason.contains("does not match its binding")),
+            "the refusal names itself"
+        );
+        assert_eq!(
+            delivery
+                .maybe_request(&subscribed_state(CodexObservedState::Idle))
+                .unwrap(),
+            None,
+            "a quarantined ledger authorizes no transport"
+        );
+        // The operator-visible surface is the existing typed delivery boundary. No new
+        // vocabulary, and the raw quarantine reason stays in tracing rather than the record.
+        let driver_diagnostic::Observed::Failure(failure) =
+            driver_diagnostic::read(&driver_diagnostic::path(&config.agent_dir))
+        else {
+            panic!("a quarantined ledger must be diagnosed")
         };
-        assert!(error.to_string().contains("client ID does not match"));
+        assert_eq!(failure.stage, driver_diagnostic::Stage::Delivery);
+        assert_eq!(failure.reason, driver_diagnostic::Reason::DeliveryUnavailable);
+        assert_eq!(failure.source, driver_diagnostic::Source::PromptTransport);
+        assert!(
+            state_path.exists(),
+            "a record we refuse to read is not a record we may destroy"
+        );
+        assert!(config.inbox.join(&filename).is_file());
     }
 
     #[test]
@@ -6279,17 +6342,10 @@ mod tests {
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
-        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+        assert!(delivery_config(tmp.path()).inbox.join(&filename).is_file());
         assert_eq!(
-            load_delivery_state(
-                &tmp.path().join("state/delivery-state.json"),
-                "h.worker",
-                "h.worker",
-            )
-            .unwrap()
-            .unwrap()
-            .phase,
-            CodexDeliveryPhase::Accepted
+            ledger_entry(tmp.path(), &filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
         );
     }
 
@@ -6400,14 +6456,20 @@ mod tests {
         let client_id = stable_client_user_message_id("h.worker", "thread-main", &filename);
         let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let delivery_state_path = tmp.path().join("state/delivery-state.json");
+        // The v1 record a prior binary left, in exactly the shape it wrote it. This is the
+        // migration boundary: no ledger exists, so the new pump adopts this attempt.
         atomic_json(
             &delivery_state_path,
-            &CodexDeliveryState::attempted(
-                &prior_runtime,
-                "thread-main".into(),
-                filename.clone(),
-                client_id.clone(),
-            ),
+            &json!({
+                "schema": delivery_ledger::CODEX_LEGACY_SCHEMA,
+                "agent": "h.worker",
+                "runtimeId": "h.worker",
+                "runtimeIncarnation": prior_runtime.incarnation(),
+                "threadId": "thread-main",
+                "filename": &filename,
+                "clientId": &client_id,
+                "phase": "attempted"
+            }),
         )
         .unwrap();
 
@@ -6512,12 +6574,19 @@ mod tests {
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
 
-        let recovered = load_delivery_state(&delivery_state_path, "h.worker", "h.worker")
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.phase, CodexDeliveryPhase::Accepted);
-        assert_eq!(recovered.client_id, client_id);
-        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+        let recovered = ledger_entry(tmp.path(), &filename).expect("the adopted attempt survives");
+        assert_eq!(recovered.phase, delivery_ledger::Phase::Consumed);
+        assert_eq!(recovered.correlation.value, client_id);
+        assert_eq!(
+            recovered.adopted_from.as_deref(),
+            Some(delivery_ledger::CODEX_LEGACY_SCHEMA),
+            "the receipt landed on the entry carried forward from v1, not on a second attempt"
+        );
+        assert!(
+            !delivery_state_path.exists(),
+            "consumption released the v1 record it was adopted from"
+        );
+        assert!(delivery_config(tmp.path()).inbox.join(&filename).is_file());
     }
 
     #[test]
