@@ -38,20 +38,55 @@ A terminal-backed or terminal-free unit declared for an agent.
 Authority: [Agent Spec task contract](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#compact-and-explicit-tasks);
 [`Task`](../../crates/agent-spec/src/spec.rs#L121-L148)
 
-### agent identity
+### agent ID
 
-The bare `identity` value of an agent declaration. It is not a claim of
-fleet-wide uniqueness.
+The explicit catalog-global immutable identifier of one logical agent subject.
+New subjects use UUIDv7. Migration assigns each legacy subject its existing
+host-qualified bus identity as an explicit ID without moving state. The legacy
+ID's original host-looking prefix becomes opaque and does not change on a later
+host move. The ID survives routing, presentation, graph, desired-state, and
+runtime-incarnation changes and is never reassigned.
 
-Authority: [`AgentSpec::identity`](../../crates/agent-spec/src/spec.rs#L24-L50);
-[Agent Spec identity rules](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host)
+The declaration spelling is `id`; positional `identity` remains the legacy
+declaration key and address fallback. Avoid: *agent identity* when it could mean
+the subject, address, runtime incarnation, or presentation.
 
-### bus ID
+Authority: [R24 immutable agent ID](requirements.md);
+[Agent Spec field rules](02-agent-spec/spec.md)
 
-The host-qualified agent address `<host>.<identity>`.
+### agent address
 
-Authority: [`AgentSpec::bus_id`](../../crates/agent-spec/src/spec.rs#L203-L211);
-[Agent Spec bus identity](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#discovery-identity-and-host)
+The mutable semantic alias used for human routing. It is unique within one
+logical host among running and suspended subjects. A retired subject is
+non-routable and releases its address. An address does not encode supervisor
+ancestry, filesystem placement, or immutable ownership even when its dotted
+segments resemble a path.
+
+Avoid: *agent path* — graph and filesystem paths are independent concepts;
+*agent handle* — use the routing-specific term.
+
+Authority: [R24 mutable agent address](requirements.md);
+[Agent Spec field rules](02-agent-spec/spec.md)
+
+### bus address
+
+The host-qualified human route `<host>.<agent-address>`. An addressless legacy
+declaration derives its bus address from `<host>.<identity>` until the first
+explicit agent address is assigned.
+
+Avoid: *bus ID* — the value is mutable and does not identify subject
+continuity.
+
+Authority: [R24 mutable agent address](requirements.md);
+[identity and address specification](spec.md#immutable-agent-id-mutable-address-and-presentation-r02-r08-r11-r13-r19-r24-r26)
+
+### agent name
+
+The optional mutable, non-unique human-facing presentation label. It never
+selects, routes, authorizes, or identifies an agent subject.
+
+Authority: [R25 bounded presentation](requirements.md);
+[identity and address specification](spec.md#immutable-agent-id-mutable-address-and-presentation-r02-r08-r11-r13-r19-r24-r26)
 
 ### catalog
 
@@ -598,9 +633,11 @@ outside this family entirely.
   observation with it.
 - Use **recovery action** for the structured argv projected with a parked task;
   it names the exact supervisor scope rather than relying on ambient defaults.
-- Use [agent identity](../../crates/agent-spec/src/spec.rs#L24-L50) for the bare
-  value and [bus ID](../../crates/agent-spec/src/spec.rs#L203-L211) for the
-  host-qualified address.
+- Use [agent ID](#agent-id) for immutable logical-subject identity,
+  [agent address](#agent-address) for the mutable host-local semantic route,
+  and [bus address](#bus-address) for its host-qualified form. Do not use
+  *agent identity*, *agent path*, or *bus ID* when the intended axis is not
+  explicit.
 - **Resource** names one concept: a [Resource binding](#resource-binding) and
   nothing else. The [linked record](#linked-record-retired) plane that once shared the
   word is retired. Do not reintroduce a second sense.

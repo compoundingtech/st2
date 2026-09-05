@@ -16,6 +16,16 @@ unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
 Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
 are tracked in [open-questions.md](./open-questions.md).
 
+The `agent` field's immutable-ID meaning is the accepted target, and it ships
+as a new record version, `st2.harness-state.v2`: this record's version suffix
+is its read contract, so changing an existing field's meaning reserves the next
+version rather than reusing `v1`. Records and producers stay on
+`st2.harness-state.v1`, whose `agent` remains a bus identity, until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+Version 2 is otherwise identical to the shape below. The reader-first rollout
+accepts both versions — narrowing the `unsupported-schema` rule below to
+versions outside that pair — before any version-2 writer activates.
+
 ## Scope
 
 This specification defines the observed-state record, its freshness and
@@ -54,7 +64,7 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
 ```json
 {
   "schema": "st2.harness-state.v1",
-  "agent": "<identity>",
+  "agent": "<identity in v1; agent ID in v2>",
   "harness": "codex | claude | pi | opencode",
   "state": "idle | active | child | ended",
   "blockedOn": "none | human",
@@ -159,8 +169,8 @@ What a reader reports, in evaluation order:
 | --- | --- | --- |
 | No record file | no observation (`null`) | never observed ≠ `unknown` |
 | File exists but cannot be read | `unknown` | `unreadable-record`; an IO error is indeterminate, never absence |
-| Unparseable / non-v1-shaped bytes | `unknown` | `malformed-record`; never falls back to mtime |
-| `schema` is not `st2.harness-state.v1` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
+| Unparseable bytes, or bytes not shaped like an accepted version | `unknown` | `malformed-record`; never falls back to mtime |
+| `schema` is neither `st2.harness-state.v1` nor, once tolerant readers ship, `st2.harness-state.v2` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
 | `writtenAtMs` > now + 60 s | `unknown` | `future-skew` |
 | `writtenAtMs` ≤ now − 15 min | `unknown` | `stale` |
 | Literal `unknown` state (never written by this crate) | `unknown` | `literal-unknown` |
