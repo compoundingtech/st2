@@ -57,7 +57,7 @@ pub(crate) enum ProviderOutcome {
 /// whatever state a hook process wrote in between and never clobbers a fresher observation.
 pub(crate) struct SessionObserver {
     agent_dir: PathBuf,
-    identity: String,
+    actor: harness_state::RecordIdentity,
     harness: &'static str,
     pty_session: String,
     session: String,
@@ -77,16 +77,17 @@ impl SessionObserver {
     /// ownership would silently produce a writer every record refuses.
     pub(crate) fn new(
         agent_dir: &Path,
-        identity: &str,
+        actor: impl Into<harness_state::RecordIdentity>,
         harness: &'static str,
         pty_session: &str,
     ) -> anyhow::Result<Self> {
+        let actor = actor.into();
         let session = harness_state::session_token();
-        let seq = harness_state::claim(agent_dir, identity, harness, &session)?;
+        let seq = harness_state::claim(agent_dir, actor.clone(), harness, &session)?;
         Ok(Self {
             seq,
             agent_dir: agent_dir.to_path_buf(),
-            identity: identity.to_string(),
+            actor,
             harness,
             pty_session: pty_session.to_string(),
             session,
@@ -99,7 +100,7 @@ impl SessionObserver {
     /// the terminal record fences exactly this session's records.
     pub(crate) fn terminal_only(
         agent_dir: &Path,
-        identity: &str,
+        actor: impl Into<harness_state::RecordIdentity>,
         harness: &'static str,
         pty_session: &str,
         session: &str,
@@ -107,7 +108,7 @@ impl SessionObserver {
     ) -> Self {
         Self {
             agent_dir: agent_dir.to_path_buf(),
-            identity: identity.to_string(),
+            actor: actor.into(),
             harness,
             pty_session: pty_session.to_string(),
             session: session.to_string(),
@@ -129,7 +130,7 @@ impl SessionObserver {
     fn writer(&self) -> harness_state::Writer {
         harness_state::Writer::new(
             &self.agent_dir,
-            &self.identity,
+            self.actor.clone(),
             self.harness,
             Some(self.pty_session.clone()),
         )
@@ -347,5 +348,33 @@ mod tests {
         assert_eq!(record.state, Activity::Ended);
         assert_eq!(record.exit.as_deref(), Some("exit unknown"));
         assert_eq!(record.reason.as_deref(), Some("launch-error"));
+    }
+
+    /// The wrapper half every interactive driver shares: whichever actor the driver resolved at
+    /// start decides both the record's `agent` bytes and its version, through the claim and the
+    /// terminal record alike. Under activation that is the immutable agent ID under version 2.
+    #[test]
+    fn an_activated_observer_claims_and_ends_under_version_2() {
+        let tmp = tempfile::tempdir().unwrap();
+        const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+        let observer = SessionObserver::new(
+            tmp.path(),
+            harness_state::RecordIdentity::activated(AGENT_ID),
+            "claude",
+            "hetz.worker",
+        )
+        .unwrap();
+        observer.ended("exit 0");
+        let path = harness_state::harness_state_path(tmp.path());
+        let bytes = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-state.v2""#),
+            "{bytes}"
+        );
+        assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
+        assert_eq!(
+            harness_state::read(&path, None).unwrap().state,
+            harness_state::Activity::Ended
+        );
     }
 }

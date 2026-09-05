@@ -88,9 +88,11 @@ pub fn run(
     let executable =
         std::env::current_exe().context("resolving st2 executable for the omp channel")?;
     let session = harness_state::session_token();
+    // One gate decision per driver process, taken before the claim it keys.
+    let actor = harness_state::RecordIdentity::for_driver(catalog_root, &identity);
     // The claim is written: it supersedes whatever the predecessor left — including a
     // still-fresh live record — before the channel or terminal writer act under it.
-    let seq = harness_state::claim(&agent_dir, identity.clone(), "omp", &session)?;
+    let seq = harness_state::claim(&agent_dir, actor.clone(), "omp", &session)?;
     // Every fallible step past the claim must end the record honestly on failure — the claim
     // placeholder standing as the last word would read as a takeover, not a launch that never
     // ran.
@@ -116,7 +118,7 @@ pub fn run(
         Err(error) => {
             let mut writer = harness_state::Writer::new(
                 &agent_dir,
-                identity.clone(),
+                actor.clone(),
                 "omp",
                 Some(runtime_id.clone()),
             )
@@ -139,7 +141,7 @@ pub fn run(
     // record fences exactly this session's live records.
     let observer = crate::provider_session::SessionObserver::terminal_only(
         &agent_dir,
-        &identity,
+        actor.clone(),
         "omp",
         &runtime_id,
         &session,
@@ -156,7 +158,7 @@ pub fn run(
         Some(&observer),
     )
     .with_context(|| format!("running omp driver '{runtime_id}'"))?;
-    record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
+    record_session_end(&agent_dir, &actor, &runtime_id, &session, seq, &outcome);
     match outcome {
         ProviderOutcome::Exited(exit) => {
             anyhow::ensure!(exit.success(), "omp provider exited with {exit}");
@@ -195,7 +197,7 @@ fn verify_supported_version(binary: &str) -> Result<()> {
 /// that the provider process is gone.
 fn record_session_end(
     agent_dir: &Path,
-    identity: &str,
+    actor: &harness_state::RecordIdentity,
     runtime_id: &str,
     session: &str,
     seq: u64,
@@ -206,7 +208,7 @@ fn record_session_end(
         ProviderOutcome::Stopped(None) => "stopped".to_string(),
     };
     let mut writer =
-        harness_state::Writer::new(agent_dir, identity, "omp", Some(runtime_id.to_string()))
+        harness_state::Writer::new(agent_dir, actor.clone(), "omp", Some(runtime_id.to_string()))
             .with_ownership(session, seq);
     if let Err(error) = writer.ended(label) {
         eprintln!("st2 omp driver: recording session end failed: {error}");
@@ -505,5 +507,30 @@ mod tests {
         assert_eq!(argv[1], "-e");
         assert!(argv[2].ends_with("omp-channel.ts"));
         assert_eq!(argv[3], "--model");
+    }
+
+    /// The omp wrapper's terminal write under an activated catalog: the actor `run` resolved once
+    /// at start decides the record's `agent` bytes and its version together.
+    #[test]
+    fn an_activated_wrapper_ends_the_session_under_version_2() {
+        use std::os::unix::process::ExitStatusExt as _;
+        const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+
+        let tmp = tempfile::tempdir().unwrap();
+        record_session_end(
+            tmp.path(),
+            &harness_state::RecordIdentity::activated(AGENT_ID),
+            "h.worker",
+            "session-test",
+            1,
+            &ProviderOutcome::Exited(ExitStatus::from_raw(0)),
+        );
+        let bytes =
+            std::fs::read_to_string(harness_state::harness_state_path(tmp.path())).unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-state.v2""#),
+            "{bytes}"
+        );
+        assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
     }
 }

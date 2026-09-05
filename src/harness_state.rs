@@ -32,12 +32,12 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
-/// The version this binary WRITES. Also the ownership key: a record is this writer's only when
-/// it carries exactly this string (see [`Writer::observe`]).
+/// The legacy record version, whose `agent` field means the bus identity `<host>.<identity>`.
+/// Normative while the catalog is not fully migrated (DELTA-003's activation gate).
 const SCHEMA: &str = "st2.harness-state.v1";
-/// The reserved next version, whose `agent` field means the immutable agent ID instead of the
-/// bus identity. The shape is otherwise identical, so a tolerant reader decodes its axes exactly
-/// like v1's; nothing here writes it yet (reader-first rollout, DELTA-003).
+/// The target record version, whose `agent` field means the immutable agent ID. The shape is
+/// otherwise identical, so a tolerant reader decodes its axes exactly like v1's; only a writer
+/// over an [`crate::identity::IdentityActivation::Activated`] catalog emits it.
 const SCHEMA_NEXT: &str = "st2.harness-state.v2";
 
 /// Read admission: exactly the v1/v2 pair, never a wider prefix match. A foreign namespace
@@ -46,6 +46,111 @@ const SCHEMA_NEXT: &str = "st2.harness-state.v2";
 /// version's while meaning something else.
 fn is_supported_schema(schema: &str) -> bool {
     schema == SCHEMA || schema == SCHEMA_NEXT
+}
+
+/// The actor bytes a driver stamps into its record, together with the record version that says
+/// what those bytes MEAN. The two travel as one value because they are one decision: `agent`
+/// holds the bus identity under v1 and the immutable agent ID under v2, so a writer that knew
+/// only the string could stamp an ID under a version promising a bus identity.
+///
+/// Also the write-side ownership key: [`Writer`] owns a record only while its version matches
+/// this one's (see [`Writer::observe`]). Both driver records share this type — [`Writer`] here
+/// and [`crate::harness_context::Writer`] beside it resolve it against their own schema
+/// constants — so one activation decision cannot version the two records apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordIdentity {
+    agent: String,
+    activated: bool,
+}
+
+impl RecordIdentity {
+    /// Legacy: the bus identity `<host>.<identity>`, written under the v1 version.
+    pub fn legacy(bus_identity: impl Into<String>) -> Self {
+        Self {
+            agent: bus_identity.into(),
+            activated: false,
+        }
+    }
+
+    /// Activated: the immutable catalog-global agent ID, written under the v2 version.
+    pub fn activated(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent: agent_id.into(),
+            activated: true,
+        }
+    }
+
+    /// Resolve the pair through DELTA-003's activation gate, which the caller decides once per
+    /// command from the catalog — never per record write. A partially migrated catalog has no
+    /// coherent ID namespace to key record ownership on, so every current invariant stays
+    /// normative there and these writers keep emitting v1 with the bus identity.
+    pub fn resolve(
+        activation: &crate::identity::IdentityActivation,
+        agent_id: &str,
+        bus_identity: &str,
+    ) -> Self {
+        match activation {
+            crate::identity::IdentityActivation::Activated => Self::activated(agent_id),
+            crate::identity::IdentityActivation::Legacy(_) => Self::legacy(bus_identity),
+        }
+    }
+
+    /// Resolve the actor one driver process was launched with, ONCE at driver start.
+    ///
+    /// A driver holds the agent key reconciliation decided for it (`--identity`, the same value
+    /// `ST_AGENT` carries) and the catalog it was launched against, so it answers the gate itself:
+    /// under activation that key already IS the immutable agent ID, and under legacy it is the bus
+    /// identity — the same bytes either way, which is why only the record version they are paired
+    /// with changes. Deciding once here and holding the result for the process's life keeps the
+    /// answer off the write path: writing a record must never discover a catalog.
+    ///
+    /// Fail-closed in every undecidable direction. An unreadable declaration, unexplained archive
+    /// state, and an outstanding migration marker each leave the catalog without a coherent ID
+    /// namespace, so the driver keeps writing what every record already on that disk is keyed by
+    /// rather than promising an ID meaning it cannot prove.
+    pub fn for_driver(catalog_root: &Path, agent_key: &str) -> Self {
+        match crate::identity::activation(catalog_root) {
+            Ok(activation) => Self::resolve(&activation, agent_key, agent_key),
+            Err(error) => {
+                tracing::debug!(
+                    "identity activation is undecidable for {}; driver records stay legacy: {error:#}",
+                    catalog_root.display()
+                );
+                Self::legacy(agent_key)
+            }
+        }
+    }
+
+    /// The actor bytes, whose meaning is [`Self::is_activated`]'s answer.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.activated
+    }
+}
+
+/// A bare identity string is a legacy bus identity: a caller that never consulted the gate — a
+/// test, or a helper handed a value read back from an already-legacy record — holds bus-identity
+/// bytes by definition. Driver producers instead resolve their actor through
+/// [`RecordIdentity::for_driver`].
+impl From<String> for RecordIdentity {
+    fn from(bus_identity: String) -> Self {
+        Self::legacy(bus_identity)
+    }
+}
+
+impl From<&str> for RecordIdentity {
+    fn from(bus_identity: &str) -> Self {
+        Self::legacy(bus_identity)
+    }
+}
+
+impl From<&String> for RecordIdentity {
+    fn from(bus_identity: &String) -> Self {
+        Self::legacy(bus_identity.as_str())
+    }
 }
 
 /// The claim-sequence floor sidecar, beside the record: claims stay monotonic even across a
@@ -258,7 +363,7 @@ impl Observation {
 pub struct Writer {
     path: PathBuf,
     lock_path: PathBuf,
-    agent: String,
+    identity: RecordIdentity,
     harness: &'static str,
     pty_session: Option<String>,
     interrupted: bool,
@@ -276,14 +381,14 @@ impl Writer {
     /// fresh.
     pub fn new(
         agent_dir: &Path,
-        agent: impl Into<String>,
+        agent: impl Into<RecordIdentity>,
         harness: &'static str,
         pty_session: Option<String>,
     ) -> Self {
         Self {
             path: harness_state_path(agent_dir),
             lock_path: agent_dir.join(LOCK_NAME),
-            agent: agent.into(),
+            identity: agent.into(),
             harness,
             pty_session,
             interrupted: false,
@@ -318,6 +423,18 @@ impl Writer {
     /// an interval the observer did not see.
     pub fn interrupt(&mut self) {
         self.interrupted = true;
+    }
+
+    /// The version this writer WRITES, and therefore the version of a record it owns. Derived
+    /// from the writer's own identity rather than hardcoded, so the write-side ownership tests
+    /// below hold in both directions: a v1 writer never touches a v2 record and a v2 writer
+    /// never touches a v1 one.
+    fn schema(&self) -> &'static str {
+        if self.identity.is_activated() {
+            SCHEMA_NEXT
+        } else {
+            SCHEMA
+        }
     }
 
     /// Hold the record's exclusive cross-process lock for one read→decide→rename cycle. The lock
@@ -404,30 +521,32 @@ impl Writer {
         if on_disk.as_ref().is_some_and(|current| current.seq > seq) {
             return Ok(false);
         }
-        // Write-side comparisons are EXACT own-version equality, deliberately narrower than the
-        // read admission in [`is_supported_schema`]: a v2 record is readable but is not this
+        // Write-side comparisons are EXACT own-version equality — this WRITER's version, not a
+        // hardcoded one — and deliberately narrower than the read admission in
+        // [`is_supported_schema`]: the other version of the pair is readable but is not this
         // writer's record. A record this writer does not own decodes its `seq` as serde-default
-        // zero, which every claim exceeds — a v1 straggler would otherwise replace a v2 record
-        // it does not own. Non-claiming writers refuse any other version outright; only the
-        // explicit written [`claim`] supersedes one.
+        // zero, which every claim exceeds, so without this a v1 straggler would replace a v2
+        // record it does not own — and, once the gate opens, a v2 writer would restamp a v1
+        // record whose `agent` means something else. Non-claiming writers refuse any other
+        // version outright; only the explicit written [`claim`] supersedes one.
         if on_disk
             .as_ref()
-            .is_some_and(|current| current.schema != SCHEMA)
+            .is_some_and(|current| current.schema != self.schema())
         {
             return Ok(false);
         }
         self.claimed_seq = Some(seq);
         // Ownership is token equality: a record is this writer's only when it carries both this
-        // binary's own write version and this session's incarnation. Anything else — any other
-        // schema (the tolerantly readable v2 included), a predecessor's or successor's token,
-        // the empty pre-token form — is never coalesced
+        // writer's own version and this session's incarnation. Anything else — any other schema
+        // (the tolerantly readable other half of the version pair included), a predecessor's or
+        // successor's token, the empty pre-token form — is never coalesced
         // against and never treated as this session's terminal word; a genuine observation
         // replaces it wholesale (one logical owner per record), continuing the counter for
         // byte-distinctness. Timestamps deliberately play no part: a same-millisecond takeover
         // and a lingering predecessor writer are both real and both ambiguous by clock.
         let own_record = on_disk
             .as_ref()
-            .filter(|current| current.schema == SCHEMA && current.incarnation == self.session);
+            .filter(|current| current.schema == self.schema() && current.incarnation == self.session);
         if skip_if_ended
             && own_record.is_some_and(|current| {
                 // Only a REAL terminal record from this session suppresses queued live frames:
@@ -481,8 +600,8 @@ impl Writer {
             ),
         };
         let record = Record {
-            schema: SCHEMA.to_string(),
-            agent: self.agent.clone(),
+            schema: self.schema().to_string(),
+            agent: self.identity.agent().to_owned(),
             harness: self.harness.to_string(),
             state: observation.state,
             blocked_on: observation.blocked_on,
@@ -514,13 +633,13 @@ impl Writer {
         let Some(mut current) = read_record(&self.path) else {
             return Ok(());
         };
-        // A schema this writer does not own — exact own-version equality, not the wider read
-        // admission — must not be round-tripped through this version's
+        // A schema this writer does not own — exact equality against this WRITER's version, not
+        // the wider read admission — must not be round-tripped through this version's
         // record type, and a record this *session* does not own must never be kept fresh: a
         // lingering predecessor re-stamping its successor's record would keep a dead seat's
         // state alive for cross-host readers, and a successor re-stamping a predecessor's would
         // resurrect history. Token equality decides, in both directions.
-        if current.schema != SCHEMA
+        if current.schema != self.schema()
             || current.state == Activity::Ended
             || current.incarnation != self.session
         {
@@ -780,7 +899,7 @@ fn next_stamp(on_disk: Option<&Record>, now_ms: u64) -> u64 {
 /// observation replaces it.
 pub fn claim(
     agent_dir: &Path,
-    agent: impl Into<String>,
+    agent: impl Into<RecordIdentity>,
     harness: &'static str,
     token: &str,
 ) -> anyhow::Result<u64> {
@@ -818,8 +937,10 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     let now_ms = crate::message::now_ms();
     let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
     let record = Record {
-        schema: SCHEMA.to_string(),
-        agent: writer.agent.clone(),
+        // The written claim supersedes ANY version it finds — that is what a claim is for — and
+        // states the claimer's own.
+        schema: writer.schema().to_string(),
+        agent: writer.identity.agent().to_owned(),
         harness: writer.harness.to_string(),
         state: Activity::Ended,
         blocked_on: BlockedOn::None,
@@ -894,7 +1015,7 @@ pub const WRAPPERLESS_PREFIX: &str = "claude-session-";
 /// `Ok(None)` = ineligible; unreadable bytes are also ineligible for this cautious path.
 pub fn claim_wrapperless(
     agent_dir: &Path,
-    agent: impl Into<String>,
+    agent: impl Into<RecordIdentity>,
     harness: &'static str,
     token: &str,
 ) -> anyhow::Result<Option<u64>> {
@@ -937,8 +1058,21 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use super::*;
 
+    /// A migrated subject's frozen immutable ID, in the UUIDv7 shape creation mints.
+    const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+
     fn writer(dir: &Path) -> Writer {
         Writer::new(dir, "hetz.worker", "codex", Some("worker".to_string()))
+    }
+
+    /// The same seat over an activated catalog: keyed by its agent ID, writing v2.
+    fn activated_writer(dir: &Path) -> Writer {
+        Writer::new(
+            dir,
+            RecordIdentity::activated(AGENT_ID),
+            "codex",
+            Some("worker".to_string()),
+        )
     }
 
     /// A new session arriving the way real wrappers do: a written claim, then adoption.
@@ -1570,9 +1704,10 @@ mod tests {
         }
     }
 
-    /// Reader-first rollout: readers accept the v1/v2 pair, but every writer here stays on v1.
+    /// The gate decides the version every write path emits, and `agent`'s meaning travels with
+    /// it: the bus identity under v1, the immutable agent ID under v2.
     #[test]
-    fn every_writer_path_emits_version_1_bytes() {
+    fn a_legacy_writer_emits_version_1_and_an_activated_writer_emits_version_2() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
 
@@ -1583,6 +1718,7 @@ mod tests {
             observed.contains(r#""schema":"st2.harness-state.v1""#),
             "observe wrote {observed}"
         );
+        assert!(observed.contains(r#""agent":"hetz.worker""#), "{observed}");
 
         writer.ended("exit 0").unwrap();
         let terminal = String::from_utf8(fs::read(&path).unwrap()).unwrap();
@@ -1597,7 +1733,174 @@ mod tests {
             claimed.contains(r#""schema":"st2.harness-state.v1""#),
             "claim wrote {claimed}"
         );
-        assert!(!claimed.contains(SCHEMA_NEXT), "no writer emits v2 yet");
+        assert!(!claimed.contains(SCHEMA_NEXT), "a legacy writer never emits v2");
+
+        // The same three paths over an activated catalog, on their own seat.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = activated_writer(tmp.path());
+        writer.observe(active()).unwrap();
+        let observed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            observed.contains(r#""schema":"st2.harness-state.v2""#),
+            "observe wrote {observed}"
+        );
+        assert!(
+            observed.contains(&format!(r#""agent":"{AGENT_ID}""#)),
+            "{observed}"
+        );
+
+        writer.ended("exit 0").unwrap();
+        let terminal = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            terminal.contains(r#""schema":"st2.harness-state.v2""#),
+            "ended wrote {terminal}"
+        );
+
+        claim(
+            tmp.path(),
+            RecordIdentity::activated(AGENT_ID),
+            "codex",
+            &session_token(),
+        )
+        .unwrap();
+        let claimed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            claimed.contains(r#""schema":"st2.harness-state.v2""#),
+            "claim wrote {claimed}"
+        );
+        assert!(claimed.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{claimed}");
+    }
+
+    /// The gate itself: which bytes and which version a caller gets for one subject.
+    #[test]
+    fn the_record_identity_follows_the_activation_gate() {
+        let activated = RecordIdentity::resolve(
+            &crate::identity::IdentityActivation::Activated,
+            AGENT_ID,
+            "hetz.worker",
+        );
+        assert!(activated.is_activated());
+        assert_eq!(activated.agent(), AGENT_ID);
+
+        for reason in [
+            crate::identity::LegacyReason::MigrationIncomplete,
+            crate::identity::LegacyReason::CatalogNotMigrated {
+                unmigrated: 1,
+                first: "agents/hetz/worker/agent.kdl".to_owned(),
+            },
+        ] {
+            let legacy = RecordIdentity::resolve(
+                &crate::identity::IdentityActivation::Legacy(reason),
+                AGENT_ID,
+                "hetz.worker",
+            );
+            assert!(!legacy.is_activated());
+            assert_eq!(legacy.agent(), "hetz.worker");
+        }
+    }
+
+    /// The driver-start boundary every producer resolves its actor through: one decision from the
+    /// catalog the driver was launched against, and Legacy in every direction the catalog cannot
+    /// prove. A driver that guessed Activated here would stamp raw agent-ID bytes into a version
+    /// promising a bus identity — the one thing pairing the two in [`RecordIdentity`] prevents.
+    #[test]
+    fn a_drivers_actor_follows_its_catalog_and_fails_closed() {
+        let declare = |catalog: &Path, identity: &str, body: &str| {
+            let dir = catalog.join("agents").join("hetz").join(identity);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("agent.kdl"),
+                format!("agent \"{identity}\" {{ host \"hetz\"; {body} }}\n"),
+            )
+            .unwrap();
+        };
+
+        // A fully migrated catalog: the launch key IS the immutable agent ID, under version 2.
+        let migrated = tempfile::tempdir().unwrap();
+        declare(migrated.path(), "worker", &format!("id \"{AGENT_ID}\""));
+        let actor = RecordIdentity::for_driver(migrated.path(), AGENT_ID);
+        assert!(actor.is_activated());
+        assert_eq!(actor.agent(), AGENT_ID);
+
+        // One unmigrated subject is enough: the catalog has no coherent ID namespace at all.
+        declare(migrated.path(), "other", "");
+        let mixed = RecordIdentity::for_driver(migrated.path(), "hetz.worker");
+        assert!(!mixed.is_activated());
+        assert_eq!(mixed.agent(), "hetz.worker");
+
+        // An interrupted migration is unproven, not optimistic.
+        let interrupted = tempfile::tempdir().unwrap();
+        declare(interrupted.path(), "worker", &format!("id \"{AGENT_ID}\""));
+        let marker = crate::catalog_migrate_ids::marker_path(interrupted.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "{}").unwrap();
+        assert!(!RecordIdentity::for_driver(interrupted.path(), AGENT_ID).is_activated());
+
+        // An undiscoverable catalog cannot decide anything, so the driver keeps writing what the
+        // records already on that disk are keyed by.
+        let broken = tempfile::tempdir().unwrap();
+        let dir = broken.path().join("agents/hetz/worker");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent.kdl"), "agent \"worker\" { host \"hetz\"").unwrap();
+        let fallback = RecordIdentity::for_driver(broken.path(), "hetz.worker");
+        assert!(!fallback.is_activated());
+        assert_eq!(fallback.agent(), "hetz.worker");
+    }
+
+    /// Write-side ownership is exact equality against the WRITER's own version, and it fails
+    /// closed in BOTH directions: a v2 writer must not restamp or coalesce against a v1 record
+    /// whose `agent` means a bus identity, and a v1 writer must not touch a v2 one. Everything
+    /// else here matches — same seat, same session token, same claimed sequence — so the version
+    /// is the only thing deciding.
+    #[test]
+    fn the_version_gate_refuses_ownership_in_both_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+
+        // A legacy writer's own live v1 record…
+        let mut legacy = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .with_session(token.clone());
+        legacy.observe(active()).unwrap();
+        let v1 = fs::read(&path).unwrap();
+
+        // …is not an activated writer's record even sharing that session: the heartbeat leaves it
+        // byte-identical rather than round-tripping it, and a live frame is refused.
+        let mut activated = Writer::new(
+            tmp.path(),
+            RecordIdentity::activated(AGENT_ID),
+            "codex",
+            Some("worker".into()),
+        )
+        .with_session(token.clone());
+        activated.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), v1, "a v2 writer restamped a v1 record");
+        assert!(!activated.observe_unless_ended(active()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), v1, "a v2 writer coalesced into a v1 record");
+
+        // Only the written claim supersedes a version it does not own, and it states its own.
+        let next = session_token();
+        let seq = claim(
+            tmp.path(),
+            RecordIdentity::activated(AGENT_ID),
+            "codex",
+            &next,
+        )
+        .unwrap();
+        let claimed: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(claimed.schema, SCHEMA_NEXT);
+        assert_eq!(claimed.agent, AGENT_ID);
+
+        // And the mirror: the legacy writer now holds this session's exact ownership, so only the
+        // version refuses it.
+        let v2 = fs::read(&path).unwrap();
+        let mut legacy = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+            .with_ownership(next, seq);
+        legacy.heartbeat().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), v2, "a v1 writer restamped a v2 record");
+        assert!(!legacy.observe_unless_ended(active()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), v2, "a v1 writer coalesced into a v2 record");
     }
 
     #[test]

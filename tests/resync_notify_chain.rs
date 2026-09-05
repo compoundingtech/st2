@@ -103,8 +103,14 @@ fn spawn(catalog: &Path) -> st2::resync::ResyncSupervisor {
         .filter(|spec| spec.desired_state.is_running())
         .cloned()
         .collect::<Vec<_>>();
-    let diagnostics =
-        supervisor.refresh(&specs, &live_subscription_specs, "hetz", &[], &[]);
+    let diagnostics = supervisor.refresh(
+        &specs,
+        &live_subscription_specs,
+        "hetz",
+        &[],
+        &[],
+        &st2::reconcile::identity_activation(catalog, &specs),
+    );
     assert!(diagnostics.is_empty(), "clean refresh: {diagnostics:?}");
     std::thread::sleep(Duration::from_millis(300));
     supervisor
@@ -253,6 +259,9 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
         &specs,
         "hetz",
         &st2::catalog::declared_profiles(catalog.path()).unwrap(),
+        &st2::identity::IdentityActivation::Legacy(
+            st2::identity::LegacyReason::MigrationIncomplete,
+        ),
     );
     assert!(
         set.carriers
@@ -315,7 +324,12 @@ fn live_install_reports_an_unwalkable_notify_chain() {
         registry,
     );
 
-    let diagnostics = supervisor.install_live(&specs[0], &specs, "hetz");
+    let diagnostics = supervisor.install_live(
+        &specs[0],
+        &specs,
+        "hetz",
+        &st2::reconcile::identity_activation(catalog.path(), &specs),
+    );
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("supervisor chain is unwalkable")

@@ -138,9 +138,11 @@ pub fn run(
     // The written claim comes BEFORE the provider spawns: a claim that cannot be written aborts
     // the launch while there is still nothing to leak, and it supersedes whatever a predecessor
     // left — a still-fresh live record included — before this wrapper's first observation.
+    // One gate decision per driver process, taken before the claim it keys.
+    let actor = harness_state::RecordIdentity::for_driver(catalog_root, &identity);
     let mut session = {
         let session = harness_state::session_token();
-        let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
+        let seq = harness_state::claim(&agent_dir, actor.clone(), "opencode", &session)?;
         let mut diagnostics =
             DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
         if let Some(reason) = version_failure {
@@ -160,7 +162,7 @@ pub fn run(
             // names the registry entry, and only aliases the identity on driver-expanded seats.
             writer: Writer::new(
                 &agent_dir,
-                identity.clone(),
+                actor.clone(),
                 "opencode",
                 Some(runtime_id.clone()),
             )
@@ -168,7 +170,7 @@ pub fn run(
             // The same incarnation token as the state record beside it, carried as provenance
             // only (HC-R15): nothing on this record is fenced on it. The claim above already
             // removed any predecessor's context record, so no second removal belongs here.
-            context: match ContextProducer::new(&agent_dir, &identity, &session) {
+            context: match ContextProducer::new(&agent_dir, &actor, &session) {
                 Ok(producer) => Some(producer),
                 Err(error) => {
                     tracing::warn!(
@@ -1083,11 +1085,15 @@ struct ContextProducer {
 }
 
 impl ContextProducer {
-    fn new(agent_dir: &Path, identity: &str, session: &str) -> Result<Self> {
+    fn new(
+        agent_dir: &Path,
+        actor: &harness_state::RecordIdentity,
+        session: &str,
+    ) -> Result<Self> {
         Ok(Self {
             writer: harness_context::Writer::new(
                 agent_dir,
-                identity,
+                actor.clone(),
                 harness_context::Harness::OpenCode,
             )?
             .with_session(session),
@@ -2693,7 +2699,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let agent_dir = tmp.path().join("agents").join("hetz").join("seat");
             std::fs::create_dir_all(&agent_dir).unwrap();
-            let producer = ContextProducer::new(&agent_dir, "hetz.seat", "incarnation-1").unwrap();
+            let producer = ContextProducer::new(
+                &agent_dir,
+                &harness_state::RecordIdentity::legacy("hetz.seat"),
+                "incarnation-1",
+            )
+            .unwrap();
             Self {
                 _tmp: tmp,
                 agent_dir,
@@ -2720,6 +2731,33 @@ mod tests {
         fn record(&self) -> Option<harness_context::Observed> {
             harness_context::read(&harness_context::harness_context_path(&self.agent_dir))
         }
+    }
+
+    /// The OpenCode producer under an activated catalog: the actor `run` resolved once at start is
+    /// handed to the state writer and this context writer alike, so both records name the
+    /// immutable agent ID under version 2 and cannot be versioned apart.
+    #[test]
+    fn an_activated_context_producer_writes_version_2() {
+        const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("hetz").join("seat");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let mut producer = ContextProducer::new(
+            &agent_dir,
+            &harness_state::RecordIdentity::activated(AGENT_ID),
+            "incarnation-1",
+        )
+        .unwrap();
+        producer.apply(&event(OC_TURN_1_FINAL));
+        producer.apply(&event(OC_TURN_1_SESSION));
+        assert!(producer.publish(), "a fresh numerator must publish");
+        let bytes = std::fs::read_to_string(harness_context::harness_context_path(&agent_dir))
+            .unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-context.v2""#),
+            "{bytes}"
+        );
+        assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
     }
 
     /// The version the fixtures are pinned to, read out of the frames themselves.

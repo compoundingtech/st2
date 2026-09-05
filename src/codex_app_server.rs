@@ -379,7 +379,10 @@ struct CodexDeliveryConfig {
     catalog_root: PathBuf,
     agent_dir: PathBuf,
     inbox: PathBuf,
-    identity: String,
+    /// The agent key this wrapper was launched with, paired with the record version it means —
+    /// one gate decision taken at driver start, so no record write consults the catalog. Its
+    /// bytes are the launch key either way, so every non-record use reads [`RecordIdentity::agent`].
+    actor: harness_state::RecordIdentity,
     this_host: String,
     supervisor: Option<String>,
     /// The codex-cli version the protocol gate admitted, carried for the native-driver
@@ -406,7 +409,7 @@ impl CodexDeliveryConfig {
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
-            identity: identity.to_string(),
+            actor: harness_state::RecordIdentity::for_driver(catalog_root, identity),
             this_host,
             supervisor,
             producer_version: None,
@@ -417,14 +420,14 @@ impl CodexDeliveryConfig {
         let Some(supervisor) = self.supervisor.as_deref() else {
             eprintln!(
                 "st2 codex: agent '{}' has no supervisor for a protocol rejection report",
-                self.identity
+                self.actor.agent()
             );
             return;
         };
-        let subject = format!("Codex protocol rejected: {}", self.identity);
+        let subject = format!("Codex protocol rejected: {}", self.actor.agent());
         let body = format!(
             "st2 rejected the installed Codex app-server protocol for agent '{}'. Native delivery did not start. Codex executable: '{}'. Error: {error:#}",
-            self.identity, codex
+            self.actor.agent(), codex
         );
         let mut key_hash = Sha256::new();
         key_hash.update(b"st2.codex-protocol-rejection.v1");
@@ -435,7 +438,7 @@ impl CodexDeliveryConfig {
             &self.catalog_root,
             supervisor,
             &self.this_host,
-            &self.identity,
+            self.actor.agent(),
             Some(&subject),
             None,
             &tags,
@@ -445,7 +448,7 @@ impl CodexDeliveryConfig {
         ) {
             eprintln!(
                 "st2 codex: failed to report agent '{}' protocol rejection to supervisor '{}': {report_error:#}",
-                self.identity, supervisor
+                self.actor.agent(), supervisor
             );
         }
     }
@@ -844,7 +847,7 @@ impl CodexInboxDelivery {
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
-        let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        let state = load_delivery_state(&state_path, config.actor.agent(), runtime.runtime_id())?;
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
@@ -858,13 +861,13 @@ impl CodexInboxDelivery {
         let harness_writer = {
             let writer = harness_state::Writer::new(
                 &config.agent_dir,
-                config.identity.clone(),
+                config.actor.clone(),
                 "codex",
                 Some(runtime.runtime_id().to_string()),
             );
             match harness_state::claim(
                 &config.agent_dir,
-                config.identity.clone(),
+                config.actor.clone(),
                 "codex",
                 runtime.incarnation(),
             ) {
@@ -884,7 +887,7 @@ impl CodexInboxDelivery {
         // already says — rather than a live state that is not live.
         let context = match harness_context::Writer::new(
             &config.agent_dir,
-            config.identity.clone(),
+            config.actor.clone(),
             harness_context::Harness::Codex,
         ) {
             Ok(writer) => Some(CodexContextProducer::new(
@@ -1095,13 +1098,16 @@ impl CodexInboxDelivery {
             .next_request_id
             .checked_add(1)
             .context("Codex delivery request ID overflow")?;
-        let client_id =
-            stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
+        let client_id = stable_client_user_message_id(
+            self.config.actor.agent(),
+            state.thread_id(),
+            &head.filename,
+        );
         let filename = head.filename.clone();
         let text = ding::poke_text(
             &self.config.catalog_root,
             &self.config.this_host,
-            &self.config.identity,
+            self.config.actor.agent(),
             head,
         );
         let request =
@@ -1913,7 +1919,7 @@ fn run_connected(
     // The stop handler is installed by run_controlled_owned before any spawn (the preflight's
     // detached app-server included); re-installing here would RESET a stop flag raised during
     // startup, so this function only relies on it.
-    let state_dir = state_dir(&delivery.catalog_root, &delivery.identity);
+    let state_dir = state_dir(&delivery.catalog_root, delivery.actor.agent());
     let endpoint = format!("unix://{}", socket_path.display());
     let tui_args = controlled_tui_args(&endpoint, &codex_argv[1..], resume_thread)?;
     let expected_resume =
@@ -1957,7 +1963,7 @@ fn run_connected(
         (None, None)
     };
     let harness_agent_dir = delivery.agent_dir.clone();
-    let harness_identity = delivery.identity.clone();
+    let harness_actor = delivery.actor.clone();
     let event_thread = thread::spawn(move || {
         let resume = expected_resume
             .as_deref()
@@ -2002,7 +2008,7 @@ fn run_connected(
             // sequence, since the claim put this token on disk.
             let mut writer = harness_state::Writer::new(
                 &harness_agent_dir,
-                harness_identity.clone(),
+                harness_actor.clone(),
                 "codex",
                 Some(runtime.runtime_id().to_string()),
             )
@@ -2053,7 +2059,7 @@ fn run_connected(
     // claimed sequence — and the terminal record fences exactly the records this session wrote.
     let mut harness_writer = harness_state::Writer::new(
         &harness_agent_dir,
-        harness_identity.clone(),
+        harness_actor.clone(),
         "codex",
         Some(runtime.runtime_id().to_string()),
     )
@@ -4819,6 +4825,37 @@ mod tests {
         );
     }
 
+    /// The Codex wrapper's one identity decision: taken when its delivery config resolves, from
+    /// the catalog it was launched against, and carried into every record it writes. A migrated
+    /// live subject's ID is frozen at its former bus identity, so the launch key is unchanged and
+    /// only the meaning — and with it the record version — moves.
+    #[test]
+    fn the_delivery_config_resolves_its_actor_through_the_gate() {
+        let host = run::detect_host();
+        let declare = |catalog: &Path, body: &str| {
+            let path = catalog.join("agents").join(&host).join("worker/agent.kdl");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                format!("agent \"worker\" {{ host \"{host}\"; command \"true\"; {body} }}\n"),
+            )
+            .unwrap();
+        };
+        let key = format!("{host}.worker");
+
+        let migrated = tempfile::tempdir().unwrap();
+        declare(migrated.path(), &format!("id \"{key}\""));
+        let activated = CodexDeliveryConfig::resolve(migrated.path(), &key).unwrap();
+        assert!(activated.actor.is_activated());
+        assert_eq!(activated.actor.agent(), key);
+
+        let unmigrated = tempfile::tempdir().unwrap();
+        declare(unmigrated.path(), "");
+        let legacy = CodexDeliveryConfig::resolve(unmigrated.path(), &key).unwrap();
+        assert!(!legacy.actor.is_activated());
+        assert_eq!(legacy.actor.agent(), key);
+    }
+
     #[test]
     fn protocol_rejection_reaches_the_declared_supervisor_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5300,7 +5337,7 @@ mod tests {
             catalog_root: root.to_path_buf(),
             inbox: message::inbox_dir(&agent_dir),
             agent_dir,
-            identity: "h.worker".into(),
+            actor: harness_state::RecordIdentity::legacy("h.worker"),
             this_host: "h".into(),
             supervisor: None,
             producer_version: Some("codex-cli 0.153.0".into()),

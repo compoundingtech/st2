@@ -198,7 +198,16 @@ impl TaskInventory {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskRow {
+    /// The owning agent: its immutable agent ID once the catalog is migrated, its legacy bus
+    /// identity while DELTA-003's gate is closed.
     agent: String,
+    /// The agent's routable bus address, and `null` for a retired subject — retirement releases
+    /// the address while the ID and this row survive. Absent entirely while the gate is closed,
+    /// because there `agent` already IS the bus identity and an address column would only
+    /// restate it. Both readings keep every row of the completeness contract: absence here is
+    /// never absence of a task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<Option<String>>,
     task: String,
     runtime_id: String,
     kind: &'static str,
@@ -245,6 +254,7 @@ struct RuntimeJson {
 #[derive(Debug)]
 struct DesiredTask {
     agent: String,
+    address: Option<Option<String>>,
     task: String,
     runtime_id: String,
     kind: TaskKind,
@@ -290,27 +300,38 @@ pub fn inventory(
         compiled_specs.clear();
     }
 
+    // One activation decision for the whole inventory, from the discovery this command already
+    // performed: the gate is all-or-nothing per catalog, and a row keyed by one identity model
+    // beside a row keyed by the other would be an incoherent ownership report. An unmigrated,
+    // unreadable, or unprovable catalog keeps legacy keys, which is also what every runtime
+    // record on disk is keyed by there.
+    let activation = crate::reconcile::discovered_identity_activation(catalog, found);
     for spec in &compiled_specs {
         if spec.resolved_host(host) != host {
             continue;
         }
-        let bus_id = spec.bus_id(host);
+        // The ownership key and the task-ID rule come from reconciliation, so the inventory
+        // reports exactly the ids the supervisor owns rather than a second derivation of them.
+        let agent_key = crate::reconcile::agent_key(spec, host, &activation);
+        let address = activation.is_activated().then(|| {
+            (!spec.desired_state.is_retired()).then(|| spec.effective_address().to_owned())
+        });
         for task in &spec.tasks {
             // Active declaration-only metadata has no desired runtime. Retired tasks remain in the
             // inventory even without launch material so stale generations stay visible.
             if spec.desired_state.is_running() && task.command.is_none() && task.argv.is_none() {
                 continue;
             }
-            let runtime_id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            let runtime_id = crate::reconcile::default_task_id(spec, task, host, &activation);
+            // Fail closed on a collision however the ids were derived: two declarations sharing
+            // one runtime id have no owner, and the envelope must say so rather than pick one.
             runtime_owners
                 .entry(runtime_id.clone())
                 .or_default()
-                .push(format!("{bus_id}/{}", task.name));
+                .push(format!("{agent_key}/{}", task.name));
             desired.push(DesiredTask {
-                agent: bus_id.clone(),
+                agent: agent_key.clone(),
+                address: address.clone(),
                 task: task.name.clone(),
                 runtime_id,
                 kind: task.kind,
@@ -463,6 +484,7 @@ pub fn inventory(
             };
             TaskRow {
                 agent: task.agent,
+                address: task.address,
                 task: task.task,
                 runtime_id: task.runtime_id,
                 kind: match task.kind {
@@ -860,6 +882,140 @@ mod tests {
         assert_eq!(value["tasks"][0]["desiredState"], "absent");
         assert_eq!(value["tasks"][0]["runtime"]["state"], "running");
         assert_eq!(value["tasks"][0]["runtime"]["pid"], 42);
+    }
+
+    /// R23 under DELTA-003: rows are keyed by the owning agent's immutable ID once the catalog is
+    /// migrated and carry its bus address, `null` once retirement released it — without weakening
+    /// completeness. Every declared task still appears, a migrated subject's ids do not move, and
+    /// the duplicate-runtime-id refusal still fails the envelope closed.
+    #[test]
+    fn activated_rows_are_id_keyed_with_a_nullable_address_and_still_refuse_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A migrated live subject: its frozen id IS its former bus identity, so nothing moves.
+        write_agent(
+            tmp.path(),
+            "h",
+            "worker",
+            r#"id "h.worker"; pty "agent" { id "h.worker"; argv "agent-bin" }"#,
+        );
+        // A subject whose id and address are unrelated — the shape creation mints after
+        // activation. The row is owned by the id; the address is only where it is reachable.
+        write_agent(
+            tmp.path(),
+            "h",
+            "chat",
+            r#"id "0199c0de-7000-7000-8000-00000000abcd"; address "support"; pty "agent" { id "h.chat"; argv "agent-bin" }"#,
+        );
+        // Retirement releases the address and makes the subject non-routable; the id, the row,
+        // and the stale generation it may still carry all survive.
+        write_agent(
+            tmp.path(),
+            "h",
+            "old",
+            r#"id "0199c0de-7000-7000-8000-0000000000ff"; retired #true; pty "agent" { id "h.old" }"#,
+        );
+        let value = json(
+            tmp.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![running("h.worker", 11)],
+                errors: vec![],
+            },
+        );
+        assert_eq!(value["errors"], Value::Array(vec![]));
+        assert_eq!(value["complete"], true);
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "no declared task may be dropped: {rows:?}");
+        let row = |agent: &str| {
+            rows.iter()
+                .find(|row| row["agent"] == agent)
+                .unwrap_or_else(|| panic!("no row for {agent} in {rows:?}"))
+                .clone()
+        };
+
+        let migrated = row("h.worker");
+        assert_eq!(migrated["address"], "worker");
+        assert_eq!(
+            migrated["runtimeId"], "h.worker",
+            "a migrated subject's task id must not move at activation"
+        );
+        assert_eq!(migrated["runtime"]["pid"], 11);
+
+        let created = row("0199c0de-7000-7000-8000-00000000abcd");
+        assert_eq!(created["address"], "support");
+        assert_eq!(
+            created["runtimeId"], "0199c0de-7000-7000-8000-00000000abcd",
+            "the canonical agent task's id IS the agent id (R26)"
+        );
+        assert_eq!(created["runtime"]["state"], "absent");
+
+        let retired = row("0199c0de-7000-7000-8000-0000000000ff");
+        assert_eq!(retired["retired"], true);
+        assert_eq!(retired["desiredState"], "absent");
+        assert_eq!(
+            retired["address"],
+            Value::Null,
+            "a retired subject holds no address, and that is a value rather than a gap"
+        );
+
+        // The same declarations under a closed gate: legacy keys, and no address column at all —
+        // there `agent` already IS the bus identity.
+        let unmigrated = tempfile::tempdir().unwrap();
+        write_agent(
+            unmigrated.path(),
+            "h",
+            "worker",
+            r#"pty "agent" { id "h.worker"; argv "agent-bin" }"#,
+        );
+        let legacy = json(
+            unmigrated.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![running("h.worker", 11)],
+                errors: vec![],
+            },
+        );
+        assert_eq!(legacy["tasks"][0]["agent"], "h.worker");
+        assert!(
+            legacy["tasks"][0].get("address").is_none(),
+            "the closed gate must not add a column: {}",
+            legacy["tasks"][0]
+        );
+
+        // Completeness is not weakened by ID keying: two declarations claiming one runtime id
+        // still have no owner, and the envelope says so and exits non-zero.
+        let collided = tempfile::tempdir().unwrap();
+        write_agent(
+            collided.path(),
+            "h",
+            "one",
+            r#"id "0199c0de-7000-7000-8000-000000000001"; pty "agent" { id "shared"; argv "agent-bin" }"#,
+        );
+        write_agent(
+            collided.path(),
+            "h",
+            "two",
+            r#"id "0199c0de-7000-7000-8000-000000000002"; pty "agent" { id "shared"; argv "agent-bin" }"#,
+        );
+        let clash = json(
+            collided.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![running("shared", 7)],
+                errors: vec![],
+            },
+        );
+        assert_eq!(clash["complete"], false);
+        let errors = clash["errors"].as_array().unwrap();
+        assert!(
+            errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.starts_with(r#"duplicate runtime id "shared" is declared by "#))),
+            "the duplicate refusal must survive ID keying: {errors:?}"
+        );
     }
 
     #[test]

@@ -41,7 +41,13 @@ pub fn run(
     crate::pretrust::pretrust_claude(std::slice::from_ref(&workspace))
         .with_context(|| format!("admitting Claude driver workspace {}", workspace.display()))?;
     install_signal_handler();
-    let observer = SessionObserver::new(&agent_dir, &identity, "claude", &runtime_id)?;
+    // One gate decision per driver process, from the catalog this wrapper was launched against.
+    let observer = SessionObserver::new(
+        &agent_dir,
+        harness_state::RecordIdentity::for_driver(catalog_root, &identity),
+        "claude",
+        &runtime_id,
+    )?;
     // The runtime ID reaches hook subprocesses through the provider environment, so their
     // transitions carry the same pty session the wrapper's records do.
     let env = [
@@ -171,7 +177,8 @@ pub fn run_observe(
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
-    if let Err(error) = observe_compaction(&agent_dir, identity, event, &payload) {
+    let actor = harness_state::RecordIdentity::for_driver(catalog_root, identity);
+    if let Err(error) = observe_compaction(&agent_dir, &actor, event, &payload) {
         tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
     }
     // The credential axis is independent of both the numbers and the categorical state, and is
@@ -185,7 +192,7 @@ pub fn run_observe(
     };
     let mut writer = observe_writer(
         &agent_dir,
-        identity,
+        &actor,
         runtime_id,
         event,
         &payload,
@@ -215,15 +222,15 @@ pub fn run_observe(
 #[allow(clippy::too_many_arguments)]
 fn observe_writer(
     agent_dir: &Path,
-    identity: &str,
+    actor: &harness_state::RecordIdentity,
     runtime_id: Option<&str>,
     event: &str,
     payload: &serde_json::Value,
     exported_session: Option<String>,
     exported_seq: Option<u64>,
 ) -> harness_state::Writer {
-    let pty_session = runtime_id.unwrap_or(identity).to_string();
-    let writer = harness_state::Writer::new(agent_dir, identity, "claude", Some(pty_session));
+    let pty_session = runtime_id.unwrap_or_else(|| actor.agent()).to_string();
+    let writer = harness_state::Writer::new(agent_dir, actor.clone(), "claude", Some(pty_session));
     if let Some(session) = exported_session {
         return match exported_seq {
             Some(seq) => writer.with_ownership(session, seq),
@@ -237,7 +244,12 @@ fn observe_writer(
             // sequence between the wrapper's read and its write. Ineligible (a live wrapper or
             // its fresh claim placeholder owns the record) or unwritable both degrade to
             // token-only.
-            return match harness_state::claim_wrapperless(agent_dir, identity, "claude", &token) {
+            return match harness_state::claim_wrapperless(
+                agent_dir,
+                actor.clone(),
+                "claude",
+                &token,
+            ) {
                 Ok(Some(seq)) => writer.with_ownership(token, seq),
                 Ok(None) => writer.with_session(token),
                 Err(error) => {
@@ -276,10 +288,10 @@ fn wrapperless_token(payload: &serde_json::Value) -> Option<String> {
 /// share the selection without sharing the takeover.
 fn context_writer(
     agent_dir: &Path,
-    identity: &str,
+    actor: &harness_state::RecordIdentity,
     payload: &serde_json::Value,
 ) -> Result<harness_context::Writer> {
-    let writer = harness_context::Writer::new(agent_dir, identity, Harness::Claude)?;
+    let writer = harness_context::Writer::new(agent_dir, actor.clone(), Harness::Claude)?;
     let exported = std::env::var(SESSION_ENV).ok().filter(|t| !t.is_empty());
     Ok(match exported.or_else(|| wrapperless_token(payload)) {
         Some(token) => writer.with_session(token),
@@ -310,7 +322,7 @@ fn context_writer(
 /// the relaunch claim (HC-R15), so the count describes this incarnation and not the seat's life.
 fn observe_compaction(
     agent_dir: &Path,
-    identity: &str,
+    actor: &harness_state::RecordIdentity,
     event: &str,
     payload: &serde_json::Value,
 ) -> Result<()> {
@@ -337,7 +349,7 @@ fn observe_compaction(
         }
         _ => return Ok(()),
     };
-    context_writer(agent_dir, identity, payload)?
+    context_writer(agent_dir, actor, payload)?
         .compacted(edge)
         .map(|_landed| ())
 }
@@ -471,7 +483,8 @@ fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<
     // call that provably cannot record is worse than none: it reads as instrumentation.
     // `06-observability`'s spec already scopes `hook_invocations_total` to `claude-observe` and
     // says other hook surfaces are not instrumented yet, which is exactly this.
-    context_writer(&agent_dir, identity, &payload)?
+    let actor = harness_state::RecordIdentity::for_driver(catalog_root, identity);
+    context_writer(&agent_dir, &actor, &payload)?
         .observe(statusline_reading(&payload))
         .map(|_landed| ())
 }
@@ -1176,8 +1189,15 @@ mod tests {
         let payload_a = serde_json::json!({ "session_id": "aaa" });
         let payload_b = serde_json::json!({ "session_id": "bbb" });
         let drive = |event: &str, payload: &serde_json::Value| {
-            let mut writer =
-                observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
+            let mut writer = observe_writer(
+                tmp.path(),
+                &harness_state::RecordIdentity::legacy("hetz.worker"),
+                None,
+                event,
+                payload,
+                None,
+                None,
+            );
             writer
                 .observe_unless_ended(observe_hook_event(event, payload).unwrap())
                 .unwrap()
@@ -1199,6 +1219,43 @@ mod tests {
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Active
+        );
+    }
+
+    /// The Claude hook producer under an activated catalog: `run_observe` resolves its actor once
+    /// from the catalog and hands it to both writers, so the transition it records names the
+    /// immutable agent ID under version 2. The wrapperless fallback for `pty_session` follows the
+    /// same value, because the actor's bytes ARE the key the driver was launched with.
+    #[test]
+    fn an_activated_hook_writes_the_agent_id_under_version_2() {
+        use crate::harness_state;
+        const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({ "session_id": "aaa" });
+        let mut writer = observe_writer(
+            tmp.path(),
+            &harness_state::RecordIdentity::activated(AGENT_ID),
+            None,
+            "UserPromptSubmit",
+            &payload,
+            None,
+            None,
+        );
+        assert!(
+            writer
+                .observe_unless_ended(observe_hook_event("UserPromptSubmit", &payload).unwrap())
+                .unwrap()
+        );
+        let bytes =
+            String::from_utf8(std::fs::read(harness_state_path(tmp.path())).unwrap()).unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-state.v2""#),
+            "{bytes}"
+        );
+        assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
+        assert!(
+            bytes.contains(&format!(r#""ptySession":"{AGENT_ID}""#)),
+            "{bytes}"
         );
     }
 
@@ -1290,13 +1347,19 @@ mod tests {
         harness_context::read(&harness_context::harness_context_path(dir)).unwrap()
     }
 
+    /// This seat's actor as an unmigrated catalog resolves it: bus identity under version 1,
+    /// which is what every producer here writes until the identity model is activated.
+    fn seat() -> crate::harness_state::RecordIdentity {
+        crate::harness_state::RecordIdentity::legacy("Silber.fabric")
+    }
+
     #[test]
     fn a_pre_turn_reading_lands_once_and_then_sits_inside_its_bucket() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = agent_dir(&tmp);
         let payload = fixture(PRE_TURN);
 
-        let mut writer = context_writer(&dir, "Silber.fabric", &payload).unwrap();
+        let mut writer = context_writer(&dir, &seat(), &payload).unwrap();
         assert!(writer.observe(statusline_reading(&payload)).unwrap());
         // A withheld percent has no bucket, so a second identical render is inside the written
         // one and, well inside the heartbeat, writes nothing. That is the write guard (HC-R09)
@@ -1318,7 +1381,7 @@ mod tests {
         let mut payload = session.clone();
         payload["trigger"] = "auto".into();
 
-        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, &seat(), "PreCompact", &payload).unwrap();
         let counted = context(&dir);
         assert_eq!(counted.compactions, 1);
         assert_eq!(
@@ -1327,7 +1390,7 @@ mod tests {
         );
 
         // The completion edge holds the count and only moves `lastCompactionMs` forward.
-        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, &seat(), "PostCompact", &payload).unwrap();
         let completed = context(&dir);
         assert_eq!(
             completed.compactions, 1,
@@ -1339,7 +1402,7 @@ mod tests {
         // and deliberately inert — counting it is exactly the double count HC-R12 forbids.
         let mut restart = session;
         restart["source"] = "compact".into();
-        observe_compaction(&dir, "Silber.fabric", "SessionStart", &restart).unwrap();
+        observe_compaction(&dir, &seat(), "SessionStart", &restart).unwrap();
         assert_eq!(context(&dir).compactions, 1);
     }
 
@@ -1351,7 +1414,7 @@ mod tests {
 
         // No record at all: the PreCompact write never landed, so PostCompact is the first
         // evidence st2 has that a compaction happened and it counts rather than losing it.
-        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, &seat(), "PostCompact", &payload).unwrap();
         let observed = context(&dir);
         assert_eq!(observed.compactions, 1);
         assert_eq!(
@@ -1368,7 +1431,7 @@ mod tests {
             "session_id": "s-1", "trigger": "auto", "agent_id": "sub-7"
         });
 
-        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, &seat(), "PreCompact", &payload).unwrap();
         assert!(harness_context::read(&harness_context::harness_context_path(&dir)).is_none());
     }
 
@@ -1407,7 +1470,7 @@ mod tests {
             wrapperless_token(&payload).as_deref(),
             Some("claude-session-abc")
         );
-        context_writer(&dir, "Silber.fabric", &payload)
+        context_writer(&dir, &seat(), &payload)
             .unwrap()
             .observe(statusline_reading(&payload))
             .unwrap();

@@ -170,8 +170,10 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let context_session = wrapper_session
         .clone()
         .unwrap_or_else(harness_state::session_token);
+    // One gate decision per channel process, from the catalog it was launched against.
+    let actor = harness_state::RecordIdentity::for_driver(catalog_root, identity);
     let mut writer =
-        harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session));
+        harness_state::Writer::new(&agent_dir, actor.clone(), kind.label, Some(pty_session));
     if let Some(session) = wrapper_session {
         // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
         // token a direction, so a straggler channel from a superseded session is refused.
@@ -192,7 +194,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     // Failing to construct it must not cost the seat its mail. Delivery never depends on
     // observability anywhere else in this loop, and this is the one fallible construction here —
     // an agent directory with no parent has nowhere safe to stage a temporary file.
-    let mut context_writer = match harness_context::Writer::new(&agent_dir, identity, kind.harness)
+    let mut context_writer = match harness_context::Writer::new(&agent_dir, actor, kind.harness)
     {
         Ok(writer) => Some(writer.with_session(context_session)),
         Err(error) => {
@@ -942,6 +944,53 @@ mod tests {
             .expect("a record must have been written")
     }
 
+    /// The channel producer under an activated catalog: `run_for` resolves its actor once from the
+    /// catalog and hands the same value to the state writer and this context writer, so the pair
+    /// of records a seat carries can never be versioned apart.
+    #[test]
+    fn an_activated_channel_writes_both_records_under_version_2() {
+        const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents").join("h").join("worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let actor = harness_state::RecordIdentity::activated(AGENT_ID);
+
+        let mut writer = harness_state::Writer::new(
+            &agent_dir,
+            actor.clone(),
+            PI_KIND.label,
+            Some(AGENT_ID.to_string()),
+        );
+        writer
+            .observe(harness_state::Observation::new(
+                harness_state::Activity::Active,
+                harness_state::BlockedOn::None,
+                harness_state::InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut context = harness_context::Writer::new(&agent_dir, actor, PI_KIND.harness).unwrap();
+        context
+            .compacted(harness_context::Compaction::new(
+                harness_context::CompactionTrigger::Auto,
+            ))
+            .unwrap();
+
+        for (path, schema) in [
+            (
+                harness_state::harness_state_path(&agent_dir),
+                "st2.harness-state.v2",
+            ),
+            (
+                harness_context::harness_context_path(&agent_dir),
+                "st2.harness-context.v2",
+            ),
+        ] {
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            assert!(bytes.contains(&format!(r#""schema":"{schema}""#)), "{bytes}");
+            assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
+        }
+    }
+
     /// HC-R13, pinned to pi 0.84.2. The payload is verbatim from the credential-free pi lab: one
     /// `message_end` for an assistant message, with `getContextUsage()` and the message's own
     /// `usage` side by side.
@@ -1311,6 +1360,7 @@ mod tests {
                 filename: "1787042542238-xex2t4.md".into(),
                 ts_ms: 1_787_042_542_238,
                 from: Some("h.supervisor".into()),
+                from_id: None,
                 subject: Some("deploy check".into()),
                 in_reply_to: None,
                 tags: Vec::new(),

@@ -42,13 +42,14 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::harness_state::{lock_exclusive, write_json_atomic};
+use crate::harness_state::{RecordIdentity, lock_exclusive, write_json_atomic};
 
-/// The version this binary WRITES, and the exact string `write_locked` treats as its own record.
+/// The legacy record version, whose `agent` field means the bus identity `<host>.<identity>`.
+/// Normative while the catalog is not fully migrated (DELTA-003's activation gate).
 const SCHEMA: &str = "st2.harness-context.v1";
-/// The reserved next version, whose `agent` field means the immutable agent ID instead of the
-/// bus identity. Otherwise identical to v1's shape; nothing here writes it yet (reader-first
-/// rollout, DELTA-003).
+/// The target record version, whose `agent` field means the immutable agent ID. Otherwise
+/// identical to v1's shape; only a writer over an
+/// [`crate::identity::IdentityActivation::Activated`] catalog emits it.
 const SCHEMA_NEXT: &str = "st2.harness-context.v2";
 
 /// Read admission: exactly the v1/v2 pair, never a prefix match. A foreign namespace
@@ -426,7 +427,7 @@ pub struct Writer {
     path: PathBuf,
     lock_path: PathBuf,
     staging_dir: PathBuf,
-    agent: String,
+    identity: RecordIdentity,
     harness: Harness,
     session: String,
 }
@@ -434,7 +435,7 @@ pub struct Writer {
 impl Writer {
     pub fn new(
         agent_dir: &Path,
-        agent: impl Into<String>,
+        agent: impl Into<RecordIdentity>,
         harness: Harness,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -445,10 +446,22 @@ impl Writer {
             path: harness_context_path(agent_dir),
             lock_path: agent_dir.join(LOCK_NAME),
             staging_dir: staging_dir(agent_dir)?,
-            agent: agent.into(),
+            identity: agent.into(),
             harness,
             session: crate::harness_state::session_token(),
         })
+    }
+
+    /// The version this writer WRITES, and therefore the version of a record it owns. Derived
+    /// from the writer's own identity rather than hardcoded: `agent` means a bus identity under
+    /// v1 and an immutable agent ID under v2, so coalescing across the pair in either direction
+    /// would reinterpret bytes it did not write.
+    fn schema(&self) -> &'static str {
+        if self.identity.is_activated() {
+            SCHEMA_NEXT
+        } else {
+            SCHEMA
+        }
     }
 
     /// Adopt the session's incarnation token, so sibling writer processes of one session agree on
@@ -491,12 +504,15 @@ impl Writer {
     ) -> anyhow::Result<bool> {
         let _lock = lock_exclusive(&self.lock_path)?;
         // A record this writer does not own — unparseable bytes, any schema other than this
-        // binary's own write version (the tolerantly readable v2 included), a harness whose
-        // arithmetic is unknown — is not coalesced against. Ownership here is exact own-version
-        // equality, deliberately narrower than the reader's accepted pair: coalescing against a
-        // v2 record would silently downgrade it to v1 numbers under a v1 `agent` meaning.
-        let current = read_record(&self.path)
-            .filter(|record| record.schema == SCHEMA && record.harness != Harness::Unrecognized);
+        // WRITER's own version (the tolerantly readable other half of the pair included), a
+        // harness whose arithmetic is unknown — is not coalesced against. Ownership here is
+        // exact own-version equality, deliberately narrower than the reader's accepted pair,
+        // and it holds in both directions: coalescing a v2 record into a v1 write would
+        // downgrade its numbers under a v1 `agent` meaning, and coalescing a v1 record into a
+        // v2 write would restate a bus identity's numbers under an agent ID.
+        let current = read_record(&self.path).filter(|record| {
+            record.schema == self.schema() && record.harness != Harness::Unrecognized
+        });
         let now_ms = crate::message::now_ms();
         if compaction.is_none()
             && let (Some(current), Some(reading)) = (current.as_ref(), reading.as_ref())
@@ -537,8 +553,8 @@ impl Writer {
             _ => now_ms,
         };
         let record = Record {
-            schema: SCHEMA.to_string(),
-            agent: self.agent.clone(),
+            schema: self.schema().to_string(),
+            agent: self.identity.agent().to_owned(),
             harness: self.harness,
             used_tokens,
             window_tokens,
@@ -749,6 +765,9 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A migrated subject's frozen immutable ID, in the UUIDv7 shape creation mints.
+    const AGENT_ID: &str = "0199c0de-7000-7000-8000-00000000abcd";
 
     fn writer(dir: &Path) -> Writer {
         Writer::new(dir, "hetz.worker", Harness::Codex).unwrap()
@@ -1268,9 +1287,10 @@ mod tests {
         }
     }
 
-    /// Every writer here stays on version 1 until DELTA-003 activates version-2 writers.
+    /// The gate decides the version, and `agent`'s meaning travels with it: a legacy writer
+    /// states the bus identity under v1, an activated one the immutable agent ID under v2.
     #[test]
-    fn the_writer_still_emits_version_1_bytes() {
+    fn a_legacy_writer_emits_version_1_and_an_activated_writer_emits_version_2() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
         let path = harness_context_path(&agent_dir);
@@ -1281,7 +1301,43 @@ mod tests {
             bytes.contains(r#""schema":"st2.harness-context.v1""#),
             "observe wrote {bytes}"
         );
-        assert!(!bytes.contains(SCHEMA_NEXT), "no writer emits v2 yet");
+        assert!(bytes.contains(r#""agent":"hetz.worker""#), "{bytes}");
+
+        let activated = catalog(&tmp.path().join("activated"));
+        let activated_path = harness_context_path(&activated);
+        let mut writer =
+            Writer::new(&activated, RecordIdentity::activated(AGENT_ID), Harness::Codex).unwrap();
+        assert!(writer.observe(reading(85_000, 33.0)).unwrap());
+        let bytes = String::from_utf8(fs::read(&activated_path).unwrap()).unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-context.v2""#),
+            "observe wrote {bytes}"
+        );
+        assert!(bytes.contains(&format!(r#""agent":"{AGENT_ID}""#)), "{bytes}");
+    }
+
+    /// The mirror of [`a_write_over_an_unowned_version_does_not_coalesce_or_downgrade_it`]: an
+    /// activated writer owns no v1 record either. Coalescing there would restate a bus
+    /// identity's numbers under an agent ID, so the write lands wholesale with fresh counters.
+    #[test]
+    fn an_activated_writer_does_not_coalesce_a_version_1_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let path = harness_context_path(&agent_dir);
+        let mut legacy = writer(&agent_dir);
+        assert!(legacy.compacted_with(Compaction::new(CompactionTrigger::Auto), reading(85_000, 33.0)).unwrap());
+        let planted = read_record(&path).unwrap();
+        assert_eq!(planted.schema, SCHEMA);
+        assert_eq!(planted.compactions, 1);
+
+        let mut activated =
+            Writer::new(&agent_dir, RecordIdentity::activated(AGENT_ID), Harness::Codex).unwrap();
+        // Same bucket as the planted reading: a coalesced write would have been skipped.
+        assert!(activated.observe(reading(85_000, 33.0)).unwrap());
+        let record = read_record(&path).unwrap();
+        assert_eq!(record.schema, SCHEMA_NEXT);
+        assert_eq!(record.agent, AGENT_ID);
+        assert_eq!(record.compactions, 0, "no counter carried over");
     }
 
     /// A record this writer does not own is never coalesced against or downgraded: the write

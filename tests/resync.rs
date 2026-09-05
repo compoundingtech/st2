@@ -80,7 +80,14 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(
+                &specs,
+                &specs,
+                "hetz",
+                &[],
+                &[],
+                &st2::reconcile::identity_activation(catalog.path(), &specs),
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -171,7 +178,14 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(
+                &specs,
+                &specs,
+                "hetz",
+                &[],
+                &[],
+                &st2::reconcile::identity_activation(catalog.path(), &specs),
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -268,7 +282,14 @@ fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change(
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(
+                &specs,
+                &specs,
+                "hetz",
+                &[],
+                &[],
+                &st2::reconcile::identity_activation(catalog.path(), &specs),
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -302,7 +323,14 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     let specs = st2::discover_strict(silent.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(
+                &specs,
+                &specs,
+                "hetz",
+                &[],
+                &[],
+                &st2::reconcile::identity_activation(silent.path(), &specs),
+            )
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -325,7 +353,14 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     fs::write(broken.path().join("broken.wasm"), b"not a module").unwrap();
     let registry = st2::catalog::declared_profiles(broken.path()).unwrap();
     let spec = &st2::discover_strict(broken.path()).specs[0];
-    let set = st2::resync::watch_set_for(spec, "hetz", &registry);
+    let set = st2::resync::watch_set_for(
+        spec,
+        "hetz",
+        &registry,
+        &st2::identity::IdentityActivation::Legacy(
+            st2::identity::LegacyReason::MigrationIncomplete,
+        ),
+    );
     assert!(
         !set.carriers.iter().any(|c| c.label == "goal"),
         "a failing resolver must not produce a carrier"

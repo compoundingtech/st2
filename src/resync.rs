@@ -24,6 +24,7 @@ use agent_spec::profile::{
 };
 use agent_spec::spec::{AgentSpec, Resource, decode_percent_path};
 
+use crate::identity::IdentityActivation;
 use crate::resource_profile::{MAX_FACTS, MAX_FACT_KEY_BYTES, ResourceFact};
 
 /// The reserved stream used only by the supervisor's crate-internal resync publisher.
@@ -142,6 +143,11 @@ fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
 }
 
 /// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
+///
+/// `bus_id` and `seat_id` are the subscription's ownership keys, so both follow DELTA-003's
+/// activation gate: legacy bus identity and `<bus-id>.<task>` while the catalog is unmigrated,
+/// the immutable agent ID and the ID-keyed task ID once it is. For a migrated legacy subject the
+/// two are byte-identical, because migration froze `id` at the former bus identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWatchSet {
     pub declaration_path: PathBuf,
@@ -160,8 +166,15 @@ pub fn watch_set_for(
     spec: &AgentSpec,
     this_host: &str,
     profiles: &ResourceProfileRegistry,
+    activation: &IdentityActivation,
 ) -> AgentWatchSet {
-    watch_set_for_in_catalog(spec, std::slice::from_ref(spec), this_host, profiles)
+    watch_set_for_in_catalog(
+        spec,
+        std::slice::from_ref(spec),
+        this_host,
+        profiles,
+        activation,
+    )
 }
 
 /// [`watch_set_for`] with the catalog view a `notify-chain` profile needs to reach the carriers
@@ -172,9 +185,10 @@ pub fn watch_set_for_in_catalog(
     specs: &[AgentSpec],
     this_host: &str,
     profiles: &ResourceProfileRegistry,
+    activation: &IdentityActivation,
 ) -> AgentWatchSet {
     let refresh = profiles.begin_refresh();
-    resolve_watch_set(spec, specs, this_host, &refresh).0
+    resolve_watch_set(spec, specs, this_host, &refresh, activation).0
 }
 
 fn resolve_watch_set(
@@ -182,6 +196,7 @@ fn resolve_watch_set(
     specs: &[AgentSpec],
     this_host: &str,
     profiles: &ResourceProfileRefresh<'_>,
+    activation: &IdentityActivation,
 ) -> (AgentWatchSet, Vec<String>) {
     let declaration_path = lexical_clean(&spec.path);
     let agent_dir = declaration_path.parent().unwrap_or(Path::new("."));
@@ -250,18 +265,20 @@ fn resolve_watch_set(
         &mut carriers,
         &mut diagnostics,
     );
-    // The supervisor's resolved logical host — not the OS hostname — decides the bus id, so an
-    // agent supervised under `st2 up --host <alias>` without an explicit declaration host still
-    // produces a recipient `resolve_stream` can resolve.
+    // The supervisor's resolved logical host — not the OS hostname — decides the legacy bus id,
+    // so an agent supervised under `st2 up --host <alias>` without an explicit declaration host
+    // still produces a recipient `resolve_stream` can resolve. Both keys come from
+    // reconciliation's own rules rather than a local copy, so a subscription and the task that
+    // owns it can never disagree about one identity.
     (
         AgentWatchSet {
             declaration_path,
-            bus_id: spec.bus_id(this_host),
-            seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
-                task.id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
-            }),
+            bus_id: crate::reconcile::agent_key(spec, this_host, activation),
+            seat_id: spec
+                .tasks
+                .iter()
+                .find(|task| task.name == "agent")
+                .map(|task| crate::reconcile::default_task_id(spec, task, this_host, activation)),
             carriers,
             declaration_summary: Some(declaration_summary(spec)),
         },
@@ -576,6 +593,10 @@ impl ResyncSupervisor {
     /// proven live by this pass and is the only source of active subscriptions. A malformed
     /// declaration retains its prior subscription only while its canonical seat is observed alive;
     /// contained profile failures reach the reconcile report.
+    ///
+    /// `activation` is the pass's ONE identity decision (DELTA-003), supplied by the reconcile
+    /// caller rather than taken here: an install and the deactivation that follows it must key
+    /// ownership identically, and only the pass knows which catalog view it decided over.
     #[must_use = "resolver diagnostics must be surfaced by the reconcile caller"]
     pub fn refresh(
         &self,
@@ -584,6 +605,7 @@ impl ResyncSupervisor {
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
+        activation: &IdentityActivation,
     ) -> Vec<String> {
         let profiles = self
             .profiles
@@ -596,6 +618,7 @@ impl ResyncSupervisor {
             this_host,
             sessions,
             malformed_declarations,
+            activation,
         )
     }
 
@@ -612,6 +635,7 @@ impl ResyncSupervisor {
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
+        activation: &IdentityActivation,
     ) -> Vec<String> {
         let mut current = self
             .profiles
@@ -625,6 +649,7 @@ impl ResyncSupervisor {
             this_host,
             sessions,
             malformed_declarations,
+            activation,
         )
     }
 
@@ -636,6 +661,7 @@ impl ResyncSupervisor {
         this_host: &str,
         sessions: &[crate::reconcile::Session],
         malformed_declarations: &[PathBuf],
+        activation: &IdentityActivation,
     ) -> Vec<String> {
         let mut diagnostics = Vec::new();
         let refresh_profiles = profiles.begin_refresh();
@@ -644,8 +670,13 @@ impl ResyncSupervisor {
             .filter(|spec| spec.resolved_host(this_host) == this_host)
             .filter(|spec| spec.desired_state.is_running())
             .map(|spec| {
-                let (set, mut failures) =
-                    resolve_watch_set(spec, catalog_specs, this_host, &refresh_profiles);
+                let (set, mut failures) = resolve_watch_set(
+                    spec,
+                    catalog_specs,
+                    this_host,
+                    &refresh_profiles,
+                    activation,
+                );
                 diagnostics.append(&mut failures);
                 set
             })
@@ -679,6 +710,7 @@ impl ResyncSupervisor {
         spec: &AgentSpec,
         specs: &[AgentSpec],
         this_host: &str,
+        activation: &IdentityActivation,
     ) -> Vec<String> {
         if spec.resolved_host(this_host) != this_host || !spec.desired_state.is_running() {
             return Vec::new();
@@ -688,7 +720,13 @@ impl ResyncSupervisor {
                 .profiles
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            resolve_watch_set(spec, specs, this_host, &profiles.begin_refresh())
+            resolve_watch_set(
+                spec,
+                specs,
+                this_host,
+                &profiles.begin_refresh(),
+                activation,
+            )
         };
         let (ack_tx, ack_rx) = channel();
         if self
@@ -703,12 +741,13 @@ impl ResyncSupervisor {
 
     /// Synchronously remove a canonical seat's active subscriptions before relaunch work begins.
     /// Sequence floors remain retained so a later successful install cannot reuse an occurrence.
-    pub fn deactivate(&self, spec: &AgentSpec, this_host: &str) {
+    pub fn deactivate(&self, spec: &AgentSpec, this_host: &str, activation: &IdentityActivation) {
+        let key = crate::reconcile::agent_key(spec, this_host, activation);
         let (ack_tx, ack_rx) = channel();
         if self
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx)).is_ok())
+            .is_some_and(|tx| tx.send(Msg::Deactivate(key, ack_tx)).is_ok())
         {
             let _ = ack_rx.recv();
         }
@@ -2101,6 +2140,19 @@ mod tests {
         }
     }
 
+    /// The gate closed: what every pre-DELTA-003 expectation below is stated against.
+    fn legacy() -> IdentityActivation {
+        IdentityActivation::Legacy(crate::identity::LegacyReason::MigrationIncomplete)
+    }
+
+    fn legacy_watch_set(
+        spec: &AgentSpec,
+        this_host: &str,
+        profiles: &ResourceProfileRegistry,
+    ) -> AgentWatchSet {
+        watch_set_for(spec, this_host, profiles, &legacy())
+    }
+
     #[test]
     fn resync_subject_uses_the_shared_three_fact_and_96_scalar_renderer() {
         let facts = vec![
@@ -2247,7 +2299,7 @@ mod tests {
 }"#;
         std::fs::write(&declaration, valid).unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "host", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -2300,7 +2352,7 @@ mod tests {
         )
         .unwrap();
         let spec = discover(tmp.path());
-        let set = watch_set_for(&spec, "hetz", &Default::default());
+        let set = legacy_watch_set(&spec, "hetz", &Default::default());
         assert_eq!(set.bus_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
@@ -2333,13 +2385,85 @@ mod tests {
         .unwrap();
         let spec = discover(tmp.path());
         assert_eq!(
-            watch_set_for(&spec, "alias", &Default::default()).bus_id,
+            legacy_watch_set(&spec, "alias", &Default::default()).bus_id,
             "alias.worker"
         );
         assert_eq!(
-            watch_set_for(&spec, "other", &Default::default()).bus_id,
+            legacy_watch_set(&spec, "other", &Default::default()).bus_id,
             "other.worker"
         );
+    }
+
+    /// Migration freezes a live subject's ID at its former bus identity, so opening the gate must
+    /// not move that subject's subscription: both ownership keys stay byte-identical. Asserted
+    /// rather than assumed — the two derivations are different code paths.
+    #[test]
+    fn activation_leaves_a_migrated_subjects_watch_set_keys_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  id "hetz.worker"
+  command "true"
+}"#,
+        )
+        .unwrap();
+        let spec = discover(tmp.path());
+
+        let before = watch_set_for(&spec, "hetz", &Default::default(), &legacy());
+        let after = watch_set_for(
+            &spec,
+            "hetz",
+            &Default::default(),
+            &IdentityActivation::Activated,
+        );
+        assert_eq!(before.bus_id, "hetz.worker");
+        assert_eq!(before.seat_id.as_deref(), Some("hetz.worker"));
+        assert_eq!(
+            after, before,
+            "activation moved a migrated subject's ownership keys"
+        );
+    }
+
+    /// A subject created after activation has an ID unrelated to its address, and the keys follow
+    /// the ID: the subscription is owned by the immutable subject, not by its mutable route.
+    #[test]
+    fn an_activated_watch_set_is_keyed_by_the_agent_id_not_the_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents/hetz/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.kdl"),
+            r#"agent "worker" {
+  host "hetz"
+  id "0199c0de-7000-7000-8000-00000000abcd"
+  address "chat"
+  command "true"
+}"#,
+        )
+        .unwrap();
+        let spec = discover(tmp.path());
+
+        let set = watch_set_for(
+            &spec,
+            "hetz",
+            &Default::default(),
+            &IdentityActivation::Activated,
+        );
+        assert_eq!(set.bus_id, "0199c0de-7000-7000-8000-00000000abcd");
+        assert_eq!(
+            set.seat_id.as_deref(),
+            Some("0199c0de-7000-7000-8000-00000000abcd"),
+            "the canonical agent task's id IS the agent id (R26)"
+        );
+        // The same declaration under a closed gate keys by the legacy bus identity, which is
+        // what every runtime record on an unmigrated catalog is keyed by.
+        let legacy_set = watch_set_for(&spec, "hetz", &Default::default(), &legacy());
+        assert_eq!(legacy_set.bus_id, "hetz.worker");
+        assert_eq!(legacy_set.seat_id.as_deref(), Some("hetz.worker"));
     }
 
     #[test]
@@ -2504,7 +2628,7 @@ mod tests {
         std::fs::write(&goal, "current bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "alias").unwrap();
 
-        let mut current = watch_set_for(
+        let mut current = legacy_watch_set(
             &discover(root.path()),
             "alias",
             &ResourceProfileRegistry::empty(),
@@ -2625,7 +2749,7 @@ mod tests {
         )
         .unwrap();
         let current =
-            watch_set_for(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
+            legacy_watch_set(&discover(root.path()), "alias", &ResourceProfileRegistry::empty());
 
         worker.apply_watch_sets(refresh_for(vec![current]));
         worker.flush_due_publishing(Instant::now() + IMMEDIATE_WINDOW + Duration::from_secs(1));
@@ -2867,7 +2991,7 @@ mod tests {
         std::fs::write(&carrier, "newer live bytes").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
 
-        let set = watch_set_for(&discover(root.path()), "hetz", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "hetz", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "hetz".to_owned(),
@@ -3020,7 +3144,7 @@ mod tests {
             watcher: None,
             emit: Arc::new(EmitQueue::default()),
         };
-        worker.apply_watch_sets(refresh_for(vec![watch_set_for(
+        worker.apply_watch_sets(refresh_for(vec![legacy_watch_set(
             &discover(root.path()),
             "hetz",
             &Default::default(),
@@ -3084,7 +3208,7 @@ mod tests {
                 .iter()
                 .find(|spec| spec.path.starts_with(root.path().join("agents/alias").join(identity)))
                 .expect("both declarations are valid");
-            watch_set_for(spec, "alias", &ResourceProfileRegistry::empty())
+            legacy_watch_set(spec, "alias", &ResourceProfileRegistry::empty())
         };
         let live_set = set_for("live");
         let joining_set = set_for("joining");
@@ -3270,7 +3394,7 @@ mod tests {
             panic!("regular carrier has a digest");
         };
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "host", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -3340,7 +3464,7 @@ mod tests {
         let carrier = resources.join("goal.md");
         std::fs::write(&carrier, "before").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "host", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -3393,7 +3517,7 @@ mod tests {
         std::fs::write(&carrier, "baseline").unwrap();
         let original_permissions = std::fs::metadata(&carrier).unwrap().permissions();
         std::fs::set_permissions(&carrier, std::fs::Permissions::from_mode(0)).unwrap();
-        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "host", &Default::default());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -3444,7 +3568,7 @@ mod tests {
         let carrier = resources.join("goal.md");
         std::fs::write(&carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
-        let set = watch_set_for(&discover(root.path()), "host", &Default::default());
+        let set = legacy_watch_set(&discover(root.path()), "host", &Default::default());
         let seen_subscription_count = set.carriers.len();
         let mut worker = Worker {
             root: root.path().to_path_buf(),
@@ -3524,7 +3648,7 @@ mod tests {
         std::fs::write(&original_carrier, "A").unwrap();
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let set =
-            watch_set_for(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
+            legacy_watch_set(&discover(root.path()), "host", &ResourceProfileRegistry::empty());
         let mut worker = Worker {
             root: root.path().to_path_buf(),
             this_host: "host".to_owned(),
@@ -3903,7 +4027,7 @@ mod tests {
             "agent \"worker\" {\n  host \"host\"\n  command \"agent\"\n  resource \"goal\" uri=\"resources/goal.md\" reason=\"Mission.\"\n}",
         )
         .unwrap();
-        let resumed = watch_set_for(
+        let resumed = legacy_watch_set(
             &discover(root.path()),
             "host",
             &ResourceProfileRegistry::empty(),
@@ -4306,8 +4430,13 @@ mod tests {
         );
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
-        let (set, diagnostics) =
-            resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
+        let (set, diagnostics) = resolve_watch_set(
+            &spec,
+            std::slice::from_ref(&spec),
+            "hetz",
+            &refresh,
+            &legacy(),
+        );
         assert!(!set.carriers.iter().any(|c| c.label == "goal"));
         assert!(set.carriers.iter().any(|c| c.label == "declaration"));
         assert!(!set.carriers.iter().any(|c| c.label == "issue"));
@@ -4344,8 +4473,13 @@ mod tests {
         );
         let refresh = profiles.begin_refresh();
         let spec = discover(tmp.path());
-        let (set, diagnostics) =
-            resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
+        let (set, diagnostics) = resolve_watch_set(
+            &spec,
+            std::slice::from_ref(&spec),
+            "hetz",
+            &refresh,
+            &legacy(),
+        );
         assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
         assert!(
             diagnostics.is_empty(),
