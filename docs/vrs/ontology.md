@@ -38,6 +38,35 @@ A terminal-backed or terminal-free unit declared for an agent.
 Authority: [Agent Spec task contract](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#compact-and-explicit-tasks);
 [`Task`](../../crates/agent-spec/src/spec.rs#L121-L148)
 
+### runtime resource target
+
+A short-lived locator from one task inventory observation that tells an
+external sampler where the observed task's process resources can be read.
+Linux uses the exact unified cgroup-v2 path from the live process's
+`/proc/<pid>/cgroup`; Darwin uses a best-effort process-tree root PID. An
+unavailable target carries one bounded reason instead of a guessed or nullable
+locator.
+
+This target is not task identity, ownership, a declaration, or a retained
+registry entry. Runtime ID identifies the task; PID, process generation,
+cgroup path, and process-tree root locate only the observation that produced
+them.
+
+Authority: [R23 fail-closed task inventory](requirements.md);
+[`task_inventory`](../../src/task_inventory.rs)
+
+### observation locator
+
+Ephemeral evidence used to find one observed runtime generation, never to
+identify the task across generations. PID, creation time, generation ID,
+runtime resource target, cgroup path, unit name, and incarnation can all be
+locators in their owning contexts; only a contract that explicitly exposes one
+may be used by a consumer. In the task inventory, systemd unit and scope names
+are deliberately not exposed as resource locators.
+
+Authority: [R23 fail-closed task inventory](requirements.md);
+[decision 0017](.decisions/0017-task-resource-targets-are-strict-observations.md)
+
 ### launch argv
 
 The ordered, opaque OS-string sequence comprising a task program and each of

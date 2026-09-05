@@ -37,8 +37,9 @@ use crate::reconcile::{
     compile_generated_tasks,
 };
 use crate::task_inventory::{
-    DesiredRuntime, ObservationBatch, ObservedState, RuntimeGeneration, RuntimeObservation,
-    RuntimeObserver, generation_id,
+    DesiredRuntime, ObservationBatch, ObservedState, ResourceTarget,
+    ResourceTargetUnavailableReason, RuntimeGeneration, RuntimeObservation, RuntimeObserver,
+    generation_id, observe_resource_target,
 };
 use agent_spec::spec::TaskKind;
 
@@ -403,6 +404,53 @@ struct PtyListEntry {
     tags: BTreeMap<String, String>,
 }
 
+/// One live session returned by the socket-backed `pty stats --json` snapshot.
+#[derive(Debug, Deserialize)]
+struct PtyStatsEntry {
+    name: String,
+    #[serde(default)]
+    process: Option<PtyStatsProcess>,
+    #[serde(default)]
+    daemon: Option<PtyStatsDaemon>,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsProcess {
+    alive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyStatsDaemon {
+    pid: u32,
+}
+
+fn confirm_pty_generation(
+    initial: &PtyListEntry,
+    stats: &[PtyStatsEntry],
+) -> Result<(), ResourceTargetUnavailableReason> {
+    let mut matching = stats.iter().filter(|candidate| candidate.name == initial.name);
+    let Some(current) = matching.next() else {
+        return Err(ResourceTargetUnavailableReason::ProcessUnavailable);
+    };
+    if matching.next().is_some() {
+        return Err(ResourceTargetUnavailableReason::RuntimeIndeterminate);
+    }
+    let (Some(process), Some(daemon), Some(created_at)) =
+        (&current.process, &current.daemon, &current.created_at)
+    else {
+        return Err(ResourceTargetUnavailableReason::RuntimeIndeterminate);
+    };
+    if !process.alive {
+        return Err(ResourceTargetUnavailableReason::ProcessUnavailable);
+    }
+    if Some(daemon.pid) != initial.pid || Some(created_at) != initial.created_at.as_ref() {
+        return Err(ResourceTargetUnavailableReason::GenerationChanged);
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct PtyMetadataPatch<'a> {
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
@@ -687,6 +735,30 @@ impl PtyCli {
                 };
             }
         };
+        // `pty list` identifies the daemon generation but is registry state,
+        // not a live socket proof. Capture each candidate daemon's kernel start
+        // token, query all live session sockets once, then accept a token only
+        // when stats reports the same name, daemon PID, and createdAt and a
+        // second token read is unchanged.
+        let start_tokens = entries
+            .iter()
+            .filter(|entry| {
+                desired_ids.contains(entry.name.as_str())
+                    && entry.status == "running"
+                    && entry.pid.is_some()
+                    && entry.created_at.is_some()
+            })
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    crate::exec_backend::process_start_time_ticks(entry.pid.unwrap() as i32).ok(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let stats_entries = start_tokens
+            .values()
+            .any(Option::is_some)
+            .then(|| self.stats_entries_at(root));
         let final_metadata = match std::fs::metadata(root) {
             Ok(final_metadata) => final_metadata,
             Err(error) => {
@@ -722,9 +794,50 @@ impl PtyCli {
             let state = match entry.status.as_str() {
                 "running" => match (entry.pid, entry.created_at.as_deref()) {
                     (Some(pid), Some(created_at)) => {
+                        let start_time_ticks = start_tokens.get(&entry.name).copied().flatten();
+                        let resource_target = match (start_time_ticks, stats_entries.as_ref()) {
+                            (Some(start_time_ticks), Some(Ok(stats))) => {
+                                match confirm_pty_generation(&entry, stats) {
+                                    Ok(()) => {
+                                        let final_start =
+                                            crate::exec_backend::process_start_time_ticks(
+                                                pid as i32,
+                                            );
+                                        match final_start {
+                                            Ok(final_start) if final_start == start_time_ticks => {
+                                                observe_resource_target(
+                                                    pid,
+                                                    Some(start_time_ticks),
+                                                )
+                                            }
+                                            Ok(_) => ResourceTarget::unavailable(
+                                                ResourceTargetUnavailableReason::GenerationChanged,
+                                            ),
+                                            Err(_) => ResourceTarget::unavailable(
+                                                ResourceTargetUnavailableReason::ProcessUnavailable,
+                                            ),
+                                        }
+                                    }
+                                    Err(reason) => ResourceTarget::unavailable(reason),
+                                }
+                            }
+                            (Some(_), Some(Err(_))) => ResourceTarget::unavailable(
+                                ResourceTargetUnavailableReason::RuntimeIndeterminate,
+                            ),
+                            _ => ResourceTarget::unavailable(
+                                ResourceTargetUnavailableReason::ProcessUnavailable,
+                            ),
+                        };
+                        // Transient resource proof must not participate in
+                        // stable PTY generation identity.
                         let generation_id =
                             generation_id("pty", &entry.name, pid, created_at, None);
-                        match RuntimeGeneration::new(pid, created_at.to_owned(), generation_id) {
+                        match RuntimeGeneration::new(
+                            pid,
+                            created_at.to_owned(),
+                            generation_id,
+                            resource_target,
+                        ) {
                             Ok(generation) => ObservedState::Running(generation),
                             Err(error) => {
                                 let message = format!(
@@ -808,6 +921,24 @@ impl PtyCli {
         }
         serde_json::from_slice(&out.stdout)
             .map_err(|error| anyhow::anyhow!("parsing `pty list --json`: {error}"))
+    }
+
+    fn stats_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyStatsEntry>> {
+        let out = output_full_stdout_with_timeout(
+            Command::new(&self.bin)
+                .args(["stats", "--json"])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty stats --json` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty stats --json` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty stats --json`: {error}"))
     }
 }
 
@@ -1012,8 +1143,14 @@ impl RuntimeObserver for SystemRunner {
                     pid,
                     created_at,
                     generation_id,
+                    start_time_ticks,
                 })) => {
-                    let state = match RuntimeGeneration::new(pid, created_at, generation_id) {
+                    let state = match RuntimeGeneration::new(
+                        pid,
+                        created_at,
+                        generation_id,
+                        observe_resource_target(pid, Some(start_time_ticks)),
+                    ) {
                         Ok(generation) => ObservedState::Running(generation),
                         Err(error) => {
                             let message = format!(
@@ -6562,6 +6699,120 @@ mod tests {
             "{:?}",
             batch.errors
         );
+    }
+
+    #[test]
+    fn pty_stats_rejects_pid_reuse_between_registry_snapshot_and_start_token_capture() {
+        let initial = PtyListEntry {
+            name: "h.worker".into(),
+            status: "running".into(),
+            exit_code: None,
+            pid: Some(41),
+            created_at: Some("2026-09-05T10:00:00.000Z".into()),
+            display_name: None,
+            tags: BTreeMap::new(),
+        };
+        let stats = |alive: bool, created_at: &str| PtyStatsEntry {
+            name: "h.worker".into(),
+            process: Some(PtyStatsProcess { alive }),
+            daemon: Some(PtyStatsDaemon { pid: 41 }),
+            created_at: Some(created_at.into()),
+        };
+
+        // PID 41 has been reused. A token captured after the registry snapshot
+        // would describe the replacement, but its live socket reports a new
+        // creation generation and prevents that token from being admitted.
+        let replacement = stats(true, "2026-09-05T10:00:01.000Z");
+        assert_eq!(
+            confirm_pty_generation(&initial, &[replacement]),
+            Err(ResourceTargetUnavailableReason::GenerationChanged)
+        );
+
+        let exited = stats(false, "2026-09-05T10:00:00.000Z");
+        assert_eq!(
+            confirm_pty_generation(&initial, &[exited]),
+            Err(ResourceTargetUnavailableReason::ProcessUnavailable)
+        );
+        let stable = stats(true, "2026-09-05T10:00:00.000Z");
+        assert_eq!(confirm_pty_generation(&initial, &[stable]), Ok(()));
+    }
+
+    #[test]
+    fn pty_resource_observation_uses_one_stats_snapshot_and_preserves_generation_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pty");
+        std::fs::create_dir(&root).unwrap();
+        let invocations = tmp.path().join("invocations");
+        let failed_once = tmp.path().join("stats-failed-once");
+        let pid = std::process::id();
+        let fake = tmp.path().join("pty-bin");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {invocations:?}
+case "$1" in
+  list)
+    printf '%s\n' '[{{"name":"h.a","status":"running","pid":{pid},"createdAt":"2026-09-05T10:00:00.000Z"}},{{"name":"h.b","status":"running","pid":{pid},"createdAt":"2026-09-05T10:00:01.000Z"}}]'
+    ;;
+  stats)
+    if [ ! -e {failed_once:?} ]; then
+      : > {failed_once:?}
+      exit 1
+    fi
+    printf '%s\n' '[{{"name":"h.a","process":{{"alive":true}},"daemon":{{"pid":{pid}}},"createdAt":"2026-09-05T10:00:00.000Z"}},{{"name":"h.b","process":{{"alive":true}},"daemon":{{"pid":{pid}}},"createdAt":"2026-09-05T10:00:01.000Z"}}]'
+    ;;
+esac
+"#,
+                invocations = invocations,
+                failed_once = failed_once,
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let cli = PtyCli {
+            bin: fake.display().to_string(),
+            catalog_root: tmp.path().join("catalog"),
+        };
+        let desired_ids = HashSet::from(["h.a", "h.b"]);
+        let unavailable = cli.task_observations_at_root(&desired_ids, &root);
+        let available = cli.task_observations_at_root(&desired_ids, &root);
+        assert!(unavailable.complete, "{:?}", unavailable.errors);
+        assert!(available.complete, "{:?}", available.errors);
+        assert_eq!(available.observations.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(invocations).unwrap(),
+            "list --json\nstats --json\nlist --json\nstats --json\n"
+        );
+        for (before, after) in unavailable
+            .observations
+            .iter()
+            .zip(&available.observations)
+        {
+            let (ObservedState::Running(before), ObservedState::Running(after)) =
+                (&before.state, &after.state)
+            else {
+                panic!("live PTY lost generation");
+            };
+            assert!(matches!(
+                before.resource_target(),
+                ResourceTarget::Unavailable { .. }
+            ));
+            assert!(!matches!(
+                after.resource_target(),
+                ResourceTarget::Unavailable { .. }
+            ));
+            assert_eq!(
+                before.generation_id(),
+                after.generation_id(),
+                "transient target proof changed stable PTY generation identity"
+            );
+        }
     }
 
     #[test]
