@@ -37,6 +37,10 @@ pub struct GraphArchived {
     pub reason: Option<String>,
     /// Catalog-relative location of the moved identity directory.
     pub archive_root: String,
+    /// The archived subject's immutable agent ID (R24), projected verbatim from the tombstone's
+    /// `agentId`. `null` for a tombstone written before ID migration reached this subject. Newest
+    /// field in the row and additive, so `CATALOG_GRAPH_SCHEMA` does not move.
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +224,7 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
             archived_at: tombstone.archived_at,
             reason: tombstone.reason,
             archive_root: tombstone.archive_root,
+            agent_id: tombstone.agent_id,
         })
         .collect();
 

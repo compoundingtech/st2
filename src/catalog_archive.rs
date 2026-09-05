@@ -84,10 +84,18 @@ pub struct UnarchiveRequest {
 }
 
 /// The durable trace an archived identity leaves in the live catalog.
+///
+/// The schema stays `st2.catalog-archive-tombstone.v1` across the addition of `agentId`: an added
+/// optional field changes no existing field's meaning, and this struct does not
+/// `deny_unknown_fields`, so a reader of either vintage parses a record of either vintage. Compare
+/// `docs/vrs/05-harness-state/spec.md:15-30`, where a version bump IS required — there an existing
+/// field's meaning changes, which no tolerant reader can absorb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tombstone {
     pub schema: String,
+    /// The legacy `<host>.<identity>` bus identity this subject was archived under. Still the
+    /// tombstone's positional key; see `agent_id` for the immutable subject ID.
     pub id: String,
     pub host: String,
     pub identity: String,
@@ -96,6 +104,11 @@ pub struct Tombstone {
     pub reason: Option<String>,
     /// Catalog-relative location of the moved directory, so a moved catalog stays readable.
     pub archive_root: String,
+    /// The archived subject's immutable agent ID (R24), frozen from the archived declaration's
+    /// explicit `id`. `None` on a tombstone written before ID migration reached this subject —
+    /// including every tombstone written by a pre-DELTA-003 st2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -108,6 +121,8 @@ pub struct ArchivedEntry {
     pub to: String,
     pub archived_at: u64,
     pub reason: Option<String>,
+    /// The archived subject's immutable agent ID (R24), mirroring its tombstone's `agentId`.
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,6 +177,8 @@ struct Candidate {
     identity: String,
     reason: Option<String>,
     from: PathBuf,
+    /// The declaration's explicit `id` (R24), threaded to the tombstone and the receipt row.
+    agent_id: Option<String>,
 }
 
 /// Archive every selected identity under one exclusive authoring lock and one generation commit.
@@ -319,10 +336,37 @@ pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
     );
 
     let tombstone_path = host_root.join(format!("{}{TOMBSTONE_SUFFIX}", request.identity));
-    let archived_at = read_tombstone(&tombstone_path)
-        .ok()
-        .flatten()
-        .map(|tombstone| tombstone.archived_at);
+    // An absent or unreadable tombstone stays tolerated: `unarchive` is the exact reverse move
+    // even for an archived directory the control plane can no longer explain.
+    let tombstone = read_tombstone(&tombstone_path).ok().flatten();
+    let archived_at = tombstone.as_ref().map(|tombstone| tombstone.archived_at);
+    if let Some(expected) = tombstone.as_ref().and_then(|it| it.agent_id.as_deref()) {
+        // A migrated tombstone froze this subject's immutable agent ID (R24). The declaration it
+        // covers must still carry the same one, or restoring it would re-enter the live plane
+        // under an identity the catalog never recorded for this subject.
+        let declaration = from.join("agent.kdl");
+        let shown = relative(&catalog, &declaration)
+            .unwrap_or_else(|| declaration.display().to_string());
+        let declared = agent_spec::discovery::parse_declared(&declaration).with_context(|| {
+            format!("read {shown} to check its agent ID against its tombstone's agentId")
+        })?;
+        let declared_id = match declared.as_slice() {
+            [single] => single.id.as_deref(),
+            many => anyhow::bail!(
+                "{shown} declares {} agents; a tombstoned identity must be one canonical declaration",
+                many.len()
+            ),
+        };
+        anyhow::ensure!(
+            declared_id == Some(expected),
+            "tombstone records agent ID '{expected}' but {shown} declares {}; repair one of them before unarchiving",
+            declared_id.map_or_else(|| "no explicit id".to_owned(), |id| format!("'{id}'"))
+        );
+    }
+    // DELTA-003: refusing an UNMIGRATED archive (a tombstone with no `agentId`) after ID migration
+    // has activated, and validating the restored ID's uniqueness against the prospective
+    // live-and-archived set, both land with the writer PR (D3). Until then a legacy tombstone
+    // restores exactly as it always did.
 
     let parent = to.parent().context("live identity path has no parent")?;
     fs::create_dir_all(parent)
@@ -613,6 +657,10 @@ fn plan(
             identity,
             reason: spec.desired_state.reason().map(str::to_owned),
             from,
+            // A migrated declaration carries its immutable ID explicitly; a legacy one has none
+            // yet, and freezing `<host>.<identity>` here is the migration verb's job, not this
+            // one's — archival must not mint identity.
+            agent_id: spec.id.clone(),
         });
     }
     refused.sort_by(|left, right| left.id.cmp(&right.id));
@@ -662,6 +710,7 @@ fn move_out(catalog: &Path, root: &Path, candidate: &Candidate, archived_at: u64
         archived_at,
         reason: candidate.reason.clone(),
         archive_root: relative(catalog, &to).context("archive destination escaped the catalog")?,
+        agent_id: candidate.agent_id.clone(),
     };
     let mut body = serde_json::to_vec_pretty(&tombstone)?;
     body.push(b'\n');
@@ -691,6 +740,7 @@ fn entry(catalog: &Path, candidate: &Candidate, archived_at: u64) -> ArchivedEnt
         to: relative(catalog, &to).unwrap_or_else(|| to.display().to_string()),
         archived_at,
         reason: candidate.reason.clone(),
+        agent_id: candidate.agent_id.clone(),
     }
 }
 
@@ -874,6 +924,9 @@ fn read_tombstone(path: &Path) -> Result<Option<Tombstone>> {
         "unknown archive tombstone schema '{}'",
         tombstone.schema
     );
+    // `id` is the legacy bus-identity key, so it must still agree with the pair it is composed
+    // of: a record where they disagree is corrupt, whatever its vintage. `agent_id` is the
+    // immutable one and is deliberately unconstrained by this pair.
     anyhow::ensure!(
         tombstone.id == format!("{}.{}", tombstone.host, tombstone.identity),
         "archive tombstone id does not match its host and identity"
@@ -1023,5 +1076,32 @@ mod tests {
             hosts["other"]["theirs"], 0,
             "only the local supervisor may reconcile its own host's rows"
         );
+    }
+
+    /// The claim that keeps `TOMBSTONE_SCHEMA` at v1: a record of either vintage parses, and a key
+    /// this build has never heard of is tolerated rather than rejected.
+    #[test]
+    fn a_tombstone_parses_without_an_agent_id_and_with_an_unknown_key() {
+        let legacy: Tombstone = serde_json::from_str(
+            r#"{"schema":"st2.catalog-archive-tombstone.v1","id":"h.gone","host":"h",
+                "identity":"gone","archivedAt":7,"reason":null,"archiveRoot":".st2/archive/h/gone"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.agent_id, None);
+
+        let forward: Tombstone = serde_json::from_str(
+            r#"{"schema":"st2.catalog-archive-tombstone.v1","id":"h.gone","host":"h",
+                "identity":"gone","archivedAt":7,"reason":null,"archiveRoot":".st2/archive/h/gone",
+                "agentId":"0199b8f4-8d3a-7c21-9a44-6f85b7320ea1","reassignedFrom":"h.gone"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            forward.agent_id.as_deref(),
+            Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+        );
+
+        // And the round trip of a legacy record re-emits exactly the legacy shape.
+        let bytes = serde_json::to_string(&legacy).unwrap();
+        assert!(!bytes.contains("agentId"), "{bytes}");
     }
 }

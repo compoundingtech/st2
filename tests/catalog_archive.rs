@@ -666,3 +666,185 @@ fn unarchive_refuses_to_overwrite_a_live_declaration() {
     );
     assert!(root.join(".st2/archive/h/gone/agent.kdl").is_file());
 }
+
+// ---- DELTA-003: the tombstone carries the archived subject's immutable agent ID -------------
+
+const MIGRATED_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+
+/// A retired seat whose declaration already carries an explicit immutable `id` (R24).
+fn migrated_retired_seat(root: &Path, identity: &str, id: &str) {
+    retired_seat(root, identity, RETIRED);
+    write(
+        root,
+        &format!("agents/h/{identity}/agent.kdl"),
+        &format!(
+            "agent \"{identity}\" {{\n  id \"{id}\"\n  host \"h\"\n  {RETIRED}\n  command \"true\"\n}}\n"
+        ),
+    );
+}
+
+/// The root slot a retired declaration never holds, so whole-catalog validation stays green.
+fn keeper(root: &Path) {
+    write(
+        root,
+        "agents/h/keeper/agent.kdl",
+        "agent \"keeper\" { host \"h\"; command \"true\" }\n",
+    );
+}
+
+fn archive_gone(root: &Path, bin: &Path) -> Output {
+    st2(
+        root,
+        bin,
+        &[
+            "catalog",
+            "archive",
+            "--identity",
+            "gone",
+            "--host",
+            "h",
+            "--json",
+        ],
+    )
+}
+
+#[test]
+fn archive_freezes_an_explicit_agent_id_in_the_tombstone_and_the_graph_row() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let root = catalog.as_path();
+    pty_shim(&bin, "[]");
+    migrated_retired_seat(root, "gone", MIGRATED_ID);
+
+    let output = archive_gone(root, &bin);
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt = json(&output);
+    assert_eq!(receipt["archived"][0]["id"], "h.gone");
+    assert_eq!(receipt["archived"][0]["agentId"], MIGRATED_ID);
+
+    let tombstone: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".st2/archive/h/gone.tombstone.json")).unwrap())
+            .unwrap();
+    assert_eq!(tombstone["schema"], "st2.catalog-archive-tombstone.v1");
+    assert_eq!(
+        tombstone["id"], "h.gone",
+        "`id` stays the legacy bus-identity key"
+    );
+    assert_eq!(tombstone["agentId"], MIGRATED_ID);
+
+    let graph = json(&st2(
+        root,
+        &bin,
+        &["catalog", "graph", "--host", "h", "--json"],
+    ));
+    assert_eq!(graph["complete"], true, "{graph:#}");
+    let rows = graph["archived"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{graph:#}");
+    assert_eq!(rows[0]["id"], "h.gone");
+    assert_eq!(rows[0]["agentId"], MIGRATED_ID);
+}
+
+#[test]
+fn a_legacy_tombstone_omits_the_agent_id_key_and_still_round_trips() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let root = catalog.as_path();
+    pty_shim(&bin, "[]");
+    retired_seat(root, "gone", RETIRED);
+    keeper(root);
+
+    assert!(archive_gone(root, &bin).status.success());
+
+    // The serialized bytes must not carry the key at all: a pre-DELTA-003 reader has to see the
+    // exact shape it always saw, which is what keeps the schema at v1.
+    let bytes = fs::read(root.join(".st2/archive/h/gone.tombstone.json")).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        !text.contains("agentId"),
+        "an unmigrated subject's tombstone must omit the key entirely:\n{text}"
+    );
+    let tombstone: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(tombstone.get("agentId").is_none(), "{tombstone:#}");
+
+    let graph = json(&st2(
+        root,
+        &bin,
+        &["catalog", "graph", "--host", "h", "--json"],
+    ));
+    assert_eq!(graph["complete"], true, "{graph:#}");
+    assert!(
+        graph["archived"][0]["agentId"].is_null(),
+        "a legacy tombstone projects a null agent ID: {graph:#}"
+    );
+
+    // Both sides absent: unarchive has nothing to reconcile and restores as it always did.
+    let restored = st2(
+        root,
+        &bin,
+        &["catalog", "unarchive", "gone", "--host", "h", "--json"],
+    );
+    assert!(
+        restored.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(root.join("agents/h/gone/agent.kdl").is_file());
+}
+
+#[test]
+fn unarchive_refuses_when_the_tombstone_and_the_declaration_disagree_on_the_agent_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let root = catalog.as_path();
+    pty_shim(&bin, "[]");
+    migrated_retired_seat(root, "gone", MIGRATED_ID);
+    keeper(root);
+    assert!(archive_gone(root, &bin).status.success());
+
+    // Rewrite the archived declaration's immutable ID out from under its tombstone.
+    let archived_spec = root.join(".st2/archive/h/gone/agent.kdl");
+    let original = fs::read_to_string(&archived_spec).unwrap();
+    fs::write(
+        &archived_spec,
+        original.replace(MIGRATED_ID, "0199b8f4-8d3a-7c21-9a44-000000000000"),
+    )
+    .unwrap();
+
+    let refused = st2(
+        root,
+        &bin,
+        &["catalog", "unarchive", "gone", "--host", "h", "--json"],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("tombstone records agent ID") && stderr.contains(MIGRATED_ID),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        archived_spec.is_file() && !root.join("agents/h/gone").exists(),
+        "a refused unarchive moves nothing"
+    );
+
+    // Agreeing again admits the exact same restore.
+    fs::write(&archived_spec, &original).unwrap();
+    let restored = st2(
+        root,
+        &bin,
+        &["catalog", "unarchive", "gone", "--host", "h", "--json"],
+    );
+    assert!(
+        restored.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("agents/h/gone/agent.kdl")).unwrap(),
+        original
+    );
+    assert!(!root.join(".st2/archive/h/gone.tombstone.json").exists());
+}
