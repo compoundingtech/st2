@@ -827,14 +827,44 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
-  `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
+  `st2.task-inventory.v2` envelope for the selected host. Rows are sorted by
   immutable agent ID, task name, and runtime ID and cover both PTY and
   terminal-free exec tasks. Each row includes immutable agent ID and nullable
   current bus address; a proved non-routable retired subject has a null address
   without weakening completeness. `complete=false` plus a non-zero exit is a
   closed result: a consumer must not turn a missing row into absence. A running
-  row always carries a PID, creation time, and opaque generation ID derived from
-  stable backend evidence.
+  row always carries a PID, creation time, opaque generation ID derived from
+  stable backend evidence, and the required `runtime.resourceTarget`.
+
+  `resourceTarget` is internally tagged by `type` and has exactly these wire
+  shapes:
+
+  | `type` | Fields | Meaning |
+  | --- | --- | --- |
+  | `linuxCgroupV2` | `path` | The slash-prefixed unified-hierarchy path exactly as read from `/proc/<pid>/cgroup`; `/` is the cgroup-v2 mount root. |
+  | `darwinProcessTree` | `rootPid` | The observed generation's PID, used as a best-effort process-tree root. |
+  | `unavailable` | `reason` | No safe target: one of `notRunning`, `runtimeIndeterminate`, `processUnavailable`, `generationChanged`, `cgroupV2Unavailable`, or `unsupportedPlatform`. |
+
+  Linux accepts exactly one `0::<path>` entry. It preserves the path bytes
+  represented by UTF-8 text, including spaces and colons, but rejects a
+  non-absolute path, NUL or carriage return, repeated separators, trailing
+  separators, `.` or `..` components, duplicate unified entries, and input
+  with no unified entry. It does not derive the path from a systemd unit,
+  scope name, runtime ID, or naming convention.
+
+  PTY observation captures a kernel process-start token after its first backend
+  snapshot, then takes a second backend snapshot and admits that token only
+  when task ID, running state, PID, and backend creation time still identify
+  the same generation. Resource observation reads the token again before and
+  after reading the target. Exec compares those two reads directly to the start
+  token already bound into its generation record. A missing process is
+  `processUnavailable`; a backend or token mismatch, or a token that changes
+  across the read, is `generationChanged`. Neither result exposes the candidate
+  path or root PID. Darwin uses the same fence around its root PID. A bounded
+  `unavailable` target is a truthful successful field and does not by itself
+  make the envelope incomplete. Locators are sampled afresh on each command:
+  st2 stores no scope registry, performs no resource sampling, and gives no
+  target continuity guarantee. Runtime ID remains task identity.
 
   Discovery runs before and after runtime observation. A semantic declaration
   change across those passes makes the result incomplete. The reader also
@@ -842,17 +872,18 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   discovery and runtime observation. Every successful declaration writer
   advances and fsyncs that monotonic generation after its durable commit; apply
   does so after live verification and before clearing its marker. Even a
-  completed declaration ABA is therefore incomplete. This remains an observational
-  seqlock and does not serialize catalog writers. A runtime root positively absent at admission is
-  empty and is not passed to its backend. An admitted PTY root that is removed
-  or replaced during `pty list` is indeterminate; because the external backend
-  creates an absent registry, concurrent root deletion is not a zero-write
-  boundary. Malformed state, PID reuse, timeouts, duplicate ids, and observer
-  failures are likewise indeterminate. Existing plain-PID exec records are
-  opened read-only without following symlinks and verified by retained file
-  identity, unchanged content and metadata, the final path identity, process
-  start token, and record mtime without rewriting them. If that proof is
-  unavailable on a supported OS, the generation remains indeterminate.
+  completed declaration ABA is therefore incomplete. This remains an
+  observational seqlock and does not serialize catalog writers. A runtime root
+  positively absent at admission is empty and is not passed to its backend. An
+  admitted PTY root that is removed or replaced during `pty list` is
+  indeterminate; because the external backend creates an absent registry,
+  concurrent root deletion is not a zero-write boundary. Malformed state, PID
+  reuse, timeouts, duplicate ids, and observer failures are likewise
+  indeterminate. Existing plain-PID exec records are opened read-only without
+  following symlinks and verified by retained file identity, unchanged content
+  and metadata, the final path identity, process start token, and record mtime
+  without rewriting them. If that proof is unavailable on a supported OS, the
+  generation remains indeterminate.
 
   Each row retains the task-level `desiredState` (`running` or `absent`) and
   appends the declaration-level `agentDesiredState` plus

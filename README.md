@@ -499,12 +499,21 @@ Use the typed inventory instead of parsing `doctor` prose:
 st2 tasks --catalog "$CATALOG" --host <host> --json
 ```
 
-The `st2.task-inventory.v1` envelope joins the selected host's desired PTY and exec tasks to
+The `st2.task-inventory.v2` envelope joins the selected host's desired PTY and exec tasks to
 read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
 drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
 otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
 become `absent` only when the corresponding backend observation is complete; uncertainty remains
 `indeterminate`.
+
+Every runtime has a tagged `resourceTarget`. A live Linux process reports
+`{"type":"linuxCgroupV2","path":"/..."}` from its exact unified
+`/proc/<pid>/cgroup` membership; a live Darwin process reports
+`{"type":"darwinProcessTree","rootPid":...}` as a best-effort tree root. All
+other cases report `{"type":"unavailable","reason":"..."}` from a bounded
+reason set. These are per-observation locators, not identity: consumers keep
+using `runtimeId` as the stable task key and rediscover the target on each
+sample.
 
 A PTY root positively absent at admission is not passed to `pty` and remains absent; an absent exec
 state root likewise remains absent. If an admitted PTY root is concurrently removed, the result is

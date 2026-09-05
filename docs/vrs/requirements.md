@@ -283,29 +283,45 @@ accepted.
 - **R23 Fail-closed task inventory:** One read-only machine command exposes
   every desired local PTY and exec task by immutable agent ID, nullable current
   bus address, task name, runtime id, kind, lifecycle, retirement, desired
-  state, runtime state, PID, creation time, and opaque runtime-generation id.
+  state, runtime state, PID, creation time, opaque runtime-generation id, and a
+  required resource-observation target. Runtime ID remains task identity. PID,
+  creation time, generation ID, cgroup path, and process-tree root are
+  observation locators only and may change between samples.
+  The resource target is a closed tagged union. A proved live Linux generation
+  exposes its exact unified cgroup-v2 path read from that process's
+  `/proc/<pid>/cgroup`; unit and scope names are not locators. A proved live
+  Darwin generation exposes its PID as a best-effort process-tree root. For
+  PTY, the kernel start token captured after the first backend snapshot becomes
+  admissible only when a second backend snapshot confirms the same PID and
+  creation generation. That token is then sampled around target observation,
+  as it is for exec. A changed, recycled, or exited process is never associated
+  with the target.
+  Non-running, indeterminate, degraded, and unsupported observations expose a bounded
+  explicit unavailable reason rather than a nullable or guessed locator.
+  Resource-target unavailability is itself a complete observation and does not
+  turn a trustworthy task inventory into an incomplete one.
   A proved non-routable retired subject has a null bus address without making
   coverage incomplete. Unknown, duplicate, malformed, unreadable, timed-out,
-  PID-reused, or otherwise unprovable evidence is indeterminate and makes the
-  versioned envelope incomplete and the command unsuccessful; it is never
-  reported as absence. The command projects a
-  supervisor's known park fault and per-task recovery action alongside the
-  unmodified runtime observation. The action is structured executable argv
-  carrying the exact canonical catalog folder and selected host, so invoking it
-  never falls back to ambient catalog or host defaults. A believable park
-  remains complete, while an unbelievable park marker fails closed like other
-  unprovable evidence.
+  PID-reused, or otherwise unprovable runtime evidence is indeterminate and
+  makes the versioned envelope incomplete and the command unsuccessful; it is
+  never reported as absence. The command projects a supervisor's known park
+  fault and per-task recovery action alongside the unmodified runtime
+  observation. The action is structured executable argv carrying the exact
+  canonical catalog folder and selected host, so invoking it never falls back
+  to ambient catalog or host defaults. A believable park remains complete,
+  while an unbelievable park marker fails closed like other unprovable
+  evidence.
   Observation detects semantic declaration drift across its runtime probe,
   does not invoke a backend for a root positively absent at admission, and
-  performs no reconciliation, cleanup, lifecycle change, or state rewrite. An
-  admitted PTY root that changes
-  filesystem identity during the backend probe makes the observation
-  incomplete; the external backend may already have recreated a concurrently
-  removed registry. This diagnostic boundary is not transactionally serialized
-  with catalog or runtime writers and is not control-plane cutover authority.
-  It samples the durable catalog generation and incomplete marker around
-  discovery and runtime observation; any marker, malformed fence, or generation
-  change makes the envelope incomplete.
+  performs no reconciliation, cleanup, lifecycle change, state rewrite,
+  resource sampling, or persistent locator registration. An admitted PTY root
+  that changes filesystem identity during the backend probe makes the
+  observation incomplete; the external backend may already have recreated a
+  concurrently removed registry. This diagnostic boundary is not
+  transactionally serialized with catalog or runtime writers and is not
+  control-plane cutover authority. It samples the durable catalog generation
+  and incomplete marker around discovery and runtime observation; any marker,
+  malformed fence, or catalog-generation change makes the envelope incomplete.
 - **R24 Immutable agent ID and mutable agent address:** Each logical agent
   subject has one explicit, catalog-global, immutable agent ID. IDs are unique
   across the live catalog and structural archive, across hosts and desired
