@@ -16,7 +16,17 @@ fs.writeFileSync(
   recorder,
   `#!${process.execPath}
 import fs from "node:fs";
-process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
+const offer = process.env.ST2_SMOKE_PROTOCOLS;
+process.stdout.write(
+  JSON.stringify({
+    type: "hello",
+    protocol: 1,
+    sessionContext: "",
+    // st2's hello keeps \`protocol: 1\` forever — the asset refuses anything else, and a refusal
+    // costs the seat its mail — and offers the versions it would also accept beside it.
+    ...(offer ? { protocols: JSON.parse(offer) } : {}),
+  }) + "\\n",
+);
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
 `,
@@ -289,6 +299,171 @@ assert.ok(durable, "a readable session store must supply the durable count");
 assert.strictEqual(durable.compaction.count, 1, "the count is getEntries() filtered to compactions");
 // Unlike pi, omp still answers inside its own compact handler, so a real reading rides the edge.
 assert.strictEqual(durable.reading.usedTokens, 22500, "omp does not null its reading at the edge");
+
+// ─── Negotiation ────────────────────────────────────────────────────────────────────────────────
+// Everything above ran against a peer whose hello offered nothing, and that is the load-bearing
+// half: the version-1 wire must be byte-identical to the one that shipped. No answer, no
+// conversation statement, and no prose on an unblocked state frame reached it.
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "client_hello"),
+  [],
+  "a hello that offers nothing is never answered",
+);
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "conversation"),
+  [],
+  "the conversation axis is stated only to a negotiated peer",
+);
+assert.ok(
+  readFrames().every(
+    (frame) => frame.type !== "state" || !("reason" in frame) || frame.blockedOn === "human",
+  ),
+  "only a blocked frame carries prose on the version-1 wire",
+);
+// And nothing on either wire is a `condition` frame. omp has no asset-side condition signal at
+// all: every fault it can prove rides the typed `turn` frame st2 already decodes, so a condition
+// frame from this asset would be a claim no capture supports.
+assert.deepStrictEqual(
+  readFrames().filter((frame) => frame.type === "condition"),
+  [],
+  "this asset states no conditions in any protocol",
+);
+
+// An offer this asset is not in is not an agreement.
+process.env.ST2_SMOKE_PROTOCOLS = "[1]";
+let before = readFrames().length;
+await handlers.get("session_start")({}, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 100));
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-1" }, activeCtx);
+await handlers.get("tool_approval_resolved")({ approved: false, sessionId: "sess-1" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before).filter((frame) => frame.type !== "context"),
+  [
+    { type: "state", state: "active" },
+    { type: "state", state: "active", blockedOn: "human", ask: "permission", reason: "bash" },
+    { type: "state", state: "active" },
+  ],
+  "an offer without version 2 keeps the legacy wire: no answer, no session id, no denial prose",
+);
+
+// The negotiated peer.
+process.env.ST2_SMOKE_PROTOCOLS = "[1,2]";
+before = readFrames().length;
+await handlers.get("session_start")({}, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 100));
+assert.deepStrictEqual(
+  readFrames().slice(before)[0],
+  { type: "client_hello", protocol: 2 },
+  "the answer is this asset's FIRST write on the connection, before any observation",
+);
+
+// omp's own `sessionId` rides both halves of the approval pair (measured 18.0.9 and 18.1.2). It
+// is stated once per channel, and a denied approval is an interruption whose word is prose.
+before = readFrames().length;
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: " sess-7 " }, activeCtx);
+await handlers.get("tool_approval_resolved")({ approved: false, sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before),
+  [
+    { type: "conversation", sessionId: "sess-7" },
+    { type: "state", state: "active", blockedOn: "human", ask: "permission", reason: "bash" },
+    { type: "state", state: "active", reason: "approvalDenied" },
+  ],
+  "a negotiated peer receives the session id once and the denial as prose",
+);
+
+before = readFrames().length;
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-7" }, activeCtx);
+await handlers.get("tool_approval_resolved")({ approved: true, sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before).filter((frame) => frame.type === "conversation"),
+  [],
+  "the same session id is stated once per channel, not once per event",
+);
+assert.deepStrictEqual(
+  readFrames().slice(before).at(-1),
+  { type: "state", state: "active" },
+  "a granted approval carries no prose",
+);
+
+// The ask outranks the approval surface, and a DENIED ask emits no `tool_result` at all
+// (DQ-OMP-1) — so only a turn boundary can retire it. Without that rule one denial mutes the
+// approval surface, and st2's positive `none` on the ask axis, for the whole process lifetime.
+before = readFrames().length;
+await handlers.get("tool_call")(
+  {
+    toolName: "ask",
+    toolCallId: "ask-2",
+    input: { questions: [{ id: "go", question: "Proceed?" }] },
+  },
+  activeCtx,
+);
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-7" }, activeCtx);
+await handlers.get("tool_approval_resolved")({ approved: true, sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before),
+  [
+    {
+      type: "state",
+      state: "active",
+      blockedOn: "human",
+      ask: "question",
+      reason: "Proceed?",
+    },
+  ],
+  "a pending ask suppresses both approval halves",
+);
+
+before = readFrames().length;
+await handlers.get("agent_start")({}, activeCtx);
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before).filter((frame) => frame.type === "state"),
+  [
+    { type: "state", state: "active" },
+    { type: "state", state: "active", blockedOn: "human", ask: "permission", reason: "bash" },
+  ],
+  "agent_start retires a never-answered ask",
+);
+
+before = readFrames().length;
+await handlers.get("tool_call")(
+  {
+    toolName: "ask",
+    toolCallId: "ask-3",
+    input: { questions: [{ id: "go", question: "Again?" }] },
+  },
+  activeCtx,
+);
+await handlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] }, activeCtx);
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.deepStrictEqual(
+  readFrames().slice(before).filter((frame) => frame.type === "state"),
+  [
+    { type: "state", state: "active", blockedOn: "human", ask: "question", reason: "Again?" },
+    { type: "state", state: "active", blockedOn: "human", ask: "permission", reason: "bash" },
+  ],
+  "agent_end retires a never-answered ask too",
+);
+// A replacement channel negotiates for itself and re-states the session id: the stash outlives
+// the connection, the agreement must not.
+before = readFrames().length;
+await handlers.get("session_start")({}, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 100));
+await handlers.get("tool_approval_requested")({ toolName: "bash", sessionId: "sess-7" }, activeCtx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+const reopened = readFrames().slice(before);
+assert.deepStrictEqual(reopened[0], { type: "client_hello", protocol: 2 });
+assert.ok(
+  reopened.some((frame) => frame.type === "conversation" && frame.sessionId === "sess-7"),
+  "a fresh connection re-states the conversation identity",
+);
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("omp extension smoke: ok");
