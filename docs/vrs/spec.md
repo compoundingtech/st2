@@ -852,15 +852,18 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   with no unified entry. It does not derive the path from a systemd unit,
   scope name, runtime ID, or naming convention.
 
-  PTY observation captures a kernel process-start token after its first backend
-  snapshot, then takes a second backend snapshot and admits that token only
-  when task ID, running state, PID, and backend creation time still identify
-  the same generation. Resource observation reads the token again before and
-  after reading the target. Exec compares those two reads directly to the start
-  token already bound into its generation record. A missing process is
-  `processUnavailable`; a backend or token mismatch, or a token that changes
-  across the read, is `generationChanged`. Neither result exposes the candidate
-  path or root PID. Darwin uses the same fence around its root PID. A bounded
+  PTY observation captures each candidate daemon's kernel process-start token
+  after the registry snapshot, then executes `pty stats --json` exactly once
+  without a session argument. The returned array is socket-backed live
+  evidence for every candidate. A token is admitted only when exactly one
+  stats row has the task name, `process.alive=true`, the same `daemon.pid`, and
+  the same `createdAt`, and a second kernel-token read equals the first.
+  Resource observation then reads the token before and after the target. Exec
+  compares those target-fence reads directly to the token already bound into
+  its generation record. A missing process is `processUnavailable`; a stats or
+  token mismatch, or a token that changes across a read, is
+  `generationChanged`. Neither result exposes the candidate path or root PID.
+  Darwin uses the same fence around its root PID. A bounded
   `unavailable` target is a truthful successful field and does not by itself
   make the envelope incomplete. Locators are sampled afresh on each command:
   st2 stores no scope registry, performs no resource sampling, and gives no

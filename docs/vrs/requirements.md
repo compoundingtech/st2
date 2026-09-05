@@ -291,13 +291,15 @@ accepted.
   exposes its exact unified cgroup-v2 path read from that process's
   `/proc/<pid>/cgroup`; unit and scope names are not locators. A proved live
   Darwin generation exposes its PID as a best-effort process-tree root. For
-  PTY, the kernel start token captured after the first backend snapshot becomes
-  admissible only when a second backend snapshot confirms the same PID and
-  creation generation. That token is then sampled around target observation,
-  as it is for exec. A changed, recycled, or exited process is never associated
-  with the target.
-  Non-running, indeterminate, degraded, and unsupported observations expose a bounded
-  explicit unavailable reason rather than a nullable or guessed locator.
+  PTY, st2 captures the candidate daemon's kernel start token, takes one
+  socket-backed `pty stats --json` snapshot for all candidates, and admits the
+  token only when the named live session reports the same daemon PID and
+  creation generation and a second token read is unchanged. That token fences
+  target observation, as the recorded token does for exec, but its transient
+  availability never changes the PTY generation ID. A changed, recycled, or
+  exited process is never associated with the target.
+  Non-running, indeterminate, degraded, and unsupported observations expose a
+  bounded explicit unavailable reason rather than a nullable or guessed locator.
   Resource-target unavailability is itself a complete observation and does not
   turn a trustworthy task inventory into an incomplete one.
   A proved non-routable retired subject has a null bus address without making

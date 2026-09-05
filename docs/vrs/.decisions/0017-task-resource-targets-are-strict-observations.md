@@ -36,11 +36,12 @@ process-generation fence. One exact unified `0::` entry preserved its
 slash-prefixed path, including spaces and colons, while absent, duplicate,
 relative, repeated-separator, trailing-separator, and traversal-capable shapes
 were rejected. Stable start-token observations admitted the candidate target.
-A deterministic PTY regression replaced the PID generation between the first
-backend snapshot and start-token capture; the second snapshot's changed
-creation generation rejected that token. A token mismatch before target read,
-a token change after it, and process exit each emitted only a bounded
-unavailable result and never the candidate locator.
+A deterministic PTY regression replaced the PID generation between the
+registry snapshot and start-token capture; the socket-backed stats row's
+changed creation generation rejected that token. A two-live-task fixture
+proved one unscoped stats snapshot serves the whole inventory. A token mismatch
+before target read, a token change after it, and process exit each emitted only
+a bounded unavailable result and never the candidate locator.
 
 A live Darwin exec observation joined the current PID as
 `darwinProcessTree.rootPid` without rewriting its retained generation record,
@@ -70,13 +71,14 @@ Unavailable reasons are exactly `notRunning`, `runtimeIndeterminate`,
 
 On Linux, st2 reads exactly one unified `0::<path>` entry from the observed
 process's `/proc/<pid>/cgroup`. Exec compares the target fence to the token in
-its generation record. PTY captures a token after its first backend snapshot
-and admits it only after a second snapshot confirms the same task, running
-state, PID, and backend creation generation; that admitted token then fences
-the target read. A missing, exited, or recycled process never publishes the
-candidate locator. Darwin fences the current process in the same way before
-exposing its PID as a best-effort tree root. All targets are rediscovered on
-each inventory command.
+its generation record. PTY captures each candidate daemon token after the
+registry snapshot, then takes one unscoped, socket-backed `pty stats --json`
+snapshot for the entire inventory. A candidate is admitted only when its named
+live stats row reports the same daemon PID and creation generation and a second
+token read is unchanged; that admitted token then fences the target read. A
+missing, exited, or recycled process never publishes the candidate locator.
+Darwin fences the current process in the same way before exposing its PID as a
+best-effort tree root. All targets are rediscovered on each inventory command.
 
 Runtime ID remains stable task identity. PID, creation time, generation ID,
 cgroup path, root PID, unit, and incarnation remain observation locators only.
