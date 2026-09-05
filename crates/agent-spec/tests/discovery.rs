@@ -383,7 +383,7 @@ agent "cos" {
     assert_eq!(ding.id.as_deref(), Some("Silber.cos.ding"));
     assert_eq!(
         ding.command.as_deref(),
-        Some("st2 ding --identity Silber.cos --root $ST_ROOT")
+        Some("st2 ding --id Silber.cos --root $ST_ROOT")
     );
     assert_eq!(
         ding.env.get("ST_AGENT").map(String::as_str),
@@ -1915,7 +1915,13 @@ fn path_supplies_identity_and_host_when_content_omits_them() {
     let s = &found.specs[0];
     assert_eq!(s.identity, "st2-claude");
     assert_eq!(s.host.as_deref(), Some("hetz"));
-    assert_eq!(s.bus_id("fallback"), "hetz.st2-claude");
+    // An unmigrated legacy declaration: its implicit agent ID, its positional declaration key,
+    // and its bus address are the same bytes, which is exactly why migration moves no state.
+    assert_eq!(s.agent_id("fallback"), "hetz.st2-claude");
+    assert_eq!(s.legacy_bus_identity("fallback"), "hetz.st2-claude");
+    assert_eq!(s.bus_address("fallback"), "hetz.st2-claude");
+    assert_eq!(s.id, None);
+    assert_eq!(s.address, None);
 }
 
 #[test]

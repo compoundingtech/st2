@@ -63,7 +63,7 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
         let output = run(
             root,
             command,
-            &["h.worker", value, "--host", "h", "--json"],
+            &["--id", "h.worker", value, "--host", "h", "--json"],
             None,
         );
         assert!(
@@ -110,7 +110,7 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
     let repeat = run(
         root,
         "rename",
-        &["worker", "Build owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Build owner", "--host", "h", "--json"],
         None,
     );
     assert!(repeat.status.success());
@@ -123,7 +123,7 @@ fn cli_sets_replaces_and_clears_fields_without_changing_identity_or_other_bytes(
         let clear = run(
             root,
             command,
-            &["h.worker", "--clear", "--host", "h", "--json"],
+            &["--id", "h.worker", "--clear", "--host", "h", "--json"],
             None,
         );
         assert!(clear.status.success());
@@ -161,7 +161,7 @@ fn cli_authors_positional_identity_without_an_existing_child_block() {
     let output = run(
         root,
         "rename",
-        &["h.worker", "Owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Owner", "--host", "h", "--json"],
         None,
     );
     assert!(
@@ -188,7 +188,7 @@ fn cli_clears_a_presentation_field_from_compact_kdl() {
     let output = run(
         root,
         "rename",
-        &["h.worker", "--clear", "--host", "h", "--json"],
+        &["--id", "h.worker", "--clear", "--host", "h", "--json"],
         None,
     );
     assert!(
@@ -221,6 +221,7 @@ fn cli_preserves_declaration_mode_under_a_restrictive_umask() {
             "--catalog",
             root.to_str().unwrap(),
             "rename",
+            "--id",
             "h.worker",
             "Owner",
             "--host",
@@ -256,7 +257,7 @@ fn cli_rejects_unicode_line_and_paragraph_separators_for_both_fields() {
             let output = run(
                 root,
                 command,
-                &["h.worker", &value, "--host", "h", "--json"],
+                &["--id", "h.worker", &value, "--host", "h", "--json"],
                 None,
             );
             assert!(
@@ -324,7 +325,7 @@ fn cli_enforces_agent_authority_and_nix_and_format_refusals() {
         let output = run(
             root,
             command,
-            &[target, "refused", "--host", "h", "--json"],
+            &["--id", target, "refused", "--host", "h", "--json"],
             actor,
         );
         assert!(!output.status.success());
@@ -336,7 +337,7 @@ fn cli_enforces_agent_authority_and_nix_and_format_refusals() {
     let allowed = run(
         root,
         "describe",
-        &["h.child", "Owned by root", "--host", "h", "--json"],
+        &["--id", "h.child", "Owned by root", "--host", "h", "--json"],
         Some("h.root"),
     );
     assert!(
@@ -373,6 +374,7 @@ fn concurrent_cli_writers_serialize_without_losing_either_field() {
                 "--catalog",
                 root.to_str().unwrap(),
                 command,
+                "--id",
                 "h.worker",
                 value,
                 "--host",
@@ -438,6 +440,7 @@ fn presentation_and_publication_contend_on_the_same_persistent_catalog_lock() {
             "--catalog",
             root.to_str().unwrap(),
             "rename",
+            "--id",
             "h.worker",
             "Build owner",
             "--host",
@@ -525,7 +528,7 @@ fn catalog_lock_refuses_a_symlinked_control_directory() {
     let output = run(
         &root,
         "rename",
-        &["h.worker", "Owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Owner", "--host", "h", "--json"],
         None,
     );
     assert!(!output.status.success());
@@ -545,6 +548,7 @@ fn presentation_crash_stages_only_in_the_control_plane() {
             "--catalog",
             root.to_str().unwrap(),
             "rename",
+            "--id",
             "h.worker",
             "Build owner",
             "--host",
@@ -579,7 +583,7 @@ fn presentation_crash_stages_only_in_the_control_plane() {
     let retry = run(
         &root,
         "rename",
-        &["h.worker", "Build owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Build owner", "--host", "h", "--json"],
         None,
     );
     assert!(
@@ -607,6 +611,7 @@ fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
             "--catalog",
             root.to_str().unwrap(),
             "rename",
+            "--id",
             "h.worker",
             "Build owner",
             "--host",
@@ -633,7 +638,7 @@ fn presentation_post_commit_generation_failure_is_fenced_and_recovered() {
     let recovered = run(
         &root,
         "rename",
-        &["h.worker", "Build owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Build owner", "--host", "h", "--json"],
         None,
     );
     assert!(
@@ -664,6 +669,7 @@ fn control_directory_swap_cannot_redirect_presentation_staging() {
             "--catalog",
             root.to_str().unwrap(),
             "rename",
+            "--id",
             "h.worker",
             "Build owner",
             "--host",
@@ -718,11 +724,79 @@ fn catalog_lock_refuses_a_symlinked_lock_file() {
     let output = run(
         &root,
         "describe",
-        &["h.worker", "Owner", "--host", "h", "--json"],
+        &["--id", "h.worker", "Owner", "--host", "h", "--json"],
         None,
     );
     assert!(!output.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["code"], "catalog-lock-failed");
     assert_eq!(fs::read_to_string(outside).unwrap(), "unchanged");
+}
+
+/// Presentation is selected by immutable agent ID and by nothing else.
+///
+/// The subject's mutable address is deliberately moved first: a selector that used to work as a
+/// positional identity, and the new address that now routes to the same subject, must both refuse,
+/// while the unchanged ID keeps working. Decision 0015 rejects a precedence-based resolver, so
+/// there is no order in which an address may satisfy an identity-authoring command.
+#[test]
+fn presentation_selection_is_immutable_id_only_and_survives_an_address_cutover() {
+    use st2::agent_author::{PresentationField, set_address, set_presentation};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(root, "h/worker/agent.kdl", &declaration("worker", None, "catalog"));
+
+    set_presentation(
+        root,
+        "h.worker",
+        "h",
+        None,
+        PresentationField::Name,
+        Some("Build owner"),
+    )
+    .unwrap();
+
+    set_address(
+        root,
+        "h.worker",
+        "h",
+        None,
+        Some(&st2::AgentAddress::parse("build.owner").unwrap()),
+    )
+    .unwrap();
+
+    let after_cutover = set_presentation(
+        root,
+        "h.worker",
+        "h",
+        None,
+        PresentationField::Description,
+        Some("Own build delivery"),
+    )
+    .unwrap();
+    assert_eq!(after_cutover.identity, "h.worker");
+
+    for reference in ["build.owner", "h.build.owner", "worker"] {
+        let error = set_presentation(
+            root,
+            reference,
+            "h",
+            None,
+            PresentationField::Name,
+            Some("no"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "target-not-found",
+            "{reference:?} is an address, never an id"
+        );
+    }
+
+    let found = st2::discover(root);
+    let spec = &found.specs[0];
+    assert_eq!(spec.name.as_deref(), Some("Build owner"));
+    assert_eq!(spec.description.as_deref(), Some("Own build delivery"));
+    assert_eq!(spec.agent_id("h"), "h.worker");
 }

@@ -30,6 +30,7 @@ pub const AGENT_SPEC_REVISION: &str = env!("AGENT_SPEC_REVISION");
 
 pub mod declared;
 pub mod discovery;
+pub mod identity;
 mod kdl_format;
 pub mod spec;
 pub mod profile;
@@ -41,6 +42,11 @@ pub use declared::{
     DeclaredNode, DeclaredParse, DeclaredSeverity, DeclaredSpan, DeclaredValue,
     parse_declared_document, parse_declared_file,
 };
+pub use identity::{
+    AGENT_ADDRESS_MAX_CHARS, AGENT_ADDRESS_SEGMENT_MAX_CHARS, AGENT_ID_MAX_BYTES, AddressBook,
+    AgentAddress, AgentId, AgentSelector, IdentityError, ResolveError, Subject,
+    UniquenessConflict, bus_address, legacy_bus_identity,
+};
 pub use discovery::{
     Declared, Discovered, SpecError, discover, discover_file, discover_strict, is_catalog_path,
     parse_declared, path_defaults,
@@ -48,8 +54,8 @@ pub use discovery::{
 pub use spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryReadiness, DeliveryTransport,
     Driver, JobType, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, STREAM_TASK_PREFIX,
-    SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, parse_duration,
-    stream_name_of_task, validate_desired_state_reason,
+    SessionDriver, Stream, StreamLaunch, Task, TaskKind, TaskLifecycle, address_book,
+    parse_duration, stream_name_of_task, validate_desired_state_reason,
 };
 pub use profile::{
     DEFAULT_SELECTOR_LIMIT_BYTES, DescriptorValidationError, PROFILE_DESCRIPTOR_ABI_VERSION,

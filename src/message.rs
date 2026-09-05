@@ -22,8 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
+use st2_wire::message::{EndpointKind, SentCoverage, SentMessageRow, SentMessages};
 
+use crate::{AddressBook, AgentId, AgentSelector, ResolveError, Subject};
+
+/// Version of the sender ledger's head, active pointer, commit nodes, and idempotency receipts.
+/// Those shapes are unchanged by DELTA-003; only the message *record* gained a second version.
 const SENT_VERSION: u32 = 1;
 const SENT_DIR: &str = "sent";
 const SENT_HEAD: &str = "index.json";
@@ -33,6 +37,33 @@ const SENT_MESSAGES: &str = "messages";
 const SENT_PENDING: &str = "pending";
 const SENT_LOCK: &str = ".lock";
 const SENT_KEYS: &str = "keys";
+
+/// Durable message-record schema versions (03-message spec, "State ownership").
+///
+/// Version 1 keeps legacy bus identities in `from`/`to`. Version 2 carries an immutable agent ID
+/// plus a publication-time bus-address snapshot for an Agent endpoint, and an explicit endpoint
+/// kind with a canonical typed address for a principal or external endpoint.
+pub const MESSAGE_RECORD_VERSION_1: u32 = 1;
+pub const MESSAGE_RECORD_VERSION_2: u32 = 2;
+
+/// The single switch for the version-2 durable message writer, one member of the DELTA-003
+/// activation cohort.
+///
+/// Reader-first was satisfied first: every reader in this module accepts version 1 and version 2,
+/// and that landed before this flipped. It is ON because a record whose `from`/`to` carry immutable
+/// agent IDs must DECLARE version 2 — under version 1 those fields mean bus identities, and storing
+/// an ID there would silently misattribute the endpoint to whatever subject now answers that route.
+/// Nothing writes an ID under version 1, and nothing writes a route under version 2.
+///
+/// Named and reversible on purpose: activation step 5 flips this together with harness-state v2,
+/// harness-context v2, and PTY schema 2, and it must be revertible with them.
+pub const WRITE_MESSAGE_RECORD_VERSION_2: bool = true;
+
+const SENT_RECORD_WRITE_VERSION: u32 = if WRITE_MESSAGE_RECORD_VERSION_2 {
+    MESSAGE_RECORD_VERSION_2
+} else {
+    MESSAGE_RECORD_VERSION_1
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -77,6 +108,8 @@ struct SentRecord {
     version: u32,
     filename: String,
     ts: u64,
+    /// The canonical endpoint. An Agent endpoint is an immutable agent ID; a typed non-Agent
+    /// endpoint is that endpoint's own canonical address. Never a mutable agent address.
     from: String,
     to: String,
     subject: Option<String>,
@@ -86,6 +119,17 @@ struct SentRecord {
     idempotency_key: Option<String>,
     body: String,
     rendered_message: String,
+    /// Version 2 only: the endpoint's bus address at publication time. Display-only, because a
+    /// released address is immediately reusable and may already route to a different subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_address: Option<String>,
+    /// Version 2 only: what the endpoint value is. Absent is the version-1 meaning, `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_kind: Option<EndpointKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_kind: Option<EndpointKind>,
 }
 
 impl SentRecord {
@@ -100,12 +144,47 @@ impl SentRecord {
             priority: self.priority.clone(),
             idempotency_key: self.idempotency_key.clone(),
             body: include_body.then(|| self.body.clone()),
+            to_address: self.to_address.clone(),
+            to_kind: self.to_kind,
+        }
+    }
+
+    /// This row's recipient endpoint, as a reader must interpret it. `owner_agent_id` is the
+    /// current immutable ID of the subject that owns this sender ledger.
+    fn recipient_endpoint<'a>(&'a self, owner_agent_id: &'a str) -> DurableEndpoint<'a> {
+        DurableEndpoint {
+            version: self.version,
+            value: &self.to,
+            kind: self.to_kind,
+            // A sender-owned row's state owner is its sender, never its recipient.
+            owns_row: false,
+            owner_agent_id,
+        }
+    }
+
+    /// This row's sender endpoint. A sender ledger row is owned by its sender, so a colliding
+    /// version-1 sender endpoint resolves to that owner's migrated ID.
+    ///
+    /// The publication path already knows its own sender, so only the attribution proofs read
+    /// this; it exists to state the ownership side of `MESSAGE-R04` in one place.
+    #[cfg(test)]
+    fn sender_endpoint<'a>(&'a self, owner_agent_id: &'a str) -> DurableEndpoint<'a> {
+        DurableEndpoint {
+            version: self.version,
+            value: &self.from,
+            kind: self.from_kind,
+            owns_row: true,
+            owner_agent_id,
         }
     }
 
     fn same_operation(&self, candidate: &Self) -> bool {
         self.from == candidate.from
             && self.to == candidate.to
+            && self.from_kind == candidate.from_kind
+            && self.to_kind == candidate.to_kind
+            && self.from_address == candidate.from_address
+            && self.to_address == candidate.to_address
             && self.subject == candidate.subject
             && self.in_reply_to == candidate.in_reply_to
             && self.tags == candidate.tags
@@ -113,6 +192,156 @@ impl SentRecord {
             && self.idempotency_key == candidate.idempotency_key
             && self.body == candidate.body
             && self.rendered_message == candidate.rendered_message
+    }
+}
+
+/// Accept both durable record versions, and refuse a record that mixes them.
+///
+/// A version-1 record carrying version-2 fields is not a tolerable older shape, it is a record
+/// whose endpoint meaning is undecidable, so it fails closed like any other corruption.
+fn validate_sent_record(record: &SentRecord) -> anyhow::Result<()> {
+    match record.version {
+        MESSAGE_RECORD_VERSION_1 => anyhow::ensure!(
+            record.from_kind.is_none()
+                && record.to_kind.is_none()
+                && record.from_address.is_none()
+                && record.to_address.is_none(),
+            "version-1 sent record carries version-2 endpoint fields"
+        ),
+        MESSAGE_RECORD_VERSION_2 => anyhow::ensure!(
+            record.from_kind.is_some() && record.to_kind.is_some(),
+            "version-2 sent record is missing an explicit endpoint kind"
+        ),
+        version => anyhow::bail!("unsupported sent record version {version}"),
+    }
+    Ok(())
+}
+
+/// The durable collision metadata the legacy-ID migration transaction writes.
+///
+/// Migration froze each unmigrated subject's `<host>.<identity>` bytes as its agent ID, so a
+/// version-1 endpoint is that subject's agent ID by construction — not a fallback, an identity.
+/// The one exception is a reassigned legacy bus identity: one subject kept the bytes while an
+/// archived subject received a generated ID, so those bytes in a version-1 row denote either
+/// subject and cannot be retyped universally (03-message spec, `MESSAGE-R04`).
+///
+/// `src/catalog_migrate.rs` owns the on-disk format and implements this for its record; nothing
+/// here parses that format.
+pub trait LegacyCollisionIndex {
+    /// True when migration reassigned these legacy `<host>.<identity>` bytes.
+    fn is_reassigned(&self, legacy_bus_identity: &str) -> bool;
+}
+
+/// A catalog that has not run the legacy-ID migration reassigned nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoLegacyCollisions;
+
+impl LegacyCollisionIndex for NoLegacyCollisions {
+    fn is_reassigned(&self, _legacy_bus_identity: &str) -> bool {
+        false
+    }
+}
+
+/// The migration transaction's durable record, read as a collision index.
+///
+/// Only contested endpoints are recorded, because a non-contested one needs no record: its bytes
+/// already are that subject's frozen legacy ID. `keeper` and the reassigned IDs are deliberately
+/// unused here — the owner's ID comes from the state being read, never from this record, which is
+/// what makes it impossible to mis-attribute an archived sender to the live keeper.
+impl LegacyCollisionIndex for crate::catalog_migrate::LegacyIdCollisions {
+    fn is_reassigned(&self, legacy_bus_identity: &str) -> bool {
+        matches!(
+            self.attribution(legacy_bus_identity),
+            crate::catalog_migrate::LegacyEndpoint::Collision { .. }
+        )
+    }
+}
+
+impl<T: LegacyCollisionIndex + ?Sized> LegacyCollisionIndex for &T {
+    fn is_reassigned(&self, legacy_bus_identity: &str) -> bool {
+        (**self).is_reassigned(legacy_bus_identity)
+    }
+}
+
+/// What one durable endpoint denotes, and therefore what authority it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointAttribution {
+    /// A canonical immutable agent ID. Carries reply and automation authority.
+    AgentId(String),
+    /// A typed non-Agent endpoint's canonical address. Replyable on that transport; never an
+    /// agent-automation key.
+    TypedAddress { kind: EndpointKind, address: String },
+    /// Colliding version-1 legacy bytes that this row's state owner does not own. Rendered as a
+    /// historical address, never as the keeping subject's ID, and carrying no reply or automation
+    /// authority: addressing the live replacement would deliver to the wrong subject.
+    UnattributedLegacyAddress(String),
+}
+
+impl EndpointAttribution {
+    /// The canonical target a reply or automation may address, or `None` when this endpoint
+    /// carries no such authority.
+    pub fn reply_target(&self) -> Option<&str> {
+        match self {
+            Self::AgentId(id) => Some(id),
+            Self::TypedAddress { address, .. } => Some(address),
+            Self::UnattributedLegacyAddress(_) => None,
+        }
+    }
+
+    /// The immutable agent ID, when this endpoint is an attributed Agent.
+    pub fn agent_id(&self) -> Option<&str> {
+        match self {
+            Self::AgentId(id) => Some(id),
+            Self::TypedAddress { .. } | Self::UnattributedLegacyAddress(_) => None,
+        }
+    }
+
+    /// Human rendering. An unattributed legacy endpoint is explicitly marked as historical so it
+    /// is never read as a live route.
+    pub fn display(&self) -> String {
+        match self {
+            Self::AgentId(id) => id.clone(),
+            Self::TypedAddress { address, .. } => address.clone(),
+            Self::UnattributedLegacyAddress(address) => format!("{address} (historical address)"),
+        }
+    }
+}
+
+/// One endpoint read back from a durable message record, with everything a reader needs to decide
+/// its attribution.
+#[derive(Debug, Clone, Copy)]
+pub struct DurableEndpoint<'a> {
+    /// The record's schema version.
+    pub version: u32,
+    /// The persisted endpoint value.
+    pub value: &'a str,
+    /// The persisted endpoint kind. Absent means `agent`, the only version-1 meaning.
+    pub kind: Option<EndpointKind>,
+    /// True when this endpoint is the row's own state owner: the sender for a sender-owned row,
+    /// the recipient for an inbox row.
+    pub owns_row: bool,
+    /// That state owner's current immutable agent ID.
+    pub owner_agent_id: &'a str,
+}
+
+impl DurableEndpoint<'_> {
+    /// Attribute this endpoint against the migration's durable collision metadata.
+    pub fn attribute(&self, collisions: &impl LegacyCollisionIndex) -> EndpointAttribution {
+        let kind = EndpointKind::or_version_1_default(self.kind);
+        if kind != EndpointKind::Agent {
+            return EndpointAttribution::TypedAddress {
+                kind,
+                address: self.value.to_owned(),
+            };
+        }
+        // A version-2 Agent endpoint already IS an immutable ID; there is nothing to reinterpret.
+        if self.version >= MESSAGE_RECORD_VERSION_2 || !collisions.is_reassigned(self.value) {
+            return EndpointAttribution::AgentId(self.value.to_owned());
+        }
+        if self.owns_row {
+            return EndpointAttribution::AgentId(self.owner_agent_id.to_owned());
+        }
+        EndpointAttribution::UnattributedLegacyAddress(self.value.to_owned())
     }
 }
 
@@ -129,8 +358,13 @@ pub struct Message {
     pub filename: String,
     /// Send time in unix ms (from the filename prefix).
     pub ts_ms: u64,
-    /// `from:` — the claimed sender.
+    /// `from:` — the claimed sender as a human route. For an Agent sender this is the sender's bus
+    /// address at publication time: display only, never authority, because an address is mutable
+    /// and a released one is immediately reusable.
     pub from: Option<String>,
+    /// `from-id:` — the sender's immutable agent ID, written by the version-2 message writer.
+    /// This, not `from`, is the sender's identity for provenance, replies, and automation.
+    pub from_id: Option<String>,
     /// `subject:`.
     pub subject: Option<String>,
     /// `in-reply-to:` — the filename of the message this replies to.
@@ -147,6 +381,67 @@ pub struct Message {
     pub event_key: Option<Box<str>>,
     /// The markdown body.
     pub body: String,
+}
+
+impl Message {
+    /// How this inbox row's sender must be attributed.
+    ///
+    /// The authoritative field is `from_id`; `from` is a mutable, immediately reusable route and is
+    /// never authority. The collision-aware version-1 path is used only when the record predates
+    /// `from_id`. `recipient_agent_id` is the row's own state owner — an inbox row is owned by its
+    /// recipient — which is what decides whether a colliding legacy endpoint may be attributed.
+    pub fn sender_attribution(
+        &self,
+        recipient_agent_id: &str,
+        collisions: &impl LegacyCollisionIndex,
+    ) -> Option<EndpointAttribution> {
+        let (version, value) = match self.from_id.as_deref() {
+            Some(id) => (MESSAGE_RECORD_VERSION_2, id),
+            None => (MESSAGE_RECORD_VERSION_1, self.from.as_deref()?),
+        };
+        Some(
+            DurableEndpoint {
+                version,
+                value,
+                kind: None,
+                owns_row: false,
+                owner_agent_id: recipient_agent_id,
+            }
+            .attribute(collisions),
+        )
+    }
+
+    /// The canonical endpoint a reply to this message must address.
+    ///
+    /// `None` means refuse: either there is no sender at all, or the sender is a colliding
+    /// version-1 endpoint this row does not own, in which case replying would deliver to whichever
+    /// subject kept the bytes rather than to the subject that actually wrote the message.
+    pub fn reply_target(
+        &self,
+        recipient_agent_id: &str,
+        collisions: &impl LegacyCollisionIndex,
+    ) -> Option<String> {
+        self.sender_attribution(recipient_agent_id, collisions)?
+            .reply_target()
+            .map(str::to_owned)
+    }
+}
+
+/// [`Message::reply_target`] against the catalog's own durable collision metadata.
+///
+/// This is the accessor a reply command should call: it never reads `from`, so an address that has
+/// since been released and reused cannot capture the reply.
+///
+/// `Err` means the collision record exists but could not be read as this schema, so no legacy
+/// endpoint can be attributed at all; `Ok(None)` is the ordinary refusal (no sender, or a
+/// contested version-1 endpoint this row does not own).
+pub fn reply_target_in(
+    catalog_root: &Path,
+    message: &Message,
+    recipient_agent_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let collisions = crate::catalog_migrate::load_legacy_id_collisions(catalog_root)?;
+    Ok(message.reply_target(recipient_agent_id, &collisions))
 }
 
 /// Current unix time in milliseconds.
@@ -202,7 +497,9 @@ pub fn is_message_filename(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
-/// Render a message file's contents (frontmatter + body).
+/// Render a message file's contents (frontmatter + body) for a sender that has no separate
+/// immutable ID to declare — a service principal or an external requester, whose canonical
+/// endpoint IS the route in `from`.
 pub fn render_message(
     from: &str,
     subject: Option<&str>,
@@ -210,11 +507,28 @@ pub fn render_message(
     tags: &[String],
     body: &str,
 ) -> String {
-    render_message_with_idempotency(from, subject, in_reply_to, tags, body, None)
+    render_message_with_idempotency(from, None, subject, in_reply_to, tags, body, None)
 }
 
+/// Render a message whose sender IS an Agent, so the route goes in `from:` and the authoritative
+/// immutable ID goes in `from-id:`. A reader must key on `from-id`, never on the mutable route.
+pub fn render_agent_message(
+    from_address: &str,
+    from_id: Option<&str>,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+) -> String {
+    render_message_with_idempotency(from_address, from_id, subject, in_reply_to, tags, body, None)
+}
+
+/// `from_id` is written as a separate `from-id:` line only by the version-2 writer. Keeping it out
+/// of the version-1 shape is what makes the reader-first rollout byte-identical: an older reader
+/// sees exactly the frontmatter it always saw.
 fn render_message_with_idempotency(
     from: &str,
+    from_id: Option<&str>,
     subject: Option<&str>,
     in_reply_to: Option<&str>,
     tags: &[String],
@@ -223,6 +537,9 @@ fn render_message_with_idempotency(
 ) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("from: {from}\n"));
+    if let Some(id) = from_id {
+        s.push_str(&format!("from-id: {id}\n"));
+    }
     if let Some(subj) = subject {
         s.push_str(&format!("subject: {subj}\n"));
     }
@@ -254,6 +571,7 @@ pub(crate) fn parse_message(filename: &str, contents: &str) -> Message {
         filename: filename.to_string(),
         ts_ms,
         from: None,
+        from_id: None,
         subject: None,
         in_reply_to: None,
         tags: Vec::new(),
@@ -283,6 +601,7 @@ pub(crate) fn parse_message(filename: &str, contents: &str) -> Message {
             let v = v.trim();
             match k.trim() {
                 "from" => msg.from = Some(v.to_string()),
+                "from-id" => msg.from_id = Some(v.to_string()),
                 "subject" => msg.subject = Some(v.to_string()),
                 "in-reply-to" => msg.in_reply_to = Some(v.to_string()),
                 "tags" => {
@@ -322,8 +641,27 @@ pub fn send_to_inbox(
     tags: &[String],
     body: &str,
 ) -> anyhow::Result<String> {
+    send_to_inbox_from_agent(inbox_dir, from, None, subject, in_reply_to, tags, body)
+}
+
+/// [`send_to_inbox`] for a sender that owns an immutable agent ID, which is written as `from-id:`.
+///
+/// The ledger-less delivery paths (an external mailbox recipient, or an external sender) must
+/// still carry the authoritative sender identity: a reply keys on `from-id`, and for any subject
+/// whose ID differs from its address — every subject created after identity migration — the
+/// mutable route alone cannot resolve back to the sender.
+#[allow(clippy::too_many_arguments)]
+pub fn send_to_inbox_from_agent(
+    inbox_dir: &Path,
+    from: &str,
+    from_id: Option<&str>,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+) -> anyhow::Result<String> {
     fs::create_dir_all(inbox_dir)?;
-    let contents = render_message(from, subject, in_reply_to, tags, body);
+    let contents = render_agent_message(from, from_id, subject, in_reply_to, tags, body);
     // This deliberately cannot match `is_message_filename`, so a concurrent scan ignores it.
     let tmp = inbox_dir.join(tmp_name());
     if let Err(error) = fs::write(&tmp, &contents) {
@@ -718,10 +1056,7 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(name.ends_with(".json"), "unexpected sent record entry");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading sent record {}", entry.path().display()))?;
-        anyhow::ensure!(
-            record.version == SENT_VERSION,
-            "unsupported sent record version"
-        );
+        validate_sent_record(&record)?;
         anyhow::ensure!(
             sent_record_name(&record.filename) == name,
             "sent record filename does not match its payload"
@@ -754,10 +1089,7 @@ fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(is_sha256(digest), "invalid pending sent record digest");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading pending sent record {}", entry.path().display()))?;
-        anyhow::ensure!(
-            record.version == SENT_VERSION,
-            "unsupported sent record version"
-        );
+        validate_sent_record(&record)?;
         anyhow::ensure!(
             is_message_filename(&record.filename),
             "invalid sent record filename"
@@ -908,10 +1240,10 @@ impl ExternalInbox {
     }
 }
 
-/// Resolve an inbox by stable identity. A proven catalog-less root retains the legacy flat bus;
-/// inside a catalog an absent identity always fails closed.
-pub fn resolve_inbox(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    resolve_list_box(root, id, host, false, false)
+/// Resolve an inbox by exact immutable agent ID. A proven catalog-less root retains the legacy
+/// flat bus; inside a catalog an unknown ID always fails closed.
+pub fn resolve_inbox(root: &Path, agent_id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, agent_id, host, false, false)
 }
 
 /// Resolve a normal declared inbox or one exact eval-owned external requester capability.
@@ -934,23 +1266,36 @@ pub fn resolve_inbox_with_external(
     }
 }
 
-/// Archive companion to [`resolve_inbox`], with the same stable-ID and catalog-less boundaries.
-pub fn resolve_archive(root: &Path, id: &str, host: &str) -> anyhow::Result<PathBuf> {
-    resolve_list_box(root, id, host, true, false)
+/// Archive companion to [`resolve_inbox`], with the same exact-ID and catalog-less boundaries.
+pub fn resolve_archive(root: &Path, agent_id: &str, host: &str) -> anyhow::Result<PathBuf> {
+    resolve_list_box(root, agent_id, host, true, false)
 }
 
-/// Resolve one box for `message ls`.
-///
-/// The permissive flat layout is automatic only when discovery proves that `root` is catalog-less.
-/// Once any valid or malformed declaration makes it a catalog, an absent identity is an error.
-/// `orphan` is the explicit recovery path for inspecting a raw flat box inside such a root.
+/// Resolve one box for `message ls` by exact immutable agent ID.
 pub fn resolve_list_box(
     root: &Path,
-    id: &str,
+    agent_id: &str,
     host: &str,
     archive: bool,
     orphan: bool,
 ) -> anyhow::Result<PathBuf> {
+    select_list_box(root, &AgentSelector::id(agent_id), host, archive, orphan)
+}
+
+/// Resolve one box for `message ls`.
+///
+/// The permissive flat layout is automatic only when discovery proves that `root` is catalog-less:
+/// a DING or eval seat under a catalog-less `ST_ROOT` names its box by the literal selector.
+/// Once any valid or malformed declaration makes it a catalog, an absent subject is an error.
+/// `orphan` is the explicit recovery path for inspecting a raw flat box inside such a root.
+pub fn select_list_box(
+    root: &Path,
+    selector: &AgentSelector,
+    host: &str,
+    archive: bool,
+    orphan: bool,
+) -> anyhow::Result<PathBuf> {
+    let id = selector.as_input();
     let flat = || {
         root.join(id)
             .join(if archive { "archive" } else { "inbox" })
@@ -959,7 +1304,7 @@ pub fn resolve_list_box(
         return Ok(flat());
     }
     if apply_incomplete(root) {
-        return resolve_agent_dir(root, id, host)?
+        return select_agent_dir(root, selector, host)?
             .map(|agent_dir| {
                 if archive {
                     archive_dir(&agent_dir)
@@ -972,17 +1317,23 @@ pub fn resolve_list_box(
             });
     }
     let discovered = crate::discover(root);
-    if let Some(agent_dir) = discovered
-        .specs
-        .iter()
-        .find(|spec| spec.bus_id(host) == id || spec.identity == id)
-        .and_then(|spec| spec.path.parent())
-    {
-        return Ok(if archive {
-            archive_dir(agent_dir)
-        } else {
-            inbox_dir(agent_dir)
-        });
+    let book = crate::spec::address_book(&discovered.specs, host)?;
+    match book.resolve(selector) {
+        Ok(subject) => {
+            let agent_dir = discovered
+                .specs
+                .iter()
+                .find(|spec| spec.agent_id(host) == subject.id.as_str())
+                .and_then(|spec| spec.path.parent())
+                .context("resolved subject has no identity directory")?;
+            return Ok(if archive {
+                archive_dir(agent_dir)
+            } else {
+                inbox_dir(agent_dir)
+            });
+        }
+        Err(ResolveError::UnknownId { .. } | ResolveError::UnknownAddress { .. }) => {}
+        Err(ambiguous) => return Err(anyhow::Error::new(ambiguous)),
     }
 
     if discovered.specs.is_empty() && discovered.errors.is_empty() {
@@ -991,34 +1342,73 @@ pub fn resolve_list_box(
     anyhow::bail!("no agent '{id}' found in catalog {}", root.display())
 }
 
-/// Resolve a recipient (a bus id `<host>.<id>` or a bare identity) to its agent folder in the
-/// catalog, via content discovery. Returns `None` if no agent matches.
+/// Resolve an exact immutable agent ID to its agent folder. Returns `None` if no subject carries
+/// that ID. A retired subject keeps its ID and stays reachable here.
 pub fn resolve_agent_dir(
     catalog_root: &Path,
-    recipient: &str,
+    agent_id: &str,
     this_host: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    Ok(resolve_agent_handle(catalog_root, recipient, this_host)?.map(|agent| agent.path))
+    select_agent_dir(catalog_root, &AgentSelector::id(agent_id), this_host)
+}
+
+/// [`resolve_agent_dir`] for an already typed selector: an exact immutable ID never falls through
+/// to address lookup, and an ordinary human reference never reaches the ID namespace.
+pub fn select_agent_dir(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    Ok(resolve_agent_handle(catalog_root, selector, this_host)?.map(|agent| agent.path))
 }
 
 pub fn with_resolved_agent_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    agent_id: &str,
     this_host: &str,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    with_resolved_state_dir(catalog_root, identity, this_host, &[], true, operation)
+    with_resolved_state_dir(catalog_root, agent_id, this_host, &[], true, operation)
 }
 
+pub fn with_selected_agent_dir<T>(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_selected_state_dir(catalog_root, selector, this_host, &[], true, operation)
+}
+
+/// Run an operation against one subject's durable state directory, keyed by exact agent ID.
 pub fn with_resolved_state_dir<T>(
     catalog_root: &Path,
-    identity: &str,
+    agent_id: &str,
     this_host: &str,
     components: &[&str],
     create: bool,
     operation: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    match resolve_agent_handle(catalog_root, identity, this_host)? {
+    with_selected_state_dir(
+        catalog_root,
+        &AgentSelector::id(agent_id),
+        this_host,
+        components,
+        create,
+        operation,
+    )
+}
+
+pub fn with_selected_state_dir<T>(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+    components: &[&str],
+    create: bool,
+    operation: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let identity = selector.as_input();
+    match resolve_agent_handle(catalog_root, selector, this_host)? {
         Some(agent) => {
             test_capability_checkpoint();
             let path = match agent.capability.as_ref() {
@@ -1065,11 +1455,26 @@ pub fn with_resolved_state_dir<T>(
 /// operation outside the catalog after recipient resolution.
 pub(crate) fn with_resolved_message_boxes<T>(
     catalog_root: &Path,
-    identity: &str,
+    agent_id: &str,
     this_host: &str,
     operation: impl FnOnce(&Path, &Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let agent = resolve_agent_handle(catalog_root, identity, this_host)?.with_context(|| {
+    with_selected_message_boxes(
+        catalog_root,
+        &AgentSelector::id(agent_id),
+        this_host,
+        operation,
+    )
+}
+
+pub(crate) fn with_selected_message_boxes<T>(
+    catalog_root: &Path,
+    selector: &AgentSelector,
+    this_host: &str,
+    operation: impl FnOnce(&Path, &Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let identity = selector.as_input();
+    let agent = resolve_agent_handle(catalog_root, selector, this_host)?.with_context(|| {
         format!(
             "no agent '{identity}' found in catalog {}",
             catalog_root.display()
@@ -1089,26 +1494,47 @@ pub(crate) fn with_resolved_message_boxes<T>(
     )
 }
 
+/// Resolve one typed selector against a fenced snapshot of the catalog's address book.
+///
+/// Ambiguity is an error, not an absent subject: two subjects answering one human reference is a
+/// catalog the caller must not silently pick from (root `spec.md`, fail-closed resolution).
 fn resolve_agent_handle(
     catalog_root: &Path,
-    recipient: &str,
+    selector: &AgentSelector,
     this_host: &str,
 ) -> anyhow::Result<Option<AddressableAgent>> {
     for _ in 0..3 {
         let before = address_fence(catalog_root)?;
-        let mut candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?
-            .into_iter()
-            .filter(|candidate| candidate.bus_id == recipient || candidate.identity == recipient)
-            .collect::<Vec<_>>();
+        let candidates = addressable_agent_dirs(catalog_root, this_host, before.1.as_ref())?;
         let after = address_fence(catalog_root)?;
         if before != after {
             continue;
         }
-        candidates.sort_by(|left, right| left.path.cmp(&right.path));
-        candidates.dedup_by(|left, right| left.path == right.path);
-        return Ok((candidates.len() == 1).then(|| candidates.remove(0)));
+        let book = AddressBook::new(
+            candidates
+                .iter()
+                .map(|candidate| candidate.subject.clone())
+                .collect(),
+        );
+        let id = match book.resolve(selector) {
+            Ok(subject) => subject.id.clone(),
+            Err(ResolveError::UnknownId { .. } | ResolveError::UnknownAddress { .. }) => {
+                return Ok(None);
+            }
+            Err(ambiguous) => return Err(anyhow::Error::new(ambiguous)),
+        };
+        let mut matched = candidates
+            .into_iter()
+            .filter(|candidate| candidate.subject.id == id)
+            .collect::<Vec<_>>();
+        matched.sort_by(|left, right| left.path.cmp(&right.path));
+        matched.dedup_by(|left, right| left.path == right.path);
+        return Ok((matched.len() == 1).then(|| matched.remove(0)));
     }
-    anyhow::bail!("catalog address book changed repeatedly while resolving {recipient:?}")
+    anyhow::bail!(
+        "catalog address book changed repeatedly while resolving {:?}",
+        selector.as_input()
+    )
 }
 
 fn address_fence(
@@ -1154,10 +1580,22 @@ fn test_address_fence_checkpoint() {}
 
 #[derive(Debug)]
 struct AddressableAgent {
-    bus_id: String,
-    identity: String,
+    /// The subject as the address book sees it: immutable ID, host, effective address, routability.
+    subject: Subject,
     path: PathBuf,
     capability: Option<File>,
+}
+
+impl AddressableAgent {
+    /// The immutable agent ID — the durable endpoint, ownership key, and automation selector.
+    fn agent_id(&self) -> &str {
+        self.subject.id.as_str()
+    }
+
+    /// The current human route, or `None` for a proved non-routable subject.
+    fn bus_address(&self) -> Option<String> {
+        self.subject.bus_address()
+    }
 }
 
 fn addressable_agent_dirs(
@@ -1177,8 +1615,7 @@ fn addressable_agent_dirs(
                     .to_path_buf();
                 let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
                 Ok(AddressableAgent {
-                    bus_id: spec.bus_id(this_host),
-                    identity: spec.identity,
+                    subject: spec.subject(this_host)?,
                     path,
                     capability: Some(capability),
                 })
@@ -1208,17 +1645,29 @@ fn addressable_agent_dirs(
             let path = identity.path();
             let capability = crate::catalog_transaction::open_dir_beneath(catalog_root, &path)?;
             let retained = crate::catalog_transaction::retained_dir_path(&capability)?;
-            let current_spec = marker_spec_matches(&retained, &key)?;
+            let declared = marker_subject(&retained, &key)?;
             let retained_state =
                 transition.original_agents.contains(&key) && marker_state_exists(&retained)?;
-            if current_spec || retained_state {
-                result.push(AddressableAgent {
-                    bus_id: format!("{}.{}", key.host, key.identity),
-                    identity: key.identity,
-                    path,
-                    capability: Some(capability),
-                });
-            }
+            // A current declaration is authoritative even mid-transition: it is the only place the
+            // subject's explicit `id` and `address` exist, and resolving a migrated subject by the
+            // positional key alone would make it unreachable exactly while an apply is incomplete.
+            // A retained-state-only entry has no readable declaration, so the positional key is
+            // all there is — which is also the identity migration would have frozen for it.
+            let subject = match (declared, retained_state) {
+                (Some(subject), _) => subject,
+                (None, true) => Subject {
+                    id: AgentId::frozen_legacy(&key.host, &key.identity)?,
+                    host: key.host,
+                    effective_address: key.identity,
+                    routable: true,
+                },
+                (None, false) => continue,
+            };
+            result.push(AddressableAgent {
+                subject,
+                path,
+                capability: Some(capability),
+            });
         }
     }
     Ok(result)
@@ -1266,14 +1715,19 @@ fn safe_entry_name(entry: &fs::DirEntry, label: &str) -> anyhow::Result<String> 
     Ok(value)
 }
 
-fn marker_spec_matches(
+/// The subject a current canonical declaration at this key declares, if any.
+///
+/// `None` means no declaration at that path currently claims this `<host>/<identity>` slot; the
+/// caller then falls back to retained state. Returning the SUBJECT rather than a bool is what
+/// keeps a migrated agent addressable by its explicit `id` while an apply is incomplete.
+fn marker_subject(
     agent_dir: &Path,
     key: &crate::catalog_transaction::AgentKey,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<Subject>> {
     let path = agent_dir.join("agent.kdl");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     anyhow::ensure!(
@@ -1282,9 +1736,27 @@ fn marker_spec_matches(
         path.display()
     );
     let declared = crate::discovery::parse_declared(&path)?;
-    Ok(declared.len() == 1
-        && declared[0].host.as_deref() == Some(&key.host)
-        && declared[0].identity.as_deref() == Some(key.identity.as_str()))
+    if declared.len() != 1
+        || declared[0].host.as_deref() != Some(&key.host)
+        || declared[0].identity.as_deref() != Some(key.identity.as_str())
+    {
+        return Ok(None);
+    }
+    let declared = &declared[0];
+    Ok(Some(Subject {
+        id: match declared.id.as_deref() {
+            Some(id) => AgentId::parse(id)?,
+            None => AgentId::frozen_legacy(&key.host, &key.identity)?,
+        },
+        host: key.host.clone(),
+        effective_address: declared
+            .address
+            .clone()
+            .unwrap_or_else(|| key.identity.clone()),
+        // Mid-transition addressability exists to keep the STATE plane reachable while the
+        // declaration plane is fenced, so it does not re-derive routability from desired state.
+        routable: true,
+    }))
 }
 
 fn marker_state_exists(agent_dir: &Path) -> anyhow::Result<bool> {
@@ -1437,25 +1909,46 @@ pub fn collect_thread(catalog_root: &Path, filename: &str) -> anyhow::Result<Vec
     Ok(out)
 }
 
+/// One resolved delivery target, with the endpoint typing a durable record must persist.
 enum DeliveryEndpoint {
     Agent(AddressableAgent),
+    /// An eval-owned external requester mailbox. Its canonical endpoint is its route; it has no
+    /// agent ID and never gets one.
     External {
-        bus_id: String,
+        address: String,
         inbox: PathBuf,
         archive: PathBuf,
     },
+    /// A legacy flat box under a proven catalog-less root, named by the literal selector.
     Flat {
-        bus_id: String,
+        address: String,
         inbox: PathBuf,
         archive: PathBuf,
     },
 }
 
 impl DeliveryEndpoint {
-    fn bus_id(&self) -> &str {
+    /// The canonical value a durable record persists: an immutable agent ID for an Agent, the
+    /// canonical address for a typed non-Agent endpoint.
+    fn endpoint(&self) -> &str {
         match self {
-            Self::Agent(agent) => &agent.bus_id,
-            Self::External { bus_id, .. } | Self::Flat { bus_id, .. } => bus_id,
+            Self::Agent(agent) => agent.agent_id(),
+            Self::External { address, .. } | Self::Flat { address, .. } => address,
+        }
+    }
+
+    fn kind(&self) -> EndpointKind {
+        match self {
+            Self::Agent(_) => EndpointKind::Agent,
+            Self::External { .. } | Self::Flat { .. } => EndpointKind::External,
+        }
+    }
+
+    /// The publication-time bus-address snapshot, for an Agent endpoint that is routable now.
+    fn address_snapshot(&self) -> Option<String> {
+        match self {
+            Self::Agent(agent) => agent.bus_address(),
+            Self::External { .. } | Self::Flat { .. } => None,
         }
     }
 
@@ -1485,29 +1978,35 @@ fn catalogless(root: &Path) -> bool {
         && discovered.errors.is_empty()
 }
 
+/// Resolve a recipient named by an ordinary human reference.
+///
+/// `--to` is a route by design, so this is the one place inside the message layer that still
+/// accepts free-form human input — and it resolves through the address book to an immutable ID
+/// before anything durable is written.
 fn resolve_delivery_endpoint(
     root: &Path,
-    recipient: &str,
+    recipient: &AgentSelector,
     host: &str,
     external: Option<&ExternalInbox>,
 ) -> anyhow::Result<DeliveryEndpoint> {
     if let Some(agent) = resolve_agent_handle(root, recipient, host)? {
         return Ok(DeliveryEndpoint::Agent(agent));
     }
+    let recipient = recipient.as_input();
     if let Some(external) = external
         && external.root == root
         && external.identity == recipient
         && external.inbox.is_dir()
     {
         return Ok(DeliveryEndpoint::External {
-            bus_id: external.identity.clone(),
+            address: external.identity.clone(),
             inbox: external.inbox.clone(),
             archive: sibling_archive_dir(&external.inbox),
         });
     }
     if catalogless(root) {
         return Ok(DeliveryEndpoint::Flat {
-            bus_id: recipient.to_string(),
+            address: recipient.to_string(),
             inbox: root.join(recipient).join("inbox"),
             archive: root.join(recipient).join("archive"),
         });
@@ -1515,6 +2014,31 @@ fn resolve_delivery_endpoint(
     anyhow::bail!("no agent '{recipient}' found in catalog {}", root.display())
 }
 
+/// The acting sender, as a durable record must persist it.
+struct SenderEndpoint {
+    /// Immutable agent ID, or the canonical address of a typed non-Agent sender.
+    endpoint: String,
+    kind: EndpointKind,
+    /// Publication-time bus address, for a routable Agent sender.
+    address: Option<String>,
+}
+
+impl SenderEndpoint {
+    /// What the rendered `from:` frontmatter line says: an Agent's human route when it has one,
+    /// otherwise the canonical endpoint itself.
+    fn rendered_from(&self) -> &str {
+        self.address.as_deref().unwrap_or(&self.endpoint)
+    }
+
+    /// The `from-id:` line, written only by the version-2 writer and only for an Agent.
+    fn rendered_from_id(&self) -> Option<&str> {
+        (WRITE_MESSAGE_RECORD_VERSION_2 && self.kind == EndpointKind::Agent)
+            .then_some(self.endpoint.as_str())
+    }
+}
+
+/// Send to `recipient`, an ordinary human reference, on behalf of the exact immutable agent ID
+/// `from`.
 #[allow(clippy::too_many_arguments)]
 pub fn send_to_resolved_inbox(
     catalog_root: &Path,
@@ -1528,11 +2052,53 @@ pub fn send_to_resolved_inbox(
     idempotency_key: Option<&str>,
     external: Option<&ExternalInbox>,
 ) -> anyhow::Result<String> {
+    send_to_resolved_inbox_from(
+        catalog_root,
+        &AgentSelector::address(recipient),
+        this_host,
+        &AgentSelector::id(from),
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        idempotency_key,
+        external,
+    )
+}
+
+/// [`send_to_resolved_inbox`] where both endpoints are still typed selectors.
+///
+/// `recipient` is typed because a reply must address the original sender's *immutable ID* — an
+/// ordinary address lookup would deliver to whoever holds those route bytes now.
+///
+/// Both endpoints are resolved HERE, and the recipient is resolved first. That ordering is the
+/// `R27` fencing contract: the recipient lookup is the one that must observe a catalog generation
+/// change and refuse a stale recipient. Resolving the acting sender earlier — at the CLI boundary,
+/// say — moves the first fenced read off the recipient and lets an unrelated `--as` failure
+/// short-circuit the send before the fence is ever crossed.
+#[allow(clippy::too_many_arguments)]
+pub fn send_to_resolved_inbox_from(
+    catalog_root: &Path,
+    recipient: &AgentSelector,
+    this_host: &str,
+    from: &AgentSelector,
+    subject: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+    body: &str,
+    idempotency_key: Option<&str>,
+    external: Option<&ExternalInbox>,
+) -> anyhow::Result<String> {
     if let Some(key) = idempotency_key {
         validate_idempotency_key(key)?;
     }
+    // Unpinned: `message send` takes no `--host` for the recipient, so a fully qualified
+    // `<host>.<address>` must reach a subject on ANY admitted logical host, exactly as the
+    // positional path did. Pinning the sending host here would make every cross-host qualified
+    // recipient unresolvable.
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
     let sender = resolve_agent_handle(catalog_root, from, this_host)?;
+    let from = from.as_input();
     let external_sender =
         external.is_some_and(|external| external.root == catalog_root && external.identity == from);
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
@@ -1540,17 +2106,35 @@ pub fn send_to_resolved_inbox(
             idempotency_key.is_none(),
             "external requester messages do not own an ordinary sent-message index"
         );
-        let canonical_from = sender
-            .as_ref()
-            .map(|agent| agent.bus_id.as_str())
-            .unwrap_or(from);
         anyhow::ensure!(
             sender.is_some() || external_sender,
             "no agent '{from}' found in catalog {}",
             catalog_root.display()
         );
+        let canonical_from = match sender.as_ref() {
+            Some(agent) => SenderEndpoint {
+                endpoint: agent.agent_id().to_owned(),
+                kind: EndpointKind::Agent,
+                address: agent.bus_address(),
+            },
+            None => SenderEndpoint {
+                endpoint: from.to_owned(),
+                kind: EndpointKind::External,
+                address: None,
+            },
+        };
         let (inbox, _) = recipient.boxes()?;
-        return send_to_inbox(&inbox, canonical_from, subject, in_reply_to, tags, body);
+        // This path owns no sender ledger, but it must still persist the same immutable sender
+        // identity the ledger path renders: a reply keys on `from-id`, never on the route.
+        return send_to_inbox_from_agent(
+            &inbox,
+            canonical_from.rendered_from(),
+            canonical_from.rendered_from_id(),
+            subject,
+            in_reply_to,
+            tags,
+            body,
+        );
     }
     let (canonical_from, sender_root) = match sender.as_ref() {
         Some(agent) => {
@@ -1558,9 +2142,23 @@ pub fn send_to_resolved_inbox(
                 Some(capability) => crate::catalog_transaction::retained_dir_path(capability)?,
                 None => agent.path.clone(),
             };
-            (agent.bus_id.clone(), path)
+            (
+                SenderEndpoint {
+                    endpoint: agent.agent_id().to_owned(),
+                    kind: EndpointKind::Agent,
+                    address: agent.bus_address(),
+                },
+                path,
+            )
         }
-        None if catalogless(catalog_root) => (from.to_string(), catalog_root.join(from)),
+        None if catalogless(catalog_root) => (
+            SenderEndpoint {
+                endpoint: from.to_string(),
+                kind: EndpointKind::External,
+                address: None,
+            },
+            catalog_root.join(from),
+        ),
         None => anyhow::bail!(
             "no agent '{from}' found in catalog {}",
             catalog_root.display()
@@ -1588,7 +2186,7 @@ fn send_with_ledger(
     this_host: &str,
     external: Option<&ExternalInbox>,
     sender_root: &Path,
-    from: &str,
+    from: &SenderEndpoint,
     recipient: DeliveryEndpoint,
     subject: Option<&str>,
     in_reply_to: Option<&str>,
@@ -1604,15 +2202,25 @@ fn send_with_ledger(
     let recovered = recover_active(catalog_root, this_host, external, &root, &mut head)?;
 
     let filename = new_filename();
-    let rendered_message =
-        render_message_with_idempotency(from, subject, in_reply_to, tags, body, idempotency_key);
+    let rendered_message = render_message_with_idempotency(
+        from.rendered_from(),
+        from.rendered_from_id(),
+        subject,
+        in_reply_to,
+        tags,
+        body,
+        idempotency_key,
+    );
     let parsed = parse_message(&filename, &rendered_message);
+    // Every version decision in this module funnels through SENT_RECORD_WRITE_VERSION; the typed
+    // endpoint and snapshot fields exist exactly when the record claims version 2.
+    let version_2 = SENT_RECORD_WRITE_VERSION == MESSAGE_RECORD_VERSION_2;
     let candidate = SentRecord {
-        version: SENT_VERSION,
+        version: SENT_RECORD_WRITE_VERSION,
         filename,
         ts: parsed.ts_ms,
-        from: from.to_string(),
-        to: recipient.bus_id().to_string(),
+        from: from.endpoint.clone(),
+        to: recipient.endpoint().to_string(),
         subject: parsed.subject,
         in_reply_to: parsed.in_reply_to,
         tags: parsed.tags,
@@ -1620,6 +2228,10 @@ fn send_with_ledger(
         idempotency_key: parsed.idempotency_key,
         body: parsed.body,
         rendered_message,
+        from_address: version_2.then(|| from.address.clone()).flatten(),
+        to_address: version_2.then(|| recipient.address_snapshot()).flatten(),
+        from_kind: version_2.then_some(from.kind),
+        to_kind: version_2.then_some(recipient.kind()),
     };
     if let Some(existing) = keyed_record(&root, &candidate)? {
         return Ok(existing.filename);
@@ -1717,10 +2329,7 @@ fn validate_sent_tip(root: &Path, head: &SentHead) -> anyhow::Result<()> {
         .join(SENT_MESSAGES)
         .join(sent_record_name(&node.filename));
     let row: SentRecord = serde_json::from_slice(&fs::read(row_path)?)?;
-    anyhow::ensure!(
-        row.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record(&row)?;
     anyhow::ensure!(
         row.filename == node.filename,
         "sent record filename does not match payload"
@@ -1788,9 +2397,35 @@ fn recover_active(
         (Some(_), []) => anyhow::bail!("active sent intent has no recoverable pending record"),
         _ => unreachable!(),
     };
-    let recipient = resolve_delivery_endpoint(catalog_root, &record.to, this_host, external)?;
+    // A persisted endpoint is canonical, never a route, so recovery re-resolves it by exact ID
+    // rather than re-running address lookup: an address change between the crash and the retry
+    // must not redirect the interrupted delivery.
+    //
+    // A version-1 endpoint is only an ID by construction while its legacy bytes were never
+    // reassigned. If migration contested them, this row does not own them — a sender ledger row is
+    // owned by its SENDER — so the bytes denote either the archived subject that wrote the intent
+    // or the live subject that kept them. Delivering to the keeper would hand a stranger a message
+    // it was never sent, so an unattributed endpoint refuses instead (`MESSAGE-R04`).
+    let collisions = crate::catalog_migrate::load_legacy_id_collisions(catalog_root)
+        .context("read legacy-id collision metadata for an interrupted send")?;
+    let attribution = record
+        .recipient_endpoint(&record.from)
+        .attribute(&collisions);
+    let target = attribution.reply_target().with_context(|| {
+        format!(
+            "pending recipient '{}' is a legacy bus identity migration reassigned; \
+             this interrupted send cannot prove which subject it was addressed to",
+            record.to
+        )
+    })?;
+    let recipient = resolve_delivery_endpoint(
+        catalog_root,
+        &AgentSelector::id(target),
+        this_host,
+        external,
+    )?;
     anyhow::ensure!(
-        recipient.bus_id() == record.to,
+        recipient.endpoint() == target,
         "pending recipient identity changed"
     );
     deliver_record(&recipient, &record)?;
@@ -1870,10 +2505,7 @@ fn read_sent_record(root: &Path, filename: &str) -> anyhow::Result<SentRecord> {
     let path = root.join(SENT_MESSAGES).join(sent_record_name(filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("reading sent record {}", path.display()))?;
-    anyhow::ensure!(
-        record.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record(&record)?;
     anyhow::ensure!(
         record.filename == filename,
         "sent record filename does not match payload"
@@ -1981,10 +2613,7 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
         .join(SENT_MESSAGES)
         .join(sent_record_name(&receipt.filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(record_path)?)?;
-    anyhow::ensure!(
-        record.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record(&record)?;
     anyhow::ensure!(
         record.filename == receipt.filename,
         "sent key record filename mismatch"
@@ -2197,7 +2826,7 @@ pub fn archive_resolved_message(
         is_message_filename(filename),
         "invalid message filename {filename:?}"
     );
-    let agent = match resolve_agent_handle(catalog_root, identity, this_host)? {
+    let agent = match resolve_agent_handle(catalog_root, &AgentSelector::id(identity), this_host)? {
         Some(agent) => agent,
         None => {
             let discovered = crate::discover(catalog_root);
@@ -2517,8 +3146,16 @@ mod tests {
             "agent \"mix.sup\" {\n  identity \"mix.sup\"\n  name \"Shared Worker\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
         )
         .unwrap();
+        // Inside a catalog the box is reached by the subject's exact immutable ID.
         assert_eq!(
-            resolve_inbox(root, "mix.sup", "h").unwrap(),
+            resolve_inbox(root, "h.mix.sup", "h").unwrap(),
+            ad.join("resources").join("inbox")
+        );
+        // An exact-ID lookup never falls through to address lookup: the bare effective address
+        // `mix.sup` names this subject as a route, and that is deliberately not an ID.
+        assert!(resolve_inbox(root, "mix.sup", "h").is_err());
+        assert_eq!(
+            select_list_box(root, &AgentSelector::address("mix.sup"), "h", false, false).unwrap(),
             ad.join("resources").join("inbox")
         );
         assert!(resolve_inbox(root, "Shared Worker", "h").is_err());
@@ -2534,6 +3171,56 @@ mod tests {
             requester
         );
         assert!(resolve_inbox_with_external(root, "missing", "h", Some(&external)).is_err());
+    }
+
+    /// The external-mailbox path owns no sender ledger, but a reply keys on `from-id`: without it
+    /// the delivered row carries only the mutable route, and for a subject whose ID differs from
+    /// its address the reply cannot resolve at all.
+    #[test]
+    fn an_external_mailbox_delivery_carries_the_immutable_sender_id() {
+        const SENDER_ID: &str = "0199c0de-0000-7000-8000-00000000dead";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let directory = root.join("h").join("sender");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("agent.kdl"),
+            format!(
+                "agent \"sender\" {{\n  identity \"sender\"\n  id {SENDER_ID:?}\n  address \"renamed\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let external = ExternalInbox::provision(root, "requester").unwrap();
+
+        let filename = send_to_resolved_inbox_from(
+            root,
+            &AgentSelector::address("requester"),
+            "h",
+            &AgentSelector::id(SENDER_ID),
+            Some("done"),
+            None,
+            &[],
+            "body",
+            None,
+            Some(&external),
+        )
+        .unwrap();
+
+        let delivered = fs::read_to_string(external.inbox.join(&filename)).unwrap();
+        let parsed = parse_message(&filename, &delivered);
+        assert_eq!(parsed.from.as_deref(), Some("h.renamed"));
+        assert_eq!(
+            parsed.from_id.as_deref(),
+            Some(SENDER_ID),
+            "the external mailbox row must carry the immutable sender ID: {delivered}"
+        );
+        assert_eq!(
+            reply_target_in(root, &parsed, "requester")
+                .unwrap()
+                .as_deref(),
+            Some(SENDER_ID),
+            "a reply from that mailbox must address the sender's immutable ID"
+        );
     }
 
     fn addressable_catalog(root: &Path) -> PathBuf {
@@ -2562,12 +3249,59 @@ mod tests {
         let agents = addressable_agent_dirs(root.path(), "host", Some(&transition)).unwrap();
 
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].bus_id, "host.worker");
+        assert_eq!(agents[0].agent_id(), "host.worker");
+        assert_eq!(agents[0].bus_address().as_deref(), Some("host.worker"));
         assert_eq!(
             fs::read(&legacy).unwrap(),
             b"stale legacy staging bytes",
             "address resolution must not clean another process's file"
         );
+    }
+
+    /// An incomplete apply fences the DECLARATION plane, not the state plane. A migrated subject
+    /// must therefore stay reachable by its explicit `id` while the marker is up — deriving the
+    /// subject from the positional `<host>/<identity>` key alone made every migrated agent
+    /// unaddressable exactly when its state was still supposed to be writable.
+    #[test]
+    fn transition_addressability_honours_a_declared_id_and_address() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/host/worker");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("agent.kdl"),
+            "agent \"worker\" { identity \"worker\"; id \"worker-uuid\"; address \"chat\"; host \"host\"; command \"true\" }\n",
+        )
+        .unwrap();
+        let transition = crate::catalog_transaction::CatalogTransition {
+            original_agents: BTreeSet::new(),
+        };
+
+        let agents = addressable_agent_dirs(root.path(), "host", Some(&transition)).unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id(), "worker-uuid");
+        assert_eq!(agents[0].bus_address().as_deref(), Some("host.chat"));
+    }
+
+    /// With no readable declaration, retained state is all there is — and the positional key is
+    /// exactly the identity migration would have frozen for that subject.
+    #[test]
+    fn transition_addressability_falls_back_to_the_positional_key_for_retained_state() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/host/worker");
+        fs::create_dir_all(agent.join("resources")).unwrap();
+        let key = crate::catalog_transaction::AgentKey {
+            host: "host".to_owned(),
+            identity: "worker".to_owned(),
+        };
+        let transition = crate::catalog_transaction::CatalogTransition {
+            original_agents: BTreeSet::from([key]),
+        };
+
+        let agents = addressable_agent_dirs(root.path(), "host", Some(&transition)).unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id(), "host.worker");
     }
 
     #[cfg(unix)]
@@ -2622,5 +3356,381 @@ mod tests {
                 "accepted unsafe external identity {identity:?}"
             );
         }
+    }
+
+    /// A minimal committed record. Version-1 shaped; the version-2 tests widen it explicitly.
+    fn record(from: &str, to: &str) -> SentRecord {
+        SentRecord {
+            version: MESSAGE_RECORD_VERSION_1,
+            filename: "1785000000000-abcdef.md".to_owned(),
+            ts: 1_785_000_000_000,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            subject: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            body: "hello\n".to_owned(),
+            rendered_message: "---\nfrom: h.sender\n---\nhello\n".to_owned(),
+            from_address: None,
+            to_address: None,
+            from_kind: None,
+            to_kind: None,
+        }
+    }
+
+    /// A version-2 Agent record keeps IDs in `from`/`to` and addresses only as snapshots, so an
+    /// address change can never rewrite history or retarget a reply.
+    #[test]
+    fn a_version_2_agent_record_round_trips_its_id_and_address_snapshot() {
+        let candidate = SentRecord {
+            version: MESSAGE_RECORD_VERSION_2,
+            from_address: Some("dev3.verifier".to_owned()),
+            to_address: Some("dev4.chat".to_owned()),
+            from_kind: Some(EndpointKind::Agent),
+            to_kind: Some(EndpointKind::Agent),
+            ..record(
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+                "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3",
+            )
+        };
+        validate_sent_record(&candidate).expect("a complete version-2 record is readable");
+
+        let json = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["from"], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        assert_eq!(json["fromAddress"], "dev3.verifier");
+        assert_eq!(json["toAddress"], "dev4.chat");
+        assert_eq!(json["toKind"], "agent");
+        assert_eq!(
+            serde_json::from_value::<SentRecord>(json).unwrap(),
+            candidate
+        );
+
+        // The snapshot is display-only: it reaches the wire row but is never the row's `to`.
+        let row = candidate.row(false);
+        assert_eq!(row.to, "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3");
+        assert_eq!(row.to_address.as_deref(), Some("dev4.chat"));
+        assert_eq!(row.to_kind, Some(EndpointKind::Agent));
+    }
+
+    /// A principal endpoint keeps its canonical address in `to` and says so, so no reader can
+    /// mistake that address for an agent ID or hand it agent automation authority.
+    #[test]
+    fn a_typed_non_agent_endpoint_persists_its_kind_and_canonical_address() {
+        let candidate = SentRecord {
+            version: MESSAGE_RECORD_VERSION_2,
+            from_kind: Some(EndpointKind::Agent),
+            to_kind: Some(EndpointKind::Principal),
+            from_address: Some("dev3.verifier".to_owned()),
+            ..record("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "dev3.billing")
+        };
+        validate_sent_record(&candidate).expect("a typed principal endpoint is readable");
+
+        let attribution = candidate
+            .recipient_endpoint("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+            .attribute(&NoLegacyCollisions);
+        assert_eq!(
+            attribution,
+            EndpointAttribution::TypedAddress {
+                kind: EndpointKind::Principal,
+                address: "dev3.billing".to_owned(),
+            }
+        );
+        assert_eq!(attribution.reply_target(), Some("dev3.billing"));
+        // Replyable on its own transport, but never an agent-automation key.
+        assert_eq!(attribution.agent_id(), None);
+    }
+
+    /// Reader-first: the same reader accepts both shapes. This is the invariant that lets version-2
+    /// writers be enabled later without a flag day.
+    #[test]
+    fn the_sent_reader_accepts_both_version_1_and_version_2_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join(SENT_MESSAGES);
+        fs::create_dir_all(&directory).unwrap();
+
+        let legacy = record("h.sender", "h.recipient");
+        let modern = SentRecord {
+            version: MESSAGE_RECORD_VERSION_2,
+            filename: "1785000000001-bcdefg.md".to_owned(),
+            from_kind: Some(EndpointKind::Agent),
+            to_kind: Some(EndpointKind::Agent),
+            to_address: Some("h.recipient".to_owned()),
+            ..record("h.sender", "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3")
+        };
+        for candidate in [&legacy, &modern] {
+            fs::write(
+                directory.join(sent_record_name(&candidate.filename)),
+                serde_json::to_vec(candidate).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let read = read_sent_records(&directory).expect("both versions are readable");
+        assert_eq!(read, vec![legacy, modern]);
+    }
+
+    /// A record that claims version 1 but carries version-2 endpoint fields has undecidable
+    /// endpoint meaning. That is corruption, not a tolerable older shape.
+    #[test]
+    fn a_version_1_record_carrying_version_2_fields_fails_closed() {
+        let mixed = SentRecord {
+            to_kind: Some(EndpointKind::Principal),
+            ..record("h.sender", "h.recipient")
+        };
+        assert!(validate_sent_record(&mixed).is_err());
+
+        let incomplete = SentRecord {
+            version: MESSAGE_RECORD_VERSION_2,
+            from_kind: Some(EndpointKind::Agent),
+            ..record("h.sender", "h.recipient")
+        };
+        assert!(validate_sent_record(&incomplete).is_err());
+    }
+
+    /// Every legacy endpoint in this index was reassigned at migration.
+    struct AllReassigned;
+
+    impl LegacyCollisionIndex for AllReassigned {
+        fn is_reassigned(&self, _legacy_bus_identity: &str) -> bool {
+            true
+        }
+    }
+
+    /// The `MESSAGE-R04` collision rule, both directions.
+    ///
+    /// `h.worker` was contested: a live subject kept those bytes and an archived subject was given
+    /// a UUID. A version-1 row in the ARCHIVED subject's own ledger says `from: h.worker`, and the
+    /// row's owner is that archived subject — so it must attribute to the archived subject's
+    /// migrated ID, never to the live keeper that now answers to those bytes.
+    #[test]
+    fn a_colliding_legacy_endpoint_attributes_only_to_the_rows_own_state_owner() {
+        let archived = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+        let row = record("h.worker", "h.peer");
+
+        assert_eq!(
+            row.sender_endpoint(archived).attribute(&AllReassigned),
+            EndpointAttribution::AgentId(archived.to_owned()),
+            "an archived sender's own row must not be reattributed to the live keeper"
+        );
+
+        // Without a recorded collision the bytes ARE the frozen ID, so nothing is reinterpreted.
+        assert_eq!(
+            row.sender_endpoint(archived).attribute(&NoLegacyCollisions),
+            EndpointAttribution::AgentId("h.worker".to_owned())
+        );
+    }
+
+    /// The recipient of a sender-owned row is not that row's state owner, so a colliding recipient
+    /// endpoint is unattributed: a historical address with no reply or automation authority.
+    #[test]
+    fn a_non_owner_colliding_endpoint_is_unattributed_and_carries_no_reply_authority() {
+        let owner = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+        let row = record("h.worker", "h.peer");
+
+        let attribution = row.recipient_endpoint(owner).attribute(&AllReassigned);
+        assert_eq!(
+            attribution,
+            EndpointAttribution::UnattributedLegacyAddress("h.peer".to_owned())
+        );
+        assert_eq!(
+            attribution.reply_target(),
+            None,
+            "addressing the live replacement would deliver to the wrong subject"
+        );
+        assert_eq!(attribution.agent_id(), None);
+        assert_eq!(attribution.display(), "h.peer (historical address)");
+        assert_ne!(
+            attribution.display(),
+            owner,
+            "the keeping subject's ID must never stand in for archived bytes"
+        );
+    }
+
+    /// A version-2 Agent endpoint is already an immutable ID, so collision metadata about legacy
+    /// bytes must not touch it even when those bytes happen to look contested.
+    #[test]
+    fn a_version_2_agent_endpoint_is_never_reinterpreted_by_collision_metadata() {
+        let owner = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+        let row = SentRecord {
+            version: MESSAGE_RECORD_VERSION_2,
+            from_kind: Some(EndpointKind::Agent),
+            to_kind: Some(EndpointKind::Agent),
+            ..record("h.worker", "h.peer")
+        };
+        assert_eq!(
+            row.recipient_endpoint(owner).attribute(&AllReassigned),
+            EndpointAttribution::AgentId("h.peer".to_owned())
+        );
+    }
+
+    /// Decision 1: a record whose endpoints are immutable IDs must DECLARE version 2. The tree was
+    /// briefly incoherent — IDs stored under a version whose `from`/`to` mean bus identities — and
+    /// that is exactly the misattribution the schema version exists to prevent.
+    #[test]
+    fn the_writer_never_stores_an_id_under_a_version_1_schema() {
+        assert!(
+            WRITE_MESSAGE_RECORD_VERSION_2,
+            "the version-2 writer cohort is on; see DELTA-003 activation step 5"
+        );
+        assert_eq!(SENT_RECORD_WRITE_VERSION, MESSAGE_RECORD_VERSION_2);
+
+        // Whatever the switch says, the two must agree: version 2 iff typed endpoints are written.
+        let sender = SenderEndpoint {
+            endpoint: "sender-uuid".to_owned(),
+            kind: EndpointKind::Agent,
+            address: Some("h.sender".to_owned()),
+        };
+        assert_eq!(sender.rendered_from(), "h.sender");
+        assert_eq!(
+            sender.rendered_from_id(),
+            Some("sender-uuid"),
+            "an Agent sender must publish its immutable ID beside its mutable route"
+        );
+
+        let rendered = render_message_with_idempotency(
+            sender.rendered_from(),
+            sender.rendered_from_id(),
+            None,
+            None,
+            &[],
+            "body",
+            None,
+        );
+        assert!(rendered.contains("from: h.sender\n"), "{rendered}");
+        assert!(rendered.contains("from-id: sender-uuid\n"), "{rendered}");
+
+        // A principal or external sender has no agent ID, so it publishes no `from-id` line.
+        let principal = SenderEndpoint {
+            endpoint: "h.billing".to_owned(),
+            kind: EndpointKind::External,
+            address: None,
+        };
+        assert_eq!(principal.rendered_from(), "h.billing");
+        assert_eq!(principal.rendered_from_id(), None);
+    }
+
+    /// Decision 3: a reply targets the authoritative `from_id`, never the mutable `from` route.
+    /// A released address is immediately reusable, so replying by route can hand the reply to a
+    /// completely different subject.
+    #[test]
+    fn a_reply_targets_the_immutable_sender_id_not_the_reusable_route() {
+        let message = Message {
+            filename: "1785000000000-abcdef.md".to_owned(),
+            ts_ms: 1_785_000_000_000,
+            from: Some("h.chat".to_owned()),
+            from_id: Some("sender-uuid".to_owned()),
+            subject: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            stream: None,
+            event_id: None,
+            event_key: None,
+            body: String::new(),
+        };
+        assert_eq!(
+            message.reply_target("recipient-uuid", &NoLegacyCollisions),
+            Some("sender-uuid".to_owned()),
+            "the route `h.chat` may already belong to someone else"
+        );
+        // Collision metadata about legacy bytes must not touch an endpoint that is already an ID.
+        assert_eq!(
+            message.reply_target("recipient-uuid", &AllReassigned),
+            Some("sender-uuid".to_owned())
+        );
+    }
+
+    /// A pre-`from_id` message falls back to the collision-aware version-1 path, and an inbox row
+    /// is owned by its RECIPIENT — so a colliding sender endpoint carries no reply authority.
+    #[test]
+    fn a_legacy_message_replies_by_collision_aware_attribution_and_refuses_when_unattributed() {
+        let legacy = Message {
+            filename: "1785000000000-abcdef.md".to_owned(),
+            ts_ms: 1_785_000_000_000,
+            from: Some("h.worker".to_owned()),
+            from_id: None,
+            subject: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            stream: None,
+            event_id: None,
+            event_key: None,
+            body: String::new(),
+        };
+        assert_eq!(
+            legacy.reply_target("recipient-uuid", &NoLegacyCollisions),
+            Some("h.worker".to_owned()),
+            "uncontested legacy bytes ARE the sender's frozen agent ID"
+        );
+        assert_eq!(
+            legacy.reply_target("recipient-uuid", &AllReassigned),
+            None,
+            "replying would deliver to whichever subject kept the reassigned bytes"
+        );
+    }
+
+    /// Interrupted-send recovery must not treat a collided version-1 recipient as an exact ID: the
+    /// keeper of those bytes is a different subject from the one the send was addressed to.
+    #[test]
+    fn recovery_refuses_a_pending_send_whose_legacy_recipient_was_reassigned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let keeper = catalog.join("h/worker");
+        fs::create_dir_all(&keeper).unwrap();
+        fs::write(
+            keeper.join("agent.kdl"),
+            "agent \"worker\" {\n  identity \"worker\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+        )
+        .unwrap();
+        // Migration reassigned `h.worker`: this live subject kept the bytes, an archived subject
+        // lost them. The pending intent below was written before that split.
+        let control = crate::catalog_migrate::legacy_id_collisions_path(&catalog);
+        fs::create_dir_all(control.parent().unwrap()).unwrap();
+        fs::write(
+            &control,
+            serde_json::to_vec(&crate::catalog_migrate::LegacyIdCollisions {
+                schema: "st2.catalog-legacy-id-collisions.v1".to_owned(),
+                entries: vec![crate::catalog_migrate::LegacyIdCollision {
+                    legacy_bus_identity: "h.worker".to_owned(),
+                    keeper: AgentId::parse("h.worker").unwrap(),
+                    reassigned: vec![AgentId::parse("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1").unwrap()],
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let sender_root = tmp.path().join("sender");
+        let root = sent_dir(&sender_root);
+        let pending = record("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "h.worker");
+        fs::create_dir_all(root.join(SENT_PENDING)).unwrap();
+        fs::write(
+            root.join(SENT_PENDING).join(pending_record_name(&pending).unwrap()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        publish_active(&root, &pending).unwrap();
+        let mut head = ensure_sent_head(&root).unwrap();
+
+        let error = recover_active(&catalog, "h", None, &root, &mut head)
+            .expect_err("a reassigned legacy recipient cannot be resolved to one subject");
+        assert!(
+            format!("{error:#}").contains("reassigned"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            !message_dir_has_entries(&inbox_dir(&keeper)),
+            "the keeper of the legacy bytes must not receive a message addressed to another subject"
+        );
+    }
+
+    fn message_dir_has_entries(dir: &Path) -> bool {
+        fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
     }
 }

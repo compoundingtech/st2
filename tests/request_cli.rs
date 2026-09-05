@@ -188,8 +188,57 @@ fn bare_request_recipient_does_not_resolve_an_agent_on_another_host() {
     );
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no agent 'worker' found"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("no routable agent answers address 'worker'"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!tmp.path().join("remote/worker/resources/inbox").exists());
+}
+
+#[test]
+fn a_duplicate_agent_id_refuses_the_address_path_instead_of_publishing_into_one_of_them() {
+    // The address book dedups its candidates BY agent ID, so an address naming one of two
+    // subjects that share an explicit `id` resolves to exactly one Subject; only the back-mapping
+    // to a declaration can catch it. Publishing first-match would write the request into the
+    // wrong subject's inbox.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "h/worker/agent.kdl",
+        "agent \"worker\" {\n  identity \"worker\"\n  host \"h\"\n  id \"shared-id\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+    );
+    write(
+        tmp.path(),
+        "h/spare/agent.kdl",
+        "agent \"spare\" {\n  identity \"spare\"\n  host \"h\"\n  id \"shared-id\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+    );
+    declare_principal(tmp.path(), "example-ci");
+
+    let output = request(
+        tmp.path(),
+        &[
+            "send",
+            "h.worker",
+            "--as",
+            "h.example-ci",
+            "--idempotency-key",
+            "one",
+            "-m",
+            "{}",
+            "--json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("declared by more than one subject"),
+        "a duplicate-id catalog must refuse the request: {stderr}"
+    );
+    assert!(!tmp.path().join("h/worker/resources/inbox").exists());
+    assert!(!tmp.path().join("h/spare/resources/inbox").exists());
 }
 
 #[test]

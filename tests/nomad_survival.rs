@@ -721,6 +721,7 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
                 "--catalog",
                 fx.catalog.to_str().unwrap(),
                 command,
+                "--id",
                 &session_id,
                 value,
             ])
@@ -792,6 +793,7 @@ fn presentation_changes_patch_the_exact_live_pty_without_restarting_it() {
                 "--catalog",
                 fx.catalog.to_str().unwrap(),
                 command,
+                "--id",
                 &session_id,
                 "--clear",
             ])

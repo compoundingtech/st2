@@ -398,7 +398,10 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let before = project(&retained_catalog, ProjectionSource::Current, &catalog)?;
     validate_projection_link_counts(&retained_catalog, &before, "live catalog")?;
     validate_live_workspace_facts(&catalog, &before.workspace_dirs)?;
-    validate_full_catalog(&retained_catalog).context("validate live catalog for diff")?;
+    // The structural archive belongs to the live catalog, so both sides of the comparison are
+    // proved unique against the same archived ID index.
+    let archived = crate::catalog_archive::archived_subjects(&retained_catalog)?;
+    validate_full_catalog(&retained_catalog, &archived).context("validate live catalog for diff")?;
     anyhow::ensure!(
         before.root_sha256 == request.expect_sha256,
         "catalog diff precondition failed: expected root sha256 {}, found {}",
@@ -409,7 +412,7 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let captured = tempfile::tempdir().context("create prepared diff capture root")?;
     capture_prepared_catalog(&prepared, captured.path())?;
     let after = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
-    validate_full_catalog(captured.path()).context("validate prepared catalog for diff")?;
+    validate_full_catalog(captured.path(), &archived).context("validate prepared catalog for diff")?;
 
     let before_specs = canonical_semantic_specs(&retained_catalog)?;
     let after_specs = canonical_semantic_specs(captured.path())?;
@@ -642,6 +645,20 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         pointer_segment(&spec.identity)
     );
     let mut fields = BTreeMap::new();
+    // `id` and `address` are normalized model fields so a prepared-catalog comparison sees an
+    // added explicit ID or an address cutover instead of treating them as unmodelled bytes.
+    insert_optional(
+        &mut fields,
+        &format!("{base}/id"),
+        SemanticType::String,
+        spec.id.as_ref().map(agent_spec::AgentId::as_str),
+    );
+    insert_optional(
+        &mut fields,
+        &format!("{base}/address"),
+        SemanticType::String,
+        spec.address.as_ref().map(agent_spec::AgentAddress::as_str),
+    );
     insert_value(
         &mut fields,
         &format!("{base}/identity"),
@@ -834,10 +851,11 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
             kind,
         );
         insert_default_bool(&mut fields, &format!("{root}/derived"), task.derived, false);
+        // Task identity is owned by the immutable agent ID, never by the mutable route.
         let effective_id = task
             .id
             .clone()
-            .unwrap_or_else(|| format!("{}.{}", spec.bus_id(host), task.name));
+            .unwrap_or_else(|| format!("{}.{}", spec.agent_id(host), task.name));
         insert_value(
             &mut fields,
             &format!("{root}/id"),
@@ -1297,7 +1315,8 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
 
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    // Bootstrap publishes an absent catalog: there is no incumbent structural archive.
+    validate_full_catalog(admission.path(), &[])?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1337,7 +1356,8 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
             desired.root_sha256,
             staged.root_sha256
         );
-        validate_full_catalog(&stage)?;
+        // A fresh bootstrap has no control plane yet, therefore no structural archive.
+        validate_full_catalog(&stage, &[])?;
         let lock = initialize_bootstrap_control(&stage)?;
         sync_tree_dirs(&stage)?;
         Ok(lock)
@@ -1405,7 +1425,10 @@ fn inspect_existing_bootstrap(
         &catalog,
         &desired.workspace_dirs,
     )?;
-    validate_full_catalog(&retained_catalog)?;
+    validate_full_catalog(
+        &retained_catalog,
+        &crate::catalog_archive::archived_subjects(&retained_catalog)?,
+    )?;
     anyhow::ensure!(
         current.root_sha256 == desired.root_sha256,
         "catalog bootstrap target already exists with root sha256 {}, expected {}",
@@ -1616,7 +1639,8 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     // are mirrored as empty directories; their live content is never copied or hashed.
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    let archived = crate::catalog_archive::archived_subjects(&catalog)?;
+    validate_full_catalog(admission.path(), &archived)?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1728,7 +1752,7 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         staged.root_sha256,
         verified.root_sha256
     );
-    validate_full_catalog(&catalog).context("validate applied live catalog")?;
+    validate_full_catalog(&catalog, &archived).context("validate applied live catalog")?;
     sync_dir(&catalog)?;
     generation.commit()?;
     test_checkpoint("before-clear");
@@ -1754,8 +1778,17 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     })
 }
 
-/// Full structural and host-scoped validation for a complete prospective catalog.
-pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
+/// Full structural, host-scoped, and identity-uniqueness validation for a complete prospective
+/// catalog.
+///
+/// `archived` carries the live catalog's structural archive as address-book subjects. IDs are
+/// catalog-global across the live plane *and* the archive, so a prospective plane is only
+/// admissible against both. A caller that legitimately has no archive to consider (a fresh
+/// bootstrap) passes an empty slice.
+pub(crate) fn validate_full_catalog(
+    root: &Path,
+    archived: &[agent_spec::Subject],
+) -> Result<()> {
     let found = crate::discover(root);
     let mut hosts = BTreeSet::new();
     for spec in &found.specs {
@@ -1788,6 +1821,36 @@ pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
         errors.is_empty(),
         "catalog fails full validation:\n{}",
         errors.into_iter().collect::<Vec<_>>().join("\n")
+    );
+    validate_identity_uniqueness(&found.specs, archived)?;
+    Ok(())
+}
+
+/// Enforce catalog-global agent-ID uniqueness and host-local effective-address uniqueness.
+///
+/// The rule itself lives in [`agent_spec::AddressBook::conflicts`]; this only supplies the
+/// complete prospective subject set. Live subjects are projected from the canonical declaration
+/// plane — every one carries an explicit host, so the `this_host` fallback is never consulted —
+/// and `archived` adds the structural archive, whose subjects are non-routable and therefore
+/// occupy the ID namespace without occupying any host's address namespace.
+pub(crate) fn validate_identity_uniqueness(
+    specs: &[agent_spec::AgentSpec],
+    archived: &[agent_spec::Subject],
+) -> Result<()> {
+    let mut subjects = agent_spec::address_book(specs, "")
+        .context("project the prospective catalog into its address book")?
+        .subjects()
+        .to_vec();
+    subjects.extend(archived.iter().cloned());
+    let conflicts = agent_spec::AddressBook::new(subjects).conflicts();
+    anyhow::ensure!(
+        conflicts.is_empty(),
+        "catalog fails identity uniqueness:\n{}",
+        conflicts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     Ok(())
 }

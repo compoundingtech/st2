@@ -390,7 +390,7 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
             "mcpServers": {"st2": {
                 "type": "stdio",
                 "command": executable.to_string_lossy(),
-                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
+                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--id", spec.agent_id(this_host)]
             }}
         }).to_string();
         plan.ops.push(RenderOp::JsonUpsert {
@@ -443,7 +443,8 @@ pub(crate) fn catalog_owned_render_inputs(
 }
 
 fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
-    let bus_id = spec.bus_id(this_host);
+    // `ST_AGENT` is the raw immutable agent ID: an exact actor selector, never a route.
+    let agent_id = spec.agent_id(this_host);
     let mut env = BTreeMap::from([
         ("CATALOG".to_string(), root.display().to_string()),
         ("ST_ROOT".to_string(), root.display().to_string()),
@@ -451,7 +452,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             "PTY_ROOT".to_string(),
             crate::run::effective_pty_root(root).display().to_string(),
         ),
-        ("ST_AGENT".to_string(), bus_id.clone()),
+        ("ST_AGENT".to_string(), agent_id.clone()),
     ]);
     if let Ok(path) = crate::hooks::versioned_hooks_dir() {
         env.insert("ST_HOOKS".to_string(), path.display().to_string());
@@ -464,7 +465,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             env.insert(key.clone(), expanded);
         }
     }
-    env.insert("ST_AGENT".to_string(), bus_id);
+    env.insert("ST_AGENT".to_string(), agent_id);
     env
 }
 
@@ -981,7 +982,7 @@ pub fn render_ownership_conflicts(
             // inputs. Ownership analysis only compares claims it can resolve without writing.
             continue;
         };
-        let owner = spec.bus_id(this_host);
+        let owner = spec.agent_id(this_host);
         for (destination, plan) in claims {
             by_destination
                 .entry(destination)
@@ -1263,7 +1264,7 @@ pub fn materialize_catalog_against(
     let mut report = MaterializeReport::default();
     let selected_ids = selected_specs
         .iter()
-        .map(|spec| spec.bus_id(this_host))
+        .map(|spec| spec.agent_id(this_host))
         .collect::<HashSet<_>>();
     if let Err(error) = crate::reconcile::validate_task_identities(ownership_specs, this_host) {
         report.failed_agents.extend(selected_ids);
@@ -1288,8 +1289,8 @@ pub fn materialize_catalog_against(
         if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
-        if report.failed_agents.contains(&bus_id) {
+        let agent_id = spec.agent_id(this_host);
+        if report.failed_agents.contains(&agent_id) {
             continue;
         }
         match materialize_agent(root, spec, this_host) {
@@ -1306,7 +1307,7 @@ pub fn materialize_catalog_against(
                 report
                     .errors
                     .push(format!("{}: {error:#}", spec.path.display()));
-                report.failed_agents.insert(bus_id);
+                report.failed_agents.insert(agent_id);
             }
         }
     }
@@ -1548,5 +1549,112 @@ mod tests {
         assert_eq!(*settings.1, ArrayMerge::Union);
         let rendered: serde_json::Value = serde_json::from_str(settings.0).unwrap();
         assert_eq!(rendered, crate::hooks::claude_settings_registration());
+    }
+
+    /// A migrated declaration whose address differs from its identity: the source of both the
+    /// exact-ID MCP selector and the raw-ID `ST_AGENT`.
+    fn migrated_mcp_catalog() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let declaration = tmp.path().join("agents/h/worker/agent.kdl");
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" {
+  id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+  host "h"
+  address "fractal.keymap.verifier"
+  command "claude"
+  deliver "mcp"
+  workspace "$CATALOG"
+}"#,
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// The rendered MCP server is automation: it selects the immutable ID through the exact-ID
+    /// flag, never the address-parsing `--identity` form.
+    #[test]
+    fn claude_mcp_render_selects_the_agent_id_through_the_exact_id_flag() {
+        let tmp = migrated_mcp_catalog();
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let plan = effective_plan(tmp.path(), &found.specs[0], "h").unwrap();
+        let rendered = plan
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                RenderOp::JsonUpsert {
+                    destination,
+                    content,
+                    ..
+                } if destination == ".mcp.json" => Some(content),
+                _ => None,
+            })
+            .expect("an mcp seat renders .mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(rendered).unwrap();
+        let args = parsed["mcpServers"]["st2"]["args"].as_array().unwrap();
+        let args = args
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        let id = args.iter().position(|arg| *arg == "--id").unwrap();
+        assert_eq!(args[id + 1], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        assert!(
+            !args.iter().any(|arg| *arg == "--identity"),
+            "the generated selector must not be the address-parsing flag: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("fractal.keymap")),
+            "no rendered argument may carry a mutable route: {args:?}"
+        );
+    }
+
+    /// `ST_AGENT` in the render environment is the raw immutable agent ID: not the bus address,
+    /// and not host-concatenated on top of the ID.
+    #[test]
+    fn render_env_st_agent_is_the_raw_agent_id() {
+        let tmp = migrated_mcp_catalog();
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        let env = render_env(tmp.path(), &found.specs[0], "h");
+
+        assert_eq!(
+            env.get("ST_AGENT").map(String::as_str),
+            Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+        );
+    }
+
+    /// Ownership keys are IDs, so an address change cannot repoint a workspace claim or a
+    /// materialization failure record at a different subject.
+    #[test]
+    fn render_ownership_is_keyed_by_agent_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (identity, address) in [("left", "shared.route"), ("right", "other.route")] {
+            let declaration = tmp.path().join(format!("agents/h/{identity}/agent.kdl"));
+            std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+            std::fs::write(
+                &declaration,
+                format!(
+                    "agent {identity:?} {{\n  id \"0199b8f4-8d3a-7c21-9a44-6f85b73200{}\"\n  host \"h\"\n  address {address:?}\n  command \"true\"\n  workspace \"$CATALOG\"\n  render {{ file \"shared.txt\" {identity:?} }}\n}}",
+                    if identity == "left" { "01" } else { "02" }
+                ),
+            )
+            .unwrap();
+        }
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+
+        let conflicts = render_ownership_conflicts(tmp.path(), &found.specs, "h");
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(
+            conflicts[0].owners,
+            BTreeSet::from([
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320001".to_owned(),
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320002".to_owned(),
+            ]),
+            "conflict owners are immutable IDs, not routes"
+        );
     }
 }

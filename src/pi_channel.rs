@@ -1311,6 +1311,9 @@ mod tests {
                 filename: "1787042542238-xex2t4.md".into(),
                 ts_ms: 1_787_042_542_238,
                 from: Some("h.supervisor".into()),
+                // An unmigrated sender's immutable ID is exactly its `<host>.<identity>` bytes, so
+                // the route and the ID coincide here by construction.
+                from_id: Some("h.supervisor".into()),
                 subject: Some("deploy check".into()),
                 in_reply_to: None,
                 tags: Vec::new(),

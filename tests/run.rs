@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use st2::message;
 use st2::reconcile::{
-    Launch, PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
-    Teardown, compile_generated_tasks,
+    Launch, PtyPresentation, ReconcilePlan, Session, SupervisorTarget, TaskCompileContext,
+    TaskLaunch, TaskTarget, Teardown, compile_generated_tasks,
 };
 use st2::run::Runner;
 use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
@@ -226,6 +226,8 @@ fn selected_one_shot_unknown_refuses_before_runner_list() {
 
 fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
     AgentSpec {
+        id: None,
+        address: None,
         identity: identity.into(),
         name: None,
         description: None,
@@ -607,7 +609,8 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
     let target = TaskTarget {
         kind: TaskKind::Exec,
         pty_id: "host.owner.work".to_owned(),
-        bus_id: "host.owner".to_owned(),
+        agent_id: "host.owner".to_owned(),
+        bus_address: "host.owner".to_owned(),
         name: "work".to_owned(),
         derived: false,
         launch: TaskLaunch::Shell("true".to_owned()),
@@ -631,6 +634,7 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
             spec: &spec,
             tasks: vec![target],
             live_derived: Vec::new(),
+            supervisor: st2::reconcile::SupervisorTarget::Undeclared,
         }],
         teardown: vec![Teardown {
             spec: &spec,
@@ -772,10 +776,30 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
     assert_eq!(compact_agent.presentation, explicit_agent.presentation);
     assert_eq!(compact_agent.tags, explicit_agent.tags);
 
+    // Schema 2: the subject is named by immutable ID, the current route is a separate owned tag,
+    // and schema 1's `agent.actor.path` route alias is explicitly deleted on every managed PTY.
+    // `agent.actor.id` names the external actor and is never in an st2-owned snapshot.
     let primary_tags = &compact_agent.presentation.as_ref().unwrap().tags;
     assert_eq!(
-        primary_tags.get("agent.actor.path"),
+        primary_tags.get("agent.presentation.schema"),
+        Some(&Some("2".to_owned()))
+    );
+    assert_eq!(
+        primary_tags.get("agent.subject.id"),
         Some(&Some("hetz.demo".to_owned()))
+    );
+    assert_eq!(
+        primary_tags.get("agent.subject.address"),
+        Some(&Some("hetz.demo".to_owned()))
+    );
+    assert_eq!(
+        primary_tags.get("agent.actor.path"),
+        Some(&None),
+        "the schema-1 route alias is deleted, not carried"
+    );
+    assert!(
+        !primary_tags.contains_key("agent.actor.id"),
+        "the external actor tag is not st2-owned: {primary_tags:?}"
     );
     assert_eq!(primary_tags.get("role"), Some(&Some("agent".to_owned())));
     assert!(!primary_tags.contains_key("run.role"));
@@ -786,9 +810,11 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
         .unwrap();
     let secondary_tags = &secondary.presentation.as_ref().unwrap().tags;
     assert_eq!(
-        secondary_tags.get("agent.actor.path"),
-        Some(&Some("hetz.demo".to_owned()))
+        secondary_tags.get("agent.subject.id"),
+        Some(&Some("hetz.demo".to_owned())),
+        "a secondary PTY belongs to the same immutable subject"
     );
+    assert_eq!(secondary_tags.get("agent.actor.path"), Some(&None));
     assert_eq!(secondary_tags.get("role"), Some(&None));
     assert!(!secondary_tags.contains_key("run.role"));
 
@@ -981,7 +1007,8 @@ fn fresh_compact_agent_launches_with_its_derived_ding() {
         &TaskLaunch::Argv(vec![
             std::env::current_exe().unwrap().display().to_string(),
             "ding".into(),
-            "--identity".into(),
+            // DING receives an exact-ID selector, never a mutable route.
+            "--id".into(),
             "hetz.demo".into(),
             "--root".into(),
             tmp.path().display().to_string(),
@@ -1417,9 +1444,16 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
         "agents/hetz/demo/agent.toml",
         "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
     );
+    // The supervisor is named by a bare ADDRESS. Its declaration is unmigrated, so its immutable
+    // ID is `hetz.cos-claude` — different bytes from the reference the child authored.
+    write(
+        tmp.path(),
+        "agents/hetz/cos-claude/agent.toml",
+        "identity=\"cos-claude\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
+    );
     let found = discover(tmp.path());
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude")],
+        sessions: vec![dead("hetz.demo-claude"), live("hetz.cos")],
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
@@ -1445,9 +1479,12 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     assert_eq!(last.crash_loops.len(), 1);
     let cl = &last.crash_loops[0];
     assert_eq!(cl.pty_id, "hetz.demo-claude");
-    assert_eq!(cl.identity, "demo");
-    assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
-    assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
+    assert_eq!(cl.agent_id, "hetz.demo");
+    assert_eq!(
+        cl.supervisor,
+        SupervisorTarget::Resolved("hetz.cos-claude".to_owned()),
+        "the authored address must already be resolved to the parent's immutable ID"
+    );
 }
 
 #[test]
@@ -1688,9 +1725,8 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
 
     let cl = CrashLoop {
         pty_id: "hetz.demo-claude".to_string(),
-        identity: "demo".to_string(),
-        host: Some("hetz".to_string()),
-        supervisor: Some("cos-claude".to_string()),
+        agent_id: "hetz.demo".to_string(),
+        supervisor: SupervisorTarget::Resolved("hetz.cos-claude".to_string()),
     };
     surface_crash_loop(tmp.path(), "hetz", &cl);
 
@@ -1708,6 +1744,81 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
     assert!(
         m.body.contains("hetz.demo-claude"),
         "body names the parked task"
+    );
+}
+
+
+/// Equal bytes across the two namespaces must not let the wrong subject receive the alert.
+///
+/// The child is UNMIGRATED, so its `supervisor "boss"` is a positional ADDRESS. A third,
+/// unrelated subject has been migrated with the immutable ID `boss` and holds no such address.
+/// An ID-first-then-address resolution answers with the impostor and the real parent never hears
+/// about the park; the child's own migration state is what makes the namespace unambiguous.
+#[test]
+fn a_legacy_supervisor_address_is_not_captured_by_an_equal_byte_agent_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The impostor: immutable ID is literally `boss`, address is something else entirely.
+    write(
+        tmp.path(),
+        "agents/hetz/impostor/agent.kdl",
+        "agent \"impostor\" { id \"boss\"; host \"hetz\"; address \"unrelated.impostor\"; \
+         pty \"agent\" { id \"hetz.impostor-seat\"; command \"true\" } }\n",
+    );
+    // The real parent: unmigrated, so its effective address is its identity `boss` and its frozen
+    // immutable ID is `hetz.boss`.
+    write(
+        tmp.path(),
+        "agents/hetz/boss/agent.toml",
+        "identity=\"boss\"\n[pty.agent]\nid=\"hetz.boss-seat\"\ncommand=\"true\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"boss\"\n[restart]\nattempts=1\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let runner = FakeRunner {
+        sessions: vec![
+            dead("hetz.demo-claude"),
+            live("hetz.impostor-seat"),
+            live("hetz.boss-seat"),
+        ],
+        ..Default::default()
+    };
+    let mut cap = FlappingCap::default();
+
+    let mut last = UpReport::default();
+    for _ in 0..3 {
+        let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+        last = UpReport::default();
+        execute(&plan, &runner, &mut cap, &mut last);
+    }
+
+    assert_eq!(last.crash_loops.len(), 1);
+    let cl = &last.crash_loops[0];
+    assert_eq!(
+        cl.supervisor,
+        SupervisorTarget::Resolved("hetz.boss".to_owned()),
+        "the address `boss` belongs to the real parent; the subject whose ID is `boss` must not \
+         capture the edge"
+    );
+
+    surface_crash_loop(tmp.path(), "hetz", cl);
+
+    let real = message::inbox_dir(&tmp.path().join("agents/hetz/boss"));
+    let msgs = message::list_dir(&real).unwrap();
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the real parent must receive the crash-loop notice"
+    );
+    assert!(msgs[0].body.contains("hetz.demo-claude"));
+
+    let impostor = message::inbox_dir(&tmp.path().join("agents/hetz/impostor"));
+    assert!(
+        message::list_dir(&impostor).map_or(true, |messages| messages.is_empty()),
+        "the equal-byte ID holder must receive nothing"
     );
 }
 
@@ -1760,9 +1871,8 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
             "hetz",
             &CrashLoop {
                 pty_id: pty_id.to_string(),
-                identity: "demo".to_string(),
-                host: Some("hetz".to_string()),
-                supervisor: Some("cos".to_string()),
+                agent_id: "hetz.demo".to_string(),
+                supervisor: SupervisorTarget::Resolved("hetz.cos".to_string()),
             },
         );
         let mut fresh = message::list_dir(&inbox)
@@ -1847,12 +1957,43 @@ fn surface_crash_loop_without_supervisor_sends_nothing() {
     );
     let cl = CrashLoop {
         pty_id: "hetz.demo-claude".to_string(),
-        identity: "demo".to_string(),
-        host: Some("hetz".to_string()),
-        supervisor: None,
+        agent_id: "hetz.demo".to_string(),
+        supervisor: SupervisorTarget::Undeclared,
     };
     // Must not panic; there is simply nobody to notify.
     surface_crash_loop(tmp.path(), "hetz", &cl);
+}
+
+/// A `supervisor` reference that named nothing must not be mistaken for "no supervisor": nothing
+/// is delivered, but the outcome is a distinct, loud diagnostic rather than a silent success.
+#[test]
+fn surface_crash_loop_with_an_unresolved_supervisor_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/hetz/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"org.gone\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+    );
+    write(
+        tmp.path(),
+        "agents/hetz/cos/agent.toml",
+        "identity=\"cos\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
+    );
+    let cl = CrashLoop {
+        pty_id: "hetz.demo-claude".to_string(),
+        agent_id: "hetz.demo".to_string(),
+        supervisor: SupervisorTarget::Unresolved("org.gone".to_string()),
+    };
+
+    surface_crash_loop(tmp.path(), "hetz", &cl);
+
+    // No inbox is guessed at: an unresolved parent means nobody receives the notice.
+    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos"));
+    assert!(
+        // Either spelling of "nothing arrived": no inbox was created, or it is empty.
+        message::list_dir(&inbox).map_or(true, |messages| messages.is_empty()),
+        "an unresolvable supervisor must not have the notice delivered to a bystander"
+    );
 }
 
 #[test]
@@ -2109,12 +2250,22 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
         "agents/hetz/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
+    // The supervisor edge is resolved when the plan is computed, so the parent has to be in the
+    // same catalog snapshot. It is declared by ADDRESS (`cos-claude`) while its immutable ID is
+    // `hetz.cos-claude`, which is exactly the case that used to drop the notice.
+    write(
+        tmp.path(),
+        "agents/hetz/cos-claude/agent.kdl",
+        "agent \"cos-claude\" { host \"hetz\"; command \"true\" }\n",
+    );
     let found = discover(tmp.path());
     let runner = FakeRunner {
         sessions: vec![
             live("hetz.demo"),
             live("hetz.demo.ding"),
             dead("hetz.demo.stream-gh-ci"),
+            // Adopted, so the supervisor's own task contributes no lifecycle op.
+            live("hetz.cos-claude"),
         ],
         ..Default::default()
     };
@@ -2170,15 +2321,13 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
     assert_eq!(last.crash_loops.len(), 1);
     let cl = &last.crash_loops[0];
     assert_eq!(cl.pty_id, "hetz.demo.stream-gh-ci");
-    assert_eq!(cl.identity, "demo");
-    assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
-    assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
-
-    write(
-        tmp.path(),
-        "agents/hetz/cos-claude/agent.kdl",
-        "agent \"cos-claude\" { host \"hetz\"; command \"true\" }\n",
+    assert_eq!(cl.agent_id, "hetz.demo");
+    assert_eq!(
+        cl.supervisor,
+        SupervisorTarget::Resolved("hetz.cos-claude".to_owned()),
+        "the authored address is already resolved to the parent's immutable ID"
     );
+
     surface_crash_loop(tmp.path(), "hetz", cl);
     let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
     let msgs = message::list_dir(&inbox).unwrap();

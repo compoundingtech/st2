@@ -7,7 +7,7 @@ see below).
 
 ## Boot ritual (on cold start or /clear)
 
-1. `st2 status $ST_AGENT --set available` — set your status so peers see you as active.
+1. `st2 status --id "$ST_AGENT" --set available` — set your status so peers see you as active.
 2. Drain your inbox backlog: `st2 message ls` to enumerate filenames, then for each: `st2 message read
    <filename>`, `st2 message reply <filename> -m "<your reply>"` if a response is warranted, and
    `st2 message archive <filename>` to clear. Don't leave inbox items unaddressed.
@@ -27,9 +27,10 @@ pixels and does not suppress notifications merely because you are `busy`:
 - Set `dnd` only as an explicit operator/agent hold. Fresh `dnd` is the only status that defers
   DING. The sidecar does not refresh `dnd`, so an abandoned hold ages to `unknown` after 15 minutes.
 
-Use `st2 status "$ST_AGENT" --set busy` before work and
-`st2 status "$ST_AGENT" --set available` when yielding. The live DING sidecar refreshes non-DND
-presence without changing its value.
+Use `st2 status --id "$ST_AGENT" --set busy` before work and
+`st2 status --id "$ST_AGENT" --set available` when yielding. `$ST_AGENT` is your immutable agent
+ID, so pass it through `--id`: the positional slot is an ordinary bus address and your address can
+change under you. The live DING sidecar refreshes non-DND presence without changing its value.
 
 ## Resume safety — do NOT double-act (important for hosted/respawned agents)
 
@@ -89,7 +90,7 @@ Bus ops:
 
 Peer discovery + state:
 - `st2 agents [--status STATE] [--json [--enrich]]`
-- `st2 status [<identity>] [--set <state>]`
+- `st2 status [<address>] [--id <agent-id>] [--set <state>]` *(defaults to you; `--id` is the exact-ID form `$ST_AGENT` uses)*
 
 Working state (lossless-restart):
 - `st2 context read [<identity>] [--decisions | --full]`
@@ -111,5 +112,6 @@ Agent declarations: `st2 agent publish`; `st2 validate`; `st2 up --materialize-o
 
 Catalog selection on every catalog-aware command: `--catalog <path>` → `$CATALOG` →
 `${XDG_STATE_HOME:-$HOME/.local/state}/st2/default/catalog`. Bus ops retain `--root` as an explicit
-flat-bus/catalog override. Other shared bus flags: `--as <identity>` (default `$ST_AGENT`), `--host`.
+flat-bus/catalog override. Other shared bus flags: `--as <address>` (the acting identity; defaults
+to the exact immutable ID in `$ST_AGENT`), `--host`.
 Every command supports `--help`.

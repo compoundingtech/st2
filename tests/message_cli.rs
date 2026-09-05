@@ -79,6 +79,120 @@ fn sent(root: &Path, identity: &str, extra: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// Declare a migrated subject: an explicit immutable `id` plus a mutable `address`.
+fn write_migrated_agent(root: &Path, identity: &str, id: &str, address: &str) {
+    let directory = root.join("h").join(identity);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("agent.kdl"),
+        format!(
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  id \"{id}\"\n  address \"{address}\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn reply(root: &Path, as_reference: &str, filename: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "reply", filename, "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", as_reference, "-m", "answer"])
+        .output()
+        .unwrap()
+}
+
+fn inbox_filenames(root: &Path, identity: &str) -> Vec<String> {
+    let inbox = root.join("h").join(identity).join("resources/inbox");
+    let Ok(entries) = fs::read_dir(&inbox) else {
+        return Vec::new();
+    };
+    let mut names = entries
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".md"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// A reply is addressed by the sender's immutable `from-id`, never by the mutable `from` route.
+/// Here the original sender's address is released and immediately taken by a different subject:
+/// routing the reply by `from` would deliver a private answer to that impostor.
+#[test]
+fn reply_routes_by_the_senders_immutable_id_after_its_address_is_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_migrated_agent(root, "writer", "writer-id", "helper");
+    write_migrated_agent(root, "reader", "reader-id", "reader");
+
+    let sent = send_message(root, "helper", "reader", "question", &[]);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let original = String::from_utf8(sent.stdout).unwrap().trim().to_owned();
+
+    // The row records the authoritative sender ID alongside the display-only route.
+    let read = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "read", &original, "--root"])
+        .arg(root)
+        .args(["--host", "h", "--as", "reader", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(value["fromId"], "writer-id");
+    assert_eq!(value["from"], "h.helper");
+
+    // The writer renames, and an unrelated subject takes the released address.
+    write_migrated_agent(root, "writer", "writer-id", "writer");
+    write_migrated_agent(root, "impostor", "impostor-id", "helper");
+
+    let replied = reply(root, "reader", &original);
+    assert!(
+        replied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replied.stderr)
+    );
+    let delivered = String::from_utf8(replied.stdout).unwrap().trim().to_owned();
+
+    assert_eq!(
+        inbox_filenames(root, "writer"),
+        vec![delivered],
+        "the reply must reach the subject that actually wrote the message"
+    );
+    assert!(
+        inbox_filenames(root, "impostor").is_empty(),
+        "the subject that merely took the released address must receive nothing"
+    );
+}
+
+/// A row with no authoritative sender is refused outright: there is no route to fall back to,
+/// because those bytes may already name a different subject.
+#[test]
+fn reply_refuses_a_row_with_no_authoritative_sender() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_migrated_agent(root, "reader", "reader-id", "reader");
+    let inbox = root.join("h/reader/resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    let filename = "1785000000000-aaaaaa.md";
+    fs::write(inbox.join(filename), "---\nsubject: anonymous\n---\nbody\n").unwrap();
+
+    let refused = reply(root, "reader", filename);
+
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("no authoritative sender to reply to"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn send_rejects_empty_explicit_and_stdin_bodies_without_persisting_a_message() {
     for body_arg in [Some(""), None] {
@@ -468,7 +582,12 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
         "payload-filename",
         "corrupt-row",
         "unreadable-row",
-        "row-version",
+        // Records are written at version 2. An unknown future version, a downgrade that leaves
+        // version-2 endpoint fields behind, and a version-2 row missing its endpoint kind are all
+        // undecidable endpoint shapes, so each must fail closed rather than be tolerated.
+        "row-version-unsupported",
+        "row-version-downgrade",
+        "row-version-missing-kind",
     ] {
         let tmp = prepare();
         let messages = tmp.path().join("h/sender/resources/sent/messages");
@@ -501,10 +620,18 @@ fn sent_ledger_fails_closed_when_head_nodes_or_rows_are_lost_substituted_or_inva
                 fs::remove_file(&row).unwrap();
                 fs::create_dir(&row).unwrap();
             }
-            "row-version" => {
+            "row-version-unsupported" | "row-version-downgrade" | "row-version-missing-kind" => {
                 let mut value: serde_json::Value =
                     serde_json::from_slice(&fs::read(&row).unwrap()).unwrap();
-                value["version"] = 2.into();
+                assert_eq!(value["version"], 2, "records are written at version 2");
+                assert!(value["fromKind"].is_string() && value["toKind"].is_string());
+                match mutate {
+                    "row-version-unsupported" => value["version"] = 3.into(),
+                    "row-version-downgrade" => value["version"] = 1.into(),
+                    _ => {
+                        value.as_object_mut().unwrap().remove("fromKind");
+                    }
+                }
                 fs::write(&row, serde_json::to_vec(&value).unwrap()).unwrap();
             }
             _ => unreachable!(),

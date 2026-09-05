@@ -42,9 +42,36 @@ reject the new endpoint and snapshot fields.
 
 ## Implementation
 
-No runtime code changes are part of the VRS pull request that opens this delta.
-Implementation must begin with tests at the Agent Spec and address-book
-boundaries. It must then propagate one typed ID/address distinction through:
+The typed ID/address distinction is implemented in st2 and covered by model-free
+tests. `agent-spec` owns `AgentId`, `AgentAddress`, UUIDv7 creation, frozen
+legacy IDs, `Subject`, `AgentSelector`, and the fail-closed `AddressBook`;
+`AgentSpec` carries explicit `id` and optional `address` and exposes exactly
+three typed accessors — `agent_id` (ownership), `bus_address` (route), and
+`legacy_bus_identity` (positional declaration key). An unmigrated declaration's
+`agent_id` is by construction the value migration freezes, which is why no
+declaration-anchored state, task ID, or socket path moves.
+`AgentSpec::bus_id` is deleted, so every former call site had to choose a
+meaning at compile time.
+
+Landed with it: `st2 catalog migrate-ids` as one additive, idempotent catalog
+transaction with durable collision metadata and `legacy-supervisor-unresolved`;
+ID-validating unarchive; `st2 agent address --id`; ID-only identity authoring
+for `rename`, `describe`, and `desired-state`; disjoint address/exact-ID inputs
+on every agent-selecting command; raw-ID `ST_AGENT`; `<agent-id>.<task-name>`
+default task IDs; PTY schema-2 owned metadata; ID-keyed graph, roster, task
+inventory, supervisor edges, resource observation, stream ingress, and resync
+ownership; typed message endpoints with collision-aware version-1 attribution;
+and tolerant readers for message versions 1-2, harness-state 1-2, and
+harness-context 1-2.
+
+What remains before this delta closes: the canonical Agent Spec and the
+downstream evals/generators still predate `id`/`address`; no real catalog has
+been migrated; and the target writers stay behind their switches
+(`message::WRITE_MESSAGE_RECORD_VERSION_2` and the harness-record version-2
+writer gate) pending steps 2-5 below. Reader-first is therefore satisfied while
+activation is not.
+
+The propagation surface this covered:
 
 - live and archived catalog validation, explicit-ID migration, unarchive, and
   ID-keyed supervisor references;
@@ -105,9 +132,10 @@ shape named by decision 0015.
 Update these load-bearing invariant rows and their named tests in the same
 implementation:
 
-- `Runner-owned task identity`, including its PTY actor-tag clause, from
+- `Runner-owned task identity`, including its PTY subject-tag clause, from
   host-qualified `ST_AGENT` and schema-1 `agent.actor.path` to raw immutable ID
-  and schema-2 `agent.actor.id` plus `agent.actor.address`;
+  and schema-2 `agent.subject.id` plus `agent.subject.address`, leaving the
+  external-actor tag `agent.actor.id` untouched;
 - `Stable roster JSON` for appended immutable ID, nullable current bus address,
   presentation, and migrated supervisor projection;
 - `R23 fail-closed diagnostic inventory` for ID-keyed ownership and nullable

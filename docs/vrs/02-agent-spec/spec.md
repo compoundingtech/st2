@@ -519,7 +519,8 @@ directly. Both paths preserve explicitly nullable name and description and
 grant no lifecycle authority.
 
 For a healthy managed PTY, patch the exact runtime task ID in place. Every PTY
-receives the schema-2 owned actor-ID, current-bus-address, and
+receives the schema-2 owned subject-ID (`agent.subject.id`),
+current-bus-address (`agent.subject.address`), and
 optional-description tag snapshot. Only the primary task named `agent` carries
 the compatibility role and maps optional name to native display metadata.
 Clearing removes only the corresponding st2-owned value. Preserve unrelated

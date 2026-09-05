@@ -141,11 +141,14 @@ fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-/// The watchable carriers of one agent, keyed by its declaration path with current routing IDs.
+/// The watchable carriers of one agent, keyed by its declaration path and its immutable agent ID.
+///
+/// Subscriptions, supersession keys, and seat ownership are all ownership, so they key on the ID:
+/// an address change must not detach a live subscription or rewrite a pending occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWatchSet {
     pub declaration_path: PathBuf,
-    pub bus_id: String,
+    pub agent_id: String,
     pub seat_id: Option<String>,
     pub carriers: Vec<WatchableCarrier>,
     declaration_summary: Option<DeclarationSummary>,
@@ -224,7 +227,7 @@ fn resolve_watch_set(
             Err(error) => {
                 diagnostics.push(format!(
                     "resync profile for {} resource '{}': {error}; binding is unwatchable",
-                    spec.bus_id(this_host),
+                    spec.bus_address(this_host),
                     resource.name()
                 ));
                 continue;
@@ -256,11 +259,11 @@ fn resolve_watch_set(
     (
         AgentWatchSet {
             declaration_path,
-            bus_id: spec.bus_id(this_host),
+            agent_id: spec.agent_id(this_host),
             seat_id: spec.tasks.iter().find(|task| task.name == "agent").map(|task| {
                 task.id
                     .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name))
+                    .unwrap_or_else(|| format!("{}.{}", spec.agent_id(this_host), task.name))
             }),
             carriers,
             declaration_summary: Some(declaration_summary(spec)),
@@ -315,7 +318,7 @@ fn append_chain_carriers(
             diagnostics.push(format!(
                 "resync notify-chain for {}: supervisor chain is unwalkable ({error:?}); \
                  ancestor carriers are unwatchable",
-                spec.bus_id(this_host)
+                spec.bus_address(this_host)
             ));
             return;
         }
@@ -329,7 +332,7 @@ fn append_chain_carriers(
         }
         let ancestor_declaration = lexical_clean(&ancestor.path);
         let ancestor_dir = ancestor_declaration.parent().unwrap_or(Path::new("."));
-        let ancestor_bus_id = ancestor.bus_id(this_host);
+        let ancestor_agent_id = ancestor.agent_id(this_host);
         for resource in &ancestor.resources {
             if resource.inactive_reason().is_some() {
                 continue;
@@ -348,7 +351,7 @@ fn append_chain_carriers(
                     carriers.push(WatchableCarrier {
                         // Qualifying by owner keeps each ancestor's layer on its own supersession
                         // key, so a burst on one ancestor cannot collapse another's event.
-                        label: format!("{}@{ancestor_bus_id}", resource.name()),
+                        label: format!("{}@{ancestor_agent_id}", resource.name()),
                         path: resolution.path,
                         class,
                         containment_root: Some(resolution.containment_root),
@@ -356,9 +359,10 @@ fn append_chain_carriers(
                 }
                 Ok(None) => {}
                 Err(error) => diagnostics.push(format!(
-                    "resync notify-chain for {}: ancestor {ancestor_bus_id} resource '{}': \
+                    "resync notify-chain for {}: ancestor {} resource '{}': \
                      {error}; that ancestor layer is unwatchable",
-                    spec.bus_id(this_host),
+                    spec.bus_address(this_host),
+                    ancestor.bus_address(this_host),
                     resource.name()
                 )),
             }
@@ -524,7 +528,7 @@ enum Msg {
     /// One handed-off publication finished. Outcomes return through the worker's own mailbox so
     /// the worker remains the only writer of carrier baselines and retry deadlines.
     Emitted {
-        bus_id: String,
+        agent_id: String,
         label: String,
         outcome: PublicationOutcome,
     },
@@ -708,7 +712,7 @@ impl ResyncSupervisor {
         if self
             .tx
             .as_ref()
-            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.bus_id(this_host), ack_tx)).is_ok())
+            .is_some_and(|tx| tx.send(Msg::Deactivate(spec.agent_id(this_host), ack_tx)).is_ok())
         {
             let _ = ack_rx.recv();
         }
@@ -898,7 +902,7 @@ impl PendingTransition {
 }
 
 struct Entry {
-    bus_id: String,
+    agent_id: String,
     seat_id: Option<String>,
     label: String,
     class: CarrierClass,
@@ -952,7 +956,7 @@ fn is_mutation(event: &notify::Event) -> bool {
 
 /// One publication handed to the emitter thread.
 struct EmitJob {
-    bus_id: String,
+    agent_id: String,
     label: String,
     transition: PendingTransition,
 }
@@ -1008,13 +1012,13 @@ impl EmitQueue {
     /// Drop every queued publication for one recipient. A publication already taken by the
     /// emitter is left alone: it was in flight while the subscription was still active, and its
     /// outcome is discarded by the worker when the subscription is gone.
-    fn cancel(&self, bus_id: &str) {
-        self.lock().jobs.retain(|job| job.bus_id != bus_id);
+    fn cancel(&self, agent_id: &str) {
+        self.lock().jobs.retain(|job| job.agent_id != agent_id);
     }
 
     /// Drop every queued publication whose recipient is no longer an active subscription.
     fn retain_recipients(&self, active: &BTreeSet<String>) {
-        self.lock().jobs.retain(|job| active.contains(&job.bus_id));
+        self.lock().jobs.retain(|job| active.contains(&job.agent_id));
     }
 
     /// Pop one queued publication without waiting. Only the synchronous test drive uses this;
@@ -1030,7 +1034,7 @@ impl EmitQueue {
         self.lock()
             .jobs
             .iter()
-            .map(|job| job.bus_id.clone())
+            .map(|job| job.agent_id.clone())
             .collect()
     }
 
@@ -1060,10 +1064,10 @@ impl EmitQueue {
 
 fn emitter_loop(root: PathBuf, this_host: String, queue: Arc<EmitQueue>, outcomes: Sender<Msg>) {
     while let Some(job) = queue.next() {
-        let outcome = emit_resync(&root, &this_host, &job.bus_id, &job.transition);
+        let outcome = emit_resync(&root, &this_host, &job.agent_id, &job.transition);
         if outcomes
             .send(Msg::Emitted {
-                bus_id: job.bus_id,
+                agent_id: job.agent_id,
                 label: job.label,
                 outcome,
             })
@@ -1155,17 +1159,17 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
                 worker.install_watch_set(set);
                 let _ = ack.send(());
             }
-            Ok(Msg::Deactivate(bus_id, ack)) => {
-                worker.deactivate_watch_set(&bus_id);
+            Ok(Msg::Deactivate(agent_id, ack)) => {
+                worker.deactivate_watch_set(&agent_id);
                 let _ = ack.send(());
             }
             Ok(Msg::Mutations(paths)) => worker.mark_mutated(paths),
             Ok(Msg::Rescan) => worker.rescan_all(),
             Ok(Msg::Emitted {
-                bus_id,
+                agent_id,
                 label,
                 outcome,
-            }) => worker.record_publication(&bus_id, &label, outcome),
+            }) => worker.record_publication(&agent_id, &label, outcome),
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1180,13 +1184,13 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
 
 fn take_retained_entry(
     previous: &mut BTreeMap<PathBuf, Vec<Entry>>,
-    bus_id: &str,
+    agent_id: &str,
     label: &str,
 ) -> Option<Entry> {
     for entries in previous.values_mut() {
         if let Some(index) = entries
             .iter()
-            .position(|entry| entry.bus_id == bus_id && entry.label == label)
+            .position(|entry| entry.agent_id == agent_id && entry.label == label)
         {
             return Some(entries.remove(index));
         }
@@ -1210,11 +1214,11 @@ fn rebuild_carriers(
             // across path buckets also lets a binding's re-resolved path/class/containment
             // metadata become current. A bus-id change intentionally seeds a new
             // recipient-scoped namespace.
-            let identity = (set.bus_id.clone(), carrier.label.clone());
+            let identity = (set.agent_id.clone(), carrier.label.clone());
             // Every recipient in a refresh set is running, so this is where a reservation parked
             // against a not-running recipient re-arms.
             let restored = parked_transitions.remove(&identity);
-            let retained = take_retained_entry(&mut previous, &set.bus_id, &carrier.label);
+            let retained = take_retained_entry(&mut previous, &set.agent_id, &carrier.label);
             let (
                 state,
                 declaration_summary,
@@ -1258,7 +1262,7 @@ fn rebuild_carriers(
             );
             let restored_reservation = restored.is_some();
             let entry = Entry {
-                bus_id: set.bus_id.clone(),
+                agent_id: set.agent_id.clone(),
                 seat_id: set.seat_id.clone(),
                 label: carrier.label.clone(),
                 class: carrier.class,
@@ -1306,7 +1310,7 @@ impl Worker {
         // scalar sequence floor per recipient/binding identity for this supervisor lifetime;
         // watches and carrier baselines remain exclusively in the active carrier map.
         for entry in previous.values().flatten() {
-            let identity = (entry.bus_id.clone(), entry.label.clone());
+            let identity = (entry.agent_id.clone(), entry.label.clone());
             self.subscription_sequences
                 .entry(identity)
                 .and_modify(|sequence| *sequence = (*sequence).max(entry.occurrence_sequence))
@@ -1317,7 +1321,7 @@ impl Worker {
             .flat_map(|(path, entries)| {
                 entries.iter().map(|entry| {
                     (
-                        (entry.bus_id.clone(), entry.label.clone()),
+                        (entry.agent_id.clone(), entry.label.clone()),
                         path.clone(),
                     )
                 })
@@ -1335,7 +1339,7 @@ impl Worker {
             .flat_map(|(path, entries)| {
                 entries.iter().filter_map(move |entry| {
                     previous_paths
-                        .get(&(entry.bus_id.clone(), entry.label.clone()))
+                        .get(&(entry.agent_id.clone(), entry.label.clone()))
                         .filter(|previous_path| *previous_path != path)
                         .map(|_| path.clone())
                 })
@@ -1379,14 +1383,14 @@ impl Worker {
             .carriers
             .values()
             .flatten()
-            .map(|entry| entry.bus_id.clone())
+            .map(|entry| entry.agent_id.clone())
             .collect::<BTreeSet<_>>();
         self.emit.retain_recipients(&active);
         self.finish_carrier_update(&previous_paths);
     }
 
     fn install_watch_set(&mut self, set: AgentWatchSet) {
-        let replaced_bus_id = set.bus_id.clone();
+        let replaced_agent_id = set.agent_id.clone();
         let previous = std::mem::take(&mut self.carriers);
         let previous_paths = self.prepare_carrier_update(&previous);
         let mut retained = BTreeMap::<PathBuf, Vec<Entry>>::new();
@@ -1394,7 +1398,7 @@ impl Worker {
         for (path, entries) in previous {
             let (matching, other): (Vec<_>, Vec<_>) = entries
                 .into_iter()
-                .partition(|entry| entry.bus_id == replaced_bus_id);
+                .partition(|entry| entry.agent_id == replaced_agent_id);
             if !matching.is_empty() {
                 retained.insert(path.clone(), matching);
             }
@@ -1419,9 +1423,9 @@ impl Worker {
         self.finish_carrier_update(&previous_paths);
     }
 
-    fn deactivate_watch_set(&mut self, bus_id: &str) {
+    fn deactivate_watch_set(&mut self, agent_id: &str) {
         // Nothing may start publishing to this recipient once the acknowledgement returns.
-        self.emit.cancel(bus_id);
+        self.emit.cancel(agent_id);
         let previous = std::mem::take(&mut self.carriers);
         let previous_paths = self.prepare_carrier_update(&previous);
         self.carriers = previous
@@ -1429,7 +1433,7 @@ impl Worker {
             .filter_map(|(path, entries)| {
                 let retained = entries
                     .into_iter()
-                    .filter(|entry| entry.bus_id != bus_id)
+                    .filter(|entry| entry.agent_id != agent_id)
                     .collect::<Vec<_>>();
                 (!retained.is_empty()).then_some((path, retained))
             })
@@ -1632,8 +1636,8 @@ impl Worker {
     #[cfg(test)]
     fn drain_publications(&mut self) {
         while let Some(job) = self.emit.take_queued() {
-            let published = emit_resync(&self.root, &self.this_host, &job.bus_id, &job.transition);
-            self.record_publication(&job.bus_id, &job.label, published);
+            let published = emit_resync(&self.root, &self.this_host, &job.agent_id, &job.transition);
+            self.record_publication(&job.agent_id, &job.label, published);
         }
     }
 
@@ -1704,7 +1708,7 @@ impl Worker {
                 }
                 entry.in_flight = true;
                 handoffs.push(EmitJob {
-                    bus_id: entry.bus_id.clone(),
+                    agent_id: entry.agent_id.clone(),
                     label: entry.label.clone(),
                     transition: pending.clone(),
                 });
@@ -1762,7 +1766,7 @@ impl Worker {
             entry.occurrence_sequence = sequence;
             entry.in_flight = true;
             handoffs.push(EmitJob {
-                bus_id: entry.bus_id.clone(),
+                agent_id: entry.agent_id.clone(),
                 label: entry.label.clone(),
                 transition: transition.clone(),
             });
@@ -1799,13 +1803,13 @@ impl Worker {
     ///
     /// An outcome whose subscription is gone — deactivated or refreshed away while the
     /// publication was outstanding — matches nothing and is discarded.
-    fn record_publication(&mut self, bus_id: &str, label: &str, outcome: PublicationOutcome) {
+    fn record_publication(&mut self, agent_id: &str, label: &str, outcome: PublicationOutcome) {
         let mut touched = Vec::new();
         let mut parked = Vec::new();
         for (path, entries) in &mut self.carriers {
             for entry in entries
                 .iter_mut()
-                .filter(|entry| entry.bus_id == bus_id && entry.label == label)
+                .filter(|entry| entry.agent_id == agent_id && entry.label == label)
             {
                 entry.in_flight = false;
                 match outcome {
@@ -1823,7 +1827,7 @@ impl Worker {
                         entry.dirty = false;
                         if let Some(reservation) = entry.pending_transition.take() {
                             parked.push((
-                                (entry.bus_id.clone(), entry.label.clone()),
+                                (entry.agent_id.clone(), entry.label.clone()),
                                 reservation,
                             ));
                         }
@@ -1849,7 +1853,7 @@ fn transition_identity(body: &str) -> String {
 fn emit_resync(
     root: &Path,
     this_host: &str,
-    bus_id: &str,
+    agent_id: &str,
     transition: &PendingTransition,
 ) -> PublicationOutcome {
     let subject = crate::resource_profile_supervisor::resource_change_subject(
@@ -1861,7 +1865,7 @@ fn emit_resync(
     match crate::event::emit_builtin_resync(
         root,
         this_host,
-        bus_id,
+        agent_id,
         &transition.event_id,
         Some(&transition.binding),
         Some(subject.as_str()),
@@ -1873,8 +1877,11 @@ fn emit_resync(
             let path = transition.path.display();
             match crate::event::refusal_kind(&error) {
                 Some(crate::event::RefusalKind::RecipientNotRunning) => {
+                    // The refusal itself names the recipient by bus address, which is the route a
+                    // person would use to go look. Repeating the immutable ID here would put an
+                    // ownership key in front of a human for no reason.
                     eprintln!(
-                        "st2: resync for '{path}' is parked until '{bus_id}' is running again: {error:#}"
+                        "st2: resync for '{path}' is parked until its recipient is running again: {error:#}"
                     );
                     PublicationOutcome::Parked
                 }
@@ -2301,7 +2308,7 @@ mod tests {
         .unwrap();
         let spec = discover(tmp.path());
         let set = watch_set_for(&spec, "hetz", &Default::default());
-        assert_eq!(set.bus_id, "hetz.worker");
+        assert_eq!(set.agent_id, "hetz.worker");
         let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
         labels.sort();
         assert_eq!(labels, vec!["declaration", "goal"]);
@@ -2320,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn bus_id_uses_the_supervisor_host_not_the_os_hostname() {
+    fn agent_id_uses_the_supervisor_host_not_the_os_hostname() {
         let tmp = tempfile::tempdir().unwrap();
         // A root-level declaration file supplies neither content nor path host: host stays
         // None, so the supervisor's logical alias must decide the recipient.
@@ -2333,11 +2340,11 @@ mod tests {
         .unwrap();
         let spec = discover(tmp.path());
         assert_eq!(
-            watch_set_for(&spec, "alias", &Default::default()).bus_id,
+            watch_set_for(&spec, "alias", &Default::default()).agent_id,
             "alias.worker"
         );
         assert_eq!(
-            watch_set_for(&spec, "other", &Default::default()).bus_id,
+            watch_set_for(&spec, "other", &Default::default()).agent_id,
             "other.worker"
         );
     }
@@ -2411,7 +2418,7 @@ mod tests {
             shared.clone(),
             vec![
                 Entry {
-                    bus_id: "host.alpha".to_owned(),
+                    agent_id: "host.alpha".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2425,7 +2432,7 @@ mod tests {
                     dirty: true,
                 },
                 Entry {
-                    bus_id: "host.beta".to_owned(),
+                    agent_id: "host.beta".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
@@ -2443,7 +2450,7 @@ mod tests {
         let sets = vec![
             AgentWatchSet {
                 declaration_path: PathBuf::from("/catalog/alpha/agent.kdl"),
-                bus_id: "host.alpha".to_owned(),
+                agent_id: "host.alpha".to_owned(),
                 seat_id: None,
                 carriers: vec![WatchableCarrier {
                     label: "goal".to_owned(),
@@ -2455,7 +2462,7 @@ mod tests {
             },
             AgentWatchSet {
                 declaration_path: PathBuf::from("/catalog/beta/agent.kdl"),
-                bus_id: "host.beta".to_owned(),
+                agent_id: "host.beta".to_owned(),
                 seat_id: None,
                 carriers: vec![WatchableCarrier {
                     label: "spec".to_owned(),
@@ -2470,19 +2477,19 @@ mod tests {
         let rebuilt = rebuild_carriers(previous, refresh_for(sets), &BTreeMap::new(), &mut BTreeMap::new());
         let entries = rebuilt.get(&shared).expect("shared path remains watched");
         assert_eq!(entries.len(), 2);
-        for (bus_id, digest) in [
+        for (agent_id, digest) in [
             ("host.alpha", "alpha-before"),
             ("host.beta", "beta-before"),
         ] {
             let entry = entries
                 .iter()
-                .find(|entry| entry.bus_id == bus_id)
+                .find(|entry| entry.agent_id == agent_id)
                 .expect("subscriber remains present");
             assert_eq!(
                 entry.state,
                 Some(CarrierState::Present(digest.to_owned()))
             );
-            assert!(entry.dirty, "pending mutation remains pending for {bus_id}");
+            assert!(entry.dirty, "pending mutation remains pending for {agent_id}");
         }
     }
 
@@ -2514,7 +2521,7 @@ mod tests {
         let previous = BTreeMap::from([(
             old_path.clone(),
             vec![Entry {
-                bus_id: "alias.worker".to_owned(),
+                agent_id: "alias.worker".to_owned(),
                 seat_id: Some("stale-seat".to_owned()),
                 label: "goal".to_owned(),
                 class: CarrierClass::Coalesced,
@@ -2535,7 +2542,7 @@ mod tests {
             .iter()
             .find(|entry| entry.label == "goal")
             .expect("the goal subscription remains pending at its current path");
-        assert_eq!(entry.bus_id, "alias.worker");
+        assert_eq!(entry.agent_id, "alias.worker");
         assert_eq!(entry.seat_id.as_deref(), Some("current-seat"));
         assert_eq!(entry.class, CarrierClass::Immediate);
         assert_eq!(
@@ -2588,7 +2595,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 old_path.clone(),
                 vec![Entry {
-                    bus_id: "alias.worker".to_owned(),
+                    agent_id: "alias.worker".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2669,7 +2676,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 old_path.clone(),
                 vec![Entry {
-                    bus_id: "host.worker".to_owned(),
+                    agent_id: "host.worker".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2693,7 +2700,7 @@ mod tests {
 
         worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
             declaration_path: declaration,
-            bus_id: "host.worker".to_owned(),
+            agent_id: "host.worker".to_owned(),
             seat_id: None,
             carriers: vec![WatchableCarrier {
                 label: "goal".to_owned(),
@@ -2725,7 +2732,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    bus_id: "host.worker".to_owned(),
+                    agent_id: "host.worker".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2749,7 +2756,7 @@ mod tests {
         let refresh = |class| {
             refresh_for(vec![AgentWatchSet {
                 declaration_path: declaration.clone(),
-                bus_id: "host.worker".to_owned(),
+                agent_id: "host.worker".to_owned(),
                 seat_id: None,
                 carriers: vec![WatchableCarrier {
                     label: "spec".to_owned(),
@@ -2785,7 +2792,7 @@ mod tests {
             BTreeMap::from([(
                 declaration.clone(),
                 vec![Entry {
-                    bus_id: "hetz.worker".to_owned(),
+                    agent_id: "hetz.worker".to_owned(),
                     seat_id: Some("custom-worker-seat".to_owned()),
                     label: "declaration".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2874,7 +2881,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    bus_id: "hetz.worker".to_owned(),
+                    agent_id: "hetz.worker".to_owned(),
                     seat_id: set.seat_id.clone(),
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -2942,7 +2949,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    bus_id: "host.missing".to_owned(),
+                    agent_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "spec".to_owned(),
                     class: CarrierClass::Coalesced,
@@ -2967,7 +2974,7 @@ mod tests {
         let now = Instant::now();
         worker.apply_watch_sets(refresh_for(vec![AgentWatchSet {
             declaration_path: PathBuf::from("/catalog/missing/agent.kdl"),
-            bus_id: "host.missing".to_owned(),
+            agent_id: "host.missing".to_owned(),
             seat_id: None,
             carriers: vec![WatchableCarrier {
                 label: "spec".to_owned(),
@@ -3160,7 +3167,7 @@ mod tests {
         let entries = [CarrierClass::Immediate, CarrierClass::Coalesced]
             .into_iter()
             .map(|class| Entry {
-                bus_id: "host.worker".to_owned(),
+                agent_id: "host.worker".to_owned(),
                 seat_id: None,
                 label: format!("{class:?}"),
                 class,
@@ -3587,7 +3594,7 @@ mod tests {
         assert!(event_field(&first_a_to_b, "occurrence").ends_with(":1"));
         assert!(event_field(&second_a_to_b, "occurrence").ends_with(":3"));
 
-        relocated.bus_id = "host.replacement".to_owned();
+        relocated.agent_id = "host.replacement".to_owned();
         worker.apply_watch_sets(refresh_for(vec![relocated]));
         assert_eq!(
             worker.carriers[&relocated_carrier]
@@ -3608,8 +3615,8 @@ mod tests {
         crate::event::publish_owner_binding_for_test(root.path(), "host").unwrap();
         let entries = ["host.alpha", "host.beta"]
             .into_iter()
-            .map(|bus_id| Entry {
-                bus_id: bus_id.to_owned(),
+            .map(|agent_id| Entry {
+                agent_id: agent_id.to_owned(),
                 seat_id: None,
                 label: "goal".to_owned(),
                 class: CarrierClass::Immediate,
@@ -3682,7 +3689,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 carrier.clone(),
                 vec![Entry {
-                    bus_id: "host.missing".to_owned(),
+                    agent_id: "host.missing".to_owned(),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -3741,8 +3748,8 @@ mod tests {
                 carrier.to_path_buf(),
                 recipients
                     .iter()
-                    .map(|bus_id| Entry {
-                        bus_id: (*bus_id).to_owned(),
+                    .map(|agent_id| Entry {
+                        agent_id: (*agent_id).to_owned(),
                         seat_id: None,
                         label: "goal".to_owned(),
                         class: CarrierClass::Immediate,
@@ -3792,7 +3799,7 @@ mod tests {
             carriers: BTreeMap::from([(
                 goal,
                 vec![Entry {
-                    bus_id: format!("host.{identity}"),
+                    agent_id: format!("host.{identity}"),
                     seat_id: None,
                     label: "goal".to_owned(),
                     class: CarrierClass::Immediate,
@@ -4047,7 +4054,7 @@ mod tests {
         let undeclared = crate::event::emit(
             root.path(),
             "host",
-            "host.solo",
+            &crate::AgentSelector::address("host.solo"),
             "other",
             "eventid",
             None,

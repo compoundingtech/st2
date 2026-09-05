@@ -28,7 +28,7 @@ mod harness;
 use crate::message::{self, Message};
 use crate::run::{CAPTURE_CAP_BYTES, read_bounded_tail, reap_detached};
 use crate::status;
-use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, chain_bus_ids, resolve_spec};
+use crate::supervisor_chain::chain_agent_ids;
 
 use composer::{ComposerState, classify_composer, classify_located_composer, classify_receipt};
 use harness::ReceiptState;
@@ -99,17 +99,173 @@ fn normalize_field(value: Option<&str>, fallback: &str, max_chars: usize) -> Str
 
 struct RelationshipResolver {
     specs: Vec<crate::AgentSpec>,
+    /// The current address book DING projects a sender's immutable ID through. Empty when the
+    /// catalog did not read coherently, which is one of the degradation cases in 01-ding.
+    book: crate::AddressBook,
+    /// Migration's durable collision metadata, read once per resolver.
+    collisions: crate::catalog_migrate::LegacyIdCollisions,
     valid: bool,
 }
 
 impl RelationshipResolver {
-    fn read(catalog_root: &Path) -> Self {
-        let discovered = crate::discover_strict(catalog_root);
+    /// Read declarations, the address book, and the collision metadata as ONE bundle.
+    ///
+    /// Migration publishes those three in stages, so an unfenced read can pair fresh declarations
+    /// with stale collision metadata and attribute a sender to the wrong subject. The fence is the
+    /// catalog generation sampled around the bundle, NOT the authoring lock: a shared acquisition
+    /// would create `<root>/.st2` inside a catalog-less flat `ST_ROOT` — permanently converting
+    /// that bus into a catalog whose flat delivery then refuses — and it would queue the sidecar's
+    /// single-threaded loop behind any authoring writer, suspending presence refresh for the length
+    /// of an apply. `read_fence` neither initializes control state nor blocks, and it additionally
+    /// refuses while an apply or a generation publication is incomplete.
+    ///
+    /// A bundle that will not settle degrades to `valid = false`, which renders the immutable ID —
+    /// never a guessed address — and never blocks delivery.
+    fn read(catalog_root: &Path, this_host: &str) -> Self {
+        for _ in 0..3 {
+            let Ok(before) = crate::catalog_lock::read_fence(catalog_root) else {
+                continue;
+            };
+            let discovered = crate::discover_strict(catalog_root);
+            let Ok(collisions) = crate::catalog_migrate::load_legacy_id_collisions(catalog_root)
+            else {
+                // An unreadable or foreign-schema collision record is not "no collisions": every
+                // legacy endpoint would look frozen. Degrade instead of attributing.
+                break;
+            };
+            let Ok(after) = crate::catalog_lock::read_fence(catalog_root) else {
+                continue;
+            };
+            if before != after {
+                continue;
+            }
+            let valid = discovered.errors.is_empty();
+            // An incoherent book is indistinguishable from an absent one for display purposes:
+            // both degrade to the immutable ID rather than guessing an address.
+            let book = crate::spec::address_book(&discovered.specs, this_host).unwrap_or_default();
+            return Self {
+                specs: discovered.specs,
+                book,
+                collisions,
+                valid,
+            };
+        }
         Self {
-            specs: discovered.specs,
-            valid: discovered.errors.is_empty(),
+            specs: Vec::new(),
+            book: crate::AddressBook::default(),
+            collisions: crate::catalog_migrate::LegacyIdCollisions::default(),
+            valid: false,
         }
     }
+
+    /// The declaration carrying exactly this immutable agent ID.
+    ///
+    /// Exact-only on purpose: an attributed sender is already an ID, and running it back through
+    /// an ID-or-address resolver would let a replacement subject that has since taken the released
+    /// address answer for the original sender.
+    fn spec_by_id<'a>(&'a self, agent_id: &str, this_host: &str) -> Option<&'a crate::AgentSpec> {
+        self.specs
+            .iter()
+            .find(|spec| spec.agent_id(this_host) == agent_id)
+    }
+}
+
+/// How DING displays one message's sender (01-ding, "Sender projection").
+///
+/// The displayed sender is the current bus address only when resolving the immutable ID against a
+/// coherent current address book succeeds. Everything else degrades to the ID, which is always
+/// displayable. The publication-time snapshot is never shown alone as the current sender: a
+/// released address is immediately reusable, so those bytes may already route elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SenderProjection {
+    /// A proved current bus address.
+    Current(String),
+    /// Lookup failed. The immutable ID, optionally with the publication-time snapshot marked as a
+    /// historical address.
+    Degraded {
+        id: String,
+        historical: Option<String>,
+    },
+    /// A typed non-Agent endpoint's canonical address, shown without any Agent lookup.
+    Typed(String),
+    /// Colliding version-1 legacy bytes this inbox row does not own. Rendered as a historical
+    /// address and never as the live subject that kept those bytes.
+    Historical(String),
+}
+
+impl SenderProjection {
+    fn display(&self) -> String {
+        match self {
+            Self::Current(address) | Self::Typed(address) => address.clone(),
+            Self::Degraded {
+                id,
+                historical: None,
+            } => id.clone(),
+            Self::Degraded {
+                id,
+                historical: Some(address),
+            } => format!("{id} (was {address})"),
+            Self::Historical(address) => format!("{address} (historical address)"),
+        }
+    }
+}
+
+/// Attribute one inbox row's sender endpoint.
+///
+/// An inbox row's state owner is its RECIPIENT, so a colliding version-1 sender endpoint is never
+/// the owner and is therefore unattributed — it carries no reply or automation authority and must
+/// not be reattributed to the live subject that kept those legacy bytes (`MESSAGE-R04`).
+fn attribute_sender(
+    msg: &Message,
+    recipient_agent_id: &str,
+    collisions: &impl message::LegacyCollisionIndex,
+) -> Option<message::EndpointAttribution> {
+    let (version, value) = match msg.from_id.as_deref() {
+        Some(id) => (message::MESSAGE_RECORD_VERSION_2, id),
+        None => (message::MESSAGE_RECORD_VERSION_1, msg.from.as_deref()?),
+    };
+    Some(
+        message::DurableEndpoint {
+            version,
+            value,
+            kind: None,
+            owns_row: false,
+            owner_agent_id: recipient_agent_id,
+        }
+        .attribute(collisions),
+    )
+}
+
+/// Project an attributed sender for display. Delivery never blocks on this lookup.
+fn project_sender(
+    resolver: &RelationshipResolver,
+    attribution: Option<&message::EndpointAttribution>,
+    snapshot: Option<&str>,
+) -> Option<SenderProjection> {
+    Some(match attribution? {
+        message::EndpointAttribution::AgentId(id) => {
+            match resolver
+                .valid
+                .then(|| resolver.book.resolve_id(id).ok())
+                .flatten()
+                .and_then(crate::Subject::bus_address)
+            {
+                Some(address) => SenderProjection::Current(address),
+                None => SenderProjection::Degraded {
+                    id: id.clone(),
+                    historical: snapshot
+                        .filter(|address| *address != id)
+                        .map(str::to_owned),
+                },
+            }
+        }
+        message::EndpointAttribution::TypedAddress { address, .. } => {
+            SenderProjection::Typed(address.clone())
+        }
+        message::EndpointAttribution::UnattributedLegacyAddress(address) => {
+            SenderProjection::Historical(address.clone())
+        }
+    })
 }
 
 fn relationship_marker(
@@ -121,22 +277,23 @@ fn relationship_marker(
     if !resolver.valid {
         return "?".to_string();
     }
-    let Some(sender) = claimed_sender.and_then(|id| resolve_spec(&resolver.specs, id, this_host))
+    let Some(sender) =
+        claimed_sender.and_then(|id| resolver.spec_by_id(id, this_host))
     else {
         return "?".to_string();
     };
-    let Some(recipient) = resolve_spec(&resolver.specs, recipient, this_host) else {
+    let Some(recipient) = resolver.spec_by_id(recipient, this_host) else {
         return "?".to_string();
     };
-    let sender_id = sender.bus_id(this_host);
-    let recipient_id = recipient.bus_id(this_host);
+    let sender_id = sender.agent_id(this_host);
+    let recipient_id = recipient.agent_id(this_host);
     if sender_id == recipient_id {
         return "↺".to_string();
     }
-    let Ok(recipient_chain) = chain_bus_ids(&resolver.specs, recipient, this_host) else {
+    let Ok(recipient_chain) = chain_agent_ids(&resolver.specs, recipient, this_host) else {
         return "?".to_string();
     };
-    let Ok(sender_chain) = chain_bus_ids(&resolver.specs, sender, this_host) else {
+    let Ok(sender_chain) = chain_agent_ids(&resolver.specs, sender, this_host) else {
         return "?".to_string();
     };
 
@@ -162,29 +319,44 @@ fn relationship_marker(
 
 /// The `[DING] …` line an agent sees for one newly arrived message. Consumers must key on the
 /// prefix and stable id rather than descriptive words. Subject and sender are bounded, normalized
-/// untrusted fields. The marker describes the relationship implied by the claimed sender identity;
+/// untrusted fields. The marker describes the relationship implied by the attributed sender ID;
 /// it does not authenticate that identity.
+///
+/// `recipient` is the seat's exact immutable agent ID: it is the owner of this inbox row, which is
+/// what decides whether a colliding legacy sender endpoint may be attributed at all.
 pub fn poke_text(catalog_root: &Path, this_host: &str, recipient: &str, msg: &Message) -> String {
-    poke_text_with_resolver(
-        &RelationshipResolver::read(catalog_root),
-        this_host,
-        recipient,
-        msg,
-    )
+    let resolver = RelationshipResolver::read(catalog_root, this_host);
+    poke_text_with_resolver(&resolver, &resolver.collisions, this_host, recipient, msg)
 }
 
 fn poke_text_with_resolver(
     resolver: &RelationshipResolver,
+    collisions: &impl message::LegacyCollisionIndex,
     this_host: &str,
     recipient: &str,
     msg: &Message,
 ) -> String {
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
-    let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
+    let attribution = attribute_sender(msg, recipient, collisions);
+    let projected = project_sender(resolver, attribution.as_ref(), msg.from.as_deref());
+    let from = normalize_field(
+        projected.as_ref().map(SenderProjection::display).as_deref(),
+        "unknown",
+        SENDER_MAX_CHARS,
+    );
     let marker = if msg.stream.is_some() && msg.event_id.is_some() {
         SOURCE_MARKER.to_string()
     } else {
-        relationship_marker(resolver, this_host, recipient, msg.from.as_deref())
+        // Only an attributed sender may imply a relationship: an unattributed legacy endpoint
+        // carries no automation authority, so it stays "?".
+        relationship_marker(
+            resolver,
+            this_host,
+            recipient,
+            attribution
+                .as_ref()
+                .and_then(message::EndpointAttribution::agent_id),
+        )
     };
     format!(
         "[DING] {marker} {from}: {subject} [id:{}]",
@@ -870,12 +1042,18 @@ impl PendingNotice {
     ) -> String {
         match self {
             Self::Recovery { .. } => RECOVERY_POKE.to_string(),
-            Self::Message { message, .. } => poke_text_with_resolver(
-                resolver.get_or_insert_with(|| RelationshipResolver::read(context.catalog_root)),
-                context.this_host,
-                context.recipient,
-                message,
-            ),
+            Self::Message { message, .. } => {
+                let resolver = resolver.get_or_insert_with(|| {
+                    RelationshipResolver::read(context.catalog_root, context.this_host)
+                });
+                poke_text_with_resolver(
+                    resolver,
+                    &resolver.collisions,
+                    context.this_host,
+                    context.recipient,
+                    message,
+                )
+            }
             Self::Adopted {
                 staged_text: Some(text),
             } => text.clone(),
@@ -1016,10 +1194,16 @@ pub fn run_ding(
     let mut seen = HashSet::new();
     let backlog = new_arrivals(inbox_dir, &mut seen);
     let mut startup_candidates = (!backlog.is_empty()).then(|| {
-        let resolver = RelationshipResolver::read(context.catalog_root);
+        let resolver = RelationshipResolver::read(context.catalog_root, context.this_host);
         std::iter::once(RECOVERY_POKE.to_string())
             .chain(backlog.iter().map(|message| {
-                poke_text_with_resolver(&resolver, context.this_host, context.recipient, message)
+                poke_text_with_resolver(
+                    &resolver,
+                    &resolver.collisions,
+                    context.this_host,
+                    context.recipient,
+                    message,
+                )
             }))
             .collect::<Vec<_>>()
     });
@@ -1279,6 +1463,8 @@ fn drain(rx: &Receiver<()>) {
 mod tests {
     use super::*;
     use crate::message::{archive_dir, archive_msg, inbox_dir, send_to_inbox};
+    // Exercised only by the supervisor-chain proofs below; shared code resolves exact IDs.
+    use crate::supervisor_chain::{SUPERVISOR_CHAIN_LIMIT, resolve_selector};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -1290,6 +1476,7 @@ mod tests {
                 .and_then(|(timestamp, _)| timestamp.parse().ok())
                 .unwrap_or_default(),
             from: Some(from.to_string()),
+            from_id: None,
             subject: subject.map(str::to_string),
             in_reply_to: None,
             tags: vec![],
@@ -1315,6 +1502,271 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// Declare a migrated subject: an explicit immutable ID plus a mutable address.
+    ///
+    /// A migrated declaration's `supervisor` value is its parent's immutable ID, which is the only
+    /// namespace a migrated child's edge is read in.
+    fn declare_migrated_agent(root: &Path, host: &str, identity: &str, id: &str, address: &str) {
+        declare_migrated_agent_supervised(root, host, identity, id, address, None);
+    }
+
+    fn declare_migrated_agent_supervised(
+        root: &Path,
+        host: &str,
+        identity: &str,
+        id: &str,
+        address: &str,
+        supervisor: Option<&str>,
+    ) {
+        let directory = root.join(host).join(identity);
+        std::fs::create_dir_all(&directory).unwrap();
+        let supervisor = supervisor
+            .map(|value| format!("  supervisor {value:?}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            directory.join("agent.kdl"),
+            format!(
+                "agent {identity:?} {{\n  identity {identity:?}\n  id {id:?}\n  address {address:?}\n  host {host:?}\n{supervisor}  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// An agent message carrying a version-2 immutable sender ID plus its publication-time route.
+    fn agent_msg(filename: &str, from_id: &str, snapshot: &str, subject: &str) -> Message {
+        Message {
+            from_id: Some(from_id.to_owned()),
+            ..msg(filename, snapshot, Some(subject))
+        }
+    }
+
+    /// Every legacy endpoint in this index was reassigned at migration.
+    struct AllReassigned;
+
+    impl message::LegacyCollisionIndex for AllReassigned {
+        fn is_reassigned(&self, _legacy_bus_identity: &str) -> bool {
+            true
+        }
+    }
+
+    /// The displayed sender is the CURRENT address, not the saved one: an address change must be
+    /// visible immediately, because the snapshot may already route to a different subject.
+    #[test]
+    fn a_resolvable_sender_id_displays_its_current_bus_address() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        declare_migrated_agent(catalog.path(), "h", "sender", "sender-uuid", "renamed");
+        let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.old-name", "hi");
+
+        assert_eq!(
+            poke_text(catalog.path(), "h", "h.recipient", &message),
+            "[DING] ? h.renamed: hi [id:abc123]"
+        );
+    }
+
+    /// `DING-R…`/01-ding sender projection: when the current-address lookup fails, degrade to the
+    /// immutable ID — which is always displayable — and mark the saved route as historical. The
+    /// snapshot is NEVER shown alone as the current sender.
+    #[test]
+    fn an_unresolvable_sender_id_degrades_to_the_id_and_marks_the_snapshot_historical() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.old-name", "hi");
+
+        let rendered = poke_text(catalog.path(), "h", "h.recipient", &message);
+        assert_eq!(rendered, "[DING] ? sender-uuid (was h.old-name): hi [id:abc123]");
+        assert!(
+            !rendered.contains("? h.old-name:"),
+            "a publication-time snapshot must never stand alone as the current sender: {rendered}"
+        );
+    }
+
+    /// DING also serves a catalog-less flat bus (an eval's `ST_ROOT`). Rendering a notice there
+    /// must not materialize `<root>/.st2`: that control directory is what `catalogless()` keys on,
+    /// so creating it converts the bus into a catalog whose flat delivery then refuses every send.
+    #[test]
+    fn a_notice_on_a_catalogless_bus_creates_no_control_directory() {
+        let bus = tempfile::tempdir().unwrap();
+        let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.sender", "hi");
+
+        let rendered = poke_text(bus.path(), "h", "h.recipient", &message);
+        assert!(
+            rendered.contains("sender-uuid"),
+            "a catalog-less bus has no address book, so the sender degrades to its ID: {rendered}"
+        );
+        assert!(
+            !bus.path().join(crate::catalog_lock::CONTROL_DIR).exists(),
+            "reading the relationship bundle must not initialize catalog control state"
+        );
+
+        // The property that matters: flat delivery still resolves after the render.
+        crate::message::send_to_resolved_inbox(
+            bus.path(),
+            "peer",
+            "h",
+            "requester",
+            Some("kick"),
+            None,
+            &[],
+            "body",
+            None,
+            None,
+        )
+        .expect("a flat bus must still deliver after DING rendered a notice on it");
+        assert!(bus.path().join("peer").join("inbox").is_dir());
+    }
+
+    /// The sidecar's flush loop is single-threaded and also drives presence refresh, so the
+    /// snapshot fence must never queue behind an authoring writer: a `catalog apply` would
+    /// otherwise make every live agent look presence-stale for the length of the write.
+    #[test]
+    fn a_notice_renders_while_an_exclusive_catalog_writer_holds_the_lock() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        declare_migrated_agent(catalog.path(), "h", "sender", "sender-uuid", "renamed");
+        let _writer = crate::CatalogLock::exclusive(catalog.path()).unwrap();
+
+        let root = catalog.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let render = std::thread::spawn(move || {
+            let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.old-name", "hi");
+            let _ = tx.send(poke_text(&root, "h", "h.recipient", &message));
+        });
+        let rendered = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a DING render must not block behind an exclusive catalog writer");
+        render.join().unwrap();
+        assert_eq!(rendered, "[DING] ? h.renamed: hi [id:abc123]");
+    }
+
+    /// An inbox row is owned by its RECIPIENT, so a colliding version-1 sender endpoint is not the
+    /// owner: it renders as a historical address and carries no automation authority, which is why
+    /// the relationship marker stays "?" even though the bytes now resolve to a live subject.
+    #[test]
+    fn a_colliding_legacy_sender_renders_as_a_historical_address_with_no_authority() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", Some("worker"));
+        declare_agent(catalog.path(), "h", "worker", None);
+        let resolver = RelationshipResolver::read(catalog.path(), "h");
+        let message = msg("1785070000000-abc123.md", "h.worker", Some("stale"));
+
+        // Without collision metadata the bytes are the frozen ID: an ordinary supervisor DING.
+        assert_eq!(
+            poke_text_with_resolver(
+                &resolver,
+                &message::NoLegacyCollisions,
+                "h",
+                "h.recipient",
+                &message
+            ),
+            "[DING] ↓ h.worker: stale [id:abc123]"
+        );
+
+        // Once those bytes are known to have been reassigned, this row cannot claim them.
+        assert_eq!(
+            poke_text_with_resolver(&resolver, &AllReassigned, "h", "h.recipient", &message),
+            "[DING] ? h.worker (historical address): stale [id:abc123]"
+        );
+    }
+
+    /// Display degradation is cosmetic. It must not change what the notice classifies against or
+    /// which subject owns the row, so the same message yields one stable notice per attempt.
+    #[test]
+    fn display_fallback_does_not_change_the_notice_used_for_receipt_classification() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.old-name", "hi");
+        let notice = PendingNotice::message(message.clone());
+
+        let direct = poke_text(catalog.path(), "h", "h.recipient", &message);
+        let staged = notice.text(
+            DingContext {
+                catalog_root: catalog.path(),
+                this_host: "h",
+                recipient: "h.recipient",
+            },
+            &mut None,
+        );
+        assert_eq!(direct, staged);
+    }
+
+    /// An attributed sender is already an immutable ID, so binding it must be exact.
+    ///
+    /// Here the sender released `worker` and a DIFFERENT subject took that address. Resolving the
+    /// attributed ID through an ID-or-address resolver would bind the replacement and render the
+    /// replacement's relationship to the recipient — durable DING output describing the wrong
+    /// subject entirely.
+    #[test]
+    fn an_attributed_sender_id_never_binds_the_subject_that_reused_its_old_address() {
+        let catalog = tempfile::tempdir().unwrap();
+        // A supervisor edge is ownership, so it is declared by immutable ID — which only a
+        // MIGRATED child may do: the recipient carries its frozen legacy ID explicitly.
+        declare_migrated_agent_supervised(
+            catalog.path(),
+            "h",
+            "recipient",
+            "h.recipient",
+            "recipient",
+            Some("replacement-uuid"),
+        );
+        // The original sender kept its ID and moved to a new address.
+        declare_migrated_agent(catalog.path(), "h", "origin", "origin-uuid", "moved");
+        // A different subject now answers to `worker`, and it supervises the recipient.
+        declare_migrated_agent(
+            catalog.path(),
+            "h",
+            "replacement",
+            "replacement-uuid",
+            "worker",
+        );
+        let resolver = RelationshipResolver::read(catalog.path(), "h");
+
+        // The recipient's supervisor is `replacement`, so a sender bound to it would render "↓".
+        assert_eq!(
+            relationship_marker(&resolver, "h", "h.recipient", Some("replacement-uuid")),
+            "↓"
+        );
+        // The real sender is `origin`, which has no supervisor relationship to the recipient.
+        assert_eq!(
+            relationship_marker(&resolver, "h", "h.recipient", Some("origin-uuid")),
+            "?"
+        );
+        // And a stale ROUTE is not an ID: it binds nothing at all.
+        assert_eq!(
+            relationship_marker(&resolver, "h", "h.recipient", Some("worker")),
+            "?",
+            "an address must never be accepted where an immutable ID is required"
+        );
+    }
+
+    /// The declaration bundle DING reads is one fenced snapshot, so a torn read degrades to the
+    /// immutable ID rather than pairing fresh declarations with stale collision metadata.
+    #[test]
+    fn an_unreadable_catalog_bundle_degrades_to_the_immutable_id() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "recipient", None);
+        std::fs::create_dir_all(catalog.path().join("h/broken")).unwrap();
+        std::fs::write(
+            catalog.path().join("h/broken/agent.kdl"),
+            "agent \"broken\" { this is not kdl",
+        )
+        .unwrap();
+
+        let resolver = RelationshipResolver::read(catalog.path(), "h");
+        assert!(!resolver.valid, "a malformed declaration is not a coherent catalog");
+        let message = agent_msg("1785070000000-abc123.md", "sender-uuid", "h.old-name", "hi");
+        assert_eq!(
+            poke_text_with_resolver(
+                &resolver,
+                &message::NoLegacyCollisions,
+                "h",
+                "h.recipient",
+                &message
+            ),
+            "[DING] ? sender-uuid (was h.old-name): hi [id:abc123]"
+        );
     }
 
     fn render_without_catalog(message: &Message) -> String {
@@ -1556,11 +2008,16 @@ mod tests {
         declare_agent(catalog.path(), "h", "loop", Some("recipient"));
         let message = msg("1785070000000-abc123.md", "h.loop", Some("cycle"));
         let expected = "[DING] ? h.loop: cycle [id:abc123]";
-        let resolver = RelationshipResolver::read(catalog.path());
-        let recipient = resolve_spec(&resolver.specs, "h.recipient", "h").unwrap();
+        let resolver = RelationshipResolver::read(catalog.path(), "h");
+        let recipient = resolve_selector(
+            &resolver.specs,
+            &crate::AgentSelector::address("h.recipient"),
+            "h",
+        )
+        .unwrap();
 
         assert_eq!(
-            chain_bus_ids(&resolver.specs, recipient, "h"),
+            chain_agent_ids(&resolver.specs, recipient, "h"),
             Err(crate::supervisor_chain::SupervisorChainError::Cycle),
             "cycle detection must be distinct from the independent depth limit"
         );
@@ -3250,7 +3707,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         crate::event::emit(
             root,
             "hetz",
-            "hetz.worker",
+            &crate::AgentSelector::address("hetz.worker"),
             "gh-ci",
             event_id,
             Some("pr-42"),
