@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, driver_diagnostic, harness_context, harness_state, message, run, status};
+use crate::{ding, driver_diagnostic, harness_context, harness_state, identity::AgentSelector, message, run, status};
 
 const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
@@ -390,7 +390,7 @@ struct CodexDeliveryConfig {
 impl CodexDeliveryConfig {
     fn resolve(catalog_root: &Path, identity: &str) -> Result<Self> {
         let this_host = run::detect_host();
-        let agent_dir = message::resolve_agent_dir(catalog_root, identity, &this_host)?
+        let agent_dir = message::resolve_actor_dir(catalog_root, identity, &this_host)?
             .with_context(|| {
                 format!(
                     "Codex native delivery agent '{identity}' is not declared in {}",
@@ -431,11 +431,23 @@ impl CodexDeliveryConfig {
         key_hash.update(body.as_bytes());
         let idempotency_key = format!("st2.codex-protocol-rejection.v1:{:x}", key_hash.finalize());
         let tags = ["codex-protocol".to_string(), "launch-rejected".to_string()];
+        // This runtime names itself by exact key, never through its own mutable address.
+        let sender = match message::actor_selector(&self.catalog_root, &self.identity, &self.this_host)
+        {
+            Ok(sender) => sender,
+            Err(resolve_error) => {
+                eprintln!(
+                    "st2 codex: failed to resolve agent '{}' as the sender of a protocol rejection report: {resolve_error:#}",
+                    self.identity
+                );
+                return;
+            }
+        };
         if let Err(report_error) = message::send_to_resolved_inbox(
             &self.catalog_root,
-            supervisor,
+            &AgentSelector::Address(supervisor.to_owned()),
             &self.this_host,
-            &self.identity,
+            &sender,
             Some(&subject),
             None,
             &tags,

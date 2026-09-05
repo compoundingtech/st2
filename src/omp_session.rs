@@ -78,7 +78,7 @@ pub fn run(
     omp_argv: Vec<String>,
 ) -> Result<()> {
     let agent_dir =
-        message::resolve_agent_dir(catalog_root, &identity, &crate::run::detect_host())?
+        message::resolve_actor_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("omp driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !omp_argv.is_empty(),

@@ -119,7 +119,7 @@ pub fn run_omp(catalog_root: &Path, identity: &str) -> Result<()> {
 }
 
 fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()> {
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_actor_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("{} channel agent '{identity}' is not declared", kind.label))?;
     let inbox = message::inbox_dir(&agent_dir);
     // Composed here rather than in the extension: what a restarted agent is told is st2's contract,
