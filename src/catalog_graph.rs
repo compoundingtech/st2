@@ -50,7 +50,10 @@ pub struct GraphRoots {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphAgent {
+    /// The immutable catalog-global agent ID (R24): the declaration's explicit `id`, else the
+    /// legacy `<host>.<identity>` bus identity migration freezes as this subject's ID.
     pub id: String,
+    /// The positional declaration key and legacy address fallback. Never the agent ID.
     pub identity: String,
     pub host: String,
     pub name: Option<String>,
@@ -71,6 +74,11 @@ pub struct GraphAgent {
     pub source: GraphSource,
     pub resources: Vec<GraphResource>,
     pub runtime: serde_json::Value,
+    /// Appended (R24): the effective mutable address — declared `address`, else `identity`.
+    pub address: String,
+    /// Appended (R24): `<host>.<address>`; `None` for a retired subject, which is non-routable
+    /// and releases its address without making the envelope incomplete.
+    pub bus_address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,10 +251,13 @@ fn graph_agent(
     let source_declaration = declarations.iter().find(|entry| entry.path == spec.path);
     let (path_identity, path_host) = path_defaults(root, &spec.path);
     let raw = source_declaration.and_then(|entry| match_declared(&entry.agents, spec, path_identity.as_deref()));
-    let id = spec.bus_id(this_host);
+    let id = spec.effective_id(this_host);
+    // The runtime roster row is still keyed by the legacy bus identity — that field keeps its
+    // meaning, so the join must not follow `id` onto an explicit catalog ID.
+    let bus_id = spec.bus_id(this_host);
     let runtime = runtime_by_path
         .get_mut(&spec.path)
-        .and_then(|rows| rows.iter().position(|row| row.identity == id).map(|index| rows.remove(index)))
+        .and_then(|rows| rows.iter().position(|row| row.identity == bus_id).map(|index| rows.remove(index)))
         .map(|row| crate::agents::graph_runtime_value(&row))
         .unwrap_or(serde_json::Value::Null);
     let resolved_workspace = spec.workspace.as_deref().and_then(|workspace| {
@@ -309,6 +320,9 @@ fn graph_agent(
             })
             .collect(),
         runtime,
+        address: spec.effective_address().to_owned(),
+        // A retired subject does not resolve and does not occupy the address namespace.
+        bus_address: (!spec.desired_state.is_retired()).then(|| spec.bus_address(this_host)),
     }
 }
 
@@ -324,10 +338,13 @@ fn admitted_topology(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Option<AdmittedTopology> {
-    let id = spec.bus_id(this_host);
+    // Keyed on the effective agent ID, the same value `GraphAgent.id` carries, so `parentId`,
+    // `rootId`, and `ancestorIds` stay coherent in a partially migrated catalog. For an
+    // unmigrated subject the effective ID *is* its bus identity, so nothing changes today.
+    let id = spec.effective_id(this_host);
     if specs
         .iter()
-        .filter(|candidate| candidate.bus_id(this_host) == id)
+        .filter(|candidate| candidate.effective_id(this_host) == id)
         .count()
         != 1
     {
@@ -349,9 +366,9 @@ fn admitted_topology(
     let ancestor_ids = chain
         .iter()
         .skip(1)
-        .map(|ancestor| ancestor.bus_id(this_host))
+        .map(|ancestor| ancestor.effective_id(this_host))
         .collect::<Vec<_>>();
-    let root_id = chain.last()?.bus_id(this_host);
+    let root_id = chain.last()?.effective_id(this_host);
     Some(AdmittedTopology {
         parent_id: ancestor_ids.first().cloned(),
         root_id,
@@ -460,6 +477,11 @@ fn declared_field(agent: &agent_spec::DeclaredAgent, name: &str) -> Option<Strin
         .map(str::to_owned)
 }
 
+/// R35: a duplicate agent ID is a conflict, and every one of its rows loses its topology facts.
+/// Keyed on the effective agent ID — an explicit `id` collision is the same fault as a legacy
+/// bus-identity collision, and for an unmigrated subject the two keys are the same bytes.
+/// DELTA-003: the migration verb (PR D2) joins the structural archive's frozen IDs to this set,
+/// so a live ID cannot collide with an archived one either.
 fn duplicate_identity_conflicts(
     root: &Path,
     this_host: &str,
@@ -468,7 +490,7 @@ fn duplicate_identity_conflicts(
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for spec in specs {
         grouped
-            .entry(spec.bus_id(this_host))
+            .entry(spec.effective_id(this_host))
             .or_default()
             .push(relative(root, &spec.path));
     }
