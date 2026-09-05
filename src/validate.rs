@@ -234,11 +234,8 @@ pub(crate) fn validate_discovered(
         }
     }
 
-    // 4. Resolved pass: cross-spec + field checks over each agent.
-    let mut seen: HashMap<String, PathBuf> = HashMap::new();
-    // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
-    // makes two unset-host same-identity specs collide (which is the real bug).
-    let collision_host = "";
+    // 4. Resolved pass: cross-spec + field checks over each agent. Catalog-wide uniqueness is
+    //    proved once after this loop, from one address book over the complete prospective catalog.
 
     for s in &d.specs {
         let rp = rel(root, &s.path);
@@ -258,21 +255,6 @@ pub(crate) fn validate_discovered(
             .map(|()| compiled)
             .map_err(|error| format!("{error:#}"))
         });
-
-        // Duplicate bus id — the runner cannot run two agents under one <host>.<identity>.
-        let bid = s.bus_id(collision_host);
-        if let Some(prev) = seen.insert(bid.clone(), s.path.clone()) {
-            issues.push(Issue::error(
-                "dup-id",
-                rp.clone(),
-                ag.clone(),
-                format!(
-                    "duplicate agent id '{}' (also declared in {})",
-                    bid,
-                    rel(root, &prev)
-                ),
-            ));
-        }
 
         if let Some(Err(error)) = &compiled {
             let code = if s.driver.is_some() && s.delivery.is_some() {
@@ -397,12 +379,14 @@ pub(crate) fn validate_discovered(
             && runs_on_selected_host
         {
             let pty_root = crate::run::effective_pty_root(root);
-            let bus_id = compiled.bus_id(host);
+            // Task ids are ownership, so they derive from the agent ID, never from the route.
+            let agent_id = compiled.agent_id(host);
             for task in &compiled.tasks {
                 if task.kind != agent_spec::spec::TaskKind::Pty {
                     continue;
                 }
-                let id = crate::reconcile::resolve_task_id(&bus_id, &task.name, task.id.as_deref());
+                let id =
+                    crate::reconcile::resolve_task_id(&agent_id, &task.name, task.id.as_deref());
                 if let Some((socket, over)) = crate::run::session_socket_overage(&pty_root, &id) {
                     issues.push(Issue::error(
                         "socket-path-too-long",
@@ -444,21 +428,21 @@ pub(crate) fn validate_discovered(
                         "supervisor-missing",
                         format!(
                             "supervisor chain from '{}' references a missing or ambiguous parent",
-                            s.bus_id(this_host.unwrap_or_default())
+                            s.agent_id(this_host.unwrap_or_default())
                         ),
                     ),
                     crate::supervisor_chain::SupervisorChainError::Cycle => (
                         "supervisor-cycle",
                         format!(
                             "supervisor chain from '{}' contains a cycle",
-                            s.bus_id(this_host.unwrap_or_default())
+                            s.agent_id(this_host.unwrap_or_default())
                         ),
                     ),
                     crate::supervisor_chain::SupervisorChainError::DepthLimit => (
                         "supervisor-depth",
                         format!(
                             "supervisor chain from '{}' exceeds the maximum depth of {}",
-                            s.bus_id(this_host.unwrap_or_default()),
+                            s.agent_id(this_host.unwrap_or_default()),
                             crate::supervisor_chain::SUPERVISOR_CHAIN_LIMIT
                         ),
                     ),
@@ -479,8 +463,8 @@ pub(crate) fn validate_discovered(
                     ag.clone(),
                     format!(
                         "supervisor chain from '{}' terminates at retired root '{}'; active agents must descend from a counted root",
-                        s.bus_id(this_host.unwrap_or_default()),
-                        chain.last().expect("chain contains at least its start").bus_id(this_host.unwrap_or_default()),
+                        s.agent_id(this_host.unwrap_or_default()),
+                        chain.last().expect("chain contains at least its start").agent_id(this_host.unwrap_or_default()),
                     ),
                 ));
             }
@@ -523,6 +507,110 @@ pub(crate) fn validate_discovered(
                 ),
             ));
         }
+    }
+
+    // Catalog-wide uniqueness, proved once from one address book over the complete prospective
+    // catalog rather than from a second hand-rolled scan. Two namespaces, two admission rules:
+    // agent IDs are catalog-global, effective addresses are unique per logical host among
+    // routable subjects only, and equal bytes across the two namespaces are not a collision. The
+    // empty default host keeps two host-less same-identity declarations colliding, which is the
+    // real bug this catches.
+    //
+    // "Catalog-global" includes the structural archive (R24): an archived subject keeps its ID, so
+    // a live declaration reusing those bytes is a duplicate even though nothing in live discovery
+    // can see it. Archival released its address, so it enters the book non-routable and occupies no
+    // host's address namespace. The archive read is fail-closed by construction — an entry it
+    // cannot explain is an error, never an empty archive — and this proof refuses with it rather
+    // than passing a catalog whose ID namespace it could not read.
+    let prospective = crate::spec::address_book(&d.specs, "").and_then(|live| {
+        let mut subjects = live.subjects().to_vec();
+        subjects.extend(crate::catalog_archive::archived_subjects(root)?);
+        Ok(crate::AddressBook::new(subjects))
+    });
+    match prospective {
+        Ok(book) => {
+            let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+            for (index, spec) in d.specs.iter().enumerate() {
+                by_id.entry(spec.agent_id("")).or_default().push(index);
+            }
+            let declarants = |ids: &[String]| {
+                let mut indexes = ids
+                    .iter()
+                    .flat_map(|id| by_id.get(id).map(Vec::as_slice).unwrap_or_default())
+                    .copied()
+                    .collect::<Vec<_>>();
+                indexes.sort_unstable();
+                indexes
+            };
+            for conflict in book.conflicts() {
+                let (code, ids, holders, message): (_, Vec<String>, _, _) = match &conflict {
+                    agent_spec::UniquenessConflict::DuplicateId { id, count } => (
+                        "dup-id",
+                        vec![id.clone()],
+                        *count,
+                        format!("duplicate agent id '{id}'"),
+                    ),
+                    agent_spec::UniquenessConflict::DuplicateAddress { host, address, ids } => (
+                        "dup-address",
+                        ids.clone(),
+                        ids.len(),
+                        format!(
+                            "effective address '{address}' on host '{}' is claimed by {}",
+                            if host.is_empty() { "<default>" } else { host },
+                            ids.join(", ")
+                        ),
+                    ),
+                };
+                let indexes = declarants(&ids);
+                // Attributed to the last declaration involved, with the earlier ones named — the
+                // author fixes the declaration that arrived into an occupied namespace.
+                let Some((&last, earlier)) = indexes.split_last() else {
+                    // No live declarant at all: every holder is in the structural archive. The
+                    // catalog's global ID namespace is still provably broken — `catalog apply`
+                    // and `publish` refuse it — so it is reported against the catalog root
+                    // rather than silently dropped for want of a declaration path to blame.
+                    issues.push(Issue::error(
+                        code,
+                        ".".to_string(),
+                        None,
+                        format!(
+                            "{message} (held only by {holders} subject(s) in the structural \
+                             archive; no live declaration claims it)"
+                        ),
+                    ));
+                    continue;
+                };
+                let spec = &d.specs[last];
+                let others = earlier
+                    .iter()
+                    .map(|&index| rel(root, &d.specs[index].path))
+                    .collect::<Vec<_>>();
+                // An archived holder has no live declaration path, so it is named as what it is
+                // rather than being silently dropped from the explanation.
+                let mut message = message;
+                if !others.is_empty() {
+                    message = format!("{message} (also declared in {})", others.join(", "));
+                }
+                if holders > indexes.len() {
+                    message = format!(
+                        "{message} (also held by {} subject(s) in the structural archive)",
+                        holders - indexes.len()
+                    );
+                }
+                issues.push(Issue::error(
+                    code,
+                    rel(root, &spec.path),
+                    Some(spec.identity.clone()),
+                    message,
+                ));
+            }
+        }
+        Err(error) => issues.push(Issue::error(
+            "uniqueness-unprovable",
+            ".".to_string(),
+            None,
+            format!("catalog-global identity uniqueness cannot be proved: {error:#}"),
+        )),
     }
 
     if let Some(host) = this_host {

@@ -546,12 +546,13 @@ impl PtyCli {
             Some(Some(None)) => {
                 cmd.arg("--no-display-name");
             }
-            // Secondary tasks retain the established task-specific presentation convention.
-            _ if target.pty_id == target.bus_id => {
+            // Secondary tasks retain the established task-specific presentation convention: the
+            // owner's human route, never its opaque ID.
+            _ if target.pty_id == target.agent_id => {
                 cmd.arg("--no-display-name");
             }
             _ => {
-                cmd.args(["--name", &target.bus_id]);
+                cmd.args(["--name", &target.bus_address]);
             }
         }
         cmd.arg("--cwd").arg(&cwd);
@@ -1143,22 +1144,13 @@ pub fn exec_state_dir(host: &str) -> PathBuf {
 pub struct CrashLoop {
     /// The parked task's pty id.
     pub pty_id: String,
-    /// The owning agent's identity and (declared) host — resolved to a bus id when surfacing.
-    pub identity: String,
-    pub host: Option<String>,
-    /// The agent's `supervisor` (from its spec), the crash-ding recipient. `None` → nobody to notify.
-    pub supervisor: Option<String>,
-}
-
-impl CrashLoop {
-    /// The parked agent's bus id (`<host>.<identity>`), using `this_host` when the spec omits a host.
-    pub fn agent_bus_id(&self, this_host: &str) -> String {
-        format!(
-            "{}.{}",
-            self.host.as_deref().unwrap_or(this_host),
-            self.identity
-        )
-    }
+    /// The immutable agent ID that owns the parked task. Park accounting is ownership, so this is
+    /// stable across an address change and needs no host qualification.
+    pub agent_id: String,
+    /// Where the crash-ding goes, already resolved from the declaration's `supervisor` reference
+    /// against the same catalog snapshot the plan came from. Storing the raw reference here is the
+    /// bug this type exists to prevent: the notifier resolves by exact ID and would drop the alert.
+    pub supervisor: crate::reconcile::SupervisorTarget,
 }
 
 /// Owned, human-readable summary of one reconcile+execute pass (no borrows of the plan/specs).
@@ -1466,9 +1458,8 @@ fn execute_with_presentation_cursor(
                         report.flapping.push(target.pty_id.clone());
                         report.crash_loops.push(CrashLoop {
                             pty_id: target.pty_id.clone(),
-                            identity: launch.spec.identity.clone(),
-                            host: launch.spec.host.clone(),
-                            supervisor: launch.spec.supervisor.clone(),
+                            agent_id: target.agent_id.clone(),
+                            supervisor: launch.supervisor.clone(),
                         });
                     }
                     if target.name == "agent" && !target.derived {
@@ -1709,10 +1700,11 @@ fn live_resync_specs(
                 if task.name != "agent" {
                     return false;
                 }
-                let task_id = task
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                let task_id = crate::reconcile::resolve_task_id(
+                    &spec.agent_id(this_host),
+                    &task.name,
+                    task.id.as_deref(),
+                );
                 live_task_ids.contains(task_id.as_str())
             })
         })
@@ -1888,7 +1880,7 @@ fn reconcile_pass(
     }
     let eligible_specs = compiled_specs
         .iter()
-        .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
+        .filter(|spec| !materialized.failed_agents.contains(&spec.agent_id(this_host)))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -2810,7 +2802,7 @@ pub fn down_specs(
 }
 
 /// Shared teardown core: kill every live task session declared on this host. Task session ids are
-/// derived identically to how reconcile spawns them (explicit `task.id`, else `<bus_id>.<task>`), so
+/// derived identically to how reconcile spawns them (explicit `task.id`, else `<agent-id>.<task>`), so
 /// the catalog `down` and the spec `down_specs` tear down exactly what `up`/`up_*_specs` launched.
 fn teardown_specs(
     specs: &[agent_spec::spec::AgentSpec],
@@ -2829,12 +2821,9 @@ fn teardown_specs(
             report.other_host.push(spec.identity.clone());
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
         for task in &spec.tasks {
-            let id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            let id = crate::reconcile::resolve_task_id(&agent_id, &task.name, task.id.as_deref());
             if live.contains(&id) {
                 match runner.kill(&id) {
                     Ok(()) => report.torn_down.push(id),
@@ -2900,8 +2889,17 @@ fn wait_for_reconcile(rx: &Receiver<()>, interval: Duration, stop: &AtomicBool) 
     }
 }
 
-/// Install independent commit and declaration wake channels. Each channel diagnoses and retries
-/// its own setup failure while the timer remains the correctness fallback for both.
+/// Best-effort supervisor watch over BOTH reconciliation inputs: the catalog generation a
+/// completed `st2` publication bumps, and the declaration space a human edits directly. Each
+/// channel installs on its own backend instance, so exhausting inotify limits on a large
+/// declaration space still leaves cooperative catalog commits waking the loop immediately, and a
+/// catalog with no control directory yet still gets declaration wakeups.
+///
+/// Installation never fails the supervisor and never blocks on a catalog writer: the watcher
+/// diagnoses each channel's failure once and reconciliation continues on the timer alone rather
+/// than silently losing immediate wakeups forever. `refresh` re-attempts a missing channel after
+/// every pass, so a control directory created (or replaced by a transaction) later becomes
+/// watched without a supervisor restart.
 fn best_effort_catalog_watcher(
     root: &Path,
     tx: Sender<()>,
@@ -2927,8 +2925,9 @@ impl RecurringWarnings {
     }
 }
 
-/// The supervisor loop: reconcile on a timer AND on folder changes until interrupted. The fs-watch is
-/// best-effort; the `interval` timer is the always-on fallback. `on_report` is called once per pass
+/// The supervisor loop: reconcile on a timer AND on catalog changes — a committed catalog
+/// generation or a direct declaration edit — until interrupted. The fs-watch is best-effort; the
+/// `interval` timer is the always-on fallback. `on_report` is called once per pass
 pub fn up_loop(
     root: &Path,
     this_host: &str,
@@ -3085,19 +3084,42 @@ fn up_loop_until(
 /// be watching (the exact miss that let a 45-min outage run). Best-effort — a missing supervisor,
 /// an unresolvable supervisor, or a send failure is logged, never fatal. Dedup (once per park) is the
 /// caller's job.
+///
+/// The recipient arrives already resolved to an immutable agent ID (see
+/// [`crate::reconcile::SupervisorTarget`]). An authored `supervisor` is a human reference, so
+/// resolving it here — against a catalog generation newer than the one that decided the park —
+/// would be a second, disagreeing resolution; and passing the raw reference to the exact-ID
+/// lookup below would silently drop the alert for every declaration that names its parent by
+/// address rather than by ID.
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
-    let agent = cl.agent_bus_id(this_host);
-    let Some(supervisor) = cl.supervisor.as_deref() else {
-        tracing::warn!(
-            "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
-            cl.pty_id
-        );
-        return;
+    let agent = cl.agent_id.as_str();
+    let supervisor = match &cl.supervisor {
+        crate::reconcile::SupervisorTarget::Undeclared => {
+            tracing::warn!(
+                "st2: crash-loop '{}' ({agent}) has no supervisor to notify.",
+                cl.pty_id
+            );
+            return;
+        }
+        // Loud, not silent: an unresolvable parent means a real park went unreported, and the
+        // operator has to repair the declaration before any future park is delivered either.
+        crate::reconcile::SupervisorTarget::Unresolved(reference) => {
+            tracing::error!(
+                "st2: crash-loop '{}' ({agent}) NOT reported: its declared supervisor '{reference}' \
+                 resolves to no single subject in this catalog. Repair the `supervisor` reference \
+                 (an exact agent ID, or an address unique on its host) — until then every park of \
+                 this agent goes unnotified.",
+                cl.pty_id
+            );
+            return;
+        }
+        crate::reconcile::SupervisorTarget::Resolved(id) => id.as_str(),
     };
     let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
     else {
-        tracing::warn!(
-            "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",
+        tracing::error!(
+            "st2: crash-loop '{}' ({agent}) NOT reported: supervisor ID '{supervisor}' has no \
+             agent directory in the catalog to notify.",
             cl.pty_id
         );
         return;
@@ -3260,7 +3282,8 @@ mod tests {
         TaskTarget {
             kind: TaskKind::Pty,
             pty_id: id.to_string(),
-            bus_id: "hetz.demo".to_string(),
+            agent_id: "hetz.demo".to_string(),
+            bus_address: "hetz.demo".to_string(),
             name: "agent".to_string(),
             derived: false,
             launch: TaskLaunch::Shell(cmd.to_string()),
@@ -3398,6 +3421,8 @@ mod tests {
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
+            id: None,
+            address: None,
             identity: "codex".into(),
             name: None,
             description: None,
@@ -3455,6 +3480,8 @@ mod tests {
     #[test]
     fn selected_identity_conflict_refuses_before_hook_verification_or_inventory() {
         let mut spec = AgentSpec {
+            id: None,
+            address: None,
             identity: "codex".into(),
             name: None,
             description: None,
@@ -3587,6 +3614,114 @@ mod tests {
             "a disconnected watcher channel must fall back to timer cadence, not spin: \
              {passes} passes in ~350ms at a 100ms interval"
         );
+    }
+
+    /// The production installer must carry the catalog-GENERATION channel, not declarations alone.
+    /// A cooperative `st2` publication lands its declarations inside a staged tree and publishes
+    /// them by bumping `.st2/catalog-generation` — a control path the declaration walk deliberately
+    /// prunes. With only the declaration channel wired, a completed transaction waited for the
+    /// timer; the 60s interval here makes any second pass proof that the generation watch woke it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_committed_catalog_generation_wakes_the_production_supervisor_watch() {
+        let catalog = tempfile::tempdir().unwrap();
+        let control = catalog.path().join(crate::catalog_lock::CONTROL_DIR);
+        std::fs::create_dir(&control).unwrap();
+        std::fs::write(control.join(crate::catalog_lock::GENERATION_FILE), "1\n").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut passes = 0usize;
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            let control = control.clone();
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                let staged = control.join("next-generation");
+                std::fs::write(&staged, "2\n").unwrap();
+                std::fs::rename(&staged, control.join(crate::catalog_lock::GENERATION_FILE))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                stop.store(true, Ordering::SeqCst);
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &SpawnCountingRunner::default(),
+                Duration::from_secs(60),
+                &stop,
+                best_effort_catalog_watcher,
+                |_| {
+                    passes += 1;
+                    let _ = started_tx.try_send(());
+                },
+            )
+            .unwrap();
+        });
+
+        assert!(
+            (2..=3).contains(&passes),
+            "a committed catalog generation must wake a further pass well inside the 60s timer, \
+             without spinning: {passes} passes"
+        );
+    }
+
+    /// Prompt catalog convergence: publishing a declaration wakes the supervisor and launches it
+    /// on the very next pass, not on the 60s timer.
+    ///
+    /// The launched task ID is the agent ID. This declaration is compact and unmigrated, so its
+    /// agent ID is exactly the frozen `<host>.<identity>` bytes and the canonical compact task ID
+    /// is that same value — which is why the expected ID is unchanged by DELTA-003.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_wakes_and_launches_a_new_direct_declaration() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent = catalog.path().join("agents/test-host/live");
+        let stop = AtomicBool::new(false);
+        let runner = SpawnCountingRunner::default();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let mut passes = 0usize;
+
+        std::thread::scope(|scope| {
+            let watchdog_stop = &stop;
+            scope.spawn(move || {
+                if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                    watchdog_stop.store(true, Ordering::SeqCst);
+                }
+            });
+            up_loop_until(
+                catalog.path(),
+                "test-host",
+                &runner,
+                Duration::from_secs(60),
+                &stop,
+                best_effort_catalog_watcher,
+                |report| {
+                    passes += 1;
+                    match passes {
+                        1 => {
+                            std::fs::create_dir_all(&agent).unwrap();
+                            std::fs::write(
+                                agent.join("agent.kdl"),
+                                r#"agent "live" { host "test-host"; command "x" }"#,
+                            )
+                            .unwrap();
+                        }
+                        2 => {
+                            assert_eq!(report.launched, ["test-host.live"]);
+                            let _ = done_tx.send(());
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        _ => panic!("one direct declaration must cause exactly one prompt pass"),
+                    }
+                },
+            )
+            .unwrap();
+        });
+
+        assert_eq!(passes, 2, "the 60s timer must not be the publication path");
+        assert_eq!(runner.spawned.borrow().as_slice(), ["test-host.live"]);
     }
 
     #[cfg(target_os = "linux")]
@@ -3853,6 +3988,7 @@ mod tests {
                     spec,
                     tasks: vec![target("hetz.demo.agent", "x")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 }],
                 ..ReconcilePlan::default()
             }
@@ -3973,6 +4109,7 @@ mod tests {
                     spec,
                     tasks: vec![target("hetz.demo.agent", "x")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 }],
                 ..ReconcilePlan::default()
             }
@@ -4012,6 +4149,8 @@ mod tests {
 
     fn spec_fixture() -> AgentSpec {
         AgentSpec {
+            id: None,
+            address: None,
             identity: "demo".into(),
             name: None,
             description: None,
@@ -4041,6 +4180,7 @@ mod tests {
             spec: &legacy_spec,
             tasks: Vec::new(),
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         };
         let mut omp_argv = target("hetz.demo.agent", "unused");
         omp_argv.launch = TaskLaunch::Argv(vec![
@@ -4079,6 +4219,7 @@ mod tests {
             spec: &typed_spec,
             tasks: Vec::new(),
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         };
         assert_eq!(
             driver_label(&typed_launch, &target("hetz.demo.agent", "claude")),
@@ -4455,9 +4596,7 @@ mod tests {
             write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
         let specs = crate::discover_strict(catalog.path()).specs;
         let task_id = |spec: &AgentSpec, task: &Task| {
-            task.id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name))
+            crate::reconcile::resolve_task_id(&spec.agent_id("hetz"), &task.name, task.id.as_deref())
         };
         let mut sessions = Vec::new();
         for spec in &specs {
@@ -4583,10 +4722,11 @@ mod tests {
                 .filter(|spec| spec.desired_state.is_running())
                 .flat_map(|spec| {
                     spec.tasks.iter().map(|task| {
-                        let id = task
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name));
+                        let id = crate::reconcile::resolve_task_id(
+                            &spec.agent_id("hetz"),
+                            &task.name,
+                            task.id.as_deref(),
+                        );
                         sess(&id, true)
                     })
                 })
@@ -4927,6 +5067,7 @@ mod tests {
                 spec: worker,
                 tasks: vec![target("hetz.worker.agent", "agent"), later],
                 live_derived: Vec::new(),
+                supervisor: crate::reconcile::SupervisorTarget::Undeclared,
             }],
             ..ReconcilePlan::default()
         };
@@ -4980,11 +5121,13 @@ mod tests {
                     spec: first,
                     tasks: vec![target("hetz.first.agent", "agent")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 },
                 Launch {
                     spec: second,
                     tasks: vec![target("hetz.second.agent", "agent")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 },
             ],
             ..ReconcilePlan::default()
@@ -5035,11 +5178,13 @@ mod tests {
                     spec: first,
                     tasks: vec![target("hetz.first.agent", "agent")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 },
                 Launch {
                     spec: second,
                     tasks: vec![target("hetz.second.agent", "agent")],
                     live_derived: Vec::new(),
+                    supervisor: crate::reconcile::SupervisorTarget::Undeclared,
                 },
             ],
             ..ReconcilePlan::default()
@@ -5264,6 +5409,7 @@ mod tests {
                 spec,
                 tasks: vec![target("hetz.worker.agent", "agent"), derived],
                 live_derived: Vec::new(),
+                supervisor: crate::reconcile::SupervisorTarget::Undeclared,
             }],
             ..ReconcilePlan::default()
         };
@@ -5420,6 +5566,7 @@ mod tests {
             spec: &spec,
             tasks: vec![target("hetz.demo.agent", "x")],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(2));
         assert!(
@@ -5446,11 +5593,13 @@ mod tests {
             spec: &left,
             tasks: vec![left_agent],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         plan.launch.push(Launch {
             spec: &right,
             tasks: vec![right_agent],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         let expected = plan
             .launch
@@ -5485,6 +5634,7 @@ mod tests {
             spec: &spec,
             tasks: vec![ding],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         let mut report = UpReport::default();
 
@@ -5514,11 +5664,13 @@ mod tests {
             spec: &codex,
             tasks: vec![codex_agent],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         plan.launch.push(Launch {
             spec: &claude,
             tasks: vec![claude_agent],
             live_derived: Vec::new(),
+            supervisor: crate::reconcile::SupervisorTarget::Undeclared,
         });
         let mut report = UpReport::default();
 
@@ -5579,17 +5731,28 @@ mod tests {
 
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "codex");
-        t.bus_id = "hetz.demo".to_owned();
+        t.agent_id = "hetz.demo".to_owned();
+        t.bus_address = "hetz.demo".to_owned();
         t.tags
             .insert("unrelated".to_owned(), "preserved".to_owned());
         t.presentation = Some(PtyPresentation {
             pty_id: "hetz.demo".to_owned(),
             display_name: Some(Some("Build owner".to_owned())),
             tags: BTreeMap::from([
-                ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
-                ("agent.actor.path".to_owned(), Some("hetz.demo".to_owned())),
                 (
-                    "agent.presentation.description".to_owned(),
+                    crate::reconcile::AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                    Some(crate::reconcile::AGENT_PRESENTATION_SCHEMA.to_owned()),
+                ),
+                (
+                    crate::reconcile::AGENT_ACTOR_ID_TAG.to_owned(),
+                    Some("hetz.demo".to_owned()),
+                ),
+                (
+                    crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    Some("hetz.demo".to_owned()),
+                ),
+                (
+                    crate::reconcile::AGENT_DESCRIPTION_TAG.to_owned(),
                     Some(format!("${key}")),
                 ),
             ]),
@@ -5608,8 +5771,13 @@ mod tests {
             .map(|pair| pair[1].as_str())
             .collect::<BTreeSet<_>>();
         assert!(tags.contains("unrelated=preserved"));
-        assert!(tags.contains("agent.presentation.schema=1"));
-        assert!(tags.contains("agent.actor.path=hetz.demo"));
+        assert!(tags.contains("agent.presentation.schema=2"));
+        assert!(tags.contains("agent.actor.id=hetz.demo"));
+        assert!(tags.contains("agent.actor.address=hetz.demo"));
+        assert!(
+            !tags.iter().any(|tag| tag.starts_with("agent.actor.path")),
+            "schema 1's actor path is replaced, not carried alongside: {tags:?}"
+        );
         assert!(tags.contains("agent.presentation.description=$ST2_TEST_PRESENTATION_LITERAL_71c"));
     }
 
@@ -5633,8 +5801,11 @@ mod tests {
             pty_id: "stable.agent.id".to_owned(),
             display_name: Some(None),
             tags: BTreeMap::from([
-                ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
-                ("agent.presentation.description".to_owned(), None),
+                (
+                    crate::reconcile::AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                    Some(crate::reconcile::AGENT_PRESENTATION_SCHEMA.to_owned()),
+                ),
+                (crate::reconcile::AGENT_DESCRIPTION_TAG.to_owned(), None),
             ]),
         };
 
@@ -5648,7 +5819,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(executable.with_extension("stdin")).unwrap())
                 .unwrap();
         assert_eq!(payload["displayName"], serde_json::Value::Null);
-        assert_eq!(payload["tags"]["agent.presentation.schema"], "1");
+        assert_eq!(payload["tags"]["agent.presentation.schema"], "2");
         assert_eq!(
             payload["tags"]["agent.presentation.description"],
             serde_json::Value::Null
@@ -6189,7 +6360,7 @@ mod tests {
     fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "exec codex 'boot'");
-        t.bus_id = t.pty_id.clone();
+        t.agent_id = t.pty_id.clone();
         t.presentation = Some(PtyPresentation {
             pty_id: t.pty_id.clone(),
             display_name: Some(Some(t.pty_id.clone())),
@@ -6585,7 +6756,7 @@ mod tests {
         std::fs::write(
             &fake,
             r#"#!/bin/sh
-printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"1","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"2","agent.actor.id":"h.live","agent.actor.address":"h.build","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
 "#,
         )
         .unwrap();
@@ -6619,7 +6790,18 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
                 .tags
                 .get("agent.presentation.schema")
                 .map(String::as_str),
-            Some("1")
+            Some("2")
+        );
+        assert_eq!(
+            presentation.tags.get("agent.actor.id").map(String::as_str),
+            Some("h.live")
+        );
+        assert_eq!(
+            presentation
+                .tags
+                .get("agent.actor.address")
+                .map(String::as_str),
+            Some("h.build")
         );
         assert_eq!(
             presentation.tags.get("unrelated").map(String::as_str),
@@ -6663,5 +6845,163 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
             batch.observations[0].state,
             ObservedState::Indeterminate(_)
         ));
+    }
+
+    /// The canonical compact agent task maps `name` to native `displayName`; the secondary PTY
+    /// keeps the established convention of showing its owner's human route.
+    #[test]
+    fn only_the_canonical_task_takes_a_native_display_name_from_the_agent_name() {
+        let cli = PtyCli::default();
+
+        let mut canonical = target("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "codex");
+        canonical.agent_id = canonical.pty_id.clone();
+        canonical.bus_address = "dev3.fractal.keymap.verifier".to_owned();
+        canonical.presentation = Some(PtyPresentation {
+            pty_id: canonical.pty_id.clone(),
+            display_name: Some(Some("Keymap verifier".to_owned())),
+            tags: BTreeMap::new(),
+        });
+        let args = cli
+            .build_run_command(&canonical, Path::new("/cat/dev3/worker"))
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        assert_eq!(args[name + 1], "Keymap verifier");
+
+        let mut secondary = target("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1.ding", "true");
+        secondary.agent_id = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".to_owned();
+        secondary.bus_address = "dev3.fractal.keymap.verifier".to_owned();
+        secondary.name = "ding".to_owned();
+        let args = cli
+            .build_run_command(&secondary, Path::new("/cat/dev3/worker"))
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let name = args.iter().position(|arg| arg == "--name").unwrap();
+        assert_eq!(
+            args[name + 1], "dev3.fractal.keymap.verifier",
+            "a secondary PTY displays the owner's route, not its opaque ID"
+        );
+    }
+
+    /// The spawn-time tag projection is the same snapshot the later metadata patch applies:
+    /// unrelated task tags survive, and an owned key whose value is absent is not written.
+    #[test]
+    fn spawn_tags_preserve_unrelated_keys_and_omit_absent_owned_values() {
+        let cli = PtyCli::default();
+        let mut t = target("dev3.worker", "codex");
+        t.agent_id = "dev3.worker".to_owned();
+        t.bus_address = "dev3.worker".to_owned();
+        t.tags.insert("role".to_owned(), "stale".to_owned());
+        t.tags
+            .insert("unrelated".to_owned(), "preserved".to_owned());
+        t.presentation = Some(PtyPresentation {
+            pty_id: t.pty_id.clone(),
+            display_name: Some(None),
+            tags: BTreeMap::from([
+                (
+                    crate::reconcile::AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                    Some(crate::reconcile::AGENT_PRESENTATION_SCHEMA.to_owned()),
+                ),
+                (
+                    crate::reconcile::AGENT_ACTOR_ID_TAG.to_owned(),
+                    Some("dev3.worker".to_owned()),
+                ),
+                // A non-routable subject has released its address.
+                (crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(), None),
+                (crate::reconcile::AGENT_DESCRIPTION_TAG.to_owned(), None),
+                (crate::reconcile::COMPATIBILITY_ROLE_TAG.to_owned(), None),
+            ]),
+        });
+
+        let args = cli
+            .build_run_command(&t, Path::new("/cat/dev3/worker"))
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let tags = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--tag")
+            .map(|pair| pair[1].as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(tags.contains("unrelated=preserved"));
+        assert!(tags.contains("agent.presentation.schema=2"));
+        assert!(tags.contains("agent.actor.id=dev3.worker"));
+        assert!(
+            !tags
+                .iter()
+                .any(|tag| tag.starts_with("agent.actor.address")),
+            "an absent owned value is removed, never written empty: {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|tag| tag.starts_with("agent.presentation.description")),
+            "an absent description is removed: {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|tag| tag.starts_with("role=")),
+            "a non-canonical PTY has the compatibility role cleared: {tags:?}"
+        );
+    }
+
+    /// A projection-only pass is not lifecycle work: it patches metadata and records nothing in
+    /// launch, teardown, garbage collection, or flapping accounting.
+    #[test]
+    fn a_presentation_only_pass_stays_out_of_lifecycle_accounting() {
+        struct PatchOnly {
+            patched: RefCell<Vec<String>>,
+        }
+        impl Runner for PatchOnly {
+            fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+                unreachable!("presentation execution does not list sessions")
+            }
+            fn spawn(&self, _: &TaskTarget, _: &Path) -> anyhow::Result<()> {
+                unreachable!("a presentation-only plan must not spawn")
+            }
+            fn kill(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!("a presentation-only plan must not kill")
+            }
+            fn remove(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!("a presentation-only plan must not remove")
+            }
+            fn patch_presentation(&self, presentation: &PtyPresentation) -> anyhow::Result<()> {
+                self.patched.borrow_mut().push(presentation.pty_id.clone());
+                Ok(())
+            }
+        }
+
+        let plan = ReconcilePlan {
+            presentation: vec![PtyPresentation {
+                pty_id: "dev3.worker".to_owned(),
+                display_name: None,
+                tags: BTreeMap::from([(
+                    crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    Some("dev3.renamed".to_owned()),
+                )]),
+            }],
+            ..Default::default()
+        };
+        let runner = PatchOnly {
+            patched: RefCell::new(Vec::new()),
+        };
+        let mut report = UpReport::default();
+        execute_with_presentation_cursor(
+            &plan,
+            &runner,
+            &mut FlappingCap::default(),
+            &mut PresentationPatchCursor::default(),
+            &mut report,
+            &mut |_| {},
+        );
+
+        assert_eq!(runner.patched.borrow().as_slice(), ["dev3.worker"]);
+        assert!(report.launched.is_empty());
+        assert!(report.restarted.is_empty());
+        assert!(report.torn_down.is_empty());
+        assert!(report.gc.is_empty());
+        assert!(report.flapping.is_empty());
+        assert!(report.crash_loops.is_empty());
+        assert!(report.errors.is_empty());
     }
 }

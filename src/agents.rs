@@ -15,7 +15,8 @@ use crate::{AgentSpec, Discovered, Resource, driver_diagnostic, harness_context,
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
-    /// The bus id — `<host>.<identity>`.
+    /// The positional `<host>.<identity>` declaration key — the legacy address fallback and the
+    /// bytes legacy-ID migration freezes. Not the subject's immutable identity.
     pub identity: String,
     /// Declaration source used to attribute this runtime observation.
     pub source_path: PathBuf,
@@ -51,10 +52,19 @@ pub struct AgentRow {
     /// three. `None` means no record exists; a record past its horizon is still reported, marked
     /// stale and carrying its age, so it survives every `observedState: unknown` derivation.
     pub context: Option<harness_context::Observed>,
+    /// The catalog-global immutable agent ID: what owns this agent's runtime, durable state,
+    /// graph edges, and automation. Equal to `identity` for an unmigrated declaration by
+    /// construction, which is why migration moves no state.
+    pub id: String,
+    /// The effective host-local address: the explicit declared `address`, else `identity`.
+    pub address: String,
+    /// The qualified human route `<host>.<effective-address>`, or `None` for a proved
+    /// non-routable subject. A retired subject releases its address but keeps its ID.
+    pub bus_address: Option<String>,
 }
 
-/// Every agent in the catalog, sorted by bus id, with presence + enrich data computed. Read-only:
-/// walks discovered specs and each agent's resources, mutating nothing.
+/// Every agent in the catalog, sorted by positional declaration key, with presence + enrich data
+/// computed. Read-only: walks discovered specs and each agent's resources, mutating nothing.
 pub fn roster(catalog_root: &Path, this_host: &str) -> Vec<AgentRow> {
     let found = crate::discover(catalog_root);
     roster_from_discovered(&found, catalog_root, this_host)
@@ -76,7 +86,7 @@ pub fn roster_from_discovered(
         .filter_map(|s| {
             let agent_dir = s.path.parent()?;
             Some(AgentRow {
-                identity: s.bus_id(this_host),
+                identity: s.legacy_bus_identity(this_host),
                 source_path: s.path.clone(),
                 status: status::read_state(&status::status_path(agent_dir)),
                 name: s.name.clone(),
@@ -103,6 +113,12 @@ pub fn roster_from_discovered(
                 // Read independently of the state record above: the wedge case this exists for is
                 // an agent whose state has gone indeterminate at 190k of a 200k window.
                 context: harness_context::read(&harness_context::harness_context_path(agent_dir)),
+                id: s.agent_id(this_host),
+                address: s.effective_address().to_owned(),
+                // Routability, not presence: a retired subject releases its effective address, so
+                // it has no human route at all while keeping its ID and staying reachable by it.
+                bus_address: (!s.desired_state.is_retired())
+                    .then(|| s.bus_address(this_host)),
             })
         })
         .collect();
@@ -306,7 +322,9 @@ fn resource_json(row: &AgentRow) -> Vec<ResourceJson<'_>> {
         .collect()
 }
 
-/// `st2 agents --json` row. Field order and names are the stable wire contract.
+/// `st2 agents --json` row. Field order and names are the stable wire contract: `identity` keeps
+/// its meaning — the positional `<host>.<identity>` declaration key — and the immutable-ID axis is
+/// appended rather than substituted, so an existing consumer keeps reading what it read before.
 #[derive(Serialize)]
 struct SummaryJson<'a> {
     identity: &'a str,
@@ -324,6 +342,12 @@ struct SummaryJson<'a> {
     #[serde(rename = "driverDiagnostic")]
     driver_diagnostic: DriverDiagnosticJson<'a>,
     context: Option<ContextJson<'a>>,
+    id: &'a str,
+    address: &'a str,
+    /// `null` for a proved non-routable retired subject: it has released its address, which is
+    /// different from having one nobody answered.
+    #[serde(rename = "busAddress")]
+    bus_address: Option<&'a str>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -347,6 +371,10 @@ struct EnrichedJson<'a> {
     #[serde(rename = "driverDiagnostic")]
     driver_diagnostic: DriverDiagnosticJson<'a>,
     context: Option<ContextJson<'a>>,
+    id: &'a str,
+    address: &'a str,
+    #[serde(rename = "busAddress")]
+    bus_address: Option<&'a str>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -368,6 +396,9 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
                 driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
                 context: ContextJson::from_row(r.context.as_ref()),
+                id: &r.id,
+                address: &r.address,
+                bus_address: r.bus_address.as_deref(),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -386,6 +417,9 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 observed_state: ObservedJson::from_row(r.observed.as_ref()),
                 driver_diagnostic: DriverDiagnosticJson::from_row(&r.driver_diagnostic),
                 context: ContextJson::from_row(r.context.as_ref()),
+                id: &r.id,
+                address: &r.address,
+                bus_address: r.bus_address.as_deref(),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -467,6 +501,14 @@ mod tests {
             observed: None,
             driver_diagnostic: driver_diagnostic::Observed::Absent,
             context: None,
+            // An unmigrated declaration's ID is exactly its positional key; its effective address
+            // is the bare identity, and only a routable subject has a bus address at all.
+            id: identity.to_string(),
+            address: identity
+                .split_once('.')
+                .map_or(identity, |(_, bare)| bare)
+                .to_string(),
+            bus_address: (!retired).then(|| identity.to_string()),
         }
     }
 
@@ -487,11 +529,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -514,7 +556,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
     }
 
@@ -532,6 +574,9 @@ mod tests {
             0,
         );
         wedged.observed = Some(harness_state::Observed {
+            subject: Some(harness_state::RecordSubject::BusIdentity(
+                "hetz.worker".into(),
+            )),
             state: harness_state::Activity::Idle,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Empty,
@@ -544,15 +589,16 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
         derived.observed = Some(harness_state::Observed {
+            subject: None,
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -564,7 +610,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
         );
     }
 
@@ -576,6 +622,7 @@ mod tests {
     fn context_is_a_fourth_axis_that_survives_an_indeterminate_observed_state() {
         let mut wedged = row("hetz.worker", State::Busy, None, false, None, 0);
         wedged.observed = Some(harness_state::Observed {
+            subject: None,
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -586,6 +633,7 @@ mod tests {
             reason: Some("session-dead".to_string()),
         });
         wedged.context = Some(harness_context::Observed {
+            subject: harness_state::RecordSubject::BusIdentity("hetz.worker".into()),
             harness: harness_context::Harness::Codex,
             used_tokens: Some(92283),
             window_tokens: Some(258400),
@@ -640,6 +688,7 @@ mod tests {
         // A percent above the window rides the wire raw, and a stale reading keeps its age.
         let mut overrun = row("hetz.pi", State::Available, None, false, None, 0);
         overrun.context = Some(harness_context::Observed {
+            subject: harness_state::RecordSubject::BusIdentity("hetz.pi".into()),
             harness: harness_context::Harness::Pi,
             used_tokens: Some(23424),
             window_tokens: Some(4000),
@@ -673,6 +722,9 @@ mod tests {
     fn exhausted_claude_rate_limit_is_explicit_beside_active_state() {
         let mut limited = row("hetz.worker", State::Available, None, false, None, 0);
         limited.observed = Some(harness_state::Observed {
+            subject: Some(harness_state::RecordSubject::BusIdentity(
+                "hetz.worker".into(),
+            )),
             state: harness_state::Activity::Active,
             blocked_on: harness_state::BlockedOn::None,
             input_buffer: harness_state::InputBuffer::Unknown,
@@ -683,6 +735,7 @@ mod tests {
             reason: None,
         });
         limited.context = Some(harness_context::Observed {
+            subject: harness_state::RecordSubject::BusIdentity("hetz.worker".into()),
             harness: harness_context::Harness::Claude,
             used_tokens: Some(194_763),
             window_tokens: Some(1_000_000),

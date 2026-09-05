@@ -41,6 +41,27 @@ fn write_agent_with_goal_scheme(root: &Path) -> PathBuf {
     dir
 }
 
+/// A migrated subject: an explicit immutable `id` plus a mutable `address`.
+fn write_migrated_agent(root: &Path, address: &str) -> PathBuf {
+    let dir = root.join("agents/hetz/worker");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("agent.kdl"),
+        format!(
+            r#"agent "worker" {{
+  id "worker-uuid"
+  address "{address}"
+  host "hetz"
+  command "agent"
+  resource "goal" uri="resources/goal.md" reason="Mission."
+}}"#
+        ),
+    )
+    .unwrap();
+    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    dir
+}
+
 fn resync_events(agent_dir: &Path) -> Vec<String> {
     let inbox = agent_dir.join("resources/inbox");
     let mut subjects = Vec::new();
@@ -107,7 +128,7 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     let error = st2::event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "resync",
         "forged-resync",
         Some("goal"),
@@ -334,4 +355,52 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     assert!(registry
         .try_resolve(broken_dir.parent().unwrap(), "dev.schickling.agent-goal://hetz/w")
         .is_err());
+}
+
+/// A resync subscription is ownership, so it keys on the immutable agent ID. Changing the
+/// subject's address is an immediate cutover of its human route and nothing else: the same watch
+/// set stays installed under the same key, and the event still lands in the same agent's inbox.
+#[test]
+fn an_address_change_keeps_the_subscription_and_its_delivery_target() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent_dir = write_migrated_agent(catalog.path(), "chat");
+    let registry = Default::default();
+
+    let before = st2::discover_strict(catalog.path()).specs;
+    assert_eq!(
+        st2::resync::watch_set_for(&before[0], "hetz", &registry).agent_id,
+        "worker-uuid",
+        "the subscription key is the immutable ID, never the route"
+    );
+
+    let supervisor =
+        st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
+    assert!(
+        supervisor
+            .refresh(&before, &before, "hetz", &[], &[])
+            .is_empty()
+    );
+
+    // Cut the address over, then re-refresh from the new catalog generation.
+    write_migrated_agent(catalog.path(), "renamed");
+    let after = st2::discover_strict(catalog.path()).specs;
+    assert_eq!(
+        st2::resync::watch_set_for(&after[0], "hetz", &registry).agent_id,
+        "worker-uuid",
+        "an address change must not move the subscription to a new key"
+    );
+    assert!(
+        supervisor
+            .refresh(&after, &after, "hetz", &[], &[])
+            .is_empty()
+    );
+
+    // A carrier change after the cutover still reaches this subject's own inbox.
+    let goal = agent_dir.join("resources/goal.md");
+    fs::create_dir_all(goal.parent().unwrap()).unwrap();
+    fs::write(&goal, "mission changed\n").unwrap();
+    assert!(
+        wait_for(|| resync_events(&agent_dir).len(), 1),
+        "the resync event must still be delivered after the address cutover"
+    );
 }

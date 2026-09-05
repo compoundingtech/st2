@@ -14,8 +14,14 @@ fn st2() -> Command {
     Command::new(env!("CARGO_BIN_EXE_st2"))
 }
 
+/// The minted immutable ID every `worker` fixture publishes under. Creation requires a generated
+/// canonical UUIDv7: a brand-new subject's ID is never derived from its placement.
+const WORKER_ID: &str = "01930000-0000-7000-8000-000000000001";
+
 fn valid_spec(retired: bool) -> String {
-    format!("agent \"worker\" {{\n  host \"host\"\n  retired #{retired}\n  argv \"true\"\n}}\n")
+    format!(
+        "agent \"worker\" {{\n  host \"host\"\n  id \"{WORKER_ID}\"\n  retired #{retired}\n  argv \"true\"\n}}\n"
+    )
 }
 
 fn publish(catalog: &Path, spec: &Path, expectation: &[&str]) -> Output {
@@ -95,7 +101,10 @@ fn spec_create_is_typed_and_idempotent() {
     assert_eq!(first["policyProfile"], "st2.core+catalog.v1");
     assert_agent_spec_revision(&first["agentSpecRevision"]);
     assert_eq!(first["status"], "published");
-    assert_eq!(first["busId"], "host.worker");
+    // The receipt names the immutable ID that owns the subject and, separately, the route a human
+    // uses to reach it. The ID is the minted UUIDv7; the route is still the identity fallback.
+    assert_eq!(first["agentId"], WORKER_ID);
+    assert_eq!(first["busAddress"], "host.worker");
     assert_eq!(first["inputSha256"], sha256(valid_spec(false).as_bytes()));
     assert_eq!(first["afterSha256"], sha256(valid_spec(false).as_bytes()));
     assert_eq!(
@@ -233,7 +242,7 @@ fn cas_rejects_stale_writers_and_preserves_resources() {
     let workspace = temp.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     let replacement = format!(
-        "agent \"worker\" {{\n  host \"host\"\n  retired #true\n  workspace \"{}\"\n  argv \"true\"\n  render {{\n    copy \"assets/PERSONA.md\" \"PERSONA.md\"\n  }}\n}}\n",
+        "agent \"worker\" {{\n  host \"host\"\n  id \"{WORKER_ID}\"\n  retired #true\n  workspace \"{}\"\n  argv \"true\"\n  render {{\n    copy \"assets/PERSONA.md\" \"PERSONA.md\"\n  }}\n}}\n",
         workspace.display()
     );
     let candidate = temp.path().join("retired.kdl");
@@ -308,7 +317,7 @@ fn full_catalog_admission_rejects_same_host_render_ownership_conflicts() {
     fs::write(
         &candidate,
         format!(
-            "agent \"worker\" {{\n  host \"host\"\n  workspace \"{}\"\n  argv \"true\"\n  render {{ file \"shared\" \"two\" }}\n}}\n",
+            "agent \"worker\" {{\n  host \"host\"\n  id \"{WORKER_ID}\"\n  workspace \"{}\"\n  argv \"true\"\n  render {{ file \"shared\" \"two\" }}\n}}\n",
             workspace.display()
         ),
     )
@@ -1115,12 +1124,12 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
     let two = temp.path().join("two.kdl");
     fs::write(
         &one,
-        "agent \"worker\" {\n  host \"host\"\n  retired #true\n  argv \"true\"\n}\n",
+        format!("agent \"worker\" {{\n  host \"host\"\n  id \"{WORKER_ID}\"\n  retired #true\n  argv \"true\"\n}}\n"),
     )
     .unwrap();
     fs::write(
         &two,
-        "agent \"worker\" {\n  host \"host\"\n  role \"other\"\n  retired #true\n  argv \"true\"\n}\n",
+        format!("agent \"worker\" {{\n  host \"host\"\n  id \"{WORKER_ID}\"\n  role \"other\"\n  retired #true\n  argv \"true\"\n}}\n"),
     )
     .unwrap();
     let expected = sha256(old.as_bytes());
@@ -1351,4 +1360,158 @@ fn wait_for_path(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// A published declaration is address-authorable, and the cutover leaves publication alone.
+///
+/// Publication owns the transactional bytes; address authoring edits exactly one field inside them.
+/// The subject keeps the agent ID publication admitted it under, so nothing anchored to that ID —
+/// task IDs, state paths, supervisor edges — moves.
+#[test]
+fn a_published_declaration_is_address_authorable_by_its_immutable_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let published = publish(&catalog, &spec, &["--expect-absent"]);
+    assert!(
+        published.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let before = fs::read_to_string(target(&catalog)).unwrap();
+
+    let receipt = st2::agent_author::set_address(
+        &catalog,
+        WORKER_ID,
+        "host",
+        None,
+        Some(&st2::AgentAddress::parse("build.owner").unwrap()),
+    )
+    .unwrap();
+    assert_eq!(receipt.id, WORKER_ID);
+    assert_eq!(receipt.address, "build.owner");
+    assert_eq!(receipt.bus_address.as_deref(), Some("host.build.owner"));
+
+    let after = fs::read_to_string(target(&catalog)).unwrap();
+    assert_eq!(
+        after.replace("  address \"build.owner\"\n", ""),
+        before,
+        "publication bytes survive the cutover except the authored field"
+    );
+
+    let found = st2::discover(&catalog);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    let book = st2::spec::address_book(&found.specs, "host").unwrap();
+    assert_eq!(
+        book.resolve_address("build.owner", None).unwrap().id.as_str(),
+        WORKER_ID,
+    );
+    assert_eq!(
+        book.resolve_id(WORKER_ID).unwrap().effective_address,
+        "build.owner",
+    );
+}
+
+/// A byte-level expectation cannot see identity, so publication compares IDs itself.
+///
+/// `--expect-sha256` proves only that the incumbent bytes are the ones the caller read. Without an
+/// explicit comparison, a matching update was free to re-key the subject and strand every ID-keyed
+/// durable surface. Both directions of divergence refuse.
+#[test]
+fn an_update_cannot_change_the_immutable_agent_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+    assert!(
+        publish(&catalog, &spec, &["--expect-absent"])
+            .status
+            .success()
+    );
+    let incumbent = fs::read_to_string(target(&catalog)).unwrap();
+    let expected = sha256(incumbent.as_bytes());
+
+    // A different explicit ID.
+    let rekey = temp.path().join("rekey.kdl");
+    fs::write(
+        &rekey,
+        incumbent.replace(WORKER_ID, "01930000-0000-7000-8000-0000000000ff"),
+    )
+    .unwrap();
+    let refused = publish(&catalog, &rekey, &["--expect-sha256", &expected]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(stderr.contains("immutable-agent-id"), "stderr: {stderr}");
+    assert_eq!(fs::read_to_string(target(&catalog)).unwrap(), incumbent);
+
+    // Dropping `id` entirely: the implicit frozen legacy value is a different ID.
+    let dropped = temp.path().join("dropped.kdl");
+    fs::write(
+        &dropped,
+        incumbent.replace(&format!("  id \"{WORKER_ID}\"\n"), ""),
+    )
+    .unwrap();
+    let refused = publish(&catalog, &dropped, &["--expect-sha256", &expected]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(stderr.contains("immutable-agent-id"), "stderr: {stderr}");
+    assert!(stderr.contains("host.worker"), "stderr: {stderr}");
+    assert_eq!(fs::read_to_string(target(&catalog)).unwrap(), incumbent);
+}
+
+/// Creating a subject mints a generated ID; it never derives one from placement.
+///
+/// The frozen-legacy fallback exists to read and update a subject that predates migration. Left
+/// open on the creation path it would let publication keep minting placement-shaped IDs forever,
+/// which is the overloading decision 0015 retires.
+#[test]
+fn creating_a_subject_requires_a_generated_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+
+    let legacy = temp.path().join("legacy.kdl");
+    fs::write(
+        &legacy,
+        "agent \"worker\" {\n  host \"host\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let refused = publish(&catalog, &legacy, &["--expect-absent"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        stderr.contains("creation-requires-generated-id"),
+        "stderr: {stderr}"
+    );
+    assert!(!target(&catalog).exists());
+
+    // A placement-shaped explicit ID is not a minted one either.
+    let placement_shaped = temp.path().join("placement.kdl");
+    fs::write(
+        &placement_shaped,
+        "agent \"worker\" {\n  host \"host\"\n  id \"host.worker\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let refused = publish(&catalog, &placement_shaped, &["--expect-absent"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("creation-requires-generated-id"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!target(&catalog).exists());
+
+    // The minted form is admitted.
+    let minted = temp.path().join("minted.kdl");
+    fs::write(&minted, valid_spec(false)).unwrap();
+    let accepted = publish(&catalog, &minted, &["--expect-absent"]);
+    assert!(
+        accepted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
 }

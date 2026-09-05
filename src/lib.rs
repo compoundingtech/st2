@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod catalog_archive;
 pub mod catalog_graph;
 pub mod catalog_lock;
+pub mod catalog_migrate;
 pub mod catalog_transaction;
 pub mod claude_channel;
 pub mod claude_mcp;
@@ -61,7 +62,14 @@ mod watch;
 // The declaration model and the catalog walk live in the `agent-spec` crate, so st2 and any other
 // reader of the same catalog share one implementation. Re-exported under their original paths:
 // `st2::spec::…` / `st2::discovery::…` keep working for the binary and the test suite.
-pub use agent_spec::{discovery, spec};
+pub use agent_spec::{discovery, identity, spec};
+
+// The typed identity contract: an immutable catalog-global agent ID, a mutable host-local address,
+// and the fail-closed address book ordinary human references resolve through (decision 0015).
+pub use agent_spec::identity::{
+    AddressBook, AgentAddress, AgentId, AgentSelector, IdentityError, ResolveError, Subject,
+    UniquenessConflict, bus_address, legacy_bus_identity,
+};
 
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{

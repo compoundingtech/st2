@@ -28,7 +28,7 @@ fn emit(root: &Path, id: &str, key: Option<&str>, supersede: bool) -> event::Eve
     event::emit(
         root,
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         id,
         key,
@@ -66,7 +66,7 @@ fn public_emit_requires_a_declared_stream_even_for_reserved_resync() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "resync",
         "forged-resync",
         Some("goal"),
@@ -95,7 +95,7 @@ fn completed_event_replay_rejects_changed_supersession_intent() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "stable-intent",
         Some("pr-1"),
@@ -120,7 +120,7 @@ fn durable_successor_failure_retains_replayable_pending_receipt() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "durable-successor",
         None,
@@ -144,7 +144,7 @@ fn durable_successor_failure_retains_replayable_pending_receipt() {
     let replay = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "durable-successor",
         None,
@@ -204,7 +204,7 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
     let conflict = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "same",
         None,
@@ -221,7 +221,7 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
     let undeclared = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "other",
         "1",
         None,
@@ -244,7 +244,7 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
     let suspended = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "2",
         None,
@@ -279,7 +279,7 @@ fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "ambiguous",
         None,
@@ -313,7 +313,7 @@ fn exact_remote_bus_id_cannot_bypass_the_owner_host_lock_domain() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "berlin.worker",
+        &st2::AgentSelector::address("berlin.worker"),
         "gh-ci",
         "remote-attempt",
         None,
@@ -433,7 +433,7 @@ fn unobservable_declaration_entry_blocks_event_recipient_resolution() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "strict-discovery",
         None,
@@ -463,7 +463,7 @@ fn symlinked_stream_state_ancestor_cannot_escape_the_agent_capability() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "escape-state",
         None,
@@ -501,7 +501,7 @@ fn predictable_stream_state_temporary_symlink_is_never_followed() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "temp-symlink",
         None,
@@ -543,7 +543,7 @@ fn stream_state_symlink_and_fifo_fail_without_following_or_blocking() {
         let error = event::emit(
             catalog.path(),
             "hetz",
-            "hetz.worker",
+            &st2::AgentSelector::address("hetz.worker"),
             "gh-ci",
             entry,
             None,
@@ -571,7 +571,7 @@ fn symlinked_inbox_cannot_escape_the_agent_capability() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "escape-inbox",
         None,
@@ -668,7 +668,7 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "initial-passed",
         Some("pr-1"),
@@ -713,7 +713,7 @@ fn predecessor_replacement_after_validation_cannot_forge_archive_receipt() {
         event::emit(
             &root,
             "hetz",
-            "hetz.worker",
+            &st2::AgentSelector::address("hetz.worker"),
             "gh-ci",
             "race-passed",
             Some("pr-1"),
@@ -763,7 +763,13 @@ fn catalog_authoring_and_emit_linearize_without_deadlock() {
     let root = catalog.path().to_path_buf();
     let (done_tx, done_rx) = mpsc::channel();
     let author = std::thread::spawn(move || {
-        let result = st2::agent_author::remove_stream(&root, "hetz.worker", "hetz", None, "gh-ci");
+        let result = st2::agent_author::remove_stream(
+            &root,
+            &st2::AgentSelector::address("hetz.worker"),
+            "hetz",
+            None,
+            "gh-ci",
+        );
         done_tx.send(result).unwrap();
     });
     assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -780,7 +786,7 @@ fn catalog_authoring_and_emit_linearize_without_deadlock() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "after-remove",
         None,
@@ -829,7 +835,7 @@ fn desired_state_authoring_and_emit_linearize_without_deadlock() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "after-suspend",
         None,
@@ -853,7 +859,7 @@ fn invalid_archive_receipt_blocks_supersession_before_successor_publication() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "pr1-pass",
         Some("pr-1"),
@@ -899,7 +905,7 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     let before_materialization = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "reserved-a",
         None,
@@ -923,7 +929,7 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     let after_materialization = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "materialized-a",
         Some("pr-1"),
@@ -950,7 +956,7 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     let replay = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "materialized-a",
         Some("pr-1"),
@@ -980,7 +986,7 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "reserved",
         Some("pr-1"),
@@ -1010,7 +1016,7 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     let corrupt = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "next",
         None,
@@ -1030,7 +1036,7 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     let forged_identity = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "next",
         None,
@@ -1066,7 +1072,7 @@ fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "reserved-fifo",
         None,
@@ -1091,7 +1097,7 @@ fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "next",
         None,
@@ -1117,7 +1123,7 @@ fn a_different_event_completes_pending_successor_compaction() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1163,7 +1169,7 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1179,7 +1185,7 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "unrelated",
         None,
@@ -1214,7 +1220,7 @@ fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1250,7 +1256,7 @@ fn pending_supersession_recovery_unlinks_a_durably_archived_predecessor() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1285,7 +1291,7 @@ fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "reserved",
         Some("pr-1"),
@@ -1308,7 +1314,7 @@ fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "next",
         None,
@@ -1335,7 +1341,7 @@ fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
     let _ = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1351,7 +1357,7 @@ fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "unrelated",
         None,
@@ -1425,7 +1431,7 @@ fn crash_replay_honors_an_archive_receipt_and_never_restores_the_inbox_copy() {
     let receipt = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "archived",
         None,
@@ -1446,7 +1452,7 @@ fn subject_frontmatter_injection_is_refused_before_any_write() {
     let error = event::emit(
         catalog.path(),
         "hetz",
-        "hetz.worker",
+        &st2::AgentSelector::address("hetz.worker"),
         "gh-ci",
         "safe-id",
         None,
@@ -1475,6 +1481,51 @@ fn stream_state_is_bounded_and_forgets_only_beyond_its_honest_horizon() {
     let replay = emit(catalog.path(), "event-0", None, false);
     assert_eq!(replay.status, EventReceiptStatus::Created);
     assert_ne!(replay.filename, first.filename);
+}
+
+#[test]
+fn a_duplicate_agent_id_refuses_stream_resolution_instead_of_picking_a_declaration() {
+    // The address book dedups its candidates BY agent ID, so `hetz.worker` resolves cleanly to a
+    // single Subject even though two declarations share the ID. The back-mapping to a declaration
+    // is what refuses; first-match would publish into — and host-check — the wrong declaration.
+    let catalog = tempfile::tempdir().unwrap();
+    declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
+    let twin = catalog.path().join("agents/hetz/twin");
+    fs::create_dir_all(&twin).unwrap();
+    fs::write(
+        twin.join("agent.kdl"),
+        "agent \"twin\" {\n  host \"hetz\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+    )
+    .unwrap();
+    // Both declarations carry the same explicit id, so the catalog's global id namespace is
+    // broken while each address still names exactly one subject.
+    for declaration in ["agents/hetz/worker/agent.kdl", "agents/hetz/twin/agent.kdl"] {
+        let path = catalog.path().join(declaration);
+        let body = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            body.replace("  host \"hetz\"\n", "  host \"hetz\"\n  id \"shared-id\"\n"),
+        )
+        .unwrap();
+    }
+
+    let refusal = event::emit(
+        catalog.path(),
+        "hetz",
+        &st2::AgentSelector::address("hetz.worker"),
+        "gh-ci",
+        "run-1",
+        None,
+        None,
+        "{}",
+        false,
+    )
+    .expect_err("a duplicate-id catalog must refuse");
+    let rendered = format!("{refusal:#}");
+    assert!(
+        rendered.contains("declared by more than one subject"),
+        "the refusal must name the broken id namespace: {rendered}"
+    );
 }
 
 #[test]

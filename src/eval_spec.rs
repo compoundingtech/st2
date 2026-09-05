@@ -368,7 +368,7 @@ pub fn ding_exec(agent_id: &str) -> SpecExec {
         id: format!("{agent_id}.ding"),
         // Identity-only: `st2 ding` defaults its poke target to `--identity` (an agent IS its pty), so
         // the redundant positional is dropped.
-        command: format!("st2 ding --identity {agent_id} --root $ST_ROOT"),
+        command: format!("st2 ding --id {agent_id} --root $ST_ROOT"),
         env: BTreeMap::new(),
         derived: true,
     }
@@ -852,7 +852,7 @@ eval {
         assert_eq!(sup.execs[0].id, "mix.sup.ding");
         assert_eq!(
             sup.execs[0].command,
-            "st2 ding --identity mix.sup --root $ST_ROOT"
+            "st2 ding --id mix.sup --root $ST_ROOT"
         );
         assert!(!sup.execs[0].env.contains_key("ST_AGENT"));
 

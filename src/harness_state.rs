@@ -32,7 +32,90 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
-const SCHEMA: &str = "st2.harness-state.v1";
+/// Schema version 1: the record's `agent` field carries the subject's bus identity.
+pub const SCHEMA_V1: &str = "st2.harness-state.v1";
+/// Schema version 2: the record's `agent` field carries the subject's immutable agent ID. Nothing
+/// else about the record changes — the version exists solely to make the meaning of that one
+/// field decidable from the bytes, because the two namespaces are separate and a v1 reader would
+/// otherwise retype a frozen legacy ID as a route.
+pub const SCHEMA_V2: &str = "st2.harness-state.v2";
+
+/// Whether the immutable-ID writer is active. **On**, with the rest of the DELTA-003 activation
+/// cohort (raw-ID `ST_AGENT`, ID-keyed runtime ownership, message record version 2, PTY schema 2).
+///
+/// The driver wrappers hand this writer a raw immutable agent ID, and a version suffix is the read
+/// contract for this record family: stamping that ID under version 1, whose `agent` means a bus
+/// identity, would misattribute it to whichever subject holds those bytes as a route. The
+/// reader-first precondition is already met — [`read`] accepts both versions and reports which
+/// namespace each one names. The constant stays named so the cohort remains visible and one
+/// reversal point exists; it is not a per-record switch to flip alone.
+pub const EMIT_SCHEMA_V2: bool = true;
+
+/// The version this build writes. Every ownership decision below — sequence adoption, own-record
+/// coalescing, heartbeat eligibility — is scoped to it: a writer owns only the shape it emits, so
+/// a v1 straggler still refuses to replace a v2 record and vice versa.
+const SCHEMA: &str = if EMIT_SCHEMA_V2 { SCHEMA_V2 } else { SCHEMA_V1 };
+
+/// Whether a record's schema is one this version can interpret. Both versions describe the same
+/// axes; only the meaning of `agent` differs, and [`RecordSubject`] carries that difference.
+pub fn is_supported_schema(schema: &str) -> bool {
+    schema == SCHEMA_V1 || schema == SCHEMA_V2
+}
+
+/// The subject a record names, carrying which typed namespace the value belongs to.
+///
+/// ID and address are separate namespaces in which equal bytes never collide, so a consumer that
+/// joins records to a catalog must know which one it is holding. An unmigrated subject's two
+/// values are byte-identical, which is why this distinction costs nothing during the transition
+/// and everything after the first address cutover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordSubject {
+    /// From a version 1 record: the writer's `<host>.<identity>` bus identity.
+    BusIdentity(String),
+    /// From a version 2 record: the subject's catalog-global immutable agent ID.
+    AgentId(String),
+}
+
+impl RecordSubject {
+    /// Build the subject from the decision the *record's own* schema discriminator already made.
+    ///
+    /// The caller passes the decision rather than the schema string because the two driver
+    /// records version independently: `st2.harness-state.v2` and `st2.harness-context.v2` are
+    /// different spellings of the same meaning, and a shared string comparison would silently
+    /// read one of them as version 1.
+    pub(crate) fn for_version(carries_agent_id: bool, agent: String) -> Self {
+        if carries_agent_id {
+            Self::AgentId(agent)
+        } else {
+            Self::BusIdentity(agent)
+        }
+    }
+
+    /// The declared value, whichever namespace it belongs to. Diagnostics only: never compare
+    /// this across namespaces.
+    pub fn value(&self) -> &str {
+        match self {
+            Self::BusIdentity(value) | Self::AgentId(value) => value,
+        }
+    }
+
+    /// The immutable agent ID, when the record proved one.
+    pub fn agent_id(&self) -> Option<&str> {
+        match self {
+            Self::AgentId(id) => Some(id),
+            Self::BusIdentity(_) => None,
+        }
+    }
+
+    /// The bus identity, when the record proved one.
+    pub fn bus_identity(&self) -> Option<&str> {
+        match self {
+            Self::BusIdentity(identity) => Some(identity),
+            Self::AgentId(_) => None,
+        }
+    }
+}
+
 /// The claim-sequence floor sidecar, beside the record: claims stay monotonic even across a
 /// record this version cannot parse.
 const SEQ_FLOOR_NAME: &str = ".harness-state.seq";
@@ -382,7 +465,16 @@ impl Writer {
                     persist_floor(&self.path, 1);
                     1
                 }
-                Some(current) if current.incarnation == self.session => current.seq,
+                // Adoption never crosses schemas: a record is this writer's own only when it
+                // carries both this build's version and this session's token. A same-token
+                // record under the other version belongs to a differently-versioned writer of
+                // this session, and inheriting its sequence would let this build write over a
+                // meaning it did not produce.
+                Some(current)
+                    if current.schema == SCHEMA && current.incarnation == self.session =>
+                {
+                    current.seq
+                }
                 Some(_) => return Ok(false),
             },
         };
@@ -542,6 +634,9 @@ pub struct Observed {
     pub since_ms: Option<u64>,
     pub exit: Option<String>,
     pub reason: Option<String>,
+    /// The subject the record names, with the namespace its version decided. `None` whenever the
+    /// observation is indeterminate: an uninterpretable record proves no subject either.
+    pub subject: Option<RecordSubject>,
 }
 
 impl Observed {
@@ -557,6 +652,7 @@ impl Observed {
             since_ms: None,
             exit: None,
             reason: Some(reason.to_string()),
+            subject: None,
         }
     }
 }
@@ -594,11 +690,14 @@ fn read_raw_at(
         return Observed::indeterminate("malformed-record", None);
     };
     let harness = Some(record.harness.clone());
-    // The discriminator gates interpretation: a future schema's words may be spelled like this
-    // version's while meaning something else, so nothing definite may be derived from them.
-    if record.schema != SCHEMA {
+    // The discriminator gates interpretation: a schema outside the pair this version understands
+    // may spell its words like these while meaning something else, so nothing definite may be
+    // derived from it. Within the pair, only the meaning of `agent` differs, and that meaning
+    // travels typed on `subject` rather than being guessed by the consumer.
+    if !is_supported_schema(&record.schema) {
         return Observed::indeterminate("unsupported-schema", harness);
     }
+    let subject = RecordSubject::for_version(record.schema == SCHEMA_V2, record.agent.clone());
     if record.written_at_ms > now_ms {
         if record.written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
             return Observed::indeterminate("future-skew", harness);
@@ -645,6 +744,7 @@ fn read_raw_at(
         since_ms: Some(record.since_ms),
         exit: record.exit,
         reason: record.reason,
+        subject: Some(subject),
     }
 }
 
@@ -748,6 +848,38 @@ fn next_stamp(on_disk: Option<&Record>, now_ms: u64) -> u64 {
         .map_or(now_ms, |previous| now_ms.max(previous.saturating_add(1)))
 }
 
+/// Ordinal of a supported schema version, or `None` for a schema this build cannot interpret.
+fn schema_rank(schema: &str) -> Option<u8> {
+    match schema {
+        SCHEMA_V1 => Some(1),
+        SCHEMA_V2 => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether a claim written under `ours` may supersede the record `current`.
+///
+/// Takeover across supported versions is ONE-WAY. Same version is ordinary supersession. An older
+/// supported version may be superseded: that is the v1 → v2 migration, and it is the only
+/// direction in which the record's meaning gains information. A NEWER supported version is
+/// refused, because during the coordinated writer cutover a still-running reader-first binary
+/// whose writer is v1 would otherwise overwrite a migrated, ID-bearing record with bus-address
+/// semantics under a higher ownership sequence — silently destroying the migrated meaning of a
+/// live record, with no later act able to tell that it happened. An unsupported schema holds
+/// nothing this build could preserve, so an explicit claim still supersedes it.
+///
+/// `ours` is a parameter rather than a read of [`SCHEMA`] so the refused direction is provable in
+/// one build: the whole defect is about two builds writing different versions at the same time.
+fn claim_may_supersede(ours: &str, current: Option<&Record>) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    match (schema_rank(&current.schema), schema_rank(ours)) {
+        (Some(on_disk), Some(ours)) => on_disk <= ours,
+        _ => true,
+    }
+}
+
 /// Claim session ownership of an agent's record, as a WRITTEN act under the record's lock: the
 /// takeover record supersedes whatever is on disk — `ended` with reason `superseded`, no exit,
 /// the new session's token, and the next ownership sequence — and the claimed sequence is
@@ -781,6 +913,19 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         StoredRecord::Parsed(record) => Some(record),
         StoredRecord::Absent | StoredRecord::Unreadable => None,
     };
+    // The semantic fence, before anything is minted or written. The SEQUENCE below deliberately
+    // stays monotonic across the one-way v1 → v2 migration — it is a counter, not a meaning, and
+    // restarting it at one would sit below a lingering predecessor's claim and fence the new
+    // session out permanently — but the record's MEANING may only ever move forward.
+    anyhow::ensure!(
+        claim_may_supersede(SCHEMA, on_disk.as_ref()),
+        "refusing to claim a `{}` record while this build writes `{SCHEMA}`: \
+         taking it over would downgrade a migrated record's `agent` field to a bus address",
+        on_disk
+            .as_ref()
+            .map(|record| record.schema.as_str())
+            .unwrap_or_default()
+    );
     let floor_path = writer.path.with_file_name(SEQ_FLOOR_NAME);
     let floor = fs::read_to_string(&floor_path)
         .ok()
@@ -889,7 +1034,12 @@ pub fn claim_wrapperless(
             let wrapperless_owner =
                 record.incarnation.is_empty() || record.incarnation.starts_with(WRAPPERLESS_PREFIX);
             let real_terminal = record.state == Activity::Ended && record.exit.is_some();
-            wrapperless_owner || real_terminal || stale
+            // The same one-way schema fence as the written claim, applied here so the cautious
+            // path refuses (`Ok(None)`) instead of reaching `claim_locked` and erroring: a build
+            // whose writer is behind the record on disk has no eligible takeover at all, however
+            // stale or orphaned that record looks.
+            claim_may_supersede(SCHEMA, Some(&record))
+                && (wrapperless_owner || real_terminal || stale)
         }
     };
     if !eligible {
@@ -926,6 +1076,21 @@ mod tests {
         let seq = claim(dir, "hetz.worker", harness, &token).unwrap();
         Writer::new(dir, "hetz.worker", harness, Some("worker".to_string()))
             .with_ownership(token, seq)
+    }
+
+    /// One record on disk under an explicit schema, with a live stamp and an orphan token, so
+    /// every eligibility clause except the schema fence says "claimable".
+    fn planted(dir: &Path, schema: &str, agent: &str, seq: u64) -> PathBuf {
+        let path = harness_state_path(dir);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"{schema}","agent":"{agent}","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","exit":"exit 0","incarnation":"","seq":{seq},"sinceMs":1,"writtenAtMs":{},"transitions":4}}"#,
+                crate::message::now_ms()
+            ),
+        )
+        .unwrap();
+        path
     }
 
     fn active() -> Observation {
@@ -1254,10 +1419,10 @@ mod tests {
 
     #[test]
     fn future_vocabulary_degrades_to_indeterminate_not_none() {
-        // A future schema gates interpretation entirely — even words spelled exactly like this
-        // version's must not decode as anything definite, because v2 may have changed what the
-        // same spelling means.
-        let raw = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        // A schema outside the pair this version understands gates interpretation entirely — even
+        // words spelled exactly like these must not decode as anything definite, because the
+        // later version may have changed what the same spelling means.
+        let raw = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Unknown);
         assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
@@ -1269,6 +1434,221 @@ mod tests {
         assert_eq!(observed.state, Activity::Active);
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
         assert_eq!(observed.input_buffer, InputBuffer::Unknown);
+    }
+
+    /// DELTA-003 step 5, reader first: this version reads both record versions *before* any writer
+    /// emits version 2, and each one's `agent` field is decoded in the namespace its own
+    /// discriminator names. A version outside that pair stays `unsupported-schema`, so the
+    /// tolerance is exactly two versions wide rather than "anything that parses".
+    #[test]
+    fn both_reserved_versions_are_read_with_their_own_agent_meaning() {
+        let v1 = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        let observed = read_raw_at(v1, None, 1_000);
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(
+            observed.subject,
+            Some(RecordSubject::BusIdentity("hetz.worker".into())),
+            "version 1 `agent` is the bus identity"
+        );
+        assert_eq!(observed.subject.as_ref().unwrap().agent_id(), None);
+
+        // Same bytes in `agent`, different namespace — which is precisely why the version exists:
+        // a frozen legacy ID and a bus identity are indistinguishable without the discriminator.
+        let v2 = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        let observed = read_raw_at(v2, None, 1_000);
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(
+            observed.subject,
+            Some(RecordSubject::AgentId("hetz.worker".into())),
+            "version 2 `agent` is the immutable agent ID"
+        );
+        assert_eq!(observed.subject.as_ref().unwrap().bus_identity(), None);
+
+        let v3 = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        let observed = read_raw_at(v3, None, 1_000);
+        assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
+        assert_eq!(observed.state, Activity::Unknown);
+        assert!(
+            observed.subject.is_none(),
+            "an uninterpretable record proves no subject either"
+        );
+    }
+
+    /// The activation cohort is on: the driver wrappers hand this writer a raw immutable agent ID,
+    /// so the record it writes must DECLARE version 2. Stamping that ID under version 1 — whose
+    /// `agent` means a bus identity — is the misattribution this version exists to prevent, and it
+    /// is exactly what the old writer default did.
+    #[test]
+    fn the_writer_declares_version_two_so_its_agent_field_means_an_immutable_id() {
+        assert!(EMIT_SCHEMA_V2);
+        assert_eq!(SCHEMA, SCHEMA_V2);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut writer = takeover(tmp.path(), "codex");
+        writer.observe(active()).unwrap();
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.schema, SCHEMA_V2);
+        // And the reader hands that value back in the ID namespace, not as a route.
+        assert_eq!(
+            read(&path, None).unwrap().subject,
+            Some(RecordSubject::AgentId(record.agent.clone()))
+        );
+
+        // Writing version 2 does not retype the version-1 records already on disk: a v1 record
+        // still reads with bus-identity meaning, which is the whole point of keeping the pair.
+        let v1 = format!(
+            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":{},"transitions":3}}"#,
+            crate::message::now_ms()
+        );
+        fs::write(&path, v1).unwrap();
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(
+            observed.subject,
+            Some(RecordSubject::BusIdentity("hetz.worker".into()))
+        );
+    }
+
+    /// The takeover fence is ONE-WAY across supported versions. The defect this pins: during the
+    /// coordinated writer cutover, a still-running reader-first binary whose writer is v1 could
+    /// claim a migrated v2 record and rewrite its `agent` field as a bus address under a HIGHER
+    /// ownership sequence — permanently fencing out the true owner and leaving no trace that the
+    /// migrated meaning was destroyed.
+    #[test]
+    fn a_claim_never_downgrades_a_record_to_an_older_schema() {
+        let v2 = Record {
+            schema: SCHEMA_V2.to_string(),
+            agent: "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".to_string(),
+            harness: "codex".to_string(),
+            state: Activity::Active,
+            blocked_on: BlockedOn::None,
+            input_buffer: InputBuffer::Unknown,
+            ask: Ask::None,
+            reason: None,
+            exit: None,
+            pty_session: Some("worker".to_string()),
+            incarnation: "other".to_string(),
+            seq: 3,
+            since_ms: 1,
+            written_at_ms: 1,
+            transitions: 1,
+        };
+        let v1 = Record {
+            schema: SCHEMA_V1.to_string(),
+            agent: "hetz.worker".to_string(),
+            ..v2.clone()
+        };
+
+        // Refused: a v1 writer must not take over a v2 record.
+        assert!(!claim_may_supersede(SCHEMA_V1, Some(&v2)));
+        // Allowed, and one-way: the v1 → v2 migration, plus same-version supersession.
+        assert!(claim_may_supersede(SCHEMA_V2, Some(&v1)));
+        assert!(claim_may_supersede(SCHEMA_V1, Some(&v1)));
+        assert!(claim_may_supersede(SCHEMA_V2, Some(&v2)));
+        // Nothing on disk, and bytes no build can interpret, hold nothing to preserve.
+        assert!(claim_may_supersede(SCHEMA_V1, None));
+        let unsupported = Record {
+            schema: "st2.harness-state.v3".to_string(),
+            ..v2.clone()
+        };
+        assert!(claim_may_supersede(SCHEMA_V1, Some(&unsupported)));
+    }
+
+    /// This build writes v2, so the v1 → v2 migration claim is the one it can exercise
+    /// end-to-end: it lands exactly once, keeps the sequence monotonic across the version change
+    /// (the counter is not a meaning, and restarting it would sit below a lingering predecessor's
+    /// claim and fence the new session out), and leaves the record declaring v2.
+    #[test]
+    fn a_version_two_claim_migrates_a_version_one_record_once_and_keeps_the_sequence() {
+        assert_eq!(SCHEMA, SCHEMA_V2, "this build writes the newer version");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = planted(tmp.path(), SCHEMA_V1, "hetz.worker", 7);
+
+        let token = session_token();
+        let seq = claim(tmp.path(), "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "codex", &token).unwrap();
+        assert_eq!(seq, 8, "the sequence continues past the version change");
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.schema, SCHEMA_V2);
+        assert_eq!(record.agent, "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+
+        // The claim itself is a fence, not an observation, so it reads indeterminate (`claimed`)
+        // and proves no subject. The session's first real observation is what a consumer joins to
+        // a catalog, and that must land in the ID namespace.
+        assert!(read(&path, None).unwrap().subject.is_none());
+        let mut owner = Writer::new(
+            tmp.path(),
+            "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+            "codex",
+            Some("worker".into()),
+        )
+        .with_ownership(token, seq);
+        owner.observe(active()).unwrap();
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(
+            observed.subject,
+            Some(RecordSubject::AgentId(
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".into()
+            )),
+            "the migrated record names the ID namespace"
+        );
+    }
+
+    /// Wrapperless eligibility respects the same fence. The planted record is exit-bearing
+    /// terminal AND orphan-tokened, so every other clause votes "claimable"; only the schema
+    /// decides. A same-version plant proves the test is not vacuous.
+    #[test]
+    fn wrapperless_eligibility_respects_the_schema_fence() {
+        let same = tempfile::tempdir().unwrap();
+        planted(same.path(), SCHEMA, "hetz.worker", 2);
+        assert!(
+            claim_wrapperless(same.path(), "hetz.worker", "codex", &session_token())
+                .unwrap()
+                .is_some(),
+            "an orphaned terminal record of this build's own version is claimable"
+        );
+
+        // The refused direction is not reachable from a build that writes the newest version, so
+        // the fence itself is asserted where it is decidable.
+        assert!(!claim_may_supersede(
+            SCHEMA_V1,
+            Some(&serde_json::from_slice::<Record>(
+                br#"{"schema":"st2.harness-state.v2","agent":"id","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","exit":"exit 0","incarnation":"","seq":2,"sinceMs":1,"writtenAtMs":1,"transitions":1}"#
+            ).unwrap())
+        ));
+    }
+
+    /// Ownership-sequence ADOPTION never crosses schemas: a same-token record under the other
+    /// version is a differently-versioned writer of this session, and inheriting its sequence
+    /// would let this build write over a meaning it did not produce.
+    #[test]
+    fn sequence_adoption_never_crosses_schemas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+        // A v1 record carrying THIS session's token: same token, wrong version.
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"{token}","seq":5,"sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
+                crate::message::now_ms()
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let mut token_only = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        token_only.session = token.clone();
+        assert!(
+            !token_only.observe_unless_ended(active()).unwrap(),
+            "a non-claiming writer must refuse a record of the other version"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the cross-version record is left byte-identical"
+        );
     }
 
     #[test]
@@ -1497,7 +1877,10 @@ mod tests {
     fn foreign_schemas_are_never_coalesced_restamped_or_treated_as_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let foreign = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
+        // Now that the writer emits version 2, a version-1 straggler is the foreign shape: its
+        // `agent` means a route, so adopting it as this writer's own record would coalesce an
+        // address onto an ID.
+        let foreign = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
         fs::write(&path, foreign).unwrap();
 
         // Heartbeat leaves a foreign record byte-identical rather than stripping its fields —
@@ -1813,13 +2196,14 @@ mod tests {
         assert_eq!(read(&path, None).unwrap().state, Activity::Active);
     }
 
-    /// W8-6: a v2 record's serde-default sequence of zero is below every claim — but a v1
-    /// straggler must not replace a record it cannot read. Only the written claim supersedes.
+    /// W8-6: a foreign record's serde-default sequence of zero is below every claim — but a writer
+    /// of the other version must not replace a record whose `agent` it would misread. Only the
+    /// written claim supersedes.
     #[test]
     fn non_claiming_writers_refuse_foreign_schemas_outright() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let v2 = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
+        let v2 = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
         fs::write(&path, v2).unwrap();
 
         let token = session_token();

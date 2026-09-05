@@ -14,7 +14,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use agent_spec::spec::{
-    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Resource, StreamLaunch,
+    AGENT_DESCRIPTION_MAX_CHARS, AGENT_NAME_MAX_CHARS, Resource, StreamLaunch, address_book,
     validate_desired_state_reason, validate_presentation,
 };
 use kdl::{KdlDocument, KdlNode};
@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use crate::catalog_lock::CatalogLock;
 use crate::run::Runner as _;
+use crate::{AddressBook, AgentAddress, AgentId, AgentSelector, Subject, UniquenessConflict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourceVersion {
@@ -72,6 +73,50 @@ impl PresentationField {
     }
 }
 
+/// One directly authored single-positional-string declaration field.
+///
+/// `id` is deliberately absent. An immutable agent ID is never edited in place: replacing one is
+/// retire-old/add-new (R24, R30), so no span edit can express it. See [`refuse_agent_id_change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectField {
+    Name,
+    Description,
+    Address,
+}
+
+impl DirectField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Description => "description",
+            Self::Address => "address",
+        }
+    }
+
+    fn duplicate_code(self) -> &'static str {
+        match self {
+            Self::Name | Self::Description => "duplicate-presentation-field",
+            Self::Address => "duplicate-address-field",
+        }
+    }
+
+    fn malformed_code(self) -> &'static str {
+        match self {
+            Self::Name | Self::Description => "malformed-presentation-field",
+            Self::Address => "malformed-address-field",
+        }
+    }
+}
+
+impl From<PresentationField> for DirectField {
+    fn from(field: PresentationField) -> Self {
+        match field {
+            PresentationField::Name => Self::Name,
+            PresentationField::Description => Self::Description,
+        }
+    }
+}
+
 /// Whether a request changed declaration bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +133,25 @@ pub struct PresentationReceipt {
     pub field: PresentationField,
     pub value: Option<String>,
     pub retired: bool,
+}
+
+/// Stable machine-readable receipt from one address cutover.
+///
+/// The cutover is immediate and total: the previous effective address stops resolving and becomes
+/// claimable as soon as this catalog generation is visible. There is no alias, redirect, history,
+/// or expiry to report, so the receipt describes only the new address book entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AddressReceipt {
+    pub result: AuthorOutcome,
+    /// The immutable agent ID the declaration was selected by. This operation never changes it.
+    pub id: String,
+    /// The effective address after the edit: the explicit value, or the restored `identity`
+    /// fallback when the request cleared it.
+    pub address: String,
+    /// The qualified human route, or `None` for a retired subject that holds no route.
+    pub bus_address: Option<String>,
+    /// Whether the declaration now carries an explicit `address`.
+    pub explicit: bool,
 }
 
 /// Stable authored desired-state selector.
@@ -193,11 +257,17 @@ impl fmt::Display for AuthorError {
 
 impl std::error::Error for AuthorError {}
 
+/// One declaration proved to be exactly one authoring target.
+///
+/// `id` is the immutable catalog-global agent ID — the value every receipt, authority edge, and
+/// candidate recheck uses. `source_host` and `source_identity` are the positional declaration key
+/// this target was written with, which is what locates the node inside its own source file.
 #[derive(Debug)]
 struct AgentTarget {
-    identity: String,
+    id: String,
     source_host: String,
     source_identity: String,
+    effective_address: String,
     declaration: PathBuf,
     retired: bool,
 }
@@ -205,9 +275,9 @@ struct AgentTarget {
 /// Add an agent-owned stream, or prove that the identical declaration already exists.
 pub fn add_stream(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
     launch: Option<StreamLaunch>,
 ) -> Result<StreamAddReceipt, AuthorError> {
@@ -231,9 +301,9 @@ pub fn add_stream(
 /// Remove one agent-owned stream. An already absent stream is an idempotent success.
 pub fn remove_stream(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
 ) -> Result<StreamRemoveReceipt, AuthorError> {
     author_stream(catalog_root, selector, this_host, actor, name, None, true).map(
@@ -247,9 +317,9 @@ pub fn remove_stream(
 
 fn author_stream(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
     launch: Option<&StreamLaunch>,
     remove: bool,
@@ -271,13 +341,11 @@ fn author_stream(
             ),
         ));
     }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    let actor = actor
-        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
-        .transpose()?;
+    let target = resolve_selected_target(&found.specs, selector, this_host)?;
+    let actor = resolve_actor(&found.specs, actor, this_host, "stream-not-authorized")?;
     authorize_actor(
         &found.specs,
-        &target.identity,
+        &target.id,
         this_host,
         actor.as_deref(),
         "stream-not-authorized",
@@ -307,7 +375,7 @@ fn author_stream(
             let runtime_id = task
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                .unwrap_or_else(|| format!("{}.{}", spec.agent_id(this_host), task.name));
             let runner = crate::run::SystemRunner::new(
                 catalog_root.to_path_buf(),
                 crate::run::exec_state_dir(this_host),
@@ -335,7 +403,7 @@ fn author_stream(
         &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
             .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
         &target.declaration,
-        &target.identity,
+        &target.id,
         &target.source_host,
         &target.source_identity,
         name,
@@ -343,7 +411,7 @@ fn author_stream(
         remove,
         || {},
     )?;
-    Ok((result, target.identity))
+    Ok((result, target.id))
 }
 
 /// Declare one Resource binding, or update the binding that already carries `name`.
@@ -353,9 +421,9 @@ fn author_stream(
 #[allow(clippy::too_many_arguments)]
 pub fn add_resource(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
     uri: &str,
     reason: &str,
@@ -377,9 +445,9 @@ pub fn add_resource(
 #[allow(clippy::too_many_arguments)]
 pub fn add_resource_with_selector(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
     uri: &str,
     reason: &str,
@@ -413,9 +481,9 @@ pub fn add_resource_with_selector(
 /// Remove one Resource binding. An already absent binding is an idempotent success.
 pub fn remove_resource(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     name: &str,
 ) -> Result<ResourceRemoveReceipt, AuthorError> {
     author_resource(
@@ -438,9 +506,9 @@ pub fn remove_resource(
 /// agent, so neither request has an outcome that preserves the caller's intent.
 pub fn rename_resource(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     old: &str,
     new: &str,
 ) -> Result<ResourceRenameReceipt, AuthorError> {
@@ -487,9 +555,9 @@ struct ResourceExpectation {
 
 fn author_resource(
     catalog_root: &Path,
-    selector: &str,
+    selector: &AgentSelector,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     intent: ResourceIntent<'_>,
 ) -> Result<(AuthorOutcome, String), AuthorError> {
     let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
@@ -509,13 +577,11 @@ fn author_resource(
             ),
         ));
     }
-    let target = resolve_target(&found.specs, selector, this_host)?;
-    let actor = actor
-        .map(|actor| resolve_target(&found.specs, actor, this_host).map(|target| target.identity))
-        .transpose()?;
+    let target = resolve_selected_target(&found.specs, selector, this_host)?;
+    let actor = resolve_actor(&found.specs, actor, this_host, "resource-not-authorized")?;
     authorize_actor(
         &found.specs,
-        &target.identity,
+        &target.id,
         this_host,
         actor.as_deref(),
         "resource-not-authorized",
@@ -526,21 +592,26 @@ fn author_resource(
         &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
             .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
         &target.declaration,
-        &target.identity,
+        &target.id,
         &target.source_host,
         &target.source_identity,
         intent,
         || {},
     )?;
-    Ok((result, target.identity))
+    Ok((result, target.id))
 }
 
 /// Author one whole-agent desired state without claiming runtime convergence.
+///
+/// `id` is the explicit immutable agent ID (R28); an ordinary address never selects a lifecycle
+/// edit. Leaving retirement re-enters the address namespace, so that transition must prove the
+/// subject's effective address — explicit or the positional `identity` fallback — is still free on
+/// its resolved host.
 pub fn set_desired_state(
     catalog_root: &Path,
-    selector: &str,
+    id: &str,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     state: DesiredStateValue,
     reason: Option<&str>,
 ) -> Result<DesiredStateReceipt, AuthorError> {
@@ -580,21 +651,49 @@ pub fn set_desired_state(
             ),
         ));
     }
-    let target = resolve_target(&found.specs, selector, this_host)?;
+    let target = resolve_by_id(&found.specs, id, this_host)?;
+    let actor = resolve_actor(&found.specs, actor, this_host, "desired-state-not-authorized")?;
     authorize_actor(
         &found.specs,
-        &target.identity,
+        &target.id,
         this_host,
-        actor,
+        actor.as_deref(),
         "desired-state-not-authorized",
     )?;
+    if target.retired && state != DesiredStateValue::Retired {
+        // Leaving retirement re-enters the address namespace, and namespace occupancy is a global
+        // property: prove it against a strict snapshot, where an entry that could conceal a
+        // declaration is uncertainty rather than absence.
+        let strict = crate::discover_strict(catalog_root);
+        if let Some(error) = strict.errors.first() {
+            return Err(AuthorError::new(
+                "catalog-malformed",
+                format!(
+                    "cannot prove effective-address uniqueness while {} is malformed: {}",
+                    error.path.display(),
+                    error.message
+                ),
+            ));
+        }
+        let restored = Subject {
+            id: parsed_agent_id(&target.id)?,
+            host: target.source_host.clone(),
+            effective_address: target.effective_address.clone(),
+            routable: true,
+        };
+        refuse_target_conflicts(
+            &prospective_book(&strict.specs, this_host, restored)?,
+            &target.id,
+            "address-conflict",
+        )?;
+    }
     let result = edit_desired_state_declaration(
         &catalog_lock,
         catalog_root,
         &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
             .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
         &target.declaration,
-        &target.identity,
+        &target.id,
         &target.source_host,
         &target.source_identity,
         state,
@@ -603,22 +702,24 @@ pub fn set_desired_state(
     )?;
     Ok(DesiredStateReceipt {
         result,
-        identity: target.identity,
+        identity: target.id,
         desired_state: state,
         reason: reason.map(str::to_owned),
     })
 }
 
-/// Set or clear one presentation field for one stable Agent Spec identity.
+/// Set or clear one presentation field for one stable Agent Spec subject.
 ///
-/// `actor` is the caller-supplied `ST_AGENT` identity. An absent actor is the explicit operator
-/// path. Within the trusted-fleet model, the guardrail limits a catalog-managed caller to itself or
-/// a descendant reached through declared supervisor edges; no presentation field expands it.
+/// `id` is the explicit immutable agent ID (R25): presentation authoring never resolves a mutable
+/// address. `actor` is the caller's typed selector — `$ST_AGENT` or `--id` as an exact ID, `--as`
+/// as an ordinary address — resolved once in its own namespace. An absent actor is the explicit
+/// operator path. Within the trusted-fleet model, the guardrail limits a catalog-managed caller to
+/// itself or a descendant reached through supervisor edges; no presentation field expands it.
 pub fn set_presentation(
     catalog_root: &Path,
-    selector: &str,
+    id: &str,
     this_host: &str,
-    actor: Option<&str>,
+    actor: Option<&AgentSelector>,
     field: PresentationField,
     requested: Option<&str>,
 ) -> Result<PresentationReceipt, AuthorError> {
@@ -639,12 +740,13 @@ pub fn set_presentation(
             ),
         ));
     }
-    let target = resolve_target(&found.specs, selector, this_host)?;
+    let target = resolve_by_id(&found.specs, id, this_host)?;
+    let actor = resolve_actor(&found.specs, actor, this_host, "presentation-not-authorized")?;
     authorize_actor(
         &found.specs,
-        &target.identity,
+        &target.id,
         this_host,
-        actor,
+        actor.as_deref(),
         "presentation-not-authorized",
     )?;
     let requested = requested
@@ -660,7 +762,7 @@ pub fn set_presentation(
         &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
             .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
         &target.declaration,
-        &target.identity,
+        &target.id,
         &target.source_host,
         &target.source_identity,
         field,
@@ -669,59 +771,314 @@ pub fn set_presentation(
     )?;
     Ok(PresentationReceipt {
         result,
-        identity: target.identity,
+        identity: target.id,
         field,
         value: requested,
         retired: target.retired,
     })
 }
 
-fn resolve_target(
+/// Cut one agent's mutable address over, or restore its positional `identity` fallback.
+///
+/// The subject is selected by explicit immutable ID (R25): its ID, ID-keyed supervisor edges, task
+/// IDs, declaration-anchored state, and any live runtime incarnation are untouched. The cutover is
+/// atomic and total — the moment this catalog generation is visible the previous effective address
+/// stops resolving and is claimable by another subject. st2 keeps no alias, redirect, history, or
+/// expiry (F20, "Address cutover and unsupported redirects").
+///
+/// `requested` of `None` is `--clear`: it removes the explicit `address` and restores the
+/// positional `identity` fallback, which is admitted only when that fallback is itself free on the
+/// resolved host.
+pub fn set_address(
+    catalog_root: &Path,
+    id: &str,
+    this_host: &str,
+    actor: Option<&AgentSelector>,
+    requested: Option<&AgentAddress>,
+) -> Result<AddressReceipt, AuthorError> {
+    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
+        AuthorError::new(
+            "catalog-lock-failed",
+            format!("acquire catalog-authoring lock: {error:#}"),
+        )
+    })?;
+    // Host-local address uniqueness is a global property, so an entry that could conceal a
+    // declaration is uncertainty rather than absence.
+    let found = crate::discover_strict(catalog_root);
+    if let Some(error) = found.errors.first() {
+        return Err(AuthorError::new(
+            "catalog-malformed",
+            format!(
+                "cannot prove an exact address target while {} is malformed: {}",
+                error.path.display(),
+                error.message
+            ),
+        ));
+    }
+    let target = resolve_by_id(&found.specs, id, this_host)?;
+    let actor = resolve_actor(&found.specs, actor, this_host, "address-not-authorized")?;
+    authorize_actor(
+        &found.specs,
+        &target.id,
+        this_host,
+        actor.as_deref(),
+        "address-not-authorized",
+    )?;
+    let effective = match requested {
+        Some(address) => address.as_str().to_owned(),
+        None => target.source_identity.clone(),
+    };
+    let conflict_code = if requested.is_some() {
+        "address-conflict"
+    } else {
+        "address-fallback-conflict"
+    };
+    let candidate = Subject {
+        id: parsed_agent_id(&target.id)?,
+        host: target.source_host.clone(),
+        effective_address: effective.clone(),
+        routable: !target.retired,
+    };
+    refuse_target_conflicts(
+        &prospective_book(&found.specs, this_host, candidate)?,
+        &target.id,
+        conflict_code,
+    )?;
+    let result = edit_address_declaration(
+        &catalog_lock,
+        catalog_root,
+        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
+            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
+        &target.declaration,
+        &target.id,
+        &target.source_host,
+        &target.source_identity,
+        requested,
+        &found.specs,
+        this_host,
+        conflict_code,
+        || {},
+    )?;
+    Ok(AddressReceipt {
+        result,
+        bus_address: (!target.retired)
+            .then(|| crate::bus_address(&target.source_host, &effective)),
+        id: target.id,
+        address: effective,
+        explicit: requested.is_some(),
+    })
+}
+
+fn parsed_agent_id(id: &str) -> Result<AgentId, AuthorError> {
+    AgentId::parse(id).map_err(|error| AuthorError::new("invalid-agent-id", error.to_string()))
+}
+
+/// The complete prospective catalog with exactly one subject swapped for its candidate shape.
+///
+/// Uniqueness is a whole-catalog property, so it is proved against every other admitted subject in
+/// the same discovery generation rather than against the edited declaration alone.
+fn prospective_book(
     specs: &[crate::AgentSpec],
-    selector: &str,
+    this_host: &str,
+    replacement: Subject,
+) -> Result<AddressBook, AuthorError> {
+    let mut subjects = Vec::with_capacity(specs.len());
+    let mut replaced = false;
+    for spec in specs {
+        let subject = spec.subject(this_host).map_err(|error| {
+            AuthorError::new(
+                "catalog-malformed",
+                format!(
+                    "cannot admit declaration {} as an address-book subject: {error:#}",
+                    spec.path.display()
+                ),
+            )
+        })?;
+        if subject.id == replacement.id {
+            subjects.push(replacement.clone());
+            replaced = true;
+        } else {
+            subjects.push(subject);
+        }
+    }
+    if !replaced {
+        subjects.push(replacement);
+    }
+    Ok(AddressBook::new(subjects))
+}
+
+/// Refuse only the conflicts this request is responsible for.
+///
+/// A pre-existing violation elsewhere in the catalog is someone else's repair; blocking on it would
+/// make an unrelated declaration uneditable. ID and address are separate namespaces, so equal bytes
+/// across the two never appear here as a conflict.
+fn refuse_target_conflicts(
+    book: &AddressBook,
+    id: &str,
+    address_code: &'static str,
+) -> Result<(), AuthorError> {
+    for conflict in book.conflicts() {
+        match &conflict {
+            UniquenessConflict::DuplicateId { id: other, .. } if other == id => {
+                return Err(AuthorError::new("duplicate-agent-id", conflict.to_string()));
+            }
+            UniquenessConflict::DuplicateAddress { ids, .. }
+                if ids.iter().any(|other| other == id) =>
+            {
+                return Err(AuthorError::new(address_code, conflict.to_string()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Build the address book for one complete discovery snapshot.
+///
+/// A declaration whose implicit or explicit ID cannot be admitted is a catalog error, not a
+/// silently skipped subject: authoring may not prove exactness against a partial catalog.
+fn catalog_book(specs: &[crate::AgentSpec], this_host: &str) -> Result<AddressBook, AuthorError> {
+    address_book(specs, this_host).map_err(|error| {
+        AuthorError::new(
+            "catalog-malformed",
+            format!("cannot project the catalog address book: {error:#}"),
+        )
+    })
+}
+
+/// Locate the declaration carrying one immutable agent ID.
+///
+/// Exact ID lookup is its own typed namespace (R24): it never falls through to address lookup, so
+/// an ID that names nothing refuses even when the same bytes happen to be a live address.
+fn resolve_by_id(
+    specs: &[crate::AgentSpec],
+    id: &str,
     this_host: &str,
 ) -> Result<AgentTarget, AuthorError> {
-    let exact = specs
+    let matches = specs
         .iter()
-        .filter(|spec| spec.bus_id(this_host) == selector)
+        .filter(|spec| spec.agent_id(this_host) == id)
         .collect::<Vec<_>>();
-    let matches = if exact.is_empty() {
-        specs
-            .iter()
-            .filter(|spec| spec.identity == selector)
-            .collect::<Vec<_>>()
-    } else {
-        exact
-    };
     match matches.as_slice() {
         [] => Err(AuthorError::new(
             "target-not-found",
-            format!("no agent {selector:?} found in the selected catalog"),
+            format!("no agent with id {id:?} exists in the selected catalog"),
         )),
-        [spec] => Ok(AgentTarget {
-            identity: spec.bus_id(this_host),
-            source_host: spec.resolved_host(this_host).to_owned(),
-            source_identity: spec.identity.clone(),
-            declaration: spec.path.clone(),
-            retired: spec.desired_state.is_retired(),
-        }),
-        many => {
-            let mut candidates = many
-                .iter()
-                .map(|spec| format!("{} ({})", spec.bus_id(this_host), spec.path.display()))
-                .collect::<Vec<_>>();
-            candidates.sort();
-            Err(AuthorError::new(
-                "target-ambiguous",
-                format!(
-                    "agent selector {selector:?} is ambiguous: {}",
-                    candidates.join(", ")
-                ),
-            ))
+        [spec] => Ok(target_of(spec, this_host)),
+        many => Err(AuthorError::new(
+            "target-ambiguous",
+            format!(
+                "agent id {id:?} is declared by more than one declaration: {}",
+                declaration_list(many)
+            ),
+        )),
+    }
+}
+
+/// Locate the declaration one ordinary human reference routes to.
+///
+/// This is the F20 bare-or-qualified address algorithm, never a hand-rolled positional comparison,
+/// and it reaches only routable subjects. Content authoring (streams, Resource bindings) accepts
+/// it; identity and lifecycle authoring does not (R25, R28).
+fn resolve_by_address(
+    specs: &[crate::AgentSpec],
+    reference: &str,
+    this_host: &str,
+    pinned_host: Option<&str>,
+) -> Result<AgentTarget, AuthorError> {
+    let book = catalog_book(specs, this_host)?;
+    let subject = book
+        .resolve_address(reference, pinned_host)
+        .map_err(|error| {
+            let code = match error {
+                crate::ResolveError::AmbiguousAddress { .. } => "target-ambiguous",
+                _ => "target-not-found",
+            };
+            AuthorError::new(code, error.to_string())
+        })?;
+    let id = subject.id.as_str();
+    let matches = specs
+        .iter()
+        .filter(|spec| spec.agent_id(this_host) == id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [spec] => Ok(target_of(spec, this_host)),
+        [] => Err(AuthorError::new(
+            "target-not-found",
+            format!("address {reference:?} resolved to id {id:?}, which no declaration carries"),
+        )),
+        many => Err(AuthorError::new(
+            "target-ambiguous",
+            format!(
+                "address {reference:?} resolved to id {id:?}, declared more than once: {}",
+                declaration_list(many)
+            ),
+        )),
+    }
+}
+
+/// Resolve one caller-supplied target selector in the namespace its own form declares.
+///
+/// Content authoring (streams, Resource bindings) accepts either an exact ID — `--id`, or the
+/// acting subject defaulted from `$ST_AGENT` — or an ordinary human address. The two never fall
+/// back into each other, so defaulting the target to the caller keeps whichever namespace the
+/// caller actually arrived in.
+fn resolve_selected_target(
+    specs: &[crate::AgentSpec],
+    selector: &AgentSelector,
+    this_host: &str,
+) -> Result<AgentTarget, AuthorError> {
+    match selector {
+        AgentSelector::Id(id) => resolve_by_id(specs, id, this_host),
+        AgentSelector::Address { reference, host } => {
+            resolve_by_address(specs, reference, this_host, host.as_deref())
         }
     }
 }
 
+fn target_of(spec: &crate::AgentSpec, this_host: &str) -> AgentTarget {
+    AgentTarget {
+        id: spec.agent_id(this_host),
+        source_host: spec.resolved_host(this_host).to_owned(),
+        source_identity: spec.identity.clone(),
+        effective_address: spec.effective_address().to_owned(),
+        declaration: spec.path.clone(),
+        retired: spec.desired_state.is_retired(),
+    }
+}
+
+fn declaration_list(specs: &[&crate::AgentSpec]) -> String {
+    let mut paths = specs
+        .iter()
+        .map(|spec| spec.path.display().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.join(", ")
+}
+
+/// Refuse to edit a declaration's immutable agent ID.
+///
+/// R24 and R30 make ID replacement retire-old/add-new: no in-place edit preserves the subject, so
+/// st2 exposes no id-authoring path. This classified refusal exists so a caller that asks for one
+/// gets the same machine-readable shape as every other authoring refusal instead of a surface that
+/// looks editable.
+pub fn refuse_agent_id_change(
+    id: &str,
+    requested: &str,
+) -> Result<std::convert::Infallible, AuthorError> {
+    Err(AuthorError::new(
+        "immutable-agent-id",
+        format!(
+            "agent id {id:?} is immutable and cannot become {requested:?}: \
+             retire this subject and add a new declaration with its own id"
+        ),
+    ))
+}
+
+/// Apply the trusted-fleet self/descendant guardrail over supervisor edges.
+///
+/// `actor` is an already-resolved immutable agent ID: every human reference was resolved once, in
+/// its own namespace, before this call. An actor ID is never compared against an address.
 fn authorize_actor(
     specs: &[crate::AgentSpec],
     target: &str,
@@ -735,34 +1092,26 @@ fn authorize_actor(
     if actor == target {
         return Ok(());
     }
-    let by_identity = specs
+    // The book itself is unused here — the walk below is keyed by ID — but building it is the
+    // load-bearing admission proof that this snapshot's identity namespaces are unambiguous.
+    let _book = catalog_book(specs, this_host)?;
+    let by_id = specs
         .iter()
-        .map(|spec| (spec.bus_id(this_host), spec))
+        .map(|spec| (spec.agent_id(this_host), spec))
         .collect::<BTreeMap<_, _>>();
     let mut current = target.to_owned();
     let mut visited = BTreeSet::new();
     while visited.insert(current.clone()) {
-        let Some(spec) = by_identity.get(&current) else {
+        let Some(spec) = by_id.get(&current) else {
             break;
         };
-        let Some(supervisor) = spec.supervisor.as_deref() else {
+        let Some(parent) = supervisor_id(specs, &by_id, spec, this_host) else {
             break;
         };
-        if supervisor == actor {
+        if parent == actor {
             return Ok(());
         }
-        let same_host = format!("{}.{}", spec.resolved_host(this_host), supervisor);
-        let qualified = if by_identity.contains_key(supervisor) {
-            supervisor.to_owned()
-        } else if by_identity.contains_key(&same_host) {
-            same_host
-        } else {
-            supervisor.to_owned()
-        };
-        if qualified == actor {
-            return Ok(());
-        }
-        current = qualified;
+        current = parent;
     }
     Err(AuthorError::new(
         refusal_code,
@@ -770,10 +1119,58 @@ fn authorize_actor(
     ))
 }
 
+/// The immutable ID one declared `supervisor` value names, resolved in exactly one namespace.
+///
+/// The edge's namespace is decided by the child that declares it — once, in
+/// [`crate::supervisor_chain::supervisor_edge`] — never by which lookup happens to answer.
+/// Trying both namespaces would let an unrelated subject whose ID is byte-equal to another
+/// subject's address capture the edge, which decision 0015 forbids. An edge that names no subject,
+/// or one this snapshot cannot attribute to a single declaration, ends the walk rather than
+/// guessing.
+fn supervisor_id(
+    specs: &[crate::AgentSpec],
+    by_id: &BTreeMap<String, &crate::AgentSpec>,
+    child: &crate::AgentSpec,
+    this_host: &str,
+) -> Option<String> {
+    let parent = crate::supervisor_chain::resolve_supervisor_spec(specs, child, this_host)?;
+    let id = parent.agent_id(this_host);
+    by_id.contains_key(&id).then_some(id)
+}
+
+/// Resolve one caller-supplied actor to the immutable agent ID it names, in its own namespace.
+///
+/// `AgentSelector::Id` is `$ST_AGENT` or `--id`: an exact ID that never reaches the address
+/// algorithm. `AgentSelector::Address` is a human `--as` reference: an ordinary address that never
+/// reaches the ID namespace. An actor that names no subject cannot hold catalog authority, so it
+/// refuses with the operation's own refusal code instead of silently walking to a refusal.
+fn resolve_actor(
+    specs: &[crate::AgentSpec],
+    actor: Option<&AgentSelector>,
+    this_host: &str,
+    refusal_code: &'static str,
+) -> Result<Option<String>, AuthorError> {
+    let Some(actor) = actor else {
+        return Ok(None);
+    };
+    let book = catalog_book(specs, this_host)?;
+    book.resolve(actor)
+        .map(|subject| Some(subject.id.as_str().to_owned()))
+        .map_err(|error| {
+            AuthorError::new(
+                refusal_code,
+                format!(
+                    "acting agent {:?} does not name a catalog subject: {error}",
+                    actor.as_input()
+                ),
+            )
+        })
+}
+
 #[cfg(test)]
 fn edit_declaration_for_test(
     path: &Path,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     field: PresentationField,
@@ -792,7 +1189,7 @@ fn edit_declaration_for_test(
         path.parent().expect("test catalog has a parent"),
         &control,
         path,
-        expected_identity,
+        expected_id,
         expected_host,
         expected_agent,
         field,
@@ -829,13 +1226,44 @@ fn edit_desired_state_for_test(
     )
 }
 
+/// Drive one address edit with a commit-window hook.
+///
+/// The stale-writer recheck happens inside the catalog lock, so a competing write can only be
+/// scheduled from inside the transaction. That window is not reachable from an integration test.
+#[cfg(test)]
+fn edit_address_for_test(
+    path: &Path,
+    requested: Option<&AgentAddress>,
+    before_commit: impl FnOnce(),
+) -> Result<AuthorOutcome, AuthorError> {
+    let catalog = path.parent().expect("test catalog has a parent");
+    let control = catalog.join(crate::catalog_lock::CONTROL_DIR);
+    fs::create_dir_all(&control).expect("create test catalog control directory");
+    let catalog_lock = CatalogLock::exclusive(catalog).expect("acquire test catalog lock");
+    let found = crate::discover(catalog);
+    edit_address_declaration(
+        &catalog_lock,
+        catalog,
+        &control,
+        path,
+        "h.worker",
+        "h",
+        "worker",
+        requested,
+        &found.specs,
+        "h",
+        "address-conflict",
+        before_commit,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn edit_stream_declaration(
     catalog_lock: &CatalogLock,
     catalog: &Path,
     control: &Path,
     path: &Path,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     name: &str,
@@ -883,12 +1311,12 @@ fn edit_stream_declaration(
             format!("parsing declaration {}: {error}", path.display()),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     if is_nix_managed(target) {
         return Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
+                "agent {expected_id:?} is Nix-owned; edit its Nix source instead of {}",
                 path.display()
             ),
         ));
@@ -901,7 +1329,7 @@ fn edit_stream_declaration(
         catalog,
         path,
         &replacement,
-        expected_identity,
+        expected_id,
         expected_host,
         expected_agent,
         name,
@@ -1016,7 +1444,7 @@ fn verify_stream_candidate(
     catalog: &Path,
     path: &Path,
     candidate: &str,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     name: &str,
@@ -1053,7 +1481,7 @@ fn verify_stream_candidate(
     let spec = specs
         .iter()
         .find(|spec| {
-            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
+            spec.identity == expected_agent && spec.agent_id(expected_host) == expected_id
         })
         .ok_or_else(|| {
             AuthorError::new(
@@ -1080,7 +1508,7 @@ fn edit_resource_declaration(
     catalog: &Path,
     control: &Path,
     path: &Path,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     intent: ResourceIntent<'_>,
@@ -1126,12 +1554,12 @@ fn edit_resource_declaration(
             format!("parsing declaration {}: {error}", path.display()),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     if is_nix_managed(target) {
         return Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
+                "agent {expected_id:?} is Nix-owned; edit its Nix source instead of {}",
                 path.display()
             ),
         ));
@@ -1143,7 +1571,7 @@ fn edit_resource_declaration(
         catalog,
         path,
         &replacement,
-        expected_identity,
+        expected_id,
         expected_host,
         expected_agent,
         &expectation,
@@ -1397,7 +1825,7 @@ fn verify_resource_candidate(
     catalog: &Path,
     path: &Path,
     candidate: &str,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     expectation: &ResourceExpectation,
@@ -1432,7 +1860,7 @@ fn verify_resource_candidate(
     let spec = specs
         .iter()
         .find(|spec| {
-            spec.identity == expected_agent && spec.bus_id(expected_host) == expected_identity
+            spec.identity == expected_agent && spec.agent_id(expected_host) == expected_id
         })
         .ok_or_else(|| {
             AuthorError::new(
@@ -1467,7 +1895,7 @@ fn edit_declaration(
     catalog: &Path,
     control: &Path,
     path: &Path,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     field: PresentationField,
@@ -1514,25 +1942,25 @@ fn edit_declaration(
             format!("parsing declaration {}: {error}", path.display()),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     if is_nix_managed(target) {
         return Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
+                "agent {expected_id:?} is Nix-owned; edit its Nix source instead of {}",
                 path.display()
             ),
         ));
     }
-    let Some(replacement) = presentation_edit(text, target, field, requested)? else {
+    let Some(replacement) = field_edit(text, target, field.into(), requested)? else {
         return Ok(AuthorOutcome::Unchanged);
     };
     verify_candidate(
         &replacement,
-        expected_identity,
+        expected_id,
         expected_host,
         expected_agent,
-        field,
+        field.into(),
         requested,
     )?;
     atomic_replace_checked(
@@ -1549,13 +1977,195 @@ fn edit_declaration(
     Ok(AuthorOutcome::Changed)
 }
 
+/// Apply one span-bounded `address` edit under the transaction contract shared with F17.
+///
+/// The candidate is reparsed and proved as part of the *complete* prospective catalog, not just as
+/// one file: host-local effective-address uniqueness is a whole-catalog property and an identity
+/// fallback can collide with another declaration's explicit address.
+#[allow(clippy::too_many_arguments)]
+fn edit_address_declaration(
+    catalog_lock: &CatalogLock,
+    catalog: &Path,
+    control: &Path,
+    path: &Path,
+    expected_id: &str,
+    expected_host: &str,
+    expected_agent: &str,
+    requested: Option<&AgentAddress>,
+    snapshot: &[crate::AgentSpec],
+    this_host: &str,
+    conflict_code: &'static str,
+    before_commit: impl FnOnce(),
+) -> Result<AuthorOutcome, AuthorError> {
+    if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
+        return Err(AuthorError::new(
+            "unsupported-declaration-format",
+            format!(
+                "address authoring requires canonical KDL, found {}",
+                path.display()
+            ),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AuthorError::new(
+            "declaration-read-failed",
+            format!("reading declaration {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(AuthorError::new(
+            "unsafe-declaration-path",
+            format!("refusing non-regular declaration path {}", path.display()),
+        ));
+    }
+    let original = fs::read(path).map_err(|error| {
+        AuthorError::new(
+            "declaration-read-failed",
+            format!("reading declaration {}: {error}", path.display()),
+        )
+    })?;
+    let original_version = SourceVersion::from_metadata(&metadata);
+    let text = std::str::from_utf8(&original).map_err(|error| {
+        AuthorError::new(
+            "malformed-declaration",
+            format!("declaration {} is not UTF-8: {error}", path.display()),
+        )
+    })?;
+    let document = KdlDocument::parse(text).map_err(|error| {
+        AuthorError::new(
+            "malformed-declaration",
+            format!("parsing declaration {}: {error}", path.display()),
+        )
+    })?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
+    if is_nix_managed(target) {
+        return Err(AuthorError::new(
+            "nix-managed-declaration",
+            format!(
+                "agent {expected_id:?} is Nix-owned; edit its Nix source instead of {}",
+                path.display()
+            ),
+        ));
+    }
+    let Some(replacement) = field_edit(
+        text,
+        target,
+        DirectField::Address,
+        requested.map(AgentAddress::as_str),
+    )?
+    else {
+        return Ok(AuthorOutcome::Unchanged);
+    };
+    verify_candidate(
+        &replacement,
+        expected_id,
+        expected_host,
+        expected_agent,
+        DirectField::Address,
+        requested.map(AgentAddress::as_str),
+    )?;
+    verify_address_candidate(
+        catalog,
+        path,
+        &replacement,
+        expected_id,
+        expected_host,
+        requested,
+        snapshot,
+        this_host,
+        conflict_code,
+    )?;
+    atomic_replace_checked(
+        catalog_lock,
+        catalog,
+        control,
+        path,
+        &original,
+        original_version,
+        replacement.as_bytes(),
+        metadata.permissions().mode() & 0o7777,
+        before_commit,
+    )?;
+    Ok(AuthorOutcome::Changed)
+}
+
+/// Reparse the candidate declaration and prove the complete prospective catalog it produces.
+///
+/// Three things must hold: the candidate still parses as a canonical Agent Spec, the subject's
+/// immutable ID is byte-identical (an address edit that moved an ID would be an unsupported
+/// identity replacement, R30), and no admitted uniqueness rule this subject participates in is
+/// violated.
+#[allow(clippy::too_many_arguments)]
+fn verify_address_candidate(
+    catalog: &Path,
+    path: &Path,
+    candidate: &str,
+    expected_id: &str,
+    expected_host: &str,
+    requested: Option<&AgentAddress>,
+    snapshot: &[crate::AgentSpec],
+    this_host: &str,
+    conflict_code: &'static str,
+) -> Result<(), AuthorError> {
+    let temporary = tempfile::tempdir()
+        .map_err(|error| AuthorError::new("unsafe-source-edit", error.to_string()))?;
+    let relative = path.strip_prefix(catalog).map_err(|_| {
+        AuthorError::new(
+            "unsafe-declaration-path",
+            format!(
+                "declaration {} is outside catalog {}",
+                path.display(),
+                catalog.display()
+            ),
+        )
+    })?;
+    let candidate_path = temporary.path().join(relative);
+    fs::create_dir_all(
+        candidate_path
+            .parent()
+            .expect("candidate declaration has a parent"),
+    )
+    .and_then(|()| fs::write(&candidate_path, candidate))
+    .map_err(|error| {
+        AuthorError::new(
+            "unsafe-source-edit",
+            format!("stage address validation: {error}"),
+        )
+    })?;
+    let (specs, _) = agent_spec::discover_file(temporary.path(), &candidate_path)
+        .map_err(|error| AuthorError::new("invalid-address", error.to_string()))?;
+    let spec = specs
+        .iter()
+        .find(|spec| spec.agent_id(expected_host) == expected_id)
+        .ok_or_else(|| {
+            AuthorError::new(
+                "immutable-agent-id",
+                format!("address candidate no longer carries agent id {expected_id:?}"),
+            )
+        })?;
+    if spec.address.as_ref().map(AgentAddress::as_str) != requested.map(AgentAddress::as_str) {
+        return Err(AuthorError::new(
+            "unsafe-source-edit",
+            "address candidate did not read back as the authored intent",
+        ));
+    }
+    let subject = spec.subject(expected_host).map_err(|error| {
+        AuthorError::new("invalid-address", format!("admit address candidate: {error:#}"))
+    })?;
+    refuse_target_conflicts(
+        &prospective_book(snapshot, this_host, subject)?,
+        expected_id,
+        conflict_code,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn edit_desired_state_declaration(
     catalog_lock: &CatalogLock,
     catalog: &Path,
     control: &Path,
     path: &Path,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     state: DesiredStateValue,
@@ -1602,12 +2212,12 @@ fn edit_desired_state_declaration(
             format!("parsing declaration {}: {error}", path.display()),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     if is_nix_managed(target) {
         return Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
+                "agent {expected_id:?} is Nix-owned; edit its Nix source instead of {}",
                 path.display()
             ),
         ));
@@ -1617,7 +2227,7 @@ fn edit_desired_state_declaration(
     };
     verify_desired_state_candidate(
         &replacement,
-        expected_identity,
+        expected_id,
         expected_host,
         expected_agent,
         state,
@@ -1684,7 +2294,7 @@ fn desired_state_edit(
 
 fn verify_desired_state_candidate(
     candidate: &str,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
     state: DesiredStateValue,
@@ -1696,7 +2306,7 @@ fn verify_desired_state_candidate(
             format!("desired-state edit did not produce valid KDL: {error}"),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     let lifecycle = target
         .children()
         .into_iter()
@@ -1722,7 +2332,7 @@ fn verify_desired_state_candidate(
 
 fn exact_agent_node<'a>(
     document: &'a KdlDocument,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
 ) -> Result<&'a KdlNode, AuthorError> {
@@ -1755,11 +2365,11 @@ fn exact_agent_node<'a>(
         [target] => Ok(*target),
         [] => Err(AuthorError::new(
             "target-changed",
-            format!("declaration no longer contains agent {expected_identity:?}"),
+            format!("declaration no longer contains agent {expected_id:?}"),
         )),
         _ => Err(AuthorError::new(
             "target-ambiguous",
-            format!("declaration contains more than one agent {expected_identity:?}"),
+            format!("declaration contains more than one agent {expected_id:?}"),
         )),
     }
 }
@@ -1806,10 +2416,14 @@ fn is_nix_managed(node: &KdlNode) -> bool {
     })
 }
 
-fn presentation_edit(
+/// Set, replace, or remove exactly one direct single-string field on one agent node.
+///
+/// `Ok(None)` is the proven no-op. Every other outcome rewrites exactly that field's span, so every
+/// unrelated byte of the declaration — including unknown fields and comments — survives.
+fn field_edit(
     text: &str,
     target: &KdlNode,
-    field: PresentationField,
+    field: DirectField,
     requested: Option<&str>,
 ) -> Result<Option<String>, AuthorError> {
     let fields = target
@@ -1828,17 +2442,17 @@ fn presentation_edit(
             None => remove_field(text, node).map(Some),
         },
         _ => Err(AuthorError::new(
-            "duplicate-presentation-field",
+            field.duplicate_code(),
             format!("target declares `{}` more than once", field.as_str()),
         )),
     }
 }
 
-fn parse_field_value(node: &KdlNode, field: PresentationField) -> Result<&str, AuthorError> {
+fn parse_field_value(node: &KdlNode, field: DirectField) -> Result<&str, AuthorError> {
     if node.children().is_some() || node.entries().len() != 1 || node.entries()[0].name().is_some()
     {
         return Err(AuthorError::new(
-            "malformed-presentation-field",
+            field.malformed_code(),
             format!(
                 "`{}` must contain exactly one positional string",
                 field.as_str()
@@ -1849,7 +2463,7 @@ fn parse_field_value(node: &KdlNode, field: PresentationField) -> Result<&str, A
         .and_then(|value| value.as_string())
         .ok_or_else(|| {
             AuthorError::new(
-                "malformed-presentation-field",
+                field.malformed_code(),
                 format!("`{}` must contain a string", field.as_str()),
             )
         })
@@ -1859,7 +2473,7 @@ fn quoted(value: &str) -> Result<String, AuthorError> {
     serde_json::to_string(value).map_err(|error| {
         AuthorError::new(
             "unsafe-source-edit",
-            format!("encode presentation string for canonical KDL: {error}"),
+            format!("encode declaration string for canonical KDL: {error}"),
         )
     })
 }
@@ -1867,7 +2481,7 @@ fn quoted(value: &str) -> Result<String, AuthorError> {
 fn replace_field(
     text: &str,
     node: &KdlNode,
-    field: PresentationField,
+    field: DirectField,
     value: &str,
 ) -> Result<Option<String>, AuthorError> {
     if parse_field_value(node, field)? == value {
@@ -1879,7 +2493,7 @@ fn replace_field(
     text.get(range.clone()).ok_or_else(|| {
         AuthorError::new(
             "malformed-declaration",
-            "presentation value span falls outside the declaration",
+            "declaration field value span falls outside the declaration",
         )
     })?;
     let mut replacement = text.to_owned();
@@ -1890,7 +2504,7 @@ fn replace_field(
 fn insert_field(
     text: &str,
     target: &KdlNode,
-    field: PresentationField,
+    field: DirectField,
     value: &str,
 ) -> Result<String, AuthorError> {
     insert_node(
@@ -2050,19 +2664,19 @@ fn line_indent(text: &str, offset: usize) -> Option<String> {
 
 fn verify_candidate(
     candidate: &str,
-    expected_identity: &str,
+    expected_id: &str,
     expected_host: &str,
     expected_agent: &str,
-    field: PresentationField,
+    field: DirectField,
     expected: Option<&str>,
 ) -> Result<(), AuthorError> {
     let document = KdlDocument::parse(candidate).map_err(|error| {
         AuthorError::new(
             "unsafe-source-edit",
-            format!("presentation edit did not produce valid KDL: {error}"),
+            format!("field edit did not produce valid KDL: {error}"),
         )
     })?;
-    let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    let target = exact_agent_node(&document, expected_id, expected_host, expected_agent)?;
     let fields = target
         .children()
         .into_iter()
@@ -2076,7 +2690,7 @@ fn verify_candidate(
             return Err(AuthorError::new(
                 "unsafe-source-edit",
                 format!(
-                    "presentation edit produced duplicate `{}` fields",
+                    "field edit produced duplicate `{}` fields",
                     field.as_str()
                 ),
             ));
@@ -2086,7 +2700,7 @@ fn verify_candidate(
         return Err(AuthorError::new(
             "unsafe-source-edit",
             format!(
-                "presentation edit did not produce the requested `{}`",
+                "field edit did not produce the requested `{}`",
                 field.as_str()
             ),
         ));
@@ -2257,7 +2871,7 @@ mod tests {
         assert_eq!(
             set_presentation(
                 root,
-                "worker",
+                "h.worker",
                 "h",
                 None,
                 PresentationField::Name,
@@ -2270,7 +2884,7 @@ mod tests {
         assert_eq!(
             set_presentation(
                 root,
-                "worker",
+                "h.worker",
                 "h",
                 None,
                 PresentationField::Name,
@@ -2281,7 +2895,7 @@ mod tests {
             AuthorOutcome::Changed
         );
         assert_eq!(
-            set_presentation(root, "worker", "h", None, PresentationField::Name, None)
+            set_presentation(root, "h.worker", "h", None, PresentationField::Name, None)
                 .unwrap()
                 .result,
             AuthorOutcome::Changed
@@ -2364,7 +2978,7 @@ mod tests {
             root,
             "h.child",
             "h",
-            Some("h.child"),
+            Some(&AgentSelector::id("h.child")),
             PresentationField::Name,
             Some("self"),
         )
@@ -2373,7 +2987,7 @@ mod tests {
             root,
             "h.child",
             "h",
-            Some("h.root"),
+            Some(&AgentSelector::id("h.root")),
             PresentationField::Description,
             Some("supervised"),
         )
@@ -2383,7 +2997,7 @@ mod tests {
                 root,
                 "h.sibling",
                 "h",
-                Some("h.child"),
+                Some(&AgentSelector::id("h.child")),
                 PresentationField::Name,
                 Some("no")
             )
@@ -2396,7 +3010,7 @@ mod tests {
                 root,
                 "h.nix",
                 "h",
-                Some("h.root"),
+                Some(&AgentSelector::id("h.root")),
                 PresentationField::Name,
                 Some("no")
             )
@@ -2472,6 +3086,202 @@ mod tests {
     }
 
     #[test]
+    fn address_authoring_refuses_a_stale_source_before_replacing_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = write(
+            temporary.path(),
+            "agent.kdl",
+            &declaration("worker", "h", None, "catalog"),
+        );
+        let changed = declaration("worker", "h", None, "external");
+        let error = edit_address_for_test(&path, Some(&address("build.owner")), || {
+            fs::write(&path, &changed).unwrap()
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "source-changed");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            changed,
+            "the competing writer's bytes survive; the refused edit wrote nothing"
+        );
+    }
+
+
+    const PARENT_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320e01";
+    const CHILD_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320e02";
+
+    /// One agent declaration with arbitrary extra child nodes.
+    fn agent_with(identity: &str, host: &str, extra: &str) -> String {
+        format!(
+            "// keep this comment\nagent {identity:?} {{\n  host {host:?}\n{extra}  command \"sleep 60\"\n}}\n"
+        )
+    }
+
+    /// A supervisor edge resolves in exactly one namespace, chosen by the child that declares it.
+    ///
+    /// The trap: an unrelated subject whose immutable ID is byte-equal to another subject's bus
+    /// address. Trying IDs first and falling back to addresses let that subject capture an
+    /// unmigrated child's legacy edge and gain descendant authority over a declaration it does not
+    /// supervise.
+    #[test]
+    fn a_supervisor_edge_never_lets_a_byte_equal_id_capture_a_legacy_address_edge() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        // `impostor` holds the ID "dev3.worker"; `lead` holds the bus address "dev3.worker".
+        write(
+            root,
+            "dev3/impostor/agent.kdl",
+            &agent_with("impostor", "dev3", "  id \"dev3.worker\"\n"),
+        );
+        write(
+            root,
+            "dev3/lead/agent.kdl",
+            &agent_with("worker", "dev3", &format!("  id {PARENT_ID:?}\n")),
+        );
+        write(
+            root,
+            "dev3/legacy/agent.kdl",
+            &agent_with("legacy", "dev3", "  supervisor \"dev3.worker\"\n"),
+        );
+        write(
+            root,
+            "dev3/migrated/agent.kdl",
+            &agent_with(
+                "migrated",
+                "dev3",
+                &format!("  id {CHILD_ID:?}\n  supervisor \"dev3.worker\"\n"),
+            ),
+        );
+
+        // The unmigrated child's edge is a legacy positional reference: it names `lead`, never the
+        // subject that merely carries those bytes as an ID.
+        let captured = set_address(
+            root,
+            "dev3.legacy",
+            "dev3",
+            Some(&AgentSelector::id("dev3.worker")),
+            Some(&address("legacy.edge")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            captured.code(),
+            "address-not-authorized",
+            "an id byte-equal to a bus address must not capture a legacy edge"
+        );
+        set_address(
+            root,
+            "dev3.legacy",
+            "dev3",
+            Some(&AgentSelector::id(PARENT_ID)),
+            Some(&address("legacy.edge")),
+        )
+        .unwrap();
+
+        // The migrated child's edge is an ID: it names `impostor`, and never resolves by address.
+        set_address(
+            root,
+            CHILD_ID,
+            "dev3",
+            Some(&AgentSelector::id("dev3.worker")),
+            Some(&address("migrated.edge")),
+        )
+        .unwrap();
+        let crossed = set_address(
+            root,
+            CHILD_ID,
+            "dev3",
+            Some(&AgentSelector::id(PARENT_ID)),
+            Some(&address("migrated.edge2")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crossed.code(),
+            "address-not-authorized",
+            "a migrated edge is an id edge; the address namespace never answers it"
+        );
+    }
+
+    /// An actor is resolved once, in the namespace its own selector declares.
+    ///
+    /// `$ST_AGENT` and `--id` are exact IDs; `--as` is an ordinary address. Neither input is
+    /// accepted in the other namespace, so a UUID never reaches the address algorithm and a human
+    /// address is never compared against an ID.
+    #[test]
+    fn an_actor_selector_resolves_in_its_own_namespace_only() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write(
+            root,
+            "h/lead/agent.kdl",
+            &agent_with(
+                "lead",
+                "h",
+                &format!("  id {PARENT_ID:?}\n  address \"parent.edge\"\n"),
+            ),
+        );
+        write(
+            root,
+            "h/child/agent.kdl",
+            &agent_with(
+                "child",
+                "h",
+                &format!("  id {CHILD_ID:?}\n  supervisor {PARENT_ID:?}\n"),
+            ),
+        );
+
+        // An ambient UUID `ST_AGENT` authorizes itself.
+        set_address(
+            root,
+            PARENT_ID,
+            "h",
+            Some(&AgentSelector::id(PARENT_ID)),
+            Some(&address("parent.edge2")),
+        )
+        .unwrap();
+
+        // A human `--as` address authorizes its subject over a descendant.
+        set_address(
+            root,
+            CHILD_ID,
+            "h",
+            Some(&AgentSelector::address("parent.edge2")),
+            Some(&address("child.edge")),
+        )
+        .unwrap();
+
+        // Neither input crosses into the other namespace.
+        for (actor, why) in [
+            (AgentSelector::id("parent.edge2"), "an address is not an id"),
+            (
+                AgentSelector::address(PARENT_ID),
+                "an id is not an address",
+            ),
+        ] {
+            let error = set_address(
+                root,
+                CHILD_ID,
+                "h",
+                Some(&actor),
+                Some(&address("child.edge2")),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "address-not-authorized", "{why}");
+            assert!(error.to_string().contains("does not name"), "{why}: {error}");
+        }
+
+        let found = crate::discover(root);
+        let book = address_book(&found.specs, "h").unwrap();
+        assert_eq!(
+            book.resolve_address("child.edge", None).unwrap().id.as_str(),
+            CHILD_ID
+        );
+    }
+
+    fn address(value: &str) -> AgentAddress {
+        AgentAddress::parse(value).expect("test address")
+    }
+
+    #[test]
     fn desired_state_authoring_prefers_an_explicit_target_over_an_anonymous_sibling() {
         let temporary = tempfile::tempdir().unwrap();
         let path = write(
@@ -2507,7 +3317,7 @@ mod tests {
         let original = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            add_stream(root, "h.worker", "h", Some("h.worker"), "webhook", None)
+            add_stream(root, &AgentSelector::address("h.worker"), "h", Some(&AgentSelector::id("h.worker")), "webhook", None)
                 .unwrap()
                 .result,
             AuthorOutcome::Changed
@@ -2515,9 +3325,9 @@ mod tests {
         assert_eq!(
             add_stream(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
-                Some("h.worker"),
+                Some(&AgentSelector::id("h.worker")),
                 "github-ci",
                 Some(StreamLaunch::Command("gh watch --repo st2".to_owned())),
             )
@@ -2528,9 +3338,9 @@ mod tests {
         assert_eq!(
             add_stream(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
-                Some("h.worker"),
+                Some(&AgentSelector::id("h.worker")),
                 "tick",
                 Some(StreamLaunch::Argv(vec![
                     "tick-source".to_owned(),
@@ -2542,7 +3352,7 @@ mod tests {
             AuthorOutcome::Changed
         );
         assert_eq!(
-            add_stream(root, "h.worker", "h", Some("h.worker"), "webhook", None)
+            add_stream(root, &AgentSelector::address("h.worker"), "h", Some(&AgentSelector::id("h.worker")), "webhook", None)
                 .unwrap()
                 .result,
             AuthorOutcome::Unchanged
@@ -2553,13 +3363,13 @@ mod tests {
         assert!(authored.contains("stream \"tick\" { argv \"tick-source\" \"--daily\" }"));
 
         assert_eq!(
-            remove_stream(root, "h.worker", "h", None, "webhook")
+            remove_stream(root, &AgentSelector::address("h.worker"), "h", None, "webhook")
                 .unwrap()
                 .result,
             AuthorOutcome::Changed
         );
         assert_eq!(
-            remove_stream(root, "h.worker", "h", None, "webhook")
+            remove_stream(root, &AgentSelector::address("h.worker"), "h", None, "webhook")
                 .unwrap()
                 .result,
             AuthorOutcome::Unchanged
@@ -2584,9 +3394,9 @@ mod tests {
         assert_eq!(
             add_stream(
                 root,
-                "beta.worker",
+                &AgentSelector::address("beta.worker"),
                 "beta",
-                Some("beta.worker"),
+                Some(&AgentSelector::id("beta.worker")),
                 "webhook",
                 None,
             )
@@ -2595,7 +3405,7 @@ mod tests {
             AuthorOutcome::Changed
         );
         assert_eq!(
-            remove_stream(root, "beta.worker", "beta", Some("beta.worker"), "existing",)
+            remove_stream(root, &AgentSelector::address("beta.worker"), "beta", Some(&AgentSelector::id("beta.worker")), "existing",)
                 .unwrap()
                 .result,
             AuthorOutcome::Changed
@@ -2635,21 +3445,21 @@ mod tests {
             &declaration("nix", "h", Some("root"), "nix"),
         );
 
-        add_stream(root, "h.child", "h", Some("h.root"), "events", None).unwrap();
+        add_stream(root, &AgentSelector::address("h.child"), "h", Some(&AgentSelector::id("h.root")), "events", None).unwrap();
         assert_eq!(
-            add_stream(root, "h.sibling", "h", Some("h.child"), "events", None)
+            add_stream(root, &AgentSelector::address("h.sibling"), "h", Some(&AgentSelector::id("h.child")), "events", None)
                 .unwrap_err()
                 .code(),
             "stream-not-authorized"
         );
         assert_eq!(
-            add_stream(root, "h.nix", "h", Some("h.root"), "events", None)
+            add_stream(root, &AgentSelector::address("h.nix"), "h", Some(&AgentSelector::id("h.root")), "events", None)
                 .unwrap_err()
                 .code(),
             "nix-managed-declaration"
         );
         assert_eq!(
-            add_stream(root, "h.child", "h", None, "Bad Name", None)
+            add_stream(root, &AgentSelector::address("h.child"), "h", None, "Bad Name", None)
                 .unwrap_err()
                 .code(),
             "invalid-stream"
@@ -2657,7 +3467,7 @@ mod tests {
         assert_eq!(
             add_stream(
                 root,
-                "h.child",
+                &AgentSelector::address("h.child"),
                 "h",
                 None,
                 "empty-argv",
@@ -2689,7 +3499,7 @@ mod tests {
         symlink(&concealed, root.join("concealed-link")).unwrap();
         let original = fs::read(&declaration_path).unwrap();
 
-        let error = add_stream(&root, "h.worker", "h", None, "events", None).unwrap_err();
+        let error = add_stream(&root, &AgentSelector::address("h.worker"), "h", None, "events", None).unwrap_err();
 
         assert_eq!(error.code(), "catalog-malformed");
         assert!(
@@ -2723,9 +3533,9 @@ mod tests {
 
         let added = add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
-            Some("h.worker"),
+            Some(&AgentSelector::id("h.worker")),
             "work",
             "github-issue://example/project/123",
             "release work item",
@@ -2738,7 +3548,7 @@ mod tests {
 
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "source",
@@ -2753,7 +3563,7 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
                 None,
                 "work",
@@ -2771,7 +3581,7 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
                 None,
                 "work",
@@ -2805,7 +3615,7 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
                 None,
                 "work",
@@ -2839,7 +3649,7 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
                 None,
                 "work",
@@ -2865,7 +3675,7 @@ mod tests {
         );
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "work",
@@ -2876,7 +3686,7 @@ mod tests {
         .unwrap();
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "source",
@@ -2886,19 +3696,19 @@ mod tests {
         )
         .unwrap();
 
-        let removed = remove_resource(root, "h.worker", "h", Some("h.worker"), "work").unwrap();
+        let removed = remove_resource(root, &AgentSelector::address("h.worker"), "h", Some(&AgentSelector::id("h.worker")), "work").unwrap();
         assert_eq!(removed.result, AuthorOutcome::Changed);
         assert_eq!(removed.name, "work");
         let after_remove = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            remove_resource(root, "h.worker", "h", None, "work")
+            remove_resource(root, &AgentSelector::address("h.worker"), "h", None, "work")
                 .unwrap()
                 .result,
             AuthorOutcome::Unchanged
         );
         assert_eq!(
-            remove_resource(root, "h.worker", "h", None, "never-declared")
+            remove_resource(root, &AgentSelector::address("h.worker"), "h", None, "never-declared")
                 .unwrap()
                 .result,
             AuthorOutcome::Unchanged
@@ -2921,7 +3731,7 @@ mod tests {
         );
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "work",
@@ -2932,7 +3742,7 @@ mod tests {
         .unwrap();
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "source",
@@ -2944,7 +3754,7 @@ mod tests {
         let before = fs::read_to_string(&path).unwrap();
 
         assert_eq!(
-            rename_resource(root, "h.worker", "h", None, "work", "work")
+            rename_resource(root, &AgentSelector::address("h.worker"), "h", None, "work", "work")
                 .unwrap()
                 .result,
             AuthorOutcome::Unchanged
@@ -2952,7 +3762,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
 
         let renamed =
-            rename_resource(root, "h.worker", "h", Some("h.worker"), "work", "task").unwrap();
+            rename_resource(root, &AgentSelector::address("h.worker"), "h", Some(&AgentSelector::id("h.worker")), "work", "task").unwrap();
         assert_eq!(renamed.result, AuthorOutcome::Changed);
         assert_eq!(renamed.old, "work");
         assert_eq!(renamed.new, "task");
@@ -2972,20 +3782,20 @@ mod tests {
         );
 
         assert_eq!(
-            rename_resource(root, "h.worker", "h", None, "work", "elsewhere")
+            rename_resource(root, &AgentSelector::address("h.worker"), "h", None, "work", "elsewhere")
                 .unwrap_err()
                 .code(),
             "resource-not-found"
         );
         // An absent `old` refuses even when the rename would otherwise be a self-rename no-op.
         assert_eq!(
-            rename_resource(root, "h.worker", "h", None, "absent", "absent")
+            rename_resource(root, &AgentSelector::address("h.worker"), "h", None, "absent", "absent")
                 .unwrap_err()
                 .code(),
             "resource-not-found"
         );
         assert_eq!(
-            rename_resource(root, "h.worker", "h", None, "task", "source")
+            rename_resource(root, &AgentSelector::address("h.worker"), "h", None, "task", "source")
                 .unwrap_err()
                 .code(),
             "resource-already-exists"
@@ -3021,9 +3831,9 @@ mod tests {
 
         add_resource(
             root,
-            "h.child",
+            &AgentSelector::address("h.child"),
             "h",
-            Some("h.root"),
+            Some(&AgentSelector::id("h.root")),
             "work",
             "github-issue://example/project/1",
             "supervised work item",
@@ -3034,9 +3844,9 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.sibling",
+                &AgentSelector::address("h.sibling"),
                 "h",
-                Some("h.child"),
+                Some(&AgentSelector::id("h.child")),
                 "work",
                 "github-issue://example/project/1",
                 "reaching across the fleet",
@@ -3047,7 +3857,7 @@ mod tests {
             "resource-not-authorized"
         );
         assert_eq!(
-            remove_resource(root, "h.sibling", "h", Some("h.child"), "work")
+            remove_resource(root, &AgentSelector::address("h.sibling"), "h", Some(&AgentSelector::id("h.child")), "work")
                 .unwrap_err()
                 .code(),
             "resource-not-authorized"
@@ -3055,9 +3865,9 @@ mod tests {
         assert_eq!(
             add_resource(
                 root,
-                "h.nix",
+                &AgentSelector::address("h.nix"),
                 "h",
-                Some("h.root"),
+                Some(&AgentSelector::id("h.root")),
                 "work",
                 "github-issue://example/project/1",
                 "Nix owns this declaration",
@@ -3085,7 +3895,7 @@ mod tests {
         ] {
             let error = add_resource(
                 root,
-                "h.child",
+                &AgentSelector::address("h.child"),
                 "h",
                 None,
                 name,
@@ -3107,7 +3917,7 @@ mod tests {
         // #345 widened the envelope: a catalog-relative carrier path is a valid binding uri.
         add_resource(
             root,
-            "h.child",
+            &AgentSelector::address("h.child"),
             "h",
             None,
             "carrier",
@@ -3132,7 +3942,7 @@ mod tests {
 
         add_resource(
             root,
-            "h.worker",
+            &AgentSelector::address("h.worker"),
             "h",
             None,
             "subject",
@@ -3144,14 +3954,14 @@ mod tests {
         assert_eq!(bound(root, "worker", "subject").uri(), exact);
 
         // The rename path carries the identity across without normalizing it either.
-        rename_resource(root, "h.worker", "h", None, "subject", "carried").unwrap();
+        rename_resource(root, &AgentSelector::address("h.worker"), "h", None, "subject", "carried").unwrap();
         assert_eq!(bound(root, "worker", "carried").uri(), exact);
 
         // A byte-identical re-declaration is a proven no-op, not a rewrite.
         assert_eq!(
             add_resource(
                 root,
-                "h.worker",
+                &AgentSelector::address("h.worker"),
                 "h",
                 None,
                 "carried",

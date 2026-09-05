@@ -71,6 +71,59 @@ fn roster_keeps_presence_separate_from_suspended_desired_state() {
     );
 }
 
+/// R24: the roster carries three separate values per row. `identity` keeps its original meaning —
+/// the positional `<host>.<identity>` declaration key — while `id` is the immutable subject and
+/// `bus_address` is the mutable route, absent entirely for a proved non-routable retired subject.
+#[test]
+fn roster_projects_immutable_id_effective_address_and_nullable_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "h/worker/agent.kdl",
+        &agent_kdl("worker", "h").replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  id \"worker-id\"\n  address \"fleet.builder\"\n",
+        ),
+    );
+    write(
+        root,
+        "h/gone/agent.kdl",
+        &retired_agent_kdl("gone", "h").replace(
+            "  type \"service\"\n",
+            "  type \"service\"\n  id \"gone-id\"\n",
+        ),
+    );
+    write(root, "h/plain/agent.kdl", &agent_kdl("plain", "h"));
+
+    let rows = roster(root, "h");
+    let find = |identity: &str| {
+        rows.iter()
+            .find(|row| row.identity == identity)
+            .unwrap_or_else(|| panic!("no roster row for {identity}"))
+    };
+
+    let worker = find("h.worker");
+    assert_eq!(worker.id, "worker-id");
+    assert_eq!(worker.address, "fleet.builder");
+    assert_eq!(worker.bus_address.as_deref(), Some("h.fleet.builder"));
+
+    // An unmigrated declaration's ID is exactly its positional key, which is why migration moves
+    // no durable state: the two values are the same bytes by construction.
+    let plain = find("h.plain");
+    assert_eq!(plain.id, "h.plain");
+    assert_eq!(plain.address, "plain");
+    assert_eq!(plain.bus_address.as_deref(), Some("h.plain"));
+
+    let gone = find("h.gone");
+    assert_eq!(gone.id, "gone-id", "retirement preserves the ID");
+    assert_eq!(gone.address, "gone");
+    assert!(
+        gone.bus_address.is_none(),
+        "a retired subject releases its address"
+    );
+}
+
 /// The roster enumerates every catalog agent by bus id (sorted), projects each one's presence, and —
 /// with enrich data — its inbox count and last-activity.
 #[test]
@@ -249,9 +302,13 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         .output()
         .unwrap();
     assert!(!absent.status.success());
+    // An ordinary reference that names nobody now refuses with an address-specific diagnostic:
+    // absence is a routing answer, not a row count.
     assert!(
         String::from_utf8_lossy(&absent.stderr)
-            .contains("expected exactly one Agent Spec with identity `h.missing`, found 0")
+            .contains("no routable agent answers address 'h.missing' on host 'h'"),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
     );
 
     let filtered_out = Command::new(env!("CARGO_BIN_EXE_st2"))
@@ -327,9 +384,46 @@ fn exact_identity_rejects_duplicates_before_status_filtering() {
         .output()
         .unwrap();
     assert!(!selected.status.success());
+    // Two declarations of one subject share one agent ID, so the address resolves to a single
+    // subject and the refusal comes from mapping that subject back to a declaration: a broken
+    // global ID namespace is refused before any row is selected or filtered.
     assert!(
         String::from_utf8_lossy(&selected.stderr)
-            .contains("expected exactly one Agent Spec with identity `h.worker`, found 2")
+            .contains("agent id 'h.worker' is declared by more than one subject"),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+}
+
+#[test]
+fn an_address_resolved_in_a_duplicate_id_catalog_refuses_instead_of_picking_a_declaration() {
+    // `resolve_address` dedups its candidates BY agent ID, so an address naming one of two
+    // subjects that share an explicit `id` resolves cleanly to a single Subject. Mapping that
+    // Subject back to a declaration is therefore where the address path proves ID uniqueness: a
+    // first-match scan would act on whichever declaration discovery happened to order first.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "declarations/one/agent.kdl",
+        &agent_kdl("worker", "h").replace("  type \"service\"\n", "  type \"service\"\n  id \"shared-id\"\n"),
+    );
+    write(
+        root,
+        "declarations/two/agent.kdl",
+        &agent_kdl("spare", "h").replace("  type \"service\"\n", "  type \"service\"\n  id \"shared-id\"\n"),
+    );
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["status", "h.worker", "--set", "available"])
+        .args(["--root", root.to_str().unwrap(), "--host", "h"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("declared by more than one subject"),
+        "a duplicate-id catalog must refuse the address path: {stderr}"
     );
 }
 
@@ -463,12 +557,14 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    // `harness_context::Writer` derives its control-plane staging directory from the exact
+    // canonical `<catalog>/agents/<host>/<identity>` shape, so this fixture must use it.
     write(
         root,
-        "hetz/filling/agent.kdl",
+        "agents/hetz/filling/agent.kdl",
         &agent_kdl("filling", "hetz"),
     );
-    let agent_dir = root.join("hetz/filling");
+    let agent_dir = root.join("agents/hetz/filling");
     set_state(&status_path(&agent_dir), State::Busy).unwrap();
 
     // No record: the axis is emitted as `null`, not omitted.

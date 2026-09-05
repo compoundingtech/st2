@@ -18,6 +18,8 @@ use anyhow::{Context, Result};
 use agent_spec::spec::{
     AgentSpec, DeliveryTransport, Driver, TaskKind, TaskLifecycle, stream_name_of_task,
 };
+use crate::supervisor_chain::{resolve_edge, supervisor_edge};
+use crate::AddressBook;
 use kdl::KdlValue;
 
 /// Immutable inputs captured once before generated tasks are compiled.
@@ -122,7 +124,8 @@ pub fn compile_driver_agent_tasks(
         let Some(driver) = spec.driver.as_ref() else {
             continue;
         };
-        let bus_id = spec.bus_id(this_host);
+        // Diagnostics name the human route; the compiled launch carries the immutable ID.
+        let address = spec.bus_address(this_host);
         let expansion = crate::driver::expand_driver(spec, this_host)?;
         let argv_nodes = expansion
             .nodes()
@@ -131,7 +134,7 @@ pub fn compile_driver_agent_tasks(
             .collect::<Vec<_>>();
         let [argv_node] = argv_nodes.as_slice() else {
             anyhow::bail!(
-                "agent '{bus_id}' driver expansion produced {} argv nodes; expected exactly one",
+                "agent '{address}' driver expansion produced {} argv nodes; expected exactly one",
                 argv_nodes.len()
             );
         };
@@ -140,7 +143,7 @@ pub fn compile_driver_agent_tasks(
                 && argv_node.entries().iter().all(|entry| {
                     entry.name().is_none() && matches!(entry.value(), KdlValue::String(_))
                 }),
-            "agent '{bus_id}' driver expansion produced a non-string argv"
+            "agent '{address}' driver expansion produced a non-string argv"
         );
         let mut argv = argv_node
             .entries()
@@ -152,7 +155,7 @@ pub fn compile_driver_agent_tasks(
             .collect::<Vec<_>>();
         anyhow::ensure!(
             !argv.is_empty(),
-            "agent '{bus_id}' driver expansion produced an empty argv"
+            "agent '{address}' driver expansion produced an empty argv"
         );
 
         let wrapper = match driver {
@@ -168,7 +171,7 @@ pub fn compile_driver_agent_tasks(
                 && argv.get(2).map(String::as_str) == Some("$CATALOG")
                 && argv.get(3).map(String::as_str) == Some("driver")
                 && argv.get(4).map(String::as_str) == Some(wrapper),
-            "agent '{bus_id}' driver expansion has an unexpected {wrapper} wrapper prefix"
+            "agent '{address}' driver expansion has an unexpected {wrapper} wrapper prefix"
         );
         argv[0] = st2_executable.clone();
         argv[2] = catalog_root.clone();
@@ -179,14 +182,14 @@ pub fn compile_driver_agent_tasks(
             .filter(|task| !task.derived && task.name == "agent");
         let task = candidates
             .next()
-            .with_context(|| format!("agent '{bus_id}' driver has no canonical `agent` task"))?;
+            .with_context(|| format!("agent '{address}' driver has no canonical `agent` task"))?;
         anyhow::ensure!(
             candidates.next().is_none(),
-            "agent '{bus_id}' driver has more than one canonical `agent` task"
+            "agent '{address}' driver has more than one canonical `agent` task"
         );
         anyhow::ensure!(
             task.kind == TaskKind::Pty,
-            "agent '{bus_id}' driver canonical task is not a PTY"
+            "agent '{address}' driver canonical task is not a PTY"
         );
         task.command = None;
         task.argv = Some(argv);
@@ -252,23 +255,24 @@ fn compile_session_wrapped_agent_tasks(
             continue;
         }
         let selected = transport.as_str();
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
+        let address = spec.bus_address(this_host);
         let mut candidates = spec
             .tasks
             .iter_mut()
             .filter(|task| !task.derived && task.name == "agent");
         let task = candidates.next().with_context(|| {
             format!(
-                "agent '{bus_id}' selects `deliver \"{selected}\"` but has no canonical `agent` task"
+                "agent '{address}' selects `deliver \"{selected}\"` but has no canonical `agent` task"
             )
         })?;
         anyhow::ensure!(
             candidates.next().is_none(),
-            "agent '{bus_id}' selects `deliver \"{selected}\"` with more than one canonical `agent` task"
+            "agent '{address}' selects `deliver \"{selected}\"` with more than one canonical `agent` task"
         );
         anyhow::ensure!(
             task.kind == TaskKind::Pty,
-            "agent '{bus_id}' selects `deliver \"{selected}\"` for a non-PTY canonical task"
+            "agent '{address}' selects `deliver \"{selected}\"` for a non-PTY canonical task"
         );
         let provider = match (&task.command, &task.argv) {
             (None, Some(argv)) => argv.clone(),
@@ -282,20 +286,20 @@ fn compile_session_wrapped_agent_tasks(
         };
         anyhow::ensure!(
             !provider.is_empty(),
-            "agent '{bus_id}' selects `deliver \"{selected}\"` with an empty canonical argv"
+            "agent '{address}' selects `deliver \"{selected}\"` with an empty canonical argv"
         );
         let runtime_id = task
             .id
             .clone()
-            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            .unwrap_or_else(|| format!("{agent_id}.{}", task.name));
         let mut argv = vec![
             st2_executable.clone(),
             "--catalog".to_string(),
             catalog_root.clone(),
             "driver".to_string(),
             wrapper.to_string(),
-            "--identity".to_string(),
-            bus_id,
+            "--id".to_string(),
+            agent_id,
             "--runtime-id".to_string(),
             runtime_id,
             "--".to_string(),
@@ -325,7 +329,7 @@ pub fn compile_generated_ding_tasks(
         .context("running st2 executable path is not UTF-8")?
         .to_owned();
     for spec in specs {
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
         for task in &mut spec.tasks {
             if !task.derived {
                 continue;
@@ -358,8 +362,10 @@ pub fn compile_generated_ding_tasks(
             task.argv = Some(vec![
                 st2_executable.clone(),
                 "ding".to_string(),
-                "--identity".to_string(),
-                bus_id.clone(),
+                // Agent-spec lowers `st2 ding --id <agent-id>`; the late-bound rewrite keeps that
+                // exact-ID form rather than handing DING a mutable route.
+                "--id".to_string(),
+                agent_id.clone(),
                 "--root".to_string(),
                 effective_root,
             ]);
@@ -397,50 +403,51 @@ pub fn compile_app_server_agent_tasks(
         if spec.delivery != Some(DeliveryTransport::AppServer) {
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
+        let address = spec.bus_address(this_host);
         let mut candidates = spec
             .tasks
             .iter_mut()
             .filter(|task| !task.derived && task.name == "agent");
         let task = candidates.next().with_context(|| {
             format!(
-                "agent '{bus_id}' selects `deliver \"app-server\"` but has no canonical `agent` task"
+                "agent '{address}' selects `deliver \"app-server\"` but has no canonical `agent` task"
             )
         })?;
         anyhow::ensure!(
             candidates.next().is_none(),
-            "agent '{bus_id}' selects `deliver \"app-server\"` with more than one canonical `agent` task"
+            "agent '{address}' selects `deliver \"app-server\"` with more than one canonical `agent` task"
         );
         anyhow::ensure!(
             task.kind == TaskKind::Pty,
-            "agent '{bus_id}' selects `deliver \"app-server\"` for a non-PTY canonical task"
+            "agent '{address}' selects `deliver \"app-server\"` for a non-PTY canonical task"
         );
         let authored = task.argv.clone().with_context(|| {
             format!(
-                "agent '{bus_id}' selects `deliver \"app-server\"`; its canonical task must use structured `argv`, not shell `command`"
+                "agent '{address}' selects `deliver \"app-server\"`; its canonical task must use structured `argv`, not shell `command`"
             )
         })?;
         anyhow::ensure!(
             !authored.is_empty(),
-            "agent '{bus_id}' selects `deliver \"app-server\"` with an empty canonical argv"
+            "agent '{address}' selects `deliver \"app-server\"` with an empty canonical argv"
         );
         anyhow::ensure!(
             !authored
                 .iter()
                 .any(|arg| arg == "--remote" || arg.starts_with("--remote=")),
-            "agent '{bus_id}' selects `deliver \"app-server\"` but its canonical argv already declares `--remote`"
+            "agent '{address}' selects `deliver \"app-server\"` but its canonical argv already declares `--remote`"
         );
         let runtime_id = task
             .id
             .clone()
-            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+            .unwrap_or_else(|| format!("{agent_id}.{}", task.name));
         let mut argv = vec![
             st2_executable.clone(),
             "--catalog".to_string(),
             catalog_root.clone(),
             "codex-app-server".to_string(),
-            "--identity".to_string(),
-            bus_id,
+            "--id".to_string(),
+            agent_id,
             "--runtime-id".to_string(),
             runtime_id,
             "--".to_string(),
@@ -479,10 +486,14 @@ pub struct ObservedPtyPresentation {
 pub struct TaskTarget {
     /// `pty` (terminal) or `exec` (terminal-free) — selects the backend.
     pub kind: TaskKind,
-    /// Resolved task id (the spec's `id`, or `<bus_id>.<name>` fallback).
+    /// Resolved task id (the spec's explicit task `id`, or the `<agent-id>.<name>` default).
     pub pty_id: String,
-    /// The agent bus id this task belongs to (`<host>.<identity>`).
-    pub bus_id: String,
+    /// The immutable agent ID that owns this task. Everything keyed off ownership — `ST_AGENT`,
+    /// default task IDs, adoption, teardown, park accounting — reads this, never the address.
+    pub agent_id: String,
+    /// The owning agent's current bus address: the human route, used for presentation only. A
+    /// change here must never move a task ID, a launch fingerprint, or an adoption decision.
+    pub bus_address: String,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
     /// Generated from another task rather than authored as an independent sibling.
@@ -514,7 +525,17 @@ pub struct PtyPresentation {
 }
 
 pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
-pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
+/// Owned-metadata schema carried by every managed PTY: immutable actor ID plus current address.
+pub const AGENT_PRESENTATION_SCHEMA: &str = "2";
+/// The immutable agent ID of the actor that owns this PTY.
+pub const AGENT_ACTOR_ID_TAG: &str = "agent.actor.id";
+/// The actor's current bus address. Removed when the subject is non-routable.
+pub const AGENT_ACTOR_ADDRESS_TAG: &str = "agent.actor.address";
+/// The schema-1 owned key this schema replaces. It held a *route*, which after an address cutover
+/// may name a different subject entirely, so leaving it behind would strand a stale alias on the
+/// session forever. It is st2-owned, so the schema-2 patch deletes it: the projection always
+/// carries this key with `None`.
+pub const LEGACY_AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
 pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
 /// Compatibility role owned by st2 only on the canonical agent PTY.
 pub const COMPATIBILITY_ROLE_TAG: &str = "role";
@@ -523,7 +544,7 @@ pub const COMPATIBILITY_ROLE_TAG: &str = "role";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskIdentityAdmissionError {
     Conflict {
-        bus_id: String,
+        agent_id: String,
         task: String,
         declared: String,
     },
@@ -533,12 +554,12 @@ impl fmt::Display for TaskIdentityAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conflict {
-                bus_id,
+                agent_id,
                 task,
                 declared,
             } => write!(
                 formatter,
-                "agent '{bus_id}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{bus_id}'"
+                "agent '{agent_id}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{agent_id}'"
             ),
         }
     }
@@ -546,7 +567,7 @@ impl fmt::Display for TaskIdentityAdmissionError {
 
 impl std::error::Error for TaskIdentityAdmissionError {}
 
-/// Reject local active tasks whose authored identity conflicts with the runner-derived bus ID.
+/// Reject local active tasks whose authored `ST_AGENT` conflicts with the runner-owned agent ID.
 pub fn validate_task_identities(
     specs: &[AgentSpec],
     this_host: &str,
@@ -555,13 +576,13 @@ pub fn validate_task_identities(
         if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
         for task in &spec.tasks {
             if let Some(declared) = task.env.get("ST_AGENT")
-                && declared != &bus_id
+                && declared != &agent_id
             {
                 return Err(TaskIdentityAdmissionError::Conflict {
-                    bus_id,
+                    agent_id,
                     task: task.name.clone(),
                     declared: declared.clone(),
                 });
@@ -572,13 +593,17 @@ pub fn validate_task_identities(
 }
 
 /// Project runner-owned identity and the supervisor source of truth into one launch target.
+///
+/// `ST_AGENT` carries the raw immutable agent ID and nothing else: it is consumed downstream
+/// through the typed exact-ID path, so it must never be an address or a separately concatenated
+/// host prefix.
 fn runner_task_env(
     spec: &AgentSpec,
     task: &crate::spec::Task,
-    bus_id: &str,
+    agent_id: &str,
 ) -> BTreeMap<String, String> {
     let mut env = task.env.clone();
-    env.insert("ST_AGENT".to_owned(), bus_id.to_owned());
+    env.insert("ST_AGENT".to_owned(), agent_id.to_owned());
     if let Some(supervisor) = &spec.supervisor {
         env.insert("ST_SUPERVISOR".to_owned(), supervisor.clone());
     } else {
@@ -587,28 +612,46 @@ fn runner_task_env(
     env
 }
 
+/// The exact owned metadata snapshot (schema 2) desired for one managed PTY.
+///
+/// Immutable actor ID, the current bus address, and the optional description. A non-routable
+/// subject has released its address, so its owned address tag is removed rather than frozen at
+/// the last route. Only the canonical compact agent task — the one whose task ID *is* the agent
+/// ID — carries `role=agent` and maps `name` to native display metadata.
+///
+/// The snapshot also always carries [`LEGACY_AGENT_ACTOR_PATH_TAG`] with `None`. Schema 1 stored a
+/// route under that key; leaving it on a session that predates this schema would strand an alias
+/// that a later address cutover can point at a different subject, so the same patch that writes
+/// schema 2 deletes it. Removing an owned key is idempotent: once gone, the desired and observed
+/// snapshots agree and no further patch is emitted.
 fn pty_presentation(
     spec: &AgentSpec,
     task: &crate::spec::Task,
     pty_id: &str,
-    bus_id: &str,
+    agent_id: &str,
+    bus_address: Option<&str>,
 ) -> Option<PtyPresentation> {
     if task.kind != TaskKind::Pty {
         return None;
     }
-    let canonical_agent = task.name == "agent" && pty_id == bus_id;
+    let canonical_agent = task.name == "agent" && pty_id == agent_id;
     Some(PtyPresentation {
         pty_id: pty_id.to_owned(),
-        display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
+        display_name: canonical_agent.then(|| match spec.name.as_ref() {
             Some(name) if name == pty_id => None,
             _ => spec.name.clone(),
         }),
         tags: BTreeMap::from([
             (
                 AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
-                Some("1".to_owned()),
+                Some(AGENT_PRESENTATION_SCHEMA.to_owned()),
             ),
-            (AGENT_ACTOR_PATH_TAG.to_owned(), Some(bus_id.to_owned())),
+            (AGENT_ACTOR_ID_TAG.to_owned(), Some(agent_id.to_owned())),
+            (
+                AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                bus_address.map(str::to_owned),
+            ),
+            (LEGACY_AGENT_ACTOR_PATH_TAG.to_owned(), None),
             (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
             (
                 COMPATIBILITY_ROLE_TAG.to_owned(),
@@ -616,6 +659,11 @@ fn pty_presentation(
             ),
         ]),
     })
+}
+
+/// The owning agent's routable bus address, or `None` once the subject is non-routable.
+fn routable_bus_address(spec: &AgentSpec, this_host: &str) -> Option<String> {
+    (!spec.desired_state.is_retired()).then(|| spec.bus_address(this_host))
 }
 
 fn presentation_matches(desired: &PtyPresentation, observed: &ObservedPtyPresentation) -> bool {
@@ -628,6 +676,50 @@ fn presentation_matches(desired: &PtyPresentation, observed: &ObservedPtyPresent
             .tags
             .iter()
             .all(|(key, value)| observed.tags.get(key) == value.as_ref())
+}
+
+/// Who to notify when a task under this launch crash-loops, decided once from the same catalog
+/// snapshot the plan was computed from.
+///
+/// A declared `supervisor` is a free-form human reference, not a typed selector, so it must be
+/// resolved before it can key anything. Resolving it here — rather than at the notification site —
+/// means the alert path never hands a route to an exact-ID resolver, and a reference that names
+/// nothing is reported instead of silently swallowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorTarget {
+    /// The declaration names no supervisor: there is nobody to notify.
+    Undeclared,
+    /// The declared reference resolved to exactly one subject, named here by its immutable ID.
+    Resolved(String),
+    /// The declared reference resolved to no subject or to more than one. Carries the reference as
+    /// authored so the diagnostic can name what the operator must fix.
+    Unresolved(String),
+}
+
+/// Resolve a declaration's `supervisor` edge once, against one catalog generation, so the
+/// crash-loop alert reaches exactly the subject the org chart says owns this agent.
+///
+/// The value's namespace is decided in exactly one place —
+/// [`crate::supervisor_chain::supervisor_edge`] — from the CHILD's migration state, so this path,
+/// the org-chart walk, DING, resync, and authoring can never disagree about an edge.
+fn resolve_supervisor(
+    specs: &[AgentSpec],
+    book: Option<&AddressBook>,
+    spec: &AgentSpec,
+    this_host: &str,
+) -> SupervisorTarget {
+    let Some(reference) = spec.supervisor.as_deref() else {
+        return SupervisorTarget::Undeclared;
+    };
+    let unresolved = || SupervisorTarget::Unresolved(reference.to_owned());
+    // A catalog this pass cannot project into one address book cannot attribute the edge either.
+    let (Some(_book), Some(edge)) = (book, supervisor_edge(specs, spec, this_host)) else {
+        return unresolved();
+    };
+    match resolve_edge(specs, &edge, this_host) {
+        Some(parent) => SupervisorTarget::Resolved(parent.agent_id(this_host)),
+        None => unresolved(),
+    }
 }
 
 /// A resolved task launch accepted by the execution backends.
@@ -647,6 +739,8 @@ pub struct Launch<'a> {
     /// Exact derived task IDs proved live in the same inventory snapshot. Execution stops these if
     /// the canonical agent becomes terminal while applying this launch.
     pub live_derived: Vec<String>,
+    /// The already-resolved crash-loop notification target for `spec`.
+    pub supervisor: SupervisorTarget,
 }
 
 /// Exact live task IDs to stop because their owner retired or their derived target is ineligible.
@@ -685,7 +779,9 @@ pub struct ReconcilePlan<'a> {
     pub live: Vec<String>,
 }
 
-/// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
+/// Resolve one exact local task selector without mutation: either an explicit task ID or the
+/// `<agent-id>.<task-name>` default. Task selection is exact-ID selection (R19) — it deliberately
+/// does not fall through to human-address lookup.
 pub fn resolve_task<'a>(
     specs: &'a [AgentSpec],
     selector: &str,
@@ -697,11 +793,9 @@ pub fn resolve_task<'a>(
             continue;
         }
         for task in &spec.tasks {
-            let runtime = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
-            let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
+            let agent_id = spec.agent_id(this_host);
+            let qualified = format!("{agent_id}.{}", task.name);
+            let runtime = task.id.clone().unwrap_or_else(|| qualified.clone());
             if selector == runtime || selector == qualified {
                 matches.push((spec, task, runtime));
             }
@@ -724,6 +818,7 @@ pub fn reconcile_selected<'a>(
     validate_task_identities(specs, this_host)?;
     let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
     let mut plan = ReconcilePlan::default();
+    let book = crate::spec::address_book(specs, this_host).ok();
     if owner.desired_state.is_retired() {
         plan.settle_retirement.push(owner);
     }
@@ -756,12 +851,14 @@ pub fn reconcile_selected<'a>(
             unreachable!("discovery rejects tasks carrying both command and argv")
         }
     };
-    let bus_id = owner.bus_id(this_host);
-    let env = runner_task_env(owner, task, &bus_id);
+    let agent_id = owner.agent_id(this_host);
+    let routable_address = routable_bus_address(owner, this_host);
+    let env = runner_task_env(owner, task, &agent_id);
     let target = TaskTarget {
         kind: task.kind,
         pty_id: runtime.clone(),
-        bus_id: bus_id.clone(),
+        agent_id: agent_id.clone(),
+        bus_address: owner.bus_address(this_host),
         name: task.name.clone(),
         derived: task.derived,
         launch,
@@ -770,7 +867,13 @@ pub fn reconcile_selected<'a>(
         tags: task.tags.clone(),
         env,
         keep: task.keep || owner.keep,
-        presentation: pty_presentation(owner, task, &runtime, &bus_id),
+        presentation: pty_presentation(
+            owner,
+            task,
+            &runtime,
+            &agent_id,
+            routable_address.as_deref(),
+        ),
     };
     match actual {
         Some(s) if s.alive => {
@@ -793,12 +896,14 @@ pub fn reconcile_selected<'a>(
                 spec: owner,
                 tasks: vec![target],
                 live_derived: Vec::new(),
+                supervisor: resolve_supervisor(specs, book.as_ref(), owner, this_host),
             });
         }
         _ => plan.launch.push(Launch {
             spec: owner,
             tasks: vec![target],
             live_derived: Vec::new(),
+            supervisor: resolve_supervisor(specs, book.as_ref(), owner, this_host),
         }),
     }
     Ok(plan)
@@ -820,13 +925,15 @@ fn session_state(by_id: &HashMap<&str, bool>, pty_id: &str) -> SessionState {
     }
 }
 
-/// Resolve a task's on-disk id: the explicit `id`, else `<bus_id>.<name>`. This is the session
-/// name `pty` binds a socket for, so admission checks resolve it through here rather than
-/// re-deriving the format.
-pub(crate) fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
+/// Resolve a task's on-disk id: the explicit task `id`, else `<agent-id>.<name>`. This is the
+/// session name `pty` binds a socket for, so admission checks resolve it through here rather than
+/// re-deriving the format. Host placement is never separately concatenated: for an unmigrated
+/// declaration the agent ID already *is* the frozen `<host>.<identity>` bytes, which is why no
+/// legacy task ID or socket path moves.
+pub(crate) fn resolve_task_id(agent_id: &str, name: &str, explicit: Option<&str>) -> String {
     match explicit {
         Some(id) => id.to_string(),
-        None => format!("{bus_id}.{name}"),
+        None => format!("{agent_id}.{name}"),
     }
 }
 
@@ -845,6 +952,9 @@ pub fn reconcile<'a>(
         .iter()
         .map(|session| (session.pty_id.as_str(), session))
         .collect();
+    // One book for the whole pass, so every supervisor edge this plan records and the uniqueness
+    // proof behind it describe the same catalog generation.
+    let book = crate::spec::address_book(specs, this_host).ok();
 
     let mut plan = ReconcilePlan::default();
     for spec in specs {
@@ -852,7 +962,8 @@ pub fn reconcile<'a>(
             plan.other_host.push(spec);
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
+        let agent_id = spec.agent_id(this_host);
+        let routable_address = routable_bus_address(spec, this_host);
 
         if !spec.desired_state.is_running() {
             if spec.desired_state.is_retired() {
@@ -860,7 +971,7 @@ pub fn reconcile<'a>(
             }
             let mut teardown_ids = Vec::new();
             for t in &spec.tasks {
-                let id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
+                let id = resolve_task_id(&agent_id, &t.name, t.id.as_deref());
                 let retain_dead = spec.desired_state.is_suspended() && (t.keep || spec.keep);
                 match session_state(&by_id, &id) {
                     SessionState::Alive => teardown_ids.push(id),
@@ -894,13 +1005,14 @@ pub fn reconcile<'a>(
                         unreachable!("discovery rejects tasks carrying both command and argv")
                     }
                 };
-                let env = runner_task_env(spec, t, &bus_id);
-                let pty_id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
+                let env = runner_task_env(spec, t, &agent_id);
+                let pty_id = resolve_task_id(&agent_id, &t.name, t.id.as_deref());
                 Some((
                     TaskTarget {
                         kind: t.kind,
                         pty_id: pty_id.clone(),
-                        bus_id: bus_id.clone(),
+                        agent_id: agent_id.clone(),
+                        bus_address: spec.bus_address(this_host),
                         name: t.name.clone(),
                         derived: t.derived,
                         launch,
@@ -909,7 +1021,13 @@ pub fn reconcile<'a>(
                         tags: t.tags.clone(),
                         env,
                         keep: t.keep || spec.keep,
-                        presentation: pty_presentation(spec, t, &pty_id, &bus_id),
+                        presentation: pty_presentation(
+                            spec,
+                            t,
+                            &pty_id,
+                            &agent_id,
+                            routable_address.as_deref(),
+                        ),
                     },
                     t.lifecycle,
                 ))
@@ -994,8 +1112,584 @@ pub fn reconcile<'a>(
                 spec,
                 tasks: to_launch,
                 live_derived,
+                // Resolved here, once per launched agent, so nothing downstream re-parses the
+                // authored reference — and only for agents that can actually reach the park path.
+                supervisor: resolve_supervisor(specs, book.as_ref(), spec, this_host),
             });
         }
     }
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_spec::spec::{AgentDesiredState, JobType, Task};
+    use agent_spec::{AgentAddress, AgentId};
+
+    use super::*;
+
+    const ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+
+    fn task(name: &str, kind: TaskKind, id: Option<&str>) -> Task {
+        Task {
+            kind,
+            derived: false,
+            name: name.to_owned(),
+            id: id.map(str::to_owned),
+            command: Some("true".to_owned()),
+            argv: None,
+            cwd: None,
+            tags: BTreeMap::new(),
+            env: BTreeMap::new(),
+            keep: false,
+            lifecycle: TaskLifecycle::Service,
+        }
+    }
+
+    fn spec(tasks: Vec<Task>) -> AgentSpec {
+        AgentSpec {
+            id: None,
+            address: None,
+            identity: "worker".to_owned(),
+            name: None,
+            description: None,
+            host: Some("dev3".to_owned()),
+            role: None,
+            job_type: JobType::Service,
+            workspace: None,
+            supervisor: None,
+            desired_state: AgentDesiredState::Running,
+            keep: false,
+            restart: None,
+            delivery: None,
+            session_driver: None,
+            driver: None,
+            delivery_readiness: None,
+            resources: Vec::new(),
+            streams: Vec::new(),
+            tasks,
+            path: PathBuf::from("/catalog/agents/dev3/worker/agent.kdl"),
+        }
+    }
+
+    fn migrated(tasks: Vec<Task>) -> AgentSpec {
+        let mut spec = spec(tasks);
+        spec.id = Some(AgentId::parse(ID).unwrap());
+        spec.address = Some(AgentAddress::parse("fractal.keymap.verifier").unwrap());
+        spec
+    }
+
+    fn target_of<'a>(plan: &'a ReconcilePlan<'_>, pty_id: &str) -> &'a TaskTarget {
+        plan.launch
+            .iter()
+            .flat_map(|launch| &launch.tasks)
+            .find(|target| target.pty_id == pty_id)
+            .unwrap_or_else(|| panic!("no launch target {pty_id}"))
+    }
+
+    /// `ST_AGENT` is consumed through the typed exact-ID path, so it must be the raw agent ID:
+    /// not the mutable bus address, and not the ID with a host concatenated onto it.
+    #[test]
+    fn st_agent_carries_the_raw_immutable_agent_id() {
+        let declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        let plan = reconcile(std::slice::from_ref(&declared), &[], "dev3").unwrap();
+
+        let target = target_of(&plan, ID);
+        assert_eq!(target.env.get("ST_AGENT").map(String::as_str), Some(ID));
+        assert_eq!(target.agent_id, ID);
+        assert_eq!(target.bus_address, "dev3.fractal.keymap.verifier");
+    }
+
+    /// An unmigrated declaration yields exactly the frozen legacy bytes, which is why no task ID
+    /// or socket path moves across migration.
+    #[test]
+    fn an_unmigrated_declaration_keeps_its_frozen_legacy_st_agent() {
+        let declared = spec(vec![task("agent", TaskKind::Pty, Some("dev3.worker"))]);
+        let plan = reconcile(std::slice::from_ref(&declared), &[], "dev3").unwrap();
+
+        assert_eq!(
+            target_of(&plan, "dev3.worker")
+                .env
+                .get("ST_AGENT")
+                .map(String::as_str),
+            Some("dev3.worker")
+        );
+    }
+
+    /// Every long-form named task without an explicit task ID defaults to `<agent-id>.<task-name>`
+    /// — including a task named `agent`. An authored task ID stays authoritative.
+    #[test]
+    fn default_task_ids_are_agent_id_dot_task_name_including_a_task_named_agent() {
+        let declared = migrated(vec![
+            task("agent", TaskKind::Pty, None),
+            task("work", TaskKind::Pty, None),
+            task("authored", TaskKind::Exec, Some("chosen.by.hand")),
+        ]);
+        let plan = reconcile(std::slice::from_ref(&declared), &[], "dev3").unwrap();
+
+        let mut ids = plan
+            .launch
+            .iter()
+            .flat_map(|launch| &launch.tasks)
+            .map(|target| target.pty_id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                &format!("{ID}.agent"),
+                &format!("{ID}.work"),
+                "chosen.by.hand",
+            ]
+        );
+    }
+
+    /// The exact owned tag snapshot, schema 2. An absent optional value is removed rather than
+    /// left stale, and the non-canonical role tag is cleared rather than omitted.
+    #[test]
+    fn owned_metadata_is_the_schema_two_snapshot_and_removes_absent_optionals() {
+        let mut declared = migrated(vec![task("work", TaskKind::Pty, None)]);
+        declared.description = None;
+        let projected = pty_presentation(
+            &declared,
+            &declared.tasks[0],
+            &format!("{ID}.work"),
+            ID,
+            Some("dev3.fractal.keymap.verifier"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            projected.tags,
+            BTreeMap::from([
+                (
+                    AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                    Some("2".to_owned())
+                ),
+                (AGENT_ACTOR_ID_TAG.to_owned(), Some(ID.to_owned())),
+                (
+                    AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    Some("dev3.fractal.keymap.verifier".to_owned())
+                ),
+                (LEGACY_AGENT_ACTOR_PATH_TAG.to_owned(), None),
+                (AGENT_DESCRIPTION_TAG.to_owned(), None),
+                (COMPATIBILITY_ROLE_TAG.to_owned(), None),
+            ])
+        );
+        assert_eq!(
+            projected.tags[LEGACY_AGENT_ACTOR_PATH_TAG], None,
+            "schema 1's actor path is deleted by this patch, never emitted alongside schema 2"
+        );
+        assert_eq!(
+            projected.display_name, None,
+            "a secondary PTY keeps its own display convention"
+        );
+    }
+
+    /// A retired subject is non-routable: it keeps its ID and releases its address, so the owned
+    /// address tag is removed rather than frozen at the last route.
+    #[test]
+    fn a_retired_subject_releases_its_owned_address_tag_but_keeps_its_id() {
+        let mut declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        declared.desired_state = AgentDesiredState::Retired { reason: None };
+        let address = routable_bus_address(&declared, "dev3");
+        assert_eq!(address, None);
+
+        let projected =
+            pty_presentation(&declared, &declared.tasks[0], ID, ID, address.as_deref()).unwrap();
+        assert_eq!(projected.tags[AGENT_ACTOR_ADDRESS_TAG], None);
+        assert_eq!(projected.tags[AGENT_ACTOR_ID_TAG], Some(ID.to_owned()));
+    }
+
+    /// Only the canonical compact agent task — the one whose task ID *is* the agent ID — carries
+    /// `role=agent` and maps `name` to native display metadata.
+    #[test]
+    fn only_the_canonical_compact_task_carries_role_agent_and_a_display_name() {
+        let mut declared = migrated(vec![
+            task("agent", TaskKind::Pty, Some(ID)),
+            task("agent", TaskKind::Pty, None),
+        ]);
+        declared.name = Some("Keymap verifier".to_owned());
+        let plan = reconcile(std::slice::from_ref(&declared), &[], "dev3").unwrap();
+
+        let canonical = target_of(&plan, ID).presentation.as_ref().unwrap();
+        assert_eq!(
+            canonical.display_name,
+            Some(Some("Keymap verifier".to_owned()))
+        );
+        assert_eq!(
+            canonical.tags[COMPATIBILITY_ROLE_TAG],
+            Some("agent".to_owned())
+        );
+
+        let long_form = target_of(&plan, &format!("{ID}.agent"))
+            .presentation
+            .as_ref()
+            .unwrap();
+        assert_eq!(long_form.display_name, None);
+        assert_eq!(
+            long_form.tags[COMPATIBILITY_ROLE_TAG], None,
+            "a non-canonical PTY must have the role tag cleared"
+        );
+    }
+
+    /// Projection is idempotent: an already-correct PTY produces no patch, so `pty` emits no
+    /// `metadata_change` event. Unrelated observed tags never provoke one either.
+    #[test]
+    fn an_already_correct_pty_produces_no_presentation_patch() {
+        let mut declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        declared.description = Some("Verifies keymaps.".to_owned());
+        let observed = Session {
+            pty_id: ID.to_owned(),
+            alive: true,
+            exit_code: None,
+            presentation: Some(ObservedPtyPresentation {
+                display_name: None,
+                tags: BTreeMap::from([
+                    (AGENT_PRESENTATION_SCHEMA_TAG.to_owned(), "2".to_owned()),
+                    (AGENT_ACTOR_ID_TAG.to_owned(), ID.to_owned()),
+                    (
+                        AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                        "dev3.fractal.keymap.verifier".to_owned(),
+                    ),
+                    (
+                        AGENT_DESCRIPTION_TAG.to_owned(),
+                        "Verifies keymaps.".to_owned(),
+                    ),
+                    (COMPATIBILITY_ROLE_TAG.to_owned(), "agent".to_owned()),
+                    ("unrelated".to_owned(), "preserved".to_owned()),
+                ]),
+            }),
+        };
+
+        let plan = reconcile(
+            std::slice::from_ref(&declared),
+            std::slice::from_ref(&observed),
+            "dev3",
+        )
+        .unwrap();
+        assert!(
+            plan.presentation.is_empty(),
+            "an unchanged snapshot must emit no patch: {:?}",
+            plan.presentation
+        );
+        assert_eq!(plan.adopt.len(), 1);
+
+        // A stale address is the one effective delta, and it patches without touching lifecycle.
+        let mut stale = observed.clone();
+        let stale_tags = &mut stale.presentation.as_mut().unwrap().tags;
+        stale_tags.insert(AGENT_ACTOR_ADDRESS_TAG.to_owned(), "dev3.worker".to_owned());
+        let repaired = reconcile(
+            std::slice::from_ref(&declared),
+            std::slice::from_ref(&stale),
+            "dev3",
+        )
+        .unwrap();
+        assert_eq!(repaired.presentation.len(), 1);
+        assert_eq!(
+            repaired.presentation[0].tags[AGENT_ACTOR_ADDRESS_TAG],
+            Some("dev3.fractal.keymap.verifier".to_owned())
+        );
+        assert!(repaired.launch.is_empty() && repaired.teardown.is_empty());
+        assert_eq!(repaired.gc, Vec::<String>::new());
+    }
+
+    /// An address change is a pure cutover: task IDs, launch inputs, workspace, the declaration
+    /// parent, and the adoption decision are all unmoved, and a healthy task is not restarted.
+    #[test]
+    fn an_address_change_moves_no_task_id_and_does_not_restart_a_healthy_task() {
+        let before = migrated(vec![
+            task("agent", TaskKind::Pty, Some(ID)),
+            task("ding", TaskKind::Exec, None),
+        ]);
+        let mut after = before.clone();
+        after.address = Some(AgentAddress::parse("renamed.elsewhere").unwrap());
+
+        let sessions = [
+            Session {
+                pty_id: ID.to_owned(),
+                alive: true,
+                exit_code: None,
+                presentation: None,
+            },
+            Session {
+                pty_id: format!("{ID}.ding"),
+                alive: true,
+                exit_code: None,
+                presentation: None,
+            },
+        ];
+
+        let plan_before = reconcile(std::slice::from_ref(&before), &sessions, "dev3").unwrap();
+        let plan_after = reconcile(std::slice::from_ref(&after), &sessions, "dev3").unwrap();
+
+        assert_eq!(plan_before.live, plan_after.live);
+        assert_eq!(plan_before.live, vec![ID.to_owned(), format!("{ID}.ding")]);
+        assert_eq!(plan_after.launch.len(), 0, "no relaunch");
+        assert_eq!(plan_after.teardown.len(), 0, "no replacement");
+        assert_eq!(plan_after.gc, Vec::<String>::new());
+        assert_eq!(plan_after.adopt.len(), 1, "the healthy agent is adopted");
+        assert_eq!(after.path, before.path, "the state anchor is unmoved");
+
+        // Only the projected route differs, and only in presentation.
+        let selected_before = reconcile_selected(std::slice::from_ref(&before), &[], "dev3", ID)
+            .unwrap();
+        let selected_after =
+            reconcile_selected(std::slice::from_ref(&after), &[], "dev3", ID).unwrap();
+        let launch_before = &selected_before.launch[0].tasks[0];
+        let launch_after = &selected_after.launch[0].tasks[0];
+        assert_eq!(launch_before.pty_id, launch_after.pty_id);
+        assert_eq!(launch_before.agent_id, launch_after.agent_id);
+        assert_eq!(launch_before.env, launch_after.env);
+        assert_eq!(launch_before.launch, launch_after.launch);
+        assert_eq!(launch_before.workspace, launch_after.workspace);
+        assert_eq!(launch_after.bus_address, "dev3.renamed.elsewhere");
+    }
+
+    /// A declared `ST_AGENT` that is not the runner-owned agent ID refuses before any write.
+    #[test]
+    fn a_declared_st_agent_that_is_not_the_agent_id_refuses() {
+        let mut declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        declared.tasks[0]
+            .env
+            .insert("ST_AGENT".to_owned(), "dev3.fractal.keymap.verifier".to_owned());
+
+        let error = validate_task_identities(std::slice::from_ref(&declared), "dev3")
+            .expect_err("an address in ST_AGENT is not the runner-owned selector");
+        assert_eq!(
+            error,
+            TaskIdentityAdmissionError::Conflict {
+                agent_id: ID.to_owned(),
+                task: "agent".to_owned(),
+                declared: "dev3.fractal.keymap.verifier".to_owned(),
+            }
+        );
+
+        declared.tasks[0]
+            .env
+            .insert("ST_AGENT".to_owned(), ID.to_owned());
+        assert!(validate_task_identities(std::slice::from_ref(&declared), "dev3").is_ok());
+    }
+
+    /// A session tagged under schema 1 carries `agent.actor.path`, which is a ROUTE: after an
+    /// address cutover those bytes can name a different subject. The first schema-2 patch must
+    /// delete that owned key, leave unrelated tags alone, and then stay idempotent.
+    #[test]
+    fn the_first_schema_two_patch_deletes_a_stale_schema_one_actor_path() {
+        let mut declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        declared.description = Some("Verifies keymaps.".to_owned());
+
+        // Exactly what a schema-1 writer left behind, plus somebody else's tag.
+        let mut observed_tags = BTreeMap::from([
+            (AGENT_PRESENTATION_SCHEMA_TAG.to_owned(), "1".to_owned()),
+            (
+                LEGACY_AGENT_ACTOR_PATH_TAG.to_owned(),
+                "dev3.worker".to_owned(),
+            ),
+            (
+                AGENT_DESCRIPTION_TAG.to_owned(),
+                "Verifies keymaps.".to_owned(),
+            ),
+            (COMPATIBILITY_ROLE_TAG.to_owned(), "agent".to_owned()),
+            ("unrelated".to_owned(), "preserved".to_owned()),
+        ]);
+        let session = |tags: &BTreeMap<String, String>| Session {
+            pty_id: ID.to_owned(),
+            alive: true,
+            exit_code: None,
+            presentation: Some(ObservedPtyPresentation {
+                display_name: None,
+                tags: tags.clone(),
+            }),
+        };
+
+        let plan = reconcile(
+            std::slice::from_ref(&declared),
+            &[session(&observed_tags)],
+            "dev3",
+        )
+        .unwrap();
+        assert_eq!(plan.presentation.len(), 1);
+        let patch = &plan.presentation[0];
+        assert_eq!(
+            patch.tags[LEGACY_AGENT_ACTOR_PATH_TAG], None,
+            "the stale schema-1 route alias must be explicitly deleted"
+        );
+        assert_eq!(
+            patch.tags[AGENT_PRESENTATION_SCHEMA_TAG],
+            Some("2".to_owned())
+        );
+        assert_eq!(patch.tags[AGENT_ACTOR_ID_TAG], Some(ID.to_owned()));
+        assert!(
+            !patch.tags.contains_key("unrelated"),
+            "an unrelated tag is not ours to touch: {:?}",
+            patch.tags
+        );
+
+        // Apply the patch the way `pty metadata patch` would, then reconcile again.
+        for (key, value) in &patch.tags {
+            match value {
+                Some(value) => {
+                    observed_tags.insert(key.clone(), value.clone());
+                }
+                None => {
+                    observed_tags.remove(key);
+                }
+            }
+        }
+        assert_eq!(
+            observed_tags.get("unrelated").map(String::as_str),
+            Some("preserved"),
+            "the unrelated tag survived the patch"
+        );
+        assert!(!observed_tags.contains_key(LEGACY_AGENT_ACTOR_PATH_TAG));
+
+        let settled = reconcile(
+            std::slice::from_ref(&declared),
+            &[session(&observed_tags)],
+            "dev3",
+        )
+        .unwrap();
+        assert!(
+            settled.presentation.is_empty(),
+            "the second patch must be a no-op: {:?}",
+            settled.presentation
+        );
+    }
+
+    /// The supervisor edge is resolved before it is stored, in the ONE namespace the child's own
+    /// migration state says its `supervisor` value is written in.
+    ///
+    /// Migration adds a child's `id` and rewrites its references to their parents' IDs in the same
+    /// atomic transition, so an explicit-`id` child's `supervisor` is an ID and an unmigrated
+    /// child's is still a positional reference. Neither namespace falls back onto the other.
+    #[test]
+    fn a_supervisor_reference_resolves_only_in_the_childs_own_namespace() {
+        const PARENT_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320aaa";
+        let mut parent = spec(vec![task("agent", TaskKind::Pty, Some(PARENT_ID))]);
+        parent.identity = "root".to_owned();
+        parent.id = Some(AgentId::parse(PARENT_ID).unwrap());
+        parent.address = Some(AgentAddress::parse("org.root").unwrap());
+
+        let target = |specs: &[AgentSpec]| {
+            let book = crate::spec::address_book(specs, "dev3").ok();
+            resolve_supervisor(specs, book.as_ref(), &specs[1], "dev3")
+        };
+
+        // A MIGRATED child's reference is an exact ID, and only the ID namespace answers.
+        let mut migrated_child = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        migrated_child.supervisor = Some(PARENT_ID.to_owned());
+        assert_eq!(
+            target(&[parent.clone(), migrated_child.clone()]),
+            SupervisorTarget::Resolved(PARENT_ID.to_owned())
+        );
+
+        // The parent's ADDRESS is not an ID, so a migrated child naming it does not resolve: that
+        // declaration was not rewritten by migration and must be repaired, not guessed at.
+        migrated_child.supervisor = Some("org.root".to_owned());
+        assert_eq!(
+            target(&[parent.clone(), migrated_child.clone()]),
+            SupervisorTarget::Unresolved("org.root".to_owned())
+        );
+
+        // An UNMIGRATED child's reference is a legacy POSITIONAL reference: a bare `<identity>` on
+        // its own host, or a qualified `<host>.<identity>`. It names a declaration slot, never a
+        // mutable route — which is what keeps a retired (non-routable) or cross-host parent
+        // reachable, and its qualified form is exactly that parent's frozen legacy ID.
+        let mut legacy_parent = spec(vec![task("agent", TaskKind::Pty, None)]);
+        legacy_parent.identity = "root".to_owned();
+        let mut legacy_child = spec(vec![task("agent", TaskKind::Pty, None)]);
+        legacy_child.identity = "worker".to_owned();
+        for reference in ["root", "dev3.root"] {
+            legacy_child.supervisor = Some(reference.to_owned());
+            assert_eq!(
+                target(&[legacy_parent.clone(), legacy_child.clone()]),
+                SupervisorTarget::Resolved("dev3.root".to_owned()),
+                "unmigrated child reference {reference}"
+            );
+        }
+
+        // A migrated parent's `address` is a route, not a positional key: an unmigrated child
+        // naming it was never rewritten by migration and is reported for repair, not guessed at.
+        legacy_child.supervisor = Some("org.root".to_owned());
+        assert_eq!(
+            target(&[parent.clone(), legacy_child.clone()]),
+            SupervisorTarget::Unresolved("org.root".to_owned())
+        );
+
+        // A reference that names nothing is reported, never silently treated as "no supervisor".
+        legacy_child.supervisor = Some("gone".to_owned());
+        assert_eq!(
+            target(&[parent.clone(), legacy_child.clone()]),
+            SupervisorTarget::Unresolved("gone".to_owned())
+        );
+
+        legacy_child.supervisor = None;
+        assert_eq!(
+            target(&[parent, legacy_child]),
+            SupervisorTarget::Undeclared
+        );
+    }
+
+    /// Equal bytes in the two namespaces must never collide. An unmigrated child's `supervisor`
+    /// is a positional reference, so an unrelated subject whose explicit *ID* is those same bytes
+    /// cannot capture the edge from the declaration that reference actually names.
+    #[test]
+    fn an_unrelated_subject_whose_id_equals_the_reference_cannot_capture_the_edge() {
+        // The impostor: its immutable ID is literally `boss`, and it holds no such address.
+        let mut impostor = spec(vec![task("agent", TaskKind::Pty, Some("boss"))]);
+        impostor.identity = "impostor".to_owned();
+        impostor.id = Some(AgentId::parse("boss").unwrap());
+        impostor.address = Some(AgentAddress::parse("unrelated.impostor").unwrap());
+
+        // The real parent: unmigrated, so the bare reference `boss` qualifies to its frozen
+        // positional ID `dev3.boss`.
+        let mut real_parent = spec(vec![task("agent", TaskKind::Pty, None)]);
+        real_parent.identity = "boss".to_owned();
+
+        let mut child = spec(vec![task("agent", TaskKind::Pty, None)]);
+        child.identity = "worker".to_owned();
+        child.supervisor = Some("boss".to_owned());
+
+        let specs = vec![impostor, real_parent, child];
+        let book = crate::spec::address_book(&specs, "dev3").ok();
+        assert_eq!(
+            resolve_supervisor(&specs, book.as_ref(), &specs[2], "dev3"),
+            SupervisorTarget::Resolved("dev3.boss".to_owned()),
+            "an unmigrated child's reference is positional; the subject whose explicit ID is \
+             `boss` must not be able to steal the edge"
+        );
+    }
+
+    /// The plan carries that resolved target on the launch, so the park path never re-parses the
+    /// authored reference.
+    #[test]
+    fn a_launch_carries_the_resolved_supervisor_id() {
+        const PARENT_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320aaa";
+        let mut parent = spec(vec![task("agent", TaskKind::Pty, Some(PARENT_ID))]);
+        parent.identity = "root".to_owned();
+        parent.id = Some(AgentId::parse(PARENT_ID).unwrap());
+        parent.address = Some(AgentAddress::parse("org.root").unwrap());
+        let mut child = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
+        // The child is migrated, so migration already rewrote this reference to the parent's ID.
+        child.supervisor = Some(PARENT_ID.to_owned());
+        let specs = vec![parent, child];
+
+        let plan = reconcile(&specs, &[], "dev3").unwrap();
+        let launched = plan
+            .launch
+            .iter()
+            .find(|launch| launch.spec.identity == "worker")
+            .expect("the child launches");
+        assert_eq!(
+            launched.supervisor,
+            SupervisorTarget::Resolved(PARENT_ID.to_owned())
+        );
+
+        let selected = reconcile_selected(&specs, &[], "dev3", ID).unwrap();
+        assert_eq!(
+            selected.launch[0].supervisor,
+            SupervisorTarget::Resolved(PARENT_ID.to_owned())
+        );
+    }
 }

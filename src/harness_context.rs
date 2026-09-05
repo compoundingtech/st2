@@ -44,7 +44,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::harness_state::{lock_exclusive, write_json_atomic};
 
-const SCHEMA: &str = "st2.harness-context.v1";
+/// Schema version 1: the record's `agent` field carries the subject's bus identity.
+pub const SCHEMA_V1: &str = "st2.harness-context.v1";
+/// Schema version 2: the record's `agent` field carries the subject's immutable agent ID. Only
+/// that one field's meaning changes; the reading itself is identical in both versions.
+pub const SCHEMA_V2: &str = "st2.harness-context.v2";
+
+/// Whether the immutable-ID writer is active. **On**, with the rest of the DELTA-003 activation
+/// cohort, for the same reason as its sibling [`crate::harness_state::EMIT_SCHEMA_V2`]: the driver
+/// wrappers hand this writer a raw immutable agent ID, and version 1's `agent` means a bus
+/// identity. [`read`] already accepts both versions and reports which namespace each names, so the
+/// reader-first precondition is met. One named constant, one reversal point, defaulted on.
+pub const EMIT_SCHEMA_V2: bool = true;
+
+/// The version this build writes. Coalescing and compaction-counter continuity are scoped to it:
+/// a writer continues only the shape it emits.
+const SCHEMA: &str = if EMIT_SCHEMA_V2 { SCHEMA_V2 } else { SCHEMA_V1 };
+
+/// Whether a record's schema is one this version can interpret.
+pub fn is_supported_schema(schema: &str) -> bool {
+    schema == SCHEMA_V1 || schema == SCHEMA_V2
+}
+
 const LOCK_NAME: &str = ".harness-context.lock";
 const TMP_PREFIX: &str = ".harness-context";
 const STAGING_DIR_NAME: &str = "harness-context-staging";
@@ -622,6 +643,9 @@ pub struct Observed {
     /// Derived by the reader from `observed_at_ms`.
     pub age_ms: u64,
     pub stale: bool,
+    /// The subject the record names, with the namespace its schema version decided. Reused from
+    /// the sibling driver record: both records versioned the same field for the same reason.
+    pub subject: crate::harness_state::RecordSubject,
 }
 
 impl Observed {
@@ -665,9 +689,9 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
         );
         return None;
     };
-    if record.schema != SCHEMA {
+    if !is_supported_schema(&record.schema) {
         tracing::warn!(
-            "st2 harness-context: {} carries schema `{}`, not `{SCHEMA}`",
+            "st2 harness-context: {} carries schema `{}`, which is neither `{SCHEMA_V1}` nor `{SCHEMA_V2}`",
             path.display(),
             record.schema
         );
@@ -701,6 +725,10 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
         last_compaction_ms: record.last_compaction_ms,
         last_compaction_trigger: record.last_compaction_trigger,
         observed_at_ms: record.observed_at_ms,
+        subject: crate::harness_state::RecordSubject::for_version(
+            record.schema == SCHEMA_V2,
+            record.agent,
+        ),
         age_ms,
         stale: age_ms >= duration_ms(HARNESS_CONTEXT_STALE),
     })
@@ -1184,10 +1212,13 @@ mod tests {
 
         fs::write(
             &path,
-            br#"{"schema":"st2.harness-context.v2","agent":"a","harness":"codex","observedAtMs":1}"#,
+            br#"{"schema":"st2.harness-context.v3","agent":"a","harness":"codex","observedAtMs":1}"#,
         )
         .unwrap();
-        assert!(read(&path).is_none(), "a schema this version does not own");
+        assert!(
+            read(&path).is_none(),
+            "a schema outside the version pair this build understands"
+        );
 
         fs::write(
             &path,
@@ -1214,6 +1245,77 @@ mod tests {
         assert_eq!(
             observed.last_compaction_trigger,
             Some(CompactionTrigger::Unknown)
+        );
+    }
+
+    /// DELTA-003 step 5, reader first: both reserved versions read now, each decoding `agent` in
+    /// the namespace its own discriminator names, while the writer keeps emitting version 1 until
+    /// the switch it shares with the sibling driver record and the message/PTY writers flips.
+    #[test]
+    fn both_reserved_versions_are_read_with_their_own_agent_meaning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_context_path(tmp.path());
+        let now = crate::message::now_ms();
+
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-context.v1","agent":"hetz.worker","harness":"codex","usedPercent":50,"observedAtMs":{now}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read(&path).unwrap().subject,
+            crate::harness_state::RecordSubject::BusIdentity("hetz.worker".into())
+        );
+
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-context.v2","agent":"hetz.worker","harness":"codex","usedPercent":50,"observedAtMs":{now}}}"#
+            ),
+        )
+        .unwrap();
+        let observed = read(&path).unwrap();
+        assert_eq!(observed.used_percent, Some(50.0), "the reading is unchanged");
+        assert_eq!(
+            observed.subject,
+            crate::harness_state::RecordSubject::AgentId("hetz.worker".into()),
+            "only the meaning of `agent` differs between the versions"
+        );
+    }
+
+    /// The writer receives a raw immutable agent ID from the driver wrappers, so the record must
+    /// declare version 2; a version-1 record already on disk keeps its bus-identity meaning.
+    #[test]
+    fn the_writer_declares_version_two_so_its_agent_field_means_an_immutable_id() {
+        assert!(EMIT_SCHEMA_V2);
+        assert_eq!(SCHEMA, SCHEMA_V2);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let path = harness_context_path(&agent_dir);
+        let mut writer = writer(&agent_dir);
+        writer.observe(reading(85_000, 33.0)).unwrap();
+        let record = read_record(&path).unwrap();
+        assert_eq!(record.schema, SCHEMA_V2);
+        assert_eq!(
+            read(&path).unwrap().subject,
+            crate::harness_state::RecordSubject::AgentId(record.agent.clone())
+        );
+
+        let now = crate::message::now_ms();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-context.v1","agent":"hetz.worker","harness":"codex","usedPercent":50,"observedAtMs":{now}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read(&path).unwrap().subject,
+            crate::harness_state::RecordSubject::BusIdentity("hetz.worker".into()),
+            "writing version 2 must not retype the version-1 records already on disk"
         );
     }
 

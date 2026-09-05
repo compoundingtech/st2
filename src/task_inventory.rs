@@ -198,7 +198,12 @@ impl TaskInventory {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskRow {
+    /// The catalog-global immutable agent ID that owns this task.
     agent: String,
+    /// The owning subject's current qualified human route, or `null` for a proved non-routable
+    /// retired subject. A released address is an answer, not missing coverage: the row is still
+    /// complete, still keyed by its ID, and still reachable by it.
+    bus_address: Option<String>,
     task: String,
     runtime_id: String,
     kind: &'static str,
@@ -245,6 +250,7 @@ struct RuntimeJson {
 #[derive(Debug)]
 struct DesiredTask {
     agent: String,
+    bus_address: Option<String>,
     task: String,
     runtime_id: String,
     kind: TaskKind,
@@ -294,7 +300,11 @@ pub fn inventory(
         if spec.resolved_host(host) != host {
             continue;
         }
-        let bus_id = spec.bus_id(host);
+        // Ownership, task ids, and the inventory key are the agent ID; the route is projected
+        // beside it and is absent exactly when the subject is non-routable.
+        let agent_id = spec.agent_id(host);
+        let bus_address =
+            (!spec.desired_state.is_retired()).then(|| spec.bus_address(host));
         for task in &spec.tasks {
             // Active declaration-only metadata has no desired runtime. Retired tasks remain in the
             // inventory even without launch material so stale generations stay visible.
@@ -304,13 +314,14 @@ pub fn inventory(
             let runtime_id = task
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+                .unwrap_or_else(|| format!("{agent_id}.{}", task.name));
             runtime_owners
                 .entry(runtime_id.clone())
                 .or_default()
-                .push(format!("{bus_id}/{}", task.name));
+                .push(format!("{agent_id}/{}", task.name));
             desired.push(DesiredTask {
-                agent: bus_id.clone(),
+                agent: agent_id.clone(),
+                bus_address: bus_address.clone(),
                 task: task.name.clone(),
                 runtime_id,
                 kind: task.kind,
@@ -463,6 +474,7 @@ pub fn inventory(
             };
             TaskRow {
                 agent: task.agent,
+                bus_address: task.bus_address,
                 task: task.task,
                 runtime_id: task.runtime_id,
                 kind: match task.kind {
@@ -639,6 +651,7 @@ mod tests {
             value["tasks"][0],
             serde_json::json!({
                 "agent": "h.worker",
+                "busAddress": "h.worker",
                 "task": "agent",
                 "runtimeId": "h.worker",
                 "kind": "pty",
@@ -666,6 +679,73 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|row| row["agent"] != "other.foreign")
+        );
+    }
+
+    /// R23: a proved non-routable retired subject reports a null bus address and stays keyed by
+    /// its immutable ID — and that null is an *answer*, so the versioned envelope remains
+    /// complete. Reporting the released address, or degrading coverage to express its absence,
+    /// are the two plausible bugs this pins.
+    #[test]
+    fn a_retired_subject_reports_a_null_bus_address_without_making_coverage_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "gone",
+            r#"desired-state "retired" reason="Replaced by worker"; pty "agent" { argv "agent-bin" }"#,
+        );
+        let value = json(
+            tmp.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![],
+                errors: vec![],
+            },
+        );
+        assert_eq!(value["errors"], Value::Array(vec![]));
+        assert_eq!(
+            value["complete"], true,
+            "a released address is an answer, not missing evidence: {value:#}"
+        );
+        let row = &value["tasks"][0];
+        assert_eq!(row["agent"], "h.gone", "the ID survives retirement");
+        assert_eq!(row["runtimeId"], "h.gone.agent");
+        assert!(
+            row["busAddress"].is_null(),
+            "a retired subject releases its address: {row:#}"
+        );
+        assert_eq!(row["retired"], true);
+        assert_eq!(row["runtime"]["state"], "absent");
+    }
+
+    /// An explicit `address` moves the route without moving anything the runtime owns: the row
+    /// key, the runtime id, and the durable task identity all stay on the agent ID.
+    #[test]
+    fn an_explicit_address_changes_only_the_projected_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "worker",
+            r#"id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"; address "fleet.builder"; pty "agent" { argv "agent-bin" }"#,
+        );
+        let value = json(
+            tmp.path(),
+            "h",
+            ObservationBatch {
+                complete: true,
+                observations: vec![],
+                errors: vec![],
+            },
+        );
+        let row = &value["tasks"][0];
+        assert_eq!(row["agent"], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        assert_eq!(row["busAddress"], "h.fleet.builder");
+        assert_eq!(
+            row["runtimeId"], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1.agent",
+            "task ids derive from the ID, never from the route: {row:#}"
         );
     }
 
