@@ -438,6 +438,23 @@ enum AgentCmd {
     /// The old address stops resolving as soon as the new catalog generation is visible and may be
     /// claimed by another subject. There is no alias, redirect, history, or expiry.
     Address(AddressArgs),
+    /// Attach this terminal to a running agent's canonical PTY session.
+    ///
+    /// Resolves the agent's canonical `agent` PTY task, waits (bounded) for positive evidence that
+    /// its session is live, then **replaces** this process with `pty attach --force <runtime-id>`.
+    /// From that point `pty` owns the tty, signals, detach keys, and the exit status; st2 adds
+    /// nothing to the session itself.
+    Attach {
+        /// Exact catalog-global agent ID. Never parsed as an address.
+        #[arg(long, value_name = "AGENT-ID")]
+        id: String,
+        /// Host used to resolve declarations whose host is omitted. Defaults to the local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Seconds to wait for the session to become live before giving up.
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
+    },
     /// Author reversible whole-agent lifecycle intent in one canonical KDL declaration.
     DesiredState {
         /// Exact catalog-global agent ID of the declaration to edit.
@@ -1416,6 +1433,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             presentation_cmd(st2::agent_author::PresentationField::Description, args)
         }
         Command::Agent(AgentCmd::Address(args)) => address_cmd(args),
+        Command::Agent(AgentCmd::Attach { id, host, wait }) => attach_cmd(&id, host, wait),
         Command::Agent(AgentCmd::DesiredState {
             id,
             state,
@@ -2104,6 +2122,117 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
     with_bus_env(&mut cmd, &root);
+    // exec() only returns on failure (e.g. `pty` not on PATH).
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec `pty`: {err}"))
+}
+
+/// How long `st2 agent attach` waits for positive evidence that the target session is live. st2
+/// owns this bound so callers that just spawned an agent (`new-agent`) need no flag at all.
+const ATTACH_READY_WAIT: Duration = Duration::from_secs(30);
+
+/// Readiness poll cadence. A pidfile read plus `kill(pid, 0)` is cheap enough to check often, and
+/// the loop is deadline-clamped so the last sleep never overshoots `--wait`.
+const ATTACH_READY_POLL: Duration = Duration::from_millis(100);
+
+/// `st2 agent attach --id <AGENT-ID>` — hand this terminal to a running agent's canonical PTY.
+///
+/// Selection is exact-ID only: an address must never resolve here, because attaching to the wrong
+/// live session is a destructive mistake a route cutover could otherwise cause. st2's whole added
+/// surface is resolve → wait → exec: it derives the canonical `agent` task's runtime id from the
+/// declaration (never guesses it), waits for *positive* liveness evidence, then **replaces** this
+/// process with `pty attach --force <runtime-id>`. Everything terminal-shaped — signals, detach,
+/// restart prompting, exit status — is `pty`'s from that instant on. A wait timeout is a human
+/// diagnostic only; nothing is authored, recorded, or retried.
+fn attach_cmd(id: &str, host: Option<String>, wait: Option<u64>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let root = catalog_root_for_env()?;
+    let host = host.unwrap_or_else(detect_host);
+    let wait = wait.map(Duration::from_secs).unwrap_or(ATTACH_READY_WAIT);
+
+    let runtime_id = {
+        let _catalog_lock = st2::CatalogLock::shared(&root)
+            .context("acquire shared catalog-authoring lock for agent attach")?;
+        let found = st2::discover_strict(&root);
+        // Attaching selects one exact declaration; a partially readable catalog could hide the very
+        // subject named, so refuse rather than attach to whatever did parse.
+        if !found.errors.is_empty() {
+            let errors = found
+                .errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path.display(), error.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "cannot attach to an exact Agent Spec while catalog discovery has {} error(s): {errors}",
+                found.errors.len()
+            );
+        }
+        let spec = resolve_agent_spec(&found, &st2::AgentSelector::id(id), &host)?;
+        let agent_id = spec.agent_id(&host);
+        let spec_host = spec.resolved_host(&host);
+        anyhow::ensure!(
+            spec_host == host,
+            "agent '{agent_id}' is homed on host '{spec_host}'; its pty registry is not observable \
+             from '{host}' — attach from that host (or pass --host '{spec_host}' there)"
+        );
+        let mut candidates = spec
+            .tasks
+            .iter()
+            .filter(|task| !task.derived && task.name == "agent");
+        let task = candidates
+            .next()
+            .with_context(|| format!("agent '{agent_id}' has no canonical `agent` task"))?;
+        anyhow::ensure!(
+            candidates.next().is_none(),
+            "agent '{agent_id}' has more than one canonical `agent` task"
+        );
+        anyhow::ensure!(
+            task.kind == st2::TaskKind::Pty,
+            "agent '{agent_id}' canonical task is not a PTY; there is no terminal to attach to"
+        );
+        st2::reconcile::task_runtime_id(spec, task, &host)
+    };
+
+    // The catalog's own registry, exactly as the runner resolves it. This one value is both probed
+    // for liveness AND handed to `pty` below, so the session st2 proved alive is provably the
+    // session `pty` then looks for.
+    let pty_root = st2::agents::probe_pty_root(&root);
+    // A `--wait` large enough to overflow the monotonic clock is a typo, not a request for an
+    // unbounded wait: refuse with the bound named rather than panicking inside the runtime.
+    let deadline = std::time::Instant::now().checked_add(wait).with_context(|| {
+        format!(
+            "--wait {}s overflows the monotonic clock; pass a bound this machine can represent",
+            wait.as_secs()
+        )
+    })?;
+    loop {
+        if ding::session_liveness_in(&pty_root, &runtime_id) == st2::harness_state::SessionLiveness::Alive
+        {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "pty session '{runtime_id}' is not live after {}s; nothing was attached — check \
+                 `st2 tasks --json` and run `st2 up` if the agent is not running",
+                wait.as_secs()
+            );
+        }
+        std::thread::sleep(deadline.saturating_duration_since(now).min(ATTACH_READY_POLL));
+    }
+
+    let mut cmd = std::process::Command::new("pty");
+    // `--force`: the caller is themselves inside a pty session, which `pty attach` otherwise
+    // refuses to nest. `--no-restart` is deliberately not passed — pty owns restart semantics.
+    cmd.args(["attach", "--force", &runtime_id]);
+    with_bus_env(&mut cmd, &root);
+    // `with_bus_env` renders PTY_ROOT from the catalog declaration alone, while the liveness probe
+    // resolves it the way the *runner* does — an ambient PTY_ROOT outranks the declaration there.
+    // Pin the probed root so the two can never disagree: otherwise a caller with an exported
+    // PTY_ROOT would have st2 prove one session alive and hand `pty` a different registry.
+    cmd.env("PTY_ROOT", &pty_root);
     // exec() only returns on failure (e.g. `pty` not on PATH).
     let err = cmd.exec();
     Err(anyhow::anyhow!("failed to exec `pty`: {err}"))

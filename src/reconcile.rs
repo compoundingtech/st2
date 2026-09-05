@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use agent_spec::spec::{
-    AgentSpec, DeliveryTransport, Driver, TaskKind, TaskLifecycle, stream_name_of_task,
+    AgentSpec, DeliveryTransport, Driver, Task, TaskKind, TaskLifecycle, stream_name_of_task,
 };
 use crate::supervisor_chain::{resolve_edge, supervisor_edge};
 use crate::AddressBook;
@@ -82,6 +82,16 @@ impl TaskCompileContext {
     pub fn catalog_root(&self) -> &Path {
         &self.catalog_root
     }
+}
+
+/// The single rule projecting a declared task onto its runtime session id: an explicitly pinned
+/// `id` wins, otherwise the id is derived as `<agent-id>.<task-name>`. Every reader that has to
+/// name a live session — runtime inventory, eval projection, `agent attach` — resolves it here so
+/// the derivation cannot drift between the writer and its observers.
+pub fn task_runtime_id(spec: &AgentSpec, task: &Task, this_host: &str) -> String {
+    task.id
+        .clone()
+        .unwrap_or_else(|| format!("{}.{}", spec.agent_id(this_host), task.name))
 }
 
 /// Compile every runner-owned launch marker into an exact invocation of this st2 binary.
