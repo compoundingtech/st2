@@ -206,7 +206,10 @@ migration assigns every live legacy declaration its existing
 `<resolved-host>.<identity>` bus identity as an explicit ID without moving
 runtime or declaration-anchored state. An archived declaration receives those
 same bytes when unused in the combined subject set; a collision receives UUIDv7
-in its declaration and tombstone. Supervisor resolution uses the combined
+in its declaration and tombstone. Migration also records each reassigned legacy
+bus identity with the subject that kept it and the archived subject's new ID so
+readers of legacy records never retype colliding bytes into the wrong subject.
+Supervisor resolution uses the combined
 pre-migration live-and-archived subject index. In the same catalog transition,
 every reference is rewritten to the parent's migrated ID. A missing or ambiguous
 reference refuses before writes with `legacy-supervisor-unresolved`; the

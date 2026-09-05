@@ -43,9 +43,14 @@ transport runs. Open questions are tracked in
 [open-questions.md](./open-questions.md); the direction this design deliberately
 does not take yet is in [roadmap.md](./roadmap.md).
 
-The `agent` field's immutable-ID meaning is the accepted target. Existing
-records and producers retain bus identity until
+The `agent` field's immutable-ID meaning is the accepted target, and it ships
+as a new record version, `st2.harness-context.v2`: the version suffix is the
+read contract, so changing an existing field's meaning reserves the next
+version rather than reusing `v1`. Records and producers stay on
+`st2.harness-context.v1`, whose `agent` remains a bus identity, until
 [DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+Version 2 is otherwise identical to the shape below, and the reader-first
+rollout accepts both versions before any version-2 writer activates.
 
 ## Scope
 
@@ -96,9 +101,10 @@ namespace is st2's own and is not registered anywhere; st2 core is its steward.
 The version suffix is the read contract, not the field set: additive fields do
 not bump it, and a reader that finds any other schema string refuses the record
 rather than guessing at fields spelled like this version's. Examples: valid
-`st2.harness-context.v1`; a future breaking shape `st2.harness-context.v2`;
-foreign and therefore refused `com.example.harness-context.v1`; invalid (no
-version) `st2.harness-context`.
+`st2.harness-context.v1`; the reserved immutable-ID shape
+`st2.harness-context.v2`, which tolerant readers accept before any producer
+emits it; foreign and therefore refused `com.example.harness-context.v1`;
+invalid (no version) `st2.harness-context`.
 
 ## Record (HC-R01, HC-R04)
 
@@ -111,7 +117,7 @@ replicated subtree (see
 ```json
 {
   "schema": "st2.harness-context.v1",
-  "agent": "<agent-id>",
+  "agent": "<identity in v1; agent ID in v2>",
   "harness": "claude | codex | pi | omp | opencode",
   "usedTokens": 92283,
   "windowTokens": 258400,

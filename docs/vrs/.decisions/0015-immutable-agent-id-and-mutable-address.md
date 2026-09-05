@@ -33,7 +33,10 @@ an `id` field to every live and structurally archived legacy declaration. A live
 subject receives its existing host-qualified bus identity, preserving current
 runtime identifiers. An archived subject receives those bytes when unused
 across the combined live-and-archived subject set; an archived collision
-receives UUIDv7 in its declaration and tombstone. Migration resolves supervisor
+receives UUIDv7 in its declaration and tombstone. Migration also records each
+reassigned legacy bus identity with the subject that kept it and the archived
+subject's new ID, so readers of legacy records never retype colliding bytes
+into the wrong subject. Migration resolves supervisor
 references against the combined pre-migration live-and-archived subject index
 and rewrites every reference to the parent's migrated ID in the same
 transaction. A missing or ambiguous reference refuses before writes and
@@ -140,5 +143,6 @@ refusal; unchanged task/PTY PID, creation identity, generation, provider
 session, inbox, archive, context, Resource state, declaration-parent state paths,
 and existing long-form task IDs after address changes; retained subject ID with
 existing lifecycle behavior for host/graph/launch controls; message-version
-reader-first compatibility and typed non-Agent endpoints; and stable
-machine-readable roster, graph, task, message, and diagnostic shapes.
+reader-first compatibility, including collision-aware attribution of legacy
+endpoints whose bytes migration reassigned, and typed non-Agent endpoints; and
+stable machine-readable roster, graph, task, message, and diagnostic shapes.

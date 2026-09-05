@@ -299,7 +299,10 @@ accepted.
   existing host-qualified bus identity as its explicit ID. A structurally
   archived legacy subject receives those same bytes when they remain unique
   across the combined live-and-archived subject set; an archived collision
-  receives UUIDv7 and records it in its declaration and tombstone. This
+  receives UUIDv7 and records it in its declaration and tombstone. Migration
+  also durably records each reassigned legacy bus identity together with the
+  subject that kept it and the archived subject's new ID, so readers of legacy
+  records never retype colliding bytes into the wrong subject. This
   preserves current runtime and archived continuity without admitting duplicate
   IDs. Supervisor resolution uses the combined pre-migration live-and-archived
   subject index. The same transition rewrites every reference to the parent's

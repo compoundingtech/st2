@@ -37,8 +37,12 @@ publication-time bus address snapshot. Immediately before constructing the
 notice, DING resolves the ID against one coherent current address book. The
 displayed sender is the current bus address only when that lookup succeeds.
 An absent, unreadable, incomplete, ambiguous, or nonroutable address book
-degrades to the stored snapshot and then the ID; cosmetic lookup never blocks
-delivery. A principal or external endpoint displays its canonical typed address
+degrades to the immutable ID, which is always displayable, optionally
+accompanied by the publication-time snapshot explicitly marked as a historical
+address. It never presents that snapshot alone as the current sender: a
+released address is immediately reusable, so the saved bytes may already route
+to a different subject. Cosmetic lookup never blocks delivery.
+A principal or external endpoint displays its canonical typed address
 without Agent lookup. Replies retain the canonical endpoint from the message;
 rendered text is never reparsed as authority.
 

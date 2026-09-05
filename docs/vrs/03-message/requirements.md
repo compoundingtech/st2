@@ -49,9 +49,10 @@ redefine terminal delivery.
   metadata. A sent row carries canonical `to`; it does not repurpose the inbound
   row's `from` field. Inbox rendering includes canonical sender ID and readable
   sender address. DING resolves the sender ID to its current bus address at
-  delivery, falling back to the publication snapshot and then the ID when no
-  coherent current route can be proved. Replies and automation always use the
-  persisted ID. A separately admitted principal or external endpoint uses an
+  delivery and otherwise falls back to the immutable ID, showing the
+  publication snapshot only when it is explicitly marked historical, because a
+  released address is immediately reusable. Replies and automation always use
+  the persisted ID. A separately admitted principal or external endpoint uses an
   explicit endpoint-kind discriminator and its canonical principal/external
   address; it is never represented as an agent ID.
 - **MESSAGE-R03 Explicit coverage:** Machine output distinguishes an unavailable index, coverage
@@ -64,7 +65,13 @@ redefine terminal delivery.
 - **MESSAGE-R04 Stable shared wire:** The sent envelope and row are serialized
   through `st2-wire`. Optional metadata and body omission preserve absent versus
   empty values. A durable record version changes whenever an existing field's
-  meaning changes or a strict record gains fields.
+  meaning changes or a strict record gains fields. A reader may reinterpret a
+  version-1 endpoint as an agent ID only for legacy bus identities that
+  migration froze for that same subject. Bytes that migration reassigned away
+  from an archived collision resolve only for the row's own state owner and are
+  otherwise rendered as an unattributed historical address that carries no
+  reply or automation authority; the reader never attributes them to the live
+  subject that kept them.
 
 ### Must survive interruption without a false Sent claim
 

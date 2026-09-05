@@ -20,7 +20,10 @@ presentation. Migration freezes every live legacy subject's existing
 host-qualified bus identity without moving declarations or declaration-parent
 state. A structurally archived subject freezes the same bytes when they remain
 unique across the combined live-and-archived set; an archived collision receives
-UUIDv7 in its declaration and tombstone. New subjects use UUIDv7. Supervisor
+UUIDv7 in its declaration and tombstone. Migration also records every
+reassigned legacy bus identity with the subject that kept it and the archived
+subject's generated ID, so a tolerant reader never retypes colliding
+version-1 bytes into the wrong subject. Supervisor
 resolution uses the combined pre-migration live-and-archived subject index; the
 same migration rewrites every reference to the parent's migrated ID. A missing
 or ambiguous reference refuses before writes with
@@ -59,8 +62,8 @@ boundaries. It must then propagate one typed ID/address distinction through:
 Activation is a reader-first transition, not a one-version flag day:
 
 1. Deploy readers that accept legacy and target Agent Specs, message versions 1
-   and 2, PTY schemas 1 and 2, and old and new projections. Keep every writer on
-   legacy output.
+   and 2, PTY schemas 1 and 2, harness-state and harness-context schemas 1 and
+   2, and old and new projections. Keep every writer on legacy output.
 2. Prove reader readiness on every admitted host and supported downstream
    consumer. An unreadable or unknown reader is not ready.
 3. In one catalog transaction, add migrated unique IDs to live and structurally
@@ -68,7 +71,8 @@ Activation is a reader-first transition, not a one-version flag day:
    supervisor reference to its already-resolved migrated ID.
 4. Re-prove reader readiness immediately before enabling target writers.
 5. Activate UUIDv7 creation, mutable-address routing, raw-ID `ST_AGENT`, ID-keyed
-   runtime ownership, message version 2, and PTY schema 2 together.
+   runtime ownership, message version 2, harness-state and harness-context
+   version 2, and PTY schema 2 together.
 
 No timeout substitutes for readiness. Until step 5 completes, existing identity
 resolution and every current invariant remain normative implementation behavior.
@@ -93,8 +97,10 @@ address uniqueness, explicit ID selection, immediate address cutover and reuse,
 retired-address release and reactivation validation, transactional concurrency,
 authority and Nix refusal, nondisruptive live continuity, readable
 message/DING sender projection and cosmetic fallback, version-1 record
-compatibility, typed non-Agent endpoints, host/graph/launch lifecycle controls,
-and every public machine wire shape named by decision 0015.
+compatibility including collision-aware legacy attribution, harness-state and
+harness-context version-2 records read by tolerant readers, typed non-Agent
+endpoints, host/graph/launch lifecycle controls, and every public machine wire
+shape named by decision 0015.
 
 Update these load-bearing invariant rows and their named tests in the same
 implementation:

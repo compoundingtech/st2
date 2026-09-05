@@ -80,7 +80,10 @@ every live and structurally archived declaration. It first assigns each live
 legacy subject its existing host-qualified bus identity, preserving current
 runtime IDs and declaration-anchored state. An archived subject receives those
 same bytes when unused across the combined live-and-archived set; a collision
-receives UUIDv7, recorded in both its declaration and tombstone. Supervisor
+receives UUIDv7, recorded in both its declaration and tombstone. Migration also
+durably records each reassigned legacy bus identity with the subject that kept
+it and the archived subject's new ID, so readers of legacy records never retype
+colliding bytes into the wrong subject. Supervisor
 resolution uses the combined pre-migration live-and-archived subject index. In
 the same atomic catalog transition, every reference is rewritten to its
 parent's migrated ID. A missing or ambiguous reference refuses before writes

@@ -86,13 +86,25 @@ The version-2 Agent record is:
 ```
 
 Version 1 keeps `from` and `to` as legacy bus identities. Migration freezes
-those same bytes as legacy agent IDs, so a version-2 reader can interpret old
-rows without rewriting immutable history. Version-2 readers accept both
-versions; strict version-1 readers reject version 2. The rollout therefore
-deploys tolerant readers fleet-wide before any version-2 writer activates.
-Principal or external endpoint records use the corresponding `fromKind` or
-`toKind` and keep that endpoint's canonical address in `from` or `to`; agent
-fields always contain agent IDs.
+those same bytes as the legacy agent ID of the subject that kept them, so a
+version-2 reader can interpret old rows without rewriting immutable history.
+An archived collision is the one exception: migration gave that archived
+subject a UUIDv7 while a live subject kept the colliding bytes, so those bytes
+in a version-1 row denote either subject. Migration therefore records every
+reassigned legacy bus identity, the subject that kept it, and the archived
+subject's generated ID as durable collision metadata, and version-2 readers
+consult that metadata instead of universally retyping version-1 endpoints. A
+colliding version-1 endpoint resolves only to the migrated ID of the row's own
+state owner: the sender for a sender-owned row, the recipient for an inbox
+row. Any other colliding endpoint is unattributed: the reader renders
+the legacy bytes as a historical address, never as the keeping subject's ID,
+and refuses reply and automation authority for it rather than addressing the
+live replacement (`MESSAGE-R04`). Version-2 readers accept both versions;
+strict version-1 readers reject version 2. The rollout therefore deploys
+tolerant readers fleet-wide before any version-2 writer activates. Principal
+or external endpoint records use the corresponding `fromKind` or `toKind` and
+keep that endpoint's canonical address in `from` or `to`; agent fields always
+contain agent IDs.
 
 Committed record filenames append `.json` to the canonical message filename. Pending and commit
 filenames are the SHA-256 digest of their canonical JSON content plus `.json`. A pending filename
