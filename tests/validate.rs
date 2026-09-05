@@ -1133,7 +1133,7 @@ fn an_agent_id_equal_to_another_agents_address_is_not_a_collision() {
     let c = catalog(&[
         (
             "h/root/agent.kdl",
-            r#"agent "root" { host "h"; address "reviewer"; command "x" }"#,
+            r#"agent "root" { host "h"; id "h.root"; address "reviewer"; command "x" }"#,
         ),
         (
             "h/worker/agent.kdl",
@@ -1141,6 +1141,8 @@ fn an_agent_id_equal_to_another_agents_address_is_not_a_collision() {
         ),
     ]);
 
+    // Both declarations carry an `id`: a partially migrated catalog is separately inadmissible, so
+    // the namespace question is only askable of a uniformly migrated one.
     let r = validate(c.path());
     assert_eq!(
         r.errors(),
@@ -1301,4 +1303,64 @@ fn a_legacy_catalog_produces_byte_identical_duplicate_diagnostics() {
         "one legacy duplicate is one diagnostic, not two: {:?}",
         r.issues
     );
+}
+
+/// A catalog is either fully migrated to explicit agent IDs or not migrated at all. A mixture has
+/// no coherent ID namespace, and refusing it is what stops a new declaration from entering a
+/// migrated catalog without an `id` — including one published through a digest-bound path whose
+/// exact bytes cannot have an id injected into them.
+#[test]
+fn a_partially_migrated_catalog_is_refused() {
+    let c = catalog(&[
+        (
+            "agents/h/root/agent.kdl",
+            "agent \"root\" {\n  id \"h.root\"\n  host \"h\"\n  argv \"true\"\n}\n",
+        ),
+        (
+            "agents/h/worker/agent.kdl",
+            "agent \"worker\" {\n  host \"h\"\n  supervisor \"h.root\"\n  argv \"true\"\n}\n",
+        ),
+    ]);
+    let r = validate_for_host(c.path(), "h");
+    assert!(
+        has(&r, "agent-id-missing", Severity::Error),
+        "expected agent-id-missing: {:?}",
+        r.issues
+    );
+    let missing = r
+        .issues
+        .iter()
+        .find(|issue| issue.code == "agent-id-missing")
+        .expect("the issue just asserted");
+    assert!(
+        missing.message.contains("1 of 2 declarations carry one"),
+        "{}",
+        missing.message
+    );
+    assert_eq!(missing.agent.as_deref(), Some("worker"));
+}
+
+/// Neither uniform state is a mixture: an all-legacy catalog and a fully migrated one both admit.
+#[test]
+fn a_uniformly_legacy_or_uniformly_migrated_catalog_admits() {
+    for (root_id, worker_id) in [("", ""), ("  id \"h.root\"\n", "  id \"h.worker\"\n")] {
+        let c = catalog(&[
+            (
+                "agents/h/root/agent.kdl",
+                &format!("agent \"root\" {{\n{root_id}  host \"h\"\n  argv \"true\"\n}}\n"),
+            ),
+            (
+                "agents/h/worker/agent.kdl",
+                &format!(
+                    "agent \"worker\" {{\n{worker_id}  host \"h\"\n  supervisor \"h.root\"\n  argv \"true\"\n}}\n"
+                ),
+            ),
+        ]);
+        let r = validate_for_host(c.path(), "h");
+        assert!(
+            !has(&r, "agent-id-missing", Severity::Error),
+            "{:?}",
+            r.issues
+        );
+    }
 }

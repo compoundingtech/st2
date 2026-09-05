@@ -356,9 +356,16 @@ pub fn migrate_ids(request: MigrateRequest) -> Result<MigrateResult> {
     // a reason migration did not cause — leaving every declaration rewritten, the generation
     // unmoved, and a marker whose resume can only fail the same way. Refusing up front keeps the
     // pre-existing fault the operator's to repair, exactly as `catalog apply` does.
-    catalog_transaction::validate_full_catalog(&catalog).context(
-        "refusing to migrate: the catalog does not currently admit, so a rewritten plane could not be re-admitted either; repair the declarations named above and retry",
-    )?;
+    //
+    // A resume skips it. The original attempt already proved the pre-migration plane admitted, and
+    // what a resume observes is a half-migrated plane — a state admission deliberately refuses
+    // (`agent-id-missing`) and that only this transaction is allowed to hold. The post-write
+    // re-admission below still runs, against the completed all-migrated plane.
+    if existing_marker.is_none() {
+        catalog_transaction::validate_full_catalog(&catalog).context(
+            "refusing to migrate: the catalog does not currently admit, so a rewritten plane could not be re-admitted either; repair the declarations named above and retry",
+        )?;
+    }
 
     if existing_marker.is_none() {
         write_marker(

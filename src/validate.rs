@@ -269,11 +269,10 @@ pub(crate) fn validate_discovered(
         // legacy/legacy, explicit/explicit across different hosts, and an explicit `id` that
         // collides with another subject's still-unmigrated frozen identity.
         //
-        // DELTA-003: the structurally archived subject set joins this check once
-        // `st2 catalog migrate-ids` lands (PR D2) — migration may freeze an archived subject's
-        // legacy bytes only while they remain unique across the combined live-and-archived set,
-        // and `st2 catalog unarchive` validates ID uniqueness against that prospective
-        // live-and-archived set rather than the live catalog alone.
+        // The structurally archived subject set joins this check through
+        // `catalog_archive::prospective_identities`, which `st2 catalog unarchive` uses to validate
+        // ID uniqueness against the prospective live-and-archived set rather than the live catalog
+        // alone. Whole-catalog ID migration owns the combined index while it assigns.
         let bid = s.effective_id(collision_host);
         let duplicate_id = seen.insert(bid.clone(), s.path.clone());
         if let Some(prev) = &duplicate_id {
@@ -565,6 +564,32 @@ pub(crate) fn validate_discovered(
                 format!(
                     "host '{}' must declare exactly one root agent; found {count}",
                     if host.is_empty() { "<default>" } else { &host }
+                ),
+            ));
+        }
+    }
+
+    // A catalog is either fully migrated to explicit agent IDs or not migrated at all. A mixed
+    // catalog has no coherent ID namespace: `effective_id` answers with a frozen legacy bus
+    // identity for one subject and an authored ID for its neighbour, so ownership, provenance, and
+    // task identity would be keyed two different ways in one pass, and `identity::activation`
+    // would keep every writer on legacy behavior while some declarations already claimed IDs.
+    //
+    // Only `st2 catalog migrate-ids` may hold a mixed state, and only inside its own transaction:
+    // it validates an all-legacy plane before its writes and an all-migrated plane after them,
+    // never a mixture. So this refusal is what stops a new declaration from entering a migrated
+    // catalog without an `id` — including one published through a digest-bound path that cannot
+    // have an ID injected into its exact bytes.
+    let migrated = d.specs.iter().filter(|spec| spec.id.is_some()).count();
+    if migrated > 0 && migrated < d.specs.len() {
+        for spec in d.specs.iter().filter(|spec| spec.id.is_none()) {
+            issues.push(Issue::error(
+                "agent-id-missing",
+                rel(root, &spec.path),
+                Some(spec.identity.clone()),
+                format!(
+                    "this catalog has migrated to explicit agent ids ({migrated} of {} declarations carry one), so every declaration must declare `id`; run `st2 catalog migrate-ids` or author the id",
+                    d.specs.len()
                 ),
             ));
         }
