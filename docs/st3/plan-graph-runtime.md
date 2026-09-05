@@ -718,6 +718,22 @@ st3 work revision cancel PROPOSAL --as person/reviewer --reason "The request cha
 
 A run can have one pending proposal. A second proposal fails until the first proposal is applied or cancelled.
 
+### Deferred declarative revision intent
+
+A future KDL operation can propose a produced plan revision against one live plan run.
+
+The operation should compile into the existing revision proposal claims. It must not create a second revision or generation model.
+
+Publishing a plan revision alone must not move an active run. The declaration must identify the target run and exact revision.
+
+A parent plan could target a linked child run. This would let a controller publish the parent plan from a shell heredoc.
+
+The plan could then sequence the proposal and verify the successor generation with normal dependencies and gates.
+
+A human-only approval must remain an external authorized claim. Publishing the controlling KDL must not imply that approval.
+
+This direction is deferred. The first design must define target selection, authority, idempotency, cancellation, and failure behavior.
+
 ### Immutable generations
 
 Each accepted revision creates one immutable successor generation. The stable plan-run subject points to the current generation.
