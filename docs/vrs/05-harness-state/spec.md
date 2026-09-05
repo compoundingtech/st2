@@ -26,6 +26,15 @@ Version 2 is otherwise identical to the shape below. The reader-first rollout
 accepts both versions — narrowing the `unsupported-schema` rule below to
 versions outside that pair — before any version-2 writer activates.
 
+The fault axis ships as a third record version, `st2.harness-state.v3`,
+specified in "Version 3: the fault axis" below. Its `agent` keeps version 2's
+meaning and its ownership envelope is byte-compatible with version 2, so the
+claim fence and the sequence floor honor a version 3 record without
+interpreting it. Readers accept and strictly validate version 3 before any
+writer emits it, and the writer-selection point stays on version 2 until the
+version 3 producers land; that same point is what version 3 activation
+replaces, rather than gaining a second selector beside it.
+
 ## Scope
 
 This specification defines the observed-state record, its freshness and
@@ -169,8 +178,8 @@ What a reader reports, in evaluation order:
 | --- | --- | --- |
 | No record file | no observation (`null`) | never observed ≠ `unknown` |
 | File exists but cannot be read | `unknown` | `unreadable-record`; an IO error is indeterminate, never absence |
-| Unparseable bytes, or bytes not shaped like an accepted version | `unknown` | `malformed-record`; never falls back to mtime |
-| `schema` is neither `st2.harness-state.v1` nor, once tolerant readers ship, `st2.harness-state.v2` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
+| Bytes carrying no version at all, or a supported version whose body does not decode | `unknown` | `malformed-record`; never falls back to mtime |
+| `schema` is outside `st2.harness-state.v1`, `.v2`, and `.v3` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else. The declared version is still reported, for the drain gate |
 | `writtenAtMs` > now + 60 s | `unknown` | `future-skew` |
 | `writtenAtMs` ≤ now − 15 min | `unknown` | `stale` |
 | Literal `unknown` state (never written by this crate) | `unknown` | `literal-unknown` |
@@ -179,6 +188,7 @@ What a reader reports, in evaluation order:
 | Live state, probe indeterminate | the recorded state | unprovable evidence downgrades nothing |
 | Fresh claim placeholder (`ended`, exitless, reason `superseded`) | `unknown` | `claimed`; a fence is not an observation |
 | `ended`, any probe result | `ended` | a terminal record outlives its writer |
+| A version 3 record | the version 3 axes, per "Version 3: the fault axis" below | its condition and ask axes are decoded strictly, before the freshness and liveness gates |
 | Otherwise | the recorded tuple | — |
 
 Every `unknown` row routes through one constructor and blanks every axis;
@@ -194,6 +204,131 @@ comes first. The cross-check is a narrowing of the ungraceful-death window
 OHS-T04/OHS-R07 say exactly this, and no death tombstone is attempted: the
 kill that removes the registry entry leaves nothing behind to prove death
 with, and fabricating evidence is the one thing this design never does.
+
+## Version 3: the fault axis (OHS-R17 – OHS-R23)
+
+Version 3 answers a question versions 1 and 2 cannot: not "what is this
+harness doing" but "what is wrong with it, and who fixes that". It keeps the
+activity, input, and ownership axes verbatim, replaces the overloaded
+`blockedOn` with two orthogonal axes, and adds a conversation bridge:
+
+```json
+{
+  "schema": "st2.harness-state.v3",
+  "agent": "<agent ID, as in v2>",
+  "harness": "codex | claude | pi | opencode | omp",
+  "state": "idle | active | child | ended",
+  "inputBuffer": "empty | nonempty | unknown",
+  "condition": {
+    "kind": "clear | fault",
+    "category": "authentication | account | quota | rateLimit | provider | context | configuration | policy | harness",
+    "code": "<provider-namespaced, open, diagnostic>",
+    "recovery": "automatic | human | terminal | unknown",
+    "observedAtMs": 1787690000000,
+    "nextObservationDueMs": 1787690300000,
+    "detail": "<diagnostic prose, optional>"
+  },
+  "ask": { "kind": "none | pending | unknown", "ask": "permission | question | review | unknown" },
+  "conversationRef": {
+    "kind": "linked | unavailable | unsupported",
+    "driver": "<driver namespace>",
+    "conversation": "<opaque provider conversation identity>",
+    "incarnation": "<runtime incarnation>",
+    "historyMutability": "stable | rewritable | unknown",
+    "capabilityEvidence": "probed | declared | unknown",
+    "verifiedThroughMs": 1787690000000
+  },
+  "reason": "<diagnostic, optional>",
+  "exit": "<ended only, optional>",
+  "ptySession": "<required for live states>",
+  "incarnation": "<session token>",
+  "seq": 7,
+  "sinceMs": 1787690000000,
+  "writtenAtMs": 1787690300000,
+  "transitions": 41
+}
+```
+
+Field rules beyond the shared envelope's:
+
+- `condition` is tagged. `clear` carries nothing else; a `clear` bearing fault
+  evidence is rejected. `fault` requires `recovery` and `observedAtMs`: a fault
+  that cannot be routed or aged is not a fault. `category` is closed; a word
+  outside the set leaves the fault untyped and still routed by `recovery`.
+  `code` is open and provider-namespaced, `detail` is prose, and neither is
+  branched on. `absent` is the version 1/2 projection, not a writable state.
+- `nextObservationDueMs` is meaningful only for `automatic` recovery; on any
+  other recovery, and when it precedes `observedAtMs`, it is a producer error
+  rather than a hint.
+- `ask` is tagged: `none` (naming no kind), `pending` (whose kind may be
+  unstated, which decodes as `unknown` rather than dropping the ask), or
+  `unknown`. It describes human prompts only.
+- `conversationRef` is optional. Stating nothing claims no capability, which
+  is not `unsupported`. A `linked` reference requires every part that makes it
+  usable — driver, opaque conversation identity, incarnation, mutability,
+  capability evidence, and a positive, finite `verifiedThroughMs` — because a
+  half-stated link is exactly what a consumer would trust and should not. No
+  conversation content rides the record.
+
+### Derivation additions
+
+| Evidence | Reads as | Reason |
+| --- | --- | --- |
+| `condition.kind` outside the tagged set | `unknown` | `unsupported-condition-kind` |
+| `clear` carrying category, code, recovery, or a time | `unknown` | `contradictory-clear` |
+| `fault` without `recovery` or `observedAtMs` | `unknown` | `incomplete-fault` |
+| `nextObservationDueMs` on a recovery this version recognizes as non-automatic (`human`, `terminal`) | `unknown` | `misplaced-observation-due`. On an UNRECOGNIZED recovery word it is kept instead: the class may be automatic in a version this reader predates, and rejecting it would turn a fault that pages under `unknown` recovery into a non-paging row |
+| `nextObservationDueMs` before `observedAtMs` | `unknown` | `inverted-observation-due` |
+| `condition.kind` is `absent` | `unknown` | `written-absent-condition`; absence is a projection, not a claim |
+| `ask.kind` outside the tagged set | `unknown` | `unsupported-ask-kind` |
+| `ask.kind` is `none` while naming a kind | `unknown` | `contradictory-ask` |
+| `conversationRef.kind` outside the tagged set | the observation, with only that axis degraded to `unavailable` carrying the rejection word | `unsupported-conversation-kind` |
+| `linked` missing driver, conversation, incarnation, mutability, or evidence | as above | `incomplete-conversation-link` |
+| `linked` with an absent or zero verification bound | as above | `unbounded-conversation-verification` |
+| `automatic` recovery whose deadline has passed at read time | the fault, `recovery: unknown`, `overdue: true` | a recovery that missed its own deadline is no longer automatic |
+| An unrecognized `category` word | the fault, untyped | still routed by `recovery` |
+| An unrecognized `recovery` word | the fault, `recovery: unknown` | unsayable recovery is treated like one needing a human |
+
+Every rejection routes through the same single indeterminate constructor as the
+older versions, so no path derives a definite state from a contradiction, and
+each one is reported typed — the word plus the age of the evidence it was
+derived from where the bytes carried a usable stamp.
+
+### The shared disposition (OHS-R21)
+
+One pure function folds the observed record and the sibling driver diagnostic
+into three closed axes — `state`, `attention`, `primaryAction` — and every
+consumer reads that result instead of re-deriving urgency. It is a row-level
+sibling of `observedState` in `st2 agents --json` and in the catalog graph's
+runtime value, because it folds two row-level axes; Doctor reports the same
+fold. It authorizes nothing: no delivery path reads it.
+
+| Evidence | state | attention | primaryAction |
+| --- | --- | --- | --- |
+| No record, no diagnostic failure | `unknown` | `none` | `observe` |
+| No record, diagnostic failure | `failed` | `now` | `remediate` |
+| Record-level indeterminate | `unknown` | `none` | `observe` |
+| `ended` | `ended` | `none` | `none` |
+| Fault, `automatic` recovery inside its deadline | `recovering` | `soon` | `none` |
+| Fault, human/terminal/unknown recovery (including an overdue automatic one) | `failed` | `now` | `remediate` |
+| Driver-diagnostic failure with no harness fault | `failed` | `now` | `remediate` |
+| Pending human ask | `waitingHuman` | `now` | `answer` |
+| Ask of an unsayable kind | the activity | `none` | `observe` |
+| Clear or absent condition, `idle` | `idle` | `none` | `none` |
+| Clear or absent condition, `active` or `child` | `working` | `none` | `none` |
+
+The order is the contract: indeterminacy and `ended` are settled before any
+fault rule, so neither ever pages; a harness fault outranks the driver
+diagnostic, which is st2's view of its own plumbing; and both outrank an ask,
+because a faulted seat cannot use an answer. The ask stays visible on the raw
+axis throughout.
+
+### Positive drain gate (OHS-R23)
+
+Every projected row carries the exact version its record declared, including
+one this build cannot interpret and including records that read indeterminate.
+A migration is therefore provable in the positive direction — every row reads
+the new version — which no absence can establish.
 
 Each controlled Codex startup generates the installed app-server schema. st2
 checks the required methods, response fields, blocking flags, and data shapes

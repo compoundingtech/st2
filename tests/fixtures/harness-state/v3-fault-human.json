@@ -1,0 +1,28 @@
+{
+  "schema": "st2.harness-state.v3",
+  "agent": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+  "harness": "codex",
+  "state": "active",
+  "ptySession": "worker",
+  "incarnation": "session-1",
+  "seq": 7,
+  "sinceMs": 1787999000000,
+  "writtenAtMs": 1787999999000,
+  "transitions": 41,
+  "inputBuffer": "unknown",
+  "condition": {
+    "kind": "fault",
+    "category": "authentication",
+    "code": "codex/unauthorized",
+    "recovery": "human",
+    "observedAtMs": 1787999999000,
+    "detail": "the provider rejected the stored credential"
+  },
+  "ask": {
+    "kind": "none"
+  },
+  "conversationRef": {
+    "kind": "unavailable",
+    "reason": "the app-server thread is not bound"
+  }
+}

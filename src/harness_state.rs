@@ -39,6 +39,20 @@ pub const SCHEMA_V1: &str = "st2.harness-state.v1";
 /// field decidable from the bytes, because the two namespaces are separate and a v1 reader would
 /// otherwise retype a frozen legacy ID as a route.
 pub const SCHEMA_V2: &str = "st2.harness-state.v2";
+/// Schema version 3: the *fault-axis* record. `agent` still means the immutable agent ID and the
+/// ownership envelope stays byte-compatible with version 2 — `schema`, `agent`, `harness`,
+/// `ptySession`, `incarnation`, `seq`, `sinceMs`, `writtenAtMs`, `transitions` keep their
+/// spelling and meaning — so the claim fence and the sequence floor can honor a version 3 record
+/// without interpreting it.
+///
+/// What version 3 adds is the `condition` axis: whether the harness is faulted, in which closed
+/// category, whose recovery is automatic or needs a human, on its own SEMANTIC clock
+/// (`observedAtMs`, plus an optional `nextObservationDueMs`) rather than the transport heartbeat.
+/// What it removes is the overloaded `blockedOn`: a fault is not an ask — a throttled provider
+/// asks nobody anything — and an ask is an actual human prompt, carried by a tagged state that
+/// says `none`, `pending(kind)`, or `unknown` without any of the three standing in for the
+/// others.
+pub const SCHEMA_V3: &str = "st2.harness-state.v3";
 
 /// Whether the immutable-ID writer is active. **On**, with the rest of the DELTA-003 activation
 /// cohort (raw-ID `ST_AGENT`, ID-keyed runtime ownership, message record version 2, PTY schema 2).
@@ -49,6 +63,12 @@ pub const SCHEMA_V2: &str = "st2.harness-state.v2";
 /// reader-first precondition is already met — [`read`] accepts both versions and reports which
 /// namespace each one names. The constant stays named so the cohort remains visible and one
 /// reversal point exists; it is not a per-record switch to flip alone.
+///
+/// Version 3 activation SUPERSEDES this constant rather than adding a second selector beside it.
+/// This build is reader-first again: it reads, strictly validates, and projects version 3 while
+/// its writer stays on version 2, so exactly one writer-selection point exists to replace when
+/// the version 3 producers land, and no seat is ever written into a shape its readers do not yet
+/// interpret.
 pub const EMIT_SCHEMA_V2: bool = true;
 
 /// The version this build writes. Every ownership decision below — sequence adoption, own-record
@@ -56,10 +76,13 @@ pub const EMIT_SCHEMA_V2: bool = true;
 /// a v1 straggler still refuses to replace a v2 record and vice versa.
 const SCHEMA: &str = if EMIT_SCHEMA_V2 { SCHEMA_V2 } else { SCHEMA_V1 };
 
-/// Whether a record's schema is one this version can interpret. Both versions describe the same
-/// axes; only the meaning of `agent` differs, and [`RecordSubject`] carries that difference.
+/// Whether a record's schema is one this version can interpret. Versions 1 and 2 describe the same
+/// axes and differ only in the meaning of `agent`, which [`RecordSubject`] carries. Version 3
+/// keeps that meaning and replaces the blocked axis with the tagged condition and ask axes, which
+/// [`ConditionView`] and [`HumanAsk`] carry. A version outside the three is uninterpretable: its
+/// words may be spelled exactly like these while meaning something else.
 pub fn is_supported_schema(schema: &str) -> bool {
-    schema == SCHEMA_V1 || schema == SCHEMA_V2
+    schema == SCHEMA_V1 || schema == SCHEMA_V2 || schema == SCHEMA_V3
 }
 
 /// The subject a record names, carrying which typed namespace the value belongs to.
@@ -218,6 +241,584 @@ impl Ask {
             Ask::Review => "review",
             Ask::Unknown => "unknown",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Version 3: the fault axis, the tagged human-ask axis, the conversation
+// bridge, typed indeterminacy, and the one shared derived disposition every
+// consumer reads instead of deriving its own.
+// ---------------------------------------------------------------------------
+
+/// Why a harness cannot make progress, as a CLOSED category. Closed because consumers route on
+/// it: a category nobody can enumerate is a category nobody can write a filter, a runbook, or an
+/// alert against. Provider vocabulary lives in the open, provider-namespaced [`Fault::code`]
+/// beside it and provider prose in [`Fault::detail`]; both stay diagnostic, and no consumer
+/// branches on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultCategory {
+    /// Credentials were rejected: a login, token, or key must be repaired.
+    Authentication,
+    /// The account itself is the obstacle — suspended, unpaid, unentitled.
+    Account,
+    /// A usage allowance is exhausted for a window.
+    Quota,
+    /// Requests are being throttled while the allowance itself is intact.
+    RateLimit,
+    /// The provider failed on its own side: an outage, a 5xx, a withdrawn model.
+    Provider,
+    /// The harness has no usable context left and cannot proceed as it stands.
+    Context,
+    /// The seat's own declaration or environment is wrong.
+    Configuration,
+    /// A policy — provider-side or local — refused the work.
+    Policy,
+    /// st2's own driver plumbing is the fault.
+    Harness,
+}
+
+impl FaultCategory {
+    /// Parse a category word. `None` for anything outside the closed set, which makes the fault
+    /// UNTYPED — still a fault, still routed by its recovery. Both alternatives are worse: mapping
+    /// an unknown word onto a neighbouring category invents a claim, and failing the whole record
+    /// would make a real fault stop paging because its label was new.
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "authentication" => Self::Authentication,
+            "account" => Self::Account,
+            "quota" => Self::Quota,
+            "rateLimit" => Self::RateLimit,
+            "provider" => Self::Provider,
+            "context" => Self::Context,
+            "configuration" => Self::Configuration,
+            "policy" => Self::Policy,
+            "harness" => Self::Harness,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Account => "account",
+            Self::Quota => "quota",
+            Self::RateLimit => "rateLimit",
+            Self::Provider => "provider",
+            Self::Context => "context",
+            Self::Configuration => "configuration",
+            Self::Policy => "policy",
+            Self::Harness => "harness",
+        }
+    }
+}
+
+/// Who or what clears a fault — the urgency axis. `Automatic` is the only value allowed to wait,
+/// and only until its own deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// The harness expects to clear this itself: a throttle window, a retried request.
+    Automatic,
+    /// A person must act.
+    Human,
+    /// Nothing clears it for this incarnation.
+    Terminal,
+    /// The producer could not say. Never optimistic: an unsayable recovery is treated exactly like
+    /// one that needs a human.
+    Unknown,
+}
+
+impl Recovery {
+    /// An unrecognized future word decodes as `Unknown`, which pages: the conservative direction.
+    fn parse(word: &str) -> Self {
+        match word {
+            "automatic" => Self::Automatic,
+            "human" => Self::Human,
+            "terminal" => Self::Terminal,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Human => "human",
+            Self::Terminal => "terminal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One fault, as st2 normalizes it for every consumer. Normalization happens here, once: the
+/// alternative is every reader re-deciding what an overdue automatic recovery means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fault {
+    /// `None` = untyped: the record named a category outside the closed set.
+    pub category: Option<FaultCategory>,
+    /// Provider-namespaced and OPEN (`claude/oauth_expired`, `codex/usage_limit_reached`):
+    /// diagnostic granularity underneath a routable category, never a substitute for one.
+    pub code: Option<String>,
+    pub recovery: Recovery,
+    /// The SEMANTIC clock: when the producer observed this condition. Deliberately distinct from
+    /// the record's transport `writtenAtMs`, which a heartbeat advances without observing
+    /// anything new.
+    pub observed_at_ms: u64,
+    /// Producer-supplied, optional, and meaningful only for `automatic` recovery: by when the
+    /// producer expects to have observed this fault clear itself.
+    pub next_observation_due_ms: Option<u64>,
+    /// Diagnostic only. No consumer branches on it.
+    pub detail: Option<String>,
+    /// Derived at READ time: an `automatic` recovery whose deadline has passed. Such a fault is
+    /// projected with `Unknown` recovery — a recovery that missed its own deadline is no longer
+    /// evidence of anything automatic — and pages until an explicit paired clear, a terminal
+    /// record, a new claim, or a new incarnation replaces it.
+    pub overdue: bool,
+}
+
+/// The condition axis as a consumer sees it. `Absent` is the version 1/2 projection: those
+/// records carry no condition axis at all, and absence is NEVER `clear` — inferring health from a
+/// record that never spoke about health is the exact mistake this axis exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionView {
+    Absent,
+    Clear,
+    Fault(Fault),
+}
+
+impl ConditionView {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Clear => "clear",
+            Self::Fault(_) => "fault",
+        }
+    }
+
+    pub fn fault(&self) -> Option<&Fault> {
+        match self {
+            Self::Fault(fault) => Some(fault),
+            Self::Absent | Self::Clear => None,
+        }
+    }
+}
+
+/// What kind of human prompt is pending. `Unknown` decodes future words and a `pending` state
+/// whose kind the producer did not name; it never means "no ask".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskKind {
+    Permission,
+    Question,
+    Review,
+    Unknown,
+}
+
+impl AskKind {
+    fn parse(word: &str) -> Self {
+        match word {
+            "permission" => Self::Permission,
+            "question" => Self::Question,
+            "review" => Self::Review,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Review => "review",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The ask axis: an ACTUAL human prompt, tagged so that "nothing is being asked", "this kind of
+/// thing is being asked", and "I cannot tell" are three different statements rather than one word
+/// doing all three jobs. Orthogonal to the condition axis: a fault is not an ask, and this axis
+/// says nothing about faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HumanAsk {
+    None,
+    Pending(AskKind),
+    Unknown,
+}
+
+impl HumanAsk {
+    /// The version 1/2 projection: the legacy `blockedOn`/`ask` pair read forward into the tagged
+    /// axis, inventing nothing. `blockedOn: human` is a real pending ask, an unrecognized legacy
+    /// word stays indeterminate rather than becoming `none`, and no fault is inferred anywhere.
+    fn from_legacy(blocked_on: BlockedOn, ask: Ask) -> Self {
+        match blocked_on {
+            BlockedOn::None => Self::None,
+            BlockedOn::Unknown => Self::Unknown,
+            BlockedOn::Human => Self::Pending(match ask {
+                Ask::Permission => AskKind::Permission,
+                Ask::Question => AskKind::Question,
+                Ask::Review => AskKind::Review,
+                // A legacy record can be blocked on a human without naming the kind — `none` is
+                // the pre-axis default — so the ask is real and its kind unstated.
+                Ask::None | Ask::Unknown => AskKind::Unknown,
+            }),
+        }
+    }
+
+    /// The legacy pair this state projects back to, so the shipped `observedState` fields keep
+    /// their exact meaning for consumers pinned to them while version 3 records flow through.
+    fn to_legacy(self) -> (BlockedOn, Ask) {
+        match self {
+            Self::None => (BlockedOn::None, Ask::None),
+            Self::Unknown => (BlockedOn::Unknown, Ask::Unknown),
+            Self::Pending(kind) => (
+                BlockedOn::Human,
+                match kind {
+                    AskKind::Permission => Ask::Permission,
+                    AskKind::Question => Ask::Question,
+                    AskKind::Review => Ask::Review,
+                    AskKind::Unknown => Ask::Unknown,
+                },
+            ),
+        }
+    }
+
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pending(_) => "pending",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn pending(self) -> Option<AskKind> {
+        match self {
+            Self::Pending(kind) => Some(kind),
+            Self::None | Self::Unknown => None,
+        }
+    }
+}
+
+/// Whether a linked conversation's already-read history can change underneath the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryMutability {
+    /// Prior turns never change: a prefix read once stays valid.
+    Stable,
+    /// The provider may rewrite or compact history, so a prefix read once may be gone.
+    Rewritable,
+    /// The producer could not say, which a consumer must treat as rewritable.
+    Unknown,
+}
+
+impl HistoryMutability {
+    fn parse(word: &str) -> Self {
+        match word {
+            "stable" => Self::Stable,
+            "rewritable" => Self::Rewritable,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Rewritable => "rewritable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// How a capability claim was established. Required beside the claim: a capability nobody can
+/// attribute is a capability nobody should build on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityEvidence {
+    /// The producer actually exercised the capability against the provider.
+    Probed,
+    /// The driver declares it from pinned knowledge of that provider version.
+    Declared,
+    /// Neither: the claim is unattributed.
+    Unknown,
+}
+
+impl CapabilityEvidence {
+    fn parse(word: &str) -> Self {
+        match word {
+            "probed" => Self::Probed,
+            "declared" => Self::Declared,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Probed => "probed",
+            Self::Declared => "declared",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A live link to the provider's own conversation: IDENTITY and CAPABILITY only. Conversation
+/// content never rides this record — nothing content-bearing is decoded from it and nothing
+/// content-bearing is projected out of it — because a catalog record replicated to every reader
+/// is the wrong place for a transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationLink {
+    /// Which driver's namespace the opaque identity below belongs to.
+    pub driver: String,
+    /// The provider's own conversation identity, opaque to st2: never parsed, never joined to a
+    /// catalog, never compared across drivers.
+    pub conversation: String,
+    /// The runtime incarnation the link was established under, so a consumer can tell a relaunch
+    /// from a continuation of the same session.
+    pub incarnation: String,
+    pub history_mutability: HistoryMutability,
+    pub capability_evidence: CapabilityEvidence,
+    /// The FINITE verification bound: the instant through which this link was actually verified.
+    /// Never open-ended, so a consumer ages the claim instead of trusting it forever.
+    pub verified_through_ms: u64,
+}
+
+/// The conversation bridge, tagged so "there is one", "there could be one and it is not reachable
+/// now", and "this driver has no such concept" stay three different answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationRef {
+    /// The driver has no conversation identity to expose at all.
+    Unsupported,
+    /// The driver has one and it is not available right now; the reason is diagnostic.
+    Unavailable(Option<String>),
+    Linked(ConversationLink),
+}
+
+impl ConversationRef {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Unavailable(_) => "unavailable",
+            Self::Linked(_) => "linked",
+        }
+    }
+
+    pub fn link(&self) -> Option<&ConversationLink> {
+        match self {
+            Self::Linked(link) => Some(link),
+            Self::Unsupported | Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Why an observation is indeterminate, TYPED. This is the authoritative field for new consumers;
+/// the legacy scalar `Observed::reason` is a compatibility projection of this same value and is
+/// never computed independently. Present exactly when the observation is indeterminate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Indeterminacy {
+    /// The closed derivation word: which rule produced the `unknown`.
+    pub reason: String,
+    /// How old the record's own evidence was when it was read, whenever the bytes carried a usable
+    /// stamp at all. Absent for bytes that carried none — an unreadable file, malformed JSON — so
+    /// "no age" and "age zero" stay different answers.
+    pub evidence_age_ms: Option<u64>,
+}
+
+/// The shared derived state: what this seat is doing, folded across the raw axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispositionState {
+    Idle,
+    Working,
+    WaitingHuman,
+    Recovering,
+    Failed,
+    Ended,
+    Unknown,
+}
+
+impl DispositionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::WaitingHuman => "waitingHuman",
+            Self::Recovering => "recovering",
+            Self::Failed => "failed",
+            Self::Ended => "ended",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// How soon a human is needed. `Now` is the only paging value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    None,
+    Soon,
+    Now,
+}
+
+impl Attention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Soon => "soon",
+            Self::Now => "now",
+        }
+    }
+}
+
+/// What that human would do first. Remediation outranks answering: a faulted seat cannot use an
+/// answer, and its pending ask stays visible on the raw axis regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryAction {
+    None,
+    Answer,
+    Remediate,
+    Observe,
+}
+
+impl PrimaryAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Answer => "answer",
+            Self::Remediate => "remediate",
+            Self::Observe => "observe",
+        }
+    }
+}
+
+/// One derived disposition: exactly three closed axes and nothing else. Every consumer — roster,
+/// catalog graph, Doctor, and any downstream presentation — reads this instead of re-deriving
+/// urgency from the raw axes, because two consumers deriving independently is how one of them
+/// starts paging for something the other ignores. Why it carries no reason of its own: the raw
+/// axes it folded are on the wire beside it — `condition`, `indeterminacy`, `humanAsk`, and the
+/// sibling driver diagnostic — so anything a reason would say is already readable at its source,
+/// and a fourth field would be a second, drifting place to say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disposition {
+    pub state: DispositionState,
+    pub attention: Attention,
+    pub primary_action: PrimaryAction,
+}
+
+impl Disposition {
+    fn new(
+        state: DispositionState,
+        attention: Attention,
+        primary_action: PrimaryAction,
+    ) -> Self {
+        Self {
+            state,
+            attention,
+            primary_action,
+        }
+    }
+}
+
+/// THE disposition function: pure, total, and the only place urgency is decided.
+///
+/// It reads the observed record's already-normalized axes plus the sibling native-driver
+/// diagnostic, and it changes neither: the raw axes ride the wire beside this result, so a
+/// consumer that disagrees can see exactly what was folded. It authorizes nothing — no delivery
+/// path reads it, matching the standing rule that driver degradation is advisory and never
+/// alters delivery.
+///
+/// The order below is the contract:
+/// 1. No record at all: nothing was ever observed, which is not a state — unless the sibling
+///    diagnostic holds a failure, the one fault st2 can prove without any observation.
+/// 2. Record-level indeterminate: unknown, non-paging, worth observing.
+/// 3. `ended`: terminal and never paging — a finished seat is not an emergency.
+/// 4. A fault: remediation is primary. `automatic` recovery inside its own deadline is
+///    `recovering`/`soon`; everything else — human, terminal, unknown, and an overdue automatic
+///    recovery normalized into unknown at read time — pages.
+/// 5. A native-driver diagnostic failure, which contributes exactly like a fault the harness
+///    itself could not report, and outranks an ask for the same reason a fault does.
+/// 6. A pending human ask: answer it.
+/// 7. Otherwise the raw activity, mapped without urgency.
+pub fn disposition(
+    observed: Option<&Observed>,
+    diagnostic: &crate::driver_diagnostic::Observed,
+) -> Disposition {
+    let Some(observed) = observed else {
+        // Nothing was ever observed. The sibling diagnostic can still be the whole story: the
+        // Claude, Codex, and omp drivers publish a diagnostic ONLY on a credential rejection, so
+        // "no harness-state record beside a published rejection" is exactly the seat whose
+        // provider refused it before it ever reported a state, and reporting that as merely
+        // unknown would hide the one fault st2 positively holds.
+        return if matches!(diagnostic, crate::driver_diagnostic::Observed::Failure(_)) {
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate,
+            )
+        } else {
+            Disposition::new(
+                DispositionState::Unknown,
+                Attention::None,
+                PrimaryAction::Observe,
+            )
+        };
+    };
+    if observed.state == Activity::Unknown {
+        return Disposition::new(
+            DispositionState::Unknown,
+            Attention::None,
+            PrimaryAction::Observe,
+        );
+    }
+    if observed.state == Activity::Ended {
+        return Disposition::new(
+            DispositionState::Ended,
+            Attention::None,
+            PrimaryAction::None,
+        );
+    }
+    if let Some(fault) = observed.condition.fault() {
+        return if fault.recovery == Recovery::Automatic {
+            Disposition::new(
+                DispositionState::Recovering,
+                Attention::Soon,
+                PrimaryAction::None,
+            )
+        } else {
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate,
+            )
+        };
+    }
+    if matches!(diagnostic, crate::driver_diagnostic::Observed::Failure(_)) {
+        return Disposition::new(
+            DispositionState::Failed,
+            Attention::Now,
+            PrimaryAction::Remediate,
+        );
+    }
+    match observed.human_ask {
+        HumanAsk::Pending(_) => Disposition::new(
+            DispositionState::WaitingHuman,
+            Attention::Now,
+            PrimaryAction::Answer,
+        ),
+        // An unsayable ask is not a summons: it cannot be answered, because nobody knows what the
+        // question is. It is worth looking at, which is what `observe` means.
+        HumanAsk::Unknown => Disposition::new(
+            activity_state(observed.state),
+            Attention::None,
+            PrimaryAction::Observe,
+        ),
+        HumanAsk::None => Disposition::new(
+            activity_state(observed.state),
+            Attention::None,
+            PrimaryAction::None,
+        ),
+    }
+}
+
+/// The activity-only mapping, used once no condition, diagnostic, or ask claims the disposition.
+fn activity_state(activity: Activity) -> DispositionState {
+    match activity {
+        Activity::Idle => DispositionState::Idle,
+        // A foreground child is the harness working through something, which is what a consumer
+        // needs to know; `child` stays visible on the raw axis for anyone who cares which.
+        Activity::Active | Activity::Child => DispositionState::Working,
+        Activity::Ended => DispositionState::Ended,
+        Activity::Unknown => DispositionState::Unknown,
     }
 }
 
@@ -441,7 +1042,7 @@ impl Writer {
             // Bytes this version cannot parse are somebody's record, not a virgin seat: a
             // non-claiming writer refuses rather than restarting the sequence and counter over
             // foreign state. Only the explicit written claim supersedes.
-            StoredRecord::Unreadable => return Ok(false),
+            StoredRecord::Unreadable(_) => return Ok(false),
         };
         // Resolve this writer's ownership sequence, then enforce its direction. A claiming
         // writer adopts the on-disk sequence when the record already carries its token (a
@@ -543,7 +1144,10 @@ impl Writer {
         // record a reader would trust: one already past the future-skew bound is somebody's
         // garbage (or an overflow probe), and inheriting it would poison every later write —
         // the writer's own clock wins instead.
-        let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+        let written_at_ms = next_stamp(
+            on_disk.as_ref().map(|current| current.written_at_ms),
+            now_ms,
+        );
         let (since_ms, transitions) = match (own_record, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
             (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
@@ -622,8 +1226,11 @@ impl Writer {
 }
 
 /// The derived view a consumer reads. `state` already folds in staleness, future skew,
-/// malformation, and (when a probe is supplied) session liveness; `reason` names which derivation
-/// produced an `unknown`, so no absence is silent.
+/// malformation, and (when a probe is supplied) session liveness; [`Observed::indeterminacy`]
+/// names which derivation produced an `unknown`, so no absence is silent. Every version projects
+/// into this one type: version 3's tagged axes are carried directly, and versions 1 and 2 project
+/// their legacy pair into [`Observed::human_ask`] while leaving [`Observed::condition`]
+/// explicitly absent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
     pub state: Activity,
@@ -633,16 +1240,38 @@ pub struct Observed {
     pub harness: Option<String>,
     pub since_ms: Option<u64>,
     pub exit: Option<String>,
+    /// Two meanings, one field, kept for compatibility: on a definite observation it is the
+    /// record's own diagnostic `reason`, and on an indeterminate one it is a projection of
+    /// [`Indeterminacy::reason`] — never computed independently of it.
     pub reason: Option<String>,
     /// The subject the record names, with the namespace its version decided. `None` whenever the
     /// observation is indeterminate: an uninterpretable record proves no subject either.
     pub subject: Option<RecordSubject>,
+    /// The EXACT schema the bytes declared, whenever they declared one at all — including a
+    /// version this build cannot interpret, and including records that then read indeterminate.
+    /// Projected because a migration needs a POSITIVE drain gate: "every row reads
+    /// `st2.harness-state.v3`" is provable from this field, while "no row is still v1" is not
+    /// provable from any absence.
+    pub schema: Option<String>,
+    /// Typed indeterminacy, present exactly when this observation is indeterminate. The
+    /// authoritative field for new consumers.
+    pub indeterminacy: Option<Indeterminacy>,
+    /// The condition axis. `Absent` for versions 1 and 2, which have no such axis: never `clear`,
+    /// and no fault is inferred from their legacy words.
+    pub condition: ConditionView,
+    /// The tagged ask axis — an actual human prompt. Versions 1 and 2 project their legacy
+    /// `blockedOn`/`ask` pair into it.
+    pub human_ask: HumanAsk,
+    /// The conversation bridge, or `None` when the record states nothing about one. `None` is not
+    /// `Unsupported`: silence is not a capability claim.
+    pub conversation: Option<ConversationRef>,
 }
 
 impl Observed {
     fn indeterminate(reason: &str, harness: Option<String>) -> Self {
         // The single constructor for an indeterminate observation: every absence routes here, so
-        // no path can derive `idle` — or anything else — from missing evidence.
+        // no path can derive `idle` — or anything else — from missing evidence, and the typed
+        // indeterminacy and its legacy projection are minted from one value.
         Self {
             state: Activity::Unknown,
             blocked_on: BlockedOn::Unknown,
@@ -653,7 +1282,32 @@ impl Observed {
             exit: None,
             reason: Some(reason.to_string()),
             subject: None,
+            schema: None,
+            indeterminacy: Some(Indeterminacy {
+                reason: reason.to_string(),
+                evidence_age_ms: None,
+            }),
+            condition: ConditionView::Absent,
+            human_ask: HumanAsk::Unknown,
+            conversation: None,
         }
+    }
+
+    /// Attach the version the bytes declared. An indeterminate observation keeps it: the drain
+    /// gate must still see the version of a record that went stale, and `unsupported-schema` is
+    /// precisely the row whose declared version an operator needs.
+    fn with_schema(mut self, schema: &str) -> Self {
+        self.schema = Some(schema.to_string());
+        self
+    }
+
+    /// Age the evidence an indeterminate observation was derived from. Only the reader knows the
+    /// clock it compared against, so the age is attached here rather than guessed by a consumer.
+    fn with_evidence_age(mut self, age_ms: Option<u64>) -> Self {
+        if let Some(indeterminacy) = self.indeterminacy.as_mut() {
+            indeterminacy.evidence_age_ms = age_ms;
+        }
+        self
     }
 }
 
@@ -686,54 +1340,58 @@ fn read_raw_at(
     probe: Option<&dyn Fn(&str) -> SessionLiveness>,
     now_ms: u64,
 ) -> Observed {
-    let Ok(record) = serde_json::from_slice::<Record>(raw) else {
+    // The envelope is decoded FIRST and carries only what every version spells identically, so
+    // the version discriminator — not a guess at which body type happens to parse — decides who
+    // may interpret the bytes. The discriminator gates interpretation because a schema outside
+    // the versions this build understands may spell its words like these while meaning something
+    // else, so nothing definite may be derived from it.
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(raw) else {
         return Observed::indeterminate("malformed-record", None);
     };
-    let harness = Some(record.harness.clone());
-    // The discriminator gates interpretation: a schema outside the pair this version understands
-    // may spell its words like these while meaning something else, so nothing definite may be
-    // derived from it. Within the pair, only the meaning of `agent` differs, and that meaning
-    // travels typed on `subject` rather than being guessed by the consumer.
-    if !is_supported_schema(&record.schema) {
-        return Observed::indeterminate("unsupported-schema", harness);
+    let harness = envelope.harness.clone();
+    // A zero stamp is the serde default for bytes that carried none: no age, rather than an age
+    // of "since the epoch".
+    let evidence_age_ms = (envelope.written_at_ms > 0)
+        .then(|| now_ms.saturating_sub(envelope.written_at_ms));
+    if !is_supported_schema(&envelope.schema) {
+        return Observed::indeterminate("unsupported-schema", harness)
+            .with_schema(&envelope.schema)
+            .with_evidence_age(evidence_age_ms);
     }
+    if envelope.schema == SCHEMA_V3 {
+        read_v3_at(raw, harness, probe, now_ms)
+    } else {
+        read_legacy_at(raw, harness, probe, now_ms)
+    }
+    .with_schema(&envelope.schema)
+    .with_evidence_age(evidence_age_ms)
+}
+
+/// Versions 1 and 2: one shape, whose only difference is the namespace of `agent`.
+fn read_legacy_at(
+    raw: &[u8],
+    harness: Option<String>,
+    probe: Option<&dyn Fn(&str) -> SessionLiveness>,
+    now_ms: u64,
+) -> Observed {
+    let Ok(record) = serde_json::from_slice::<Record>(raw) else {
+        return Observed::indeterminate("malformed-record", harness);
+    };
+    // Within the pair only the meaning of `agent` differs, and that meaning travels typed on
+    // `subject` rather than being guessed by the consumer.
     let subject = RecordSubject::for_version(record.schema == SCHEMA_V2, record.agent.clone());
-    if record.written_at_ms > now_ms {
-        if record.written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
-            return Observed::indeterminate("future-skew", harness);
-        }
-    } else if now_ms - record.written_at_ms >= duration_ms(HARNESS_STATE_STALE) {
-        return Observed::indeterminate("stale", harness);
+    if let Err(reason) = freshness(record.written_at_ms, now_ms) {
+        return Observed::indeterminate(reason, harness);
     }
     if record.state == Activity::Unknown {
         // A literal `unknown` is never written by this crate; treat one like malformation.
         return Observed::indeterminate("literal-unknown", harness);
     }
-    if record.state == Activity::Ended
-        && record.exit.is_none()
-        && record.reason.as_deref() == Some("superseded")
-    {
-        // The claim placeholder is a fence, not an observation: the session wrote it at startup
-        // and has observed nothing yet. Reading it as definite `ended` would flip a live seat
-        // to dead for every consumer whose harness never publishes its first frame promptly —
-        // indeterminate, distinctly, until the first real observation or the ordinary horizon.
+    if is_claim_placeholder(record.state, record.exit.as_deref(), record.reason.as_deref()) {
         return Observed::indeterminate("claimed", harness);
     }
-    if record.state != Activity::Ended
-        && let Some(probe) = probe
-    {
-        // Same-host readers cross-check live states against the session registry. A live record
-        // that names no session offers nothing to check — without this rule it would stay
-        // definite through an external SIGKILL for the whole staleness horizon, which is exactly
-        // the window the cross-check exists to close. Writers therefore must fence live states
-        // (enforced in `observe`); a fenced record whose session is provably dead is downgraded,
-        // and an unreadable registry still downgrades nothing.
-        let Some(session) = record.pty_session.as_deref() else {
-            return Observed::indeterminate("unfenced-record", harness);
-        };
-        if probe(session) == SessionLiveness::Dead {
-            return Observed::indeterminate("session-dead", harness);
-        }
+    if let Err(reason) = liveness(record.state, record.pty_session.as_deref(), probe) {
+        return Observed::indeterminate(reason, harness);
     }
     Observed {
         state: record.state,
@@ -745,6 +1403,249 @@ fn read_raw_at(
         exit: record.exit,
         reason: record.reason,
         subject: Some(subject),
+        schema: Some(record.schema),
+        indeterminacy: None,
+        // Versions 1 and 2 carry no condition axis. It is EXPLICITLY absent rather than `clear`,
+        // and no fault is inferred from `blockedOn`, from a diagnostic `reason`, or from anything
+        // else in these records: they never spoke about faults.
+        condition: ConditionView::Absent,
+        human_ask: HumanAsk::from_legacy(record.blocked_on, record.ask),
+        conversation: None,
+    }
+}
+
+/// Version 3, strictly. Edge validation runs BEFORE the freshness and liveness gates: a record
+/// whose axes contradict each other is not a weaker observation, it is not an observation, and its
+/// age says nothing about that. Every rejection carries its own reason word, so an operator can
+/// tell a producer bug from a stale seat.
+fn read_v3_at(
+    raw: &[u8],
+    harness: Option<String>,
+    probe: Option<&dyn Fn(&str) -> SessionLiveness>,
+    now_ms: u64,
+) -> Observed {
+    let Ok(record) = serde_json::from_slice::<RecordV3>(raw) else {
+        return Observed::indeterminate("malformed-record", harness);
+    };
+    let condition = match decode_condition(&record.condition, now_ms) {
+        Ok(condition) => condition,
+        Err(reason) => return Observed::indeterminate(reason, harness),
+    };
+    let human_ask = match decode_ask(&record.ask) {
+        Ok(human_ask) => human_ask,
+        Err(reason) => return Observed::indeterminate(reason, harness),
+    };
+    // The conversation bridge is a CAPABILITY axis, not part of the observation: a producer that
+    // states it badly has still told us what the harness is doing and what is wrong with it.
+    // Discarding the whole record over a half-stated link would trade a real fault and a waiting
+    // human for a broken side-channel, so the damage is contained to this axis, which degrades to
+    // `unavailable` carrying st2's own closed rejection word — never provider prose, and never a
+    // `linked` claim a consumer could act on.
+    let conversation = record
+        .conversation_ref
+        .as_ref()
+        .map(|wire| decode_conversation(wire).unwrap_or_else(|reason| {
+            ConversationRef::Unavailable(Some(reason.to_string()))
+        }));
+    if let Err(reason) = freshness(record.written_at_ms, now_ms) {
+        return Observed::indeterminate(reason, harness);
+    }
+    if record.state == Activity::Unknown {
+        return Observed::indeterminate("literal-unknown", harness);
+    }
+    if is_claim_placeholder(record.state, record.exit.as_deref(), record.reason.as_deref()) {
+        return Observed::indeterminate("claimed", harness);
+    }
+    if let Err(reason) = liveness(record.state, record.pty_session.as_deref(), probe) {
+        return Observed::indeterminate(reason, harness);
+    }
+    // The legacy pair is projected from the tagged axis, so a consumer pinned to
+    // `blockedOn`/`ask` keeps reading exactly what those fields have always meant.
+    let (blocked_on, ask) = human_ask.to_legacy();
+    Observed {
+        state: record.state,
+        blocked_on,
+        input_buffer: record.input_buffer,
+        ask,
+        harness,
+        since_ms: Some(record.since_ms),
+        exit: record.exit,
+        reason: record.reason,
+        // Version 3 keeps version 2's meaning: `agent` is the immutable agent ID.
+        subject: Some(RecordSubject::AgentId(record.agent)),
+        schema: Some(record.schema),
+        indeterminacy: None,
+        condition,
+        human_ask,
+        conversation,
+    }
+}
+
+/// The transport freshness gate, shared by every version: the record's own embedded stamp against
+/// the reader's clock, never file mtime.
+fn freshness(written_at_ms: u64, now_ms: u64) -> Result<(), &'static str> {
+    if written_at_ms > now_ms {
+        if written_at_ms - now_ms > duration_ms(HARNESS_STATE_FUTURE_SKEW) {
+            return Err("future-skew");
+        }
+    } else if now_ms - written_at_ms >= duration_ms(HARNESS_STATE_STALE) {
+        return Err("stale");
+    }
+    Ok(())
+}
+
+/// The claim placeholder is a fence, not an observation: the session wrote it at startup and has
+/// observed nothing yet. Reading it as definite `ended` would flip a live seat to dead for every
+/// consumer whose harness never publishes its first frame promptly — indeterminate, distinctly,
+/// until the session's first real observation or the ordinary horizon.
+fn is_claim_placeholder(state: Activity, exit: Option<&str>, reason: Option<&str>) -> bool {
+    state == Activity::Ended && exit.is_none() && reason == Some("superseded")
+}
+
+/// The same-host session-liveness cross-check, shared by every version. A live record that names
+/// no session offers nothing to check — without this rule it would stay definite through an
+/// external SIGKILL for the whole staleness horizon, which is exactly the window the cross-check
+/// exists to close. Writers therefore must fence live states (enforced in `observe`); a fenced
+/// record whose session is provably dead is downgraded, and an unreadable registry still
+/// downgrades nothing. A fresh `ended` survives: a terminal record is supposed to outlive its
+/// writer.
+fn liveness(
+    state: Activity,
+    pty_session: Option<&str>,
+    probe: Option<&dyn Fn(&str) -> SessionLiveness>,
+) -> Result<(), &'static str> {
+    if state == Activity::Ended {
+        return Ok(());
+    }
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    let Some(session) = pty_session else {
+        return Err("unfenced-record");
+    };
+    if probe(session) == SessionLiveness::Dead {
+        return Err("session-dead");
+    }
+    Ok(())
+}
+
+/// Strict decode of the condition axis. The rejections are the point: a producer that contradicts
+/// itself must be visible as a producer bug rather than averaged into a plausible-looking state.
+fn decode_condition(wire: &WireCondition, now_ms: u64) -> Result<ConditionView, &'static str> {
+    match wire.kind.as_str() {
+        "clear" => {
+            // A `clear` carrying fault evidence is two contradictory claims in one record. Picking
+            // either would be a guess, and guessing toward `clear` would silence a real fault.
+            if wire.category.is_some()
+                || wire.code.is_some()
+                || wire.recovery.is_some()
+                || wire.observed_at_ms.is_some()
+                || wire.next_observation_due_ms.is_some()
+            {
+                return Err("contradictory-clear");
+            }
+            Ok(ConditionView::Clear)
+        }
+        "fault" => {
+            // Recovery and the semantic observation time are what make a fault actionable and
+            // ageable; a fault without them cannot be routed or timed out, so it is not a fault.
+            let recovery = Recovery::parse(wire.recovery.as_deref().ok_or("incomplete-fault")?);
+            let observed_at_ms = wire.observed_at_ms.ok_or("incomplete-fault")?;
+            if let Some(due) = wire.next_observation_due_ms {
+                // A deadline belongs to a recovery that is supposed to happen by itself. On a
+                // recovery this build RECOGNIZES as not automatic it is a producer error, not a
+                // hint. On an unrecognized recovery word it is not: the record may well be an
+                // automatic class this build has never heard of, and rejecting it would turn a
+                // fault that pages under `unknown` recovery into a non-paging indeterminate row —
+                // trading a visible fault for silence over a word we simply do not know.
+                if matches!(recovery, Recovery::Human | Recovery::Terminal) {
+                    return Err("misplaced-observation-due");
+                }
+                // An inverted deadline is incoherent whatever the recovery class: it claims the
+                // next observation was already due before the condition was observed.
+                if due < observed_at_ms {
+                    return Err("inverted-observation-due");
+                }
+            }
+            // The overdue decision uses the SEMANTIC clock at READ time: the transport heartbeat
+            // that keeps this record fresh never moves the deadline, and an automatic recovery
+            // that missed it stops being evidence of anything automatic.
+            let overdue = recovery == Recovery::Automatic
+                && wire.next_observation_due_ms.is_some_and(|due| now_ms > due);
+            Ok(ConditionView::Fault(Fault {
+                category: wire.category.as_deref().and_then(FaultCategory::parse),
+                code: wire.code.clone(),
+                recovery: if overdue { Recovery::Unknown } else { recovery },
+                observed_at_ms,
+                next_observation_due_ms: wire.next_observation_due_ms,
+                detail: wire.detail.clone(),
+                overdue,
+            }))
+        }
+        // `absent` is the LEGACY projection, not a writable state: a version 3 producer with no
+        // condition to report has not finished projecting its harness.
+        "absent" => Err("written-absent-condition"),
+        _ => Err("unsupported-condition-kind"),
+    }
+}
+
+/// Strict decode of the ask axis. Unknown is a first-class member here, so a future ask kind
+/// degrades to "an ask of an unstated kind" rather than failing the record: the ask itself was
+/// stated, and dropping it would lose a waiting human.
+fn decode_ask(wire: &WireAsk) -> Result<HumanAsk, &'static str> {
+    match wire.kind.as_str() {
+        "none" => {
+            if wire.ask.is_some() {
+                return Err("contradictory-ask");
+            }
+            Ok(HumanAsk::None)
+        }
+        "pending" => Ok(HumanAsk::Pending(
+            wire.ask.as_deref().map_or(AskKind::Unknown, AskKind::parse),
+        )),
+        "unknown" => Ok(HumanAsk::Unknown),
+        _ => Err("unsupported-ask-kind"),
+    }
+}
+
+/// Strict decode of the conversation bridge, whose failures are CONTAINED to this axis by its
+/// caller: an `Err` here degrades the reference to `unavailable` carrying the rejection word,
+/// never the whole observation. A `linked` reference must carry every part of what
+/// makes it usable — namespace, opaque identity, incarnation, an explicit mutability claim with
+/// its evidence, and a finite verification bound — because a half-stated link is precisely the
+/// thing a consumer would trust and should not.
+fn decode_conversation(wire: &WireConversation) -> Result<ConversationRef, &'static str> {
+    match wire.kind.as_str() {
+        "unsupported" => Ok(ConversationRef::Unsupported),
+        "unavailable" => Ok(ConversationRef::Unavailable(wire.reason.clone())),
+        "linked" => Ok(ConversationRef::Linked(ConversationLink {
+            driver: wire.driver.clone().ok_or("incomplete-conversation-link")?,
+            conversation: wire
+                .conversation
+                .clone()
+                .ok_or("incomplete-conversation-link")?,
+            incarnation: wire
+                .incarnation
+                .clone()
+                .ok_or("incomplete-conversation-link")?,
+            history_mutability: HistoryMutability::parse(
+                wire.history_mutability
+                    .as_deref()
+                    .ok_or("incomplete-conversation-link")?,
+            ),
+            capability_evidence: CapabilityEvidence::parse(
+                wire.capability_evidence
+                    .as_deref()
+                    .ok_or("incomplete-conversation-link")?,
+            ),
+            // Finite and positive: an unbounded or zero bound is an unverifiable claim, which is
+            // worse than an unavailable one because it looks verified.
+            verified_through_ms: wire
+                .verified_through_ms
+                .filter(|&bound| bound > 0)
+                .ok_or("unbounded-conversation-verification")?,
+        })),
+        _ => Err("unsupported-conversation-kind"),
     }
 }
 
@@ -752,13 +1653,118 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// What the record file holds, tri-state: absence, bytes this version cannot parse, or a parsed
-/// record. Collapsing `Unreadable` into `Absent` would let a writer treat an undeserializable
-/// v2 record as a virgin seat — restarting the sequence and counter over live foreign state.
+/// What the record file holds, tri-state: absence, bytes this version cannot decode as its own
+/// record shape, or a parsed record. Collapsing `Unreadable` into `Absent` would let a writer
+/// treat an undeserializable record as a virgin seat — restarting the sequence and counter over
+/// live foreign state.
 enum StoredRecord {
     Absent,
-    Unreadable,
+    /// Bytes this build cannot decode as a legacy record, carrying the shared ownership envelope
+    /// whenever they are a versioned record at all. A version 3 record is exactly that from this
+    /// build's version 2 writer: uninterpretable, yet its schema fence and its ownership sequence
+    /// must still be honored, which is impossible if the bytes are reported as opaque garbage.
+    Unreadable(Option<Envelope>),
     Parsed(Record),
+}
+
+/// The version-independent ownership envelope. Every version of this record spells these fields
+/// identically and means the same thing by them, which is what lets the claim fence, the sequence
+/// floor, and stamp continuity work across a version this build cannot interpret.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Envelope {
+    schema: String,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    transitions: u64,
+    #[serde(default)]
+    written_at_ms: u64,
+}
+
+/// The version 3 durable record. Additive-tolerant on read like its predecessor (no
+/// `deny_unknown_fields`): a reader pinned to an older crate may be older than the writer. Note
+/// what is absent by construction — no `blockedOn`, and nothing content-bearing about a
+/// conversation — so a legacy `Record` can never decode these bytes and a transcript can never
+/// ride them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordV3 {
+    schema: String,
+    agent: String,
+    harness: String,
+    state: Activity,
+    input_buffer: InputBuffer,
+    condition: WireCondition,
+    ask: WireAsk,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_ref: Option<WireConversation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pty_session: Option<String>,
+    #[serde(default)]
+    incarnation: String,
+    #[serde(default)]
+    seq: u64,
+    since_ms: u64,
+    written_at_ms: u64,
+    transitions: u64,
+}
+
+/// The condition axis as it rides the record: a discriminator plus the union of every arm's
+/// fields. Decoded through [`decode_condition`] rather than a serde-tagged enum, because the
+/// contradictions worth rejecting — a `clear` carrying fault evidence, a fault without recovery,
+/// a deadline on a recovery nobody automates — are exactly what a tolerant tagged decode would
+/// silently accept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCondition {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_observation_due_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireAsk {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ask: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireConversation {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_mutability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_through_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 fn read_stored(path: &Path) -> StoredRecord {
@@ -767,10 +1773,12 @@ fn read_stored(path: &Path) -> StoredRecord {
         // IO) is somebody's record — treating it as a virgin seat would let a token-only write
         // or a wrapperless claim rename over live state it never saw.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoredRecord::Absent,
-        Err(_) => StoredRecord::Unreadable,
+        Err(_) => StoredRecord::Unreadable(None),
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(record) => StoredRecord::Parsed(record),
-            Err(_) => StoredRecord::Unreadable,
+            // Undecodable as this build's record shape, but still possibly a record: the envelope
+            // is what the ownership protocol needs, and it is version-independent.
+            Err(_) => StoredRecord::Unreadable(serde_json::from_slice(&bytes).ok()),
         },
     }
 }
@@ -778,7 +1786,7 @@ fn read_stored(path: &Path) -> StoredRecord {
 fn read_record(path: &Path) -> Option<Record> {
     match read_stored(path) {
         StoredRecord::Parsed(record) => Some(record),
-        StoredRecord::Absent | StoredRecord::Unreadable => None,
+        StoredRecord::Absent | StoredRecord::Unreadable(_) => None,
     }
 }
 
@@ -836,12 +1844,13 @@ pub(crate) fn write_json_atomic<T: Serialize>(
     Ok(())
 }
 
-/// The per-record monotonic stamp: strictly beyond the on-disk stamp when that stamp is inside
-/// the future-skew trust bound (a stamp beyond it is somebody's garbage or an overflow probe,
-/// and inheriting it would poison every later write), and the writer's own clock otherwise.
-fn next_stamp(on_disk: Option<&Record>, now_ms: u64) -> u64 {
-    on_disk
-        .map(|current| current.written_at_ms)
+/// The per-record monotonic stamp: strictly beyond the previous on-disk stamp when that stamp is
+/// inside the future-skew trust bound (a stamp beyond it is somebody's garbage or an overflow
+/// probe, and inheriting it would poison every later write), and the writer's own clock
+/// otherwise. Takes the stamp rather than the record so a version this build cannot interpret
+/// still contributes its own continuity through the shared envelope.
+fn next_stamp(previous: Option<u64>, now_ms: u64) -> u64 {
+    previous
         .filter(|&previous| {
             previous <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
         })
@@ -853,6 +1862,7 @@ fn schema_rank(schema: &str) -> Option<u8> {
     match schema {
         SCHEMA_V1 => Some(1),
         SCHEMA_V2 => Some(2),
+        SCHEMA_V3 => Some(3),
         _ => None,
     }
 }
@@ -870,11 +1880,11 @@ fn schema_rank(schema: &str) -> Option<u8> {
 ///
 /// `ours` is a parameter rather than a read of [`SCHEMA`] so the refused direction is provable in
 /// one build: the whole defect is about two builds writing different versions at the same time.
-fn claim_may_supersede(ours: &str, current: Option<&Record>) -> bool {
+fn claim_may_supersede(ours: &str, current: Option<&str>) -> bool {
     let Some(current) = current else {
         return true;
     };
-    match (schema_rank(&current.schema), schema_rank(ours)) {
+    match (schema_rank(current), schema_rank(ours)) {
         (Some(on_disk), Some(ours)) => on_disk <= ours,
         _ => true,
     }
@@ -903,34 +1913,54 @@ pub fn claim(
 /// The claim's body, under an already-held record lock.
 fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // Unreadable bytes are superseded like anything else — that is exactly what the claim is
-    // for — but their CONTENT cannot be continued (the counter restarts). The SEQUENCE must
-    // survive them regardless: a claim restarting at one would sit below a lingering
+    // for — but their MEANING cannot be continued (the record's axes restart). Their OWNERSHIP
+    // must survive them regardless: a claim restarting at one would sit below a lingering
     // predecessor's claim, whose next write would replace the new claim and then permanently
-    // fence the new session out. The floor sidecar, written under this same lock on every
-    // claim, preserves monotonicity across records this version cannot parse; only both files
-    // being damaged loses the floor, and that residual is documented.
-    let on_disk = match read_stored(&writer.path) {
+    // fence the new session out. Two independent mechanisms preserve it: the version-independent
+    // envelope, which a record of a version this build cannot interpret still carries, and the
+    // floor sidecar, written under this same lock on every claim, which survives bytes carrying
+    // no envelope at all. Only both being damaged loses the floor, and that residual is
+    // documented.
+    let stored = read_stored(&writer.path);
+    let on_disk = match &stored {
         StoredRecord::Parsed(record) => Some(record),
-        StoredRecord::Absent | StoredRecord::Unreadable => None,
+        StoredRecord::Absent | StoredRecord::Unreadable(_) => None,
     };
+    // A record whose meaning this build cannot read but whose envelope it can. Collapsing this
+    // into "nothing on disk" is how a version 2 claim would silently overwrite a migrated
+    // version 3 record — the very defect the one-way fence below exists to prevent, reappearing
+    // through the parse failure instead of through the comparison.
+    let foreign = match &stored {
+        StoredRecord::Unreadable(envelope) => envelope.as_ref(),
+        StoredRecord::Absent | StoredRecord::Parsed(_) => None,
+    };
+    let on_disk_schema = on_disk
+        .map(|record| record.schema.as_str())
+        .or_else(|| foreign.map(|envelope| envelope.schema.as_str()));
     // The semantic fence, before anything is minted or written. The SEQUENCE below deliberately
     // stays monotonic across the one-way v1 → v2 migration — it is a counter, not a meaning, and
     // restarting it at one would sit below a lingering predecessor's claim and fence the new
     // session out permanently — but the record's MEANING may only ever move forward.
     anyhow::ensure!(
-        claim_may_supersede(SCHEMA, on_disk.as_ref()),
+        claim_may_supersede(SCHEMA, on_disk_schema),
         "refusing to claim a `{}` record while this build writes `{SCHEMA}`: \
          taking it over would downgrade a migrated record's `agent` field to a bus address",
-        on_disk
-            .as_ref()
-            .map(|record| record.schema.as_str())
-            .unwrap_or_default()
+        on_disk_schema.unwrap_or_default()
     );
     let floor_path = writer.path.with_file_name(SEQ_FLOOR_NAME);
     let floor = fs::read_to_string(&floor_path)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok());
-    let highest = on_disk.as_ref().map(|record| record.seq).max(floor);
+    let previous_seq = on_disk
+        .map(|record| record.seq)
+        .or_else(|| foreign.map(|envelope| envelope.seq));
+    let previous_stamp = on_disk
+        .map(|record| record.written_at_ms)
+        .or_else(|| foreign.map(|envelope| envelope.written_at_ms));
+    let previous_transitions = on_disk
+        .map(|record| record.transitions)
+        .or_else(|| foreign.map(|envelope| envelope.transitions));
+    let highest = previous_seq.max(floor);
     // A saturated sequence would mint SHARED ownership forever after: every later claim would
     // return the same MAX, and two sessions holding equal claims are exactly the ambiguity the
     // sequence exists to remove. Fail loudly; producers degrade to token-only and stay alive.
@@ -940,7 +1970,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     );
     let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
-    let written_at_ms = next_stamp(on_disk.as_ref(), now_ms);
+    let written_at_ms = next_stamp(previous_stamp, now_ms);
     let record = Record {
         schema: SCHEMA.to_string(),
         agent: writer.agent.clone(),
@@ -956,9 +1986,7 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
         seq,
         since_ms: written_at_ms,
         written_at_ms,
-        transitions: on_disk
-            .as_ref()
-            .map_or(0, |record| record.transitions.saturating_add(1)),
+        transitions: previous_transitions.map_or(0, |transitions| transitions.saturating_add(1)),
     };
     write_record(&writer.path, &record)?;
     // The floor accompanies every act that establishes ownership; its own failure
@@ -1026,7 +2054,7 @@ pub fn claim_wrapperless(
     let _lock = writer.locked()?;
     let eligible = match read_stored(&writer.path) {
         StoredRecord::Absent => true,
-        StoredRecord::Unreadable => false,
+        StoredRecord::Unreadable(_) => false,
         StoredRecord::Parsed(record) => {
             let now_ms = crate::message::now_ms();
             let stale =
@@ -1038,7 +2066,7 @@ pub fn claim_wrapperless(
             // path refuses (`Ok(None)`) instead of reaching `claim_locked` and erroring: a build
             // whose writer is behind the record on disk has no eligible takeover at all, however
             // stale or orphaned that record looks.
-            claim_may_supersede(SCHEMA, Some(&record))
+            claim_may_supersede(SCHEMA, Some(record.schema.as_str()))
                 && (wrapperless_owner || real_terminal || stale)
         }
     };
@@ -1419,14 +2447,20 @@ mod tests {
 
     #[test]
     fn future_vocabulary_degrades_to_indeterminate_not_none() {
-        // A schema outside the pair this version understands gates interpretation entirely — even
-        // words spelled exactly like these must not decode as anything definite, because the
+        // A schema outside the versions this build understands gates interpretation entirely —
+        // even words spelled exactly like these must not decode as anything definite, because the
         // later version may have changed what the same spelling means.
-        let raw = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        let raw = br#"{"schema":"st2.harness-state.v4","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Unknown);
         assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
+        assert_eq!(
+            observed.schema.as_deref(),
+            Some("st2.harness-state.v4"),
+            "the declared version is reported even when it cannot be interpreted, so a drain \
+             gate can positively account for every row"
+        );
 
         // And on a v1 record with a known state, unknown axis words stay indeterminate.
         let raw = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#;
@@ -1434,12 +2468,18 @@ mod tests {
         assert_eq!(observed.state, Activity::Active);
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
         assert_eq!(observed.input_buffer, InputBuffer::Unknown);
+        assert_eq!(
+            observed.human_ask,
+            HumanAsk::Unknown,
+            "an unrecognized legacy blocked word projects indeterminate, never `none`"
+        );
     }
 
-    /// DELTA-003 step 5, reader first: this version reads both record versions *before* any writer
-    /// emits version 2, and each one's `agent` field is decoded in the namespace its own
-    /// discriminator names. A version outside that pair stays `unsupported-schema`, so the
-    /// tolerance is exactly two versions wide rather than "anything that parses".
+    /// Reader first, twice over: this version reads every record version it will ever be asked
+    /// about *before* the corresponding writer exists, and each one's `agent` field is decoded in
+    /// the namespace its own discriminator names. A version outside the supported set stays
+    /// `unsupported-schema`, so the tolerance is exactly three versions wide rather than
+    /// "anything that parses".
     #[test]
     fn both_reserved_versions_are_read_with_their_own_agent_meaning() {
         let v1 = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
@@ -1464,8 +2504,24 @@ mod tests {
         );
         assert_eq!(observed.subject.as_ref().unwrap().bus_identity(), None);
 
-        let v3 = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        // Version 3 keeps version 2's namespace: the fault axis changed, the subject did not.
+        let v3 = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","inputBuffer":"empty","condition":{"kind":"clear"},"ask":{"kind":"none"},"sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
         let observed = read_raw_at(v3, None, 1_000);
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(
+            observed.subject,
+            Some(RecordSubject::AgentId("hetz.worker".into())),
+            "version 3 `agent` is the immutable agent ID, exactly as version 2 established"
+        );
+
+        // The legacy shape is NOT accepted under the version 3 discriminator: same words, new
+        // contract, and a v3 record without the condition axis has not stated the axis at all.
+        let mislabeled = br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        let observed = read_raw_at(mislabeled, None, 1_000);
+        assert_eq!(observed.reason.as_deref(), Some("malformed-record"));
+
+        let v4 = br#"{"schema":"st2.harness-state.v4","agent":"hetz.worker","harness":"codex","state":"active","inputBuffer":"empty","condition":{"kind":"clear"},"ask":{"kind":"none"},"sinceMs":1,"writtenAtMs":1000,"transitions":3}"#;
+        let observed = read_raw_at(v4, None, 1_000);
         assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
         assert_eq!(observed.state, Activity::Unknown);
         assert!(
@@ -1541,18 +2597,21 @@ mod tests {
         };
 
         // Refused: a v1 writer must not take over a v2 record.
-        assert!(!claim_may_supersede(SCHEMA_V1, Some(&v2)));
+        assert!(!claim_may_supersede(SCHEMA_V1, Some(v2.schema.as_str())));
         // Allowed, and one-way: the v1 → v2 migration, plus same-version supersession.
-        assert!(claim_may_supersede(SCHEMA_V2, Some(&v1)));
-        assert!(claim_may_supersede(SCHEMA_V1, Some(&v1)));
-        assert!(claim_may_supersede(SCHEMA_V2, Some(&v2)));
+        assert!(claim_may_supersede(SCHEMA_V2, Some(v1.schema.as_str())));
+        assert!(claim_may_supersede(SCHEMA_V1, Some(v1.schema.as_str())));
+        assert!(claim_may_supersede(SCHEMA_V2, Some(v2.schema.as_str())));
+        // The same one-way rule now extends to version 3, which is why this build's version 2
+        // writer can never take a v3 record over: the fault axis is information a v2 claim would
+        // silently destroy, exactly as a v1 claim would destroy the ID namespace.
+        assert!(!claim_may_supersede(SCHEMA_V2, Some(SCHEMA_V3)));
+        assert!(!claim_may_supersede(SCHEMA_V1, Some(SCHEMA_V3)));
+        assert!(claim_may_supersede(SCHEMA_V3, Some(SCHEMA_V2)));
+        assert!(claim_may_supersede(SCHEMA_V3, Some(SCHEMA_V3)));
         // Nothing on disk, and bytes no build can interpret, hold nothing to preserve.
         assert!(claim_may_supersede(SCHEMA_V1, None));
-        let unsupported = Record {
-            schema: "st2.harness-state.v3".to_string(),
-            ..v2.clone()
-        };
-        assert!(claim_may_supersede(SCHEMA_V1, Some(&unsupported)));
+        assert!(claim_may_supersede(SCHEMA_V1, Some("st2.harness-state.v4")));
     }
 
     /// This build writes v2, so the v1 → v2 migration claim is the one it can exercise
@@ -1611,12 +2670,7 @@ mod tests {
 
         // The refused direction is not reachable from a build that writes the newest version, so
         // the fence itself is asserted where it is decidable.
-        assert!(!claim_may_supersede(
-            SCHEMA_V1,
-            Some(&serde_json::from_slice::<Record>(
-                br#"{"schema":"st2.harness-state.v2","agent":"id","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","exit":"exit 0","incarnation":"","seq":2,"sinceMs":1,"writtenAtMs":1,"transitions":1}"#
-            ).unwrap())
-        ));
+        assert!(!claim_may_supersede(SCHEMA_V1, Some(SCHEMA_V2)));
     }
 
     /// Ownership-sequence ADOPTION never crosses schemas: a same-token record under the other
@@ -2446,6 +3500,701 @@ mod tests {
             fs::read(&path).unwrap(),
             live,
             "nothing renamed over the live record"
+        );
+    }
+
+    /// The reader clock the golden fixtures are written against. Fixed rather than `now_ms()`, so
+    /// every fixture's freshness, deadline, and evidence age is a stated number a reviewer can
+    /// check by hand.
+    const FIXTURE_NOW_MS: u64 = 1_788_000_000_000;
+    const FIXTURE_AGENT_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+
+    fn fixture(raw: &str) -> Observed {
+        read_raw_at(raw.as_bytes(), None, FIXTURE_NOW_MS)
+    }
+
+    fn healthy() -> crate::driver_diagnostic::Observed {
+        crate::driver_diagnostic::Observed::Absent
+    }
+
+    /// One version 3 record with the axes under test substituted in, fresh against
+    /// [`FIXTURE_NOW_MS`], so an edge case differs from a valid record by exactly the edge.
+    fn v3_raw(condition: &str, ask: &str, conversation: Option<&str>) -> String {
+        let conversation =
+            conversation.map_or(String::new(), |wire| format!(r#","conversationRef":{wire}"#));
+        format!(
+            r#"{{"schema":"st2.harness-state.v3","agent":"{FIXTURE_AGENT_ID}","harness":"codex","state":"active","inputBuffer":"empty","condition":{condition},"ask":{ask}{conversation},"ptySession":"worker","incarnation":"session-1","seq":1,"sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
+            FIXTURE_NOW_MS - 1_000
+        )
+    }
+
+    /// The golden wire: one fixture per shape a consumer must handle, decoded through the real
+    /// reader and folded through the real disposition function. This is the table that fails when
+    /// a projection quietly changes meaning — a fixture is bytes, so nothing here can pass by
+    /// agreeing with the code that produced it.
+    #[test]
+    fn golden_fixtures_cover_every_shape_a_consumer_must_handle() {
+        // Version 1: legacy, bus identity, condition EXPLICITLY absent — never `clear`.
+        let v1 = fixture(include_str!("../tests/fixtures/harness-state/v1-active.json"));
+        assert_eq!(v1.schema.as_deref(), Some(SCHEMA_V1));
+        assert_eq!(v1.state, Activity::Active);
+        assert_eq!(v1.condition, ConditionView::Absent);
+        assert_eq!(v1.human_ask, HumanAsk::None);
+        assert_eq!(
+            v1.subject,
+            Some(RecordSubject::BusIdentity("hetz.worker".into()))
+        );
+        assert!(v1.indeterminacy.is_none());
+        assert_eq!(
+            disposition(Some(&v1), &healthy()),
+            Disposition::new(
+                DispositionState::Working,
+                Attention::None,
+                PrimaryAction::None
+            )
+        );
+
+        // Version 2: same axes, ID namespace, and a legacy human block projecting into the tagged
+        // axis without inventing a condition.
+        let v2 = fixture(include_str!("../tests/fixtures/harness-state/v2-blocked.json"));
+        assert_eq!(v2.schema.as_deref(), Some(SCHEMA_V2));
+        assert_eq!(
+            v2.condition,
+            ConditionView::Absent,
+            "versions 1 and 2 never infer a condition, and absence is never `clear`"
+        );
+        assert_eq!(v2.human_ask, HumanAsk::Pending(AskKind::Question));
+        assert_eq!(
+            (v2.blocked_on, v2.ask),
+            (BlockedOn::Human, Ask::Question),
+            "the shipped legacy pair keeps its exact meaning beside the tagged axis"
+        );
+        assert_eq!(
+            v2.subject,
+            Some(RecordSubject::AgentId(FIXTURE_AGENT_ID.into()))
+        );
+        assert_eq!(
+            disposition(Some(&v2), &healthy()),
+            Disposition::new(
+                DispositionState::WaitingHuman,
+                Attention::Now,
+                PrimaryAction::Answer
+            )
+        );
+
+        // Version 3, clear, with a complete conversation link.
+        let clear = fixture(include_str!("../tests/fixtures/harness-state/v3-clear.json"));
+        assert_eq!(clear.schema.as_deref(), Some(SCHEMA_V3));
+        assert_eq!(clear.condition, ConditionView::Clear);
+        assert_eq!(clear.human_ask, HumanAsk::None);
+        let link = clear
+            .conversation
+            .as_ref()
+            .and_then(ConversationRef::link)
+            .expect("the fixture states a linked conversation");
+        assert_eq!(link.history_mutability, HistoryMutability::Rewritable);
+        assert_eq!(link.capability_evidence, CapabilityEvidence::Probed);
+        assert_eq!(link.verified_through_ms, FIXTURE_NOW_MS - 1_000);
+        assert_eq!(
+            disposition(Some(&clear), &healthy()),
+            Disposition::new(
+                DispositionState::Working,
+                Attention::None,
+                PrimaryAction::None
+            )
+        );
+
+        // A human-recovery fault: pages, and remediation is what the human does.
+        let human = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-fault-human.json"
+        ));
+        let fault = human.condition.fault().expect("the fixture states a fault");
+        assert_eq!(fault.category, Some(FaultCategory::Authentication));
+        assert_eq!(fault.recovery, Recovery::Human);
+        assert_eq!(fault.code.as_deref(), Some("codex/unauthorized"));
+        assert!(!fault.overdue);
+        assert_eq!(fault.observed_at_ms, FIXTURE_NOW_MS - 1_000);
+        assert_eq!(
+            human.conversation.as_ref().map(ConversationRef::kind),
+            Some("unavailable")
+        );
+        assert_eq!(
+            disposition(Some(&human), &healthy()),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+
+        // An automatic recovery inside its own deadline: recovering, soon, nobody acts yet.
+        let waiting = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-fault-automatic-pending.json"
+        ));
+        let fault = waiting.condition.fault().expect("fault");
+        assert_eq!(fault.recovery, Recovery::Automatic);
+        assert_eq!(fault.category, Some(FaultCategory::RateLimit));
+        assert!(!fault.overdue);
+        assert_eq!(
+            disposition(Some(&waiting), &healthy()),
+            Disposition::new(
+                DispositionState::Recovering,
+                Attention::Soon,
+                PrimaryAction::None
+            )
+        );
+
+        // The same fault past its own deadline: no longer evidence of anything automatic.
+        let overdue = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-fault-automatic-overdue.json"
+        ));
+        let fault = overdue.condition.fault().expect("fault");
+        assert!(fault.overdue);
+        assert_eq!(
+            fault.recovery,
+            Recovery::Unknown,
+            "an automatic recovery that missed its own deadline is untyped, and untyped pages"
+        );
+        assert_eq!(
+            fault.next_observation_due_ms,
+            Some(FIXTURE_NOW_MS - 60_000)
+        );
+        assert_eq!(
+            disposition(Some(&overdue), &healthy()),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+
+        // Fault and ask at once: remediation is primary, and the ask stays visible on both the
+        // tagged and the legacy axis rather than being swallowed by the fault.
+        let both = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-fault-and-ask.json"
+        ));
+        assert_eq!(
+            both.condition.fault().map(|fault| fault.category),
+            Some(Some(FaultCategory::Provider))
+        );
+        assert_eq!(both.human_ask, HumanAsk::Pending(AskKind::Permission));
+        assert_eq!((both.blocked_on, both.ask), (BlockedOn::Human, Ask::Permission));
+        assert_eq!(
+            disposition(Some(&both), &healthy()),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+
+        // A malformed version 3 record: a `clear` carrying fault evidence is not a weaker
+        // observation, and its declared version survives for the drain gate.
+        let malformed = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-contradictory-clear.json"
+        ));
+        assert_eq!(malformed.state, Activity::Unknown);
+        let indeterminacy = malformed
+            .indeterminacy
+            .as_ref()
+            .expect("an indeterminate observation states why, typed");
+        assert_eq!(indeterminacy.reason, "contradictory-clear");
+        assert_eq!(indeterminacy.evidence_age_ms, Some(1_000));
+        assert_eq!(
+            malformed.reason.as_deref(),
+            Some("contradictory-clear"),
+            "the legacy scalar is a projection of the typed reason, never a second derivation"
+        );
+        assert_eq!(malformed.schema.as_deref(), Some(SCHEMA_V3));
+        assert_eq!(malformed.condition, ConditionView::Absent);
+        assert_eq!(
+            disposition(Some(&malformed), &healthy()),
+            Disposition::new(
+                DispositionState::Unknown,
+                Attention::None,
+                PrimaryAction::Observe
+            )
+        );
+
+        // An unknown future version: uninterpretable, non-paging, and still accounted for.
+        let future = fixture(include_str!(
+            "../tests/fixtures/harness-state/unknown-future-schema.json"
+        ));
+        assert_eq!(future.state, Activity::Unknown);
+        assert_eq!(
+            future.indeterminacy.as_ref().map(|why| why.reason.as_str()),
+            Some("unsupported-schema")
+        );
+        assert_eq!(future.schema.as_deref(), Some("st2.harness-state.v4"));
+        assert!(future.subject.is_none());
+        assert_eq!(
+            disposition(Some(&future), &healthy()),
+            Disposition::new(
+                DispositionState::Unknown,
+                Attention::None,
+                PrimaryAction::Observe
+            )
+        );
+    }
+
+    /// Strict edge validation, one case per rejection. Each pair differs from a valid record by
+    /// exactly the contradiction under test, and each carries its OWN reason word: an operator
+    /// must be able to tell a producer bug from a stale seat, and one bug from another.
+    #[test]
+    fn strict_version_three_edges_are_rejected_with_distinct_reasons() {
+        let none = r#"{"kind":"none"}"#;
+        for (condition, ask, expected) in [
+            // A clear that carries fault evidence claims two contradictory things at once.
+            (
+                r#"{"kind":"clear","recovery":"human"}"#,
+                none,
+                "contradictory-clear",
+            ),
+            (
+                r#"{"kind":"clear","observedAtMs":1}"#,
+                none,
+                "contradictory-clear",
+            ),
+            // A fault that cannot be routed or aged is not a fault.
+            (
+                r#"{"kind":"fault","category":"quota","observedAtMs":1}"#,
+                none,
+                "incomplete-fault",
+            ),
+            (
+                r#"{"kind":"fault","category":"quota","recovery":"human"}"#,
+                none,
+                "incomplete-fault",
+            ),
+            // A deadline belongs only to a recovery that is supposed to happen by itself.
+            (
+                r#"{"kind":"fault","category":"quota","recovery":"human","observedAtMs":1,"nextObservationDueMs":2}"#,
+                none,
+                "misplaced-observation-due",
+            ),
+            (
+                r#"{"kind":"fault","category":"quota","recovery":"automatic","observedAtMs":9,"nextObservationDueMs":2}"#,
+                none,
+                "inverted-observation-due",
+            ),
+            // `absent` is the legacy projection, not a state a producer may claim.
+            (r#"{"kind":"absent"}"#, none, "written-absent-condition"),
+            (r#"{"kind":"degraded"}"#, none, "unsupported-condition-kind"),
+            // An ask that says "nothing is pending" while naming a pending kind.
+            (
+                r#"{"kind":"clear"}"#,
+                r#"{"kind":"none","ask":"question"}"#,
+                "contradictory-ask",
+            ),
+            (
+                r#"{"kind":"clear"}"#,
+                r#"{"kind":"waiting"}"#,
+                "unsupported-ask-kind",
+            ),
+        ] {
+            let observed = fixture(&v3_raw(condition, ask, None));
+            assert_eq!(observed.state, Activity::Unknown, "{condition} {ask}");
+            assert_eq!(
+                observed.indeterminacy.as_ref().map(|why| why.reason.as_str()),
+                Some(expected),
+                "{condition} {ask}"
+            );
+            assert_eq!(
+                observed.condition,
+                ConditionView::Absent,
+                "a rejected record proves no condition either"
+            );
+        }
+
+        // What is tolerated, and why: an unknown CATEGORY leaves the fault untyped but still
+        // routed by its recovery — failing the record would make a real fault stop paging because
+        // its label was new — and a `pending` ask whose kind is unstated keeps the waiting human.
+        let untyped = fixture(&v3_raw(
+            r#"{"kind":"fault","category":"gravity","recovery":"terminal","observedAtMs":1}"#,
+            none,
+            None,
+        ));
+        let fault = untyped.condition.fault().expect("still a fault");
+        assert_eq!(fault.category, None, "an unknown category is untyped");
+        assert_eq!(fault.recovery, Recovery::Terminal);
+        assert_eq!(
+            disposition(Some(&untyped), &healthy()),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+
+        let unnamed = fixture(&v3_raw(
+            r#"{"kind":"clear"}"#,
+            r#"{"kind":"pending"}"#,
+            None,
+        ));
+        assert_eq!(unnamed.human_ask, HumanAsk::Pending(AskKind::Unknown));
+        assert_eq!(
+            disposition(Some(&unnamed), &healthy()).primary_action,
+            PrimaryAction::Answer,
+            "an ask of an unstated kind is still an ask"
+        );
+
+        // An unrecognized RECOVERY word is unknown, which pages — the conservative direction.
+        let unrecognized = fixture(&v3_raw(
+            r#"{"kind":"fault","category":"provider","recovery":"eventually","observedAtMs":1}"#,
+            none,
+            None,
+        ));
+        assert_eq!(
+            unrecognized.condition.fault().map(|fault| fault.recovery),
+            Some(Recovery::Unknown)
+        );
+        assert_eq!(
+            disposition(Some(&unrecognized), &healthy()).attention,
+            Attention::Now
+        );
+
+        // A deadline beside an unrecognized recovery word is NOT rejected: the record may be an
+        // automatic class this build has never heard of, and rejecting it would turn a fault that
+        // pages under `unknown` recovery into a non-paging indeterminate row. An inverted
+        // deadline stays incoherent whatever the recovery word says.
+        let deadline_on_unknown = fixture(&v3_raw(
+            r#"{"kind":"fault","category":"provider","recovery":"eventually","observedAtMs":1,"nextObservationDueMs":2}"#,
+            none,
+            None,
+        ));
+        let fault = deadline_on_unknown
+            .condition
+            .fault()
+            .expect("an unknown recovery word keeps the fault");
+        assert_eq!(fault.recovery, Recovery::Unknown);
+        assert_eq!(fault.next_observation_due_ms, Some(2));
+        assert!(
+            !fault.overdue,
+            "only an automatic recovery can be overdue; unknown already pages"
+        );
+        assert_eq!(
+            disposition(Some(&deadline_on_unknown), &healthy()),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+        let inverted_on_unknown = fixture(&v3_raw(
+            r#"{"kind":"fault","category":"provider","recovery":"eventually","observedAtMs":9,"nextObservationDueMs":2}"#,
+            none,
+            None,
+        ));
+        assert_eq!(
+            inverted_on_unknown
+                .indeterminacy
+                .as_ref()
+                .map(|why| why.reason.as_str()),
+            Some("inverted-observation-due")
+        );
+    }
+
+    /// The conversation bridge is identity and capability only, and a half-stated link is exactly
+    /// what a consumer would trust and should not. Silence is not a capability claim either:
+    /// stating nothing is `None`, which is not `unsupported`.
+    #[test]
+    fn the_conversation_bridge_requires_a_complete_finite_link() {
+        let clear = r#"{"kind":"clear"}"#;
+        let none = r#"{"kind":"none"}"#;
+        let complete = format!(
+            r#"{{"kind":"linked","driver":"codex","conversation":"thread_01JXPLACEHOLDER","incarnation":"session-1","historyMutability":"stable","capabilityEvidence":"declared","verifiedThroughMs":{}}}"#,
+            FIXTURE_NOW_MS - 1_000
+        );
+        let observed = fixture(&v3_raw(clear, none, Some(&complete)));
+        let link = observed
+            .conversation
+            .as_ref()
+            .and_then(ConversationRef::link)
+            .expect("complete");
+        assert_eq!(link.driver, "codex");
+        assert_eq!(link.conversation, "thread_01JXPLACEHOLDER");
+        assert_eq!(link.history_mutability, HistoryMutability::Stable);
+        assert_eq!(link.capability_evidence, CapabilityEvidence::Declared);
+
+        for (wire, expected) in [
+            // Each of the five required parts, removed one at a time.
+            (
+                r#"{"kind":"linked","conversation":"c","incarnation":"i","historyMutability":"stable","capabilityEvidence":"probed","verifiedThroughMs":1}"#,
+                "incomplete-conversation-link",
+            ),
+            (
+                r#"{"kind":"linked","driver":"codex","incarnation":"i","historyMutability":"stable","capabilityEvidence":"probed","verifiedThroughMs":1}"#,
+                "incomplete-conversation-link",
+            ),
+            (
+                r#"{"kind":"linked","driver":"codex","conversation":"c","historyMutability":"stable","capabilityEvidence":"probed","verifiedThroughMs":1}"#,
+                "incomplete-conversation-link",
+            ),
+            (
+                r#"{"kind":"linked","driver":"codex","conversation":"c","incarnation":"i","capabilityEvidence":"probed","verifiedThroughMs":1}"#,
+                "incomplete-conversation-link",
+            ),
+            (
+                r#"{"kind":"linked","driver":"codex","conversation":"c","incarnation":"i","historyMutability":"stable","verifiedThroughMs":1}"#,
+                "incomplete-conversation-link",
+            ),
+            // An absent or zero verification bound is an unverifiable claim that looks verified.
+            (
+                r#"{"kind":"linked","driver":"codex","conversation":"c","incarnation":"i","historyMutability":"stable","capabilityEvidence":"probed"}"#,
+                "unbounded-conversation-verification",
+            ),
+            (
+                r#"{"kind":"linked","driver":"codex","conversation":"c","incarnation":"i","historyMutability":"stable","capabilityEvidence":"probed","verifiedThroughMs":0}"#,
+                "unbounded-conversation-verification",
+            ),
+            (r#"{"kind":"maybe"}"#, "unsupported-conversation-kind"),
+        ] {
+            let observed = fixture(&v3_raw(clear, none, Some(wire)));
+            // Only the capability axis degrades. The observation itself — activity, condition,
+            // ask — is intact, because a badly stated side-channel is not evidence about the
+            // harness, and discarding the record would trade a real fault for a broken link.
+            assert_eq!(
+                observed.conversation,
+                Some(ConversationRef::Unavailable(Some(expected.to_string()))),
+                "{wire}"
+            );
+            assert_eq!(observed.state, Activity::Active, "{wire}");
+            assert_eq!(observed.condition, ConditionView::Clear, "{wire}");
+            assert_eq!(observed.human_ask, HumanAsk::None, "{wire}");
+            assert!(
+                observed.indeterminacy.is_none(),
+                "a rejected conversation reference never makes the observation indeterminate: \
+                 {wire}"
+            );
+        }
+
+        // The two negative capability answers are distinct from each other and from silence.
+        assert_eq!(
+            fixture(&v3_raw(clear, none, Some(r#"{"kind":"unsupported"}"#))).conversation,
+            Some(ConversationRef::Unsupported)
+        );
+        assert_eq!(
+            fixture(&v3_raw(
+                clear,
+                none,
+                Some(r#"{"kind":"unavailable","reason":"no bound thread"}"#)
+            ))
+            .conversation,
+            Some(ConversationRef::Unavailable(Some(
+                "no bound thread".to_string()
+            )))
+        );
+        assert_eq!(
+            fixture(&v3_raw(clear, none, None)).conversation,
+            None,
+            "a record that states nothing about a conversation claims no capability"
+        );
+    }
+
+    /// The two clocks are independent. The heartbeat exists to keep TRANSPORT freshness alive; it
+    /// cannot move a fault's semantic observation time or its deadline, and whether a deadline has
+    /// passed is decided at READ time against the reader's clock. Without this separation a seat
+    /// could heartbeat its way out of an overdue recovery forever.
+    #[test]
+    fn the_heartbeat_moves_transport_freshness_only_and_never_the_semantic_fault_clock() {
+        let observed_at = FIXTURE_NOW_MS - 10_000;
+        let due = FIXTURE_NOW_MS + 1_000;
+        let raw = v3_raw(
+            &format!(
+                r#"{{"kind":"fault","category":"rateLimit","recovery":"automatic","observedAtMs":{observed_at},"nextObservationDueMs":{due}}}"#
+            ),
+            r#"{"kind":"none"}"#,
+            None,
+        );
+
+        let before = read_raw_at(raw.as_bytes(), None, FIXTURE_NOW_MS);
+        let after = read_raw_at(raw.as_bytes(), None, due + 1);
+        for observation in [&before, &after] {
+            let fault = observation.condition.fault().expect("fault");
+            assert_eq!(
+                (fault.observed_at_ms, fault.next_observation_due_ms),
+                (observed_at, Some(due)),
+                "the semantic clock belongs to the record, not the reader"
+            );
+        }
+        assert!(!before.condition.fault().unwrap().overdue);
+        assert!(after.condition.fault().unwrap().overdue);
+        assert_eq!(
+            disposition(Some(&before), &healthy()).attention,
+            Attention::Soon
+        );
+        assert_eq!(
+            disposition(Some(&after), &healthy()).attention,
+            Attention::Now,
+            "the same bytes page once their own deadline has passed"
+        );
+    }
+
+    /// A native-driver diagnostic failure contributes to the shared disposition — it is a fault
+    /// the harness itself could not report — while changing no raw axis. And the two non-paging
+    /// rules hold against it: a finished seat is not an emergency, and neither is a record nobody
+    /// can interpret.
+    #[test]
+    fn a_driver_diagnostic_failure_contributes_without_touching_raw_axes_or_paging_the_dead() {
+        let failing = crate::driver_diagnostic::Observed::Failure(crate::driver_diagnostic::Failure {
+            driver: crate::driver_diagnostic::Driver::Codex,
+            stage: crate::driver_diagnostic::Stage::ProviderAuth,
+            reason: crate::driver_diagnostic::Reason::ProviderAuthRejected,
+            source: crate::driver_diagnostic::Source::TurnResult,
+            producer_version: None,
+            support: crate::driver_diagnostic::Support::Supported,
+            observed_at: FIXTURE_NOW_MS - 5_000,
+            evidence_age_ms: 5_000,
+        });
+
+        let clear = fixture(include_str!("../tests/fixtures/harness-state/v3-clear.json"));
+        assert_eq!(
+            disposition(Some(&clear), &failing),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+        assert_eq!(
+            (clear.condition.clone(), clear.human_ask, clear.state),
+            (ConditionView::Clear, HumanAsk::None, Activity::Active),
+            "normalization folds the diagnostic in without rewriting what the record said"
+        );
+
+        // The harness's own fault outranks the diagnostic: it is the semantic axis, and the
+        // diagnostic is st2's view of its own plumbing.
+        let recovering = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-fault-automatic-pending.json"
+        ));
+        assert_eq!(
+            disposition(Some(&recovering), &failing),
+            Disposition::new(
+                DispositionState::Recovering,
+                Attention::Soon,
+                PrimaryAction::None
+            )
+        );
+
+        let ended = fixture(&v3_raw_ended());
+        assert_eq!(
+            disposition(Some(&ended), &failing),
+            Disposition::new(
+                DispositionState::Ended,
+                Attention::None,
+                PrimaryAction::None
+            ),
+            "a finished seat never pages"
+        );
+
+        let malformed = fixture(include_str!(
+            "../tests/fixtures/harness-state/v3-contradictory-clear.json"
+        ));
+        assert_eq!(
+            disposition(Some(&malformed), &failing),
+            Disposition::new(
+                DispositionState::Unknown,
+                Attention::None,
+                PrimaryAction::Observe
+            ),
+            "a record nobody can interpret never pages"
+        );
+
+        // Never observed is not a state: it is worth looking at and nothing else.
+        assert_eq!(
+            disposition(None, &healthy()),
+            Disposition::new(
+                DispositionState::Unknown,
+                Attention::None,
+                PrimaryAction::Observe
+            )
+        );
+
+        // ...but a published rejection beside no record at all is the credential case: Claude,
+        // Codex, and omp publish a diagnostic ONLY on a rejection, so this is the whole story.
+        assert_eq!(
+            disposition(None, &failing),
+            Disposition::new(
+                DispositionState::Failed,
+                Attention::Now,
+                PrimaryAction::Remediate
+            )
+        );
+    }
+
+    /// A terminal version 3 record, exit-bearing so it is not the claim placeholder.
+    fn v3_raw_ended() -> String {
+        format!(
+            r#"{{"schema":"st2.harness-state.v3","agent":"{FIXTURE_AGENT_ID}","harness":"codex","state":"ended","inputBuffer":"unknown","condition":{{"kind":"clear"}},"ask":{{"kind":"none"}},"exit":"exit 0","incarnation":"session-1","seq":1,"sinceMs":1,"writtenAtMs":{},"transitions":2}}"#,
+            FIXTURE_NOW_MS - 1_000
+        )
+    }
+
+    /// Reader-first means exactly this: this build READS a version 3 record and refuses to touch
+    /// it. The defect being fenced is subtle — a v3 record does not decode as this build's record
+    /// shape at all, so without the version-independent envelope the claim path would see "no
+    /// record on disk" and rename a version 2 claim over a live migrated record, destroying its
+    /// fault axis with no trace that it happened.
+    #[test]
+    fn a_version_three_record_is_read_but_never_written_over_by_this_builds_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let planted = format!(
+            r#"{{"schema":"st2.harness-state.v3","agent":"{FIXTURE_AGENT_ID}","harness":"codex","state":"active","inputBuffer":"empty","condition":{{"kind":"clear"}},"ask":{{"kind":"none"}},"ptySession":"worker","incarnation":"","seq":9,"sinceMs":1,"writtenAtMs":{},"transitions":4}}"#,
+            crate::message::now_ms()
+        );
+        fs::write(&path, &planted).unwrap();
+
+        // Reading works — that is the whole point of shipping the reader first.
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.condition, ConditionView::Clear);
+        assert_eq!(observed.schema.as_deref(), Some(SCHEMA_V3));
+
+        // Writing does not: an ordinary observation refuses, the cautious wrapperless claim is
+        // ineligible, and the explicit claim errors instead of downgrading the record's meaning.
+        let mut token_only = writer(tmp.path());
+        assert!(!token_only.observe_unless_ended(active()).unwrap());
+        assert!(
+            claim_wrapperless(tmp.path(), "hetz.worker", "codex", "claude-session-x")
+                .unwrap()
+                .is_none()
+        );
+        let error = claim(tmp.path(), "hetz.worker", "codex", &session_token())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(SCHEMA_V3), "{error}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            planted.as_bytes(),
+            "the version 3 record is left byte-identical by every path"
+        );
+    }
+
+    /// The other half of the envelope's job: bytes this build cannot decode as a record still
+    /// carry their OWNERSHIP forward when their version is one a claim may supersede. Without
+    /// this, a claim over a torn record restarts at sequence one and a lingering predecessor
+    /// holding a higher sequence fences the new session out permanently.
+    #[test]
+    fn an_undecodable_records_envelope_still_carries_its_ownership_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        // A truncated version 1 record: a real record with a decodable envelope and a body this
+        // build cannot read. No floor sidecar exists, so the envelope is the only evidence.
+        fs::write(
+            &path,
+            br#"{"schema":"st2.harness-state.v1","seq":9,"transitions":4,"writtenAtMs":1}"#,
+        )
+        .unwrap();
+
+        let seq = claim(tmp.path(), "hetz.worker", "codex", &session_token()).unwrap();
+        assert_eq!(
+            seq, 10,
+            "the ownership sequence continues past bytes this build cannot read"
+        );
+        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            record.transitions, 5,
+            "and so does the counter that keeps writes byte-distinct"
         );
     }
 }

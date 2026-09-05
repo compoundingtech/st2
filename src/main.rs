@@ -2333,7 +2333,8 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
             let observed_path = st2::harness_state::harness_state_path(dir);
             let pty_root = st2::agents::probe_pty_root(&catalog);
             let probe = |session: &str| st2::ding::session_liveness_in(&pty_root, session);
-            match st2::harness_state::read(&observed_path, Some(&probe)) {
+            let observed = st2::harness_state::read(&observed_path, Some(&probe));
+            match &observed {
                 None => report_advisory(
                     &format!("{bus_address} observed harness state absent"),
                     "no driver has published a harness-state record for this agent",
@@ -2416,8 +2417,10 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                     );
                 }
             }
+            // Read once: the diagnostic is both its own advisory axis and an input to the shared
+            // disposition below, and two reads could disagree.
+            let diagnostic = st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
             if st2::driver_diagnostic::expected_for(spec) {
-                let diagnostic = st2::driver_diagnostic::read(&st2::driver_diagnostic::path(dir));
                 match &diagnostic {
                     st2::driver_diagnostic::Observed::Failure(failure) => report_advisory(
                         &format!(
@@ -2445,6 +2448,25 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         }
                     }
                 }
+            }
+            // The shared derived disposition: Doctor reports the SAME fold every other consumer
+            // reads instead of re-deriving urgency from the axes above, so an operator and a
+            // downstream presentation can never disagree about whether a seat needs a human. It
+            // is advisory like every axis it folds, and it authorizes nothing.
+            let disposition = st2::harness_state::disposition(observed.as_ref(), &diagnostic);
+            if disposition.attention != st2::harness_state::Attention::None {
+                report_advisory(
+                    &format!(
+                        "{bus_address} needs attention {} (disposition `{}`)",
+                        disposition.attention.as_str(),
+                        disposition.state.as_str()
+                    ),
+                    &format!(
+                        "primary action `{}` — the observed condition and driver diagnostic \
+                         above say why",
+                        disposition.primary_action.as_str()
+                    ),
+                );
             }
         }
     }
@@ -2895,6 +2917,17 @@ fn observed_column(observed: Option<&st2::harness_state::Observed>) -> String {
     let mut column = observed.state.as_str().to_string();
     if observed.blocked_on == st2::harness_state::BlockedOn::Human {
         column.push_str("+human");
+    }
+    // A faulted seat whose activity word is `active` would otherwise render as ordinary work,
+    // which is the one row an operator most needs to see. The category is the routable word; an
+    // untyped fault says so rather than borrowing a neighbouring category's name.
+    if let Some(fault) = observed.condition.fault() {
+        column.push_str(&format!(
+            "+fault({})",
+            fault
+                .category
+                .map_or("untyped", st2::harness_state::FaultCategory::as_str)
+        ));
     }
     if observed.state == st2::harness_state::Activity::Unknown
         && let Some(reason) = observed.reason.as_deref()

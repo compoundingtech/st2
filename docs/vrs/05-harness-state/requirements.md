@@ -204,6 +204,86 @@ authorizes or changes delivery.
   reached its ordinary end — clears it; an unclassified failure leaves a
   standing rejection standing. Delivery semantics are unchanged.
 
+### Must separate what is wrong from what is being asked
+
+- **OHS-R17 Condition is its own axis:** The record carries a tagged
+  `condition ∈ clear | fault`, published under its own record version so the
+  meaning of a version's bytes stays decidable from those bytes. A fault
+  carries a CLOSED `category ∈ authentication | account | quota | rateLimit |
+  provider | context | configuration | policy | harness` — closed because
+  consumers route on it — an OPEN, provider-namespaced `code` for diagnostic
+  granularity, a `recovery ∈ automatic | human | terminal | unknown`, and its
+  own semantic observation time. Provider prose is diagnostic only; no
+  consumer branches on it. A category word outside the closed set leaves the
+  fault UNTYPED and still routed by its recovery: neither borrowing a
+  neighbouring category nor discarding the whole observation is acceptable,
+  because the first invents a claim and the second makes a real fault stop
+  being reported. Versions without the axis project it as EXPLICITLY absent —
+  never `clear`, and no fault is inferred from their legacy words.
+- **OHS-R18 An ask is an actual human prompt:** The ask axis is tagged so
+  `none`, `pending` with its kind, and `unknown` are three distinct
+  statements, and it speaks only about prompts. A fault is not an ask: a
+  throttled provider asks nobody anything. Where a fault and an ask coexist,
+  remediation is primary and the ask remains visible on the raw axis.
+- **OHS-R19 Strict edges, typed indeterminacy:** A record whose OBSERVATION
+  axes contradict each other is not a weaker observation; it is not an
+  observation. Every rejection carries its own reason word — a `clear`
+  bearing fault evidence, a fault missing recovery or its observation time, a
+  recovery deadline on a recovery this version recognizes as non-automatic,
+  an inverted deadline, an ask that names a kind while claiming none — so an
+  operator can tell a producer bug from a stale seat and one bug from
+  another. Rejection is scoped to what the contradiction actually damages:
+  strictness must not destroy evidence. A deadline beside an UNRECOGNIZED
+  recovery word is kept, because that class may be automatic in a version
+  the reader predates and rejecting it would turn a fault that pages into a
+  non-paging row; and a badly stated conversation reference degrades only
+  that axis, because a broken side-channel is not evidence about the harness.
+  Indeterminacy is exposed TYPED, carrying that word and the age of the
+  evidence it was derived from when the bytes carried a usable stamp; the
+  legacy scalar reason remains a projection of the same single value and is
+  never derived independently.
+- **OHS-R20 Two clocks:** Transport freshness and semantic observation are
+  separate. The heartbeat proves only that a writer still holds evidence; it
+  never moves a fault's observation time or its recovery deadline, and
+  attention is derived at READ time. An `automatic` recovery past its own
+  deadline becomes an untyped, unknown-recovery fault that pages until an
+  explicit paired clear, a terminal record, a new claim, or a new incarnation
+  replaces it — a recovery that missed its own deadline is no longer evidence
+  of anything automatic.
+- **OHS-R21 One shared disposition:** st2 owns normalization and publishes
+  ONE derived disposition — exactly three closed axes: a state, how soon a
+  human is needed, and what that human would do first — from one pure
+  function, exposed on the roster, the catalog graph, and Doctor. Consumers
+  read it; none re-derives urgency, because two independent derivations are
+  how one consumer starts paging for what another ignores. Raw activity, the
+  actual human ask, the condition, and recovery stay orthogonal and ride
+  beside it, so a consumer that disagrees can see exactly what was folded.
+  Ended and record-level indeterminate never page. A native-driver diagnostic
+  failure contributes through the same function — it is a fault the harness
+  could not report itself — and still never changes delivery.
+- **OHS-R22 Conversation reference is identity and capability:** The
+  conversation bridge is tagged `linked | unavailable | unsupported`, and a
+  linked reference carries the driver's namespace, the provider's opaque
+  conversation identity, the runtime incarnation, an explicit history
+  mutability claim with the evidence for it, and a FINITE verification bound
+  so a consumer ages the claim instead of trusting it forever. A record that
+  states nothing about a conversation claims no capability, which is distinct
+  from `unsupported`. Conversation content stays out of the record entirely.
+  A `linked` reference that is not fully stated is not trusted and not
+  discarded either: it degrades to `unavailable` carrying st2's own closed
+  rejection word — never provider prose — and the observation's activity,
+  condition, and ask axes stand untouched.
+- **OHS-R23 Reader-first activation with a positive drain gate:** A record
+  version is read, strictly validated, and projected before any writer emits
+  it, and exactly one writer-selection point decides which version this build
+  writes. Every projected row carries the EXACT version its record declared,
+  including versions the build cannot interpret, so a migration's drain gate
+  is positive — "every row reads the new version" is checkable, while "no row
+  is still the old one" is not checkable from any absence. The ownership
+  envelope is version-independent, so a claim honors the schema fence and the
+  ownership sequence of a record whose meaning it cannot read rather than
+  treating those bytes as an empty seat.
+
 ## Evidence
 
 The measurements are #268's, taken 2026-08-16/17 on one host and carried with
