@@ -3,18 +3,40 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use st2::identity::{IdentityActivation, LegacyReason};
 use st2::reconcile::ObservedPtyPresentation;
-use st2::reconcile::reconcile_selected;
-use st2::reconcile::resolve_task;
 use st2::spec::{AgentDesiredState, AgentSpec, JobType, Resource, Task, TaskKind, TaskLifecycle};
 use st2::{Session, reconcile as reconcile_result};
+
+/// Every case below this line pins the pre-activation projection, which DELTA-003 keeps normative
+/// until the whole catalog is migrated. The activated projection has its own cases at the bottom.
+fn legacy() -> IdentityActivation {
+    IdentityActivation::Legacy(LegacyReason::MigrationIncomplete)
+}
 
 fn reconcile<'a>(
     specs: &'a [AgentSpec],
     sessions: &[Session],
     host: &str,
 ) -> st2::ReconcilePlan<'a> {
-    reconcile_result(specs, sessions, host).unwrap()
+    reconcile_result(specs, sessions, host, &legacy()).unwrap()
+}
+
+fn resolve_task<'a>(
+    specs: &'a [AgentSpec],
+    selector: &str,
+    host: &str,
+) -> anyhow::Result<(&'a AgentSpec, &'a Task, String)> {
+    st2::reconcile::resolve_task(specs, selector, host, &legacy())
+}
+
+fn reconcile_selected<'a>(
+    specs: &'a [AgentSpec],
+    sessions: &[Session],
+    host: &str,
+    selector: &str,
+) -> anyhow::Result<st2::ReconcilePlan<'a>> {
+    st2::reconcile::reconcile_selected(specs, sessions, host, selector, &legacy())
 }
 
 #[test]
@@ -512,7 +534,7 @@ fn suspended_agents_teardown_live_tasks_reap_dead_nonkeep_and_never_launch() {
 
     let mut running = specs[0].clone();
     running.desired_state = AgentDesiredState::Running;
-    let error = reconcile_result(&[running], &[], "host").unwrap_err();
+    let error = reconcile_result(&[running], &[], "host", &legacy()).unwrap_err();
     assert!(error.to_string().contains("conflicting ST_AGENT"));
 }
 
@@ -890,7 +912,7 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
     // Retired with a live seat: admits (no TaskIdentityAdmissionError), tears down the seat,
     // settles retirement, launches nothing. The declared resources do not block any of this.
     let retired = [with_resources()];
-    let plan = reconcile_result(&retired, &[live("hetz.worker")], HOST)
+    let plan = reconcile_result(&retired, &[live("hetz.worker")], HOST, &legacy())
         .expect("retired specs with resources are admitted");
     assert_eq!(plan.teardown.len(), 1);
     assert_eq!(plan.teardown[0].pty_ids, vec!["hetz.worker"]);
@@ -898,7 +920,7 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
     assert!(plan.launch.is_empty());
 
     // Once the seat is gone, retirement is complete: nothing to tear down, gc, or launch.
-    let plan = reconcile_result(&retired, &[], HOST).expect("retired specs with resources admit");
+    let plan = reconcile_result(&retired, &[], HOST, &legacy()).expect("retired specs with resources admit");
     assert!(plan.teardown.is_empty());
     assert!(plan.launch.is_empty());
     assert!(plan.gc.is_empty());
@@ -909,7 +931,7 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
     unretired.desired_state = AgentDesiredState::Running;
     assert_eq!(unretired.resources.len(), 2);
     let specs = [unretired];
-    let plan = reconcile_result(&specs, &[], HOST).expect("running specs with resources admit");
+    let plan = reconcile_result(&specs, &[], HOST, &legacy()).expect("running specs with resources admit");
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.worker");
     assert!(plan.settle_retirement.is_empty());
@@ -1103,4 +1125,285 @@ fn selecting_a_live_task_proves_it_alive_to_the_restart_cap() {
     );
     assert_eq!(plan.adopt.len(), 1);
     assert!(plan.launch.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// DELTA-003 activated identity projection (R24-R26). Everything above this line
+// pins the legacy projection that stays normative until the catalog is migrated.
+// ---------------------------------------------------------------------------
+
+/// A UUIDv7-shaped ID, as `st2` mints for a subject created after activation. Its bytes share
+/// nothing with the host-qualified bus identity, which is what makes the re-key observable.
+const MINTED_ID: &str = "01998f3a-2b7c-7c31-9f0e-2a6d4b8e5c10";
+
+fn observed(display_name: Option<&str>, tags: &[(&str, &str)]) -> ObservedPtyPresentation {
+    ObservedPtyPresentation {
+        display_name: display_name.map(String::from),
+        tags: tags
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
+    }
+}
+
+/// Every task ID shape one subject can carry: the compact canonical agent task lowering keys to
+/// the bus identity, a long-form named task with no ID, lowering's derived companion, and an
+/// independently authored ID.
+fn every_task_shape() -> AgentSpec {
+    let mut ding = task(TaskKind::Exec, "ding", Some("hetz.worker.ding"), Some("d"));
+    ding.derived = true;
+    let mut spec = svc(
+        "worker",
+        Some(HOST),
+        vec![
+            task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("run")),
+            task(TaskKind::Pty, "shell", None, Some("sh")),
+            ding,
+            task(TaskKind::Exec, "probe", Some("bespoke-probe"), Some("p")),
+        ],
+    );
+    spec.description = Some("owns the build".into());
+    spec
+}
+
+fn launched(plan: &st2::ReconcilePlan<'_>) -> Vec<(String, String)> {
+    let mut rows = plan.launch[0]
+        .tasks
+        .iter()
+        .map(|target| {
+            (
+                target.pty_id.clone(),
+                target.env["ST_AGENT"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
+
+/// The continuity proof. Migration freezes a live subject's ID to its former bus identity, so
+/// activating the target model must not move one task ID — and because a task ID *is* the name
+/// `pty` binds its session socket for, not one socket path moves either.
+#[test]
+fn a_migrated_subject_keeps_byte_identical_task_ids_and_socket_paths() {
+    let before = [every_task_shape()];
+    let mut migrated = every_task_shape();
+    migrated.id = Some(migrated.bus_id(HOST));
+    let after = [migrated];
+
+    let legacy_rows = launched(&reconcile(&before, &[], HOST));
+    let activated_rows = launched(
+        &reconcile_result(&after, &[], HOST, &IdentityActivation::Activated).unwrap(),
+    );
+
+    assert_eq!(
+        legacy_rows, activated_rows,
+        "the frozen ID equals the former bus identity, so nothing may move"
+    );
+    assert_eq!(
+        legacy_rows,
+        vec![
+            ("bespoke-probe".to_owned(), "hetz.worker".to_owned()),
+            ("hetz.worker".to_owned(), "hetz.worker".to_owned()),
+            ("hetz.worker.ding".to_owned(), "hetz.worker".to_owned()),
+            ("hetz.worker.shell".to_owned(), "hetz.worker".to_owned()),
+        ]
+    );
+}
+
+/// R26 for a subject minted after activation: `ST_AGENT` and every default task ID key off the
+/// immutable ID, never the host-qualified bus identity, while an authored ID stays authoritative.
+#[test]
+fn activated_identity_keys_st_agent_and_default_task_ids_on_the_immutable_id() {
+    let mut spec = every_task_shape();
+    spec.id = Some(MINTED_ID.to_owned());
+    let specs = [spec];
+
+    let plan = reconcile_result(&specs, &[], HOST, &IdentityActivation::Activated).unwrap();
+
+    assert_eq!(
+        launched(&plan),
+        vec![
+            (MINTED_ID.to_owned(), MINTED_ID.to_owned()),
+            (format!("{MINTED_ID}.ding"), MINTED_ID.to_owned()),
+            (format!("{MINTED_ID}.shell"), MINTED_ID.to_owned()),
+            ("bespoke-probe".to_owned(), MINTED_ID.to_owned()),
+        ]
+    );
+    // Host placement is never concatenated into the ID, and the legacy prefix is gone entirely.
+    assert!(
+        plan.launch[0]
+            .tasks
+            .iter()
+            .all(|target| !target.pty_id.starts_with("hetz.")),
+        "no activated task ID may retain the host-qualified prefix"
+    );
+}
+
+/// The schema-2 owned tag snapshot: `agent.actor.path` is retired as a removal, `agent.actor.id`
+/// and `agent.actor.address` replace it, an absent description is a removal, and exec tasks get no
+/// PTY metadata at all.
+#[test]
+fn activated_pty_metadata_is_the_schema_two_snapshot_and_retires_the_actor_path() {
+    let mut spec = every_task_shape();
+    spec.id = Some(MINTED_ID.to_owned());
+    spec.address = Some("build".into());
+    let specs = [spec];
+
+    let plan = reconcile_result(&specs, &[], HOST, &IdentityActivation::Activated).unwrap();
+    let target = |id: &str| {
+        plan.launch[0]
+            .tasks
+            .iter()
+            .find(|target| target.pty_id == id)
+            .expect("declared task is in the launch plan")
+    };
+
+    let expected = BTreeMap::from([
+        ("agent.presentation.schema".to_owned(), Some("2".to_owned())),
+        ("agent.actor.id".to_owned(), Some(MINTED_ID.to_owned())),
+        (
+            "agent.actor.address".to_owned(),
+            Some("hetz.build".to_owned()),
+        ),
+        ("agent.actor.path".to_owned(), None),
+        (
+            "agent.presentation.description".to_owned(),
+            Some("owns the build".to_owned()),
+        ),
+        ("role".to_owned(), Some("agent".to_owned())),
+    ]);
+    assert_eq!(
+        target(MINTED_ID).presentation.as_ref().unwrap().tags,
+        expected
+    );
+    // The mutable address is projected, and it is not the ownership key.
+    assert_eq!(target(MINTED_ID).bus_address, "hetz.build");
+    assert_eq!(target(MINTED_ID).agent_key, MINTED_ID);
+
+    let mut secondary = expected.clone();
+    secondary.insert("role".to_owned(), None);
+    assert_eq!(
+        target(&format!("{MINTED_ID}.shell"))
+            .presentation
+            .as_ref()
+            .unwrap()
+            .tags,
+        secondary,
+        "every managed PTY carries the snapshot; only the canonical agent carries the role"
+    );
+
+    for exec in ["bespoke-probe", &format!("{MINTED_ID}.ding")] {
+        assert!(
+            target(exec).presentation.is_none(),
+            "exec task {exec} must receive no PTY metadata"
+        );
+    }
+}
+
+/// Native display metadata and the compatibility role belong to the canonical compact agent task
+/// alone. A task merely *named* `agent` whose authored ID is not the agent ID is an ordinary
+/// secondary PTY: it keeps its own display convention and has the role actively cleared.
+#[test]
+fn activated_role_and_display_name_are_scoped_to_the_canonical_agent_task() {
+    let mut spec = svc(
+        "worker",
+        Some(HOST),
+        vec![
+            task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("run")),
+            task(TaskKind::Pty, "agent", Some("bespoke-agent"), Some("alt")),
+        ],
+    );
+    spec.id = Some(MINTED_ID.to_owned());
+    spec.name = Some("Build Worker".into());
+    let specs = [spec];
+
+    let plan = reconcile_result(&specs, &[], HOST, &IdentityActivation::Activated).unwrap();
+    let presentation = |id: &str| {
+        plan.launch[0]
+            .tasks
+            .iter()
+            .find(|target| target.pty_id == id)
+            .unwrap()
+            .presentation
+            .clone()
+            .unwrap()
+    };
+
+    let canonical = presentation(MINTED_ID);
+    assert_eq!(canonical.display_name, Some(Some("Build Worker".to_owned())));
+    assert_eq!(canonical.tags["role"], Some("agent".to_owned()));
+
+    let other = presentation("bespoke-agent");
+    assert_eq!(
+        other.display_name, None,
+        "a non-canonical PTY preserves its task-specific display convention"
+    );
+    assert_eq!(
+        other.tags["role"], None,
+        "the compatibility role is actively cleared off every other PTY"
+    );
+    // Presentation is never duplicated into tags.
+    assert!(!other.tags.contains_key("name"));
+    assert!(!canonical.tags.contains_key("name"));
+}
+
+/// An address change is a nondisruptive cutover: it produces exactly one metadata patch and enters
+/// no launch, teardown, garbage collection, or replacement. The healthy task keeps its ID — and so
+/// its PID, creation identity, and generation.
+#[test]
+fn an_activated_address_change_patches_metadata_without_touching_the_runtime() {
+    let mut spec = svc(
+        "worker",
+        Some(HOST),
+        vec![task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("run"))],
+    );
+    spec.id = Some(MINTED_ID.to_owned());
+
+    // The live session already carries the converged snapshot for the current address.
+    let converged = observed(
+        None,
+        &[
+            ("agent.presentation.schema", "2"),
+            ("agent.actor.id", MINTED_ID),
+            ("agent.actor.address", "hetz.worker"),
+            ("role", "agent"),
+            ("operator.note", "unrelated"),
+        ],
+    );
+    let mut session = live(MINTED_ID);
+    session.presentation = Some(converged);
+
+    let steady = [spec.clone()];
+    let plan = reconcile_result(&steady, &[session.clone()], HOST, &IdentityActivation::Activated)
+        .unwrap();
+    assert!(
+        plan.presentation.is_empty(),
+        "a converged snapshot must not be re-patched: {:?}",
+        plan.presentation
+    );
+
+    spec.address = Some("build".into());
+    let cutover = [spec];
+    let plan =
+        reconcile_result(&cutover, &[session], HOST, &IdentityActivation::Activated).unwrap();
+
+    assert_eq!(plan.presentation.len(), 1);
+    let patch = &plan.presentation[0];
+    assert_eq!(patch.pty_id, MINTED_ID, "the task ID does not move");
+    assert_eq!(
+        patch.tags["agent.actor.address"],
+        Some("hetz.build".to_owned())
+    );
+    assert_eq!(patch.tags["agent.actor.id"], Some(MINTED_ID.to_owned()));
+    // The patch owns only st2's own keys: an unrelated operator tag is not in the snapshot at all,
+    // so it is preserved rather than cleared.
+    assert!(!patch.tags.contains_key("operator.note"));
+
+    assert!(plan.launch.is_empty(), "no launch");
+    assert!(plan.teardown.is_empty(), "no teardown");
+    assert!(plan.gc.is_empty(), "no garbage collection");
+    assert!(plan.held.is_empty(), "no hold");
+    assert_eq!(plan.adopt.len(), 1, "the healthy task is adopted unchanged");
+    assert_eq!(plan.live, vec![MINTED_ID.to_owned()]);
 }

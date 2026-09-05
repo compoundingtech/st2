@@ -20,11 +20,17 @@ use agent_spec::spec::{
 };
 use kdl::KdlValue;
 
+use crate::identity::{IdentityActivation, LegacyReason};
+
 /// Immutable inputs captured once before generated tasks are compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCompileContext {
     catalog_root: PathBuf,
     st2_executable: PathBuf,
+    /// This pass's DELTA-003 identity-activation decision, or `None` while the caller has not
+    /// decided one. Undecided compiles legacy bytes: the gate is all-or-nothing, so a caller that
+    /// has not proved catalog migration must not emit target-model identity.
+    identity_activation: Option<IdentityActivation>,
 }
 
 impl TaskCompileContext {
@@ -57,6 +63,7 @@ impl TaskCompileContext {
         Ok(Self {
             catalog_root,
             st2_executable,
+            identity_activation: None,
         })
     }
 
@@ -79,6 +86,27 @@ impl TaskCompileContext {
 
     pub fn catalog_root(&self) -> &Path {
         &self.catalog_root
+    }
+
+    /// Bind this pass's identity-activation decision (DELTA-003 step 5).
+    pub fn with_identity_activation(mut self, activation: IdentityActivation) -> Self {
+        self.identity_activation = Some(activation);
+        self
+    }
+
+    /// Whether this compilation writes target-model identity.
+    fn activated(&self) -> bool {
+        self.identity_activation
+            .as_ref()
+            .is_some_and(IdentityActivation::is_activated)
+    }
+
+    /// The runner-owned agent key this compilation writes for `spec`.
+    fn agent_key(&self, spec: &AgentSpec, this_host: &str) -> String {
+        match &self.identity_activation {
+            Some(activation) => agent_key(spec, this_host, activation),
+            None => spec.bus_id(this_host),
+        }
     }
 }
 
@@ -123,6 +151,15 @@ pub fn compile_driver_agent_tasks(
             continue;
         };
         let bus_id = spec.bus_id(this_host);
+        let agent_key = context.agent_key(spec, this_host);
+        // The shared expansion in `driver` is host-qualified because it cannot see the activation
+        // gate. Both runner-owned values are captured here, before the canonical task is borrowed
+        // mutably, so an activated pass can re-key them below.
+        let canonical_task_id = spec
+            .tasks
+            .iter()
+            .find(|task| !task.derived && task.name == "agent")
+            .map(|task| task_id_parts(&agent_key, &bus_id, task, context.activated()));
         let expansion = crate::driver::expand_driver(spec, this_host)?;
         let argv_nodes = expansion
             .nodes()
@@ -188,6 +225,15 @@ pub fn compile_driver_agent_tasks(
             task.kind == TaskKind::Pty,
             "agent '{bus_id}' driver canonical task is not a PTY"
         );
+        if let Some(canonical_task_id) = canonical_task_id.filter(|_| context.activated()) {
+            anyhow::ensure!(
+                argv.get(5).map(String::as_str) == Some("--identity")
+                    && argv.get(7).map(String::as_str) == Some("--runtime-id"),
+                "agent '{bus_id}' driver expansion has an unexpected {wrapper} identity prefix"
+            );
+            argv[6] = agent_key;
+            argv[8] = canonical_task_id;
+        }
         task.command = None;
         task.argv = Some(argv);
     }
@@ -253,6 +299,8 @@ fn compile_session_wrapped_agent_tasks(
         }
         let selected = transport.as_str();
         let bus_id = spec.bus_id(this_host);
+        let agent_key = context.agent_key(spec, this_host);
+        let activated = context.activated();
         let mut candidates = spec
             .tasks
             .iter_mut()
@@ -284,10 +332,7 @@ fn compile_session_wrapped_agent_tasks(
             !provider.is_empty(),
             "agent '{bus_id}' selects `deliver \"{selected}\"` with an empty canonical argv"
         );
-        let runtime_id = task
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+        let runtime_id = task_id_parts(&agent_key, &bus_id, task, activated);
         let mut argv = vec![
             st2_executable.clone(),
             "--catalog".to_string(),
@@ -295,7 +340,7 @@ fn compile_session_wrapped_agent_tasks(
             "driver".to_string(),
             wrapper.to_string(),
             "--identity".to_string(),
-            bus_id,
+            agent_key,
             "--runtime-id".to_string(),
             runtime_id,
             "--".to_string(),
@@ -325,7 +370,8 @@ pub fn compile_generated_ding_tasks(
         .context("running st2 executable path is not UTF-8")?
         .to_owned();
     for spec in specs {
-        let bus_id = spec.bus_id(this_host);
+        // `st2 ding --identity` is a generated exact-ID consumer, not a human address parser.
+        let agent_key = context.agent_key(spec, this_host);
         for task in &mut spec.tasks {
             if !task.derived {
                 continue;
@@ -359,7 +405,7 @@ pub fn compile_generated_ding_tasks(
                 st2_executable.clone(),
                 "ding".to_string(),
                 "--identity".to_string(),
-                bus_id.clone(),
+                agent_key.clone(),
                 "--root".to_string(),
                 effective_root,
             ]);
@@ -398,6 +444,8 @@ pub fn compile_app_server_agent_tasks(
             continue;
         }
         let bus_id = spec.bus_id(this_host);
+        let agent_key = context.agent_key(spec, this_host);
+        let activated = context.activated();
         let mut candidates = spec
             .tasks
             .iter_mut()
@@ -430,17 +478,14 @@ pub fn compile_app_server_agent_tasks(
                 .any(|arg| arg == "--remote" || arg.starts_with("--remote=")),
             "agent '{bus_id}' selects `deliver \"app-server\"` but its canonical argv already declares `--remote`"
         );
-        let runtime_id = task
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("{bus_id}.{}", task.name));
+        let runtime_id = task_id_parts(&agent_key, &bus_id, task, activated);
         let mut argv = vec![
             st2_executable.clone(),
             "--catalog".to_string(),
             catalog_root.clone(),
             "codex-app-server".to_string(),
             "--identity".to_string(),
-            bus_id,
+            agent_key,
             "--runtime-id".to_string(),
             runtime_id,
             "--".to_string(),
@@ -479,10 +524,15 @@ pub struct ObservedPtyPresentation {
 pub struct TaskTarget {
     /// `pty` (terminal) or `exec` (terminal-free) — selects the backend.
     pub kind: TaskKind,
-    /// Resolved task id (the spec's `id`, or `<bus_id>.<name>` fallback).
+    /// Resolved task id: the explicit authored `id`, else `<agent_key>.<name>` (R26).
     pub pty_id: String,
-    /// The agent bus id this task belongs to (`<host>.<identity>`).
-    pub bus_id: String,
+    /// The runner-owned agent key this task belongs to — the immutable agent ID once the identity
+    /// model is activated, and the host-qualified bus identity `<host>.<identity>` while legacy.
+    /// Migration froze every live subject's ID to those same bytes, so activation moves nothing.
+    pub agent_key: String,
+    /// The subject's human-routable bus address `<host>.<address>`. Equal to `agent_key` for a
+    /// subject with no explicit `address`, which is every subject before activation.
+    pub bus_address: String,
     /// The task name (`agent`, `ding`, …).
     pub name: String,
     /// Generated from another task rather than authored as an independent sibling.
@@ -514,16 +564,132 @@ pub struct PtyPresentation {
 }
 
 pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
+/// Schema 1's owned actor tag. Schema 2 replaces it with [`AGENT_ACTOR_ID_TAG`] plus
+/// [`AGENT_ACTOR_ADDRESS_TAG`] and emits it as a removal, so a PTY that started under schema 1
+/// does not keep a stale owned key after the cutover.
 pub const AGENT_ACTOR_PATH_TAG: &str = "agent.actor.path";
+/// Schema 2: the immutable, catalog-global agent ID.
+pub const AGENT_ACTOR_ID_TAG: &str = "agent.actor.id";
+/// Schema 2: the current, mutable bus address.
+pub const AGENT_ACTOR_ADDRESS_TAG: &str = "agent.actor.address";
 pub const AGENT_DESCRIPTION_TAG: &str = "agent.presentation.description";
 /// Compatibility role owned by st2 only on the canonical agent PTY.
 pub const COMPATIBILITY_ROLE_TAG: &str = "role";
+
+/// The runner-owned key one subject's identity is derived from.
+///
+/// Legacy: the host-qualified bus identity. Activated: the explicit immutable agent ID. Migration
+/// froze every live subject's ID to its former bus identity, so the two agree byte-for-byte for a
+/// migrated subject and no `ST_AGENT`, task ID, socket path, or ownership key moves at activation.
+///
+/// Under activation an explicit `id` is always present — proving exactly that is what the gate
+/// does — so its absence is unreachable rather than a silent fallback to the legacy projection.
+pub fn agent_key(spec: &AgentSpec, this_host: &str, activation: &IdentityActivation) -> String {
+    match activation {
+        IdentityActivation::Activated => spec.id.clone().unwrap_or_else(|| {
+            unreachable!(
+                "identity activation admits only fully migrated catalogs, but '{}' carries no explicit agent id",
+                spec.path.display()
+            )
+        }),
+        IdentityActivation::Legacy(_) => spec.bus_id(this_host),
+    }
+}
+
+/// One task's runtime ID (R26) from values captured before the task may be borrowed mutably.
+fn task_id_parts(
+    agent_key: &str,
+    legacy_bus_id: &str,
+    task: &crate::spec::Task,
+    activated: bool,
+) -> String {
+    // Lowering runs in the Agent Spec crate, which cannot see the activation gate, so every task ID
+    // it synthesizes carries the legacy host-qualified prefix: `<bus-id>` for the compact canonical
+    // agent task, `<bus-id>.<name>` for everything else it names. Under activation those two shapes
+    // are re-keyed onto the agent ID, which is what R26 requires. This is byte-for-byte identical
+    // for every migrated subject — its frozen ID *is* the legacy bus identity — and correct for a
+    // subject created after activation. An independently authored ID stays authoritative.
+    if activated && let Some(id) = task.id.as_deref() {
+        if !task.derived && task.name == "agent" && id == legacy_bus_id {
+            return agent_key.to_owned();
+        }
+        if id == format!("{legacy_bus_id}.{}", task.name) {
+            return format!("{agent_key}.{}", task.name);
+        }
+    }
+    resolve_task_id(agent_key, &task.name, task.id.as_deref())
+}
+
+/// One task's runtime ID: the explicit authored ID, else `<agent-key>.<task-name>` (R26).
+///
+/// Every consumer that needs a task's on-disk identity — reconciliation, socket admission, task
+/// inventory, resync seats — must resolve it through here so they cannot disagree about ownership.
+pub fn default_task_id(
+    spec: &AgentSpec,
+    task: &crate::spec::Task,
+    this_host: &str,
+    activation: &IdentityActivation,
+) -> String {
+    task_id_parts(
+        &agent_key(spec, this_host, activation),
+        &spec.bus_id(this_host),
+        task,
+        activation.is_activated(),
+    )
+}
+
+/// Decide the DELTA-003 identity gate once, for a caller that already holds a complete local
+/// catalog view.
+///
+/// Anything st2 cannot *prove* migrated answers legacy: the gate is all-or-nothing, so an
+/// incomplete migration transaction or a structural archive st2 cannot observe is never an
+/// optimistic yes.
+pub fn identity_activation(root: &Path, specs: &[AgentSpec]) -> IdentityActivation {
+    if specs.is_empty() {
+        // `activation_from` answers a vacuous yes for an empty subject set. Nothing has been
+        // proved migrated, and a decision that outlives its (empty) view would then key a later
+        // unmigrated subject as if it had an ID, so keep the gate closed.
+        return IdentityActivation::Legacy(LegacyReason::CatalogNotMigrated {
+            unmigrated: 0,
+            first: "no local subjects".to_owned(),
+        });
+    }
+    if crate::catalog_migrate_ids::marker_path(root).exists() {
+        return IdentityActivation::Legacy(LegacyReason::MigrationIncomplete);
+    }
+    match crate::catalog_archive::observe(root) {
+        Ok(observation) if observation.issues.is_empty() => {
+            crate::identity::activation_from(specs, &observation.archived, false)
+        }
+        _ => IdentityActivation::Legacy(LegacyReason::CatalogNotMigrated {
+            unmigrated: 1,
+            first: crate::catalog_archive::archive_root(root).display().to_string(),
+        }),
+    }
+}
+
+/// [`identity_activation`] for a pass that discovered the catalog itself.
+///
+/// An unreadable declaration may itself be the unmigrated subject, so a catalog whose discovery is
+/// incomplete keeps the pass legacy.
+pub fn discovered_identity_activation(
+    root: &Path,
+    found: &crate::Discovered,
+) -> IdentityActivation {
+    match found.errors.first() {
+        Some(error) => IdentityActivation::Legacy(LegacyReason::CatalogNotMigrated {
+            unmigrated: found.errors.len(),
+            first: error.path.display().to_string(),
+        }),
+        None => identity_activation(root, &found.specs),
+    }
+}
 
 /// Fail-closed admission errors for runner-owned task identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskIdentityAdmissionError {
     Conflict {
-        bus_id: String,
+        agent: String,
         task: String,
         declared: String,
     },
@@ -533,12 +699,12 @@ impl fmt::Display for TaskIdentityAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Conflict {
-                bus_id,
+                agent,
                 task,
                 declared,
             } => write!(
                 formatter,
-                "agent '{bus_id}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{bus_id}'"
+                "agent '{agent}' task '{task}' declares conflicting ST_AGENT '{declared}'; expected runner-owned value '{agent}'"
             ),
         }
     }
@@ -546,39 +712,52 @@ impl fmt::Display for TaskIdentityAdmissionError {
 
 impl std::error::Error for TaskIdentityAdmissionError {}
 
-/// Reject local active tasks whose authored identity conflicts with the runner-derived bus ID.
+/// Reject local active tasks whose authored identity conflicts with the runner-owned agent key.
 pub fn validate_task_identities(
     specs: &[AgentSpec],
     this_host: &str,
+    activation: &IdentityActivation,
 ) -> Result<(), TaskIdentityAdmissionError> {
     for spec in specs {
         if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
-        for task in &spec.tasks {
-            if let Some(declared) = task.env.get("ST_AGENT")
-                && declared != &bus_id
-            {
-                return Err(TaskIdentityAdmissionError::Conflict {
-                    bus_id,
-                    task: task.name.clone(),
-                    declared: declared.clone(),
-                });
-            }
+        validate_agent_task_identity(spec, &agent_key(spec, this_host, activation))?;
+    }
+    Ok(())
+}
+
+/// The same rule for one subject whose runner-owned key the caller already decided.
+pub fn validate_agent_task_identity(
+    spec: &AgentSpec,
+    agent: &str,
+) -> Result<(), TaskIdentityAdmissionError> {
+    for task in &spec.tasks {
+        if let Some(declared) = task.env.get("ST_AGENT")
+            && declared != agent
+        {
+            return Err(TaskIdentityAdmissionError::Conflict {
+                agent: agent.to_owned(),
+                task: task.name.clone(),
+                declared: declared.clone(),
+            });
         }
     }
     Ok(())
 }
 
 /// Project runner-owned identity and the supervisor source of truth into one launch target.
+///
+/// `ST_SUPERVISOR` is passed through verbatim: the migration transaction already rewrote every
+/// supervisor reference to the parent's migrated ID, so under activation the declared value *is*
+/// the agent ID and re-resolving it here would reintroduce address parsing on an exact selector.
 fn runner_task_env(
     spec: &AgentSpec,
     task: &crate::spec::Task,
-    bus_id: &str,
+    agent_key: &str,
 ) -> BTreeMap<String, String> {
     let mut env = task.env.clone();
-    env.insert("ST_AGENT".to_owned(), bus_id.to_owned());
+    env.insert("ST_AGENT".to_owned(), agent_key.to_owned());
     if let Some(supervisor) = &spec.supervisor {
         env.insert("ST_SUPERVISOR".to_owned(), supervisor.clone());
     } else {
@@ -591,24 +770,54 @@ fn pty_presentation(
     spec: &AgentSpec,
     task: &crate::spec::Task,
     pty_id: &str,
-    bus_id: &str,
+    agent_key: &str,
+    bus_address: &str,
+    activation: &IdentityActivation,
 ) -> Option<PtyPresentation> {
     if task.kind != TaskKind::Pty {
         return None;
     }
-    let canonical_agent = task.name == "agent" && pty_id == bus_id;
+    let canonical_agent = task.name == "agent" && pty_id == agent_key;
+    let name = || match spec.name.as_ref() {
+        Some(name) if name == pty_id => None,
+        _ => spec.name.clone(),
+    };
+    if !activation.is_activated() {
+        return Some(PtyPresentation {
+            pty_id: pty_id.to_owned(),
+            display_name: (task.name == "agent").then(name),
+            tags: BTreeMap::from([
+                (
+                    AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
+                    Some("1".to_owned()),
+                ),
+                (AGENT_ACTOR_PATH_TAG.to_owned(), Some(agent_key.to_owned())),
+                (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
+                (
+                    COMPATIBILITY_ROLE_TAG.to_owned(),
+                    canonical_agent.then(|| "agent".to_owned()),
+                ),
+            ]),
+        });
+    }
     Some(PtyPresentation {
         pty_id: pty_id.to_owned(),
-        display_name: (task.name == "agent").then(|| match spec.name.as_ref() {
-            Some(name) if name == pty_id => None,
-            _ => spec.name.clone(),
-        }),
+        // R26 restricts native display metadata to the canonical compact agent task; every other
+        // PTY keeps its own task-specific display convention.
+        display_name: canonical_agent.then(name),
         tags: BTreeMap::from([
             (
                 AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
-                Some("1".to_owned()),
+                Some("2".to_owned()),
             ),
-            (AGENT_ACTOR_PATH_TAG.to_owned(), Some(bus_id.to_owned())),
+            (AGENT_ACTOR_ID_TAG.to_owned(), Some(agent_key.to_owned())),
+            (
+                AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                Some(bus_address.to_owned()),
+            ),
+            // Schema 1's owned actor tag is retired, not inherited: leaving it behind would keep a
+            // stale host-qualified value on a PTY that outlived the cutover.
+            (AGENT_ACTOR_PATH_TAG.to_owned(), None),
             (AGENT_DESCRIPTION_TAG.to_owned(), spec.description.clone()),
             (
                 COMPATIBILITY_ROLE_TAG.to_owned(),
@@ -685,23 +894,23 @@ pub struct ReconcilePlan<'a> {
     pub live: Vec<String>,
 }
 
-/// Resolve one exact local task selector (`host.agent.task` or explicit task id) without mutation.
+/// Resolve one exact local task selector (`<agent-key>.<task>` or explicit task id) without
+/// mutation.
 pub fn resolve_task<'a>(
     specs: &'a [AgentSpec],
     selector: &str,
     this_host: &str,
+    activation: &IdentityActivation,
 ) -> anyhow::Result<(&'a AgentSpec, &'a crate::spec::Task, String)> {
     let mut matches = Vec::new();
     for spec in specs {
         if spec.resolved_host(this_host) != this_host {
             continue;
         }
+        let key = agent_key(spec, this_host, activation);
         for task in &spec.tasks {
-            let runtime = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
-            let qualified = format!("{}.{}", spec.bus_id(this_host), task.name);
+            let runtime = default_task_id(spec, task, this_host, activation);
+            let qualified = format!("{key}.{}", task.name);
             if selector == runtime || selector == qualified {
                 matches.push((spec, task, runtime));
             }
@@ -720,9 +929,10 @@ pub fn reconcile_selected<'a>(
     sessions: &[Session],
     this_host: &str,
     selector: &str,
+    activation: &IdentityActivation,
 ) -> anyhow::Result<ReconcilePlan<'a>> {
-    validate_task_identities(specs, this_host)?;
-    let (owner, task, runtime) = resolve_task(specs, selector, this_host)?;
+    validate_task_identities(specs, this_host, activation)?;
+    let (owner, task, runtime) = resolve_task(specs, selector, this_host, activation)?;
     let mut plan = ReconcilePlan::default();
     if owner.desired_state.is_retired() {
         plan.settle_retirement.push(owner);
@@ -756,12 +966,14 @@ pub fn reconcile_selected<'a>(
             unreachable!("discovery rejects tasks carrying both command and argv")
         }
     };
-    let bus_id = owner.bus_id(this_host);
-    let env = runner_task_env(owner, task, &bus_id);
+    let key = agent_key(owner, this_host, activation);
+    let bus_address = owner.bus_address(this_host);
+    let env = runner_task_env(owner, task, &key);
     let target = TaskTarget {
         kind: task.kind,
         pty_id: runtime.clone(),
-        bus_id: bus_id.clone(),
+        agent_key: key.clone(),
+        bus_address: bus_address.clone(),
         name: task.name.clone(),
         derived: task.derived,
         launch,
@@ -770,7 +982,7 @@ pub fn reconcile_selected<'a>(
         tags: task.tags.clone(),
         env,
         keep: task.keep || owner.keep,
-        presentation: pty_presentation(owner, task, &runtime, &bus_id),
+        presentation: pty_presentation(owner, task, &runtime, &key, &bus_address, activation),
     };
     match actual {
         Some(s) if s.alive => {
@@ -820,23 +1032,28 @@ fn session_state(by_id: &HashMap<&str, bool>, pty_id: &str) -> SessionState {
     }
 }
 
-/// Resolve a task's on-disk id: the explicit `id`, else `<bus_id>.<name>`. This is the session
+/// Resolve a task's on-disk id: the explicit `id`, else `<agent-key>.<name>`. This is the session
 /// name `pty` binds a socket for, so admission checks resolve it through here rather than
-/// re-deriving the format.
-pub(crate) fn resolve_task_id(bus_id: &str, name: &str, explicit: Option<&str>) -> String {
+/// re-deriving the format. Prefer [`default_task_id`], which also applies the activated compact
+/// re-key; this is the raw shape rule for a caller that already holds the key.
+pub(crate) fn resolve_task_id(agent_key: &str, name: &str, explicit: Option<&str>) -> String {
     match explicit {
         Some(id) => id.to_string(),
-        None => format!("{bus_id}.{name}"),
+        None => format!("{agent_key}.{name}"),
     }
 }
 
 /// Compute the reconcile plan for `specs` given observed `sessions`, filtering to `this_host`.
+///
+/// `activation` is decided once per pass by the caller and is never re-derived per subject: a
+/// partially migrated catalog has no coherent ID namespace, so the gate is all-or-nothing.
 pub fn reconcile<'a>(
     specs: &'a [AgentSpec],
     sessions: &[Session],
     this_host: &str,
+    activation: &IdentityActivation,
 ) -> Result<ReconcilePlan<'a>, TaskIdentityAdmissionError> {
-    validate_task_identities(specs, this_host)?;
+    validate_task_identities(specs, this_host, activation)?;
     let by_id: HashMap<&str, bool> = sessions
         .iter()
         .map(|s| (s.pty_id.as_str(), s.alive))
@@ -852,7 +1069,8 @@ pub fn reconcile<'a>(
             plan.other_host.push(spec);
             continue;
         }
-        let bus_id = spec.bus_id(this_host);
+        let key = agent_key(spec, this_host, activation);
+        let bus_address = spec.bus_address(this_host);
 
         if !spec.desired_state.is_running() {
             if spec.desired_state.is_retired() {
@@ -860,7 +1078,7 @@ pub fn reconcile<'a>(
             }
             let mut teardown_ids = Vec::new();
             for t in &spec.tasks {
-                let id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
+                let id = default_task_id(spec, t, this_host, activation);
                 let retain_dead = spec.desired_state.is_suspended() && (t.keep || spec.keep);
                 match session_state(&by_id, &id) {
                     SessionState::Alive => teardown_ids.push(id),
@@ -894,13 +1112,14 @@ pub fn reconcile<'a>(
                         unreachable!("discovery rejects tasks carrying both command and argv")
                     }
                 };
-                let env = runner_task_env(spec, t, &bus_id);
-                let pty_id = resolve_task_id(&bus_id, &t.name, t.id.as_deref());
+                let env = runner_task_env(spec, t, &key);
+                let pty_id = default_task_id(spec, t, this_host, activation);
                 Some((
                     TaskTarget {
                         kind: t.kind,
                         pty_id: pty_id.clone(),
-                        bus_id: bus_id.clone(),
+                        agent_key: key.clone(),
+                        bus_address: bus_address.clone(),
                         name: t.name.clone(),
                         derived: t.derived,
                         launch,
@@ -909,7 +1128,14 @@ pub fn reconcile<'a>(
                         tags: t.tags.clone(),
                         env,
                         keep: t.keep || spec.keep,
-                        presentation: pty_presentation(spec, t, &pty_id, &bus_id),
+                        presentation: pty_presentation(
+                            spec,
+                            t,
+                            &pty_id,
+                            &key,
+                            &bus_address,
+                            activation,
+                        ),
                     },
                     t.lifecycle,
                 ))

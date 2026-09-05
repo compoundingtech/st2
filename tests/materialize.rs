@@ -1174,3 +1174,51 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("materialized 1 operation"));
 }
+
+/// The `$ST_AGENT` render variable is a materialization writer, so it moves with the gate: a
+/// catalog whose every subject carries an explicit ID renders the immutable agent ID, and an
+/// unmigrated one keeps rendering the host-qualified bus identity.
+///
+/// The generated Claude MCP declaration is the other identity writer here; it is proved at the
+/// unit boundary by `src/materialize.rs::the_generated_mcp_declaration_carries_the_decided_agent_key`,
+/// which needs no installed hook set.
+#[test]
+fn activated_materialization_renders_the_agent_id_into_the_render_environment() {
+    const MINTED_ID: &str = "01998f3a-2b7c-7c31-9f0e-2a6d4b8e5c10";
+
+    for (declared_id, expected_agent) in [(None, "Silber.cos"), (Some(MINTED_ID), MINTED_ID)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("catalog");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let id_line = declared_id
+            .map(|id| format!("  id \"{id}\"\n"))
+            .unwrap_or_default();
+        write(
+            &catalog.join("agents/Silber/cos/agent.kdl"),
+            format!(
+                r#"agent "cos" {{
+  host "Silber"
+{id_line}  workspace "{}"
+  command "true"
+  render {{
+    file "ACTOR" "$ST_AGENT"
+  }}
+}}
+"#,
+                workspace.display()
+            ),
+        );
+
+        let specs = discover(&catalog).specs;
+        assert_eq!(specs.len(), 1);
+        let report = materialize_catalog(&catalog, &specs, "Silber");
+        assert!(report.is_clean(), "{:?}", report.errors);
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("ACTOR")).unwrap(),
+            expected_agent,
+            "$ST_AGENT expands to the runner-owned agent key"
+        );
+    }
+}

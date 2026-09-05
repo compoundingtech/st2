@@ -1058,7 +1058,8 @@ mod generation_observation_tests {
         TaskTarget {
             kind: crate::spec::TaskKind::Exec,
             pty_id: id.to_string(),
-            bus_id: "host.test".to_string(),
+            agent_key: "host.test".to_string(),
+            bus_address: "host.test".to_string(),
             name: "probe".to_string(),
             derived: false,
             launch: TaskLaunch::Shell("sleep 30".to_string()),

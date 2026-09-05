@@ -547,11 +547,11 @@ impl PtyCli {
                 cmd.arg("--no-display-name");
             }
             // Secondary tasks retain the established task-specific presentation convention.
-            _ if target.pty_id == target.bus_id => {
+            _ if target.pty_id == target.agent_key => {
                 cmd.arg("--no-display-name");
             }
             _ => {
-                cmd.args(["--name", &target.bus_id]);
+                cmd.args(["--name", &target.bus_address]);
             }
         }
         cmd.arg("--cwd").arg(&cwd);
@@ -1691,6 +1691,7 @@ fn live_resync_specs(
     this_host: &str,
     sessions: &[Session],
     report: &UpReport,
+    activation: &crate::identity::IdentityActivation,
 ) -> Vec<agent_spec::spec::AgentSpec> {
     let live_task_ids = sessions
         .iter()
@@ -1709,10 +1710,8 @@ fn live_resync_specs(
                 if task.name != "agent" {
                     return false;
                 }
-                let task_id = task
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}.{}", spec.bus_id(this_host), task.name));
+                let task_id =
+                    crate::reconcile::default_task_id(spec, task, this_host, activation);
                 live_task_ids.contains(task_id.as_str())
             })
         })
@@ -1777,7 +1776,18 @@ fn reconcile_pass(
         ..Default::default()
     };
 
-    if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host) {
+    // The DELTA-003 identity gate, decided exactly once for this pass from the catalog it just
+    // discovered under the shared lock. Every writer below reads this one value; nothing
+    // re-derives it per subject, because a partially migrated catalog has no coherent ID
+    // namespace to key ownership on.
+    let activation = crate::reconcile::discovered_identity_activation(root, &found);
+    let task_context = &task_context
+        .clone()
+        .with_identity_activation(activation.clone());
+
+    if let Err(error) =
+        crate::reconcile::validate_task_identities(&found.specs, this_host, &activation)
+    {
         report.errors.push(error.to_string());
         return report;
     }
@@ -1914,7 +1924,7 @@ fn reconcile_pass(
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
-    let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host) {
+    let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host, &activation) {
         Ok(plan) => plan,
         Err(error) => {
             report.errors.push(error.to_string());
@@ -1925,7 +1935,7 @@ fn reconcile_pass(
     if let Some(resync) = resync {
         for launch in &plan.launch {
             if launch.tasks.iter().any(|task| task.name == "agent") {
-                resync.deactivate(launch.spec, this_host);
+                resync.deactivate(launch.spec, this_host, &activation);
             }
         }
     }
@@ -1945,16 +1955,21 @@ fn reconcile_pass(
         // complete catalog-aware sets synchronously before unrelated repairs can block. The
         // targeted upsert retains unchanged baselines and pending transitions, so this is
         // idempotent across steady-state passes.
-        for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report) {
+        for spec in live_resync_specs(&compiled_specs, this_host, &sessions, &report, &activation) {
             report
                 .warnings
-                .extend(resync.install_live(&spec, &found.specs, this_host));
+                .extend(resync.install_live(&spec, &found.specs, this_host, &activation));
         }
     }
     let mut boundary_warnings = Vec::new();
     let mut install_new_live_seat = |spec: &agent_spec::spec::AgentSpec| {
         if let Some(resync) = resync {
-            boundary_warnings.extend(resync.install_live(spec, &found.specs, this_host));
+            boundary_warnings.extend(resync.install_live(
+                spec,
+                &found.specs,
+                this_host,
+                &activation,
+            ));
         }
     };
     execute_reconcile(
@@ -1989,7 +2004,7 @@ fn reconcile_pass(
             }
         };
         let live_subscription_specs =
-            live_resync_specs(&compiled_specs, this_host, &sessions, &report);
+            live_resync_specs(&compiled_specs, this_host, &sessions, &report, &activation);
         if let Some(resource_profiles) = resource_profiles {
             let generation = match crate::catalog_lock::read_generation_token(root) {
                 Ok(generation) => generation,
@@ -2023,6 +2038,7 @@ fn reconcile_pass(
                 this_host,
                 &sessions,
                 &malformed_declarations,
+                &activation,
             ));
         }
     }
@@ -2395,7 +2411,10 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     let mut report = UpReport::default();
     {
         let _entered = span.enter();
-        if let Err(error) = crate::reconcile::validate_task_identities(specs, this_host) {
+        let activation = spec_team_activation(specs);
+        if let Err(error) =
+            crate::reconcile::validate_task_identities(specs, this_host, &activation)
+        {
             report.errors.push(error.to_string());
         } else {
             let observe_span = runtime_observe_span();
@@ -2415,6 +2434,7 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
                     cap,
                     debounce,
                     presentation_cursor,
+                    &activation,
                     &mut report,
                 ),
                 Err(error) => {
@@ -2429,6 +2449,26 @@ pub(crate) fn reconcile_pass_specs_with_cursor(
     }
     crate::metrics::record_reconcile_pass(started.elapsed(), !report.errors.is_empty());
     report
+}
+
+/// The identity gate for an in-memory spec team (`st2 up <spec>`).
+///
+/// A spec team is a self-contained subject set with no structural archive and no migration
+/// transaction, so its own declarations decide the gate. No spec team declares an explicit `id`
+/// today, which makes this exactly the current legacy behavior.
+pub(crate) fn spec_team_activation(
+    specs: &[agent_spec::spec::AgentSpec],
+) -> crate::identity::IdentityActivation {
+    if specs.is_empty() {
+        // An empty team proves nothing; `activation_from` would answer a vacuous yes.
+        return crate::identity::IdentityActivation::Legacy(
+            crate::identity::LegacyReason::CatalogNotMigrated {
+                unmigrated: 0,
+                first: "no team members".to_owned(),
+            },
+        );
+    }
+    crate::identity::activation_from(specs, &[], false)
 }
 
 /// Reconcile an in-memory team against an already captured session snapshot. Eval supervision uses
@@ -2458,6 +2498,7 @@ pub(crate) fn reconcile_pass_specs_with_sessions(
             cap,
             debounce,
             presentation_cursor,
+            &spec_team_activation(specs),
             &mut report,
         );
         finish_reconcile_pass(&span, &report);
@@ -2474,11 +2515,12 @@ fn reconcile_specs_with_sessions_in_span(
     cap: &mut FlappingCap,
     debounce: &mut LivenessDebounce,
     presentation_cursor: &mut PresentationPatchCursor,
+    activation: &crate::identity::IdentityActivation,
     report: &mut UpReport,
 ) {
     let now = Instant::now();
     debounce.observe(sessions, now);
-    match crate::reconcile(specs, sessions, this_host) {
+    match crate::reconcile(specs, sessions, this_host, activation) {
         Ok(mut plan) => {
             report.deferred = debounce.defer_flickers(&mut plan, now);
             execute_reconcile(
@@ -2580,7 +2622,11 @@ pub fn up_once_selected(
                 drop(discover_entered);
                 found
             };
-            let (owner, _, _) = crate::reconcile::resolve_task(&found.specs, selector, this_host)?;
+            // One gate decision for this command, before `found.errors` is consumed below.
+            let activation =
+                crate::reconcile::discovered_identity_activation(catalog_root, &found);
+            let (owner, _, _) =
+                crate::reconcile::resolve_task(&found.specs, selector, this_host, &activation)?;
             let mut report = UpReport::default();
             report.warnings.extend(found.warnings);
             report.errors.extend(
@@ -2589,7 +2635,8 @@ pub fn up_once_selected(
                     .into_iter()
                     .map(|e| format!("{}: {}", e.path.display(), e.message)),
             );
-            if let Err(error) = crate::reconcile::validate_task_identities(&found.specs, this_host)
+            if let Err(error) =
+                crate::reconcile::validate_task_identities(&found.specs, this_host, &activation)
             {
                 report.errors.push(error.to_string());
                 return Ok(report);
@@ -2672,9 +2719,12 @@ fn up_once_selected_specs_with_gates<V>(
 where
     V: FnOnce(Option<&'static str>) -> anyhow::Result<()>,
 {
-    crate::reconcile::resolve_task(specs, selector, this_host)?;
-    crate::reconcile::validate_task_identities(specs, this_host)?;
-    let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?;
+    // One gate decision for this command, from the catalog view the caller handed in.
+    let activation = crate::reconcile::identity_activation(catalog_root, specs);
+    crate::reconcile::resolve_task(specs, selector, this_host, &activation)?;
+    crate::reconcile::validate_task_identities(specs, this_host, &activation)?;
+    let task_context = TaskCompileContext::current(catalog_root.to_path_buf())?
+        .with_identity_activation(activation.clone());
     let mut compiled_specs = specs.to_vec();
     compile_generated_tasks(&mut compiled_specs, this_host, &task_context)?;
     let sessions = {
@@ -2688,8 +2738,13 @@ where
         drop(observe_entered);
         sessions.map_err(|e| anyhow::anyhow!("list sessions: {e}"))?
     };
-    let mut plan =
-        crate::reconcile::reconcile_selected(&compiled_specs, &sessions, this_host, selector)?;
+    let mut plan = crate::reconcile::reconcile_selected(
+        &compiled_specs,
+        &sessions,
+        this_host,
+        selector,
+        &activation,
+    )?;
     let mut report = UpReport::default();
     gate_harness_launches_on_hooks(&mut plan, catalog_root, &mut report, verify_hooks);
     execute_reconcile(
@@ -3260,7 +3315,8 @@ mod tests {
         TaskTarget {
             kind: TaskKind::Pty,
             pty_id: id.to_string(),
-            bus_id: "hetz.demo".to_string(),
+            agent_key: "hetz.demo".to_string(),
+            bus_address: "hetz.demo".to_string(),
             name: "agent".to_string(),
             derived: false,
             launch: TaskLaunch::Shell(cmd.to_string()),
@@ -4137,7 +4193,7 @@ mod tests {
             ..UpReport::default()
         };
 
-        let eligible = live_resync_specs(&specs, "hetz", &sessions, &report)
+        let eligible = live_resync_specs(&specs, "hetz", &sessions, &report, &spec_team_activation(&specs))
             .into_iter()
             .map(|spec| spec.identity)
             .collect::<Vec<_>>();
@@ -4191,7 +4247,13 @@ mod tests {
             sess("hetz.retired.agent", true),
             sess("hetz.suspended.agent", true),
         ];
-        let eligible = live_resync_specs(&specs, "hetz", &sessions, &UpReport::default())
+        let eligible = live_resync_specs(
+            &specs,
+            "hetz",
+            &sessions,
+            &UpReport::default(),
+            &spec_team_activation(&specs),
+        )
             .into_iter()
             .map(|spec| spec.identity)
             .collect::<Vec<_>>();
@@ -4891,17 +4953,22 @@ mod tests {
             &mut report,
             &mut |spec| {
                 install_count += 1;
-                assert!(resync.install_live(spec, specs, "hetz").is_empty());
+                assert!(
+                    resync
+                        .install_live(spec, specs, "hetz", &spec_team_activation(specs))
+                        .is_empty()
+                );
             },
         );
         assert!(
             resync
                 .refresh(
                     specs,
-                    &live_resync_specs(specs, "hetz", &[], &report),
+                    &live_resync_specs(specs, "hetz", &[], &report, &spec_team_activation(specs)),
                     "hetz",
                     &[],
                     &[],
+                    &spec_team_activation(specs),
                 )
                 .is_empty()
         );
@@ -5302,7 +5369,11 @@ mod tests {
                 &mut report,
                 &mut |spec| {
                     installs.fetch_add(1, AtomicOrdering::SeqCst);
-                    assert!(resync.install_live(spec, &specs, "hetz").is_empty());
+                    assert!(
+                        resync
+                            .install_live(spec, &specs, "hetz", &spec_team_activation(&specs))
+                            .is_empty()
+                    );
                 },
             );
         });
@@ -5310,10 +5381,11 @@ mod tests {
             resync
                 .refresh(
                     &specs,
-                    &live_resync_specs(&specs, "hetz", &[], &report),
+                    &live_resync_specs(&specs, "hetz", &[], &report, &spec_team_activation(&specs)),
                     "hetz",
                     &[],
                     &[],
+                    &spec_team_activation(&specs),
                 )
                 .is_empty()
         );
@@ -5585,7 +5657,7 @@ mod tests {
 
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "codex");
-        t.bus_id = "hetz.demo".to_owned();
+        t.agent_key = "hetz.demo".to_owned();
         t.tags
             .insert("unrelated".to_owned(), "preserved".to_owned());
         t.presentation = Some(PtyPresentation {
@@ -6195,7 +6267,7 @@ mod tests {
     fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
         let cli = PtyCli::default();
         let mut t = target("hetz.demo", "exec codex 'boot'");
-        t.bus_id = t.pty_id.clone();
+        t.agent_key = t.pty_id.clone();
         t.presentation = Some(PtyPresentation {
             pty_id: t.pty_id.clone(),
             display_name: Some(Some(t.pty_id.clone())),

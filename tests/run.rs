@@ -473,8 +473,16 @@ use st2::park::{DirParkObserver, ParkObserver, ParkProjection, ParkState};
 use st2::run::{grant_unpark_requests, publish_parks};
 use st2::{FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once};
 
+/// These cases pin the pre-activation projection, which stays normative until the catalog is
+/// migrated.
+fn legacy() -> st2::identity::IdentityActivation {
+    st2::identity::IdentityActivation::Legacy(
+        st2::identity::LegacyReason::MigrationIncomplete,
+    )
+}
+
 fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> ReconcilePlan<'a> {
-    reconcile_result(specs, sessions, host).unwrap()
+    reconcile_result(specs, sessions, host, &legacy()).unwrap()
 }
 
 #[derive(Default)]
@@ -609,7 +617,8 @@ fn lifecycle_work_precedes_a_bounded_presentation_batch() {
     let target = TaskTarget {
         kind: TaskKind::Exec,
         pty_id: "host.owner.work".to_owned(),
-        bus_id: "host.owner".to_owned(),
+        agent_key: "host.owner".to_owned(),
+        bus_address: "host.owner".to_owned(),
         name: "work".to_owned(),
         derived: false,
         launch: TaskLaunch::Shell("true".to_owned()),
@@ -930,6 +939,181 @@ fn runner_owned_identity_is_rederived_for_dead_task_replay() {
             .iter()
             .map(|target| (&target.pty_id, target.env.get("ST_AGENT")))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The activated half of **Runner-owned task identity**. A catalog whose every subject carries an
+/// explicit ID turns the gate on, and then `ST_AGENT` is the raw immutable ID and every managed PTY
+/// carries the schema-2 snapshot with `agent.actor.id` plus `agent.actor.address` in place of the
+/// retired `agent.actor.path`.
+///
+/// The migrated case is also the end-to-end continuity proof: a frozen ID equals the former bus
+/// identity, so the spawned task IDs — the names `pty` binds session sockets for — are exactly the
+/// legacy ones.
+#[test]
+fn runner_owned_identity_is_the_raw_agent_id_with_schema_two_metadata_once_activated() {
+    const MINTED_ID: &str = "01998f3a-2b7c-7c31-9f0e-2a6d4b8e5c10";
+
+    for (agent_id, expected_ids) in [
+        // Migrated: the frozen ID is the former bus identity, so nothing moves.
+        (
+            "hetz.demo",
+            vec!["hetz.demo".to_owned(), "hetz.demo.ding".to_owned()],
+        ),
+        // Minted after activation: default task IDs re-key onto the ID, host bytes and all.
+        (
+            MINTED_ID,
+            vec![MINTED_ID.to_owned(), format!("{MINTED_ID}.ding")],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "agents/hetz/demo/agent.kdl",
+            &format!(
+                r#"agent "demo" {{
+  host "hetz"
+  id "{agent_id}"
+  description "owns the build"
+  command "true"
+  ding
+}}
+"#
+            ),
+        );
+        let runner = FakeRunner::default();
+
+        let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(runner.spawned.borrow().as_slice(), expected_ids);
+        let targets = runner.spawned_targets.borrow();
+        for target in targets.iter() {
+            assert_eq!(
+                target.env.get("ST_AGENT").map(String::as_str),
+                Some(agent_id),
+                "ST_AGENT is the raw agent ID, not the bus address: task {}",
+                target.pty_id
+            );
+        }
+
+        let agent_pty = targets
+            .iter()
+            .find(|target| target.pty_id == agent_id)
+            .expect("the canonical agent PTY is keyed by the agent ID");
+        let tags = &agent_pty.presentation.as_ref().unwrap().tags;
+        assert_eq!(
+            tags.get("agent.presentation.schema"),
+            Some(&Some("2".to_owned()))
+        );
+        assert_eq!(tags.get("agent.actor.id"), Some(&Some(agent_id.to_owned())));
+        assert_eq!(
+            tags.get("agent.actor.address"),
+            Some(&Some("hetz.demo".to_owned())),
+            "the address stays the host-qualified route even when the ID is opaque"
+        );
+        assert_eq!(
+            tags.get("agent.actor.path"),
+            Some(&None),
+            "schema 1's owned actor tag is retired as a removal"
+        );
+        assert_eq!(tags.get("role"), Some(&Some("agent".to_owned())));
+
+        // The derived DING companion is an exec task: no PTY metadata, and its generated argv
+        // selects its owner by exact ID.
+        let ding = targets
+            .iter()
+            .find(|target| target.pty_id != agent_id)
+            .unwrap();
+        assert_eq!(ding.kind, TaskKind::Exec);
+        assert!(ding.presentation.is_none());
+        match &ding.launch {
+            TaskLaunch::Argv(argv) => {
+                let identity = argv
+                    .windows(2)
+                    .find(|pair| pair[0] == "--identity")
+                    .expect("the generated DING argv names its owner");
+                assert_eq!(identity[1], agent_id);
+            }
+            other => panic!("the generated DING companion must be direct argv: {other:?}"),
+        }
+    }
+}
+
+/// `--identity` is an exact actor selector and `--runtime-id` is the task's on-disk ID, so once the
+/// identity model is activated the session wrapper receives the immutable agent ID and the re-keyed
+/// task ID — not the host-qualified bus identity the shared driver expansion emits.
+#[test]
+fn activated_wrapper_argv_carries_the_agent_id_and_the_task_id() {
+    const MINTED_ID: &str = "01998f3a-2b7c-7c31-9f0e-2a6d4b8e5c10";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let declaration = catalog.join("worker.kdl");
+    fs::write(
+        &declaration,
+        format!(
+            r#"agent "worker" {{
+  host "h"
+  id "{MINTED_ID}"
+  workspace "{}"
+  deliver "pi-channel"
+  argv "pi" "-a" "boot"
+}}
+"#,
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    let executable = catalog.join("bin/st2");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(&executable, "test binary").unwrap();
+
+    let (specs, _) = st2::discover_file(&catalog, &declaration).unwrap();
+    let compile = |activated: bool| {
+        let mut spec = specs.clone().into_iter().next().unwrap();
+        let mut context = TaskCompileContext::new(catalog.clone(), executable.clone()).unwrap();
+        if activated {
+            context = context.with_identity_activation(st2::identity::IdentityActivation::Activated);
+        }
+        compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
+        let task = spec.tasks.iter().find(|task| task.name == "agent").unwrap();
+        let argv = task.argv.clone().unwrap();
+        let value = |flag: &str| {
+            argv.windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+                .unwrap_or_else(|| panic!("wrapper argv has no {flag}: {argv:?}"))
+        };
+        (
+            value("--identity"),
+            value("--runtime-id"),
+            task.id.clone().unwrap(),
+        )
+    };
+
+    // Legacy stays byte-for-byte on the host-qualified bus identity.
+    assert_eq!(
+        compile(false),
+        (
+            "h.worker".to_owned(),
+            "h.worker".to_owned(),
+            "h.worker".to_owned()
+        )
+    );
+    // Activated: both runner-owned values key off the immutable ID. The lowered task ID itself is
+    // untouched in the declaration — reconciliation re-keys it — which is why `--runtime-id` is
+    // taken from the same shared rule rather than from `task.id`.
+    assert_eq!(
+        compile(true),
+        (
+            MINTED_ID.to_owned(),
+            MINTED_ID.to_owned(),
+            "h.worker".to_owned()
+        )
     );
 }
 

@@ -130,7 +130,7 @@ fn pi_deliver_wraps_the_authored_launch_without_rendering_anything() {
     );
     // No derived DING companion, and no rendered channel configuration of any kind.
     assert!(spec.tasks.iter().all(|task| !task.derived));
-    let rendered = materialize_agent(&catalog, &spec, "h").unwrap();
+    let rendered = materialize_agent(&catalog, &spec, "h", &spec.bus_id("h")).unwrap();
     assert!(
         !format!("{rendered:?}").contains("pi-channel"),
         "{rendered:?}"
@@ -163,7 +163,7 @@ fn opaque_session_driver_materializes_without_rewriting_or_adding_launch_tasks()
     compile_generated_tasks(std::slice::from_mut(&mut spec), "h", &context).unwrap();
 
     assert_eq!(spec.tasks, [original_task]);
-    assert!(materialize_agent(&catalog, &spec, "h").unwrap().is_empty());
+    assert!(materialize_agent(&catalog, &spec, "h", &spec.bus_id("h")).unwrap().is_empty());
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn claude_driver_uses_the_packaged_channel_without_project_mcp_state() {
     let hooks = tempfile::tempdir().unwrap().keep();
     st2::hooks::install_at(&hooks, false).unwrap();
     unsafe { std::env::set_var("ST_HOOKS", &hooks) };
-    materialize_agent(&catalog, &driver, "h").unwrap();
+    materialize_agent(&catalog, &driver, "h", &driver.bus_id("h")).unwrap();
     assert!(!driver_workspace.join(".mcp.json").exists());
     assert!(
         driver_workspace
@@ -419,7 +419,7 @@ fn ambiguous_driver_source_neither_compiles_nor_materializes() {
             .contains("choose one launch source")
     );
     assert_eq!(spec, before);
-    let materialize_error = materialize_agent(&catalog, &spec, "h").unwrap_err();
+    let materialize_error = materialize_agent(&catalog, &spec, "h", &spec.bus_id("h")).unwrap_err();
     assert!(
         materialize_error
             .to_string()

@@ -434,9 +434,10 @@ fn boot_team_with_runner(
     host: &str,
     runner: &dyn Runner,
 ) -> Result<UpReport> {
-    crate::reconcile::validate_task_identities(agent_specs, host)?;
+    let activation = crate::run::spec_team_activation(agent_specs);
+    crate::reconcile::validate_task_identities(agent_specs, host, &activation)?;
     let sessions = runner.list_sessions().context("listing pty sessions")?;
-    let plan = reconcile(agent_specs, &sessions, host)?;
+    let plan = reconcile(agent_specs, &sessions, host, &activation)?;
     let mut report = UpReport::default();
     let mut cap = FlappingCap::default();
     execute(&plan, runner, &mut cap, &mut report);
@@ -448,7 +449,11 @@ fn supervised_eval_sessions(
     host: &str,
     runner: &dyn Runner,
 ) -> Result<Vec<crate::reconcile::Session>> {
-    crate::reconcile::validate_task_identities(agent_specs, host)?;
+    crate::reconcile::validate_task_identities(
+        agent_specs,
+        host,
+        &crate::run::spec_team_activation(agent_specs),
+    )?;
     runner
         .list_sessions()
         .context("listing supervised eval sessions")
@@ -762,7 +767,7 @@ fn teardown_team_with_runner(specs: &[AgentSpec], host: &str, runner: &dyn Runne
         })
         .collect();
     if let Ok(sessions) = runner.list_sessions() {
-        let plan = reconcile(&retired, &sessions, host)
+        let plan = reconcile(&retired, &sessions, host, &crate::run::spec_team_activation(specs))
             .expect("retired specs are excluded from task identity admission");
         let mut report = UpReport::default();
         let mut cap = FlappingCap::default();
@@ -2320,7 +2325,8 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
             Some("st2 ding --identity evalhost.mix.sup --root $ST_ROOT")
         );
 
-        let plan = reconcile(&specs, &[], "evalhost").unwrap();
+        let plan = reconcile(&specs, &[], "evalhost", &crate::run::spec_team_activation(&specs))
+            .unwrap();
         let targets = plan
             .launch
             .iter()
@@ -2343,6 +2349,65 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 .get("ST_SUPERVISOR")
                 .map(String::as_str),
             Some("evalhost.mix.sup")
+        );
+    }
+
+    /// DELTA-003 (step 5): an in-memory spec team declares no `id` on any member, so its identity
+    /// gate must answer legacy and every runner-owned task id must keep exactly the bytes it had
+    /// before the writers landed. The expected ids are written out literally on purpose — deriving
+    /// them through `agent_key`/`default_task_id` would let the helpers under test define their own
+    /// answer.
+    #[test]
+    fn a_spec_team_without_ids_stays_legacy_and_keeps_its_task_ids() {
+        let spec = parse_spec(
+            r#"
+            team "t" {
+              agent "a" { command "sleep 100000"; ding }
+              agent "b" { command "sleep 100000" }
+            }
+            "#,
+        )
+        .unwrap();
+        let specs = spec_to_agent_specs(&spec.agents, "evalhost", Path::new("/tmp/eval-root"));
+        assert!(specs.iter().all(|spec| spec.id.is_none()));
+        let activation = crate::run::spec_team_activation(&specs);
+        assert!(matches!(
+            activation,
+            crate::identity::IdentityActivation::Legacy(_)
+        ));
+
+        let resolved = specs
+            .iter()
+            .flat_map(|spec| {
+                spec.tasks.iter().map(|task| {
+                    crate::reconcile::default_task_id(spec, task, "evalhost", &activation)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolved,
+            vec![
+                "evalhost.t.a".to_owned(),
+                "evalhost.t.a.ding".to_owned(),
+                "evalhost.t.b".to_owned(),
+            ]
+        );
+
+        let mut spawned = reconcile(&specs, &[], "evalhost", &activation)
+            .unwrap()
+            .launch
+            .iter()
+            .flat_map(|launch| launch.tasks.iter())
+            .map(|target| target.pty_id.clone())
+            .collect::<Vec<_>>();
+        spawned.sort();
+        assert_eq!(
+            spawned,
+            vec![
+                "evalhost.t.a".to_owned(),
+                "evalhost.t.a.ding".to_owned(),
+                "evalhost.t.b".to_owned(),
+            ]
         );
     }
 

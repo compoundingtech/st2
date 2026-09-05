@@ -380,7 +380,15 @@ fn resolve_driver_render_executable(plan: &mut RenderPlan, agent: &str) -> Resul
 }
 
 /// Add either the typed driver render or the unchanged legacy delivery render.
-fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<RenderPlan> {
+///
+/// `agent` is the runner-owned agent key the caller decided for this pass: the generated
+/// `.mcp.json` declaration is an exact-ID consumer, not a human address parser.
+fn effective_plan(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+    agent: &str,
+) -> Result<RenderPlan> {
     crate::driver::ensure_single_source(spec)?;
     let mut plan = parse_plan_with_driver(spec, this_host)?;
     if spec.driver.is_none() && spec.delivery == Some(agent_spec::spec::DeliveryTransport::Mcp) {
@@ -390,7 +398,7 @@ fn effective_plan(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Rend
             "mcpServers": {"st2": {
                 "type": "stdio",
                 "command": executable.to_string_lossy(),
-                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", spec.bus_id(this_host)]
+                "args": ["--catalog", root.display().to_string(), "claude-mcp", "--identity", agent]
             }}
         }).to_string();
         plan.ops.push(RenderOp::JsonUpsert {
@@ -423,8 +431,12 @@ pub(crate) fn catalog_owned_render_inputs(
     spec: &AgentSpec,
     this_host: &str,
 ) -> Result<Vec<PathBuf>> {
-    let plan = effective_plan(root, spec, this_host)?;
-    let env = render_env(root, spec, this_host);
+    // A single-subject boundary holds no proof that the whole catalog is migrated, so it stays on
+    // the legacy projection — exactly as host-scoped socket admission does. The frozen ID equals
+    // the former bus identity, so this is byte-identical for every migrated subject.
+    let agent = spec.bus_id(this_host);
+    let plan = effective_plan(root, spec, this_host, &agent)?;
+    let env = render_env(root, spec, &agent);
     let spec_dir = spec.path.parent().unwrap_or(root);
     let mut inputs = BTreeSet::new();
     for operation in plan.ops {
@@ -442,8 +454,7 @@ pub(crate) fn catalog_owned_render_inputs(
     Ok(inputs.into_iter().collect())
 }
 
-fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String, String> {
-    let bus_id = spec.bus_id(this_host);
+fn render_env(root: &Path, spec: &AgentSpec, agent: &str) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         ("CATALOG".to_string(), root.display().to_string()),
         ("ST_ROOT".to_string(), root.display().to_string()),
@@ -451,7 +462,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             "PTY_ROOT".to_string(),
             crate::run::effective_pty_root(root).display().to_string(),
         ),
-        ("ST_AGENT".to_string(), bus_id.clone()),
+        ("ST_AGENT".to_string(), agent.to_string()),
     ]);
     if let Ok(path) = crate::hooks::versioned_hooks_dir() {
         env.insert("ST_HOOKS".to_string(), path.display().to_string());
@@ -464,7 +475,7 @@ fn render_env(root: &Path, spec: &AgentSpec, this_host: &str) -> BTreeMap<String
             env.insert(key.clone(), expanded);
         }
     }
-    env.insert("ST_AGENT".to_string(), bus_id);
+    env.insert("ST_AGENT".to_string(), agent.to_string());
     env
 }
 
@@ -878,8 +889,9 @@ fn claims_for_agent(
     root: &Path,
     spec: &AgentSpec,
     this_host: &str,
+    agent: &str,
 ) -> Result<BTreeMap<PathBuf, Vec<RenderClaim>>> {
-    let plan = effective_plan(root, spec, this_host)?;
+    let plan = effective_plan(root, spec, this_host, agent)?;
     if plan.ops.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -887,7 +899,7 @@ fn claims_for_agent(
         .workspace
         .as_deref()
         .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
-    let env = render_env(root, spec, this_host);
+    let env = render_env(root, spec, agent);
     let workspace = PathBuf::from(expand(workspace_raw, &env));
     let workspace = workspace
         .canonicalize()
@@ -971,16 +983,22 @@ pub fn render_ownership_conflicts(
     specs: &[AgentSpec],
     this_host: &str,
 ) -> Vec<RenderOwnershipConflict> {
+    // One gate decision for the whole analysis: a per-subject decision would let a partially
+    // migrated catalog mix two identity models inside one comparison.
+    let activation = crate::reconcile::identity_activation(root, specs);
     let mut by_destination = BTreeMap::<PathBuf, BTreeMap<String, Vec<RenderClaim>>>::new();
     for spec in specs {
         if !spec.desired_state.is_running() || spec.resolved_host(this_host) != this_host {
             continue;
         }
-        let Ok(claims) = claims_for_agent(root, spec, this_host) else {
+        let agent = crate::reconcile::agent_key(spec, this_host, &activation);
+        let Ok(claims) = claims_for_agent(root, spec, this_host, &agent) else {
             // The normal per-agent materialization path reports malformed plans and unavailable
             // inputs. Ownership analysis only compares claims it can resolve without writing.
             continue;
         };
+        // The report key stays the host-qualified bus identity: it is this report's join key with
+        // the caller's selection set, not an identity projection.
         let owner = spec.bus_id(this_host);
         for (destination, plan) in claims {
             by_destination
@@ -1006,9 +1024,16 @@ pub fn render_ownership_conflicts(
 }
 
 /// Execute one agent's render plan in declaration order.
-pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<Vec<String>> {
-    crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
-    let plan = effective_plan(root, spec, this_host)?;
+///
+/// `agent` is the runner-owned agent key the caller decided for its pass.
+pub fn materialize_agent(
+    root: &Path,
+    spec: &AgentSpec,
+    this_host: &str,
+    agent: &str,
+) -> Result<Vec<String>> {
+    crate::reconcile::validate_agent_task_identity(spec, agent)?;
+    let plan = effective_plan(root, spec, this_host, agent)?;
     if plan.ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -1029,7 +1054,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
         .workspace
         .as_deref()
         .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
-    let env = render_env(root, spec, this_host);
+    let env = render_env(root, spec, agent);
     let workspace = PathBuf::from(expand(workspace_raw, &env));
     if !workspace.is_dir() {
         anyhow::bail!(
@@ -1203,8 +1228,14 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
 }
 
 /// Validate an agent's render declaration and all catalog-owned inputs without writing its workspace.
+///
+/// Host-scoped validation stays on the legacy projection, exactly as unbindable-socket admission
+/// does: this boundary sees one subject and cannot prove the whole catalog is migrated. Because
+/// migration freezes each live subject's ID to its former bus identity, that is byte-identical to
+/// the activated projection for every migrated subject.
 pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<()> {
-    crate::reconcile::validate_task_identities(std::slice::from_ref(spec), this_host)?;
+    let agent = spec.bus_id(this_host);
+    crate::reconcile::validate_agent_task_identity(spec, &agent)?;
     let plan = parse_plan_with_driver(spec, this_host)?;
     if plan.ops.is_empty() {
         return Ok(());
@@ -1213,7 +1244,7 @@ pub fn validate_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Result<
         .workspace
         .as_deref()
         .with_context(|| format!("agent '{}' has render{{}} but no workspace", spec.identity))?;
-    let env = render_env(root, spec, this_host);
+    let env = render_env(root, spec, &agent);
     let workspace = PathBuf::from(expand(workspace_raw, &env));
     let spec_dir = spec.path.parent().unwrap_or(root);
     for op in plan.ops {
@@ -1265,7 +1296,11 @@ pub fn materialize_catalog_against(
         .iter()
         .map(|spec| spec.bus_id(this_host))
         .collect::<HashSet<_>>();
-    if let Err(error) = crate::reconcile::validate_task_identities(ownership_specs, this_host) {
+    // One gate decision for this whole command, from the complete active fleet it was handed.
+    let activation = crate::reconcile::identity_activation(root, ownership_specs);
+    if let Err(error) =
+        crate::reconcile::validate_task_identities(ownership_specs, this_host, &activation)
+    {
         report.failed_agents.extend(selected_ids);
         report.errors.push(error.to_string());
         return report;
@@ -1292,7 +1327,8 @@ pub fn materialize_catalog_against(
         if report.failed_agents.contains(&bus_id) {
             continue;
         }
-        match materialize_agent(root, spec, this_host) {
+        let agent = crate::reconcile::agent_key(spec, this_host, &activation);
+        match materialize_agent(root, spec, this_host, &agent) {
             Ok(notes) => {
                 for note in notes {
                     if note.starts_with("WARN ") {
@@ -1531,7 +1567,7 @@ mod tests {
         .unwrap();
         let found = crate::discover(tmp.path());
         assert!(found.errors.is_empty(), "{:?}", found.errors);
-        let plan = effective_plan(tmp.path(), &found.specs[0], "h").unwrap();
+        let plan = effective_plan(tmp.path(), &found.specs[0], "h", "h.worker").unwrap();
         let settings = plan
             .ops
             .iter()
@@ -1548,5 +1584,44 @@ mod tests {
         assert_eq!(*settings.1, ArrayMerge::Union);
         let rendered: serde_json::Value = serde_json::from_str(settings.0).unwrap();
         assert_eq!(rendered, crate::hooks::claude_settings_registration());
+    }
+
+    /// The generated Claude MCP declaration selects its owner by exact ID, so `--identity` carries
+    /// whatever agent key the pass decided — the immutable agent ID once the model is activated.
+    #[test]
+    fn the_generated_mcp_declaration_carries_the_decided_agent_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let declaration = tmp.path().join("agents/h/worker/agent.kdl");
+        std::fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        std::fs::write(
+            &declaration,
+            r#"agent "worker" { host "h"; command "claude"; deliver "mcp"; workspace "$CATALOG" }"#,
+        )
+        .unwrap();
+        let found = crate::discover(tmp.path());
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+
+        for agent in ["h.worker", "01998f3a-2b7c-7c31-9f0e-2a6d4b8e5c10"] {
+            let plan = effective_plan(tmp.path(), &found.specs[0], "h", agent).unwrap();
+            let declared = plan
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    RenderOp::JsonUpsert {
+                        destination,
+                        content,
+                        ..
+                    } if destination == ".mcp.json" => Some(content),
+                    _ => None,
+                })
+                .expect("legacy mcp seats declare the st2 server");
+            let rendered: serde_json::Value = serde_json::from_str(declared).unwrap();
+            let args = rendered["mcpServers"]["st2"]["args"].as_array().unwrap();
+            let identity = args
+                .windows(2)
+                .find(|pair| pair[0] == "--identity")
+                .expect("the declaration names its owner");
+            assert_eq!(identity[1], serde_json::Value::String(agent.to_owned()));
+        }
     }
 }
