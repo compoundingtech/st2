@@ -17,7 +17,18 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+// The wire version this asset ACCEPTS on the hello. It never rises on its own: the hello is
+// st2 → asset and is written before any read, so a control plane that unilaterally raised this
+// number would be refused by every already-loaded predecessor asset, and a refusal costs that
+// seat its mail.
 const PROTOCOL = 1;
+
+// The protocol this asset can additionally SPEAK, answered with a `client_hello` when st2's hello
+// offers it. It adds no new observation to the frames below; it is this asset's positive statement
+// that it retires a never-answered ask on a turn boundary and forwards omp's own `sessionId` —
+// which is what lets st2 state the ask axis positively and link the conversation. An st2 that
+// does not offer it never sees the answer, and an older asset never sends one.
+const PROTOCOL_CONDITION_AXIS = 2;
 
 const BIN = "ST2_OMP_CHANNEL_BIN";
 const CATALOG = "ST2_OMP_CHANNEL_CATALOG";
@@ -30,9 +41,14 @@ const SEQ = "ST2_OMP_CHANNEL_SEQ";
 // and never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
+/** Diagnostic prose for a refused approval. It is not a condition and no reader branches on it. */
+const APPROVAL_DENIED = "approvalDenied";
+
 type Frame = {
   type?: string;
   protocol?: number;
+  /** Every protocol st2 would accept on this connection; absent on a version-1 control plane. */
+  protocols?: unknown;
   sessionContext?: string;
   content?: string;
   deliverAs?: "steer" | "followUp";
@@ -68,6 +84,15 @@ type Stash = {
   pendingAskToolCallId?: string;
   /** Generation fencing every bounded settle poll against newer activity. */
   settleGeneration?: number;
+  /**
+   * The protocol st2 and this asset agreed on for the LIVE channel: undefined until a hello
+   * offers version 2 and this asset answers. It is per-connection, never per-process, because a
+   * session replacement may re-spawn a DIFFERENT st2 binary; the stash outlives the channel, so
+   * a stale agreement would let this asset speak a wire its current peer never offered.
+   */
+  negotiated?: number;
+  /** omp's own session id, once an event has exposed one. Forwarded exactly once per channel. */
+  conversationSessionId?: string;
 };
 
 /**
@@ -137,7 +162,7 @@ const terminalProviderError = (event: AgentEndFrame): ProviderError | undefined 
  * build whose telemetry surface moved still loads and still delivers mail, and a widened cast alone
  * would make that tolerance absolute and silent. Erased at runtime.
  *
- * Note what this can and cannot prove for omp. It pins the SHAPE against pi 0.84.2's typings, which
+ * Note what this can and cannot prove for omp. It pins the SHAPE against pi 0.84.4's typings, which
  * is all this asset compiles against — omp ships no typings of its own. It cannot prove omp's
  * `tokens` still means prompt-only input, because that is a meaning and not a shape; the
  * version-pinned fixture in `src/pi_channel.rs` is what bounds that (HC-R13, HC-T03).
@@ -253,6 +278,11 @@ export default function (pi: ExtensionAPI) {
     // session's cost as their own.
     state.lastCostUsd = undefined;
     state.pendingAskToolCallId = undefined;
+    // Both are properties of the CONNECTION, not of the process: the successor negotiates for
+    // itself, and it must re-state omp's session id rather than assume its predecessor's peer
+    // already recorded it.
+    state.negotiated = undefined;
+    state.conversationSessionId = undefined;
 
     cancelSettle();
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
@@ -311,6 +341,15 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           clearTimeout(timer);
+          // Answer the offer — if there is one — as this asset's FIRST write. st2 keys the whole
+          // connection off this frame: a state frame that reached it first would be folded on the
+          // legacy path, and the axes below would then be read by a peer that never agreed to
+          // them. An st2 that offers nothing gets no answer and keeps version 1.
+          const offered = Array.isArray(frame.protocols) ? frame.protocols : [];
+          if (offered.includes(PROTOCOL_CONDITION_AXIS)) {
+            state.negotiated = PROTOCOL_CONDITION_AXIS;
+            send({ type: "client_hello", protocol: PROTOCOL_CONDITION_AXIS });
+          }
           settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");
           return;
         }
@@ -483,11 +522,21 @@ export default function (pi: ExtensionAPI) {
 
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
+  // A turn boundary retires a never-answered ask. A DENIED ask emits no `tool_result` at all
+  // (DQ-OMP-1), so without this one denial would hold `pendingAskToolCallId` for the whole
+  // process lifetime — muting the approval surface and, worse, making st2's positive `none` on
+  // the ask axis unreachable for every later turn.
+  const retireAsk = () => {
+    state.pendingAskToolCallId = undefined;
+  };
+
   pi.on("agent_start", async () => {
     cancelSettle();
+    retireAsk();
     sendFrame({ type: "state", state: "active" });
   });
   pi.on("agent_end", async (event, ctx) => {
+    retireAsk();
     captureCost(event);
     sendContext(ctx);
     const end = event as AgentEndFrame;
@@ -598,10 +647,30 @@ export default function (pi: ExtensionAPI) {
 
   // Approval events are an independent human-blocking surface. omp's pinned pi typings do not
   // declare them, so register through the same widened `on` view.
-  type ApprovalFrame = { toolName?: unknown };
+  type ApprovalFrame = { toolName?: unknown; sessionId?: unknown; approved?: unknown };
+  /**
+   * omp's own `sessionId`, measured on BOTH halves of the approval pair and identical across it
+   * (18.0.9 and 18.1.2 captures). It is the only typed conversation identity omp exposes to an
+   * extension — `getContextUsage`, `sessionManager.getEntries`, and `model.id` carry none — so
+   * the approval events are the only place it can be read without inventing a probe.
+   *
+   * Forwarded once per channel and only to a negotiated peer. Until one is observed this asset
+   * says NOTHING about the axis, which is a different claim from "omp has no conversations".
+   * Captured before the ask-suppression check below: the identity is a separate axis from the
+   * ask, and an approval arriving under a pending ask is still evidence of the session.
+   */
+  const noteConversation = (event: { sessionId?: unknown }) => {
+    if (state.negotiated !== PROTOCOL_CONDITION_AXIS) return;
+    const id = typeof event.sessionId === "string" ? event.sessionId.trim() : "";
+    if (!id || id === state.conversationSessionId) return;
+    state.conversationSessionId = id;
+    sendFrame({ type: "conversation", sessionId: id });
+  };
+
   onWidened("tool_approval_requested", async (rawEvent) => {
-    if (state.pendingAskToolCallId) return;
     const event = rawEvent as ApprovalFrame;
+    noteConversation(event);
+    if (state.pendingAskToolCallId) return;
     const tool = typeof event.toolName === "string" ? event.toolName : "unknown";
     cancelSettle();
     sendFrame({
@@ -612,13 +681,23 @@ export default function (pi: ExtensionAPI) {
       reason: tool,
     });
   });
-  onWidened("tool_approval_resolved", async (_event, ctx) => {
+  onWidened("tool_approval_resolved", async (rawEvent, ctx) => {
+    const event = rawEvent as ApprovalFrame;
+    noteConversation(event);
     if (state.pendingAskToolCallId) return;
+    // A denial is an INTERRUPTION, not a fault: nothing in the closed condition vocabulary names
+    // it, so the ask is simply over and the word rides as diagnostic prose. Stated only to a
+    // negotiated peer, which keeps the version-1 wire byte-identical.
+    const refused = typeof event.approved === "boolean" && !event.approved;
+    const denied =
+      state.negotiated === PROTOCOL_CONDITION_AXIS && refused
+        ? { reason: APPROVAL_DENIED }
+        : {};
     if (idleProof(ctx)) {
-      sendFrame({ type: "state", state: "idle" });
+      sendFrame({ type: "state", state: "idle", ...denied });
       return;
     }
-    sendFrame({ type: "state", state: "active" });
+    sendFrame({ type: "state", state: "active", ...denied });
     watchSettle(ctx);
   });
 

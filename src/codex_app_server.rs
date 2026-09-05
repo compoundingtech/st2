@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, driver_diagnostic, harness_context, harness_state, message, run, status};
+use crate::{
+    delivery_ledger, ding, driver_diagnostic, harness_context, harness_state, message, run, status,
+};
 
 const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
@@ -43,6 +45,10 @@ const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
 ];
 const REQUIRED_CODEX_CLIENT_NOTIFICATIONS: &[&str] = &["initialized"];
 const REQUIRED_CODEX_SERVER_NOTIFICATIONS: &[&str] = &[
+    // The account window and the typed error notification are the fault axis's two native
+    // inputs; both are branched on, so both are admitted here and pinned by shape below.
+    "account/rateLimits/updated",
+    "error",
     "item/completed",
     "item/started",
     "thread/started",
@@ -91,7 +97,6 @@ const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
-const DELIVERY_STATE_SCHEMA: &str = "st2.codex-delivery-state.v1";
 const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
@@ -295,6 +300,299 @@ fn codex_turn_outcome(turn: Option<&Value>) -> CodexTurnOutcome {
     }
 }
 
+/// Every `CodexErrorInfo` enum word this build's fault table forks on.
+///
+/// Pinned by [`verify_codex_protocol_schemas`]: a release that renamed or merged one of these
+/// must refuse the launch rather than let st2 silently reclassify a live seat's failure into the
+/// unclassified fall-through. The union's data-carrying arms are single-key objects rather than
+/// words and are deliberately absent — losing one of those costs precision, not visibility.
+const CODEX_CLASSIFIED_ERROR_WORDS: &[&str] = &[
+    "badRequest",
+    "contextWindowExceeded",
+    "cyberPolicy",
+    "internalServerError",
+    "misalignmentPolicyViolation",
+    "other",
+    "rateLimitExceeded",
+    "sandboxError",
+    "serverOverloaded",
+    "sessionBudgetExceeded",
+    "threadRollbackFailed",
+    CODEX_PROVIDER_AUTH_REJECTED,
+    "usageLimitExceeded",
+];
+
+/// Every `RateLimitReachedType` word this build's fault table forks on, pinned for the same
+/// reason as the error words above: the fork between a throttled window and an exhausted
+/// allowance is exactly what these words decide.
+const CODEX_RATE_LIMIT_REACHED_WORDS: &[&str] = &[
+    "rate_limit_reached",
+    "workspace_member_credits_depleted",
+    "workspace_member_usage_limit_reached",
+    "workspace_owner_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+];
+
+/// The provider's own explanation for a resume it refused, carried as the conversation bridge's
+/// diagnostic reason. st2's own rejection words for that axis are reserved and unspellable here.
+const CODEX_NO_PERSISTED_ROLLOUT: &str = "no persisted rollout";
+
+/// Which signal raised a fault, so a paired clear names the EXACT key its own signal raised.
+///
+/// The account rate-limit window is deliberately NOT a member. `account/rateLimits/updated` is a
+/// sparse rolling update whose nullable fields mean "unavailable in this update", never
+/// "recovered" — the generated schema says so in as many words — so no snapshot of it can be
+/// read as a clear. A window fault this build raises is escaped only by a positive turn
+/// completion, a new claim, or a new incarnation, until a merged or explicitly read snapshot
+/// signal exists to prove the window lifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexFaultSource {
+    /// A typed word Codex itself named, on a turn result, the error notification, or the account
+    /// window's own reached type.
+    Typed,
+    /// st2's own unclassified-protocol hold; leaving that hold is its paired clear.
+    UnknownProtocol,
+    /// A failure the harness reported without classifying it. It never REPLACES a fault that
+    /// already stands, because a typed word for the same episode says strictly more.
+    Unclassified,
+}
+
+/// One statement about the fault axis, derived from exactly one signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexConditionOp {
+    Raise {
+        fault: harness_state::FaultReport,
+        source: CodexFaultSource,
+    },
+    /// Clear the fault this incarnation raised from that signal, by the exact key it raised.
+    ClearRaised(CodexFaultSource),
+    /// Clear the whole axis on a positive observation of progress a fault would have blocked.
+    ClearAll(harness_state::ProgressProof),
+}
+
+/// A write this producer still owes the record.
+#[derive(Debug, Clone)]
+enum CodexPendingWrite {
+    /// The legacy observation, which is the shape this build's writer still emits.
+    Legacy(harness_state::Observation),
+    /// The version 3 tuple.
+    Frame(harness_state::Frame),
+}
+
+/// What this producer can prove about its conversation identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexConversationEvidence {
+    /// No thread bound yet — and nothing is published while unbound either.
+    Unbound,
+    /// A thread a typed provider response named, verified through that frame's instant.
+    Probed {
+        thread_id: String,
+        verified_through_ms: u64,
+    },
+    /// The identity exists and is not reachable from this connection.
+    Unreachable { reason: &'static str },
+}
+
+/// Codex's own error vocabulary mapped onto the closed fault axis, plus the recovery class that
+/// word means where the harness states no retry of its own.
+///
+/// A presence-tested `match` with an explicit fall-through, never a lookup with a default: a
+/// future or renamed word must stay VISIBLE under the most conservative truthful category rather
+/// than be folded into a neighbour, so it becomes a harness-reported unclassified failure whose
+/// recovery nobody claims to know. `other` — Codex's own catch-all — lands there by the same
+/// route, because it names no cause at all.
+fn codex_fault_class(word: &str) -> (harness_state::FaultCategory, harness_state::Recovery) {
+    use crate::harness_state::{FaultCategory as Category, Recovery};
+    match word {
+        CODEX_PROVIDER_AUTH_REJECTED => (Category::Authentication, Recovery::Human),
+        "usageLimitExceeded" | "sessionBudgetExceeded" => (Category::Quota, Recovery::Human),
+        "rateLimitExceeded" => (Category::RateLimit, Recovery::Human),
+        "serverOverloaded"
+        | "internalServerError"
+        | "httpConnectionFailed"
+        | "responseStreamConnectionFailed"
+        | "responseStreamDisconnected"
+        | "responseTooManyFailedAttempts" => (Category::Provider, Recovery::Human),
+        "contextWindowExceeded" => (Category::Context, Recovery::Human),
+        "cyberPolicy" | "misalignmentPolicyViolation" => (Category::Policy, Recovery::Human),
+        "badRequest" | "activeTurnNotSteerable" => (Category::Configuration, Recovery::Human),
+        "threadRollbackFailed" | "sandboxError" => (Category::Harness, Recovery::Human),
+        _ => (Category::Harness, Recovery::Unknown),
+    }
+}
+
+/// The one word a `CodexErrorInfo` names.
+///
+/// The union has two shapes: bare enum strings, and single-key objects carrying data
+/// (`httpConnectionFailed`, the response-stream family, `activeTurnNotSteerable`). An
+/// `as_str`-only read would silently drop that whole family, so the object arm's single key IS
+/// its word. Anything else — a null, a multi-key object, a shape this build cannot read — states
+/// nothing rather than guessing.
+fn codex_error_info_word(info: Option<&Value>) -> Option<&str> {
+    match info? {
+        Value::String(word) if !word.is_empty() => Some(word.as_str()),
+        Value::Object(fields) if fields.len() == 1 => fields
+            .keys()
+            .next()
+            .map(String::as_str)
+            .filter(|word| !word.is_empty()),
+        _ => None,
+    }
+}
+
+/// One Codex error word as a fault a consumer can route, time, and age.
+fn codex_fault(
+    word: &str,
+    will_retry: Option<bool>,
+    observed_at_ms: u64,
+) -> harness_state::FaultReport {
+    let (category, stated) = codex_fault_class(word);
+    let recovery = match will_retry {
+        // `willRetry` is required on the error notification and absent from a turn result. Where
+        // Codex states it, a promised retry IS an automatic recovery; a refused retry leaves the
+        // table's own class, which is never optimistic.
+        Some(true) => harness_state::Recovery::Automatic,
+        Some(false) | None => stated,
+    };
+    harness_state::FaultReport::new(category, recovery, observed_at_ms)
+        .with_code(format!("codex/{word}"))
+}
+
+/// What one inbound control frame states about the fault axis.
+///
+/// One frame yields at most one statement, and a frame that states nothing yields `None` —
+/// never a clear, because an activity edge has observed nothing about the provider. Codex emits
+/// its unclassified `thread/status/changed -> systemError` BEFORE the typed `error` notification
+/// and the failed `turn/completed`, so the typed words arrive last and win.
+fn codex_condition_edge(
+    message: &Value,
+    thread_id: &str,
+    observed_at_ms: u64,
+) -> Option<CodexConditionOp> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    let bound = message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id);
+    match method {
+        "error" if bound => Some(CodexConditionOp::Raise {
+            fault: codex_fault(
+                codex_error_info_word(message.pointer("/params/error/codexErrorInfo"))?,
+                message
+                    .pointer("/params/willRetry")
+                    .and_then(Value::as_bool),
+                observed_at_ms,
+            ),
+            source: CodexFaultSource::Typed,
+        }),
+        "turn/completed" if bound => {
+            match message
+                .pointer("/params/turn/status")
+                .and_then(Value::as_str)?
+            {
+                // The only positive progress proof this protocol emits: a turn ran to completion
+                // against the provider, which every fault above would have prevented.
+                "completed" => Some(CodexConditionOp::ClearAll(
+                    harness_state::ProgressProof::TurnCompleted,
+                )),
+                // A turn result carries no retry statement, so the table's class stands.
+                "failed" => Some(CodexConditionOp::Raise {
+                    fault: codex_fault(
+                        codex_error_info_word(
+                            message.pointer("/params/turn/error/codexErrorInfo"),
+                        )?,
+                        None,
+                        observed_at_ms,
+                    ),
+                    source: CodexFaultSource::Typed,
+                }),
+                // `interrupted`, `inProgress`, and any future word: no evidence either way, so a
+                // standing fault stands.
+                _ => None,
+            }
+        }
+        // The account window is seat-level and names no thread at all.
+        "account/rateLimits/updated" => {
+            codex_rate_limit_condition(message.pointer("/params/rateLimits")?, observed_at_ms)
+        }
+        _ => None,
+    }
+}
+
+/// What one `account/rateLimits/updated` snapshot states about the fault axis.
+///
+/// The notification is a SPARSE rolling update: its own schema says nullable account metadata
+/// "may be unavailable in a rolling update and does not clear a previously observed value". So
+/// every absent-or-null field here means UNAVAILABLE, never recovered — an omitted or null
+/// `rateLimitReachedType` states nothing at all, and no snapshot of this notification can clear
+/// a standing fault. A window fault is escaped only by a positive turn completion, a new claim,
+/// or a new incarnation.
+///
+/// For the same reason the classification is built only from fields actually PRESENT: calling a
+/// reached window self-clearing means claiming the allowance behind it is intact, which is a
+/// claim only the credit metadata can support.
+fn codex_rate_limit_condition(
+    snapshot: &Value,
+    observed_at_ms: u64,
+) -> Option<CodexConditionOp> {
+    use crate::harness_state::{FaultCategory as Category, FaultReport, Recovery};
+    // Only this field says a window was REACHED. Occupancy alone classifies nothing: the numeric
+    // record already carries it, and Codex account-window occupancy does not decide availability
+    // without its separate credit metadata.
+    let reached = snapshot
+        .get("rateLimitReachedType")
+        .and_then(Value::as_str)?;
+    // Present credit metadata, or nothing. `hasCredits` and `unlimited` are both required on the
+    // snapshot Codex sends, so their absence here is the sparse update omitting the whole object
+    // — unavailable, and unavailable proves nothing in either direction.
+    let credits = snapshot.pointer("/credits");
+    let has_credits = credits
+        .and_then(|credits| credits.get("hasCredits"))
+        .and_then(Value::as_bool);
+    let unlimited = credits
+        .and_then(|credits| credits.get("unlimited"))
+        .and_then(Value::as_bool);
+    // The wall behind the window: a limit reached with the balance proven empty is not a window
+    // that rolls over, it is a purchase a person has to make.
+    if has_credits == Some(false) && unlimited == Some(false) {
+        return Some(CodexConditionOp::Raise {
+            fault: FaultReport::new(Category::Quota, Recovery::Human, observed_at_ms)
+                .with_code("codex/creditsDepleted"),
+            source: CodexFaultSource::Typed,
+        });
+    }
+    let solvent = has_credits == Some(true) || unlimited == Some(true);
+    let (category, recovery) = match reached {
+        // A throttled window whose allowance is PROVEN intact is the one arm that recovers by
+        // itself. Where the credit metadata is unavailable the same word proves only that a
+        // limit was reached, so the recovery stays unsayable — which pages rather than waits.
+        "rate_limit_reached" if solvent => (Category::RateLimit, Recovery::Automatic),
+        "rate_limit_reached" => (Category::RateLimit, Recovery::Unknown),
+        "workspace_owner_usage_limit_reached"
+        | "workspace_member_usage_limit_reached"
+        | "workspace_owner_credits_depleted"
+        | "workspace_member_credits_depleted" => (Category::Quota, Recovery::Human),
+        // The gate pins every word above, so this arm is reachable only through a release the
+        // gate refused to admit. It keeps the field's own family and a recovery nobody claims to
+        // know.
+        _ => (Category::RateLimit, Recovery::Unknown),
+    };
+    let mut fault = FaultReport::new(category, recovery, observed_at_ms)
+        .with_code(format!("codex/rateLimitReached.{reached}"));
+    // `resetsAt` is EPOCH SECONDS in the captured snapshot, and nullable there too. A deadline
+    // belongs only to a recovery that happens by itself, and one preceding its own observation
+    // makes the whole record indeterminate — so an absent, unreadable, or inverted stamp is
+    // simply omitted.
+    if recovery == Recovery::Automatic
+        && let Some(resets_at) = snapshot.pointer("/primary/resetsAt").and_then(Value::as_i64)
+        && let Ok(resets_at_ms) = u64::try_from(resets_at.saturating_mul(1_000))
+        && resets_at_ms >= observed_at_ms
+    {
+        fault = fault.with_observation_due(resets_at_ms);
+    }
+    Some(CodexConditionOp::Raise {
+        fault,
+        source: CodexFaultSource::Typed,
+    })
+}
+
 impl CodexObservedState {
     /// Driver-side projection into the generic observed-harness-state vocabulary (#162). `Held` is
     /// a delivery predicate — the complement of steerable — and never leaks into the published
@@ -359,6 +657,122 @@ impl CodexObservedState {
                 | CodexHoldReason::UnknownStatus => None,
             },
         }
+    }
+
+    /// Driver-side projection into the version 3 tuple: the same activity and ask facts the
+    /// legacy projection reports, with two deliberate differences.
+    ///
+    /// A terminal PROVIDER error is no longer an `ended` seat. `ended` is the incarnation's last
+    /// word and belongs to the process-exit owner alone ([`run_connected`]); a Codex thread that
+    /// failed a turn is a LIVE seat that is not working, which is exactly what the fault axis is
+    /// for. The failure reaches the record through [`Self::state_condition`] and the typed error
+    /// frames instead — and for the same reason a thread-level `systemError`, which the legacy
+    /// projection had to withhold entirely, is now reported: the fault is the provable part.
+    ///
+    /// The condition axis rides `Unchanged` on every frame. An activity edge has observed
+    /// nothing about the provider, and the publish site states the axis once per incarnation.
+    fn harness_frame(&self) -> Option<harness_state::Frame> {
+        use crate::harness_state::{
+            Activity, AskKind, ConditionReport, Frame, HumanAsk, InputBuffer,
+        };
+        // This producer reads the app-server control stream and cannot see the composer.
+        let frame =
+            |state, ask| Frame::new(state, InputBuffer::Unknown, ConditionReport::Unchanged, ask);
+        Some(match self {
+            CodexObservedState::AwaitingStatus => return None,
+            CodexObservedState::Idle => frame(Activity::Idle, HumanAsk::None),
+            // No work is in progress and the failure rides the fault axis. `providerAuth` is the
+            // same word OpenCode's `ProviderAuthError` already publishes.
+            CodexObservedState::TerminalError { reason } => frame(Activity::Idle, HumanAsk::None)
+                .with_reason(match reason {
+                    CodexTerminalError::SystemError => "systemError",
+                    CodexTerminalError::ProviderAuthRejected => "providerAuth",
+                }),
+            CodexObservedState::Active { .. } => frame(Activity::Active, HumanAsk::None),
+            CodexObservedState::Held { reason, .. } => match reason {
+                // Review's edges are model-emitted items inside a running turn: plain activity,
+                // no human, no ask. The delivery hold is a separate axis, and the protocol gate
+                // pins exactly two active flags — so no Codex signal can mean a review ask.
+                CodexHoldReason::Review => {
+                    frame(Activity::Active, HumanAsk::None).with_reason("review")
+                }
+                CodexHoldReason::WaitingOnApproval => {
+                    frame(Activity::Active, HumanAsk::Pending(AskKind::Permission))
+                        .with_reason("waitingOnApproval")
+                }
+                CodexHoldReason::WaitingOnUserInput => {
+                    frame(Activity::Active, HumanAsk::Pending(AskKind::Question))
+                        .with_reason("waitingOnUserInput")
+                }
+                // Compaction is work the harness does on itself, never a fault.
+                CodexHoldReason::Compaction => {
+                    frame(Activity::Active, HumanAsk::None).with_reason("compaction")
+                }
+                CodexHoldReason::UnknownProtocol => {
+                    frame(Activity::Active, HumanAsk::None).with_reason("unknownProtocol")
+                }
+                // Codex positively reported active; st2 merely cannot name a steerable turn.
+                CodexHoldReason::ActiveWithoutTurn => {
+                    frame(Activity::Active, HumanAsk::None).with_reason("activeWithoutTurn")
+                }
+                CodexHoldReason::ConflictingTurn => {
+                    frame(Activity::Active, HumanAsk::None).with_reason("conflictingTurn")
+                }
+                CodexHoldReason::SystemError => {
+                    frame(Activity::Idle, HumanAsk::None).with_reason("systemError")
+                }
+                // Nothing here is provable, and no absence may derive a definite state.
+                CodexHoldReason::NotLoaded | CodexHoldReason::UnknownStatus => return None,
+            },
+        })
+    }
+
+    /// What the observed state ITSELF states about the fault axis, for the two failures that
+    /// carry no native word: st2's own unclassified-protocol hold, and a thread-level system
+    /// error Codex reports without naming a cause.
+    ///
+    /// Every state that projects a frame and is not the unclassified-protocol hold carries that
+    /// hold's paired clear, because a state only ever leaves that hold by the hold's own signal —
+    /// a typed exit item or a later thread status. No state states a clear of anything else.
+    fn state_condition(&self, observed_at_ms: u64) -> Option<CodexConditionOp> {
+        use crate::harness_state::{FaultCategory, FaultReport, Recovery};
+        let harness_fault = |code: &str, recovery| {
+            FaultReport::new(FaultCategory::Harness, recovery, observed_at_ms)
+                .with_code(format!("codex/{code}"))
+        };
+        Some(match self {
+            CodexObservedState::Held {
+                reason: CodexHoldReason::UnknownProtocol,
+                ..
+            } => CodexConditionOp::Raise {
+                // st2's own plumbing is the fault: a signal this build cannot classify holds
+                // delivery, and a person has to teach the adapter the word.
+                fault: harness_fault("unknownProtocol", Recovery::Human),
+                source: CodexFaultSource::UnknownProtocol,
+            },
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            }
+            | CodexObservedState::Held {
+                reason: CodexHoldReason::SystemError,
+                ..
+            } => CodexConditionOp::Raise {
+                // Visible under the most conservative truthful category, with a recovery nobody
+                // claims to know. It yields to the typed word Codex sends for the same episode.
+                fault: harness_fault("systemError", Recovery::Unknown),
+                source: CodexFaultSource::Unclassified,
+            },
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderAuthRejected,
+            } => CodexConditionOp::Raise {
+                fault: codex_fault(CODEX_PROVIDER_AUTH_REJECTED, None, observed_at_ms),
+                source: CodexFaultSource::Typed,
+            },
+            _ if self.harness_frame().is_some() => {
+                CodexConditionOp::ClearRaised(CodexFaultSource::UnknownProtocol)
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -464,51 +878,13 @@ struct PendingCodexDelivery {
     method: CodexDeliveryMethod,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum CodexDeliveryPhase {
-    Attempted,
-    Accepted,
-}
-
-/// One durable FIFO delivery attempt.
-///
-/// `Attempted` is written before transport. A replacement control connection reconciles that
-/// ambiguous attempt against the resumed thread before it may send the client ID again. `Accepted`
-/// is written only after the exact completed typed user-message event and remains until normal
-/// message archive precedence removes the inbox entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CodexDeliveryState {
-    schema: String,
-    agent: String,
-    runtime_id: String,
-    runtime_incarnation: String,
-    thread_id: String,
-    filename: String,
-    client_id: String,
-    phase: CodexDeliveryPhase,
-}
-
-impl CodexDeliveryState {
-    fn attempted(
-        runtime: &CodexRuntime,
-        thread_id: String,
-        filename: String,
-        client_id: String,
-    ) -> Self {
-        Self {
-            schema: DELIVERY_STATE_SCHEMA.to_string(),
-            agent: runtime.agent.clone(),
-            runtime_id: runtime.runtime_id.clone(),
-            runtime_incarnation: runtime.incarnation.clone(),
-            thread_id,
-            filename,
-            client_id,
-            phase: CodexDeliveryPhase::Attempted,
-        }
-    }
-}
+// One durable FIFO delivery attempt lives in the shared `crate::delivery_ledger`, which grades
+// Codex's two receipts honestly: the JSON-RPC result of `turn/start`/`turn/steer` is
+// `transportAccepted`, and only the exact completed typed user message — live, or found in a
+// resumed thread's history — is `consumed`. Codex has no storage receipt and no scheduler
+// admission signal, so it can never write the phases in between, and consumption is its true
+// ceiling: reaching it releases FIFO ownership. Ordinary message archive precedence, which is the
+// recipient agent's own act, still removes the inbox entry.
 
 /// The exact codex-cli version whose Rust source settled the occupancy arithmetic below, read at
 /// tag `rust-v0.151.0` (tag object `d8673cb68e349c208659b986697773d3145dbb14`) because the Nix
@@ -799,7 +1175,6 @@ struct RejectedCodexDelivery {
 
 struct CodexInboxDelivery {
     config: CodexDeliveryConfig,
-    state_path: PathBuf,
     runtime: CodexRuntime,
     wake: Receiver<()>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -807,7 +1182,7 @@ struct CodexInboxDelivery {
     next_presence_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
-    state: Option<CodexDeliveryState>,
+    ledger: delivery_ledger::Ledger,
     pending: Option<PendingCodexDelivery>,
     rejected: Option<RejectedCodexDelivery>,
     next_request_id: u64,
@@ -816,9 +1191,20 @@ struct CodexInboxDelivery {
     /// and stop the heartbeat, so a state the pump can no longer see ages out instead of staying
     /// artificially fresh.
     harness_evidence: bool,
-    /// A projected transition whose write failed, retried on the next pump pass before any
-    /// heartbeat may re-stamp the contradicted on-disk state.
-    pending_observation: Option<harness_state::Observation>,
+    /// A projected write that failed, retried on the next pump pass before any heartbeat may
+    /// re-stamp the contradicted on-disk state.
+    pending_write: Option<CodexPendingWrite>,
+    /// Whether this incarnation has stated the condition axis at least once. Version 3 cannot
+    /// write `absent`, so the first frame states it and every later frame carries it forward.
+    condition_stated: bool,
+    /// The fault this incarnation raised and believes stands, beside the signal that raised it,
+    /// so a paired clear names the EXACT key rather than a category or a code prefix.
+    standing_fault: Option<(harness_state::FaultKey, CodexFaultSource)>,
+    /// A fault-axis operation waiting for the observation it attaches to, or retried after a
+    /// failed write.
+    pending_condition: Option<CodexConditionOp>,
+    /// What this producer can prove about the conversation bridge.
+    conversation: CodexConversationEvidence,
     /// The numeric axis's producer, beside the categorical one. `None` only where the record has
     /// nowhere safe to stage — observability never blocks a launch.
     context: Option<CodexContextProducer>,
@@ -831,7 +1217,7 @@ struct CodexInboxDelivery {
 impl CodexInboxDelivery {
     fn new(
         config: CodexDeliveryConfig,
-        state_path: PathBuf,
+        legacy_path: PathBuf,
         runtime: CodexRuntime,
     ) -> Result<Self> {
         fs::create_dir_all(&config.inbox).with_context(|| {
@@ -844,7 +1230,18 @@ impl CodexInboxDelivery {
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
-        let state = load_delivery_state(&state_path, &config.identity, runtime.runtime_id())?;
+        // The ledger's authority is `delivery-ledger.json`; the v1 path beside it is the one-shot
+        // adoption source and the rollback floor, never read as authority again. Codex's v1
+        // `Accepted` was written only from the typed completed user message, so it adopts as
+        // `consumed` — the one adoption that may suppress a duplicate on its own evidence.
+        let identity = config.identity.clone();
+        let ledger = delivery_ledger::Ledger::open(
+            &legacy_path,
+            delivery_ledger::Harness::Codex.profile(),
+            &config.identity,
+            runtime.runtime_id(),
+            |thread, filename| stable_client_user_message_id(&identity, thread, filename),
+        );
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
         // driver-expanded seats — a hand-authored seat may declare a different task ID.
@@ -907,7 +1304,6 @@ impl CodexInboxDelivery {
         );
         Ok(Self {
             config,
-            state_path,
             runtime,
             wake,
             _watcher: watcher,
@@ -915,13 +1311,17 @@ impl CodexInboxDelivery {
             next_presence_refresh: Instant::now(),
             head: None,
             suppressed: false,
-            state,
+            ledger,
             pending: None,
             rejected: None,
             next_request_id: FIRST_DELIVERY_REQUEST_ID,
             harness_writer,
             harness_evidence: false,
-            pending_observation: None,
+            pending_write: None,
+            condition_stated: false,
+            standing_fault: None,
+            pending_condition: None,
+            conversation: CodexConversationEvidence::Unbound,
             context,
             diagnostics,
         })
@@ -933,16 +1333,49 @@ impl CodexInboxDelivery {
     /// retried before any heartbeat, so a stale on-disk state is never kept fresh in
     /// contradiction of the latest observation.
     fn observe_harness(&mut self, observed: &CodexObservedState) {
-        match observed.harness_observation() {
-            Some(observation) => self.publish_observation(observation),
-            None => {
-                // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
-                // and mark the stream discontinuous so a state restated after the gap opens a
-                // fresh transition instead of claiming continuity across an unobserved interval.
-                self.harness_evidence = false;
-                self.pending_observation = None;
-                self.harness_writer.interrupt();
+        // Version 2 carries no condition, tagged-ask, or conversation axis, and this build still
+        // emits it: the legacy projection rides EXACTLY as it did before, and not one of the
+        // version 3 operations below is reachable until the writer emits version 3.
+        if !self.harness_writer.writes_condition_axis() {
+            match observed.harness_observation() {
+                Some(observation) => self.publish_observation(observation),
+                None => self.lose_evidence(),
             }
+            return;
+        }
+        match observed.harness_frame() {
+            Some(frame) => {
+                self.publish_frame(frame);
+                self.settle_condition(observed);
+            }
+            None => self.lose_evidence(),
+        }
+    }
+
+    /// Attach whatever the fault axis now has to say, once there is an observation to attach it
+    /// to.
+    ///
+    /// Two statements can ride one frame: what the observed state itself says, and the typed
+    /// native edge that arrived with it. State first, native second — the native word is the more
+    /// specific claim about the same episode, and Codex reports its unclassified thread status
+    /// first. Without landed evidence NEITHER is applied: a condition write restates the
+    /// record's activity verbatim, so attaching one now would refresh a stale state. The edge
+    /// queues instead, keeping the typed native statement where both are waiting.
+    fn settle_condition(&mut self, observed: &CodexObservedState) {
+        let stated = observed.state_condition(message::now_ms());
+        if !self.harness_evidence {
+            if let Some(op) = stated
+                && self.pending_condition.is_none()
+            {
+                self.pending_condition = Some(op);
+            }
+            return;
+        }
+        if let Some(op) = stated {
+            self.apply_condition(op);
+        }
+        if let Some(op) = self.pending_condition.take() {
+            self.apply_condition(op);
         }
     }
 
@@ -986,39 +1419,231 @@ impl CodexInboxDelivery {
         }
     }
 
+    /// Record what one inbound control frame states about the fault axis.
+    ///
+    /// Frame-level like [`Self::observe_context`] and [`Self::observe_provider_auth`], for the
+    /// same reason: it reads fields — the typed error notification's `willRetry`, the account
+    /// window's reached type — that no branch below it looks at, and every one of them may
+    /// `continue`. It returns whether an edge was recorded, because a fault changes the observed
+    /// record while leaving `CodexObservedState` identical: the publish predicate must be the
+    /// union of the two, or a fault would never reach the record at all.
+    ///
+    /// The edge is applied after the frame it arrived with is published, because a condition
+    /// attaches to an observation. A newer edge replaces an unapplied one: it is the later
+    /// statement about the same axis.
+    fn observe_condition(&mut self, message: &Value, thread_id: &str) -> bool {
+        if !self.harness_writer.writes_condition_axis() {
+            return false;
+        }
+        let Some(op) = codex_condition_edge(message, thread_id, message::now_ms()) else {
+            return false;
+        };
+        self.pending_condition = Some(op);
+        true
+    }
+
+    /// The bound thread is this session's conversation identity, proven by the typed provider
+    /// response that named it.
+    fn bind_conversation(&mut self, thread_id: &str) {
+        self.conversation = CodexConversationEvidence::Probed {
+            thread_id: thread_id.to_string(),
+            verified_through_ms: message::now_ms(),
+        };
+    }
+
+    /// The identity exists and this connection cannot reach it: a resume the provider refused.
+    fn conversation_unreachable(&mut self, reason: &'static str) {
+        self.conversation = CodexConversationEvidence::Unreachable { reason };
+    }
+
+    /// The conversation bridge as this producer can PROVE it, or `None` while there is nothing
+    /// proven to state — which leaves the record's axis exactly as it stands rather than
+    /// claiming an absence.
+    fn conversation_state(&self) -> Option<harness_state::ConversationState> {
+        match &self.conversation {
+            CodexConversationEvidence::Unbound => None,
+            CodexConversationEvidence::Probed {
+                thread_id,
+                verified_through_ms,
+            } => Some(harness_state::ConversationState::Linked(
+                harness_state::ConversationClaim {
+                    driver: "codex".to_string(),
+                    conversation: thread_id.clone(),
+                    // Codex rewrites thread context through `contextCompaction`, which this
+                    // adapter observes on the same stream: a prefix read once may be gone.
+                    history_mutability: harness_state::HistoryMutability::Rewritable,
+                    // Both bind paths carry a positive typed provider probe: the accepted
+                    // `thread/resume` response, or the owning TUI's own `thread/started`.
+                    capability_evidence: harness_state::CapabilityEvidence::Probed,
+                    verified_through_ms: *verified_through_ms,
+                },
+            )),
+            CodexConversationEvidence::Unreachable { reason } => Some(
+                harness_state::ConversationState::Unavailable(Some((*reason).to_string())),
+            ),
+        }
+    }
+
     fn publish_observation(&mut self, observation: harness_state::Observation) {
         match self.harness_writer.observe(observation.clone()) {
             Ok(()) => {
                 self.harness_evidence = true;
-                self.pending_observation = None;
+                self.pending_write = None;
             }
             Err(_) => {
                 self.harness_evidence = false;
                 self.harness_writer.interrupt();
-                self.pending_observation = Some(observation);
+                self.pending_write = Some(CodexPendingWrite::Legacy(observation));
             }
         }
     }
 
-    fn write_state(&mut self, state: CodexDeliveryState) -> Result<()> {
-        atomic_json(&self.state_path, &state)?;
-        self.state = Some(state);
-        Ok(())
+    /// Publish one resolved version 3 tuple.
+    ///
+    /// The condition axis is stated exactly ONCE per incarnation and carried forward untouched
+    /// afterwards. Version 3 cannot write `absent`, and the claim this construction made removed
+    /// whatever a predecessor left, so a fresh incarnation stating `clear` states exactly what it
+    /// has observed: no fault. Every later frame states `unchanged`, because an activity edge has
+    /// observed nothing about the provider and a frame restating `clear` would erase a standing
+    /// fault on every turn boundary.
+    fn publish_frame(&mut self, frame: harness_state::Frame) {
+        let mut frame = frame;
+        if !self.condition_stated {
+            frame.condition = harness_state::ConditionReport::Clear;
+        }
+        if let Some(conversation) = self.conversation_state() {
+            frame = frame.with_conversation(conversation);
+        }
+        match self.harness_writer.publish(frame.clone()) {
+            Ok(outcome) if outcome.accepted() => {
+                self.harness_evidence = true;
+                self.pending_write = None;
+                self.condition_stated = true;
+            }
+            // A refusal is an ownership or version verdict, not a transient failure: a later
+            // session owns the record, or it speaks a version this writer does not emit. No
+            // retry changes either, so this writer stops claiming evidence and lets the record
+            // age out instead of spinning on a write that cannot land.
+            Ok(refused) => {
+                tracing::warn!("st2 codex: observed-state publish refused: {refused:?}");
+                self.lose_evidence();
+            }
+            Err(error) => {
+                tracing::warn!("st2 codex: observed-state publish failed: {error:#}");
+                self.harness_evidence = false;
+                self.harness_writer.interrupt();
+                self.pending_write = Some(CodexPendingWrite::Frame(frame));
+            }
+        }
     }
 
-    fn clear_state(&mut self) -> Result<()> {
-        remove_state_file(&self.state_path)?;
-        self.state = None;
-        Ok(())
+    /// Evidence lost: stop heartbeating, drop anything pending (it predates the gap), and mark
+    /// the stream discontinuous so a state restated after the gap opens a fresh transition
+    /// instead of claiming continuity across an interval nobody observed. The fault ledger is
+    /// deliberately untouched: a condition st2 observed does not stop holding because the
+    /// activity axis went dark.
+    fn lose_evidence(&mut self) {
+        self.harness_evidence = false;
+        self.pending_write = None;
+        self.harness_writer.interrupt();
+    }
+
+    /// Apply one fault-axis operation against what this incarnation believes stands.
+    fn apply_condition(&mut self, op: CodexConditionOp) {
+        // Version 2 has nowhere to carry a condition and the writer refuses the operation as a
+        // value, so retrying it would spin forever. Nothing reaches here until version 3.
+        if !self.harness_writer.writes_condition_axis() {
+            return;
+        }
+        let outcome = match &op {
+            CodexConditionOp::Raise { fault, source } => {
+                // A failure the harness reported without classifying it never REPLACES a fault
+                // that already stands: a typed word for the same episode says strictly more,
+                // and Codex reports its unclassified thread status before the typed word.
+                if *source == CodexFaultSource::Unclassified && self.standing_fault.is_some() {
+                    return;
+                }
+                self.harness_writer.raise_fault(fault.clone())
+            }
+            CodexConditionOp::ClearRaised(source) => {
+                // A paired clear names the EXACT key its own signal raised. Where this
+                // incarnation raised nothing from that signal there is nothing to clear, and a
+                // clear derived from a category would let one signal silence another's fault.
+                let Some((key, raised)) = self.standing_fault.clone() else {
+                    return;
+                };
+                if raised != *source {
+                    return;
+                }
+                self.harness_writer.clear_fault(key)
+            }
+            CodexConditionOp::ClearAll(proof) => {
+                if self.standing_fault.is_none() {
+                    return;
+                }
+                self.harness_writer.clear_all(*proof)
+            }
+        };
+        match outcome {
+            Ok(landed) if landed.accepted() => {
+                self.standing_fault = match &op {
+                    CodexConditionOp::Raise { fault, source } => Some((fault.key(), *source)),
+                    CodexConditionOp::ClearRaised(_) | CodexConditionOp::ClearAll(_) => None,
+                };
+            }
+            // The fault this clear named is not the one standing — it was already replaced. The
+            // record is right and the ledger was stale: benign, and never retried.
+            Ok(harness_state::WriteOutcome::Refused(
+                harness_state::Refusal::ConditionMismatch { current },
+            )) => {
+                tracing::debug!("st2 codex: paired clear matched no standing fault: {current:?}");
+            }
+            // A condition attaches to an observation, and the first fault of a session can
+            // arrive before its first frame: retried on the next pump pass.
+            Ok(harness_state::WriteOutcome::Refused(harness_state::Refusal::Unobserved)) => {
+                self.pending_condition = Some(op);
+            }
+            Ok(refused) => {
+                tracing::warn!("st2 codex: fault write refused: {refused:?}");
+            }
+            Err(error) => {
+                tracing::warn!("st2 codex: fault write failed: {error:#}");
+                self.pending_condition = Some(op);
+            }
+        }
+    }
+
+    /// Reconcile the ledger to what the recipient still has unread, then re-assert the rollback
+    /// floor. Archive precedence is the recipient agent's act and the only settlement authority:
+    /// an entry whose file left the inbox releases ownership, and this pump never moves a file.
+    fn reconcile_inbox(&mut self, unread: &[message::Message]) -> Result<()> {
+        self.ledger
+            .prune(|filename| unread.iter().any(|message| message.filename == filename))?;
+        // Re-asserted on every pass while an entry is outstanding: a crash exactly at the floor
+        // write would otherwise leave a landing with no v1-readable lower bound.
+        self.ledger.reassert_floor()
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
         let now = Instant::now();
         // A pending transition retries on EVERY pump pass — its write failed once and the
         // on-disk record contradicts the latest observation until it lands; only the heartbeat
-        // is presence-cadence work.
-        if let Some(pending) = self.pending_observation.clone() {
-            self.publish_observation(pending);
+        // is presence-cadence work. The fault edge retries behind it, in that order: a
+        // condition attaches to an observation, so it cannot land before one exists.
+        if let Some(pending) = self.pending_write.clone() {
+            match pending {
+                CodexPendingWrite::Legacy(observation) => self.publish_observation(observation),
+                CodexPendingWrite::Frame(frame) => self.publish_frame(frame),
+            }
+        }
+        // A fault attaches to an OBSERVATION and a condition write carries the record's activity
+        // forward verbatim, so a queued edge waits while this session has no landed observation:
+        // applying one across an evidence gap would restate — and re-stamp — a state the pump
+        // could no longer see. It attaches on the pass after evidence returns.
+        if self.harness_evidence
+            && let Some(pending) = self.pending_condition.take()
+        {
+            self.apply_condition(pending);
         }
         if now >= self.next_presence_refresh {
             // This wrapper owns the live provider session. It therefore owns the presence lease.
@@ -1037,13 +1662,7 @@ impl CodexInboxDelivery {
             return Ok(());
         }
         let unread = message::list_inbox(&self.config.inbox)?;
-        if self.state.as_ref().is_some_and(|state| {
-            unread
-                .iter()
-                .all(|message| message.filename != state.filename)
-        }) {
-            self.clear_state()?;
-        }
+        self.reconcile_inbox(&unread)?;
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
                 .iter()
@@ -1063,20 +1682,48 @@ impl CodexInboxDelivery {
         if self.pending.is_some() || !state.subscribed || self.suppressed {
             return Ok(None);
         }
-        if let Some(delivery_state) = self.state.as_ref() {
-            if delivery_state.thread_id == state.thread_id {
-                return Ok(None);
-            }
-            // A newly selected thread is a different delivery binding. An old binding's receipt
-            // must neither suppress nor acknowledge delivery to this thread.
-            self.clear_state()?;
+        // Fail closed: an unreadable ledger holds and surfaces rather than guessing. It never
+        // refuses to start — a control connection that will not start delivers nothing at all.
+        // The operator-visible surface is the existing typed boundary — the transport is
+        // unavailable — and the raw reason stays in tracing, so no unbounded prose reaches the
+        // record. Restating it is coalesced by the publisher, so a held pass costs no write.
+        if let Some(reason) = self.ledger.quarantined().map(str::to_string) {
+            tracing::warn!("st2 codex: delivery ledger is quarantined: {reason}");
+            self.diagnostics.publish(
+                driver_diagnostic::Stage::Delivery,
+                driver_diagnostic::Reason::DeliveryUnavailable,
+                driver_diagnostic::Source::PromptTransport,
+            );
+            return Ok(None);
         }
-        let Some(head) = self.head.as_ref() else {
+        // A newly selected thread is a different delivery binding. An old binding's receipt must
+        // neither suppress nor acknowledge delivery to this thread.
+        if self
+            .ledger
+            .binding()
+            .is_some_and(|binding| binding != state.thread_id())
+        {
+            self.ledger.rebind(state.thread_id())?;
+        }
+        let Some(head) = self.head.clone() else {
             return Ok(None);
         };
         if self.rejected.as_ref().is_some_and(|rejected| {
             rejected.filename == head.filename && rejected.observed == state.observed
         }) {
+            return Ok(None);
+        }
+        // Exactly one delivery is outstanding at a time on this transport: an entry bound to some
+        // other file holds the pump until archive precedence resolves it, so a message arriving
+        // out of filename order can never open a second concurrent delivery.
+        if !self.ledger.entries().is_empty() && self.ledger.entry(&head.filename).is_none() {
+            return Ok(None);
+        }
+        // An attempt this pump already owns is held until evidence settles or refuses it. Only an
+        // authoritative "no" — a rejected request, or a resumed history proving the client ID
+        // never landed — authorizes sending the same identity again; a carried-forward v1 record
+        // never does.
+        if self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry {
             return Ok(None);
         }
         let method = match &state.observed {
@@ -1102,16 +1749,28 @@ impl CodexInboxDelivery {
             &self.config.catalog_root,
             &self.config.this_host,
             &self.config.identity,
-            head,
+            &head,
         );
         let request =
             codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
-        self.write_state(CodexDeliveryState::attempted(
-            &self.runtime,
-            state.thread_id().to_string(),
-            filename.clone(),
-            client_id,
-        ))?;
+        // Durable ownership before transport: the v1-readable floor first, then the ledger's own
+        // `attempted`.
+        self.ledger.begin(delivery_ledger::Begin {
+            filename: filename.clone(),
+            binding: state.thread_id().to_string(),
+            correlation: delivery_ledger::Correlation::native(client_id.clone()),
+            // Codex's typed receipt is a live frame, so an attempt is acknowledged only by the
+            // incarnation that made it; an older one is settled by the resume sweep instead.
+            incarnation: Some(self.runtime.incarnation().to_string()),
+            legacy_floor: delivery_ledger::codex_floor(
+                &self.config.identity,
+                self.runtime.runtime_id(),
+                self.runtime.incarnation(),
+                state.thread_id(),
+                &filename,
+                &client_id,
+            ),
+        })?;
         self.pending = Some(PendingCodexDelivery {
             request_id,
             filename,
@@ -1134,13 +1793,13 @@ impl CodexInboxDelivery {
             .take()
             .context("Codex delivery is not pending")?;
         if message.get("error").is_some() {
-            if !self
-                .state
-                .as_ref()
-                .is_some_and(|state| state.phase == CodexDeliveryPhase::Accepted)
-            {
-                self.clear_state()?;
-            }
+            // The request itself was refused: an authoritative negative acknowledgement about
+            // this attempt, and the only thing that re-authorizes the same client ID here. A
+            // delivery that already reached its ceiling cannot be un-settled by a late error.
+            self.ledger.negative(
+                &pending.filename,
+                delivery_ledger::NegativeReceipt::Rejected,
+            )?;
             self.rejected = Some(RejectedCodexDelivery {
                 filename: pending.filename,
                 observed: observed.clone(),
@@ -1159,6 +1818,12 @@ impl CodexInboxDelivery {
                 );
             }
         }
+        // The request returned a well-formed result. That is a fact about the call, never about
+        // the model, so it grades no higher than `transportAccepted`.
+        self.ledger.record(
+            &pending.filename,
+            delivery_ledger::Evidence::TransportAccepted,
+        )?;
         self.rejected = None;
         Ok(true)
     }
@@ -1169,26 +1834,37 @@ impl CodexInboxDelivery {
         {
             return Ok(false);
         }
-        let Some(delivery_state) = self.state.as_ref() else {
+        let Some(client_id) = message
+            .pointer("/params/item/clientId")
+            .and_then(Value::as_str)
+        else {
             return Ok(false);
         };
         if message.pointer("/params/threadId").and_then(Value::as_str) != Some(state.thread_id())
-            || delivery_state.thread_id != state.thread_id()
-            || delivery_state.runtime_incarnation != self.runtime.incarnation()
             || state.runtime_incarnation != self.runtime.incarnation()
-            || message
-                .pointer("/params/item/clientId")
-                .and_then(Value::as_str)
-                != Some(delivery_state.client_id.as_str())
         {
             return Ok(false);
         }
-        if delivery_state.phase == CodexDeliveryPhase::Accepted {
-            return Ok(true);
+        // One correlation may carry several inbox files, so one typed receipt settles every entry
+        // it delivered — each on its own monotone entry.
+        let settled: Vec<String> = self
+            .ledger
+            .correlated(client_id)
+            .into_iter()
+            .filter(|filename| {
+                self.ledger.entry(filename).is_some_and(|entry| {
+                    entry.binding == state.thread_id()
+                        && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
+                })
+            })
+            .collect();
+        if settled.is_empty() {
+            return Ok(false);
         }
-        let mut accepted = delivery_state.clone();
-        accepted.phase = CodexDeliveryPhase::Accepted;
-        self.write_state(accepted)?;
+        for filename in &settled {
+            self.ledger
+                .record(filename, delivery_ledger::Evidence::Consumed)?;
+        }
         Ok(true)
     }
 
@@ -1198,12 +1874,17 @@ impl CodexInboxDelivery {
         if message.get("error").is_some() {
             return Ok(());
         }
-        let Some(delivery_state) = self.state.as_ref() else {
-            return Ok(());
-        };
-        if delivery_state.thread_id != state.thread_id()
-            || delivery_state.phase == CodexDeliveryPhase::Accepted
-        {
+        let unsettled: Vec<(String, String)> = self
+            .ledger
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.binding == state.thread_id()
+                    && entry.phase < delivery_ledger::Phase::Consumed
+            })
+            .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
+            .collect();
+        if unsettled.is_empty() {
             return Ok(());
         }
         let turns = message
@@ -1212,70 +1893,30 @@ impl CodexInboxDelivery {
             .context(
                 "Codex thread/resume response has no typed turn history for delivery recovery",
             )?;
-        let accepted = turns.iter().any(|turn| {
-            turn.get("items")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("userMessage")
-                            && item.get("clientId").and_then(Value::as_str)
-                                == Some(delivery_state.client_id.as_str())
+        for (filename, client_id) in unsettled {
+            let accepted = turns.iter().any(|turn| {
+                turn.get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("userMessage")
+                                && item.get("clientId").and_then(Value::as_str)
+                                    == Some(client_id.as_str())
+                        })
                     })
-                })
-        });
-        if accepted {
-            let mut state = delivery_state.clone();
-            state.phase = CodexDeliveryPhase::Accepted;
-            self.write_state(state)
-        } else {
-            self.clear_state()
+            });
+            if accepted {
+                self.ledger
+                    .record(&filename, delivery_ledger::Evidence::Consumed)?;
+            } else {
+                // An authoritative resumed history without the client ID proves the pre-crash
+                // attempt never landed. That absence is the receipt — retained, not erased —
+                // and only it may authorize sending the same stable ID again.
+                self.ledger
+                    .negative(&filename, delivery_ledger::NegativeReceipt::Absent)?;
+            }
         }
-    }
-}
-
-fn load_delivery_state(
-    path: &Path,
-    identity: &str,
-    runtime_id: &str,
-) -> Result<Option<CodexDeliveryState>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let state: CodexDeliveryState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("reading Codex delivery state {}", path.display()))?;
-    anyhow::ensure!(
-        state.schema == DELIVERY_STATE_SCHEMA,
-        "Codex delivery state has unsupported schema '{}'",
-        state.schema
-    );
-    anyhow::ensure!(
-        state.agent == identity && state.runtime_id == runtime_id,
-        "Codex delivery state belongs to a different runtime"
-    );
-    anyhow::ensure!(
-        !state.runtime_incarnation.is_empty()
-            && !state.thread_id.is_empty()
-            && message::is_message_filename(&state.filename),
-        "Codex delivery state has an invalid runtime binding or filename"
-    );
-    anyhow::ensure!(
-        state.client_id
-            == stable_client_user_message_id(identity, &state.thread_id, &state.filename),
-        "Codex delivery state client ID does not match its binding"
-    );
-    Ok(Some(state))
-}
-
-fn remove_state_file(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            File::open(path.parent().context("state file has no parent")?)?.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Ok(())
     }
 }
 
@@ -2058,19 +2699,30 @@ fn run_connected(
         Some(runtime.runtime_id().to_string()),
     )
     .with_session(runtime.incarnation());
+    // Wrapper-owned, so it goes through the shared terminal write: a codex TUI that died before
+    // the pump published anything leaves the condition axis unstated behind the claim fence, and
+    // version 3 refuses that write rather than serializing an axis nobody stated. This process
+    // watched a child, not a provider turn, so `clear` is the only axis it may state.
     let _ = match &result {
-        Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
-        Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
+        Ok(TuiEnd::Exited(status)) => crate::provider_session::write_terminal(
+            &mut harness_writer,
+            &describe_tui_exit(Some(*status)),
+            None,
+            harness_state::ConditionReport::Clear,
+        ),
+        Ok(TuiEnd::Stopped(status)) => crate::provider_session::write_terminal(
+            &mut harness_writer,
+            &describe_tui_exit(*status),
+            None,
+            harness_state::ConditionReport::Clear,
+        ),
         Err(error) => {
             let observed_exit = tui.try_wait().ok().flatten();
-            harness_writer.observe(
-                harness_state::Observation::new(
-                    harness_state::Activity::Ended,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Unknown,
-                )
-                .with_exit(describe_tui_exit(observed_exit))
-                .with_reason(format!("{error}")),
+            crate::provider_session::write_terminal(
+                &mut harness_writer,
+                &describe_tui_exit(observed_exit),
+                Some(&format!("{error}")),
+                harness_state::ConditionReport::Clear,
             )
         }
     };
@@ -2801,7 +3453,7 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_state_path = control_state_path.with_file_name("delivery-state.json");
+        let delivery_state_path = control_state_path.with_file_name(delivery_ledger::LEGACY_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_state_path.clone(), runtime.clone())
@@ -2920,6 +3572,10 @@ fn pump_control(
                     atomic_json(control_state_path, &bound)
                         .context("persisting Codex control state")?;
                     if let Some(delivery) = delivery.as_mut() {
+                        // The resumed thread's identity is proven by the typed resume response
+                        // this frame just accepted, so the conversation bridge is stated from
+                        // that probe rather than from a thread id st2 merely remembers.
+                        delivery.bind_conversation(bound.thread_id());
                         delivery.observe_harness(&bound.observed);
                     }
                     control_state = Some(bound);
@@ -2945,6 +3601,9 @@ fn pump_control(
                 atomic_json(control_state_path, &bound)
                     .context("persisting Codex fresh control state")?;
                 if let Some(delivery) = delivery.as_mut() {
+                    // Same probe on the fresh path: the owning TUI's typed `thread/started`
+                    // named this thread, which is what `binding_candidate` just read.
+                    delivery.bind_conversation(bound.thread_id());
                     delivery.observe_harness(&bound.observed);
                 }
                 control_state = Some(bound);
@@ -2963,12 +3622,18 @@ fn pump_control(
             // another reading on the next model response, roughly 10-15 per turn — and the record
             // is honest about the gap through `ageMs` meanwhile, which is cheaper than teaching the
             // binding handshake to hold observability frames it has no state to attribute yet.
-            if let Some(delivery) = delivery.as_mut() {
-                delivery.observe_context(&message, state.thread_id());
-                // The credential axis, taken here for the same reason: it reads a typed turn
-                // result no branch below looks at, and every one of them may `continue`.
-                delivery.observe_provider_auth(&message, state.thread_id());
-            }
+            let condition_changed = match delivery.as_mut() {
+                Some(delivery) => {
+                    delivery.observe_context(&message, state.thread_id());
+                    // The credential axis, taken here for the same reason: it reads a typed turn
+                    // result no branch below looks at, and every one of them may `continue`.
+                    delivery.observe_provider_auth(&message, state.thread_id());
+                    // The fault axis, same reason once more — and it is the only reader of
+                    // `willRetry` and of the account window's reached type.
+                    delivery.observe_condition(&message, state.thread_id())
+                }
+                None => false,
+            };
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
                     delivery
@@ -3002,7 +3667,14 @@ fn pump_control(
                         }
                         changed
                     }
-                    SubscriptionAcceptance::Deferred => false,
+                    SubscriptionAcceptance::Deferred => {
+                        // The conversation identity exists and this connection cannot reach it:
+                        // stated as unavailable rather than as a link nobody could resume.
+                        if let Some(delivery) = delivery.as_mut() {
+                            delivery.conversation_unreachable(CODEX_NO_PERSISTED_ROLLOUT);
+                        }
+                        false
+                    }
                 }
             } else {
                 state
@@ -3012,9 +3684,17 @@ fn pump_control(
             if changed {
                 atomic_json(control_state_path, state)
                     .context("persisting Codex observed control state")?;
-                if let Some(delivery) = delivery.as_mut() {
-                    delivery.observe_harness(&state.observed);
-                }
+            }
+            // A fault edge changes the observed record while leaving `CodexObservedState`
+            // identical, so the publish predicate is the union of the two. The control-state
+            // FILE stays gated on `changed` alone: it carries no condition axis, and the
+            // observed record is the one place a fault belongs.
+            if (changed || condition_changed)
+                && let Some(delivery) = delivery.as_mut()
+            {
+                delivery.observe_harness(&state.observed);
+            }
+            if changed {
                 let _ = events.send(ControlEvent::Observed);
             }
             if !state.subscribed
@@ -3471,16 +4151,104 @@ fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> Result<()> {
         "TurnError.codexErrorInfo does not use CodexErrorInfo"
     );
     let error_words = schema_variant_words(definitions, "CodexErrorInfo")?;
-    for word in [
-        CODEX_PROVIDER_AUTH_REJECTED,
-        "rateLimitExceeded",
-        "usageLimitExceeded",
-    ] {
+    // Every word the fault table forks on, not only the credential and quota trio: a merged or
+    // renamed arm must refuse the launch rather than silently reclassify a live seat's failure
+    // into the unclassified fall-through. The data-carrying arms (`httpConnectionFailed` and the
+    // response-stream family) are objects rather than enum words and stay unpinned on purpose:
+    // losing one costs precision, and the fall-through still keeps the failure visible.
+    for word in CODEX_CLASSIFIED_ERROR_WORDS {
         anyhow::ensure!(
-            error_words.contains(word),
+            error_words.contains(*word),
             "CodexErrorInfo has no '{word}' word"
         );
     }
+    // The typed error NOTIFICATION, which carries a failure Codex reports beside — and before —
+    // any turn result. `willRetry` is required and overrides the recovery class of every word
+    // above, so a release that made it optional must refuse the launch instead of leaving st2 to
+    // guess whether a fault clears itself.
+    let notified_error = required_schema_path(definitions, "ErrorNotification", &["error"])?;
+    anyhow::ensure!(
+        notified_error == schema_definition(definitions, "TurnError")?,
+        "ErrorNotification.error does not use TurnError"
+    );
+    for field in ["threadId", "turnId"] {
+        let schema = required_schema_path(definitions, "ErrorNotification", &[field])?;
+        require_type(
+            definitions,
+            schema,
+            "string",
+            &format!("ErrorNotification.{field}"),
+        )?;
+    }
+    require_property_type(
+        definitions,
+        schema_definition(definitions, "ErrorNotification")?,
+        "willRetry",
+        "boolean",
+        true,
+        "ErrorNotification",
+    )?;
+    // The account rate-limit snapshot: `rateLimitReachedType` is the only field that classifies
+    // a window as reached — occupancy alone classifies nothing — the credit metadata is the wall
+    // behind it, and `resetsAt` is the automatic recovery's deadline.
+    let snapshot = required_schema_path(
+        definitions,
+        "AccountRateLimitsUpdatedNotification",
+        &["rateLimits"],
+    )?;
+    anyhow::ensure!(
+        snapshot == schema_definition(definitions, "RateLimitSnapshot")?,
+        "AccountRateLimitsUpdatedNotification.rateLimits does not use RateLimitSnapshot"
+    );
+    let reached = nullable_schema(
+        definitions,
+        property(
+            definitions,
+            snapshot,
+            "rateLimitReachedType",
+            "RateLimitSnapshot",
+        )?,
+        "RateLimitSnapshot.rateLimitReachedType",
+    )?;
+    anyhow::ensure!(
+        reached == schema_definition(definitions, "RateLimitReachedType")?,
+        "RateLimitSnapshot.rateLimitReachedType does not use RateLimitReachedType"
+    );
+    let reached_words = schema_enum(definitions, "RateLimitReachedType")?;
+    for word in CODEX_RATE_LIMIT_REACHED_WORDS {
+        anyhow::ensure!(
+            reached_words.contains(*word),
+            "RateLimitReachedType has no '{word}' word"
+        );
+    }
+    let credits = nullable_schema(
+        definitions,
+        property(definitions, snapshot, "credits", "RateLimitSnapshot")?,
+        "RateLimitSnapshot.credits",
+    )?;
+    for field in ["hasCredits", "unlimited"] {
+        require_property_type(
+            definitions,
+            credits,
+            field,
+            "boolean",
+            true,
+            "CreditsSnapshot",
+        )?;
+    }
+    let primary = nullable_schema(
+        definitions,
+        property(definitions, snapshot, "primary", "RateLimitSnapshot")?,
+        "RateLimitSnapshot.primary",
+    )?;
+    require_property_type(
+        definitions,
+        primary,
+        "resetsAt",
+        "integer",
+        false,
+        "RateLimitWindow",
+    )?;
     for notification in ["ItemStartedNotification", "ItemCompletedNotification"] {
         let item = required_schema_path(definitions, notification, &["item"])?;
         anyhow::ensure!(
@@ -4535,12 +5303,7 @@ mod tests {
                 "oneOf": [
                     {
                         "type": "string",
-                        "enum": [
-                            "usageLimitExceeded",
-                            "rateLimitExceeded",
-                            "unauthorized",
-                            "other"
-                        ]
+                        "enum": CODEX_CLASSIFIED_ERROR_WORDS
                     },
                     object_schema(
                         &["httpConnectionFailed"],
@@ -4548,6 +5311,74 @@ mod tests {
                     )
                 ]
             }),
+        );
+        definitions.insert(
+            "ErrorNotification".into(),
+            object_schema(
+                &["error", "threadId", "turnId", "willRetry"],
+                &[
+                    ("error", reference("TurnError")),
+                    ("threadId", json!({ "type": "string" })),
+                    ("turnId", json!({ "type": "string" })),
+                    ("willRetry", json!({ "type": "boolean" })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "RateLimitReachedType".into(),
+            json!({
+                "type": "string",
+                "enum": CODEX_RATE_LIMIT_REACHED_WORDS
+            }),
+        );
+        definitions.insert(
+            "RateLimitWindow".into(),
+            object_schema(
+                &["usedPercent"],
+                &[
+                    ("usedPercent", json!({ "type": "integer" })),
+                    ("windowDurationMins", json!({ "type": ["integer", "null"] })),
+                    ("resetsAt", json!({ "type": ["integer", "null"] })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "CreditsSnapshot".into(),
+            object_schema(
+                &["hasCredits", "unlimited"],
+                &[
+                    ("hasCredits", json!({ "type": "boolean" })),
+                    ("unlimited", json!({ "type": "boolean" })),
+                    ("balance", json!({ "type": ["string", "null"] })),
+                ],
+            ),
+        );
+        definitions.insert(
+            "RateLimitSnapshot".into(),
+            object_schema(
+                &[],
+                &[
+                    (
+                        "primary",
+                        json!({ "anyOf": [reference("RateLimitWindow"), { "type": "null" }] }),
+                    ),
+                    (
+                        "credits",
+                        json!({ "anyOf": [reference("CreditsSnapshot"), { "type": "null" }] }),
+                    ),
+                    (
+                        "rateLimitReachedType",
+                        json!({ "anyOf": [reference("RateLimitReachedType"), { "type": "null" }] }),
+                    ),
+                ],
+            ),
+        );
+        definitions.insert(
+            "AccountRateLimitsUpdatedNotification".into(),
+            object_schema(
+                &["rateLimits"],
+                &[("rateLimits", reference("RateLimitSnapshot"))],
+            ),
         );
         for notification in ["TurnStartedNotification", "TurnCompletedNotification"] {
             definitions.insert(
@@ -4815,6 +5646,79 @@ mod tests {
         let error = verify_codex_protocol_schemas(&untyped).unwrap_err();
         assert!(
             format!("{error:#}").contains("Turn has no error property"),
+            "{error:#}"
+        );
+    }
+
+    /// Branching on the typed `error` notification means depending on it: a release that drops
+    /// the notification, its required retry statement, or any word the fault table reads must
+    /// refuse the launch rather than silently stop classifying a live seat's failures.
+    #[test]
+    fn the_gate_pins_the_error_notification_and_every_classified_word() {
+        let mut missing = compatible_protocol_schemas();
+        missing
+            .server_notifications
+            .get_mut("oneOf")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .retain(|arm| {
+                arm.pointer("/properties/method/enum/0").and_then(Value::as_str) != Some("error")
+            });
+        let error = verify_codex_protocol_schemas(&missing).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("server notification"),
+            "{error:#}"
+        );
+
+        let mut unretried = compatible_protocol_schemas();
+        unretried
+            .protocol
+            .pointer_mut("/definitions/ErrorNotification/required")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .retain(|name| name.as_str() != Some("willRetry"));
+        let error = verify_codex_protocol_schemas(&unretried).unwrap_err();
+        assert!(format!("{error:#}").contains("willRetry"), "{error:#}");
+
+        for word in [
+            "sessionBudgetExceeded",
+            "contextWindowExceeded",
+            "serverOverloaded",
+            "cyberPolicy",
+            "badRequest",
+            "sandboxError",
+            "other",
+        ] {
+            let mut dropped = compatible_protocol_schemas();
+            dropped
+                .protocol
+                .pointer_mut("/definitions/CodexErrorInfo/oneOf/0/enum")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .retain(|value| value.as_str() != Some(word));
+            let error = verify_codex_protocol_schemas(&dropped).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("CodexErrorInfo has no '{word}' word")),
+                "{error:#}"
+            );
+        }
+
+        // The account window's own reached-type vocabulary, for exactly the same reason: the
+        // fault table forks on these words too.
+        let mut reached = compatible_protocol_schemas();
+        reached
+            .protocol
+            .pointer_mut("/definitions/RateLimitReachedType/enum")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .retain(|value| value.as_str() != Some("rate_limit_reached"));
+        let error = verify_codex_protocol_schemas(&reached).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("rate_limit_reached"),
             "{error:#}"
         );
     }
@@ -5318,10 +6222,24 @@ mod tests {
     fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDelivery {
         CodexInboxDelivery::new(
             config,
-            root.join("state/delivery-state.json"),
+            root.join("state").join(delivery_ledger::LEGACY_FILE),
             CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
         )
         .unwrap()
+    }
+
+    /// Read the ledger back through its own loader and the real correlation derivation: a test
+    /// that read the bytes directly would not notice a record the pump itself would refuse.
+    fn ledger_entry(root: &Path, filename: &str) -> Option<delivery_ledger::Entry> {
+        delivery_ledger::Ledger::open(
+            &root.join("state").join(delivery_ledger::LEGACY_FILE),
+            delivery_ledger::Harness::Codex.profile(),
+            "h.worker",
+            "h.worker",
+            |thread, file| stable_client_user_message_id("h.worker", thread, file),
+        )
+        .entry(filename)
+        .cloned()
     }
 
     fn acknowledge_tui_thread_loaded(events: &Receiver<ControlEvent>) {
@@ -5825,6 +6743,690 @@ mod tests {
         );
     }
 
+    /// The 23-frame #263 capture read on the version 3 axes. The seat that used to project
+    /// `ended` on a provider failure now reads a LIVE seat carrying one typed quota fault:
+    /// `ended` is the incarnation's last word and belongs to the process-exit owner alone.
+    #[test]
+    fn captured_usage_limit_is_a_live_quota_fault_not_an_ended_seat() {
+        use crate::harness_state::{Activity, FaultCategory, HumanAsk, Recovery};
+        let frames = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let observed_at_ms = 1_788_000_000_000;
+        let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+        let mut stated = Vec::new();
+        for frame in &frames {
+            state.observe(frame).unwrap();
+            if let Some(op) = codex_condition_edge(frame, "thread-main", observed_at_ms) {
+                stated.push((
+                    frame["method"].as_str().unwrap_or_default().to_string(),
+                    op,
+                ));
+            }
+            // No frame of the capture may project a terminal record.
+            if let Some(projected) = state.observed().harness_frame() {
+                assert_ne!(projected.state, Activity::Ended, "{frame}");
+                assert!(projected.exit.is_none(), "{frame}");
+            }
+        }
+
+        // Exactly two captured frames state the fault, in the captured order.
+        assert_eq!(
+            stated
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["error", "turn/completed"]
+        );
+        for (method, op) in &stated {
+            let CodexConditionOp::Raise { fault, .. } = op else {
+                panic!("{method} must raise a fault: {op:?}")
+            };
+            assert_eq!(fault.category, FaultCategory::Quota, "{method}");
+            assert_eq!(
+                fault.code.as_deref(),
+                Some("codex/usageLimitExceeded"),
+                "{method}"
+            );
+            // `willRetry` is false in the capture and a failed turn states no retry at all:
+            // neither may report an automatic recovery nobody promised.
+            assert_eq!(fault.recovery, Recovery::Human, "{method}");
+            assert_eq!(fault.observed_at_ms, observed_at_ms, "{method}");
+            assert_eq!(fault.next_observation_due_ms, None, "{method}");
+        }
+
+        let projected = state
+            .observed()
+            .harness_frame()
+            .expect("a faulted seat is still an observable seat");
+        assert_eq!(projected.state, Activity::Idle);
+        assert_eq!(projected.ask, HumanAsk::None);
+        assert_eq!(projected.reason.as_deref(), Some("systemError"));
+    }
+
+    /// The two captures walk identical methods and differ in ONE word of `codexErrorInfo`. That
+    /// word is the whole fork: a credential a person must repair against an allowance that ran
+    /// out, neither read from prose.
+    #[test]
+    fn a_rejected_credential_and_an_exhausted_allowance_diverge_on_one_word() {
+        use crate::harness_state::FaultCategory;
+        let error_frame = |fixture: &str| {
+            fixture
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|frame| frame["method"] == "error")
+                .expect("each capture carries the typed error notification")
+        };
+        for (fixture, category, code) in [
+            (
+                include_str!("../tests/fixtures/codex_provider_auth_inbound.jsonl"),
+                FaultCategory::Authentication,
+                "codex/unauthorized",
+            ),
+            (
+                include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl"),
+                FaultCategory::Quota,
+                "codex/usageLimitExceeded",
+            ),
+        ] {
+            let Some(CodexConditionOp::Raise { fault, source }) =
+                codex_condition_edge(&error_frame(fixture), "thread-main", 11)
+            else {
+                panic!("{code} must raise a fault")
+            };
+            assert_eq!(fault.category, category, "{code}");
+            assert_eq!(fault.code.as_deref(), Some(code));
+            assert_eq!(source, CodexFaultSource::Typed, "{code}");
+        }
+    }
+
+    /// A blanket clear is the one operation that can silence a fault nobody saw resolve, so it
+    /// rides exactly one positive edge: a turn that ran to completion against the provider.
+    #[test]
+    fn only_a_completed_turn_clears_every_fault() {
+        let completed = |status: &str, error: Value| {
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turn": { "id": "turn-1", "status": status, "error": error }
+                }
+            })
+        };
+        assert_eq!(
+            codex_condition_edge(&completed("completed", Value::Null), "thread-main", 1),
+            Some(CodexConditionOp::ClearAll(
+                harness_state::ProgressProof::TurnCompleted
+            ))
+        );
+        assert!(matches!(
+            codex_condition_edge(
+                &completed("failed", json!({ "codexErrorInfo": "sandboxError" })),
+                "thread-main",
+                1
+            ),
+            Some(CodexConditionOp::Raise { .. })
+        ));
+        // Neither an interrupted turn nor one this version cannot classify is evidence either
+        // way, so a standing fault stands.
+        for status in ["interrupted", "inProgress", "futureStatus"] {
+            assert_eq!(
+                codex_condition_edge(&completed(status, Value::Null), "thread-main", 1),
+                None,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            codex_condition_edge(&completed("failed", Value::Null), "thread-main", 1),
+            None,
+            "a failed turn with no typed error states nothing rather than guessing"
+        );
+        assert_eq!(
+            codex_condition_edge(&completed("completed", Value::Null), "thread-other", 1),
+            None,
+            "another thread's progress is not this seat's evidence"
+        );
+    }
+
+    /// `account/rateLimits/updated` is a SPARSE rolling update: absent-or-null means the field
+    /// was unavailable in this update, never that anything recovered. So no snapshot of it
+    /// states a clear, and the classification is built only from fields actually present — an
+    /// automatic recovery in particular is a claim about the allowance behind the window, which
+    /// only the credit metadata can support.
+    #[test]
+    fn a_sparse_window_snapshot_states_only_what_it_carries() {
+        use crate::harness_state::{FaultCategory, Recovery};
+        let captured = include_str!("../tests/fixtures/codex_token_usage_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["method"] == "account/rateLimits/updated")
+            .expect("the capture carries one rate-limit snapshot");
+        assert_eq!(
+            codex_condition_edge(&captured, "thread-main", 1),
+            None,
+            "the captured present-and-null reached type is unavailable, not a recovery"
+        );
+
+        let observed_at_ms = 1_788_000_000_000;
+        let snapshot = |reached: Value, extra: Value| {
+            let mut limits = json!({
+                "primary": {
+                    "usedPercent": 100,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_788_452_803_i64
+                },
+                "rateLimitReachedType": reached
+            });
+            if let Some(fields) = extra.as_object() {
+                for (key, value) in fields {
+                    limits[key] = value.clone();
+                }
+            }
+            json!({
+                "method": "account/rateLimits/updated",
+                "params": { "rateLimits": limits }
+            })
+        };
+        let solvent = json!({ "credits": { "hasCredits": true, "unlimited": false } });
+
+        // Nothing about the fault axis is stated by a snapshot whose reached type is null,
+        // omitted, or carried only as occupancy — and never a clear, whatever stands.
+        for (label, frame) in [
+            ("null", snapshot(Value::Null, solvent.clone())),
+            (
+                "omitted",
+                json!({
+                    "method": "account/rateLimits/updated",
+                    "params": { "rateLimits": { "primary": { "usedPercent": 44 } } }
+                }),
+            ),
+            (
+                "no params",
+                json!({ "method": "account/rateLimits/updated" }),
+            ),
+        ] {
+            assert_eq!(
+                codex_condition_edge(&frame, "thread-main", observed_at_ms),
+                None,
+                "{label}"
+            );
+        }
+
+        // A reached window whose allowance is PROVEN intact is the one arm that recovers by
+        // itself, and `resetsAt` is EPOCH SECONDS in the capture.
+        let Some(CodexConditionOp::Raise { fault, source }) = codex_condition_edge(
+            &snapshot(json!("rate_limit_reached"), solvent),
+            "thread-main",
+            observed_at_ms,
+        ) else {
+            panic!("a reached window is a fault")
+        };
+        assert_eq!(fault.category, FaultCategory::RateLimit);
+        assert_eq!(
+            fault.code.as_deref(),
+            Some("codex/rateLimitReached.rate_limit_reached")
+        );
+        assert_eq!(fault.recovery, Recovery::Automatic);
+        assert_eq!(fault.next_observation_due_ms, Some(1_788_452_803_000));
+        assert!(fault.next_observation_due_ms.unwrap() >= fault.observed_at_ms);
+        // Every rate-limit fault is a typed word Codex named, so the window's own snapshots can
+        // never name a paired clear for it: only a positive turn completion escapes it.
+        assert_eq!(source, CodexFaultSource::Typed);
+
+        // The same word with the credit metadata UNAVAILABLE proves only that a limit was
+        // reached: no automatic recovery is claimed, and no deadline rides an unsayable one.
+        let Some(CodexConditionOp::Raise { fault, .. }) = codex_condition_edge(
+            &snapshot(json!("rate_limit_reached"), json!({})),
+            "thread-main",
+            observed_at_ms,
+        ) else {
+            panic!("a reached window is still a fault")
+        };
+        assert_eq!(fault.category, FaultCategory::RateLimit);
+        assert_eq!(fault.recovery, Recovery::Unknown);
+        assert_eq!(fault.next_observation_due_ms, None);
+
+        // A proven-empty balance is a purchase, not a window: quota, human, no deadline.
+        let Some(CodexConditionOp::Raise { fault, .. }) = codex_condition_edge(
+            &snapshot(
+                json!("rate_limit_reached"),
+                json!({ "credits": { "hasCredits": false, "unlimited": false } }),
+            ),
+            "thread-main",
+            observed_at_ms,
+        ) else {
+            panic!("a depleted balance is a fault")
+        };
+        assert_eq!(fault.category, FaultCategory::Quota);
+        assert_eq!(fault.code.as_deref(), Some("codex/creditsDepleted"));
+        assert_eq!(fault.recovery, Recovery::Human);
+        assert_eq!(fault.next_observation_due_ms, None);
+
+        // The words that name an exhausted allowance need no credit metadata to classify, and
+        // carry no deadline because nothing rolls over by itself.
+        for word in [
+            "workspace_owner_usage_limit_reached",
+            "workspace_member_usage_limit_reached",
+            "workspace_owner_credits_depleted",
+            "workspace_member_credits_depleted",
+        ] {
+            let Some(CodexConditionOp::Raise { fault, .. }) = codex_condition_edge(
+                &snapshot(json!(word), json!({})),
+                "thread-main",
+                observed_at_ms,
+            ) else {
+                panic!("{word} must raise a fault")
+            };
+            assert_eq!(fault.category, FaultCategory::Quota, "{word}");
+            assert_eq!(fault.recovery, Recovery::Human, "{word}");
+            assert_eq!(fault.next_observation_due_ms, None, "{word}");
+            assert_eq!(
+                fault.code,
+                Some(format!("codex/rateLimitReached.{word}")),
+                "{word}"
+            );
+        }
+
+        // A word the gate never admitted keeps the field's own family with an unsayable
+        // recovery, and still no deadline.
+        let Some(CodexConditionOp::Raise { fault, .. }) = codex_condition_edge(
+            &snapshot(json!("future_limit_nobody_has_seen"), json!({})),
+            "thread-main",
+            observed_at_ms,
+        ) else {
+            panic!("an unadmitted word must stay visible")
+        };
+        assert_eq!(fault.category, FaultCategory::RateLimit);
+        assert_eq!(fault.recovery, Recovery::Unknown);
+        assert_eq!(fault.next_observation_due_ms, None);
+    }
+
+    /// A fault observed while the activity axis is dark stays QUEUED. A condition operation
+    /// restates the record's activity verbatim, so attaching one without a landed observation of
+    /// this session's would refresh a state the pump could no longer see — the exact stale-state
+    /// refresh the pending-transition retry exists to prevent.
+    #[test]
+    fn a_fault_queued_during_an_evidence_gap_waits_for_the_next_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let queued = CodexConditionOp::Raise {
+            fault: harness_state::FaultReport::new(
+                harness_state::FaultCategory::Quota,
+                harness_state::Recovery::Human,
+                1_788_000_000_000,
+            )
+            .with_code("codex/usageLimitExceeded"),
+            source: CodexFaultSource::Typed,
+        };
+        delivery.pending_condition = Some(queued.clone());
+        assert!(
+            !delivery.harness_evidence,
+            "no observation has landed for this session yet"
+        );
+
+        delivery.next_presence_refresh = Instant::now() + status::STATUS_REFRESH;
+        delivery.refresh_if_due().unwrap();
+        assert_eq!(
+            delivery.pending_condition,
+            Some(queued.clone()),
+            "with nothing to attach to, the edge waits instead of restating an activity"
+        );
+
+        // An indeterminate projection loses evidence without dropping the queued fault: a
+        // condition st2 observed does not stop holding because the activity axis went dark.
+        delivery.observe_harness(&CodexObservedState::Held {
+            reason: CodexHoldReason::NotLoaded,
+            turn_id: None,
+        });
+        assert!(!delivery.harness_evidence);
+        assert_eq!(delivery.pending_condition, Some(queued));
+
+        // Evidence returning is what lets it attach. On the version 2 wire the writer refuses
+        // the operation as a value, so the edge is consumed on that pass rather than retried
+        // forever against a record that cannot carry it.
+        delivery.observe_harness(&CodexObservedState::Idle);
+        assert!(delivery.harness_evidence);
+        delivery.next_presence_refresh = Instant::now() + status::STATUS_REFRESH;
+        delivery.refresh_if_due().unwrap();
+        assert_eq!(delivery.pending_condition, None);
+    }
+
+    /// `willRetry` is required on the typed error notification and is the only thing that may
+    /// call a Codex fault self-clearing. Every other word keeps the table's class, and a word
+    /// this build does not know stays visible instead of being folded into a neighbour.
+    #[test]
+    fn will_retry_flips_the_recovery_class_and_an_unknown_word_stays_visible() {
+        use crate::harness_state::{FaultCategory, Recovery};
+        let notification = |word: Value, will_retry: bool| {
+            json!({
+                "method": "error",
+                "params": {
+                    "error": { "codexErrorInfo": word },
+                    "willRetry": will_retry,
+                    "threadId": "thread-main",
+                    "turnId": "turn-1"
+                }
+            })
+        };
+        let fault_of = |frame: &Value| match codex_condition_edge(frame, "thread-main", 7) {
+            Some(CodexConditionOp::Raise { fault, .. }) => fault,
+            other => panic!("{other:?} is not a raised fault"),
+        };
+        assert_eq!(
+            fault_of(&notification(json!("rateLimitExceeded"), true)).recovery,
+            Recovery::Automatic
+        );
+        assert_eq!(
+            fault_of(&notification(json!("rateLimitExceeded"), false)).recovery,
+            Recovery::Human,
+            "a refused retry keeps the table's own class"
+        );
+
+        for (word, category) in [
+            ("unauthorized", FaultCategory::Authentication),
+            ("usageLimitExceeded", FaultCategory::Quota),
+            ("sessionBudgetExceeded", FaultCategory::Quota),
+            ("rateLimitExceeded", FaultCategory::RateLimit),
+            ("serverOverloaded", FaultCategory::Provider),
+            ("internalServerError", FaultCategory::Provider),
+            ("contextWindowExceeded", FaultCategory::Context),
+            ("cyberPolicy", FaultCategory::Policy),
+            ("misalignmentPolicyViolation", FaultCategory::Policy),
+            ("badRequest", FaultCategory::Configuration),
+            ("threadRollbackFailed", FaultCategory::Harness),
+            ("sandboxError", FaultCategory::Harness),
+        ] {
+            let fault = fault_of(&notification(json!(word), false));
+            assert_eq!(fault.category, category, "{word}");
+            assert_eq!(fault.code, Some(format!("codex/{word}")), "{word}");
+        }
+
+        // The data-carrying arms are objects, not strings: the single key IS the word, and an
+        // `as_str`-only read would silently drop that whole family.
+        let object = fault_of(&notification(
+            json!({ "httpConnectionFailed": { "httpStatusCode": 503 } }),
+            false,
+        ));
+        assert_eq!(object.category, FaultCategory::Provider);
+        assert_eq!(object.code.as_deref(), Some("codex/httpConnectionFailed"));
+        assert_eq!(
+            fault_of(&notification(json!({ "activeTurnNotSteerable": {} }), false)).category,
+            FaultCategory::Configuration
+        );
+
+        for word in ["other", "futureFailureNobodyHasSeen"] {
+            let fault = fault_of(&notification(json!(word), false));
+            assert_eq!(fault.category, FaultCategory::Harness, "{word}");
+            assert_eq!(fault.recovery, Recovery::Unknown, "{word}");
+            assert_eq!(fault.code, Some(format!("codex/{word}")), "{word}");
+        }
+        assert_eq!(
+            fault_of(&notification(json!("other"), true)).recovery,
+            Recovery::Automatic,
+            "an unknown word the harness promises to retry is automatic on that promise"
+        );
+
+        assert_eq!(
+            codex_condition_edge(&notification(json!("unauthorized"), false), "thread-other", 7),
+            None,
+            "another thread's error is not this seat's fault"
+        );
+        assert_eq!(
+            codex_condition_edge(&notification(json!({}), false), "thread-main", 7),
+            None,
+            "a union shape this build cannot read states nothing"
+        );
+    }
+
+    /// The projection never writes the incarnation's last word: `ended` has exactly two sites,
+    /// both in `run_connected`, and both observe a real process exit. It also cannot spell a
+    /// review ask — the protocol gate pins `ThreadActiveFlag` to exactly two words, neither of
+    /// which means review.
+    #[test]
+    fn no_codex_frame_reports_an_ended_seat_or_a_review_ask() {
+        use crate::harness_state::{Activity, AskKind, ConditionReport, HumanAsk};
+        let held = |reason| CodexObservedState::Held {
+            reason,
+            turn_id: Some("turn-1".into()),
+        };
+        let mut projected = vec![
+            (
+                "awaitingStatus".to_string(),
+                CodexObservedState::AwaitingStatus.harness_frame(),
+            ),
+            ("idle".to_string(), CodexObservedState::Idle.harness_frame()),
+            (
+                "active".to_string(),
+                CodexObservedState::Active {
+                    turn_id: "turn-1".into(),
+                }
+                .harness_frame(),
+            ),
+        ];
+        for reason in [
+            CodexTerminalError::SystemError,
+            CodexTerminalError::ProviderAuthRejected,
+        ] {
+            projected.push((
+                format!("terminal {reason:?}"),
+                CodexObservedState::TerminalError { reason }.harness_frame(),
+            ));
+        }
+        for reason in [
+            CodexHoldReason::ActiveWithoutTurn,
+            CodexHoldReason::ConflictingTurn,
+            CodexHoldReason::Review,
+            CodexHoldReason::Compaction,
+            CodexHoldReason::UnknownProtocol,
+            CodexHoldReason::NotLoaded,
+            CodexHoldReason::SystemError,
+            CodexHoldReason::UnknownStatus,
+            CodexHoldReason::WaitingOnApproval,
+            CodexHoldReason::WaitingOnUserInput,
+        ] {
+            projected.push((format!("held {reason:?}"), held(reason).harness_frame()));
+        }
+        for (label, frame) in &projected {
+            let Some(frame) = frame else { continue };
+            assert_ne!(frame.state, Activity::Ended, "{label}");
+            assert!(frame.exit.is_none(), "{label}");
+            assert_ne!(frame.ask, HumanAsk::Pending(AskKind::Review), "{label}");
+            assert_ne!(
+                frame.ask,
+                HumanAsk::Unknown,
+                "{label}: this producer does see the ask surface"
+            );
+            assert_eq!(
+                frame.condition,
+                ConditionReport::Unchanged,
+                "{label}: an activity edge states nothing about the fault axis"
+            );
+        }
+
+        // The rows nothing can prove stay withheld, exactly as the legacy projection withholds
+        // them: no absence may derive a definite state.
+        for state in [
+            CodexObservedState::AwaitingStatus,
+            held(CodexHoldReason::NotLoaded),
+            held(CodexHoldReason::UnknownStatus),
+        ] {
+            assert_eq!(state.harness_frame(), None, "{state:?}");
+        }
+        // Codex reported a thread-level system error: the seat is live and not working, and the
+        // failure rides the fault axis instead of a fabricated terminal record.
+        assert_eq!(
+            held(CodexHoldReason::SystemError)
+                .harness_frame()
+                .unwrap()
+                .state,
+            Activity::Idle
+        );
+        assert_eq!(
+            held(CodexHoldReason::WaitingOnApproval)
+                .harness_frame()
+                .unwrap()
+                .ask,
+            HumanAsk::Pending(AskKind::Permission)
+        );
+        assert_eq!(
+            held(CodexHoldReason::WaitingOnUserInput)
+                .harness_frame()
+                .unwrap()
+                .ask,
+            HumanAsk::Pending(AskKind::Question)
+        );
+    }
+
+    /// Two failures have no native word at all: st2's own unclassified-protocol hold, and a
+    /// thread-level system error Codex reports without naming a cause. Both stay visible, and
+    /// each is escaped only by the signal that raised it.
+    #[test]
+    fn a_faulted_thread_state_states_its_own_fault_without_a_native_word() {
+        use crate::harness_state::{FaultCategory, Recovery};
+        let held = |reason| CodexObservedState::Held {
+            reason,
+            turn_id: None,
+        };
+        let Some(CodexConditionOp::Raise { fault, source }) =
+            held(CodexHoldReason::UnknownProtocol).state_condition(9)
+        else {
+            panic!("an unclassified protocol signal is a harness fault")
+        };
+        assert_eq!(fault.category, FaultCategory::Harness);
+        assert_eq!(fault.code.as_deref(), Some("codex/unknownProtocol"));
+        assert_eq!(fault.recovery, Recovery::Human);
+        assert_eq!(source, CodexFaultSource::UnknownProtocol);
+        assert_eq!(
+            CodexObservedState::Idle.state_condition(9),
+            Some(CodexConditionOp::ClearRaised(
+                CodexFaultSource::UnknownProtocol
+            )),
+            "leaving the hold by its own signal is that fault's exact paired clear"
+        );
+
+        for state in [
+            held(CodexHoldReason::SystemError),
+            CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            },
+        ] {
+            let Some(CodexConditionOp::Raise { fault, source }) = state.state_condition(9) else {
+                panic!("{state:?} must stay visible")
+            };
+            assert_eq!(fault.category, FaultCategory::Harness, "{state:?}");
+            assert_eq!(fault.code.as_deref(), Some("codex/systemError"), "{state:?}");
+            assert_eq!(fault.recovery, Recovery::Unknown, "{state:?}");
+            assert_eq!(source, CodexFaultSource::Unclassified, "{state:?}");
+        }
+
+        let Some(CodexConditionOp::Raise { fault, source }) = CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderAuthRejected,
+        }
+        .state_condition(9)
+        else {
+            panic!("the state machine already classified this credential")
+        };
+        assert_eq!(fault.category, FaultCategory::Authentication);
+        assert_eq!(fault.code.as_deref(), Some("codex/unauthorized"));
+        assert_eq!(fault.recovery, Recovery::Human);
+        assert_eq!(source, CodexFaultSource::Typed);
+
+        for state in [
+            CodexObservedState::AwaitingStatus,
+            held(CodexHoldReason::NotLoaded),
+            held(CodexHoldReason::UnknownStatus),
+        ] {
+            assert_eq!(state.state_condition(9), None, "{state:?}");
+        }
+    }
+
+    /// The conversation bridge is stated only from typed provider identity this driver already
+    /// holds, and a resume the provider refused is stated as unavailable rather than linked.
+    #[test]
+    fn a_bound_thread_states_a_probed_conversation_and_a_refused_resume_does_not() {
+        use crate::harness_state::{CapabilityEvidence, ConversationState, HistoryMutability};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        assert_eq!(
+            delivery.conversation_state(),
+            None,
+            "nothing is claimed before a thread is bound"
+        );
+
+        delivery.bind_conversation("thread-main");
+        let Some(ConversationState::Linked(link)) = delivery.conversation_state() else {
+            panic!("a bound thread is a linked conversation")
+        };
+        assert_eq!(link.driver, "codex");
+        assert_eq!(link.conversation, "thread-main");
+        assert_eq!(link.history_mutability, HistoryMutability::Rewritable);
+        assert_eq!(link.capability_evidence, CapabilityEvidence::Probed);
+        assert!(link.verified_through_ms > 0);
+
+        delivery.conversation_unreachable(CODEX_NO_PERSISTED_ROLLOUT);
+        assert_eq!(
+            delivery.conversation_state(),
+            Some(ConversationState::Unavailable(Some(
+                CODEX_NO_PERSISTED_ROLLOUT.to_string()
+            )))
+        );
+    }
+
+    /// The version 2 wire has no condition axis: on a writer emitting it, every version 3
+    /// operation stays inert and the legacy projection — including its terminal reading of a
+    /// provider failure — is exactly what it was. Production emits version 3 now, so the version
+    /// 2 writer is substituted through the test-only seam; this is the shape of every legacy
+    /// record still on disk.
+    #[test]
+    fn version_two_delivery_keeps_the_legacy_projection_and_states_no_condition() {
+        use crate::harness_state::{self, Activity};
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let record_path = harness_state::harness_state_path(&config.agent_dir);
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        // The whole session on the version 2 wire. `CodexInboxDelivery::new` performed a
+        // PRODUCTION claim, so the seam substitutes the writer's version and the now-foreign
+        // version 3 fence that claim wrote is removed: a version 2 build would have written a
+        // version 2 fence there, and what this test pins is what the pump writes afterwards.
+        delivery
+            .harness_writer
+            .emit_schema(harness_state::SCHEMA_V2);
+        std::fs::remove_file(&record_path).unwrap();
+        assert!(
+            !delivery.harness_writer.writes_condition_axis(),
+            "the legacy projection is reached through the version 2 seam"
+        );
+
+        let error = json!({
+            "method": "error",
+            "params": {
+                "error": { "codexErrorInfo": "usageLimitExceeded" },
+                "willRetry": false,
+                "threadId": "thread-main",
+                "turnId": "turn-failed"
+            }
+        });
+        assert!(
+            !delivery.observe_condition(&error, "thread-main"),
+            "a condition edge cannot change a record whose wire has no condition axis"
+        );
+        assert_eq!(delivery.pending_condition, None);
+
+        delivery.observe_harness(&CodexObservedState::TerminalError {
+            reason: CodexTerminalError::SystemError,
+        });
+        let observed = harness_state::read(&record_path, None).expect("record written");
+        assert_eq!(observed.state, Activity::Ended);
+        assert_eq!(observed.reason.as_deref(), Some("systemError"));
+        assert!(
+            delivery.pending_write.is_none(),
+            "the legacy write landed exactly as before"
+        );
+    }
+
     #[test]
     fn idle_session_refreshes_stale_presence_without_inbox_activity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5930,8 +7532,8 @@ mod tests {
         let idle = subscribed_state(CodexObservedState::Idle);
         let request = delivery.maybe_request(&idle).unwrap().unwrap();
         assert_eq!(
-            delivery.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Attempted,
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Attempted,
             "submission ownership is durable before transport"
         );
         assert!(
@@ -5943,9 +7545,9 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            delivery.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Attempted,
-            "JSON success is not typed acceptance"
+            delivery.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::TransportAccepted,
+            "a well-formed JSON result is transport, never typed acceptance"
         );
         assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
@@ -6023,11 +7625,12 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            load_delivery_state(&state_path, "h.worker", "h.worker")
-                .unwrap()
-                .unwrap()
-                .phase,
-            CodexDeliveryPhase::Accepted
+            ledger_entry(tmp.path(), &filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
+        );
+        assert!(
+            !state_path.exists(),
+            "consumption released the v1 rollback floor"
         );
         assert!(config.inbox.join(&filename).is_file());
 
@@ -6049,7 +7652,11 @@ mod tests {
         assert_eq!(replacement.maybe_request(&idle).unwrap(), None);
         assert!(
             !state_path.exists(),
-            "archive precedence clears the receipt"
+            "no outstanding delivery, no rollback floor"
+        );
+        assert!(
+            ledger_entry(tmp.path(), &filename).is_none(),
+            "archive precedence — the recipient agent's own act — releases the ledger entry"
         );
     }
 
@@ -6100,21 +7707,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            recovered.state.as_ref().unwrap().phase,
-            CodexDeliveryPhase::Accepted
+            recovered.ledger.entry(&filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed,
+            "a resumed history carrying the client ID is the same typed receipt, found late"
         );
         assert_eq!(recovered.maybe_request(&idle).unwrap(), None);
         assert!(config.inbox.join(&filename).is_file());
 
-        // An authoritative resumed history without the client ID proves that the pre-send record
-        // did not reach typed acceptance. Only then may the same stable ID be retried.
-        recovered.state.as_mut().unwrap().phase = CodexDeliveryPhase::Attempted;
-        atomic_json(
-            &tmp.path().join("state/delivery-state.json"),
-            recovered.state.as_ref().unwrap(),
+        // An authoritative resumed history WITHOUT the client ID proves the pre-crash attempt
+        // never landed. Only that absence may re-authorize the same stable ID — so it needs its
+        // own scenario, because the delivery above is settled and can never be un-settled.
+        let absent_tmp = tempfile::tempdir().unwrap();
+        let absent_config = delivery_config(absent_tmp.path());
+        let absent_filename = message::send_to_inbox(
+            &absent_config.inbox,
+            "h.sender",
+            Some("absent"),
+            None,
+            &[],
+            "body",
         )
         .unwrap();
-        recovered
+        let mut attempted = inbox_delivery(absent_tmp.path(), absent_config.clone());
+        let absent_client_id = attempted.maybe_request(&idle).unwrap().unwrap()
+            ["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(attempted);
+
+        let mut replacement = inbox_delivery(absent_tmp.path(), absent_config);
+        assert_eq!(
+            replacement.maybe_request(&idle).unwrap(),
+            None,
+            "an ambiguous attempt is held and surfaced, never replayed on its own"
+        );
+        replacement
             .reconcile_resume(
                 &json!({
                     "id": CONTROL_SUBSCRIBE_REQUEST_ID,
@@ -6123,20 +7751,35 @@ mod tests {
                 &idle,
             )
             .unwrap();
-        assert!(recovered.state.is_none());
-        let retry = recovered.maybe_request(&idle).unwrap().unwrap();
-        assert_eq!(retry["params"]["clientUserMessageId"], client_id);
+        assert_eq!(
+            replacement
+                .ledger
+                .entry(&absent_filename)
+                .unwrap()
+                .negative,
+            Some(delivery_ledger::NegativeReceipt::Absent),
+            "the absence is retained as evidence, not erased"
+        );
+        let retry = replacement.maybe_request(&idle).unwrap().unwrap();
+        assert_eq!(retry["params"]["clientUserMessageId"], absent_client_id);
     }
 
+    /// v1 refused to START on a record whose client ID contradicted its own binding, which is the
+    /// worst available failure: the control connection never comes up and nothing is delivered at
+    /// all. The ledger fails closed instead — it starts, authorizes no transport, retains the
+    /// reason, and destroys no evidence.
     #[test]
-    fn malformed_delivery_state_fails_closed() {
+    fn a_tampered_v1_record_fails_closed_without_refusing_to_start() {
         let tmp = tempfile::tempdir().unwrap();
         let config = delivery_config(tmp.path());
+        let filename =
+            message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+                .unwrap();
         let state_path = tmp.path().join("state/delivery-state.json");
         atomic_json(
             &state_path,
             &json!({
-                "schema": DELIVERY_STATE_SCHEMA,
+                "schema": delivery_ledger::CODEX_LEGACY_SCHEMA,
                 "agent": "h.worker",
                 "runtimeId": "h.worker",
                 "runtimeIncarnation": "incarnation-test",
@@ -6147,15 +7790,36 @@ mod tests {
             }),
         )
         .unwrap();
-        let error = match CodexInboxDelivery::new(
-            config,
-            state_path,
-            CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap(),
-        ) {
-            Ok(_) => panic!("accepted malformed delivery state"),
-            Err(error) => error,
+        let mut delivery = inbox_delivery(tmp.path(), config.clone());
+        assert!(
+            delivery
+                .ledger
+                .quarantined()
+                .is_some_and(|reason| reason.contains("does not match its binding")),
+            "the refusal names itself"
+        );
+        assert_eq!(
+            delivery
+                .maybe_request(&subscribed_state(CodexObservedState::Idle))
+                .unwrap(),
+            None,
+            "a quarantined ledger authorizes no transport"
+        );
+        // The operator-visible surface is the existing typed delivery boundary. No new
+        // vocabulary, and the raw quarantine reason stays in tracing rather than the record.
+        let driver_diagnostic::Observed::Failure(failure) =
+            driver_diagnostic::read(&driver_diagnostic::path(&config.agent_dir))
+        else {
+            panic!("a quarantined ledger must be diagnosed")
         };
-        assert!(error.to_string().contains("client ID does not match"));
+        assert_eq!(failure.stage, driver_diagnostic::Stage::Delivery);
+        assert_eq!(failure.reason, driver_diagnostic::Reason::DeliveryUnavailable);
+        assert_eq!(failure.source, driver_diagnostic::Source::PromptTransport);
+        assert!(
+            state_path.exists(),
+            "a record we refuse to read is not a record we may destroy"
+        );
+        assert!(config.inbox.join(&filename).is_file());
     }
 
     #[test]
@@ -6279,17 +7943,10 @@ mod tests {
         server.join().unwrap();
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
-        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+        assert!(delivery_config(tmp.path()).inbox.join(&filename).is_file());
         assert_eq!(
-            load_delivery_state(
-                &tmp.path().join("state/delivery-state.json"),
-                "h.worker",
-                "h.worker",
-            )
-            .unwrap()
-            .unwrap()
-            .phase,
-            CodexDeliveryPhase::Accepted
+            ledger_entry(tmp.path(), &filename).unwrap().phase,
+            delivery_ledger::Phase::Consumed
         );
     }
 
@@ -6400,14 +8057,20 @@ mod tests {
         let client_id = stable_client_user_message_id("h.worker", "thread-main", &filename);
         let prior_runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
         let delivery_state_path = tmp.path().join("state/delivery-state.json");
+        // The v1 record a prior binary left, in exactly the shape it wrote it. This is the
+        // migration boundary: no ledger exists, so the new pump adopts this attempt.
         atomic_json(
             &delivery_state_path,
-            &CodexDeliveryState::attempted(
-                &prior_runtime,
-                "thread-main".into(),
-                filename.clone(),
-                client_id.clone(),
-            ),
+            &json!({
+                "schema": delivery_ledger::CODEX_LEGACY_SCHEMA,
+                "agent": "h.worker",
+                "runtimeId": "h.worker",
+                "runtimeIncarnation": prior_runtime.incarnation(),
+                "threadId": "thread-main",
+                "filename": &filename,
+                "clientId": &client_id,
+                "phase": "attempted"
+            }),
         )
         .unwrap();
 
@@ -6512,12 +8175,19 @@ mod tests {
         let _ = shutdown.shutdown(Shutdown::Both);
         pump.join().unwrap();
 
-        let recovered = load_delivery_state(&delivery_state_path, "h.worker", "h.worker")
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.phase, CodexDeliveryPhase::Accepted);
-        assert_eq!(recovered.client_id, client_id);
-        assert!(delivery_config(tmp.path()).inbox.join(filename).is_file());
+        let recovered = ledger_entry(tmp.path(), &filename).expect("the adopted attempt survives");
+        assert_eq!(recovered.phase, delivery_ledger::Phase::Consumed);
+        assert_eq!(recovered.correlation.value, client_id);
+        assert_eq!(
+            recovered.adopted_from.as_deref(),
+            Some(delivery_ledger::CODEX_LEGACY_SCHEMA),
+            "the receipt landed on the entry carried forward from v1, not on a second attempt"
+        );
+        assert!(
+            !delivery_state_path.exists(),
+            "consumption released the v1 record it was adopted from"
+        );
+        assert!(delivery_config(tmp.path()).inbox.join(&filename).is_file());
     }
 
     #[test]

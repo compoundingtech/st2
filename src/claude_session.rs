@@ -16,7 +16,11 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 
 use crate::harness_context::{self, Compaction, CompactionTrigger, Harness, RateLimits, Reading};
-use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
+use crate::harness_state::{
+    Activity, Ask, AskKind, BlockedOn, CapabilityEvidence, ConditionReport, ConversationClaim,
+    ConversationState, FaultCategory, FaultReport, Frame, HistoryMutability, HumanAsk, InputBuffer,
+    Observation, Recovery, WriteOutcome,
+};
 use crate::provider_session::{
     PROVIDER_POLL, STOP, SessionObserver, install_signal_handler, run_provider,
 };
@@ -180,7 +184,7 @@ pub fn run_observe(
     if let Some(edge) = provider_auth_edge(event, &payload) {
         publish_provider_auth(&agent_dir, edge);
     }
-    let Some(observation) = observe_hook_event(event, &payload) else {
+    let Some(observed) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
     let mut writer = observe_writer(
@@ -201,17 +205,44 @@ pub fn run_observe(
     }
     // A late hook finishing after the wrapper reaped Claude must not replace the terminal record
     // with a live state: the wrapper's `ended` carries this same token and is the session's last
-    // word. (`false` = suppressed; the hook has nothing else to do with it.)
-    writer.observe_unless_ended(observation).map(|_wrote| ())
+    // word — on both surfaces below.
+    if !writer.writes_condition_axis() {
+        // The version this build emits carries no condition, tagged-ask, or conversation axis,
+        // and this record has exactly ONE source of truth: state the legacy triple, exactly as
+        // this adapter always has. Keeping a stated fault in a sidecar the session's sibling
+        // processes cannot see would be that second source. Activation is one flip of the
+        // writer's emitted version, after which the branch below takes over unchanged.
+        // (`false` = suppressed; the hook has nothing else to do with it.)
+        return writer
+            .observe_unless_ended(observed.observation())
+            .map(|_wrote| ());
+    }
+    match writer.publish_unless_ended(observed.frame())? {
+        // Written or already-said are both "the record now says this".
+        WriteOutcome::Landed | WriteOutcome::Coalesced => Ok(()),
+        // A refusal is a VALUE here — a successor session's claim, a foreign schema, a condition
+        // axis nobody has stated yet, this session's own terminal record — and a hook process has
+        // no second record to report it through, so it is diagnosed rather than swallowed. Still
+        // fail-open: the harness is waiting on this hook, and no observation is worth wedging it.
+        WriteOutcome::Refused(refusal) => {
+            tracing::warn!(
+                "st2 claude-observe: observed-state write refused for {event}: {refusal:?}"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Select the ownership a hook write acts under. The wrapper's exported token makes hook writes
 /// this session's records (adopted ownership when the claimed sequence travels beside it). A
 /// wrapperless seat falls back to Claude's own session_id — and because token-only writers never
-/// claim, the SessionStart arm IS that path's session boundary and performs the WRITTEN claim
+/// claim, the session-boundary arm IS that path's boundary and performs the WRITTEN claim
 /// (degrading to token-only with a warning if the claim cannot be written); later hooks of the
 /// same session adopt its records by token. What such a seat still lacks is a heartbeat and
 /// terminal owner — the documented hooks-only limitation.
+///
+/// Which `SessionStart` is that boundary depends on what the emitted version can carry: see
+/// [`claims_wrapperless_session`].
 #[allow(clippy::too_many_arguments)]
 fn observe_writer(
     agent_dir: &Path,
@@ -231,7 +262,7 @@ fn observe_writer(
         };
     }
     if let Some(token) = wrapperless_token(payload) {
-        if event == "SessionStart" {
+        if claims_wrapperless_session(writer.writes_condition_axis(), event, payload) {
             // Eligibility and the written takeover are ONE act under the record lock: a
             // hooks-only SessionStart racing a wrapper's startup can no longer steal the
             // sequence between the wrapper's read and its write. Ineligible (a live wrapper or
@@ -251,6 +282,28 @@ fn observe_writer(
         return writer.with_session(token);
     }
     writer
+}
+
+/// Whether this hook invocation is the WRAPPERLESS seat's session boundary — the one act that
+/// performs the written claim.
+///
+/// While the emitted version carries no condition axis, this is every `SessionStart`, exactly as
+/// this adapter has always behaved: same claim, same sequence, same bytes.
+///
+/// Once the condition axis is on the wire a claim is no longer neutral. A claim writes this
+/// session's FENCE, and a fence is deliberately excluded from what an unstated axis inherits, so
+/// claiming on a MID-PROCESS `SessionStart` — `compact`, `clear` — would drop a standing fault by
+/// ownership: exactly the laundering the mapping refuses to do with `clear`, arriving through the
+/// other door. Those events keep the token-only path, where the record already carries this
+/// session's token, its sequence is adopted, and the standing condition carries. Only a genuinely
+/// fresh incarnation claims, which is the one case where superseding the axis is the truth.
+fn claims_wrapperless_session(
+    writes_condition_axis: bool,
+    event: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    event == "SessionStart"
+        && (!writes_condition_axis || session_start_is_fresh_incarnation(payload))
 }
 
 /// Claude's own session id under the wrapperless prefix, for a seat that runs `claude` directly
@@ -529,7 +582,119 @@ fn chain_statusline(raw: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Map one Claude hook event to an observation, or `None` when the event says nothing about
+/// The ask surface Claude can state, closed at three words. `PermissionRequest`'s `tool_name` is
+/// the ONLY ask signal any registered hook carries and it distinguishes exactly two kinds, so
+/// both projections below are total functions of one decision. Storing a [`HumanAsk`] here
+/// instead would force this adapter to invent a legacy word for `Pending(Review)` and for
+/// `Unknown` — kinds Claude has no signal for at all — and an invented projection is how the
+/// legacy and tagged axes start disagreeing about the same prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookAsk {
+    None,
+    Permission,
+    Question,
+}
+
+impl HookAsk {
+    fn tagged(self) -> HumanAsk {
+        match self {
+            Self::None => HumanAsk::None,
+            Self::Permission => HumanAsk::Pending(AskKind::Permission),
+            Self::Question => HumanAsk::Pending(AskKind::Question),
+        }
+    }
+
+    /// The legacy pair, verbatim as this adapter has always written it: an ask is meaningful only
+    /// while blocked on a human, which is exactly what the two pending kinds mean here.
+    fn legacy(self) -> (BlockedOn, Ask) {
+        match self {
+            Self::None => (BlockedOn::None, Ask::None),
+            Self::Permission => (BlockedOn::Human, Ask::Permission),
+            Self::Question => (BlockedOn::Human, Ask::Question),
+        }
+    }
+}
+
+/// What one Claude hook event states about top-level harness state: every axis at once, decided
+/// from one look at the payload, so no reader can observe the activity, the condition, the ask
+/// and the conversation link half-applied.
+///
+/// `condition: Unchanged` is the load-bearing default. Almost every Claude edge is an activity or
+/// ask edge that has observed NOTHING about whether the provider is faulted, and a condition may
+/// be cleared only by a positive success edge (`Stop`) or a new incarnation — never by a turn
+/// starting, a tool running, or a compaction restart. Stating the carry here rather than reading
+/// the standing condition first also keeps the decision inside the single lock the write holds:
+/// check-then-act across two acquisitions is the race `claim_wrapperless` exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookState {
+    pub state: Activity,
+    pub ask: HookAsk,
+    pub condition: ConditionReport,
+    /// Stated only by the incarnation boundary and the turn-end edges — the ones that neither
+    /// repeat nor fire several times a turn — because the link's `verifiedThroughMs` is minted
+    /// from the hook's clock: restating it on a repeatable edge would make every repeat a
+    /// different tuple, landing a write and restarting `sinceMs`. `None` leaves the axis exactly
+    /// as the record has it, which is how the standing link carries.
+    pub conversation: Option<ConversationState>,
+    /// Diagnostic only, and one of a closed set of static words. No consumer branches on it.
+    pub reason: Option<&'static str>,
+}
+
+impl HookState {
+    fn new(state: Activity, ask: HookAsk, condition: ConditionReport) -> Self {
+        Self {
+            state,
+            ask,
+            condition,
+            conversation: None,
+            reason: None,
+        }
+    }
+
+    fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    fn with_conversation(mut self, conversation: Option<ConversationState>) -> Self {
+        self.conversation = conversation;
+        self
+    }
+
+    /// The legacy observation this event has always written — same activity, same legacy
+    /// blocked/ask pair, same reason — for the version this build still emits. The condition and
+    /// conversation axes are dropped rather than stored beside the record: the version 2 wire has
+    /// nowhere to carry them, and a sidecar would give this record a second source of truth.
+    fn observation(&self) -> Observation {
+        let (blocked_on, ask) = self.ask.legacy();
+        let observation =
+            Observation::new(self.state, blocked_on, InputBuffer::Unknown).with_ask(ask);
+        match self.reason {
+            Some(reason) => observation.with_reason(reason),
+            None => observation,
+        }
+    }
+
+    /// The version 3 tuple: one statement of every axis this event resolved.
+    fn frame(&self) -> Frame {
+        let frame = Frame::new(
+            self.state,
+            InputBuffer::Unknown,
+            self.condition.clone(),
+            self.ask.tagged(),
+        );
+        let frame = match self.conversation.clone() {
+            Some(conversation) => frame.with_conversation(conversation),
+            None => frame,
+        };
+        match self.reason {
+            Some(reason) => frame.with_reason(reason),
+            None => frame,
+        }
+    }
+}
+
+/// Map one Claude hook event to the state it proves, or `None` when the event says nothing about
 /// top-level harness state.
 ///
 /// Claude gives no call identity on the event that enters `blocked` (`PermissionRequest` carries
@@ -540,11 +705,30 @@ fn chain_statusline(raw: &[u8]) -> Result<()> {
 /// resolution and the batched false-clear #268 §C predicted cannot occur. The residual limit is
 /// denial: "No" ends the turn with zero further events (no Stop, and no PermissionDenied even when
 /// registered), so `blocked` stands until the next `UserPromptSubmit`/`SessionStart`.
-pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Observation> {
+///
+/// DECLARED UNSUPPORTED, stated rather than guessed. A user interrupt (Esc/Ctrl-C) emits no hook
+/// event at all, so activity stays `active` with no available edge and no idle is invented.
+/// Crash-versus-clean-exit is not knowable here — `SessionEnd` is not registered and its reason
+/// vocabulary cannot tell SIGKILL from logout — so the wrapper's exit status remains the only
+/// source of `ended`. `Notification`, the only `auth_success` signal, is not registered either,
+/// which is why Claude has no paired clear and no `AskKind::Review` mapping exists.
+pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<HookState> {
+    observe_hook_event_at(event, payload, message::now_ms())
+}
+
+/// [`observe_hook_event`] with the hook's own clock passed in, which is what makes the whole
+/// mapping a pure function of `(event, payload, now)`: a fault's SEMANTIC observation instant and
+/// a conversation link's finite verification bound are both stamped from it.
+fn observe_hook_event_at(
+    event: &str,
+    payload: &serde_json::Value,
+    now_ms: u64,
+) -> Option<HookState> {
     // Any event carrying an agent identity is a subagent's and must never move top-level state:
     // a phantom `SubagentStop` trails every completed turn, 1.5-2.9s after `Stop`. That phantom
     // populating `agent_id` is an undocumented emergent property — if a future Claude build omits
     // it, subagent completions read as top-level activity again and nothing here would catch it.
+    // Evaluated before every axis: a subagent event must not raise, clear, or move anything.
     if payload
         .get("agent_id")
         .and_then(serde_json::Value::as_str)
@@ -552,34 +736,67 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
     {
         return None;
     }
-    match event {
-        "SessionStart" => Some(
-            Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown)
-                .with_reason("sessionStart"),
-        ),
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(Observation::new(
-            Activity::Active,
-            BlockedOn::None,
-            InputBuffer::Unknown,
-        )),
-        "Stop" => Some(Observation::new(
+    let observed = match event {
+        "SessionStart" => HookState::new(
             Activity::Idle,
-            BlockedOn::None,
-            InputBuffer::Unknown,
-        )),
+            HookAsk::None,
+            // A fresh incarnation is one of the two edges that may clear the axis: a fault stands
+            // until an explicit paired clear, a terminal record, a new claim, or a NEW
+            // INCARNATION, and `run_observe`'s `interrupt()` already makes this event that
+            // boundary. The mid-process sources are NOT boundaries and must not clear.
+            if session_start_is_fresh_incarnation(payload) {
+                ConditionReport::Clear
+            } else {
+                ConditionReport::Unchanged
+            },
+        )
+        .with_reason("sessionStart")
+        // The boundary edge establishes the link for the incarnation; every later frame inherits
+        // it from the record.
+        .with_conversation(conversation_claim(payload, now_ms)),
+        // Activity edges. Each releases a residual ask — including the DQ-H1 denial residual, for
+        // which `UserPromptSubmit` is the only recovery edge — and states nothing whatsoever about
+        // the condition: a turn starting is not evidence that a rejected credential was repaired.
+        //
+        // They state nothing about the conversation either, and that is deliberate. These are the
+        // REPEATABLE edges — several per turn, measured — and the link they would restate is
+        // identical except for a freshly minted `verifiedThroughMs`. That one moving field would
+        // make every repeat a different tuple: the write would land instead of coalescing, and
+        // `sinceMs` would restart on a state the seat never left. The standing link carries.
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => {
+            HookState::new(Activity::Active, HookAsk::None, ConditionReport::Unchanged)
+        }
+        // THE positive success edge, and Claude's only one: a turn that reached its ordinary end
+        // is progress a standing fault would have prevented — `ProgressProof::TurnCompleted` —
+        // so it clears the whole axis. Stated inside the tuple rather than through
+        // `Writer::clear_all` because the activity and the clear are ONE observation here: two
+        // writes would publish an intermediate record showing `idle` with the fault still
+        // standing, and the sibling clear on a fresh incarnation cannot use the condition-only
+        // path at all, since that record belongs to the predecessor session.
+        //
+        // A turn boundary is once-per-turn and never repeats without an intervening prompt, so
+        // re-verifying the conversation link here refreshes its bound without the churn the
+        // repeatable edges above would cause.
+        "Stop" => HookState::new(Activity::Idle, HookAsk::None, ConditionReport::Clear)
+            .with_conversation(conversation_claim(payload, now_ms)),
         // `StopFailure` fires INSTEAD of `Stop` when an API error ended the turn (Claude Code's
-        // own words, 2.1.259), at the same lifecycle point — so the categorical truth is the one
-        // `Stop` writes and only the reason differs. Deliberately not `ended`: the TUI is still
-        // live, a human can re-login and carry on, and this seat's terminal record belongs to the
-        // wrapper (OHS-T04). A hook claiming `ended` here would be a false terminal.
-        "StopFailure" => Some(
-            Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown).with_reason(
-                match stop_failure_error(payload) {
-                    Some(CLAUDE_AUTH_REJECTED_ERROR) => "providerAuth",
-                    _ => "apiError",
-                },
-            ),
-        ),
+        // own words, 2.1.259), at the same lifecycle point — so the activity is the one `Stop`
+        // writes and the failure rides the condition axis beside it. Deliberately not `ended`:
+        // the TUI is still live, a human can re-login and carry on, and this seat's terminal
+        // record belongs to the wrapper (OHS-T04). A hook claiming `ended` here would be a false
+        // terminal. And deliberately not an ask: the remediation a human owes is visible on the
+        // condition axis, while a synthesized `pending` would fabricate a prompt nobody can
+        // answer and would outrank nothing.
+        "StopFailure" => HookState::new(
+            Activity::Idle,
+            HookAsk::None,
+            stop_failure_condition(payload, now_ms),
+        )
+        .with_reason(match stop_failure_error(payload) {
+            Some(CLAUDE_AUTH_REJECTED_ERROR) => "providerAuth",
+            _ => "apiError",
+        })
+        .with_conversation(conversation_claim(payload, now_ms)),
         "PermissionRequest" => {
             // Driver-side classification (#162): the payload's tool_name distinguishes Claude's
             // question form from an ordinary permission prompt — the DQ-H1 captures show
@@ -587,18 +804,140 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             let ask = if payload.get("tool_name").and_then(serde_json::Value::as_str)
                 == Some("AskUserQuestion")
             {
-                Ask::Question
+                HookAsk::Question
             } else {
-                Ask::Permission
+                HookAsk::Permission
             };
-            Some(
-                Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
-                    .with_ask(ask)
-                    .with_reason("permissionRequest"),
-            )
+            // An ask is not a fault: a waiting human is the seat working as designed, so the
+            // condition axis is untouched here. Nor is a prompt evidence about the conversation:
+            // a batch can raise several, so this edge repeats and carries the standing link.
+            HookState::new(Activity::Active, ask, ConditionReport::Unchanged)
+                .with_reason("permissionRequest")
         }
-        _ => None,
+        // `PreCompact`/`PostCompact` are harness-CONTEXT edges (see `observe_compaction`) and
+        // every other event is unregistered or unmapped: silence rather than a guess.
+        _ => return None,
+    };
+    Some(observed)
+}
+
+/// Whether one `SessionStart` names a genuinely NEW incarnation — the only kind that may clear a
+/// standing condition.
+///
+/// Two of Claude's source words are mid-process and must not: `compact` is the same session's
+/// third sighting of one compaction (see `observe_compaction`), and `clear` empties the
+/// conversation inside the running process — same pty, same wrapper, same st2 incarnation. A
+/// fault the provider still holds survives both, so clearing on either would silence it on every
+/// automatic compaction or every `/clear`. `startup` and `resume` are real process boundaries,
+/// and an absent word is treated as one because that is what the event otherwise means.
+fn session_start_is_fresh_incarnation(payload: &serde_json::Value) -> bool {
+    !matches!(
+        payload.get("source").and_then(serde_json::Value::as_str),
+        Some(COMPACT_SOURCE | CLEAR_SOURCE)
+    )
+}
+
+/// The `SessionStart` source word for a compaction restart: the same incarnation, mid-session.
+const COMPACT_SOURCE: &str = "compact";
+/// The `SessionStart` source word for an in-process `/clear`: same incarnation, emptied history.
+const CLEAR_SOURCE: &str = "clear";
+
+/// The condition one `StopFailure` states, from the closed `error` word and nothing else.
+///
+/// PRESENCE-TESTED, not defaulted: every word Claude publishes has its own arm, so
+/// `max_output_tokens` can mean "no mapping" — a truncated response is not a seat fault, and
+/// collapsing it into the unrecognized-word arm would page an operator once per long answer.
+/// Codes are provider-namespaced with a slash, category-routable underneath, and the word rides
+/// verbatim so the diagnostic granularity survives the categories collapsing several words into
+/// one.
+///
+/// No row is [`Recovery::Automatic`] and no row sets a next-observation deadline, because Claude
+/// declares neither: it names no reset instant for `rate_limit`, and its internal retries are
+/// gated inside the bundle and never surfaced. An `automatic` recovery is projected as
+/// recovering/soon and NEVER pages while its deadline holds, so an automatic Claude fault would
+/// launder a wedged seat indefinitely. Unclearable classes therefore take [`Recovery::Unknown`],
+/// which pages, and Claude's next `Stop` clears them.
+///
+/// The credential class comes from this typed word alone. `error_details` and
+/// `last_assistant_message` ride the same payload and are prose: splitting `invalid_request` into
+/// a context fault by matching English on them is exactly the prose classification INVARIANTS
+/// forbids, so the too-large case stays declared-unsupported instead of guessed.
+fn stop_failure_condition(payload: &serde_json::Value, observed_at_ms: u64) -> ConditionReport {
+    let Some(word) = stop_failure_error(payload).filter(|word| !word.is_empty()) else {
+        // A `StopFailure` with no word at all: the turn provably failed and st2's own driver
+        // plumbing is the most conservative truthful owner of an unclassified harness-reported
+        // failure. Codeless rather than code-guessed — a minted word would be indistinguishable
+        // from one Claude actually published.
+        return ConditionReport::Fault(
+            FaultReport::new(FaultCategory::Harness, Recovery::Unknown, observed_at_ms)
+                .with_detail("stopFailure carried no error word"),
+        );
+    };
+    let (category, recovery) = match word {
+        // A rejected credential: one re-login repairs it.
+        CLAUDE_AUTH_REJECTED_ERROR => (FaultCategory::Authentication, Recovery::Human),
+        // An org entitlement no re-login satisfies — a policy refusal, not a credential.
+        "oauth_org_not_allowed" => (FaultCategory::Policy, Recovery::Human),
+        // The account itself is the obstacle. Not `quota`: no allowance window is exhausted, and
+        // an operator's repair is billing rather than waiting.
+        "account_on_hold" | "billing_error" => (FaultCategory::Account, Recovery::Human),
+        // Throttled while the allowance itself is intact, with no reset instant published.
+        "rate_limit" => (FaultCategory::RateLimit, Recovery::Unknown),
+        // The provider failed on its own side.
+        "overloaded" | "server_error" => (FaultCategory::Provider, Recovery::Unknown),
+        // The request this seat's own declaration produced is wrong: a model it may not use, or
+        // arguments the provider rejects. Both need an operator to change the seat.
+        "invalid_request" | "model_not_found" => (FaultCategory::Configuration, Recovery::Human),
+        // DELIBERATE NO MAPPING. The response hit its own output cap; the turn ended, the seat is
+        // healthy, and nothing about the provider is faulted. An explicit arm rather than a
+        // default so it can never drift into the unrecognized-word fault below.
+        "max_output_tokens" => return ConditionReport::Unchanged,
+        // Claude's own `unknown`, and every future word this build has never seen. Still a fault
+        // — a turn failed — routed by its recovery and labelled with the most conservative
+        // truthful category for a harness-reported failure nobody can classify. Guessing a
+        // neighbouring category would invent a claim the harness never made; the verbatim word
+        // stays visible in the code.
+        _ => (FaultCategory::Harness, Recovery::Unknown),
+    };
+    ConditionReport::Fault(
+        FaultReport::new(category, recovery, observed_at_ms).with_code(format!("claude/{word}")),
+    )
+}
+
+/// Claude's conversation identity, from the one typed field every hook payload carries.
+///
+/// `session_id` is the provider's own conversation identity — already load-bearing here, since
+/// [`wrapperless_token`] derives a whole ownership namespace from it — and it rides VERBATIM,
+/// never the prefixed token, which is st2's ownership namespace rather than Claude's identity.
+/// The incarnation is not stated: the writing session stamps it, so a reader can always falsify a
+/// mismatch against the record's own.
+///
+/// `Rewritable`, because Claude compacts: `PreCompact`/`PostCompact` are registered and counted in
+/// this same file, so a prefix read once may be gone. `Declared`, because that is pinned knowledge
+/// of Claude 2.1.x and st2 never probed the transcript. `transcript_path` rides the same payload
+/// and is deliberately not carried: this link is identity and capability only, and a host-local
+/// transcript path is content-bearing.
+///
+/// A payload with no `session_id` states NOTHING — `None` leaves the axis as the record has it.
+/// `Unsupported` would be false (Claude plainly has conversations) and a half-stated link is what
+/// the reader degrades with its own rejection word.
+fn conversation_claim(payload: &serde_json::Value, now_ms: u64) -> Option<ConversationState> {
+    let conversation = payload
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    // The verification bound must be finite and positive; a zero clock is not a bound, so it
+    // withholds the claim rather than writing one this build's own reader would degrade.
+    if now_ms == 0 {
+        return None;
     }
+    Some(ConversationState::Linked(ConversationClaim {
+        driver: "claude".to_string(),
+        conversation: conversation.to_string(),
+        history_mutability: HistoryMutability::Rewritable,
+        capability_evidence: CapabilityEvidence::Declared,
+        verified_through_ms: now_ms,
+    }))
 }
 
 /// The `StopFailure` error word that names a rejected provider credential.
@@ -674,6 +1013,20 @@ mod tests {
 
     use super::*;
     use crate::harness_state::harness_state_path;
+
+    /// One hook write on the surface `run_observe` uses after activation: the version 3 frame,
+    /// through the real locked writer. The outcome is returned rather than unwrapped into a bool
+    /// because a refusal is a VALUE here — a successor's claim, a terminal record, or an axis
+    /// nobody has stated — and several tests below assert exactly which one.
+    fn hook_publish(
+        writer: &mut harness_state::Writer,
+        event: &str,
+        payload: &serde_json::Value,
+    ) -> harness_state::WriteOutcome {
+        writer
+            .publish_unless_ended(observe_hook_event(event, payload).unwrap().frame())
+            .unwrap()
+    }
 
     #[test]
     fn only_the_packaged_channel_requests_the_installation_preflight() {
@@ -760,23 +1113,25 @@ mod tests {
     }
 
     #[test]
-    fn hook_events_map_to_observations_with_the_blocked_edges() {
+    fn hook_events_map_to_the_typed_tuple_with_the_blocked_edges() {
         let none = serde_json::Value::Null;
 
         let blocked = observe_hook_event("PermissionRequest", &none).unwrap();
         assert_eq!(blocked.state, Activity::Active);
-        assert_eq!(blocked.blocked_on, BlockedOn::Human);
-        assert_eq!(blocked.reason.as_deref(), Some("permissionRequest"));
+        assert_eq!(blocked.ask, HookAsk::Permission);
+        assert_eq!(blocked.ask.legacy(), (BlockedOn::Human, Ask::Permission));
+        assert_eq!(blocked.reason, Some("permissionRequest"));
 
         // The exit edges: tool progress or a turn boundary clears the human hold.
         for event in ["PreToolUse", "PostToolUse"] {
             let cleared = observe_hook_event(event, &none).unwrap();
             assert_eq!(cleared.state, Activity::Active);
-            assert_eq!(cleared.blocked_on, BlockedOn::None);
+            assert_eq!(cleared.ask, HookAsk::None);
+            assert_eq!(cleared.ask.legacy(), (BlockedOn::None, Ask::None));
         }
         let stop = observe_hook_event("Stop", &none).unwrap();
         assert_eq!(stop.state, Activity::Idle);
-        assert_eq!(stop.blocked_on, BlockedOn::None);
+        assert_eq!(stop.ask, HookAsk::None);
 
         assert_eq!(
             observe_hook_event("UserPromptSubmit", &none).unwrap().state,
@@ -821,8 +1176,8 @@ mod tests {
         ] {
             let observed = observe_hook_event("StopFailure", payload).unwrap();
             assert_eq!(observed.state, Activity::Idle, "the turn ended: {reason}");
-            assert_eq!(observed.blocked_on, BlockedOn::None);
-            assert_eq!(observed.reason.as_deref(), Some(reason));
+            assert_eq!(observed.ask, HookAsk::None, "a fault is never an ask");
+            assert_eq!(observed.reason, Some(reason));
         }
 
         assert_eq!(
@@ -957,15 +1312,15 @@ mod tests {
 
         let entered = observe_hook_event("PermissionRequest", &permission_request).unwrap();
         assert_eq!(
-            (entered.state, entered.blocked_on),
-            (Activity::Active, BlockedOn::Human)
+            (entered.state, entered.ask.legacy()),
+            (Activity::Active, (BlockedOn::Human, Ask::Permission))
         );
         // 33 s of open prompt produced no intervening event in the capture; the very next event
         // is the granted call's own PostToolUse, which correctly releases the block.
         let released = observe_hook_event("PostToolUse", &post_touch).unwrap();
         assert_eq!(
-            (released.state, released.blocked_on),
-            (Activity::Active, BlockedOn::None)
+            (released.state, released.ask.legacy()),
+            (Activity::Active, (BlockedOn::None, Ask::None))
         );
         let _ = observe_hook_event("PreToolUse", &pre_touch);
         assert_eq!(
@@ -983,16 +1338,18 @@ mod tests {
             SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
 
         // A hook process wrote a blocked observation between wrapper ticks — carrying the
-        // wrapper's exported token, exactly as the env plumbing arranges in a real seat.
-        harness_state::Writer::new(
+        // wrapper's exported token, exactly as the env plumbing arranges in a real seat, and on
+        // the surface `run_observe` uses: the boundary event states the condition axis over the
+        // claim fence, and later hooks ride on top of it.
+        let mut hook = harness_state::Writer::new(
             tmp.path(),
             "hetz.worker",
             "claude",
             Some("hetz.worker".to_string()),
         )
-        .with_session(observer.session())
-        .observe(observe_hook_event("PermissionRequest", &serde_json::Value::Null).unwrap())
-        .unwrap();
+        .with_session(observer.session());
+        hook_publish(&mut hook, "SessionStart", &serde_json::Value::Null);
+        hook_publish(&mut hook, "PermissionRequest", &serde_json::Value::Null);
         let before = fs::read(&record).unwrap();
 
         std::thread::sleep(Duration::from_millis(2));
@@ -1021,7 +1378,11 @@ mod tests {
             "claude",
             Some("hetz.worker".to_string()),
         )
-        .observe(observe_hook_event("UserPromptSubmit", &serde_json::Value::Null).unwrap())
+        .observe(
+            observe_hook_event("UserPromptSubmit", &serde_json::Value::Null)
+                .unwrap()
+                .observation(),
+        )
         .unwrap();
 
         let result = run_provider(
@@ -1068,24 +1429,551 @@ mod tests {
 
     #[test]
     fn permission_requests_classify_their_ask_kind_from_the_tool_name() {
-        use crate::harness_state::Ask;
         let permission = observe_hook_event(
             "PermissionRequest",
             &serde_json::json!({ "tool_name": "Bash", "tool_input": {} }),
         )
         .unwrap();
-        assert_eq!(permission.ask, Ask::Permission);
+        assert_eq!(permission.ask, HookAsk::Permission);
+        assert_eq!(
+            permission.ask.tagged(),
+            HumanAsk::Pending(AskKind::Permission)
+        );
+        assert_eq!(permission.ask.legacy(), (BlockedOn::Human, Ask::Permission));
 
         let question = observe_hook_event(
             "PermissionRequest",
             &serde_json::json!({ "tool_name": "AskUserQuestion", "tool_input": {} }),
         )
         .unwrap();
-        assert_eq!(question.ask, Ask::Question);
+        assert_eq!(question.ask, HookAsk::Question);
+        assert_eq!(question.ask.tagged(), HumanAsk::Pending(AskKind::Question));
+        assert_eq!(question.ask.legacy(), (BlockedOn::Human, Ask::Question));
+
+        // Claude has no review signal at all, so no mapping may produce one.
+        assert_ne!(question.ask.tagged(), HumanAsk::Pending(AskKind::Review));
 
         // Non-blocking events carry no ask.
         let idle = observe_hook_event("Stop", &serde_json::json!({})).unwrap();
-        assert_eq!(idle.ask, Ask::None);
+        assert_eq!(idle.ask, HookAsk::None);
+        assert_eq!(idle.ask.tagged(), HumanAsk::None);
+        assert_eq!(idle.ask.legacy(), (BlockedOn::None, Ask::None));
+    }
+
+    /// A deterministic clock, so the mapping is asserted as the pure function it is.
+    const OBSERVED_AT_MS: u64 = 1_764_000_000_000;
+
+    /// The closed `StopFailure` vocabulary (Claude Code 2.1.259), pinned word by word: ten words
+    /// that state a condition and one — `max_output_tokens` — that deliberately states none. A
+    /// `_ =>` default over this table would publish a page per truncated response, which is why
+    /// every word has its own arm and why this test enumerates all eleven rather than sampling.
+    #[test]
+    fn every_stop_failure_word_maps_to_its_own_fault_or_to_no_mapping_at_all() {
+        let table: [(&str, Option<(FaultCategory, &str, Recovery)>); 11] = [
+            (
+                "authentication_failed",
+                Some((
+                    FaultCategory::Authentication,
+                    "claude/authentication_failed",
+                    Recovery::Human,
+                )),
+            ),
+            (
+                "oauth_org_not_allowed",
+                Some((
+                    FaultCategory::Policy,
+                    "claude/oauth_org_not_allowed",
+                    Recovery::Human,
+                )),
+            ),
+            (
+                "account_on_hold",
+                Some((
+                    FaultCategory::Account,
+                    "claude/account_on_hold",
+                    Recovery::Human,
+                )),
+            ),
+            (
+                "billing_error",
+                Some((
+                    FaultCategory::Account,
+                    "claude/billing_error",
+                    Recovery::Human,
+                )),
+            ),
+            (
+                "rate_limit",
+                Some((
+                    FaultCategory::RateLimit,
+                    "claude/rate_limit",
+                    Recovery::Unknown,
+                )),
+            ),
+            (
+                "overloaded",
+                Some((
+                    FaultCategory::Provider,
+                    "claude/overloaded",
+                    Recovery::Unknown,
+                )),
+            ),
+            (
+                "server_error",
+                Some((
+                    FaultCategory::Provider,
+                    "claude/server_error",
+                    Recovery::Unknown,
+                )),
+            ),
+            (
+                "invalid_request",
+                Some((
+                    FaultCategory::Configuration,
+                    "claude/invalid_request",
+                    Recovery::Human,
+                )),
+            ),
+            (
+                "model_not_found",
+                Some((
+                    FaultCategory::Configuration,
+                    "claude/model_not_found",
+                    Recovery::Human,
+                )),
+            ),
+            // The deliberate null: a response that hit its own output cap says nothing about the
+            // seat's health, so the condition axis is carried untouched.
+            ("max_output_tokens", None),
+            (
+                "unknown",
+                Some((FaultCategory::Harness, "claude/unknown", Recovery::Unknown)),
+            ),
+        ];
+
+        for (word, want) in table {
+            let payload = serde_json::json!({"hook_event_name": "StopFailure", "error": word});
+            let condition = stop_failure_condition(&payload, OBSERVED_AT_MS);
+            let Some((category, code, recovery)) = want else {
+                assert_eq!(
+                    condition,
+                    ConditionReport::Unchanged,
+                    "{word} maps to nothing at all"
+                );
+                continue;
+            };
+            let ConditionReport::Fault(fault) = condition else {
+                panic!("{word} states a fault")
+            };
+            assert_eq!(fault.category, category, "{word}");
+            assert_eq!(fault.code.as_deref(), Some(code), "{word}");
+            assert_eq!(fault.recovery, recovery, "{word}");
+            // The SEMANTIC instant, from the hook's own clock.
+            assert_eq!(fault.observed_at_ms, OBSERVED_AT_MS, "{word}");
+            assert_eq!(
+                fault.detail, None,
+                "`error_details` is prose and never rides the fault: {word}"
+            );
+        }
+
+        // A word this build has never seen is still a fault — visible, routed by its recovery,
+        // and never guessed into a neighbouring category — carrying the verbatim word.
+        let ConditionReport::Fault(future) = stop_failure_condition(
+            &serde_json::json!({"error": "quantum_flux"}),
+            OBSERVED_AT_MS,
+        ) else {
+            panic!("an unrecognized word is still a failed turn")
+        };
+        assert_eq!(future.category, FaultCategory::Harness);
+        assert_eq!(future.code.as_deref(), Some("claude/quantum_flux"));
+        assert_eq!(future.recovery, Recovery::Unknown);
+
+        // Presence-tested, not defaulted: a `StopFailure` carrying no word at all is codeless
+        // rather than code-guessed, because a minted word would be indistinguishable from one
+        // Claude published.
+        for payload in [
+            serde_json::json!({"hook_event_name": "StopFailure"}),
+            serde_json::json!({"error": ""}),
+        ] {
+            let ConditionReport::Fault(wordless) = stop_failure_condition(&payload, OBSERVED_AT_MS)
+            else {
+                panic!("a wordless StopFailure still failed the turn: {payload}")
+            };
+            assert_eq!(wordless.category, FaultCategory::Harness);
+            assert_eq!(wordless.code, None);
+            assert_eq!(wordless.recovery, Recovery::Unknown);
+        }
+    }
+
+    /// The anti-laundering guard. `Recovery::Automatic` is projected as recovering/soon and NEVER
+    /// pages while its deadline holds, so an automatic Claude fault would keep a wedged seat
+    /// quiet indefinitely — and Claude has no retry visibility and publishes no reset instant to
+    /// time one with. No row may declare it, and no row may set a deadline.
+    #[test]
+    fn claude_never_declares_a_recovery_it_cannot_time() {
+        for word in [
+            "authentication_failed",
+            "oauth_org_not_allowed",
+            "account_on_hold",
+            "billing_error",
+            "rate_limit",
+            "overloaded",
+            "server_error",
+            "invalid_request",
+            "model_not_found",
+            "max_output_tokens",
+            "unknown",
+            "a_word_from_a_later_build",
+            "",
+        ] {
+            let payload = serde_json::json!({"error": word});
+            let ConditionReport::Fault(fault) = stop_failure_condition(&payload, OBSERVED_AT_MS)
+            else {
+                continue;
+            };
+            assert_ne!(fault.recovery, Recovery::Automatic, "{word}");
+            assert_ne!(
+                fault.recovery,
+                Recovery::Terminal,
+                "a re-login or a wait can still clear it: {word}"
+            );
+            assert_eq!(fault.next_observation_due_ms, None, "{word}");
+        }
+    }
+
+    /// `StopFailure` is idle PLUS a fault: the TUI is live and only the wrapper's process exit
+    /// writes the terminal word. It synthesizes no ask either — the remediation is on the
+    /// condition axis, and a pending ask would fabricate a prompt nobody can answer.
+    #[test]
+    fn a_stop_failure_is_idle_with_a_fault_and_never_ended_or_an_ask() {
+        let payload = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+            "session_id": "s-1",
+            "error_details": "please try again later",
+        });
+        let observed = observe_hook_event_at("StopFailure", &payload, OBSERVED_AT_MS).unwrap();
+        assert_eq!(observed.state, Activity::Idle);
+        assert_ne!(
+            observed.state,
+            Activity::Ended,
+            "the wrapper's exit is the sole terminal writer"
+        );
+        assert_eq!(observed.ask, HookAsk::None);
+        let ConditionReport::Fault(fault) = &observed.condition else {
+            panic!("the failure rides the condition axis")
+        };
+        assert_eq!(fault.category, FaultCategory::RateLimit);
+        assert_eq!(fault.observed_at_ms, OBSERVED_AT_MS);
+
+        // The version 3 statement: one frame, no exit, the ask still positively none.
+        let frame = observed.frame();
+        assert_eq!(frame.state, Activity::Idle);
+        assert_eq!(frame.ask, HumanAsk::None);
+        assert_eq!(frame.exit, None, "a fault never carries a terminal outcome");
+        assert_eq!(frame.condition, observed.condition);
+        assert_eq!(frame.reason.as_deref(), Some("apiError"));
+
+        // The truncation word is the one `StopFailure` that raises nothing at all, while still
+        // reporting the turn's end exactly as it always did.
+        let truncated = observe_hook_event_at(
+            "StopFailure",
+            &serde_json::json!({"error": "max_output_tokens"}),
+            OBSERVED_AT_MS,
+        )
+        .unwrap();
+        assert_eq!(truncated.state, Activity::Idle);
+        assert_eq!(truncated.condition, ConditionReport::Unchanged);
+        assert_eq!(truncated.reason, Some("apiError"));
+    }
+
+    /// The clear edges, and the two `SessionStart` sources that look like boundaries but are not.
+    #[test]
+    fn a_completed_turn_and_a_fresh_incarnation_are_the_only_edges_that_clear() {
+        let session = serde_json::json!({"session_id": "s-1"});
+        let stop = observe_hook_event_at("Stop", &session, OBSERVED_AT_MS).unwrap();
+        assert_eq!(
+            (stop.state, stop.condition.clone()),
+            (Activity::Idle, ConditionReport::Clear),
+            "a completed turn is progress a standing fault would have prevented"
+        );
+
+        // Genuine process boundaries: a new incarnation supersedes whatever the last one held.
+        for source in ["startup", "resume"] {
+            let mut payload = session.clone();
+            payload["source"] = source.into();
+            let boundary = observe_hook_event_at("SessionStart", &payload, OBSERVED_AT_MS).unwrap();
+            assert_eq!(boundary.condition, ConditionReport::Clear, "{source}");
+            assert_eq!(boundary.state, Activity::Idle, "{source}");
+        }
+        // A `SessionStart` with no source word is treated as one, because that is what the event
+        // otherwise means.
+        assert_eq!(
+            observe_hook_event_at("SessionStart", &session, OBSERVED_AT_MS)
+                .unwrap()
+                .condition,
+            ConditionReport::Clear
+        );
+
+        // The MID-PROCESS sources. `compact` is the same session seeing one compaction a third
+        // time (see `observe_compaction`); `clear` empties the conversation inside the running
+        // process — same pty, same wrapper, same incarnation. A fault the provider still holds
+        // survives both, so clearing on either would silence it on every automatic compaction and
+        // every `/clear`.
+        for source in ["compact", "clear"] {
+            let mut payload = session.clone();
+            payload["source"] = source.into();
+            let mid_process =
+                observe_hook_event_at("SessionStart", &payload, OBSERVED_AT_MS).unwrap();
+            assert_eq!(
+                mid_process.condition,
+                ConditionReport::Unchanged,
+                "{source}"
+            );
+            assert_eq!(mid_process.state, Activity::Idle, "{source}");
+            assert_eq!(mid_process.reason, Some("sessionStart"), "{source}");
+        }
+    }
+
+    /// An activity or ask edge has learned NOTHING about whether the provider is faulted. Carrying
+    /// the axis is also what preserves a standing fault's semantic clock: a stated `clear` here
+    /// would silence it, and a restated fault would re-mint `observedAtMs` on every tool call.
+    #[test]
+    fn an_activity_edge_never_clears_a_standing_condition() {
+        let session = serde_json::json!({"session_id": "s-1"});
+        for event in [
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+        ] {
+            let observed = observe_hook_event_at(event, &session, OBSERVED_AT_MS).unwrap();
+            assert_eq!(observed.state, Activity::Active, "{event}");
+            assert_eq!(observed.condition, ConditionReport::Unchanged, "{event}");
+            assert_eq!(
+                observed.frame().condition,
+                ConditionReport::Unchanged,
+                "the carry must reach the write, not just the mapping: {event}"
+            );
+        }
+
+        // A repeatable edge is CLOCK-INDEPENDENT: nothing it states may be minted from `now`, or
+        // two identical observations would be two different tuples. The conversation link is the
+        // one field that could be, so these edges state none and the standing link carries.
+        for event in [
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+        ] {
+            let first = observe_hook_event_at(event, &session, OBSERVED_AT_MS).unwrap();
+            let later = observe_hook_event_at(event, &session, OBSERVED_AT_MS + 90_000).unwrap();
+            assert_eq!(first.conversation, None, "{event}");
+            assert_eq!(
+                first, later,
+                "a repeat must restate exactly the same tuple: {event}"
+            );
+            assert_eq!(
+                first.frame(),
+                later.frame(),
+                "identical frames are what makes the repeat coalesce: {event}"
+            );
+        }
+
+        // The measured DQ-H1 denial residual on the tagged axis: "No" ends the turn with no
+        // further event, so the ask stands until the next prompt, which is the only edge that
+        // releases it — and that release still touches no condition.
+        let denied = observe_hook_event_at(
+            "PermissionRequest",
+            &serde_json::json!({"session_id": "s-1", "tool_name": "Bash"}),
+            OBSERVED_AT_MS,
+        )
+        .unwrap();
+        assert_eq!(denied.ask.tagged(), HumanAsk::Pending(AskKind::Permission));
+        let next_prompt =
+            observe_hook_event_at("UserPromptSubmit", &session, OBSERVED_AT_MS).unwrap();
+        assert_eq!(next_prompt.ask, HookAsk::None);
+        assert_eq!(next_prompt.condition, ConditionReport::Unchanged);
+    }
+
+    /// The write-rate consequence of the rule above, on the path this build emits: a repeated
+    /// activity edge must not touch the record at all. If any axis were minted from `now`, the
+    /// second write would land, `transitions` would advance, and `sinceMs` — when the state was
+    /// ENTERED — would restart on a state the seat never left, on every tool call of every turn.
+    #[test]
+    fn a_repeated_activity_edge_neither_writes_nor_restarts_since() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = harness_state_path(tmp.path());
+        let payload = serde_json::json!({"session_id": "s-1"});
+        let mut writer = harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        );
+        // The boundary event states the condition axis once; version 3 refuses an activity-only
+        // frame before that, which is the same bootstrap `run_observe` relies on in production.
+        hook_publish(&mut writer, "SessionStart", &payload);
+        let publish = |writer: &mut harness_state::Writer| {
+            hook_publish(writer, "PostToolUse", &payload).accepted()
+        };
+
+        assert!(publish(&mut writer));
+        let first = fs::read(&record).unwrap();
+        let since_ms = harness_state::read(&record, None).unwrap().since_ms;
+
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(publish(&mut writer), "the record still says this");
+        assert_eq!(
+            fs::read(&record).unwrap(),
+            first,
+            "a restated activity edge coalesces: nothing was written"
+        );
+        assert_eq!(
+            harness_state::read(&record, None).unwrap().since_ms,
+            since_ms,
+            "`sinceMs` marks when the state was entered and must not restart"
+        );
+    }
+
+    /// The conversation bridge, from the one typed field every hook payload carries.
+    #[test]
+    fn hook_states_link_claudes_session_id_with_bounded_declared_evidence() {
+        let payload = serde_json::json!({
+            "session_id": "abc-123",
+            "transcript_path": "/home/x/.claude/projects/abc-123.jsonl",
+        });
+        let observed = observe_hook_event_at("Stop", &payload, OBSERVED_AT_MS).unwrap();
+        let Some(ConversationState::Linked(link)) = observed.conversation.clone() else {
+            panic!("Claude's session id is typed evidence of its own conversation")
+        };
+        assert_eq!(link.driver, "claude");
+        assert_eq!(
+            link.conversation, "abc-123",
+            "the provider's identity rides verbatim"
+        );
+        assert_ne!(
+            Some(link.conversation.clone()),
+            wrapperless_token(&payload),
+            "the prefixed token is st2's ownership namespace, not Claude's identity"
+        );
+        // Claude compacts — this file counts the edges — so a prefix read once may be gone.
+        assert_eq!(link.history_mutability, HistoryMutability::Rewritable);
+        // Pinned knowledge of 2.1.x; st2 never probed the transcript.
+        assert_eq!(link.capability_evidence, CapabilityEvidence::Declared);
+        // Finite and positive: a consumer ages the claim instead of trusting it forever.
+        assert_eq!(link.verified_through_ms, OBSERVED_AT_MS);
+        // Identity and capability ONLY: the transcript path rides the same payload and is
+        // content-bearing, so it must not reach a replicated record.
+        assert!(!format!("{link:?}").contains("transcript"), "{link:?}");
+        assert_eq!(observed.frame().conversation, observed.conversation);
+
+        // Nothing to state is stated as nothing: `Unsupported` would be false (Claude plainly
+        // has conversations) and a half-stated link is what the reader degrades.
+        for silent in [serde_json::json!({}), serde_json::json!({"session_id": ""})] {
+            assert_eq!(
+                observe_hook_event_at("Stop", &silent, OBSERVED_AT_MS)
+                    .unwrap()
+                    .conversation,
+                None,
+                "{silent}"
+            );
+        }
+        // A zero clock is not a finite verification bound, so the claim is withheld rather than
+        // written in a shape this build's own reader rejects.
+        assert_eq!(
+            observe_hook_event_at("Stop", &payload, 0)
+                .unwrap()
+                .conversation,
+            None
+        );
+    }
+
+    /// Source compatibility: on a writer that does not emit the condition axis, every Claude hook
+    /// writes exactly the bytes it always did. The condition and conversation axes are DROPPED
+    /// rather than half-written or stashed in a sidecar, and their absence reads as `absent` —
+    /// never as health. Production emits version 3 now, so the version 2 writer comes from the
+    /// test-only emitted-schema seam: this is the shape of every legacy record still on disk and
+    /// of anything a rollback writes.
+    #[test]
+    fn the_legacy_wire_is_unchanged_while_the_writer_omits_the_condition_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = harness_state_path(tmp.path());
+        let payload = serde_json::json!({"session_id": "s-1", "error": "rate_limit"});
+        let mut writer = harness_state::Writer::new(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            Some("hetz.worker".to_string()),
+        )
+        .with_emitted_schema(harness_state::SCHEMA_V2);
+        assert!(
+            !writer.writes_condition_axis(),
+            "the legacy projection is reached through the version 2 seam"
+        );
+        assert!(
+            writer
+                .observe_unless_ended(
+                    observe_hook_event("StopFailure", &payload)
+                        .unwrap()
+                        .observation()
+                )
+                .unwrap()
+        );
+
+        let raw = fs::read_to_string(&record).unwrap();
+        for key in ["condition", "conversationRef", "humanAsk"] {
+            assert!(
+                !raw.contains(&format!("\"{key}\"")),
+                "{key} must not reach the version 2 wire: {raw}"
+            );
+        }
+        let observed = harness_state::read(&record, None).unwrap();
+        assert_eq!(observed.state, Activity::Idle);
+        assert_eq!(observed.blocked_on, BlockedOn::None);
+        assert_eq!(observed.ask, Ask::None);
+        assert_eq!(observed.reason.as_deref(), Some("apiError"));
+        assert_eq!(
+            observed.condition,
+            harness_state::ConditionView::Absent,
+            "a record that never spoke about health is not healthy"
+        );
+    }
+
+    /// Claude's unobservable edges stay declared-unsupported: no mapping exists for an interrupt,
+    /// for `SessionEnd`, or for `Notification` (the only `auth_success` signal, unregistered —
+    /// which is why Claude has no paired clear). Pinned so a future build that starts emitting
+    /// them fails loudly here instead of silently doing nothing in the field.
+    #[test]
+    fn claudes_unobservable_edges_stay_declared() {
+        let session = serde_json::json!({"session_id": "s-1"});
+        for event in [
+            "Notification",
+            "SessionEnd",
+            "SubagentStart",
+            "SubagentStop",
+            "PermissionDenied",
+            "Interrupt",
+            // The compaction edges are harness-CONTEXT only and must never touch this axis.
+            "PreCompact",
+            "PostCompact",
+        ] {
+            assert_eq!(observe_hook_event(event, &session), None, "{event}");
+        }
+    }
+
+    /// A subagent's event must not raise, clear, or move anything — on either axis.
+    #[test]
+    fn subagent_events_never_raise_or_clear_a_condition() {
+        for (event, error) in [("StopFailure", "authentication_failed"), ("Stop", "")] {
+            let payload = serde_json::json!({
+                "session_id": "s-1",
+                "agent_id": "sub-1",
+                "agent_type": "",
+                "error": error,
+            });
+            assert_eq!(observe_hook_event(event, &payload), None, "{event}");
+        }
     }
 
     /// T2: a hook that finishes after the wrapper reaped Claude must not replace the terminal
@@ -1108,13 +1996,7 @@ mod tests {
             Some("hetz.worker".to_string()),
         )
         .with_session(observer.session());
-        assert!(
-            !late
-                .observe_unless_ended(
-                    observe_hook_event("PostToolUse", &serde_json::Value::Null).unwrap()
-                )
-                .unwrap()
-        );
+        assert!(!hook_publish(&mut late, "PostToolUse", &serde_json::Value::Null).accepted());
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Ended
@@ -1131,11 +2013,7 @@ mod tests {
         .with_session("claude-session-fresh");
         fallback.interrupt();
         assert!(
-            !fallback
-                .observe_unless_ended(
-                    observe_hook_event("SessionStart", &serde_json::Value::Null).unwrap()
-                )
-                .unwrap()
+            !hook_publish(&mut fallback, "SessionStart", &serde_json::Value::Null).accepted()
         );
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
@@ -1152,13 +2030,7 @@ mod tests {
             Some("hetz.worker".to_string()),
         )
         .with_ownership(next.session().to_string(), next.seq());
-        assert!(
-            fresh
-                .observe_unless_ended(
-                    observe_hook_event("SessionStart", &serde_json::Value::Null).unwrap()
-                )
-                .unwrap()
-        );
+        assert!(hook_publish(&mut fresh, "SessionStart", &serde_json::Value::Null).accepted());
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Idle
@@ -1175,12 +2047,11 @@ mod tests {
         let record = harness_state_path(tmp.path());
         let payload_a = serde_json::json!({ "session_id": "aaa" });
         let payload_b = serde_json::json!({ "session_id": "bbb" });
+        // The whole ownership selection plus the write, exactly as `run_observe` performs them.
         let drive = |event: &str, payload: &serde_json::Value| {
             let mut writer =
                 observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
-            writer
-                .observe_unless_ended(observe_hook_event(event, payload).unwrap())
-                .unwrap()
+            hook_publish(&mut writer, event, payload).accepted()
         };
 
         assert!(drive("SessionStart", &payload_a), "A claims");
@@ -1200,6 +2071,119 @@ mod tests {
             harness_state::read(&record, None).unwrap().state,
             Activity::Active
         );
+    }
+
+    /// The wrapperless session boundary, decided in one predicate.
+    ///
+    /// The version 3 half is the load-bearing one: a claim writes this session's FENCE, which is
+    /// excluded from what an unstated axis inherits, so claiming on a mid-process `SessionStart`
+    /// would drop a standing fault by OWNERSHIP — the same laundering the mapping refuses to do
+    /// with `clear`, arriving through the other door. Pinned as a pure function of
+    /// `(writes_condition_axis, event, payload)` so BOTH arms stay decidable from one build; the
+    /// version 3 arm is now also proved end-to-end, against the real writer, by
+    /// `a_wrapperless_session_start_claims_only_for_a_fresh_incarnation`.
+    #[test]
+    fn a_mid_process_session_start_claims_only_while_the_condition_axis_is_unwritable() {
+        for source in [
+            None,
+            Some("startup"),
+            Some("resume"),
+            Some("compact"),
+            Some("clear"),
+        ] {
+            let mut payload = serde_json::json!({"session_id": "aaa"});
+            if let Some(source) = source {
+                payload["source"] = source.into();
+            }
+            // The legacy wire: every `SessionStart` is the boundary and claims, unchanged.
+            assert!(
+                claims_wrapperless_session(false, "SessionStart", &payload),
+                "{source:?}"
+            );
+            // With the condition axis on the wire, only a genuinely fresh incarnation claims.
+            let fresh = !matches!(source, Some("compact") | Some("clear"));
+            assert_eq!(
+                claims_wrapperless_session(true, "SessionStart", &payload),
+                fresh,
+                "{source:?}"
+            );
+        }
+
+        // No other event is a session boundary on either wire: token-only writers never claim.
+        let payload = serde_json::json!({"session_id": "aaa"});
+        for event in [
+            "Stop",
+            "StopFailure",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "PreCompact",
+        ] {
+            assert!(
+                !claims_wrapperless_session(false, event, &payload),
+                "{event}"
+            );
+            assert!(
+                !claims_wrapperless_session(true, event, &payload),
+                "{event}"
+            );
+        }
+    }
+
+    /// The version 3 arm of the predicate above, end to end against the real writer — the proof
+    /// activation makes reachable.
+    ///
+    /// A mid-process `SessionStart` (`compact`, `clear`) keeps the token-only path, so no claim
+    /// fence is written and the standing fault this session already stated CARRIES: laundering it
+    /// away by ownership is exactly the defect the predicate exists to prevent. A genuinely fresh
+    /// incarnation (`startup`, `resume`) claims, and superseding the axis there is the truth.
+    #[test]
+    fn a_wrapperless_session_start_claims_only_for_a_fresh_incarnation() {
+        let seat = |source: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let record = harness_state_path(tmp.path());
+            let drive = |event: &str, payload: &serde_json::Value| {
+                let mut writer =
+                    observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
+                hook_publish(&mut writer, event, payload)
+            };
+            // Claude's session id does NOT change across a compaction, so the successor differs
+            // from the predecessor by `source` alone — which is the whole question.
+            let mut session = serde_json::json!({"session_id": "aaa"});
+            drive("SessionStart", &session);
+            let mut failed = session.clone();
+            failed["error"] = "authentication_failed".into();
+            drive("StopFailure", &failed);
+            let before = harness_state::read(&record, None).expect("a stated record");
+            session["source"] = source.into();
+            drive("SessionStart", &session);
+            (
+                before,
+                harness_state::read(&record, None).expect("a stated record"),
+            )
+        };
+
+        for mid_process in ["compact", "clear"] {
+            let (before, after) = seat(mid_process);
+            assert!(
+                matches!(before.condition, harness_state::ConditionView::Fault(_)),
+                "{mid_process}: the fault must stand before the boundary event"
+            );
+            assert!(
+                matches!(after.condition, harness_state::ConditionView::Fault(_)),
+                "{mid_process}: a mid-process boundary must not launder a standing fault by \
+                 ownership"
+            );
+        }
+        for fresh in ["startup", "resume"] {
+            let (_, after) = seat(fresh);
+            assert_eq!(
+                after.condition,
+                harness_state::ConditionView::Clear,
+                "{fresh}: a fresh incarnation legitimately supersedes the axis"
+            );
+        }
     }
 
     /// The status-line payload captured verbatim from the version in the producer table, before

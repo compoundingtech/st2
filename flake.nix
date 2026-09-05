@@ -492,10 +492,10 @@
         # without integrity hashes, which `fetchNpmDeps` cannot express.
         checks.pi-extension-types =
           let
-            piVersion = "0.84.2";
+            piVersion = "0.84.4";
             piTarball = pkgs.fetchurl {
               url = "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-${piVersion}.tgz";
-              hash = "sha256-lbiZzXsaDB8BdMe/M6tCdDXjVTp9H0dWZhqpx/Gmj/o=";
+              hash = "sha256-W852bRnDzroY8/uq2RxEnJ+dc5gfnjQA7O+TIAbwaWg=";
             };
             nodeTypesTarball = pkgs.fetchurl {
               url = "https://registry.npmjs.org/@types/node/-/node-26.2.0.tgz";

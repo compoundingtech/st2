@@ -51,10 +51,14 @@ pub const SCHEMA_V1: &str = "st2.harness-context.v1";
 pub const SCHEMA_V2: &str = "st2.harness-context.v2";
 
 /// Whether the immutable-ID writer is active. **On**, with the rest of the DELTA-003 activation
-/// cohort, for the same reason as its sibling [`crate::harness_state::EMIT_SCHEMA_V2`]: the driver
-/// wrappers hand this writer a raw immutable agent ID, and version 1's `agent` means a bus
-/// identity. [`read`] already accepts both versions and reports which namespace each names, so the
+/// cohort, for the same reason its sibling record family's selector
+/// ([`crate::harness_state::EMIT_SCHEMA_V3`]) carries that cohort forward: the driver wrappers
+/// hand this writer a raw immutable agent ID, and version 1's `agent` means a bus identity.
+/// [`read`] already accepts both versions and reports which namespace each names, so the
 /// reader-first precondition is met. One named constant, one reversal point, defaulted on.
+///
+/// This record family has exactly two versions and no version 3: the numeric reading is identical
+/// in both, so the sibling's fault-axis cutover has nothing to do here.
 pub const EMIT_SCHEMA_V2: bool = true;
 
 /// The version this build writes. Coalescing and compaction-counter continuity are scoped to it:

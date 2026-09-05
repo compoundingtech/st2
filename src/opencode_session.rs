@@ -6,16 +6,19 @@
 //! stream and projects session status, permission asks, and questions into the generic
 //! `harness-state` record — evidence-gated, so a dropped stream stops the heartbeat and the record
 //! ages out rather than restating a state nobody is watching. The delivery pump mirrors the Codex
-//! FIFO discipline: an `Attempted` receipt is persisted before transport, the transport is
-//! `POST /session/<id>/prompt_async` with a caller-derived stable `messageID`, and the only
-//! accepted receipt is the message read back from the server — never the `/tui/*` endpoints, which
-//! acknowledge input even when no TUI is attached.
+//! FIFO discipline through the shared [`crate::delivery_ledger`]: an `attempted` entry is durable
+//! before transport, the transport is `POST /session/<id>/prompt_async` with a caller-derived
+//! stable `messageID`, and the only receipt this transport can produce is the message read back
+//! from the server — never the `/tui/*` endpoints, which acknowledge input even when no TUI is
+//! attached. That read-back is graded as `persisted`, because it proves the server STORED the
+//! message and says nothing about the session scheduler admitting it; persistence therefore holds
+//! the inbox entry rather than releasing it, and is never mistaken for consumption.
 //!
 //! Fail-closed gate: delivery requires both a supported `opencode --version` and a live `/doc`
 //! subset check proving the exact API arms st2 depends on. Observation requires only the `/doc`
 //! check — its vocabulary already degrades to indeterminate on anything unrecognized.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::ExitStatusExt as _;
@@ -27,7 +30,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -35,9 +37,13 @@ use crate::driver_diagnostic::{
     Driver as DiagnosticDriver, Publisher as DiagnosticPublisher, Reason as DiagnosticReason,
     Source as DiagnosticSource, Stage as DiagnosticStage, Support as DiagnosticSupport,
 };
-use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
+use crate::harness_state::{
+    self, Activity, Ask, AskKind, BlockedOn, CapabilityEvidence, ConditionReport, ConversationClaim,
+    ConversationState, FaultCategory, FaultKey, FaultReport, Frame, HistoryMutability, HumanAsk,
+    InputBuffer, Observation, ProgressProof, Recovery, Refusal, WriteOutcome, Writer,
+};
 use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
-use crate::{ding, harness_context, harness_version, message, status};
+use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
 /// (1.18, measured at 1.18.19). The live `/doc` check below guards the shape; this list guards
@@ -50,7 +56,6 @@ use crate::{ding, harness_context, harness_version, message, status};
 /// risk this widening accepts. A new MINOR still needs the surfaces re-verified.
 const SUPPORTED_OPENCODE_MINORS: [(u32, u32); 1] = [(1, 18)];
 
-const DELIVERY_STATE_SCHEMA: &str = "st2.opencode-delivery-state.v1";
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const INBOX_REFRESH_FALLBACK: Duration = Duration::from_secs(2);
 const DELIVERY_RETRY: Duration = Duration::from_secs(2);
@@ -188,10 +193,14 @@ pub fn run(
             // would leave the exitless `ended (superseded)` placeholder standing as a false
             // takeover. The launch failed under THIS session's ownership, so the record ends
             // honestly here instead (the same contract pi's launch path keeps).
-            let _ = session.writer.observe(
-                Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
-                    .with_reason("launch-error")
-                    .with_exit("exit unknown"),
+            // No projection exists yet — the provider never started — so the axis this states,
+            // if the record still needs it stated, is the empty machine's: no standing fault.
+            // The launch failure itself rides the record's `reason` and `exit`.
+            write_terminal(
+                &mut session.writer,
+                "exit unknown",
+                Some("launch-error"),
+                EventMachine::default().bootstrap_condition(),
             );
             return Err(error);
         }
@@ -241,16 +250,31 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             // the group yields inside the grace window the wrapper survives, so the record is
             // rewritten with the exit the reap actually observed — "stopped" remains only as
             // escalation cover.
-            let _ = session.writer.ended("stopped");
+            write_terminal(
+                &mut session.writer,
+                "stopped",
+                None,
+                machine.bootstrap_condition(),
+            );
             let reaped = stop_provider_group(child);
             if let Ok(Some(exit)) = &reaped {
-                let _ = session.writer.ended(describe_exit(*exit));
+                write_terminal(
+                    &mut session.writer,
+                    &describe_exit(*exit),
+                    None,
+                    machine.bootstrap_condition(),
+                );
             }
             break reaped.map(|_| ());
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
-                let _ = session.writer.ended(describe_exit(exit));
+                write_terminal(
+                    &mut session.writer,
+                    &describe_exit(exit),
+                    None,
+                    machine.bootstrap_condition(),
+                );
                 break completed(exit);
             }
             Ok(None) => {}
@@ -258,10 +282,11 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 // The liveness check failing is a terminal outcome too: without this write the
                 // claim placeholder stands as the visible state (the self-review's error-arm
                 // class).
-                let _ = session.writer.observe(
-                    Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
-                        .with_reason("launch-error")
-                        .with_exit("exit unknown"),
+                write_terminal(
+                    &mut session.writer,
+                    "exit unknown",
+                    Some("launch-error"),
+                    machine.bootstrap_condition(),
                 );
                 return Err(error).context("checking opencode provider");
             }
@@ -309,7 +334,10 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 SseMessage::Connected => {
-                    machine = EventMachine::default();
+                    // The ACTIVITY axis restarts from the level seed below; the standing faults
+                    // and the conversation identity ride across, because the level surface
+                    // states neither and a blip must not silence a live fault.
+                    machine = machine.reconnected();
                     sse_connected = true;
                     session.diagnostics.clear(DiagnosticStage::Sse);
                     // Evidence turns on only once the level seed succeeds: resuming heartbeats
@@ -354,7 +382,12 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 context.publish();
             }
         }
-        if machine.poisoned && machine.ended.is_none() && evidence {
+        // Which projection a poisoned status word withholds depends on the emitted version: the
+        // legacy one keeps a sticky terminal that outranks poison, the version 3 one has no
+        // terminal arm at all, so it is withheld outright until a seed rebuilds the activity.
+        let withheld =
+            machine.poisoned && (session.writer.writes_condition_axis() || machine.ended.is_none());
+        if withheld && evidence {
             // The projection went untrustworthy mid-stream: stop heartbeating over it and let
             // the level seed rebuild the whole picture from the server's own truth.
             evidence = false;
@@ -373,8 +406,44 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 &mut session.diagnostics,
             );
         }
-        if evidence && let Some(observation) = machine.observation() {
-            let _ = session.writer.observe(observation);
+        if session.writer.writes_condition_axis() {
+            // ORDER MATTERS. A condition operation attaches to an OBSERVATION: against a claim
+            // fence — which has observed nothing — it is refused as `Unobserved`, and a frame
+            // whose condition is `Unchanged` over that same fence has no axis to inherit and is
+            // refused as `Unstated`. So the frame goes first and states the axis when the record
+            // needs it stated, and only then do the queued edges move it.
+            //
+            // While there is no evidence nothing is written at all AND the queue is HELD: the
+            // faults were observed on frames that did arrive, and a lost stream must not silence
+            // them — it only delays the write until the record has an observation to carry it.
+            if evidence {
+                if let Some(frame) = machine.frame() {
+                    let outcome = session.writer.publish(frame);
+                    if matches!(&outcome, Ok(WriteOutcome::Refused(Refusal::Unstated))) {
+                        // The one retry: this session's first frame, stating the axis the fence
+                        // left absent as whatever the reducer projects right now.
+                        if let Some(stated) = machine.frame_with(machine.bootstrap_condition()) {
+                            note_write(session.writer.publish(stated));
+                        }
+                    } else {
+                        note_write(outcome);
+                    }
+                }
+                for edge in machine.take_edges() {
+                    note_write(match edge {
+                        ConditionEdge::Raise(fault) => session.writer.raise_fault(fault),
+                        ConditionEdge::ClearPaired(key) => session.writer.clear_fault(key),
+                        ConditionEdge::ClearAll(proof) => session.writer.clear_all(proof),
+                    });
+                }
+            }
+        } else {
+            // The version 2 wire has nowhere to carry a condition, so the queue is drained and
+            // dropped rather than growing for a writer that can never state it.
+            let _ = machine.take_edges();
+            if evidence && let Some(observation) = machine.observation() {
+                let _ = session.writer.observe(observation);
+            }
         }
 
         let now = Instant::now();
@@ -403,6 +472,47 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
     };
     sse_stop.store(true, Ordering::SeqCst);
     outcome
+}
+
+/// A version 3 write's outcome, logged rather than dropped. Landing and coalescing are both
+/// success; a refusal — a foreign schema, a later session's claim, a paired clear that matched
+/// nothing — is a value, and this record family has exactly one store and no second place to
+/// report it through.
+fn note_write(outcome: Result<harness_state::WriteOutcome>) {
+    match outcome {
+        Ok(outcome) => {
+            if let Some(refusal) = outcome.refusal() {
+                tracing::warn!("st2 opencode-session: harness-state write refused: {refusal:?}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!("st2 opencode-session: harness-state write failed: {error:#}");
+        }
+    }
+}
+
+/// THE terminal record for this driver's four process-exit owners — the launch failure, the STOP
+/// path and its reap, the ordinary child exit, and the failed liveness check.
+///
+/// The vocabulary decision, the `Unchanged`-first attempt, and the one-shot `Unstated` retry are
+/// [`crate::provider_session::write_terminal`]'s: every terminal owner in the crate must write
+/// the same shape, so that rule lives in one place. What stays here is what is OpenCode's alone —
+/// the `bootstrap` this driver hands it is the axis its own reducer projects for the winning
+/// session rather than a blanket `clear`, and a refusal is reported through this module's
+/// [`note_write`] rather than swallowed.
+fn write_terminal(
+    writer: &mut Writer,
+    exit: &str,
+    reason: Option<&str>,
+    bootstrap: ConditionReport,
+) {
+    match crate::provider_session::write_terminal(writer, exit, reason, bootstrap) {
+        // The legacy surface has no typed outcome: it made the exact statement `Writer::ended`
+        // makes and there is nothing to report.
+        Ok(None) => {}
+        Ok(Some(outcome)) => note_write(Ok(outcome)),
+        Err(error) => note_write(Err(error)),
+    }
 }
 
 fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
@@ -740,15 +850,21 @@ fn seed_from_server(
         DiagnosticReason::MalformedStatus,
         DiagnosticSource::StatusSnapshot,
     ))?;
-    let mut seeded = EventMachine::default();
+    // The ACTIVITY axis is what the level surface owns; the standing faults and the conversation
+    // identity ride across the swap, because `/session/status` states neither.
+    let mut seeded = machine.reconnected();
     seeded.seed_idle();
+    let mut retrying_now = BTreeSet::new();
     for (session_id, status) in map {
         // Exactly the pinned vocabulary: an unknown future word is not "busy" — it is surface
         // drift the /doc gate vocabulary did not cover.
         match status.get("type").and_then(Value::as_str) {
             Some("idle") => {}
             Some("busy") => seeded.seed_busy(session_id.clone(), false),
-            Some("retry") => seeded.seed_busy(session_id.clone(), true),
+            Some("retry") => {
+                seeded.seed_busy(session_id.clone(), true);
+                retrying_now.insert(session_id.clone());
+            }
             _ => {
                 return Err((
                     DiagnosticReason::UnknownStatus,
@@ -757,6 +873,11 @@ fn seed_from_server(
             }
         }
     }
+    // This map is the authoritative statement of who is retrying, so a retry fault carried
+    // across the swap whose session is not in it has ended: its exit arm passed unobserved while
+    // the stream was down, and leaving it standing would wedge an automatic recovery that is
+    // already over. Each is retired through its own exact key.
+    seeded.retire_retries(&retrying_now);
     // Both pending-ask listings must succeed for the seed to count: a transient failure must not
     // restore evidence on an unblocked picture and silently wedge an ask opened during the outage.
     for (endpoint, kind, unavailable, malformed, source) in [
@@ -787,6 +908,10 @@ fn seed_from_server(
             seeded.seed_ask(id.to_string(), kind);
         }
     }
+    // Every read above answered 200 against this seat's own server, which is what makes the
+    // conversation link's capability PROBED rather than declared, and its verification bound
+    // finite. The identity itself comes only from OpenCode's typed `sessionID`.
+    seeded.verified_through_ms = message::now_ms();
     *machine = seeded;
     Ok(())
 }
@@ -811,9 +936,212 @@ fn seed_with_diagnostics(
 
 // ---- event projection ------------------------------------------------------------------------
 
+/// The floor at which a millisecond number is a unix INSTANT rather than a duration: `1e12` ms is
+/// September 2001, and no retry delay is 30 years. Used to read `session.status{retry}.next`
+/// without guessing which of the two the unverified spelling means.
+const EPOCH_MS_FLOOR: u64 = 1_000_000_000_000;
+
+/// How many condition edges are held while the producer has no evidence to write them against.
+/// See [`EventMachine::push_edge`] for why trimming the oldest surplus is lossless.
+const CONDITION_EDGE_QUEUE: usize = 64;
+
+/// One condition-axis edge this reducer decided, replayed onto the record by the wrapper loop.
+/// Edges rather than a level restatement because the shared writer carries the rest of the tuple
+/// across a condition mutation verbatim: a producer that learned its provider is throttled has
+/// learned nothing new about whether the model is working, and making it restate an activity it
+/// did not observe is how a stale activity gets refreshed by a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionEdge {
+    Raise(FaultReport),
+    ClearPaired(FaultKey),
+    ClearAll(ProgressProof),
+}
+
+/// The pairing identity a clear must name EXACTLY: category plus the full code, never a prefix.
+type ConditionKey = (&'static str, Option<String>);
+
+fn condition_key(fault: &FaultReport) -> ConditionKey {
+    (fault.category.as_str(), fault.code.clone())
+}
+
+/// The single slot's total order, so a record carrying one condition while several faults stand
+/// never flaps between two equally-ranked ones: (1) a recovery a person owns outranks one the
+/// harness owns, (2) category severity, (3) the earlier observation, (4) the code. Total and
+/// antisymmetric — the last component is unique inside a set keyed by `(category, code)`.
+fn fault_rank(fault: &FaultReport) -> (u8, u8, u64, &str) {
+    let recovery = match fault.recovery {
+        Recovery::Human | Recovery::Terminal | Recovery::Unknown => 0,
+        Recovery::Automatic => 1,
+    };
+    let category = match fault.category {
+        FaultCategory::Authentication => 0,
+        FaultCategory::Account => 1,
+        FaultCategory::Quota => 2,
+        FaultCategory::RateLimit => 3,
+        FaultCategory::Policy => 4,
+        FaultCategory::Context => 5,
+        FaultCategory::Configuration => 6,
+        FaultCategory::Provider => 7,
+        FaultCategory::Harness => 8,
+    };
+    (
+        recovery,
+        category,
+        fault.observed_at_ms,
+        fault.code.as_deref().unwrap_or(""),
+    )
+}
+
+/// Whether two reports are the SAME fault, ignoring when it was observed — everything a consumer
+/// would route, time, or read differently counts, and `observedAtMs` is precisely the field a
+/// restatement must not move.
+fn same_fault(left: &FaultReport, right: &FaultReport) -> bool {
+    left.category == right.category
+        && left.code == right.code
+        && left.recovery == right.recovery
+        && left.next_observation_due_ms == right.next_observation_due_ms
+        && left.detail == right.detail
+}
+
+/// A fault code is `provider/code` and diagnostic underneath a routable category, so a name st2
+/// could not classify rides it verbatim except for the characters that would break that grammar.
+fn code_word(name: &str) -> String {
+    let word: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if word.is_empty() {
+        "unknown".to_string()
+    } else {
+        word
+    }
+}
+
+/// `session.error` by its typed `error.name` — the eight-arm union measured on 1.18.19, matched
+/// EXHAUSTIVELY so "maps to nothing" and "unknown to me" stay different answers rather than one
+/// `unwrap_or` default.
+///
+/// `MessageAbortedError` is the one deliberate null: an interruption is not a fault and the closed
+/// category set has no word for one, so it never raises and never clears. An unrecognized name is
+/// NOT a null — it is a failure the harness itself reported and st2 could not classify, so it
+/// stays visible under the most conservative truthful category (`harness`, whose plumbing
+/// produced an unreadable verdict) with its recovery left unclaimed, carrying the name it could
+/// not classify as diagnostic granularity. The name also rides `reason`; nothing branches on it.
+fn session_error_fault(name: &str, payload: &Value, now_ms: u64) -> Option<FaultReport> {
+    Some(match name {
+        "ProviderAuthError" => {
+            FaultReport::new(FaultCategory::Authentication, Recovery::Human, now_ms)
+                .with_code("opencode/ProviderAuthError")
+        }
+        "ContextOverflowError" => {
+            FaultReport::new(FaultCategory::Context, Recovery::Human, now_ms)
+                .with_code("opencode/ContextOverflowError")
+        }
+        "MessageOutputLengthError" => {
+            FaultReport::new(FaultCategory::Context, Recovery::Human, now_ms)
+                .with_code("opencode/MessageOutputLengthError")
+        }
+        "ContentFilterError" => FaultReport::new(FaultCategory::Policy, Recovery::Human, now_ms)
+            .with_code("opencode/ContentFilterError"),
+        "StructuredOutputError" => {
+            FaultReport::new(FaultCategory::Harness, Recovery::Human, now_ms)
+                .with_code("opencode/StructuredOutputError")
+        }
+        "MessageAbortedError" => return None,
+        "APIError" => api_error_fault(payload, now_ms),
+        unclassified => FaultReport::new(FaultCategory::Harness, Recovery::Unknown, now_ms)
+            .with_code(format!("opencode/session_error.{}", code_word(unclassified))),
+    })
+}
+
+/// `APIError` by the HTTP status the provider actually returned. The split the closed vocabulary
+/// forces: 402 is an allowance/billing wall (`account`), 429 is a throttle with the allowance
+/// intact (`rateLimit`), and 5xx is the provider failing on its own side (`provider`) — there is
+/// no `network` word, and SSE transport loss is not a fault at all.
+///
+/// `data.isRetryable`, when the harness states it, overrides the recovery class in both
+/// directions: it is OpenCode's own verdict on whether it will keep trying.
+fn api_error_fault(payload: &Value, now_ms: u64) -> FaultReport {
+    let (category, recovery, code) = match payload
+        .pointer("/error/data/status")
+        .and_then(Value::as_u64)
+    {
+        Some(status @ (401 | 403)) => (
+            FaultCategory::Authentication,
+            Recovery::Human,
+            format!("opencode/APIError.{status}"),
+        ),
+        Some(402) => (
+            FaultCategory::Account,
+            Recovery::Human,
+            "opencode/APIError.402".to_string(),
+        ),
+        Some(429) => (
+            FaultCategory::RateLimit,
+            Recovery::Automatic,
+            "opencode/APIError.429".to_string(),
+        ),
+        Some(status) if status >= 500 => (
+            FaultCategory::Provider,
+            Recovery::Automatic,
+            format!("opencode/APIError.{status}"),
+        ),
+        Some(status) if status >= 400 => (
+            FaultCategory::Configuration,
+            Recovery::Human,
+            format!("opencode/APIError.{status}"),
+        ),
+        // A status this version cannot read still happened on the provider's own API: `provider`
+        // is the truthful floor for it and the recovery stays unclaimed rather than guessed.
+        _ => (
+            FaultCategory::Provider,
+            Recovery::Unknown,
+            "opencode/APIError".to_string(),
+        ),
+    };
+    let recovery = match payload
+        .pointer("/error/data/isRetryable")
+        .and_then(Value::as_bool)
+    {
+        Some(true) => Recovery::Automatic,
+        Some(false) => Recovery::Human,
+        None => recovery,
+    };
+    FaultReport::new(category, recovery, now_ms).with_code(code)
+}
+
+/// The ONE positive clearAll edge: a completed assistant turn that carried no error. The `summary`
+/// exclusion reuses the measured trap the numeric axis already encodes — `summary` is a boolean on
+/// assistant messages and an object on user ones, and the compaction summarizer's own message is
+/// an assistant message. `session.idle`, `session.status{idle}`, a delivery read-back 200 (which
+/// proves persistence, not turn success) and a level reseed are deliberately NOT this edge.
+fn turn_completed(payload: &Value) -> bool {
+    let info = payload.get("info").unwrap_or(&Value::Null);
+    info.get("role").and_then(Value::as_str) == Some("assistant")
+        && info.get("summary").and_then(Value::as_bool) != Some(true)
+        && info
+            .pointer("/time/completed")
+            .is_some_and(|completed| !completed.is_null())
+        && info.get("error").is_none_or(Value::is_null)
+}
+
 /// The pure projection from OpenCode's event stream to one seat-level observation. A dedicated
 /// seat aggregates across the server's sessions: any busy session is activity, any open
 /// permission or question is a human block, and idle is only derived from positive level evidence.
+///
+/// The version 3 fault axis is folded in here and nowhere else, shaped by what OpenCode actually
+/// emits: a `session.error` arrives BEFORE `session.status{idle}` and a second one can arrive
+/// after it. So no activity edge may clear a condition, `session.idle` is not a success edge, and
+/// the standing faults are independent of the activity map — they survive an idle, an abort, a
+/// poisoned status word, and an SSE reconnect. The record carries one condition while several
+/// faults can stand, so [`EventMachine::winner`] projects the set through [`fault_rank`] and
+/// [`EventMachine::edges`] carries only the transitions of that one slot.
 #[derive(Default)]
 struct EventMachine {
     /// sessionID → currently retrying (vs plainly busy).
@@ -822,16 +1150,76 @@ struct EventMachine {
     blocked: BTreeMap<String, &'static str>,
     /// Level evidence seen: idle is a proof, never a default.
     seen_level: bool,
-    /// A tracked-busy session moved to a status word this version cannot read: every projection
-    /// is withheld until a fresh level seed replaces this machine.
+    /// A tracked-busy session moved to a status word this version cannot read: every ACTIVITY
+    /// projection is withheld until a fresh level seed replaces this machine. A standing fault
+    /// still reads: the unknown word made the busy map untrustworthy, not the fault set.
     poisoned: bool,
-    /// Terminal reason, once observed.
+    /// Terminal reason, once observed. LEGACY (schema 2) ONLY: the version 2 wire has no
+    /// condition axis, so a rejected provider credential can only be spelled as this record's
+    /// last word there, and it stays byte-for-byte what the shipped adapter writes. The version 3
+    /// projection has no `ended` arm at all — see [`EventMachine::frame`].
     ended: Option<&'static str>,
     /// The most recent non-terminal session error, surfaced as the idle reason once.
     last_error: Option<String>,
+    /// The standing faults, keyed exactly as a paired clear must name them.
+    conditions: BTreeMap<ConditionKey, FaultReport>,
+    /// sessionID → the retry fault raised for it. `session.status{retry}` does not repeat
+    /// `action.reason` on its exit arm, so the exact code a clear must name is remembered here.
+    retrying: BTreeMap<String, FaultKey>,
+    /// The fault on the record's single slot, as this reducer last stated it.
+    published: Option<FaultReport>,
+    /// Condition-axis transitions awaiting the writer, in the order they were observed.
+    edges: Vec<ConditionEdge>,
+    /// The provider's own conversation identity, from OpenCode's typed `sessionID`.
+    conversation: Option<String>,
+    /// When the wrapper last had that session named to it by the server it is talking to.
+    verified_through_ms: u64,
 }
 
 impl EventMachine {
+    /// The machine a reconnect or a fresh level seed starts from. The ACTIVITY axis is rebuilt
+    /// from the level surface — that is the whole point of the seed — while the standing faults
+    /// are carried across: OpenCode's level surface says nothing about them, so dropping them on
+    /// a stream blip would silence a live auth wall.
+    ///
+    /// The queued EDGES ride across too. A queued edge is an observation that already happened on
+    /// a frame the stream did deliver; a reconnect is not evidence against it, and the producer
+    /// may well have been unable to write it yet (a lost stream writes nothing). The carried slot
+    /// is then re-stated, because a raise of the same fault preserves its original `observedAtMs`
+    /// and the record is the only other place that slot lives.
+    fn reconnected(&self) -> Self {
+        let mut fresh = Self {
+            conditions: self.conditions.clone(),
+            retrying: self.retrying.clone(),
+            published: self.published.clone(),
+            conversation: self.conversation.clone(),
+            verified_through_ms: self.verified_through_ms,
+            edges: self.edges.clone(),
+            ..Self::default()
+        };
+        if let Some(fault) = fresh.published.clone() {
+            fresh.push_edge(ConditionEdge::Raise(fault));
+        }
+        fresh
+    }
+
+    /// Retire the retry faults the AUTHORITATIVE level surface no longer reports as retrying.
+    /// A retry carried across a reseed whose session is absent from the status map (idle sessions
+    /// are omitted) or reports any other word has ended: its own end event passed while the
+    /// stream was down, and the level map at seed time is the whole truth about who is retrying.
+    /// Each one is retired through its exact `(category, code)` key, like any other paired clear.
+    fn retire_retries(&mut self, retrying_now: &BTreeSet<String>) {
+        let settled: Vec<String> = self
+            .retrying
+            .keys()
+            .filter(|session| !retrying_now.contains(*session))
+            .cloned()
+            .collect();
+        for session in settled {
+            self.retry_ended(&session);
+        }
+    }
+
     fn seed_idle(&mut self) {
         self.seen_level = true;
     }
@@ -848,38 +1236,59 @@ impl EventMachine {
     }
 
     fn apply(&mut self, event: &Value) {
+        self.apply_at(event, message::now_ms());
+    }
+
+    /// The reducer, with the observation instant passed in: `observedAtMs` is the SEMANTIC clock
+    /// of a fault, so the one place it is minted is the edge that observed the fault.
+    fn apply_at(&mut self, event: &Value, now_ms: u64) {
         let Some(kind) = event.get("type").and_then(Value::as_str) else {
             return;
         };
-        let properties = event.get("properties").unwrap_or(&Value::Null);
+        // The `.v2.` spellings move the payload from `properties` to `data` — OpenCode's own SDK
+        // shim performs that downgrade, which is exactly why the `/doc` marker gate cannot see
+        // the switch. Read whichever root this frame actually carries.
+        let payload = [event.get("properties"), event.get("data")]
+            .into_iter()
+            .flatten()
+            .find(|value| value.is_object())
+            .unwrap_or(&Value::Null);
         let session_id = || {
-            properties
+            payload
                 .get("sessionID")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         };
+        if kind.starts_with("session.")
+            && let Some(id) = payload.get("sessionID").and_then(Value::as_str)
+        {
+            self.saw_conversation(id, now_ms);
+        }
         match kind {
             "session.status" => {
                 let Some(session_id) = session_id() else {
                     return;
                 };
-                match properties
+                match payload
                     .pointer("/status/type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                 {
                     "busy" => {
                         self.seen_level = true;
-                        self.busy.insert(session_id, false);
+                        self.busy.insert(session_id.clone(), false);
                         self.last_error = None;
+                        self.retry_ended(&session_id);
                     }
                     "retry" => {
                         self.seen_level = true;
-                        self.busy.insert(session_id, true);
+                        self.busy.insert(session_id.clone(), true);
+                        self.retry_began(&session_id, payload, now_ms);
                     }
                     "idle" => {
                         self.seen_level = true;
                         self.busy.remove(&session_id);
+                        self.retry_ended(&session_id);
                     }
                     // A future status arm is not evidence of anything — not even level evidence:
                     // counting it would let an unrecognized word prove `idle` on a quiet server.
@@ -897,14 +1306,22 @@ impl EventMachine {
                 if let Some(session_id) = session_id() {
                     self.seen_level = true;
                     self.busy.remove(&session_id);
+                    // The retry signal's other end event: this session has settled, so the retry
+                    // it was in is over. Still the SAME session key and still the exact code —
+                    // no other fault is touched, and no other session's retry is.
+                    self.retry_ended(&session_id);
                 }
             }
             "session.error" => {
-                let name = properties
+                let name = payload
                     .pointer("/error/name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 if name == "ProviderAuthError" {
+                    // The LEGACY word, unchanged (see the field's own note). The version 3
+                    // projection reads the authentication fault raised below instead and leaves
+                    // the seat live: OpenCode keeps serving, and only the process-exit owner
+                    // writes a terminal record.
                     self.ended = Some("providerAuth");
                 } else {
                     if let Some(session_id) = session_id() {
@@ -913,32 +1330,249 @@ impl EventMachine {
                     self.seen_level = true;
                     self.last_error = Some(format!("error:{name}"));
                 }
+                if let Some(fault) = session_error_fault(name, payload, now_ms) {
+                    self.raise(fault);
+                }
             }
-            "permission.asked" => {
-                if let Some(id) = ask_id(properties) {
+            "permission.asked" | "permission.v2.asked" => {
+                if let Some(id) = ask_id(payload) {
                     self.blocked.insert(id, "permission");
                 }
             }
-            "permission.replied" => {
-                if let Some(id) = ask_id(properties) {
+            "permission.replied" | "permission.v2.replied" => {
+                if let Some(id) = ask_id(payload) {
                     self.blocked.remove(&id);
                 }
             }
-            "question.asked" => {
-                if let Some(id) = ask_id(properties) {
+            "question.asked" | "question.v2.asked" => {
+                if let Some(id) = ask_id(payload) {
                     self.blocked.insert(id, "question");
                 }
             }
-            "question.replied" | "question.rejected" => {
-                if let Some(id) = ask_id(properties) {
+            "question.replied"
+            | "question.rejected"
+            | "question.v2.replied"
+            | "question.v2.rejected" => {
+                if let Some(id) = ask_id(payload) {
                     self.blocked.remove(&id);
                 }
             }
-            // server.connected, server.heartbeat, plugin.added replay, message.*, … — not state.
+            // The turn's own success edge, and the only thing that clears the whole axis.
+            "message.updated" => {
+                if turn_completed(payload) {
+                    self.clear_everything(ProgressProof::TurnCompleted);
+                }
+            }
+            // The server threw its own instance away. NOT a terminal record: the child may still
+            // be reaped normally afterwards, and its exit is the process-exit owner's word.
+            "global.disposed" | "server.instance.disposed" => {
+                self.raise(
+                    FaultReport::new(FaultCategory::Harness, Recovery::Human, now_ms)
+                        .with_code("opencode/disposed"),
+                );
+            }
+            // server.connected, server.heartbeat, plugin.added replay, session.compacted (normal
+            // compaction, numeric axis only), … — not state.
             _ => {}
         }
     }
 
+    /// `session.status{retry}` is the only deadline OpenCode declares for itself (DQ-H8): the
+    /// harness says when it will next act, and the record carries THAT instant rather than a
+    /// number st2 invented. An automatic recovery with no declared deadline carries none.
+    fn retry_began(&mut self, session_id: &str, payload: &Value, now_ms: u64) {
+        let (category, word) = match payload
+            .pointer("/status/action/reason")
+            .and_then(Value::as_str)
+        {
+            Some("provider_auth") => (FaultCategory::Authentication, "provider_auth"),
+            Some("rate_limit") => (FaultCategory::RateLimit, "rate_limit"),
+            Some("provider_error") => (FaultCategory::Provider, "provider_error"),
+            // A retry whose cause the harness did not name: `provider` is the truthful floor —
+            // something on the provider side made OpenCode retry — and no narrower claim is
+            // evidenced. The code says `unknown` so the two cases stay distinguishable.
+            _ => (FaultCategory::Provider, "unknown"),
+        };
+        let mut fault = FaultReport::new(category, Recovery::Automatic, now_ms)
+            .with_code(format!("opencode/retry.{word}"));
+        if let Some(next) = payload
+            .pointer("/status/next")
+            .and_then(Value::as_u64)
+            .filter(|next| *next > 0)
+        {
+            // `next` is measured as the harness's delay in milliseconds, but the spelling is
+            // unverified at the pinned build, so it is disambiguated by MAGNITUDE rather than by
+            // guessing: anything at or above the epoch floor is a unix-millisecond instant (no
+            // retry waits 30+ years), everything below it is a delay from the observation. An
+            // absolute instant already in the past is due NOW — the deadline cannot precede the
+            // observation that carries it, and a past deadline is exactly what "overdue" means.
+            let due = if next >= EPOCH_MS_FLOOR {
+                next.max(now_ms)
+            } else {
+                now_ms.saturating_add(next)
+            };
+            fault = fault.with_observation_due(due);
+        }
+        if let Some(attempt) = payload.pointer("/status/attempt").and_then(Value::as_u64) {
+            fault = fault.with_detail(format!("retry attempt {attempt}"));
+        }
+        self.retrying.insert(session_id.to_string(), fault.key());
+        self.raise(fault);
+    }
+
+    /// The retry signal's OWN end event: the same session reporting a status word that is not
+    /// `retry`. This is the same event family and the same session key as the raise, not a
+    /// foreign activity edge — and it clears its exact code, because a `429` rateLimit fault and
+    /// a `retry.rate_limit` fault share a category and differ only by code.
+    ///
+    /// The record is SEAT-level, though, and several sessions of one server can be retrying for
+    /// the same reason under one code. So the condition holds until the LAST of them settles:
+    /// clearing on the first exit would silence a retry still in flight on a sibling session,
+    /// while a per-session code would fragment a seat-level axis into unbounded cardinality.
+    fn retry_ended(&mut self, session_id: &str) {
+        let Some(key) = self.retrying.remove(session_id) else {
+            return;
+        };
+        if self.retrying.values().any(|standing| *standing == key) {
+            return;
+        }
+        self.clear_paired(key);
+    }
+
+    /// Raise a fault, or restate one that already stands. The semantic clock is minted once per
+    /// key: a restatement — a further retry attempt included — never postpones the instant the
+    /// condition was first observed (OHS-R20).
+    fn raise(&mut self, mut fault: FaultReport) {
+        let key = condition_key(&fault);
+        if let Some(standing) = self.conditions.get(&key) {
+            fault.observed_at_ms = standing.observed_at_ms;
+            // The carried-back instant can predate a deadline computed from a later clock, and a
+            // deadline may never precede the observation it follows.
+            if let Some(due) = fault.next_observation_due_ms {
+                fault.next_observation_due_ms = Some(due.max(fault.observed_at_ms));
+            }
+            if same_fault(standing, &fault) {
+                return;
+            }
+        }
+        self.conditions.insert(key, fault);
+        self.settle();
+    }
+
+    /// Clear the fault this key names and ONLY that one. A key naming a fault that does not stand
+    /// clears nothing, and clearing a fault a higher-ranked one was masking moves no slot.
+    fn clear_paired(&mut self, key: FaultKey) {
+        if self
+            .conditions
+            .remove(&(key.category.as_str(), key.code.clone()))
+            .is_none()
+        {
+            return;
+        }
+        if self
+            .published
+            .as_ref()
+            .is_some_and(|standing| standing.key() == key)
+        {
+            self.published = None;
+            self.push_edge(ConditionEdge::ClearPaired(key));
+        }
+        self.settle();
+    }
+
+    /// The only blanket clear, and only behind a positive typed proof of progress the standing
+    /// fault would have prevented. It is stated even over an empty set: a completed turn is a
+    /// positive health observation, and `clear` is a different answer from `absent`.
+    fn clear_everything(&mut self, proof: ProgressProof) {
+        self.conditions.clear();
+        self.retrying.clear();
+        self.published = None;
+        self.push_edge(ConditionEdge::ClearAll(proof));
+    }
+
+    /// Project the fault set onto the record's single slot and queue the transition, if it moved.
+    fn settle(&mut self) {
+        let winner = self.winner().cloned();
+        if winner != self.published {
+            if let Some(fault) = winner.clone() {
+                self.push_edge(ConditionEdge::Raise(fault));
+            }
+            self.published = winner;
+        }
+    }
+
+    fn winner(&self) -> Option<&FaultReport> {
+        self.conditions
+            .values()
+            .min_by(|left, right| fault_rank(left).cmp(&fault_rank(right)))
+    }
+
+    fn take_edges(&mut self) -> Vec<ConditionEdge> {
+        std::mem::take(&mut self.edges)
+    }
+
+    /// Queue one condition edge. The queue is HELD, not dropped, while the producer has no
+    /// evidence to hang a write on: the fault was observed on a frame that did arrive. It is
+    /// bounded because the record shows exactly one slot and the newest edge always states the
+    /// slot the reducer projects now, so trimming the oldest surplus loses only intermediate
+    /// history no reader could ever have observed.
+    fn push_edge(&mut self, edge: ConditionEdge) {
+        if self.edges.last() == Some(&edge) {
+            return;
+        }
+        self.edges.push(edge);
+        if self.edges.len() > CONDITION_EDGE_QUEUE {
+            self.edges.drain(..self.edges.len() - CONDITION_EDGE_QUEUE);
+        }
+    }
+
+    /// The axis a version 3 record must have STATED once before an activity-only frame can ride
+    /// on top of it. A claim fence has observed nothing, so it carries no condition to inherit
+    /// and `Unchanged` over it is refused as [`harness_state::Refusal::Unstated`]; this is what
+    /// the first frame of a session says instead. `Clear` over an empty fault set is a positive
+    /// health claim the producer has earned: nothing is published until the level seed succeeds.
+    fn bootstrap_condition(&self) -> ConditionReport {
+        match self.winner() {
+            Some(fault) => ConditionReport::Fault(fault.clone()),
+            None => ConditionReport::Clear,
+        }
+    }
+
+    /// The seat's conversation identity, from OpenCode's own typed `sessionID`. A newer id
+    /// replaces the old one, matching the delivery pump's last-writer-wins target (DQ-C10), and
+    /// the verification bound only ever moves forward.
+    fn saw_conversation(&mut self, session_id: &str, at_ms: u64) {
+        if self.conversation.as_deref() != Some(session_id) {
+            self.conversation = Some(session_id.to_string());
+        }
+        self.verified_through_ms = self.verified_through_ms.max(at_ms);
+    }
+
+    fn conversation_state(&self) -> ConversationState {
+        match &self.conversation {
+            Some(conversation) if self.verified_through_ms > 0 => {
+                ConversationState::Linked(ConversationClaim {
+                    driver: "opencode".to_string(),
+                    conversation: conversation.clone(),
+                    // Positively evidenced, not declared: this adapter handles `session.compacted`
+                    // and filters the summarizer's own assistant message, i.e. OpenCode
+                    // demonstrably rewrites history underneath a reader.
+                    history_mutability: HistoryMutability::Rewritable,
+                    // The wrapper exercises this session over HTTP — the level seed's own 200s and
+                    // the frames the server names it on — so the capability is probed, never
+                    // declared from pinned knowledge.
+                    capability_evidence: CapabilityEvidence::Probed,
+                    verified_through_ms: self.verified_through_ms,
+                })
+            }
+            // Never `Unsupported`: OpenCode HAS conversation identity and the seat's TUI has
+            // simply not created a session yet. Denying the capability would be a false claim.
+            _ => ConversationState::Unavailable(Some("no-session".to_string())),
+        }
+    }
+
+    /// The LEGACY (schema 2) projection, unchanged: this is what the shipped adapter writes while
+    /// the emitted version has no condition axis to carry a fault on.
     fn observation(&self) -> Option<Observation> {
         // A sticky terminal outranks poison: `ended` does not depend on the busy map the
         // unknown word made untrustworthy, and withholding it would lose the terminal to the
@@ -978,6 +1612,55 @@ impl EventMachine {
             return Some(match &self.last_error {
                 Some(reason) => observation.with_reason(reason.clone()),
                 None => observation,
+            });
+        }
+        None
+    }
+
+    /// The version 3 resolved tuple, with NO terminal arm: only the process-exit owner writes
+    /// `ended`, so a rejected credential reads here as a live seat carrying an authentication
+    /// fault. The condition rides `Unchanged` on every frame — an activity edge is not evidence
+    /// about a fault in either direction, and OpenCode proves it by emitting the error before the
+    /// idle — so the queued condition edges are the only writes that move that axis.
+    ///
+    /// `HumanAsk::None` over an empty ask map is a positive claim this producer can make: the
+    /// level seed that gates every publish reads `/permission` and `/question`, so absence is
+    /// listed rather than assumed.
+    fn frame(&self) -> Option<Frame> {
+        self.frame_with(ConditionReport::Unchanged)
+    }
+
+    /// [`EventMachine::frame`] with the condition axis stated explicitly, for the one write that
+    /// has to state it: the session's first frame, over a claim fence that carries no axis to
+    /// leave unchanged.
+    fn frame_with(&self, condition: ConditionReport) -> Option<Frame> {
+        if self.poisoned {
+            return None;
+        }
+        let frame = |state: Activity, ask: HumanAsk| {
+            Frame::new(state, InputBuffer::Unknown, condition.clone(), ask)
+                .with_conversation(self.conversation_state())
+        };
+        if let Some(kind) = self.blocked.values().next() {
+            let ask = match *kind {
+                "question" => AskKind::Question,
+                _ => AskKind::Permission,
+            };
+            return Some(frame(Activity::Active, HumanAsk::Pending(ask)).with_reason(*kind));
+        }
+        if !self.busy.is_empty() {
+            let active = frame(Activity::Active, HumanAsk::None);
+            return Some(if self.busy.values().all(|retry| *retry) {
+                active.with_reason("retry")
+            } else {
+                active
+            });
+        }
+        if self.seen_level {
+            let idle = frame(Activity::Idle, HumanAsk::None);
+            return Some(match &self.last_error {
+                Some(reason) => idle.with_reason(reason.clone()),
+                None => idle,
             });
         }
         None
@@ -1304,33 +1987,14 @@ fn cumulative_tokens(tokens: &Value) -> Option<u64> {
 
 // ---- native delivery -------------------------------------------------------------------------
 
+/// What `GET /session/{session}/message/{message}` proved. A storage receipt, graded to
+/// [`delivery_ledger::Phase::Persisted`]: it says the server holds the exact client message, never
+/// that anything read it.
 #[derive(Clone, Copy)]
 enum ReadBack {
     Durable,
     Absent,
     Indeterminate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum DeliveryPhase {
-    Attempted,
-    Accepted,
-}
-
-/// One durable FIFO delivery attempt, written before transport (the Codex discipline). The stable
-/// `messageID` makes a replayed attempt reconcilable: the server either shows the message durably
-/// (accepted) or does not (retry the same identity, never a second one).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DeliveryState {
-    schema: String,
-    agent: String,
-    runtime_id: String,
-    session_id: String,
-    filename: String,
-    message_id: String,
-    phase: DeliveryPhase,
 }
 
 struct Delivery {
@@ -1340,8 +2004,7 @@ struct Delivery {
     this_host: String,
     identity: String,
     runtime_id: String,
-    state_path: PathBuf,
-    state: Option<DeliveryState>,
+    ledger: delivery_ledger::Ledger,
     /// The session a new delivery binds to: the most recently observed one.
     target_session: Option<String>,
     next_attempt: Instant,
@@ -1355,35 +2018,37 @@ impl Delivery {
         identity: &str,
         runtime_id: &str,
     ) -> Self {
-        let state_path = state_dir(catalog_root, identity).join("delivery-state.json");
+        let legacy_path = state_dir(catalog_root, identity).join(delivery_ledger::LEGACY_FILE);
         Self::with_state_path(
             catalog_root,
             agent_dir,
             this_host,
             identity,
             runtime_id,
-            state_path,
+            legacy_path,
         )
     }
 
+    /// `legacy_path` is the v1 `delivery-state.json`: the one-shot adoption source and the
+    /// rollback floor. The ledger itself lives beside it under [`delivery_ledger::LEDGER_FILE`].
     fn with_state_path(
         catalog_root: &Path,
         agent_dir: &Path,
         this_host: &str,
         identity: &str,
         runtime_id: &str,
-        state_path: PathBuf,
+        legacy_path: PathBuf,
     ) -> Self {
-        let state = std::fs::read(&state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<DeliveryState>(&bytes).ok())
-            .filter(|state| {
-                state.schema == DELIVERY_STATE_SCHEMA
-                    && state.agent == identity
-                    && message::is_message_filename(&state.filename)
-                    && state.message_id
-                        == stable_message_id(identity, &state.session_id, &state.filename)
-            });
+        let owner = identity.to_string();
+        // The same derivation the transport uses, so a record whose messageID does not match its
+        // own session and filename is provably not this agent's and fails closed.
+        let ledger = delivery_ledger::Ledger::open(
+            &legacy_path,
+            delivery_ledger::Harness::OpenCode.profile(),
+            identity,
+            runtime_id,
+            |session, filename| stable_message_id(&owner, session, filename),
+        );
         Self {
             catalog_root: catalog_root.to_path_buf(),
             inbox: message::inbox_dir(agent_dir),
@@ -1391,8 +2056,7 @@ impl Delivery {
             this_host: this_host.to_string(),
             identity: identity.to_string(),
             runtime_id: runtime_id.to_string(),
-            state_path,
-            state,
+            ledger,
             target_session: None,
             next_attempt: Instant::now(),
         }
@@ -1427,13 +2091,10 @@ impl Delivery {
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         let unread = message::list_inbox(&self.inbox)?;
-        if let Some(state) = self.state.as_ref()
-            && unread
-                .iter()
-                .all(|message| message.filename != state.filename)
-        {
-            self.clear_state()?;
-        }
+        // Archive is the recipient agent's act and the only settlement authority. An entry whose
+        // file left the inbox releases ownership here; this pump never moves a file itself.
+        self.ledger
+            .prune(|filename| unread.iter().any(|entry| entry.filename == filename))?;
         if status::read_state(&self.status_path) == status::State::Dnd {
             return Ok(());
         }
@@ -1458,65 +2119,93 @@ impl Delivery {
                 recovered
             }
         };
-        if let Some(state) = self.state.as_ref()
-            && state.session_id != target
-        {
-            // A newly selected session is a different delivery binding (the Codex thread rule).
-            self.clear_state()?;
+        // A newly selected session is a different delivery binding (the Codex thread rule): the
+        // old binding's receipt may neither suppress nor acknowledge delivery to this one.
+        if self.ledger.binding().is_some_and(|binding| binding != target) {
+            self.ledger.rebind(&target)?;
         }
-
-        if let Some(state) = self.state.clone() {
-            if state.filename != head.filename {
-                return Ok(()); // The bound message is behind the head; archive precedence resolves it.
+        // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
+        // refused to start: a driver that will not start delivers nothing at all. The
+        // operator-visible surface is the existing typed boundary — the transport is unavailable —
+        // and the raw reason stays in tracing, so no unbounded prose reaches the record.
+        if let Some(reason) = self.ledger.quarantined() {
+            tracing::warn!("st2 opencode-session: delivery ledger is quarantined: {reason}");
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.publish(
+                    DiagnosticStage::Delivery,
+                    DiagnosticReason::DeliveryUnavailable,
+                    DiagnosticSource::PromptTransport,
+                );
             }
-            match state.phase {
-                DeliveryPhase::Accepted => {
-                    if let Some(diagnostics) = diagnostics.as_deref_mut() {
-                        diagnostics.clear(DiagnosticStage::Delivery);
-                        diagnostics.clear(DiagnosticStage::ReadBack);
-                    }
-                    return Ok(());
+            return Ok(());
+        }
+        // Re-asserted on every pass while an entry is outstanding: a crash exactly at the floor
+        // write would otherwise leave a landing with no v1-readable lower bound, and a rolled-back
+        // binary would take its state=None path and POST the same messageID again.
+        self.ledger.reassert_floor()?;
+        if let Some(entry) = self.ledger.entry(&head.filename).cloned() {
+            // Storage is a receipt, not consumption: it stops the POST loop and holds the inbox
+            // entry, and only prompt admission would release ownership.
+            if entry.phase >= delivery_ledger::Phase::Persisted {
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.clear(DiagnosticStage::Delivery);
+                    diagnostics.clear(DiagnosticStage::ReadBack);
                 }
-                DeliveryPhase::Attempted => {
-                    return self.reconcile_or_retry(client, state, diagnostics);
-                }
+                return Ok(());
             }
+            return self.reconcile_or_retry(client, entry, diagnostics);
+        }
+        if !self.ledger.entries().is_empty() {
+            return Ok(()); // The bound message is behind the head; archive precedence resolves it.
         }
 
         let message_id = stable_message_id(&self.identity, &target, &head.filename);
-        let state = DeliveryState {
-            schema: DELIVERY_STATE_SCHEMA.to_string(),
-            agent: self.identity.clone(),
-            runtime_id: self.runtime_id.clone(),
-            session_id: target,
+        let entry = self.ledger.begin(delivery_ledger::Begin {
             filename: head.filename.clone(),
-            message_id,
-            phase: DeliveryPhase::Attempted,
-        };
-        self.write_state(state.clone())?;
+            binding: target.clone(),
+            correlation: delivery_ledger::Correlation::native(message_id.clone()),
+            // OpenCode's v1 record carried no incarnation and its read-back is a durable query,
+            // not a live frame, so a pre-crash attempt is reconcilable without one.
+            incarnation: None,
+            legacy_floor: delivery_ledger::opencode_floor(
+                &self.identity,
+                &self.runtime_id,
+                &target,
+                &head.filename,
+                &message_id,
+            ),
+        })?;
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text, diagnostics)
+        self.send(client, &entry, &text, diagnostics)
     }
 
     fn reconcile_or_retry(
         &mut self,
         client: &Client,
-        state: DeliveryState,
+        entry: delivery_ledger::Entry,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
-        let read_back = self.read_back(client, &state);
+        let read_back = self.read_back(client, &entry);
         report_read_back(read_back, &mut diagnostics);
         match read_back {
             ReadBack::Durable => {
-                let mut accepted = state;
-                accepted.phase = DeliveryPhase::Accepted;
-                return self.write_state(accepted);
+                self.ledger
+                    .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+                return Ok(());
             }
             // Measured on 1.18.19: a second POST with the same messageID appends its parts again
             // into the same message, so an indeterminate read-back must never trigger a resend —
             // the read-back itself is retried on a later pass.
             ReadBack::Indeterminate => return Ok(()),
-            ReadBack::Absent => {}
+            // A 404 for the exact client message is an authoritative absence: the only receipt
+            // that may authorize another POST of the same identity.
+            ReadBack::Absent => {
+                self.ledger
+                    .negative(&entry.filename, delivery_ledger::NegativeReceipt::Absent)?;
+            }
+        }
+        if self.ledger.retry(&entry.filename) != delivery_ledger::RetryDecision::Retry {
+            return Ok(());
         }
         if Instant::now() < self.next_attempt {
             return Ok(());
@@ -1524,27 +2213,27 @@ impl Delivery {
         let unread = message::list_inbox(&self.inbox)?;
         let Some(head) = unread
             .into_iter()
-            .find(|message| message.filename == state.filename)
+            .find(|message| message.filename == entry.filename)
         else {
             return Ok(());
         };
         let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &state, &text, diagnostics)
+        self.send(client, &entry, &text, diagnostics)
     }
 
     fn send(
         &mut self,
         client: &Client,
-        state: &DeliveryState,
+        entry: &delivery_ledger::Entry,
         text: &str,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
-            "messageID": state.message_id,
+            "messageID": entry.correlation.value,
             "parts": [{ "type": "text", "text": text }],
         });
-        let path = format!("/session/{}/prompt_async", state.session_id);
+        let path = format!("/session/{}/prompt_async", entry.binding);
         let status = match client.post_json(&path, &payload) {
             Ok(status) => status,
             Err(error) => {
@@ -1568,44 +2257,34 @@ impl Delivery {
             }
             anyhow::bail!("POST {path} returned {status}");
         }
+        // The transport call succeeded. That is a fact about the call, not about the server's
+        // state, so it grades no higher than `transportAccepted`.
+        self.ledger
+            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
-        let read_back = self.read_back(client, state);
+        let read_back = self.read_back(client, entry);
         report_read_back(read_back, &mut diagnostics);
         if matches!(read_back, ReadBack::Durable) {
-            let mut accepted = state.clone();
-            accepted.phase = DeliveryPhase::Accepted;
-            self.write_state(accepted)?;
+            self.ledger
+                .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
         }
         Ok(())
     }
 
     /// The only receipt this transport accepts: the exact client message read back durably.
-    fn read_back(&self, client: &Client, state: &DeliveryState) -> ReadBack {
-        let path = format!("/session/{}/message/{}", state.session_id, state.message_id);
+    fn read_back(&self, client: &Client, entry: &delivery_ledger::Entry) -> ReadBack {
+        let path = format!(
+            "/session/{}/message/{}",
+            entry.binding, entry.correlation.value
+        );
         match client.status_of_get(&path) {
             Ok(200) => ReadBack::Durable,
             Ok(404) => ReadBack::Absent,
             // A 5xx or a transport error proves nothing about the message either way.
             Ok(_) | Err(_) => ReadBack::Indeterminate,
         }
-    }
-
-    fn write_state(&mut self, state: DeliveryState) -> Result<()> {
-        atomic_json(&self.state_path, &state)?;
-        self.state = Some(state);
-        Ok(())
-    }
-
-    fn clear_state(&mut self) -> Result<()> {
-        match std::fs::remove_file(&self.state_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.state = None;
-        Ok(())
     }
 }
 
@@ -1666,28 +2345,6 @@ fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     base.join("st2").join("opencode").join(&digest[..24])
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let parent = path.parent().context("state file has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".{}.tmp", std::process::id()));
-    // Durability, not just atomicity: a crash between the rename and OpenCode's acceptance of
-    // the prompt_async would lose the Attempted receipt and make the pump re-POST duplicate
-    // parts. The bytes reach disk before the rename and the directory entry afterwards, so
-    // once delivery proceeds the receipt survives.
-    let mut file = std::fs::File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(value)?)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1732,6 +2389,18 @@ mod tests {
 
     fn observed(machine: &EventMachine) -> Observation {
         machine.observation().expect("an observation")
+    }
+
+    /// The version 3 resolved tuple. Every assertion on it is reducer-level on purpose: the
+    /// emitted version is still 2, so a condition-only change is projected away on the wire and
+    /// only the pure native-event→typed mapping is observable here.
+    fn framed(machine: &EventMachine) -> Frame {
+        machine.frame().expect("a frame")
+    }
+
+    /// The one fault the record's single slot would carry.
+    fn standing(machine: &EventMachine) -> FaultReport {
+        machine.winner().cloned().expect("a standing fault")
     }
 
     #[test]
@@ -1872,8 +2541,14 @@ mod tests {
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }
 
+    /// The LEGACY (schema 2) projection, pinned unchanged. Production now emits version 3, so
+    /// this is no longer the live shape — which is exactly why it is pinned: a version 1 or 2
+    /// record still on disk, and any seat a rollback puts back on version 2, must keep reading
+    /// the same way, including the terminal word version 2 has to spell a rejected credential
+    /// with, having no condition axis to put it on. The version 3 projection of the same replay
+    /// is the test below.
     #[test]
-    fn provider_auth_error_is_terminal_and_other_errors_settle_to_idle_with_a_reason() {
+    fn the_legacy_projection_keeps_its_terminal_auth_word_and_idle_reasons() {
         let mut machine = EventMachine::default();
         machine.apply(&event(
             r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
@@ -1891,6 +2566,931 @@ mod tests {
         let ended = observed(&machine);
         assert_eq!(ended.state, Activity::Ended);
         assert_eq!(ended.reason.as_deref(), Some("providerAuth"));
+    }
+
+    /// Spike I10, the one live defect in the shipped adapter: a rejected provider credential is a
+    /// live authentication fault, not this record's last word. The version 3 projection has no
+    /// terminal arm at all — the wrapper's own exit path is the sole terminal writer — and the
+    /// seat stays observable so an operator can see the wall while the TUI keeps answering.
+    #[test]
+    fn provider_auth_error_is_a_live_authentication_fault_never_a_terminal() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+            ),
+            1_000,
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ProviderAuthError"}}}"#,
+            ),
+            2_000,
+        );
+
+        let fault = standing(&machine);
+        assert_eq!(fault.category, FaultCategory::Authentication);
+        assert_eq!(fault.code.as_deref(), Some("opencode/ProviderAuthError"));
+        assert_eq!(fault.recovery, Recovery::Human);
+        assert_eq!(fault.observed_at_ms, 2_000);
+        assert_eq!(
+            fault.next_observation_due_ms, None,
+            "a wall a person must repair has no automatic deadline"
+        );
+        let live = framed(&machine);
+        assert_eq!(live.state, Activity::Active, "the seat keeps serving");
+        assert_eq!(live.condition, ConditionReport::Unchanged);
+        assert_eq!(live.exit, None);
+        assert_eq!(machine.take_edges(), vec![ConditionEdge::Raise(fault)]);
+
+        // OpenCode's own ordering: the idle follows the error. It leaves the wall standing and
+        // still never produces a terminal.
+        machine.apply_at(
+            &event(r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#),
+            3_000,
+        );
+        assert_eq!(framed(&machine).state, Activity::Idle);
+        assert_eq!(
+            standing(&machine).code.as_deref(),
+            Some("opencode/ProviderAuthError")
+        );
+        assert_eq!(
+            machine.take_edges(),
+            vec![],
+            "an activity edge never writes the condition axis"
+        );
+    }
+
+    /// OpenCode's measured ordering: the error arrives BEFORE `session.status{idle}` and a second
+    /// one can arrive after it. So the idle clears nothing, and restating the same condition does
+    /// not re-mint the instant it was first observed (OHS-R20).
+    #[test]
+    fn an_error_before_idle_and_a_second_error_after_keep_one_standing_fault() {
+        let overflow = r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ContextOverflowError"}}}"#;
+        let mut machine = EventMachine::default();
+        machine.apply_at(&event(overflow), 1_000);
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"idle"}}}"#,
+            ),
+            2_000,
+        );
+        assert_eq!(framed(&machine).state, Activity::Idle);
+        assert_eq!(
+            standing(&machine).code.as_deref(),
+            Some("opencode/ContextOverflowError"),
+            "`session.idle` is not a success edge on this harness"
+        );
+        let _ = machine.take_edges();
+
+        machine.apply_at(&event(overflow), 3_000);
+        assert_eq!(
+            standing(&machine).observed_at_ms, 1_000,
+            "the semantic clock is minted once per condition"
+        );
+        assert_eq!(
+            machine.take_edges(),
+            vec![],
+            "a restatement of the same fault moves no slot"
+        );
+    }
+
+    /// DQ-H8, answered for OpenCode by OpenCode: `session.status{retry}` declares its own next
+    /// attempt, so the deadline on the record is the harness's `next` and never a number st2
+    /// invented. Its clear is the same signal's own end event, on the same session key.
+    #[test]
+    fn retry_carries_the_harness_declared_deadline_and_clears_its_own_exact_code() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"retry","attempt":2,"next":30000,"action":{"reason":"rate_limit"}}}}"#,
+            ),
+            1_000_000,
+        );
+        let fault = standing(&machine);
+        assert_eq!(fault.category, FaultCategory::RateLimit);
+        assert_eq!(fault.code.as_deref(), Some("opencode/retry.rate_limit"));
+        assert_eq!(fault.recovery, Recovery::Automatic);
+        assert_eq!(
+            fault.next_observation_due_ms,
+            Some(1_030_000),
+            "the deadline is the harness's own `next`, offset from the observation"
+        );
+        assert_eq!(fault.detail.as_deref(), Some("retry attempt 2"));
+        assert_eq!(framed(&machine).reason.as_deref(), Some("retry"));
+        let _ = machine.take_edges();
+
+        // A retry on ANOTHER session is its own fault, under its own reason's code…
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_b","status":{"type":"retry","action":{"reason":"provider_error"}}}}"#,
+            ),
+            1_000_100,
+        );
+        // …and this session's own end event clears exactly the code it raised.
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+            ),
+            1_000_200,
+        );
+        let remaining = standing(&machine);
+        assert_eq!(
+            remaining.code.as_deref(),
+            Some("opencode/retry.provider_error"),
+            "the other session's retry is untouched"
+        );
+        assert_eq!(
+            remaining.next_observation_due_ms, None,
+            "an automatic recovery the harness gave no deadline for carries none"
+        );
+        assert_eq!(
+            machine.take_edges(),
+            vec![
+                ConditionEdge::ClearPaired(
+                    FaultKey::new(FaultCategory::RateLimit).with_code("opencode/retry.rate_limit")
+                ),
+                ConditionEdge::Raise(remaining),
+            ]
+        );
+    }
+
+    /// CX-1: a `429` rateLimit fault and a `retry.rate_limit` fault share a CATEGORY and differ
+    /// only by code, so a category-scoped clear would silence the wrong one.
+    #[test]
+    fn a_paired_clear_names_the_full_code_not_the_category() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"APIError","data":{"status":429}}}}"#,
+            ),
+            1_000,
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"retry","next":5000,"action":{"reason":"rate_limit"}}}}"#,
+            ),
+            2_000,
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"idle"}}}"#,
+            ),
+            3_000,
+        );
+        assert_eq!(
+            standing(&machine).code.as_deref(),
+            Some("opencode/APIError.429"),
+            "the sibling code in the same category survives its neighbour's clear"
+        );
+    }
+
+    /// The one positive clearAll edge, and everything that is deliberately not it. This is the
+    /// test that keeps a failed turn from laundering itself clean.
+    #[test]
+    fn only_a_completed_assistant_message_clears_the_whole_axis() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ContentFilterError"}}}"#,
+            ),
+            1_000,
+        );
+        let fault = standing(&machine);
+        assert_eq!(fault.category, FaultCategory::Policy);
+        let _ = machine.take_edges();
+
+        for quiet in [
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#,
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"idle"}}}"#,
+            // The compaction summarizer's own message is an assistant message.
+            r#"{"type":"message.updated","properties":{"info":{"role":"assistant","summary":true,"time":{"completed":2}}}}"#,
+            // An unfinished turn.
+            r#"{"type":"message.updated","properties":{"info":{"role":"assistant","time":{"created":1}}}}"#,
+            // A finished turn that carried an error is not progress.
+            r#"{"type":"message.updated","properties":{"info":{"role":"assistant","time":{"completed":2},"error":{"name":"APIError"}}}}"#,
+            // `summary` is an OBJECT on user messages, and therefore truthy.
+            r#"{"type":"message.updated","properties":{"info":{"role":"user","summary":{"diffs":[]},"time":{"completed":2}}}}"#,
+        ] {
+            machine.apply_at(&event(quiet), 2_000);
+            assert_eq!(machine.winner(), Some(&fault), "{quiet} is not progress");
+            assert_eq!(machine.take_edges(), vec![], "{quiet} writes no condition");
+        }
+
+        machine.apply_at(
+            &event(
+                r#"{"type":"message.updated","properties":{"info":{"role":"assistant","summary":false,"time":{"created":1,"completed":2}}}}"#,
+            ),
+            3_000,
+        );
+        assert_eq!(machine.winner(), None);
+        assert_eq!(
+            machine.take_edges(),
+            vec![ConditionEdge::ClearAll(ProgressProof::TurnCompleted)],
+            "a blanket clear names the progress it witnessed"
+        );
+    }
+
+    /// The two deliberate nulls of the mapping: an interruption is not a fault, and ordinary
+    /// compaction is the numeric axis's business. Neither raises, and neither clears.
+    #[test]
+    fn an_abort_and_a_compaction_are_not_faults_and_clear_nothing() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ProviderAuthError"}}}"#,
+            ),
+            1_000,
+        );
+        let wall = standing(&machine);
+        let _ = machine.take_edges();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"MessageAbortedError"}}}"#,
+            ),
+            2_000,
+        );
+        machine.apply_at(
+            &event(r#"{"type":"session.compacted","properties":{"sessionID":"ses_a"}}"#),
+            3_000,
+        );
+        assert_eq!(machine.winner(), Some(&wall));
+        assert_eq!(machine.take_edges(), vec![]);
+        assert_eq!(
+            framed(&machine).reason.as_deref(),
+            Some("error:MessageAbortedError"),
+            "the name still rides `reason`, diagnostically"
+        );
+    }
+
+    /// Both spellings of the same ask normalize to one ask, including the `data` payload root
+    /// OpenCode's own SDK shim downgrades the v2 frames to. The verbatim 1.18.19 v1 fixtures
+    /// above cover the other half, unchanged. No `review` ask exists on this surface and none is
+    /// synthesized.
+    #[test]
+    fn both_ask_spellings_enter_and_exit_the_same_ask() {
+        let mut machine = EventMachine::default();
+        machine.seed_idle();
+        machine.apply_at(
+            &event(r#"{"type":"permission.v2.asked","data":{"id":"per_1","sessionID":"ses_a"}}"#),
+            1_000,
+        );
+        assert_eq!(
+            framed(&machine).ask,
+            HumanAsk::Pending(AskKind::Permission)
+        );
+        assert_eq!(
+            observed(&machine).ask,
+            Ask::Permission,
+            "the legacy pair normalizes the same frame identically"
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"permission.v2.replied","data":{"requestID":"per_1","reply":"once"}}"#,
+            ),
+            2_000,
+        );
+        assert_eq!(framed(&machine).ask, HumanAsk::None);
+
+        machine.apply_at(
+            &event(r#"{"type":"question.v2.asked","properties":{"id":"que_1","sessionID":"ses_a"}}"#),
+            3_000,
+        );
+        assert_eq!(framed(&machine).ask, HumanAsk::Pending(AskKind::Question));
+        machine.apply_at(
+            &event(r#"{"type":"question.v2.rejected","data":{"requestID":"que_1"}}"#),
+            4_000,
+        );
+        assert_eq!(framed(&machine).ask, HumanAsk::None);
+        assert_eq!(machine.take_edges(), vec![], "an ask is not a fault");
+    }
+
+    /// A name this build cannot classify is NOT a null: the harness reported a failure, so it
+    /// stays visible under the most conservative truthful category with its recovery unclaimed
+    /// and the name carried as diagnostic granularity. Guards the presence-tested-lookup
+    /// regression where an unknown name quietly becomes a neighbouring category.
+    #[test]
+    fn an_unclassified_error_stays_visible_under_the_conservative_category() {
+        for (name, code) in [
+            ("UnknownError", "opencode/session_error.UnknownError"),
+            ("SomeFutureError", "opencode/session_error.SomeFutureError"),
+            ("weird name/slashed", "opencode/session_error.weird_name_slashed"),
+        ] {
+            let mut machine = EventMachine::default();
+            machine.apply_at(
+                &event(&format!(
+                    r#"{{"type":"session.error","properties":{{"sessionID":"ses_a","error":{{"name":"{name}"}}}}}}"#
+                )),
+                1_000,
+            );
+            let fault = standing(&machine);
+            assert_eq!(fault.category, FaultCategory::Harness, "{name}");
+            assert_eq!(fault.code.as_deref(), Some(code));
+            assert_eq!(
+                fault.recovery,
+                Recovery::Unknown,
+                "{name}: no recovery class is claimed for a verdict st2 cannot read"
+            );
+            assert_eq!(
+                framed(&machine).reason.as_deref(),
+                Some(format!("error:{name}").as_str())
+            );
+        }
+    }
+
+    /// `APIError` by the status the provider returned, split across the closed category set the
+    /// final vocabulary forces: 402 is a billing wall, 429 a throttle, 5xx the provider's own
+    /// failure. There is no `network` word and none is improvised.
+    #[test]
+    fn api_error_statuses_split_across_the_closed_category_set() {
+        for (status, category, code, recovery) in [
+            (
+                401,
+                FaultCategory::Authentication,
+                "opencode/APIError.401",
+                Recovery::Human,
+            ),
+            (
+                403,
+                FaultCategory::Authentication,
+                "opencode/APIError.403",
+                Recovery::Human,
+            ),
+            (
+                402,
+                FaultCategory::Account,
+                "opencode/APIError.402",
+                Recovery::Human,
+            ),
+            (
+                429,
+                FaultCategory::RateLimit,
+                "opencode/APIError.429",
+                Recovery::Automatic,
+            ),
+            (
+                400,
+                FaultCategory::Configuration,
+                "opencode/APIError.400",
+                Recovery::Human,
+            ),
+            (
+                503,
+                FaultCategory::Provider,
+                "opencode/APIError.503",
+                Recovery::Automatic,
+            ),
+        ] {
+            let fault = api_error_fault(
+                &event(&format!(r#"{{"error":{{"data":{{"status":{status}}}}}}}"#)),
+                1_000,
+            );
+            assert_eq!(
+                (fault.category, fault.code.as_deref(), fault.recovery),
+                (category, Some(code), recovery),
+                "status {status}"
+            );
+        }
+        // The harness's own verdict on retryability overrides the class in both directions…
+        assert_eq!(
+            api_error_fault(
+                &event(r#"{"error":{"data":{"status":429,"isRetryable":false}}}"#),
+                1_000
+            )
+            .recovery,
+            Recovery::Human
+        );
+        assert_eq!(
+            api_error_fault(
+                &event(r#"{"error":{"data":{"status":400,"isRetryable":true}}}"#),
+                1_000
+            )
+            .recovery,
+            Recovery::Automatic
+        );
+        // …and a status this version cannot read claims nothing narrower than the provider.
+        let unreadable = api_error_fault(&event(r#"{"error":{"data":{}}}"#), 1_000);
+        assert_eq!(unreadable.category, FaultCategory::Provider);
+        assert_eq!(unreadable.recovery, Recovery::Unknown);
+        assert_eq!(unreadable.code.as_deref(), Some("opencode/APIError"));
+    }
+
+    /// The server threw its own instance away: a harness fault a person must act on, NOT this
+    /// record's last word — the child may still be reaped normally, and its exit is the
+    /// process-exit owner's to write.
+    #[test]
+    fn disposal_is_a_harness_fault_not_a_terminal() {
+        for kind in ["global.disposed", "server.instance.disposed"] {
+            let mut machine = EventMachine::default();
+            machine.seed_idle();
+            machine.apply_at(
+                &event(&format!(r#"{{"type":"{kind}","properties":{{}}}}"#)),
+                1_000,
+            );
+            let fault = standing(&machine);
+            assert_eq!(fault.category, FaultCategory::Harness, "{kind}");
+            assert_eq!(fault.code.as_deref(), Some("opencode/disposed"));
+            assert_eq!(fault.recovery, Recovery::Human);
+            assert_eq!(framed(&machine).state, Activity::Idle, "{kind}");
+            assert_eq!(
+                machine.observation().map(|observation| observation.state),
+                Some(Activity::Idle),
+                "{kind} writes no legacy terminal either"
+            );
+        }
+    }
+
+    /// A status word this version cannot read makes the busy map untrustworthy, not the fault
+    /// set: the ACTIVITY axis is withheld until a level seed rebuilds it, while the standing
+    /// fault stays readable and is restated for the record across the swap.
+    #[test]
+    fn a_poisoned_status_withholds_activity_but_not_a_standing_fault() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"StructuredOutputError"}}}"#,
+            ),
+            1_000,
+        );
+        let fault = standing(&machine);
+        let _ = machine.take_edges();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"hibernating"}}}"#,
+            ),
+            2_000,
+        );
+        assert!(machine.poisoned);
+        assert_eq!(machine.frame(), None);
+        assert_eq!(machine.winner(), Some(&fault));
+
+        let mut reseeded = machine.reconnected();
+        reseeded.seed_idle();
+        assert_eq!(
+            reseeded.frame().map(|frame| frame.state),
+            Some(Activity::Idle),
+            "the level seed owns the activity axis"
+        );
+        assert_eq!(reseeded.winner(), Some(&fault), "the fault rode across");
+        assert_eq!(
+            reseeded.take_edges(),
+            vec![ConditionEdge::Raise(fault)],
+            "and is restated, because the record is the only other place it lives"
+        );
+    }
+
+    /// OHS-R22: the conversation reference is identity plus capability, from typed evidence only.
+    #[test]
+    fn the_conversation_is_linked_from_the_typed_session_id_or_unavailable() {
+        assert_eq!(
+            EventMachine::default().conversation_state(),
+            ConversationState::Unavailable(Some("no-session".to_string())),
+            "never `unsupported`: OpenCode HAS conversation identity, this seat has no session yet"
+        );
+
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+            ),
+            4_200,
+        );
+        let ConversationState::Linked(link) = machine.conversation_state() else {
+            panic!("a linked conversation");
+        };
+        assert_eq!(link.driver, "opencode");
+        assert_eq!(link.conversation, "ses_a");
+        assert_eq!(link.history_mutability, HistoryMutability::Rewritable);
+        assert_eq!(link.capability_evidence, CapabilityEvidence::Probed);
+        assert_eq!(link.verified_through_ms, 4_200);
+        assert_eq!(
+            framed(&machine).conversation,
+            Some(ConversationState::Linked(link))
+        );
+    }
+
+    /// I10 as a blanket property: whatever OpenCode reports on its own surface, the version 3
+    /// projection never spells a terminal record. Only the wrapper's exit path does.
+    #[test]
+    fn no_native_event_ever_projects_a_terminal_frame() {
+        let mut machine = EventMachine::default();
+        machine.seed_idle();
+        for raw in [
+            r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ProviderAuthError"}}}"#,
+            r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"APIError","data":{"status":402}}}}"#,
+            r#"{"type":"global.disposed","properties":{}}"#,
+            r#"{"type":"server.instance.disposed","properties":{}}"#,
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#,
+        ] {
+            machine.apply_at(&event(raw), 1_000);
+            let frame = framed(&machine);
+            assert_ne!(frame.state, Activity::Ended, "{raw}");
+            assert_eq!(frame.exit, None, "{raw}: a producer frame carries no exit");
+        }
+        // …while the legacy projection keeps the version 2 word it has always written.
+        assert_eq!(observed(&machine).state, Activity::Ended);
+    }
+
+    /// A version 3 record must have its condition axis STATED once: a claim fence has observed
+    /// nothing, so it carries no axis for `Unchanged` to inherit and the writer refuses that
+    /// frame as `Unstated`. This is what the retry states instead — the winning fault if one
+    /// stands, and a positive `clear` if none does.
+    #[test]
+    fn the_first_frame_states_the_condition_axis_a_claim_fence_left_absent() {
+        let mut machine = EventMachine::default();
+        machine.seed_idle();
+        assert_eq!(
+            machine.bootstrap_condition(),
+            ConditionReport::Clear,
+            "a seeded producer with no fault has earned the positive health claim"
+        );
+        assert_eq!(machine.frame().unwrap().condition, ConditionReport::Unchanged);
+        assert_eq!(
+            machine
+                .frame_with(machine.bootstrap_condition())
+                .unwrap()
+                .condition,
+            ConditionReport::Clear
+        );
+
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ProviderAuthError"}}}"#,
+            ),
+            1_000,
+        );
+        let fault = standing(&machine);
+        assert_eq!(
+            machine.bootstrap_condition(),
+            ConditionReport::Fault(fault.clone()),
+            "the bootstrap states the slot the reducer projects, not a blank clear"
+        );
+        assert_eq!(
+            machine
+                .frame_with(machine.bootstrap_condition())
+                .unwrap()
+                .condition,
+            ConditionReport::Fault(fault)
+        );
+        // The ordinary frame still leaves the axis alone: only the bootstrap states it.
+        assert_eq!(machine.frame().unwrap().condition, ConditionReport::Unchanged);
+    }
+
+    /// The write path end to end through a REAL [`Writer`] over a real claim, at the version this
+    /// build emits. It pins the two boundaries the fault axis must not disturb: the seat becomes
+    /// observable over the exitless fence, and the WRAPPER's exit is the only thing that ever
+    /// writes a terminal record.
+    #[test]
+    fn a_real_writer_bootstraps_over_the_claim_fence_and_only_ended_writes_the_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents/h/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let token = harness_state::session_token();
+        let seq = harness_state::claim(&agent_dir, "h.worker", "opencode", &token).unwrap();
+        let mut writer = Writer::new(&agent_dir, "h.worker", "opencode", Some("worker".to_string()))
+            .with_ownership(token, seq);
+        let path = harness_state::harness_state_path(&agent_dir);
+
+        // The claim fence has observed nothing, so it reads INDETERMINATE rather than as a
+        // definite terminal — which is exactly why the adapter's first frame has to state the
+        // condition axis instead of inheriting one.
+        let fence = harness_state::read(&path, None).expect("the claim fence");
+        assert_eq!(fence.state, Activity::Unknown);
+        assert_eq!(fence.reason.as_deref(), Some("claimed"));
+        assert_eq!(fence.exit, None);
+
+        let mut machine = EventMachine::default();
+        machine.apply(&event(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
+        ));
+        machine.apply(&event(
+            r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ContextOverflowError"}}}"#,
+        ));
+
+        if writer.writes_condition_axis() {
+            let outcome = writer.publish(machine.frame().expect("a frame")).unwrap();
+            if matches!(outcome, WriteOutcome::Refused(Refusal::Unstated)) {
+                let stated = machine
+                    .frame_with(machine.bootstrap_condition())
+                    .expect("a stated frame");
+                assert!(
+                    writer.publish(stated).unwrap().accepted(),
+                    "the bootstrap retry states the axis the fence left absent"
+                );
+            }
+            for edge in machine.take_edges() {
+                let outcome = match edge {
+                    ConditionEdge::Raise(fault) => writer.raise_fault(fault),
+                    ConditionEdge::ClearPaired(key) => writer.clear_fault(key),
+                    ConditionEdge::ClearAll(proof) => writer.clear_all(proof),
+                };
+                assert!(outcome.unwrap().accepted());
+            }
+            assert!(
+                harness_state::read(&path, None)
+                    .expect("a live record")
+                    .condition
+                    .fault()
+                    .is_some(),
+                "the standing fault reached the record"
+            );
+        } else {
+            // The live path at this build: the axis is unrepresentable, so it is refused as a
+            // VALUE rather than cached anywhere, and the legacy observation is what lands.
+            assert_eq!(
+                writer
+                    .raise_fault(
+                        FaultReport::new(FaultCategory::Harness, Recovery::Human, 1_000)
+                            .with_code("opencode/disposed")
+                    )
+                    .unwrap(),
+                WriteOutcome::Refused(Refusal::ConditionUnrepresentable {
+                    schema: harness_state::SCHEMA_V2
+                })
+            );
+            writer.observe(machine.observation().expect("an observation")).unwrap();
+            let live = harness_state::read(&path, None).expect("a live record");
+            assert_eq!(live.state, Activity::Idle, "the error settled the turn");
+            assert_eq!(live.reason.as_deref(), Some("error:ContextOverflowError"));
+            assert_eq!(live.exit, None, "a live record carries no exit");
+            assert_eq!(
+                live.condition,
+                harness_state::ConditionView::Absent,
+                "version 2 has no condition axis and infers none from its legacy words"
+            );
+        }
+
+        // The terminal record is the wrapper's, through the one helper every exit owner uses,
+        // with the exit the reap observed.
+        write_terminal(
+            &mut writer,
+            "exit 0",
+            None,
+            machine.bootstrap_condition(),
+        );
+        let terminal = harness_state::read(&path, None).expect("a terminal record");
+        assert_eq!(terminal.state, Activity::Ended);
+        assert_eq!(terminal.exit.as_deref(), Some("exit 0"));
+    }
+
+    /// A session can exit before it ever published a frame — a launch failure, an immediate reap —
+    /// and its terminal must still land over the virgin claim fence, which has no condition axis
+    /// to leave unchanged. Real claim, real [`Writer`], real read-back, for every exit owner's
+    /// exact `(exit, reason)` pair.
+    #[test]
+    fn a_terminal_lands_over_the_claim_fence_before_any_frame_was_published() {
+        for (exit, reason) in [
+            // run(): spawn_provider failed.
+            ("exit unknown", Some("launch-error")),
+            // The STOP path's escalation cover, and its reap.
+            ("stopped", None),
+            ("exit 0", None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path().join("agents/h/worker");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let path = harness_state::harness_state_path(&agent_dir);
+            let token = harness_state::session_token();
+            let seq = harness_state::claim(&agent_dir, "h.worker", "opencode", &token).unwrap();
+            let mut writer =
+                Writer::new(&agent_dir, "h.worker", "opencode", Some("worker".to_string()))
+                    .with_ownership(token, seq);
+            assert_eq!(
+                harness_state::read(&path, None).unwrap().reason.as_deref(),
+                Some("claimed"),
+                "nothing has been observed on this record yet"
+            );
+
+            write_terminal(
+                &mut writer,
+                exit,
+                reason,
+                EventMachine::default().bootstrap_condition(),
+            );
+
+            let terminal = harness_state::read(&path, None).expect("a terminal record");
+            assert_eq!(terminal.state, Activity::Ended, "{exit}");
+            assert_eq!(terminal.exit.as_deref(), Some(exit));
+            assert_eq!(terminal.reason.as_deref(), reason, "{exit}");
+            assert_eq!(terminal.blocked_on, BlockedOn::None);
+            assert_eq!(terminal.ask, Ask::None);
+        }
+    }
+
+    /// Routing every exit owner through one helper moved no bytes: while the writer emits version
+    /// 2 the helper IS [`Writer::ended`]'s legacy statement. Once the writer flips, the same
+    /// helper's first terminal states the axis a fence left absent instead.
+    #[test]
+    fn the_terminal_helper_keeps_the_legacy_ended_bytes_until_the_writer_flips() {
+        let fixture = || {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path().join("agents/h/worker");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let path = harness_state::harness_state_path(&agent_dir);
+            let seq =
+                harness_state::claim(&agent_dir, "h.worker", "opencode", "fixed-token").unwrap();
+            let writer =
+                Writer::new(&agent_dir, "h.worker", "opencode", Some("worker".to_string()))
+                    .with_ownership("fixed-token", seq);
+            (tmp, path, writer)
+        };
+        // The write's own clock is the only thing two separate writes may differ in.
+        let normalized = |path: &Path| {
+            let mut value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap())
+                .unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("writtenAtMs");
+            object.remove("sinceMs");
+            value
+        };
+
+        let (_helper_tmp, helper_path, mut helper_writer) = fixture();
+        if helper_writer.writes_condition_axis() {
+            // Version 3: the fence carries no axis, so the plain terminal is refused and the
+            // one-shot retry states it.
+            let mut probe =
+                Frame::new(Activity::Ended, InputBuffer::Unknown, ConditionReport::Unchanged, HumanAsk::None);
+            probe = probe.with_exit("exit 0");
+            assert_eq!(
+                helper_writer.publish(probe).unwrap(),
+                WriteOutcome::Refused(Refusal::Unstated),
+                "an unstated axis over a fence is refused, which is what the helper retries"
+            );
+            write_terminal(&mut helper_writer, "exit 0", None, ConditionReport::Clear);
+            let terminal = harness_state::read(&helper_path, None).expect("a terminal record");
+            assert_eq!(terminal.state, Activity::Ended);
+            assert_eq!(terminal.exit.as_deref(), Some("exit 0"));
+            assert_eq!(terminal.condition, harness_state::ConditionView::Clear);
+            return;
+        }
+
+        write_terminal(&mut helper_writer, "exit 0", None, ConditionReport::Clear);
+        let (_legacy_tmp, legacy_path, mut legacy_writer) = fixture();
+        legacy_writer.ended("exit 0").unwrap();
+        assert_eq!(
+            normalized(&helper_path),
+            normalized(&legacy_path),
+            "the version 2 terminal is exactly the legacy statement"
+        );
+    }
+
+    /// The level surface is the authoritative statement of who is retrying: a retry fault carried
+    /// across a reseed whose session the map no longer reports as retrying is over, because its
+    /// own exit arm passed while the stream was down.
+    #[test]
+    fn a_reseed_retires_a_retry_the_level_surface_no_longer_reports() {
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+
+        let mut machine = EventMachine::default();
+        for session in ["ses_gone", "ses_busy", "ses_still"] {
+            machine.apply_at(
+                &event(&format!(
+                    r#"{{"type":"session.status","properties":{{"sessionID":"{session}","status":{{"type":"retry","action":{{"reason":"rate_limit"}}}}}}}}"#
+                )),
+                1_000,
+            );
+        }
+        assert_eq!(machine.retrying.len(), 3);
+        let _ = machine.take_edges();
+
+        // `ses_gone` is absent (idle sessions are omitted), `ses_busy` reports another word, and
+        // only `ses_still` is still retrying.
+        *server.status_body.lock().unwrap() = Some(
+            r#"{"ses_busy":{"type":"busy"},"ses_still":{"type":"retry"}}"#.to_string(),
+        );
+        assert!(seed_from_server(&client, &mut machine).is_ok());
+        assert_eq!(
+            machine.retrying.keys().collect::<Vec<_>>(),
+            vec!["ses_still"],
+            "only the session the level surface still reports keeps its retry fault"
+        );
+        assert_eq!(
+            standing(&machine).code.as_deref(),
+            Some("opencode/retry.rate_limit"),
+            "the surviving retry still stands, under its own exact code"
+        );
+        assert_eq!(framed(&machine).state, Activity::Active);
+    }
+
+    /// `session.idle` is the retry signal's other end event on that exact session — and only on
+    /// that one.
+    #[test]
+    fn session_idle_retires_the_retry_of_that_exact_session_only() {
+        let mut machine = EventMachine::default();
+        for session in ["ses_a", "ses_b"] {
+            machine.apply_at(
+                &event(&format!(
+                    r#"{{"type":"session.status","properties":{{"sessionID":"{session}","status":{{"type":"retry","action":{{"reason":"provider_error"}}}}}}}}"#
+                )),
+                1_000,
+            );
+        }
+        let _ = machine.take_edges();
+        machine.apply_at(
+            &event(r#"{"type":"session.idle","properties":{"sessionID":"ses_a"}}"#),
+            2_000,
+        );
+        assert_eq!(
+            machine.retrying.keys().collect::<Vec<_>>(),
+            vec!["ses_b"],
+            "ses_b's retry is untouched"
+        );
+        assert_eq!(
+            standing(&machine).code.as_deref(),
+            Some("opencode/retry.provider_error"),
+            "the same code still stands for the other session"
+        );
+        machine.apply_at(
+            &event(r#"{"type":"session.idle","properties":{"sessionID":"ses_b"}}"#),
+            3_000,
+        );
+        assert_eq!(machine.winner(), None, "both retries have now ended");
+        assert_eq!(machine.retrying.len(), 0);
+    }
+
+    /// `session.status{retry}.next` is disambiguated by MAGNITUDE, never by guessing: a small
+    /// number is a delay from the observation, an epoch-scale number is the instant itself, and an
+    /// instant already past is due now rather than before the observation that carries it.
+    #[test]
+    fn the_retry_deadline_is_read_by_epoch_magnitude() {
+        let now = 1_800_000_000_000_u64;
+        for (next, due, why) in [
+            (30_000_u64, now + 30_000, "a delay in milliseconds"),
+            (now + 45_000, now + 45_000, "an absolute instant"),
+            (now - 45_000, now, "an absolute instant already past is due now"),
+        ] {
+            let mut machine = EventMachine::default();
+            machine.apply_at(
+                &event(&format!(
+                    r#"{{"type":"session.status","properties":{{"sessionID":"ses_a","status":{{"type":"retry","next":{next},"action":{{"reason":"rate_limit"}}}}}}}}"#
+                )),
+                now,
+            );
+            let fault = standing(&machine);
+            assert_eq!(fault.next_observation_due_ms, Some(due), "{why}");
+            assert!(
+                fault.next_observation_due_ms >= Some(fault.observed_at_ms),
+                "{why}: a deadline never precedes its observation"
+            );
+        }
+        // A zero or unreadable `next` is no deadline at all, never a deadline of now.
+        for next in ["0", "null", r#""soon""#] {
+            let mut machine = EventMachine::default();
+            machine.apply_at(
+                &event(&format!(
+                    r#"{{"type":"session.status","properties":{{"sessionID":"ses_a","status":{{"type":"retry","next":{next}}}}}}}"#
+                )),
+                now,
+            );
+            assert_eq!(standing(&machine).next_observation_due_ms, None, "next={next}");
+        }
+    }
+
+    /// A queued edge is an observation that already happened. A reconnect is not evidence against
+    /// it, so the queue rides across the swap rather than being swallowed by the blip — and the
+    /// carried slot is restated exactly once, not once per reconnect.
+    #[test]
+    fn a_reconnect_holds_the_queued_condition_edges() {
+        let mut machine = EventMachine::default();
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"APIError","data":{"status":402}}}}"#,
+            ),
+            1_000,
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"message.updated","properties":{"info":{"role":"assistant","time":{"completed":2}}}}"#,
+            ),
+            2_000,
+        );
+        machine.apply_at(
+            &event(
+                r#"{"type":"session.error","properties":{"sessionID":"ses_a","error":{"name":"ContentFilterError"}}}"#,
+            ),
+            3_000,
+        );
+        let queued = machine.edges.clone();
+        assert_eq!(queued.len(), 3, "raise, blanket clear, raise");
+
+        let carried = machine.reconnected();
+        assert_eq!(
+            carried.edges, queued,
+            "nothing queued is dropped, and the final edge already states the slot"
+        );
+        assert_eq!(carried.winner(), machine.winner());
+
+        // A second reconnect over a queue that no longer ends in the slot's own raise restates it
+        // once.
+        let mut drained = machine.reconnected();
+        let _ = drained.take_edges();
+        let restated = drained.reconnected();
+        assert_eq!(
+            restated.edges,
+            vec![ConditionEdge::Raise(standing(&machine))],
+            "the record is the only other place the slot lives"
+        );
     }
 
     #[test]
@@ -2138,14 +3738,16 @@ mod tests {
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
         let state_path = tmp.path().join("state/delivery-state.json");
-        let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path.clone());
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
         server.read_back_error.store(true, Ordering::SeqCst);
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1, "one POST, attempted");
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Attempted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::TransportAccepted),
+            "the POST landed; nothing yet proves the server holds it"
+        );
 
         // While the read-back stays indeterminate, no pass may re-POST.
         delivery.pump(&client);
@@ -2155,9 +3757,11 @@ mod tests {
         // The read-back recovering flips the same attempt to Accepted with no second POST.
         server.read_back_error.store(false, Ordering::SeqCst);
         delivery.pump(&client);
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted),
+            "a recovered read-back proves storage, not consumption"
+        );
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
@@ -2299,8 +3903,26 @@ mod tests {
         (delivery, filename)
     }
 
+    /// Read the ledger back through its own loader and the real correlation derivation: a test
+    /// that read the bytes directly would not notice a record the pump itself would refuse.
+    fn reopen_ledger(legacy_path: &Path) -> delivery_ledger::Ledger {
+        delivery_ledger::Ledger::open(
+            legacy_path,
+            delivery_ledger::Harness::OpenCode.profile(),
+            "h.worker",
+            "h.worker",
+            |session, file| stable_message_id("h.worker", session, file),
+        )
+    }
+
+    fn ledger_phase(legacy_path: &Path, filename: &str) -> Option<delivery_ledger::Phase> {
+        reopen_ledger(legacy_path)
+            .entry(filename)
+            .map(|entry| entry.phase)
+    }
+
     #[test]
-    fn delivery_attempts_before_transport_and_accepts_only_the_read_back_receipt() {
+    fn a_durable_read_back_is_persistence_that_never_releases_the_inbox_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
@@ -2313,43 +3935,62 @@ mod tests {
             server.posts.lock().unwrap().as_slice(),
             [expected_id.clone()]
         );
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
-        assert_eq!(state.message_id, expected_id);
+        // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
+        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
+        assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
+        assert_eq!(entry.correlation.value, expected_id);
+        assert_eq!(
+            reopen_ledger(&state_path).retention(&filename),
+            delivery_ledger::Retention::Hold(delivery_ledger::HoldReason::UnreadReceipt),
+            "storage is not admission: ownership is retained until the scheduler proves it, and \
+             only the recipient's own archive settles the message"
+        );
+        assert!(
+            message::inbox_dir(&tmp.path().join("agents/h/worker"))
+                .join(&filename)
+                .is_file(),
+            "the ledger never archives an inbox file"
+        );
 
-        // Accepted is terminal for this file: further pumps send nothing.
+        // Persistence is terminal for the POST loop: further pumps send nothing.
         delivery.pump(&client);
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn a_stale_attempt_reconciles_by_reading_back_instead_of_resending() {
+    fn a_v1_attempt_is_adopted_and_reconciled_by_reading_back_instead_of_resending() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
         let state_path = tmp.path().join("state/delivery-state.json");
-        let (_, filename) = delivery_fixture(tmp.path(), state_path.clone());
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let inbox = message::inbox_dir(&agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let filename =
+            message::send_to_inbox(&inbox, "h.sender", Some("subject"), None, &[], "body").unwrap();
 
-        // A prior incarnation attempted this exact delivery and the server made it durable.
+        // The migration boundary: a prior binary attempted this exact delivery and the server made
+        // it durable, and no ledger exists yet.
         let message_id = stable_message_id("h.worker", "ses_target", &filename);
         server.durable.lock().unwrap().insert(message_id.clone());
-        atomic_json(
+        // The v1 record, in the exact shape the old binary wrote it.
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
             &state_path,
-            &DeliveryState {
-                schema: DELIVERY_STATE_SCHEMA.to_string(),
-                agent: "h.worker".to_string(),
-                runtime_id: "h.worker".to_string(),
-                session_id: "ses_target".to_string(),
-                filename,
-                message_id: message_id.clone(),
-                phase: DeliveryPhase::Attempted,
-            },
+            serde_json::to_vec(&json!({
+                "schema": delivery_ledger::OPENCODE_LEGACY_SCHEMA,
+                "agent": "h.worker",
+                "runtimeId": "h.worker",
+                "sessionId": "ses_target",
+                "filename": &filename,
+                "messageId": &message_id,
+                "phase": "attempted",
+            }))
+            .unwrap(),
         )
         .unwrap();
 
-        let agent_dir = tmp.path().join("agents/h/worker");
         let mut delivery = Delivery::with_state_path(
             tmp.path(),
             &agent_dir,
@@ -2362,9 +4003,125 @@ mod tests {
         delivery.pump(&client);
 
         assert!(server.posts.lock().unwrap().is_empty(), "must not resend");
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted),
+            "the adopted attempt reconciles to storage without a second POST"
+        );
+    }
+
+    /// The load-bearing rollback limit from the migration sweep: a delivery STARTED by the new
+    /// binary has no v1 record, so a rolled-back binary takes its `state == None` path and POSTs
+    /// before it ever requeries — appending the same messageID's parts a second time on 1.18.19,
+    /// at 9 of 9 crash positions. The v1-shaped floor is what removes that whole class, and it
+    /// only works if it passes v1's own load filter, which recomputes the messageID.
+    #[test]
+    fn a_post_migration_delivery_leaves_a_v1_readable_floor_so_a_rollback_cannot_re_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+        server.read_back_error.store(true, Ordering::SeqCst);
+
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert!(
+            state_path
+                .with_file_name(delivery_ledger::LEDGER_FILE)
+                .is_file(),
+            "authority lives in the fresh namespace"
+        );
+
+        // v1's own load filter, verbatim: schema, agent, filename grammar, and the recomputed
+        // `stable_message_id`. A floor failing any of these is silently discarded and buys nothing.
+        let floor: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(floor["schema"], delivery_ledger::OPENCODE_LEGACY_SCHEMA);
+        assert_eq!(floor["agent"], "h.worker");
+        assert!(message::is_message_filename(
+            floor["filename"].as_str().unwrap()
+        ));
+        assert_eq!(
+            floor["messageId"].as_str().unwrap(),
+            stable_message_id("h.worker", floor["sessionId"].as_str().unwrap(), &filename)
+        );
+        // Never advanced, so v1 reads a true lower bound and reconciles instead of accepting.
+        assert_eq!(floor["phase"], "attempted");
+
+        // It stays exactly that on every later pass while the delivery is outstanding.
+        delivery.pump(&client);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&state_path).unwrap()).unwrap(),
+            floor
+        );
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+    }
+
+    /// A true quarantine is operator-visible on the existing typed boundary — the transport is
+    /// unavailable — and nowhere else: no new diagnostic vocabulary, and the raw reason stays in
+    /// tracing so no unbounded prose reaches the record.
+    #[test]
+    fn a_quarantined_ledger_publishes_the_typed_delivery_boundary_and_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-state.json");
+        let agent_dir = tmp.path().join("agents/h/worker");
+        let inbox = message::inbox_dir(&agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        message::send_to_inbox(&inbox, "h.sender", Some("subject"), None, &[], "body").unwrap();
+
+        // A v1 record whose messageID contradicts its own session and filename is provably not
+        // this agent's, so it can be neither adopted nor ignored: it fails closed.
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&json!({
+                "schema": delivery_ledger::OPENCODE_LEGACY_SCHEMA,
+                "agent": "h.worker",
+                "runtimeId": "h.worker",
+                "sessionId": "ses_target",
+                "filename": "1786380000000-abc123.md",
+                "messageId": "msgtampered",
+                "phase": "attempted",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut delivery = Delivery::with_state_path(
+            tmp.path(),
+            &agent_dir,
+            "h",
+            "h.worker",
+            "h.worker",
+            state_path.clone(),
+        );
+        delivery.saw_session("ses_target");
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            Some("1.18.19".to_string()),
+            DiagnosticSupport::Supported,
+        );
+        delivery.pump_diagnosed(&client, &mut diagnostics);
+
+        assert!(
+            server.posts.lock().unwrap().is_empty(),
+            "a quarantined ledger authorizes no transport"
+        );
+        let crate::driver_diagnostic::Observed::Failure(failure) =
+            crate::driver_diagnostic::read(&crate::driver_diagnostic::path(&agent_dir))
+        else {
+            panic!("a quarantined ledger must be diagnosed")
+        };
+        assert_eq!(failure.stage, DiagnosticStage::Delivery);
+        assert_eq!(failure.reason, DiagnosticReason::DeliveryUnavailable);
+        assert_eq!(failure.source, DiagnosticSource::PromptTransport);
+        assert!(
+            state_path.exists(),
+            "a record we refuse to read is not a record we may destroy"
+        );
     }
 
     #[test]
@@ -2377,9 +4134,11 @@ mod tests {
         let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
 
         delivery.pump(&client);
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Attempted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Attempted),
+            "a refused POST never reaches transportAccepted"
+        );
 
         server.accept_posts.store(true, Ordering::SeqCst);
         delivery.next_attempt = Instant::now();
@@ -2390,9 +4149,10 @@ mod tests {
             server.posts.lock().unwrap().as_slice(),
             [expected_id.clone(), expected_id]
         );
-        let state: DeliveryState =
-            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        assert_eq!(state.phase, DeliveryPhase::Accepted);
+        assert_eq!(
+            ledger_phase(&state_path, &filename),
+            Some(delivery_ledger::Phase::Persisted)
+        );
     }
 
     #[test]

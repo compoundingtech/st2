@@ -20,7 +20,19 @@ import type {
   SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 
-const PROTOCOL = 1;
+// The wire versions this asset speaks, highest first in preference. Version 1 is the frame set
+// this file shipped with; version 2 adds the condition frame and nothing else. Negotiation is
+// `max(SUPPORTED ∩ hello.protocols)`, with the hello's scalar `protocol` as the only offer when an
+// older control plane sends no list — so this asset keeps working against both, and a control
+// plane that offers nothing this asset speaks is refused rather than guessed at.
+const SUPPORTED = [1, 2] as const;
+const CONDITION_PROTOCOL = 2;
+
+// The only two faults pi can prove, provider-namespaced so a code cannot collide with another
+// harness's. Named here because the same strings appear on a raise and on its paired clear, and a
+// clear whose code drifted from its raise silently stops clearing anything.
+const ASSISTANT_ERROR = "pi/assistantError";
+const COMPACT_FAILED = "pi/session_compact_failed";
 
 const BIN = "ST2_PI_CHANNEL_BIN";
 const CATALOG = "ST2_PI_CHANNEL_CATALOG";
@@ -36,6 +48,7 @@ const HELLO_TIMEOUT_MS = 5000;
 type Frame = {
   type?: string;
   protocol?: number;
+  protocols?: unknown;
   sessionContext?: string;
   content?: string;
   deliverAs?: "steer" | "followUp";
@@ -58,6 +71,13 @@ type Stash = {
   session?: string;
   seq?: string;
   child?: childProcess.ChildProcess;
+  /**
+   * The wire version agreed with the channel this stash currently holds, unset until its hello
+   * arrives. It lives beside `child` because it describes that channel and nothing else: a
+   * session replacement spawns a new channel and must re-negotiate rather than inherit, or a
+   * downgraded control plane would keep receiving frames its wire cannot carry.
+   */
+  protocol?: number;
   /**
    * The last assistant message's `usage.cost.total`.
    *
@@ -169,7 +189,11 @@ export default function (pi: ExtensionAPI) {
 
   const closeChild = (child: childProcess.ChildProcess | undefined) => {
     if (!child) return;
-    if (state.child === child) state.child = undefined;
+    if (state.child === child) {
+      state.child = undefined;
+      // The agreement belonged to that channel. A successor re-negotiates from its own hello.
+      state.protocol = undefined;
+    }
     // The channel treats EOF on its stdin as the session boundary, so ending this pipe is what
     // reaps it. That happens on its own whenever pi exits, however it exits.
     if (!child.stdin?.destroyed) child.stdin?.end();
@@ -211,6 +235,9 @@ export default function (pi: ExtensionAPI) {
       { stdio: ["pipe", "pipe", "inherit"], env: channelEnv },
     );
     state.child = child;
+    // A fresh channel has agreed nothing yet, and until its hello lands this asset sends only
+    // the frames every version carries.
+    state.protocol = undefined;
 
     return new Promise<string>((resolve) => {
       let settled = false;
@@ -221,16 +248,20 @@ export default function (pi: ExtensionAPI) {
       };
       const timer = setTimeout(() => settle(""), HELLO_TIMEOUT_MS);
       timer.unref?.();
+      // Retiring the channel retires its agreement with it.
+      const retire = () => {
+        if (state.child !== child) return;
+        state.child = undefined;
+        state.protocol = undefined;
+      };
       child.on("error", () => {
-        if (state.child === child) state.child = undefined;
+        retire();
         settle("");
       });
       // An observability pipe must never take pi down: a channel that closed its stdin mid-write
       // surfaces EPIPE on the stream, which without a listener is an uncaught exception in the
       // host process. Retire the channel instead — frames simply stop, fail-open.
-      child.stdin.on("error", () => {
-        if (state.child === child) state.child = undefined;
-      });
+      child.stdin.on("error", retire);
       child.on("exit", () => settle(""));
 
       const send = (frame: Record<string, unknown>) => {
@@ -246,17 +277,34 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (frame.type === "hello") {
-          // A newer control plane may speak a wire this asset was not written against. Refusing is
-          // the honest outcome: presence still decays, so the agent reads as unreachable rather
-          // than silently never receiving mail.
-          if (frame.protocol !== PROTOCOL) {
+          // Negotiate rather than compare. The hello's scalar `protocol` is a FLOOR that never
+          // moves — an already-published asset compares it for equality — so a control plane that
+          // speaks a newer wire advertises the set in `protocols` and this asset picks the highest
+          // it also speaks. An empty intersection is refused, which is the honest outcome:
+          // presence still decays, so the agent reads as unreachable rather than silently never
+          // receiving mail.
+          const offered = Array.isArray(frame.protocols)
+            ? frame.protocols.filter((value): value is number => typeof value === "number")
+            : typeof frame.protocol === "number"
+              ? [frame.protocol]
+              : [];
+          const agreed = offered
+            .filter((value) => (SUPPORTED as readonly number[]).includes(value))
+            .reduce<number | undefined>(
+              (best, value) => (best === undefined || value > best ? value : best),
+              undefined,
+            );
+          if (agreed === undefined) {
             closeChild(child);
             ctx.ui?.notify?.(
-              `st2: pi channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st2's hook set`,
+              `st2: pi channel offers protocol ${offered.join(", ") || "none"}, which this extension does not speak (it speaks ${SUPPORTED.join(", ")}); reinstall st2's hook set`,
             );
             settle("");
             return;
           }
+          // Recorded against the channel this hello came from, never "whatever is current": a
+          // predecessor draining its queued hello must not re-version the successor's channel.
+          if (state.child === child) state.protocol = agreed;
           clearTimeout(timer);
           settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");
           return;
@@ -302,7 +350,7 @@ export default function (pi: ExtensionAPI) {
   // starts exactly at that boundary — an `agent_end` emit would blip a spurious idle before it.
   // `agent_settled` is the first point pi is provably idle. The frame is observational — st2
   // decides what becomes of it — and a closed channel drops it silently, matching the fail-open
-  // rule this file already follows. pi 0.84.2 exposes no typed waiting-on-a-human event, so no
+  // rule this file already follows. pi 0.84.4 exposes no typed waiting-on-a-human event, so no
   // frame here ever claims one.
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
@@ -310,6 +358,71 @@ export default function (pi: ExtensionAPI) {
     child.stdin.write(JSON.stringify(frame) + "\n");
   };
   const sendState = (word: "active" | "idle") => sendFrame({ type: "state", state: word });
+
+  /**
+   * The condition axis, extension side (protocol 2 only).
+   *
+   * A condition frame states the fault axis and NOTHING ELSE: pi's fault evidence (`agent_end`)
+   * carries no activity claim, and folding it onto a state frame would fabricate one and refresh
+   * a stale activity from an event that observed none. The converse holds too — a state frame
+   * never touches the condition axis — so a standing fault survives every activity edge and the
+   * record settles as `idle` beside it: activity honest, wedged seat visible. That pairing is the
+   * whole fix for the measured false idle, where `agent_settled` fires from a `finally` after a
+   * failed turn and published a clean idle for a wedged seat.
+   *
+   * Gated on the negotiated version, not on the code being installed: an st2 that speaks only
+   * protocol 1 has nowhere to put this frame, and sending it anyway would put an unreadable line
+   * on a wire that is otherwise exactly the one it shipped with.
+   */
+  const sendCondition = (op: Record<string, unknown>) => {
+    if ((state.protocol ?? 0) < CONDITION_PROTOCOL) return;
+    sendFrame({ type: "condition", ...op });
+  };
+
+  /**
+   * pi's own verdict on the run that just ended, read off the LAST assistant message in
+   * `agent_end`'s `messages` array — measured against the published tarball's own declarations
+   * (`AgentEndEvent { type: "agent_end"; messages: AgentMessage[] }`, 0.84.2
+   * dist/core/extensions/types.d.ts:542-544 and 0.84.4 :555-558). There is no `message` singular
+   * on this event; reading one returned `undefined` for every real end, which is silently the
+   * worst possible outcome — no raise, no clear, and the false idle unfixed.
+   *
+   * The classification compares pi's typed `stopReason` against its own closed vocabulary
+   * (`pending | stop | length | toolUse | error | aborted | deferred`, pi-ai
+   * 0.84.4 dist/types.d.ts:287, 0.84.2 :277) and never reads prose. `errorMessage` rides along
+   * as DIAGNOSTIC detail only: nothing branches on it and no category is inferred from it.
+   *
+   * Three answers, because two would have to lie. `failed` is an error-ended run. `completed` is
+   * an ordinary end — `stop` or `length`, the two words that prove the provider answered and the
+   * run finished — and it is the only positive success edge. `undefined` covers everything else:
+   * no assistant message at all, an `aborted` run (a person interrupted it, which proves neither
+   * health nor fault), and `pending`/`deferred`/`toolUse`/any future word. Those emit NO frame:
+   * a raise would invent a failure and a clear would silence a fault nobody saw resolve.
+   */
+  const runOutcome = (
+    messages: readonly unknown[],
+  ): { state: "failed" | "completed"; detail?: string } | undefined => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (!message || typeof message !== "object") continue;
+      if (!("role" in message) || message.role !== "assistant") continue;
+      if (!("stopReason" in message) || typeof message.stopReason !== "string") return undefined;
+      if (message.stopReason === "error") {
+        const detail =
+          "errorMessage" in message &&
+          typeof message.errorMessage === "string" &&
+          message.errorMessage.trim() !== ""
+            ? message.errorMessage
+            : undefined;
+        return { state: "failed", detail };
+      }
+      if (message.stopReason === "stop" || message.stopReason === "length") {
+        return { state: "completed" };
+      }
+      return undefined;
+    }
+    return undefined;
+  };
 
   // Harness context, extension side (HC-R02, HC-R03, HC-R11, HC-R12).
   //
@@ -417,30 +530,106 @@ export default function (pi: ExtensionAPI) {
     sendContext(ctx);
   });
 
-  const onContextEvent = (name: "message_end" | "turn_end" | "agent_end") =>
+  // A helper for the events pi types loosely; the cast is on the REGISTRATION function, not on an
+  // event payload, and every payload read below narrows.
+  const onEvent = (
+    name: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) =>
     (pi.on as unknown as (
       event: string,
       handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-    ) => void)(name, async (event, ctx) => {
+    ) => void)(name, handler);
+
+  for (const name of ["message_end", "turn_end"]) {
+    onEvent(name, async (event, ctx) => {
       captureCost(event);
       sendContext(ctx);
     });
-  onContextEvent("message_end");
-  onContextEvent("turn_end");
-  onContextEvent("agent_end");
+  }
+
+  // `agent_end` is where a pi run's OUTCOME becomes visible, and until now this handler read only
+  // the numbers off it. That outcome is the entire cause of the measured false idle:
+  // `_emitAgentSettled` runs from the `finally` of `_runAgentPrompt` and fires unconditionally
+  // after a failed run, so a wedged seat published a clean `idle` with no reason at all.
+  // Classifying here — before `agent_settled`, which is the measured order — is what makes the
+  // fault land first and the idle land honestly beside it.
+  //
+  // Registered through pi's TYPED overload, deliberately: `event.messages` is then checked
+  // against the pinned tarball's own `AgentEndEvent`, which is exactly the check the untyped
+  // registration cast defeated while this handler read a `message` field that does not exist.
+  pi.on("agent_end", async (event, ctx) => {
+    captureCost(event);
+    sendContext(ctx);
+    const outcome = runOutcome(event.messages ?? []);
+    if (!outcome) return;
+    if (outcome.state === "failed") {
+      // `harness`, not `authentication`/`quota`/`provider`: the typed evidence is "a pi run
+      // failed", nothing more. pi ships no error-classification field (omp's `errorId` bitfield
+      // is exactly what pi lacks), so any narrower category would be inferred from prose. The
+      // prose rides `detail`, diagnostic-only. `unknown` recovery because pi says nothing about
+      // who clears this — never optimistic, so it pages.
+      sendCondition({
+        op: "raise",
+        category: "harness",
+        code: ASSISTANT_ERROR,
+        recovery: "unknown",
+        ...(outcome.detail === undefined ? {} : { detail: outcome.detail }),
+      });
+      return;
+    }
+    // pi's ONLY positive success edge: a run that reached its ordinary end proves the provider
+    // accepted the credential and the work ran. `agent_settled` is not this edge — it fires from
+    // a `finally` after a failure too — which is why the unkeyed clear hangs here alone.
+    sendCondition({ op: "clearAll", proof: "turnCompleted" });
+  });
 
   // pi's `session_compact` carries `reason ∈ manual | threshold | overflow` — the only v1 producer
   // that names its trigger at all. Measured in the handler itself: `getContextUsage()` already
   // reports `{tokens: null, percent: null}` there, and `getEntries()` already counts the new
   // entry, so this one frame carries both the honest withheld reading and the durable count.
-  (pi.on as unknown as (
-    event: string,
-    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-  ) => void)("session_compact", async (event, ctx) => {
-    const reason = (event as { reason?: unknown })?.reason;
+  onEvent("session_compact", async (event, ctx) => {
+    const reason = event && typeof event === "object" && "reason" in event ? event.reason : null;
     sendContext(ctx, {
       trigger: typeof reason === "string" ? reason : null,
       count: durableCompactions(ctx),
+    });
+    // A compaction that succeeded is the paired clear for its own failure, keyed on the EXACT
+    // category and code. A category-only clear would also wipe any other `context` fault, and
+    // there is no fallback to an unkeyed clear: on a healthy seat this ordinarily matches nothing
+    // and st2 logs that at debug.
+    sendCondition({ op: "clear", category: "context", code: COMPACT_FAILED });
+  });
+
+  // pi-only, and typed: `session_compact_failed` is the failure sibling of the event above, so
+  // this is a real signal rather than an inference from prose. `context`, because the harness has
+  // no usable window left and could not reclaim any; `human`, because nothing in pi retries it.
+  // No paired clear is derived from anything else — only a later successful compaction retires
+  // it.
+  //
+  // Two version facts ride on this handler. The event exists from pi 0.84.3 (zero occurrences in
+  // the 0.84.2 tarball, declared in 0.84.4 dist/core/extensions/types.d.ts:464-476), and
+  // registering a name a running build never emits is harmless — pi's `on` is a plain map insert
+  // (dist/core/extensions/loader.js:209-213) — so on an older build this is simply inert rather
+  // than a fault this seat cannot report. And the event's own `aborted` flag is load-bearing: a
+  // cancelled `/compact` is a person changing their mind, not a harness that ran out of context,
+  // so only `aborted === false` is a fault. The flag is read POSITIVELY — a build that does not
+  // carry it states nothing, and an unreadable flag must not become a raise.
+  onEvent("session_compact_failed", async (event) => {
+    if (!event || typeof event !== "object") return;
+    if (!("aborted" in event) || event.aborted !== false) return;
+    const detail =
+      "errorMessage" in event &&
+      typeof event.errorMessage === "string" &&
+      event.errorMessage.trim() !== ""
+        ? event.errorMessage
+        : undefined;
+    sendCondition({
+      op: "raise",
+      category: "context",
+      code: COMPACT_FAILED,
+      recovery: "human",
+      ...(detail === undefined ? {} : { detail }),
     });
   });
 

@@ -18,7 +18,8 @@ use std::process::ExitStatus;
 use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
-    install_signal_handler, run_provider_observed, ProviderOutcome, PROVIDER_POLL, STOP,
+    PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+    write_terminal,
 };
 use crate::{harness_state, harness_version, hooks, message, status};
 
@@ -121,14 +122,15 @@ pub fn run(
                 Some(runtime_id.clone()),
             )
             .with_ownership(session.clone(), seq);
-            let _ = writer.observe(
-                harness_state::Observation::new(
-                    harness_state::Activity::Ended,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Unknown,
-                )
-                .with_reason("launch-error")
-                .with_exit("exit unknown"),
+            // The launch error is this incarnation's FIRST write: the claim fence above states
+            // no condition and fences are never carried forward, so the version 3 write needs
+            // the one bootstrap retry [`write_terminal`] owns or the seat would keep reading a
+            // takeover placeholder instead of a launch that never ran.
+            let _ = write_terminal(
+                &mut writer,
+                "exit unknown",
+                Some("launch-error"),
+                harness_state::ConditionReport::Clear,
             );
             return Err(error);
         }
@@ -208,7 +210,15 @@ fn record_session_end(
     let mut writer =
         harness_state::Writer::new(agent_dir, identity, "omp", Some(runtime_id.to_string()))
             .with_ownership(session, seq);
-    if let Err(error) = writer.ended(label) {
+    // The channel may have published nothing at all — an omp that died before loading its
+    // extension is exactly that — so this terminal write states the condition axis itself when
+    // nothing else did, and otherwise carries the channel's standing condition forward.
+    if let Err(error) = write_terminal(
+        &mut writer,
+        &label,
+        None,
+        harness_state::ConditionReport::Clear,
+    ) {
         eprintln!("st2 omp driver: recording session end failed: {error}");
     }
 }

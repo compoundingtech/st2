@@ -19,6 +19,7 @@ use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
     PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+    write_terminal,
 };
 use crate::{harness_state, hooks, message, status};
 
@@ -32,7 +33,13 @@ const EXTENSION: &str = "pi-channel.ts";
 /// type-checks and runtime-smokes the shipped asset against exactly this tarball. That makes the
 /// flake pin the gate for this constant, and `pi_channel`'s fixture asserts the two agree: a pi
 /// bump that changes what `getContextUsage().tokens` means must move both together or fail.
-pub const MEASURED_CONTEXT_VERSION: &str = "0.84.2";
+///
+/// Moved 0.84.2 -> 0.84.4 with the flake pin, and the arithmetic was re-verified rather than
+/// assumed: `getContextUsage()` (`dist/core/agent-session.js`) and `calculateContextTokens`
+/// (`dist/core/compaction/compaction.js:86-88`, `usage.totalTokens || input + output + cacheRead
+/// + cacheWrite`) are byte-identical between the two published tarballs, so the recorded fixture
+/// still means what it says under the newer pin.
+pub const MEASURED_CONTEXT_VERSION: &str = "0.84.4";
 
 /// The exact st2 executable the pi extension must spawn for its channel.
 pub const CHANNEL_BIN: &str = "ST2_PI_CHANNEL_BIN";
@@ -106,14 +113,15 @@ pub fn run(
                 Some(runtime_id.clone()),
             )
             .with_ownership(session.clone(), seq);
-            let _ = writer.observe(
-                harness_state::Observation::new(
-                    harness_state::Activity::Ended,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Unknown,
-                )
-                .with_reason("launch-error")
-                .with_exit("exit unknown"),
+            // The launch error is this incarnation's FIRST write: the claim fence above states
+            // no condition and fences are never carried forward, so the version 3 write needs
+            // the one bootstrap retry [`write_terminal`] owns or the seat would keep reading a
+            // takeover placeholder instead of a launch that never ran.
+            let _ = write_terminal(
+                &mut writer,
+                "exit unknown",
+                Some("launch-error"),
+                harness_state::ConditionReport::Clear,
             );
             return Err(error);
         }
@@ -173,7 +181,15 @@ fn record_session_end(
     let mut writer =
         harness_state::Writer::new(agent_dir, identity, "pi", Some(runtime_id.to_string()))
             .with_ownership(session, seq);
-    if let Err(error) = writer.ended(label) {
+    // The channel may have published nothing at all — a pi that died before loading its
+    // extension is exactly that — so this terminal write states the condition axis itself when
+    // nothing else did, and otherwise carries the channel's standing condition forward.
+    if let Err(error) = write_terminal(
+        &mut writer,
+        &label,
+        None,
+        harness_state::ConditionReport::Clear,
+    ) {
         tracing::warn!("st2 pi driver: recording session end failed: {error}");
     }
 }
@@ -284,11 +300,16 @@ mod tests {
         let agent_dir = tmp.path();
         let mut channel_writer =
             crate::harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        // The channel STATES the tuple, exactly as `pi_channel` does: version 3 refuses an
+        // activity edge whose condition axis no producer of this session ever stated, so a legacy
+        // observation here would write nothing and the terminal record would have no counter to
+        // continue.
         channel_writer
-            .observe(crate::harness_state::Observation::new(
+            .publish(crate::harness_state::Frame::new(
                 crate::harness_state::Activity::Active,
-                crate::harness_state::BlockedOn::None,
                 crate::harness_state::InputBuffer::Unknown,
+                crate::harness_state::ConditionReport::Clear,
+                crate::harness_state::HumanAsk::Unknown,
             ))
             .unwrap();
         drop(channel_writer);
@@ -434,11 +455,15 @@ mod tests {
         let mut channel =
             harness_state::Writer::new(tmp.path(), "h.worker", "pi", Some("h.worker".to_string()))
                 .with_ownership(session.clone(), seq);
+        // The channel STATES its tuple, as `pi_channel` does. A legacy observation here would be
+        // refused as unstated over the claim fence above, leaving `live` as the fence bytes and
+        // making the no-heartbeat assertion vacuous.
         channel
-            .observe(harness_state::Observation::new(
+            .publish(harness_state::Frame::new(
                 Activity::Active,
-                harness_state::BlockedOn::None,
                 harness_state::InputBuffer::Unknown,
+                harness_state::ConditionReport::Clear,
+                harness_state::HumanAsk::Unknown,
             ))
             .unwrap();
         let live = std::fs::read(&record).unwrap();

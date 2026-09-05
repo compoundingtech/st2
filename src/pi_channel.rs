@@ -35,9 +35,21 @@ inbox by reading, acting on, replying when useful, and archiving each handled me
 resuming or starting work, set your status to busy; set available only when yielding or ready for \
 new work.";
 
-/// The wire version the shipped extension is written against. A mismatch is the extension's to
-/// refuse: st2 never guesses what an older asset understands.
+/// The wire version the hello ADVERTISES as its floor, and the only one an already-published
+/// asset understands. It stays literally 1 forever: the pinned v1 asset compares this field for
+/// strict equality and closes the channel on a mismatch, so advertising a newer number here would
+/// make every hook set in the field refuse the channel and silently stop all delivery.
 pub const PROTOCOL: u32 = 1;
+
+/// Every wire version this build speaks, offered beside the floor so a NEWER asset can negotiate
+/// up without the floor ever moving. The asset selects `max(supported ∩ protocols)` and refuses
+/// only on an empty intersection; an older asset ignores the list and keeps reading `protocol`.
+/// Version 2 adds the condition frame — nothing else — so an asset that stays on 1 keeps its
+/// exact existing behaviour.
+///
+/// Additive by construction: an asset that does not know the field ignores it, and an asset that
+/// does answers with a `client_hello` naming what it will speak.
+pub const PROTOCOLS: [u32; 2] = [1, 2];
 
 /// Last-resort durable state when compaction begins before the agent authored a checkpoint.
 ///
@@ -47,6 +59,12 @@ const PRE_COMPACT_STUB: &str = "# now — pre-compact stub\n\n\
 PreCompact fired before the model captured durable working state. Reconstruct from git status,\n\
 recent commits, and the st2 inbox, then write a real checkpoint with `st2 context write`.\n";
 const PRE_COMPACT_ERROR_REASON: &str = "pre-compact context recovery failed";
+
+/// The negotiated asset's diagnostic word for a refused approval. It is prose about an ASK that
+/// is over — never a condition — and it exists only in the negotiated vocabulary, so the version
+/// 2 projection withholds it: a record shape readers are pinned to must not grow a novel `reason`
+/// on an unblocked frame because a newer asset started narrating one.
+const APPROVAL_DENIED_REASON: &str = "approvalDenied";
 
 /// How pi is asked to hand one delivered message to the agent.
 ///
@@ -71,6 +89,22 @@ fn channel_content(subject: Option<&str>, body: &str) -> String {
     }
 }
 
+/// st2's hello: the version the asset must understand, and every version st2 would also accept.
+///
+/// `protocol` stays 1 forever. The hello is st2 → asset and is written before any read, so a
+/// control plane that raised it unilaterally would be REFUSED by every already-loaded asset —
+/// and a refusal costs that seat its mail. The offer beside it is how a newer wire is reached
+/// instead: additive, ignored by an old asset, answered by a new one.
+fn hello(identity: &str, session_context: &str) -> Value {
+    json!({
+        "type": "hello",
+        "protocol": PROTOCOL,
+        "protocols": PROTOCOLS,
+        "identity": identity,
+        "sessionContext": session_context,
+    })
+}
+
 /// The harness-specific facts the shared channel loop needs: which env names carry the wrapper's
 /// exported ownership triple, what label goes on records and errors, and which native-driver
 /// diagnostic word — if any — this channel publishes under.
@@ -88,6 +122,18 @@ pub struct ChannelKind {
     pub runtime_id_env: &'static str,
     pub session_env: &'static str,
     pub seq_env: &'static str,
+    /// What this kind's frames state on the version 3 ask axis when the wire claims no pending
+    /// ask. `HumanAsk::Unknown` is a POSITIVE statement — "this harness exposes no ask surface at
+    /// all", which is pi's case on every frame forever — and it is stronger than it looks: a kind
+    /// carrying it never derives a `pending` ask from any frame, because a channel that cannot see
+    /// the axis cannot vouch for a foreign asset's claim about it. `None` is the ordinary answer
+    /// for a kind that does see the axis (omp) and reports nothing waiting.
+    pub default_ask: harness_state::HumanAsk,
+    /// The conversation axis this kind can state with no evidence off the wire. pi has no
+    /// conversation identity to expose at all; omp demonstrably has sessions (`--no-session`,
+    /// `sessionManager`), so it states NOTHING until an event exposes one — never `Unsupported`,
+    /// which would be a false capability claim.
+    pub conversation: Option<harness_state::ConversationState>,
 }
 
 const PI_KIND: ChannelKind = ChannelKind {
@@ -97,6 +143,8 @@ const PI_KIND: ChannelKind = ChannelKind {
     runtime_id_env: crate::pi_session::CHANNEL_RUNTIME_ID,
     session_env: crate::pi_session::CHANNEL_SESSION,
     seq_env: crate::pi_session::CHANNEL_SEQ,
+    default_ask: harness_state::HumanAsk::Unknown,
+    conversation: Some(harness_state::ConversationState::Unsupported),
 };
 
 const OMP_KIND: ChannelKind = ChannelKind {
@@ -106,6 +154,8 @@ const OMP_KIND: ChannelKind = ChannelKind {
     runtime_id_env: crate::omp_session::CHANNEL_RUNTIME_ID,
     session_env: crate::omp_session::CHANNEL_SESSION,
     seq_env: crate::omp_session::CHANNEL_SEQ,
+    default_ask: harness_state::HumanAsk::None,
+    conversation: None,
 };
 
 /// Run the pi native message channel over stdio.
@@ -134,15 +184,10 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         }
     });
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    write_json(
-        &mut stdout,
-        &json!({
-            "type": "hello",
-            "protocol": PROTOCOL,
-            "identity": identity,
-            "sessionContext": session_context,
-        }),
-    )?;
+    // Named so the version negotiation is provable without a live channel: the floor and the
+    // offered set are the one thing in this file an already-published asset compares against, and
+    // getting them wrong stops all delivery silently.
+    write_json(&mut stdout, &hello(identity, &session_context))?;
     stdout.flush()?;
     // The channel owns the live half of observed harness state: it is the one process that sees
     // the harness's own turn events, and its stdio connection to the extension is the evidence
@@ -236,6 +281,24 @@ fn channel_loop(
     let mut delivered = HashSet::new();
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
+    // What this CONNECTION agreed to speak. A session replacement re-spawns this channel from a
+    // possibly-replaced binary while the loaded asset is the predecessor's, so the agreement is
+    // per connection and its absence is the default rather than a failure.
+    let mut negotiated: Option<u32> = None;
+    // The conversation identity, once the asset has forwarded one. It rides every later frame:
+    // the axis has no operation of its own, and restating an activity nobody observed just to
+    // carry an identity would refresh a stale state.
+    let mut conversation: Option<harness_state::ConversationState> = None;
+    // A raise the record had no observation of this session's to attach to. It is held rather
+    // than dropped and rather than published beside a fabricated activity: the seat is faulted,
+    // and the first genuine activity edge is what makes the fault recordable. Unreachable in
+    // practice — the extension seeds a state frame from `ctx.isIdle()` at open time — which is
+    // exactly why the fallback must not be a guess.
+    let mut deferred_fault: Option<harness_state::FaultReport> = None;
+    // The adapter-owned fault that is still TRUE, tracked separately from whatever occupies the
+    // record's single condition slot: a later provider fault may displace it there, and a turn
+    // that completes retires the provider's fault without touching st2's own.
+    let mut harness_fault: Option<harness_state::FaultReport> = None;
     loop {
         match input.recv_timeout(poll) {
             Ok(line) => {
@@ -251,16 +314,107 @@ fn channel_loop(
                 // The typed turn result, decoded once: it feeds two independent records and the
                 // credential edge must not depend on the categorical write landing.
                 let turn = frame.as_ref().and_then(turn_result);
+                if let Some(protocol) = frame.as_ref().and_then(negotiated_protocol) {
+                    negotiated = Some(protocol);
+                }
+                // Which wire this channel writes is the WRITER's business alone: version 3 has
+                // the condition axis, version 2 does not, and a record has exactly one source of
+                // truth either way. Negotiation is a separate question about what the ASSET
+                // promised, and it narrows two axes rather than the whole write — see
+                // [`connection_frame`]. Withholding the version 3 tuple from an un-negotiated
+                // peer would be strictly worse: its faults are on the same typed turn frame, so
+                // a wedged seat would go unstated.
+                let states_tuple = writer.writes_condition_axis();
+                let promoted = negotiated == Some(PROTOCOL_CONDITION_AXIS);
+                if promoted
+                    && let Some(claim) = frame
+                        .as_ref()
+                        .and_then(|frame| conversation_claim(frame, crate::message::now_ms()))
+                {
+                    conversation = Some(claim);
+                }
                 if let Some(observation) = frame
                     .as_ref()
                     .and_then(state_observation)
                     .or_else(|| turn.as_ref().and_then(turn_observation))
+                {
+                    if states_tuple {
+                        let mut published =
+                            connection_frame(kind, observation, promoted, conversation.clone());
+                        // The condition rides the SAME write as the activity it was observed
+                        // with: they are one look at the harness, and correlating them across
+                        // two writes is a race a reader can lose. A fault the record had nowhere
+                        // to attach yet takes this frame instead of being dropped.
+                        if let Some(fault) = turn
+                            .as_ref()
+                            .and_then(|turn| turn_fault(turn, crate::message::now_ms()))
+                            .or_else(|| deferred_fault.take())
+                        {
+                            published.condition = harness_state::ConditionReport::Fault(fault);
+                        }
+                        if let Err(error) = publish_frame(writer, published, label) {
+                            tracing::warn!(
+                                "st2 {label} channel: recording observed state failed: {error}"
+                            );
+                        }
                     // A queued live frame must never overwrite the wrapper's terminal record:
                     // the channel and the wrapper are separate processes, so the flock alone
                     // serializes but does not order their writes.
-                    && let Err(error) = writer.observe_unless_ended(observation)
+                    } else if let Err(error) =
+                        writer.observe_unless_ended(legacy_observation(observation))
+                    {
+                        tracing::warn!(
+                            "st2 {label} channel: recording observed state failed: {error}"
+                        );
+                    }
+                    // An activity edge is the one thing that can retire a deferred raise's
+                    // reason for waiting: the record now holds an observation of this session's
+                    // for the fault to attach to.
+                    if let Some(fault) = deferred_fault.take() {
+                        deferred_fault = apply_condition(writer, ConditionEdge::Raise(fault), label);
+                    }
+                }
+                // The condition axis, on its own frame and deliberately without an activity
+                // claim: pi's fault evidence carries none, and restating activity here would
+                // refresh a stale one from a frame that observed nothing about it. An activity
+                // edge never clears a condition, and a condition edge never restates activity.
+                if let Some(edge) = frame
+                    .as_ref()
+                    .and_then(|frame| condition_frame(frame, message::now_ms()))
                 {
-                    tracing::warn!("st2 {label} channel: recording observed state failed: {error}");
+                    if states_tuple {
+                        // A clear the harness sent while a raise is still held retires that
+                        // raise. Without this the held fault outlives the very edge that
+                        // resolved it and the next activity edge republishes a condition the
+                        // harness has already retracted.
+                        if deferred_fault
+                            .as_ref()
+                            .is_some_and(|held| retires_deferred(&edge, held))
+                        {
+                            deferred_fault = None;
+                        }
+                        if let Some(fault) = apply_condition(writer, edge, label) {
+                            deferred_fault = Some(fault);
+                        }
+                    } else {
+                        // Version 2 has nowhere to carry it and this record has exactly one
+                        // source of truth, so the edge is dropped rather than cached where the
+                        // session's sibling writers could not see it.
+                        tracing::debug!(
+                            "st2 {label} channel: condition frame dropped: this build's records \
+                             carry no condition axis"
+                        );
+                    }
+                }
+                // The one positive success edge on the whole axis: a turn that reached its
+                // ordinary end. Nothing else clears everything — not an activity edge, not an
+                // approval resolution, not a compaction, and least of all a retry omp is about to
+                // make, which sends no frame at all. And it clears only what it is evidence
+                // about: an adapter-owned pre-compact failure that still holds is restated, since
+                // a working provider says nothing about st2's own failed write.
+                if states_tuple && matches!(turn.as_ref(), Some(TurnResult::Ordinary)) {
+                    let _cleared =
+                        apply_condition(writer, turn_completed_edge(harness_fault.as_ref()), label);
                 }
                 // The credential axis is a third record, independent of the numbers and of the
                 // categorical state: a rejection stands until a turn reaches its ordinary end,
@@ -284,22 +438,53 @@ fn channel_loop(
                 }
                 if frame.as_ref().is_some_and(|frame| {
                     frame.get("type").and_then(Value::as_str) == Some("pre_compact")
-                }) && let Err(error) = ensure_pre_compact_context(agent_dir)
-                {
-                    tracing::warn!(
-                        "st2 {label} channel: writing pre-compact context stub failed: {error}"
-                    );
-                    let actionable = harness_state::Observation::new(
-                        harness_state::Activity::Active,
-                        harness_state::BlockedOn::None,
-                        harness_state::InputBuffer::Unknown,
-                    )
-                    .with_reason(PRE_COMPACT_ERROR_REASON);
-                    if let Err(state_error) = writer.observe_unless_ended(actionable) {
-                        tracing::warn!(
-                            "st2 {label} channel: recording pre-compact recovery failure failed: \
-                             {state_error}"
-                        );
+                }) {
+                    match ensure_pre_compact_context(agent_dir) {
+                        Err(error) => {
+                            tracing::warn!(
+                                "st2 {label} channel: writing pre-compact context stub failed: \
+                                 {error}"
+                            );
+                            if states_tuple {
+                                // st2's own plumbing is what broke, so this is the one fault
+                                // this adapter OWNS rather than observes. It is raised without
+                                // restating the activity axis: nothing was learned about whether
+                                // the model is working. It is also remembered, because only the
+                                // next SUCCESSFUL pre-compact edge may retire it.
+                                let edge = pre_compact_edge(false, crate::message::now_ms());
+                                if let ConditionEdge::Raise(fault) = &edge {
+                                    harness_fault = Some(fault.clone());
+                                }
+                                deferred_fault = apply_condition(writer, edge, label);
+                            } else {
+                                let actionable = harness_state::Observation::new(
+                                    harness_state::Activity::Active,
+                                    harness_state::BlockedOn::None,
+                                    harness_state::InputBuffer::Unknown,
+                                )
+                                .with_reason(PRE_COMPACT_ERROR_REASON);
+                                if let Err(state_error) = writer.observe_unless_ended(actionable) {
+                                    tracing::warn!(
+                                        "st2 {label} channel: recording pre-compact recovery \
+                                         failure failed: {state_error}"
+                                    );
+                                }
+                            }
+                        }
+                        // The stub is there now, so the failure a previous edge recorded is over.
+                        // The clear names the category AND the full code — never the category
+                        // alone and never a blanket clear — so a standing credential rejection
+                        // survives a compaction that went fine.
+                        Ok(_) if states_tuple => {
+                            deferred_fault = None;
+                            harness_fault = None;
+                            let _cleared = apply_condition(
+                                writer,
+                                pre_compact_edge(true, crate::message::now_ms()),
+                                label,
+                            );
+                        }
+                        Ok(_) => {}
                     }
                 }
             }
@@ -355,6 +540,297 @@ fn state_observation(frame: &Value) -> Option<harness_state::Observation> {
         observation = observation.with_reason(reason);
     }
     Some(observation)
+}
+
+/// The tagged ask axis as ONE kind's asset can state it.
+///
+/// A kind whose default is `Unknown` cannot see an ask surface at all, so nothing it emits may be
+/// promoted into a positive answer — not even the `blockedOn: none` its frames carry by default,
+/// which is the pre-axis spelling of "nothing to report" rather than of "no human is waiting".
+fn tagged_ask(
+    kind: &ChannelKind,
+    blocked_on: harness_state::BlockedOn,
+    ask: harness_state::Ask,
+) -> harness_state::HumanAsk {
+    if kind.default_ask == harness_state::HumanAsk::Unknown {
+        return harness_state::HumanAsk::Unknown;
+    }
+    match blocked_on {
+        // A real pending ask. An unnamed or unrecognized kind stays indeterminate: the ask is
+        // real and its kind unstated, which is not the same as no ask.
+        harness_state::BlockedOn::Human => harness_state::HumanAsk::Pending(match ask {
+            harness_state::Ask::Permission => harness_state::AskKind::Permission,
+            harness_state::Ask::Question => harness_state::AskKind::Question,
+            harness_state::Ask::Review => harness_state::AskKind::Review,
+            harness_state::Ask::None | harness_state::Ask::Unknown => {
+                harness_state::AskKind::Unknown
+            }
+        }),
+        harness_state::BlockedOn::None => kind.default_ask,
+        harness_state::BlockedOn::Unknown => harness_state::HumanAsk::Unknown,
+    }
+}
+
+/// The version 3 tuple one observation states for this kind.
+///
+/// The condition axis is `Unchanged`, always: an activity or ask edge has learned NOTHING about
+/// whether the provider is faulted, and a producer forced to pick `clear` there would fabricate
+/// health several times a turn. The caller replaces it only where it genuinely observed a
+/// condition with the same look at the harness.
+fn kind_frame(kind: &ChannelKind, observation: harness_state::Observation) -> harness_state::Frame {
+    let mut frame = harness_state::Frame::new(
+        observation.state,
+        observation.input_buffer,
+        harness_state::ConditionReport::Unchanged,
+        tagged_ask(kind, observation.blocked_on, observation.ask),
+    );
+    if let Some(conversation) = kind.conversation.clone() {
+        frame = frame.with_conversation(conversation);
+    }
+    if let Some(reason) = observation.reason {
+        frame = frame.with_reason(reason);
+    }
+    if let Some(exit) = observation.exit {
+        frame = frame.with_exit(exit);
+    }
+    frame
+}
+
+/// What one `type: "condition"` frame asks of the condition axis. Three operations and no fourth:
+/// there is no word here that ends a session, because a condition frame is never evidence that a
+/// process exited — the outer session wrapper alone writes the terminal record. omp's adapters
+/// mint the same three operations from its typed turn frame and its own pre-compact edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionEdge {
+    Raise(harness_state::FaultReport),
+    ClearPaired(harness_state::FaultKey),
+    ClearAll(harness_state::ProgressProof),
+}
+
+/// Decode a condition frame, protocol 2.
+///
+/// Same discipline as [`state_observation`], for the same reason: an unrecognized `op`, a category
+/// outside the closed set, a recovery word this build does not know, a `code` that is not
+/// `provider/code`, and a `clearAll` whose proof word is missing or unknown each drop the frame
+/// silently rather than guessing. A newer asset must not be able to make this channel record
+/// something it cannot vouch for — and of the two failure directions, dropping an edge leaves the
+/// record as it was while guessing one publishes a claim nobody made.
+///
+/// The observation instant is stamped HERE, by Rust: the asset and this process share no clock,
+/// so a semantic timestamp off the wire would be another harness's idea of now.
+fn condition_frame(frame: &Value, observed_at_ms: u64) -> Option<ConditionEdge> {
+    if frame.get("type").and_then(Value::as_str) != Some("condition") {
+        return None;
+    }
+    let op = frame.get("op").and_then(Value::as_str)?;
+    // The unkeyed clear names no fault, so it must name the progress it witnessed. There is
+    // deliberately no default: an unproven blanket clear is exactly how a fault that still holds
+    // stops paging.
+    if op == "clearAll" {
+        return Some(ConditionEdge::ClearAll(
+            match frame.get("proof").and_then(Value::as_str)? {
+                "turnCompleted" => harness_state::ProgressProof::TurnCompleted,
+                "requestSucceeded" => harness_state::ProgressProof::RequestSucceeded,
+                _ => return None,
+            },
+        ));
+    }
+    let category = fault_category(frame.get("category").and_then(Value::as_str)?)?;
+    // Absent is a real answer (a fault, or a clear, carrying no code at all); present-but-not-
+    // namespaced is a malformed frame, because a bare word is how two providers' codes collide.
+    let code = match frame.get("code") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(code))
+            if code
+                .split_once('/')
+                .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty()) =>
+        {
+            Some(code.clone())
+        }
+        Some(_) => return None,
+    };
+    match op {
+        "raise" => {
+            let recovery = fault_recovery(frame.get("recovery").and_then(Value::as_str)?)?;
+            let mut fault = harness_state::FaultReport::new(category, recovery, observed_at_ms);
+            if let Some(code) = code {
+                fault = fault.with_code(code);
+            }
+            // Diagnostic only, and the only place provider prose is allowed to ride: no consumer
+            // branches on it, and nothing above ever reclassifies the category from it.
+            if let Some(detail) = frame
+                .get("detail")
+                .and_then(Value::as_str)
+                .filter(|detail| !detail.is_empty())
+            {
+                fault = fault.with_detail(detail);
+            }
+            Some(ConditionEdge::Raise(fault))
+        }
+        // A paired clear names the EXACT `(category, code)` of the fault it clears — never the
+        // category alone, which is how one provider signal silences a different live fault in the
+        // same category.
+        "clear" => {
+            let mut key = harness_state::FaultKey::new(category);
+            if let Some(code) = code {
+                key = key.with_code(code);
+            }
+            Some(ConditionEdge::ClearPaired(key))
+        }
+        _ => None,
+    }
+}
+
+/// The closed category vocabulary, spelled out rather than inferred: a word outside it drops the
+/// frame here instead of becoming an untyped fault, because a producer in this build has no
+/// excuse for a category it cannot name.
+fn fault_category(word: &str) -> Option<harness_state::FaultCategory> {
+    Some(match word {
+        "authentication" => harness_state::FaultCategory::Authentication,
+        "account" => harness_state::FaultCategory::Account,
+        "quota" => harness_state::FaultCategory::Quota,
+        "rateLimit" => harness_state::FaultCategory::RateLimit,
+        "provider" => harness_state::FaultCategory::Provider,
+        "context" => harness_state::FaultCategory::Context,
+        "configuration" => harness_state::FaultCategory::Configuration,
+        "policy" => harness_state::FaultCategory::Policy,
+        "harness" => harness_state::FaultCategory::Harness,
+        _ => return None,
+    })
+}
+
+/// The closed recovery vocabulary. `unknown` is a word an asset may STATE — "the harness said
+/// nothing about who clears this" — and it is never optimistic: it pages exactly like `human`.
+fn fault_recovery(word: &str) -> Option<harness_state::Recovery> {
+    Some(match word {
+        "automatic" => harness_state::Recovery::Automatic,
+        "human" => harness_state::Recovery::Human,
+        "terminal" => harness_state::Recovery::Terminal,
+        "unknown" => harness_state::Recovery::Unknown,
+        _ => return None,
+    })
+}
+
+/// Publish one activity edge, stating the condition axis once when the record has none.
+///
+/// A version 3 record's condition axis is not writable as `absent` and silence is not a value
+/// either, so the FIRST activity-only frame of an incarnation is refused with
+/// [`harness_state::Refusal::Unstated`] — and pi's first frame is exactly that, the
+/// `session_start` seed. Without the restatement a healthy pi seat would publish no record at
+/// all, which reads as `unknown` for every consumer.
+fn publish_frame(
+    writer: &mut harness_state::Writer,
+    frame: harness_state::Frame,
+    label: &str,
+) -> Result<()> {
+    let outcome = writer.publish_unless_ended(frame.clone())?;
+    if let Some(stated) = restate_condition(&frame, &outcome) {
+        report_outcome(
+            label,
+            "observed state",
+            &writer.publish_unless_ended(stated)?,
+        );
+        return Ok(());
+    }
+    report_outcome(label, "observed state", &outcome);
+    Ok(())
+}
+
+/// Log what a typed write outcome means. Landing and coalescing are both success and say nothing.
+/// A paired clear that matched no standing fault is the ORDINARY outcome of a successful
+/// compaction on a healthy seat, so it is debug and never a warning — and it never falls back to
+/// an unkeyed clear, which would silence whatever else stands. Every refusal is fail-open:
+/// delivery never depends on a record landing.
+fn report_outcome(label: &str, what: &str, outcome: &harness_state::WriteOutcome) {
+    match outcome.refusal() {
+        None => {}
+        Some(harness_state::Refusal::ConditionMismatch { current }) => tracing::debug!(
+            "st2 {label} channel: {what} matched no standing fault (standing: {current:?})"
+        ),
+        Some(refusal) => {
+            tracing::warn!("st2 {label} channel: {what} was refused: {refusal:?}");
+        }
+    }
+}
+
+/// The one frame worth restating, and only for the one refusal that proves it is safe.
+///
+/// A version 3 record's condition axis is not writable as `absent`, so the FIRST activity-only
+/// frame of a record whose axis nobody ever stated is refused as
+/// [`harness_state::Refusal::Unstated`] — and that refusal is itself the proof that no condition
+/// of this session's stands, because a standing one would have been inherited and stated. There
+/// is therefore nothing to erase, and `clear` initializes the axis truthfully. Every other
+/// refusal is a fact about ownership or a terminal record, which restating cannot help, and a
+/// frame that already states a condition is never rewritten.
+fn restate_condition(
+    frame: &harness_state::Frame,
+    outcome: &harness_state::WriteOutcome,
+) -> Option<harness_state::Frame> {
+    if !matches!(outcome.refusal(), Some(harness_state::Refusal::Unstated))
+        || !matches!(frame.condition, harness_state::ConditionReport::Unchanged)
+    {
+        return None;
+    }
+    let mut restated = frame.clone();
+    restated.condition = harness_state::ConditionReport::Clear;
+    Some(restated)
+}
+
+/// Whether one condition edge retires a raise that is still being held.
+///
+/// A held raise is a fault the record has not accepted yet, so the ordinary clear paths cannot
+/// reach it: it lives in this process. An unkeyed clear retires whatever stands, held included —
+/// its proof is a positive observation that the harness made progress. A paired clear retires it
+/// only on the EXACT key, the same rule the writer applies to a landed fault, so one signal
+/// cannot silence a different held fault. A raise never retires another: replacement is
+/// [`apply_condition`]'s business.
+fn retires_deferred(edge: &ConditionEdge, held: &harness_state::FaultReport) -> bool {
+    match edge {
+        ConditionEdge::ClearAll(_) => true,
+        ConditionEdge::ClearPaired(key) => *key == held.key(),
+        ConditionEdge::Raise(_) => false,
+    }
+}
+
+/// Apply one condition operation, returning a fault the record had nowhere to attach yet.
+///
+/// A condition attaches to an OBSERVATION, so a raise that arrives before this session's first
+/// frame is handed back to the caller to ride the next one rather than being dropped: st2's own
+/// pre-compact failure is exactly that shape. A condition operation never states activity: the
+/// writer carries the rest of the tuple — including the pty session that vouches for it — across
+/// from this session's own record.
+///
+/// A clear that matched nothing is the ORDINARY case and not a problem to report: most
+/// compactions never failed, and most turns end with no fault standing. The writer answers with
+/// what actually stands and writes nothing, which is the correct outcome.
+fn apply_condition(
+    writer: &mut harness_state::Writer,
+    edge: ConditionEdge,
+    label: &str,
+) -> Option<harness_state::FaultReport> {
+    let (what, deferred, outcome) = match edge {
+        ConditionEdge::Raise(fault) => (
+            "a condition",
+            Some(fault.clone()),
+            writer.raise_fault(fault),
+        ),
+        ConditionEdge::ClearPaired(key) => ("a condition clear", None, writer.clear_fault(key)),
+        ConditionEdge::ClearAll(proof) => ("a condition clear", None, writer.clear_all(proof)),
+    };
+    match outcome {
+        Err(error) => {
+            tracing::warn!("st2 {label} channel: recording {what} failed: {error}");
+            None
+        }
+        Ok(harness_state::WriteOutcome::Refused(harness_state::Refusal::Unobserved)) => deferred,
+        Ok(harness_state::WriteOutcome::Refused(
+            harness_state::Refusal::ConditionMismatch { .. },
+        )) => None,
+        Ok(outcome) => {
+            report_outcome(label, what, &outcome);
+            None
+        }
+    }
 }
 
 /// The observed-state reason a rejected provider credential publishes, shared verbatim with the
@@ -507,6 +983,248 @@ fn publish_provider_auth(
         ),
         ProviderAuthEdge::Accepted => publisher.clear(driver_diagnostic::Stage::ProviderAuth),
     }
+}
+
+/// The protocol version whose whole content is a PROMISE BY THE ASSET: that it retires a
+/// never-answered ask on a turn boundary (a denied ask emits no `tool_result` at all, DQ-OMP-1)
+/// and that it forwards omp's own `sessionId`. No frame changes shape; what changes is what st2 is
+/// entitled to STATE — a positive `none` on the ask axis, and a linked conversation — so the
+/// agreement is per CONNECTION and never per binary: a session replacement re-spawns this channel
+/// from a possibly-replaced binary while the loaded asset is the predecessor's, so either version
+/// may be on the other end at any time. Offered on the hello beside `protocol`, which stays 1
+/// forever because an asset refuses a hello it does not understand and a refusal costs that seat
+/// its mail.
+const PROTOCOL_CONDITION_AXIS: u32 = 2;
+
+/// The asset's answer to the hello's offer, or `None` for every other frame — including an answer
+/// naming a version st2 never offered, which is not an agreement but a frame this channel drops
+/// like any other it cannot vouch for.
+fn negotiated_protocol(frame: &Value) -> Option<u32> {
+    if frame.get("type").and_then(Value::as_str) != Some("client_hello") {
+        return None;
+    }
+    let answered = frame.get("protocol").and_then(Value::as_u64)?;
+    (answered == u64::from(PROTOCOL_CONDITION_AXIS)).then_some(PROTOCOL_CONDITION_AXIS)
+}
+
+/// omp's fault codes: open, provider-namespaced, and diagnostic granularity UNDERNEATH the closed
+/// category beside them — one code per measured class, so a reader can tell an exhausted
+/// allowance from a refused key without reading prose, and no consumer has to.
+mod omp_fault {
+    pub const AUTH_FAILED: &str = "omp/authFailed";
+    pub const USAGE_LIMIT: &str = "omp/usageLimit";
+    pub const ACCOUNT_POLICY: &str = "omp/accountPolicy";
+    pub const TRANSIENT_EXHAUSTED: &str = "omp/transientExhausted";
+    pub const PROVIDER_ERROR: &str = "omp/providerError";
+    pub const UNCLASSIFIED: &str = "omp/unclassified";
+    /// The one fault this ADAPTER owns rather than observes: st2's own last-resort pre-compact
+    /// checkpoint could not be written. Nothing about omp is wrong; st2's plumbing is.
+    pub const PRE_COMPACT_WRITE_FAILED: &str = "omp/preCompactContextWriteFailed";
+}
+
+/// The condition axis of one typed turn result, over the classifications measured on omp 18.1.7
+/// (`docs/vrs/06-omp-driver/.experiments/2026-09-05-omp-provider-credential-rejection.md`).
+///
+/// Three decisions this encodes, none of which may be re-litigated silently:
+///
+/// * `qe.Class` gates everything. Without it the same field carries a BARE HTTP STATUS, so a bit
+///   test that skipped it would be reading digits — and reading digits is how a 403 about credits
+///   becomes a refused credential.
+/// * The negative flags outrank `AuthFailed`, in the order they were measured co-occurring with
+///   it: an exhausted allowance is `quota`, an org or content refusal is `policy`, a throttle that
+///   reached a turn END is `rateLimit`. Only `Class + AuthFailed` alone is `authentication`, which
+///   is exactly [`provider_credential_rejected`] — the same rule, stated once for two axes.
+/// * `Recovery::Unknown`, never `Automatic`, for the throttled and unclassified rows. The turn
+///   frame carries no deadline, and an automatic fault without a `nextObservationDueMs` can never
+///   escalate; `Unknown` is documented as never optimistic, so it pages.
+///
+/// `UsageLimit` deliberately does not split `quota` from `account`: the 402 "insufficient balance"
+/// and the 403 "out of credits" carry the SAME flag, and separating them would require reading
+/// omp's prose (OMP-R06, OHS-R16 forbid it).
+///
+/// No `detail` is attached. omp's own words already ride the record's `reason` verbatim, exactly
+/// as they do today, and duplicating them into the fault would make its semantic clock restart
+/// every time the provider reworded the same condition.
+fn turn_fault(result: &TurnResult<'_>, observed_at_ms: u64) -> Option<harness_state::FaultReport> {
+    let TurnResult::ProviderError { classification, .. } = result else {
+        return None;
+    };
+    use harness_state::{FaultCategory as Category, Recovery};
+    let (category, code, recovery) = match classification {
+        Some(id) if id & omp_error::CLASSIFIED != 0 => {
+            let id = *id;
+            if id & omp_error::USAGE_LIMIT != 0 {
+                (Category::Quota, omp_fault::USAGE_LIMIT, Recovery::Human)
+            } else if id & omp_error::ACCOUNT_POLICY != 0 {
+                (Category::Policy, omp_fault::ACCOUNT_POLICY, Recovery::Human)
+            } else if id & omp_error::TRANSIENT != 0 {
+                (
+                    Category::RateLimit,
+                    omp_fault::TRANSIENT_EXHAUSTED,
+                    Recovery::Unknown,
+                )
+            } else if id & omp_error::AUTH_FAILED != 0 {
+                (
+                    Category::Authentication,
+                    omp_fault::AUTH_FAILED,
+                    Recovery::Human,
+                )
+            } else {
+                (
+                    Category::Provider,
+                    omp_fault::PROVIDER_ERROR,
+                    Recovery::Unknown,
+                )
+            }
+        }
+        // A classification this reader cannot see is still a fault, and it stays VISIBLE: the
+        // turn died between omp and the provider, which is what `provider` says, and the code
+        // says st2 could not narrow it. `harness` would claim st2's own plumbing broke — a
+        // different and untrue statement — and `clear` would launder a wedged seat.
+        _ => (
+            Category::Provider,
+            omp_fault::UNCLASSIFIED,
+            Recovery::Unknown,
+        ),
+    };
+    Some(harness_state::FaultReport::new(category, recovery, observed_at_ms).with_code(code))
+}
+
+/// The version 2 projection of one observation: exactly the bytes this channel wrote before the
+/// negotiated vocabulary existed.
+///
+/// The only new word a negotiated asset puts on an UNBLOCKED state frame is the approval-denial
+/// diagnostic, and version 2 has no ask axis that makes it meaningful, so it is withheld here
+/// rather than appearing as a novel `reason`. Every reason the version 2 wire already carried is
+/// untouched: a blocked frame's ask prose, a turn error's own words, and the pre-compact recovery
+/// reason all ride through verbatim.
+fn legacy_observation(
+    mut observation: harness_state::Observation,
+) -> harness_state::Observation {
+    if observation.blocked_on != harness_state::BlockedOn::Human
+        && observation.reason.as_deref() == Some(APPROVAL_DENIED_REASON)
+    {
+        observation.reason = None;
+    }
+    observation
+}
+
+/// What one pre-compact edge does to the adapter-owned fault: a failed stub write raises it, and
+/// a SUCCESSFUL one is the only thing that retires it. No amount of provider-side progress can:
+/// the two facts are unrelated, which is why the retirement is a paired clear naming this exact
+/// code rather than anything blanket.
+fn pre_compact_edge(succeeded: bool, observed_at_ms: u64) -> ConditionEdge {
+    if succeeded {
+        ConditionEdge::ClearPaired(pre_compact_fault_key())
+    } else {
+        ConditionEdge::Raise(pre_compact_fault(observed_at_ms))
+    }
+}
+
+/// What an ordinary turn end states about the condition axis.
+///
+/// A completed turn proves the PROVIDER accepted the credential and did the work, which is what
+/// authorizes clearing a fault nobody watched resolve. It proves nothing whatsoever about st2's
+/// own pre-compact write, so an adapter-owned fault that still holds is RESTATED instead of being
+/// swept up by the blanket clear — and restating the same fault preserves the instant it was
+/// first observed, so its semantic clock survives every turn that runs underneath it.
+fn turn_completed_edge(standing: Option<&harness_state::FaultReport>) -> ConditionEdge {
+    match standing {
+        Some(fault) => ConditionEdge::Raise(fault.clone()),
+        None => ConditionEdge::ClearAll(harness_state::ProgressProof::TurnCompleted),
+    }
+}
+
+/// The tuple as it may be stated on THIS connection.
+///
+/// The condition axis rides the typed `turn` frame, which every protocol version sends
+/// identically, so a fault is stated either way: a wedged seat must stay visible whatever the
+/// asset negotiated. The conversation axis rests on a promise only a negotiated asset made — to
+/// forward omp's own session id — so no wire-evidenced link is claimed without it, while a
+/// kind-level capability claim (pi's `unsupported`) is a fact about the driver and stands on
+/// every connection.
+///
+/// The ask axis is downgraded in exactly ONE direction: a positive `none` becomes `unknown`,
+/// because the promise that makes absence provable — retiring a never-answered ask on a turn
+/// boundary — was never made, so an un-negotiated asset's `none` could be a denied ask nobody
+/// retired. A PENDING ask is preserved verbatim, kind and all: the legacy `blockedOn`/`ask` pair
+/// rides the same frame under both protocols, so a waiting human is equally proven either way,
+/// and a frame blocked without a nameable kind is already `Pending(Unknown)` — a human is
+/// waiting and the kind is unstated. Downgrading a pending ask to `unknown` would hide the one
+/// thing this axis exists to surface, and dropping it would be worse still.
+fn connection_frame(
+    kind: &ChannelKind,
+    observation: harness_state::Observation,
+    negotiated: bool,
+    conversation: Option<harness_state::ConversationState>,
+) -> harness_state::Frame {
+    let mut frame = kind_frame(kind, observation);
+    if !negotiated {
+        frame.ask = match frame.ask {
+            harness_state::HumanAsk::None => harness_state::HumanAsk::Unknown,
+            pending => pending,
+        };
+        return frame;
+    }
+    if let Some(claim) = conversation {
+        frame = frame.with_conversation(claim);
+    }
+    frame
+}
+
+/// st2's own pre-compact recovery write failed: `harness`, because the harness plumbing is what
+/// broke, and `human`, because nothing retries it — the next compaction edge is the only thing
+/// that can prove it works again.
+fn pre_compact_fault(observed_at_ms: u64) -> harness_state::FaultReport {
+    harness_state::FaultReport::new(
+        harness_state::FaultCategory::Harness,
+        harness_state::Recovery::Human,
+        observed_at_ms,
+    )
+    .with_code(omp_fault::PRE_COMPACT_WRITE_FAILED)
+}
+
+/// The EXACT pairing key the recovered edge clears: category and full code. Never the category
+/// alone and never a blanket clear — a standing `authentication`/`omp/authFailed` from a failed
+/// turn must survive a compaction that went fine, and a mismatch is answered with
+/// [`harness_state::Refusal::ConditionMismatch`] and no write at all, which is the ordinary case
+/// here because most compactions never failed in the first place.
+fn pre_compact_fault_key() -> harness_state::FaultKey {
+    harness_state::FaultKey::new(harness_state::FaultCategory::Harness)
+        .with_code(omp_fault::PRE_COMPACT_WRITE_FAILED)
+}
+
+/// omp's own conversation identity, off the `{"type":"conversation"}` frame a negotiated asset
+/// sends the first time an event exposes one.
+///
+/// The evidence is `sessionId`, measured on both halves of the approval pair and identical across
+/// it (18.0.9 and 18.1.2). `Probed` because it was read off a live event rather than declared
+/// from typings, and `Rewritable` because omp compacts its own session store — a prefix read once
+/// may be gone. Before any frame arrives the axis is OMITTED, never `Unsupported`: omp
+/// demonstrably has sessions (`--no-session`, `sessionManager`), so claiming it has none would be
+/// a false capability claim, while saying nothing claims nothing.
+fn conversation_claim(
+    frame: &Value,
+    verified_through_ms: u64,
+) -> Option<harness_state::ConversationState> {
+    if frame.get("type").and_then(Value::as_str) != Some("conversation") {
+        return None;
+    }
+    let conversation = frame.get("sessionId").and_then(Value::as_str)?.trim();
+    // A link with no positive verification bound is refused at the write boundary, so an
+    // unstampable observation is no observation.
+    if conversation.is_empty() || verified_through_ms == 0 {
+        return None;
+    }
+    Some(harness_state::ConversationState::Linked(
+        harness_state::ConversationClaim {
+            driver: OMP_KIND.label.to_string(),
+            conversation: conversation.to_owned(),
+            history_mutability: harness_state::HistoryMutability::Rewritable,
+            capability_evidence: harness_state::CapabilityEvidence::Probed,
+            verified_through_ms,
+        },
+    ))
 }
 
 /// Write the recovery stub only when durable working state is absent or whitespace-only.
@@ -768,6 +1486,11 @@ mod tests {
 
     /// A pre-compaction edge creates a last-resort checkpoint only for whitespace-only state. The
     /// channel, not the TypeScript extension, resolves the durable path and performs the write.
+    ///
+    /// The record assertion at the end is the VERSION 2 projection of a failed stub write — an
+    /// `active` frame carrying the recovery reason — so the loop runs on a version 2 writer here.
+    /// Version 3 states the same failure as an adapter-owned fault instead, which is proved by
+    /// `the_pre_compact_fault_is_cleared_by_category_and_full_code` and the omp condition table.
     #[test]
     fn pre_compact_frame_writes_only_over_blank_context() {
         let tmp = tempfile::tempdir().unwrap();
@@ -779,7 +1502,8 @@ mod tests {
 
         let run_frame = || {
             let mut writer =
-                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                    .with_emitted_schema(harness_state::SCHEMA_V2);
             let (tx, rx) = mpsc::channel();
             tx.send(Ok(r#"{"type":"pre_compact"}"#.to_string()))
                 .unwrap();
@@ -875,7 +1599,9 @@ mod tests {
     }
 
     /// The wrapper's terminal record is the incarnation's last word: a live frame the extension
-    /// queued before dying must not resurrect the session after the wrapper reaped it.
+    /// queued before dying must not resurrect the session after the wrapper reaped it. That holds
+    /// for every axis — a queued condition edge is refused by the same terminal fence, and the
+    /// record's bytes are unchanged by the whole queue.
     #[test]
     fn a_queued_live_frame_never_overwrites_the_wrappers_terminal_record() {
         let tmp = tempfile::tempdir().unwrap();
@@ -891,12 +1617,25 @@ mod tests {
         let mut wrapper_writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
                 .with_session(session);
-        wrapper_writer.ended("signal 9").unwrap();
+        // Exactly what `src/pi_session.rs` does, including the one bootstrap retry version 3
+        // needs: this wrapper observed nothing, so the axis is unstated until it states it.
+        crate::provider_session::write_terminal(
+            &mut wrapper_writer,
+            "signal 9",
+            None,
+            harness_state::ConditionReport::Clear,
+        )
+        .unwrap();
         let terminal = std::fs::read(&record).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(r#"{"type":"state","state":"idle"}"#.to_string()))
-            .unwrap();
+        for frame in [
+            r#"{"type":"state","state":"idle"}"#,
+            r#"{"type":"condition","op":"raise","category":"harness","code":"pi/assistantError","recovery":"unknown","detail":"401 Unauthorized"}"#,
+            r#"{"type":"condition","op":"clearAll","proof":"turnCompleted"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
         drop(tx);
         let mut out = Vec::new();
         channel_loop(
@@ -934,7 +1673,9 @@ mod tests {
             .expect("a record must have been written")
     }
 
-    /// HC-R13, pinned to pi 0.84.2. The payload is verbatim from the credential-free pi lab: one
+    /// HC-R13, pinned to pi 0.84.4. The payload is verbatim from the credential-free pi lab
+    /// (captured on 0.84.2, and carried forward because `getContextUsage()` and
+    /// `calculateContextTokens` are byte-identical in the 0.84.4 tarball): one
     /// `message_end` for an assistant message, with `getContextUsage()` and the message's own
     /// `usage` side by side.
     ///
@@ -946,11 +1687,11 @@ mod tests {
     /// pi reports a float that runs far above 100 when a turn overruns the window, and a producer
     /// or reader that clamped it would hide exactly the saturation this record exists to show.
     #[test]
-    fn the_pi_0_84_2_fixture_pins_total_tokens_as_the_numerator() {
+    fn the_pinned_pi_fixture_pins_total_tokens_as_the_numerator() {
         const MEASURED: &str = crate::pi_session::MEASURED_CONTEXT_VERSION;
         assert_eq!(
-            MEASURED, "0.84.2",
-            "the fixture below was captured on this build"
+            MEASURED, "0.84.4",
+            "the fixture below is pinned to the build the flake type-checks against"
         );
         // Verbatim `event.message.usage` from the same event, carried so the assertion below can
         // name the number this producer must NOT publish.
@@ -1537,6 +2278,1428 @@ mod tests {
         assert_eq!(
             driver_diagnostic::read(&driver_diagnostic::path(agent_dir)),
             driver_diagnostic::Observed::Absent
+        );
+        // And the fault axis draws the same line. pi's error-ended turn arrives as prose that
+        // says `401`, and the category it decodes to is `harness` — the honest reading of "a pi
+        // turn failed" — never `authentication`, which would be inferred from that very string.
+        let raise = condition_frame(
+            &json!({"type":"condition","op":"raise","category":"harness",
+                    "code":"pi/assistantError","recovery":"unknown",
+                    "detail":"401 Unauthorized: invalid x-api-key"}),
+            1_000,
+        )
+        .unwrap();
+        let ConditionEdge::Raise(fault) = &raise else {
+            panic!("an error tail raises a fault: {raise:?}");
+        };
+        assert_eq!(fault.category, harness_state::FaultCategory::Harness);
+        assert_ne!(
+            fault.category,
+            harness_state::FaultCategory::Authentication,
+            "pi has no error-classification field, so a credential verdict here would be prose"
+        );
+        assert_eq!(
+            fault.detail.as_deref(),
+            Some("401 Unauthorized: invalid x-api-key"),
+            "the prose is carried, diagnostically, and nothing branches on it"
+        );
+    }
+
+    /// The measured false idle, and its fix. `agent_end` raises before `agent_settled` reports the
+    /// idle, and an activity edge carries the condition axis forward `Unchanged`, so the record
+    /// settles as idle BESIDE a standing fault instead of laundering a wedged seat into a clean
+    /// yield.
+    #[test]
+    fn a_failed_pi_turn_publishes_idle_beside_a_standing_fault() {
+        let raise = condition_frame(
+            &json!({"type":"condition","op":"raise","category":"harness",
+                    "code":"pi/assistantError","recovery":"unknown","detail":"provider said no"}),
+            4_200,
+        )
+        .unwrap();
+        let ConditionEdge::Raise(fault) = &raise else {
+            panic!("an error tail raises a fault: {raise:?}");
+        };
+        assert_eq!(fault.category, harness_state::FaultCategory::Harness);
+        assert_eq!(fault.code.as_deref(), Some("pi/assistantError"));
+        assert_eq!(fault.recovery, harness_state::Recovery::Unknown);
+        assert_ne!(
+            fault.recovery,
+            harness_state::Recovery::Automatic,
+            "an unsayable recovery must page, never wait for a deadline nobody set"
+        );
+        assert_eq!(
+            fault.next_observation_due_ms, None,
+            "pi declares no deadline, and st2 never synthesizes one"
+        );
+        // The semantic clock is Rust's, stamped when the frame was read: the asset and this
+        // process share no clock.
+        assert_eq!(fault.observed_at_ms, 4_200);
+
+        // The idle that follows. It states activity and nothing else.
+        let settled = kind_frame(
+            &PI_KIND,
+            state_observation(&json!({"type":"state","state":"idle"})).unwrap(),
+        );
+        assert_eq!(settled.state, harness_state::Activity::Idle);
+        assert_eq!(
+            settled.condition,
+            harness_state::ConditionReport::Unchanged,
+            "the idle must carry the standing fault forward, not clear it"
+        );
+        assert_eq!(settled.ask, harness_state::HumanAsk::Unknown);
+        assert_eq!(
+            settled.conversation,
+            Some(harness_state::ConversationState::Unsupported)
+        );
+        assert_eq!(
+            settled.reason, None,
+            "the prose belongs to the fault's detail, not to the activity axis"
+        );
+    }
+
+    /// A version 3 record's condition axis is not writable as `absent`, so the first activity-only
+    /// frame of an incarnation — pi's `session_start` seed — is refused as `Unstated`. That
+    /// refusal is its own evidence (a standing fault of this session's would have STATED the
+    /// axis), so the frame is restated once as `clear` and nothing else about it moves. Every
+    /// other outcome is left exactly alone: a retry there would argue with the record instead of
+    /// observing the harness.
+    #[test]
+    fn a_fresh_seats_first_frame_states_the_condition_axis_once() {
+        let seed = kind_frame(
+            &PI_KIND,
+            state_observation(&json!({"type":"state","state":"idle"})).unwrap(),
+        );
+        assert_eq!(seed.condition, harness_state::ConditionReport::Unchanged);
+
+        let restated = restate_condition(
+            &seed,
+            &harness_state::WriteOutcome::Refused(harness_state::Refusal::Unstated),
+        )
+        .expect("an unstated axis must be stated once");
+        assert_eq!(restated.condition, harness_state::ConditionReport::Clear);
+        assert_eq!(restated.state, seed.state, "the activity axis is unchanged");
+        assert_eq!(restated.ask, seed.ask);
+        assert_eq!(restated.conversation, seed.conversation);
+        assert_eq!(restated.exit, None, "restating never terminates a record");
+
+        for outcome in [
+            harness_state::WriteOutcome::Landed,
+            harness_state::WriteOutcome::Coalesced,
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Terminal),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unobserved),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unfenced),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Superseded {
+                on_disk_seq: 4,
+                ours: 3,
+            }),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::ConditionMismatch {
+                current: None,
+            }),
+        ] {
+            assert_eq!(
+                restate_condition(&seed, &outcome),
+                None,
+                "outcome: {outcome:?}"
+            );
+        }
+    }
+
+    /// An activity edge has learned nothing about the provider, so it may not clear a condition —
+    /// in either direction, and however many of them arrive.
+    #[test]
+    fn an_activity_edge_never_clears_a_standing_pi_fault() {
+        for word in ["active", "idle"] {
+            let frame = json!({"type":"state","state":word});
+            let observation = state_observation(&frame).unwrap();
+            assert_eq!(
+                kind_frame(&PI_KIND, observation).condition,
+                harness_state::ConditionReport::Unchanged,
+                "state:{word} must not state the condition axis"
+            );
+            assert_eq!(
+                condition_frame(&frame, 1_000),
+                None,
+                "a state frame is not a condition edge"
+            );
+        }
+        // Nor is the numeric axis: a compaction reading says nothing about a fault either.
+        assert_eq!(
+            condition_frame(
+                &json!({"type":"context","reading":{"usedTokens":10,"usedPercent":1.0}}),
+                1_000
+            ),
+            None
+        );
+    }
+
+    /// pi's one positive success edge. An unkeyed clear must name the progress it witnessed, so a
+    /// `clearAll` whose proof word is missing or unrecognized is dropped rather than believed:
+    /// that frame is the only operation that can silence a fault nobody saw resolve.
+    #[test]
+    fn a_clean_agent_end_is_pis_only_clear_all() {
+        assert_eq!(
+            condition_frame(&json!({"type":"condition","op":"clearAll","proof":"turnCompleted"}), 1),
+            Some(ConditionEdge::ClearAll(
+                harness_state::ProgressProof::TurnCompleted
+            ))
+        );
+        for frame in [
+            json!({"type":"condition","op":"clearAll"}),
+            json!({"type":"condition","op":"clearAll","proof":"probably"}),
+            json!({"type":"condition","op":"clearAll","proof":"assumed"}),
+            json!({"type":"condition","op":"clearAll","proof":null}),
+            json!({"type":"condition","op":"settled","proof":"turnCompleted"}),
+        ] {
+            assert_eq!(condition_frame(&frame, 1), None, "frame: {frame}");
+        }
+    }
+
+    /// CX-1, pinned for pi: a paired clear names the EXACT `(category, code)` pair. The compaction
+    /// success edge clears its own failure and nothing else — a category-only key, or one carrying
+    /// a sibling's code, is a different key and the writer refuses it as a mismatch.
+    #[test]
+    fn a_compaction_failure_is_cleared_only_by_its_own_key() {
+        let raised = condition_frame(
+            &json!({"type":"condition","op":"raise","category":"context",
+                    "code":"pi/session_compact_failed","recovery":"human"}),
+            9_000,
+        )
+        .unwrap();
+        let ConditionEdge::Raise(fault) = &raised else {
+            panic!("a compaction failure raises a fault: {raised:?}");
+        };
+        assert_eq!(fault.category, harness_state::FaultCategory::Context);
+        assert_eq!(fault.recovery, harness_state::Recovery::Human);
+        assert_eq!(fault.detail, None, "the typed event needs no prose");
+
+        let cleared = condition_frame(
+            &json!({"type":"condition","op":"clear","category":"context",
+                    "code":"pi/session_compact_failed"}),
+            9_100,
+        )
+        .unwrap();
+        assert_eq!(cleared, ConditionEdge::ClearPaired(fault.key()));
+        let ConditionEdge::ClearPaired(key) = cleared else {
+            panic!("a compaction success is a paired clear");
+        };
+        // The two keys a lazier producer would have sent instead. Neither matches the fault, so
+        // neither can silence it.
+        assert_ne!(
+            key,
+            harness_state::FaultKey::new(harness_state::FaultCategory::Context),
+            "a category-only clear would wipe any other context fault"
+        );
+        assert_ne!(
+            key,
+            harness_state::FaultKey::new(harness_state::FaultCategory::Context)
+                .with_code("pi/session_compact")
+        );
+        // A code that is not provider-namespaced is a malformed frame, not a bare-word key: two
+        // providers' codes collide exactly there.
+        assert_eq!(
+            condition_frame(
+                &json!({"type":"condition","op":"clear","category":"context",
+                        "code":"session_compact_failed"}),
+                9_100
+            ),
+            None
+        );
+        // And a category this build cannot name drops the frame rather than becoming untyped.
+        assert_eq!(
+            condition_frame(
+                &json!({"type":"condition","op":"raise","category":"vibes",
+                        "recovery":"human"}),
+                9_100
+            ),
+            None
+        );
+        // As does a recovery word it cannot name: the urgency axis is what routes the fault.
+        assert_eq!(
+            condition_frame(
+                &json!({"type":"condition","op":"raise","category":"context",
+                        "recovery":"eventually"}),
+                9_100
+            ),
+            None
+        );
+    }
+
+    /// A raise the record could not accept yet lives in this process, so the ordinary clear paths
+    /// cannot reach it. An unkeyed clear and its own paired key must retire it anyway, or the held
+    /// fault outlives the very edge that resolved it and the next activity edge republishes a
+    /// condition the harness already retracted.
+    #[test]
+    fn a_clear_retires_a_raise_that_has_not_landed_yet() {
+        let held = harness_state::FaultReport::new(
+            harness_state::FaultCategory::Context,
+            harness_state::Recovery::Human,
+            5_000,
+        )
+        .with_code("pi/session_compact_failed");
+
+        assert!(retires_deferred(
+            &ConditionEdge::ClearAll(harness_state::ProgressProof::TurnCompleted),
+            &held
+        ));
+        assert!(retires_deferred(
+            &ConditionEdge::ClearPaired(held.key()),
+            &held
+        ));
+        // A different key is a different fault: it may not silence this one, held or standing.
+        assert!(!retires_deferred(
+            &ConditionEdge::ClearPaired(harness_state::FaultKey::new(
+                harness_state::FaultCategory::Context
+            )),
+            &held
+        ));
+        assert!(!retires_deferred(
+            &ConditionEdge::ClearPaired(
+                harness_state::FaultKey::new(harness_state::FaultCategory::Harness)
+                    .with_code("pi/assistantError")
+            ),
+            &held
+        ));
+        // Replacing one raise with another is the writer's business, not a retirement.
+        assert!(!retires_deferred(
+            &ConditionEdge::Raise(
+                harness_state::FaultReport::new(
+                    harness_state::FaultCategory::Harness,
+                    harness_state::Recovery::Unknown,
+                    6_000,
+                )
+                .with_code("pi/assistantError")
+            ),
+            &held
+        ));
+    }
+
+    /// pi has no ask surface at all, so every pi frame states `unknown` — positively, forever —
+    /// and derives a pending ask from nothing, not even from a foreign asset's claim of one. A
+    /// fabricated `pending` injects a question into the ask queue that nobody can answer.
+    #[test]
+    fn pi_frames_never_claim_an_ask() {
+        assert_eq!(PI_KIND.default_ask, harness_state::HumanAsk::Unknown);
+        assert_eq!(OMP_KIND.default_ask, harness_state::HumanAsk::None);
+
+        let foreign = json!({"type":"state","state":"active","blockedOn":"human",
+                             "ask":"permission"});
+        let observation = state_observation(&foreign).unwrap();
+        assert_eq!(
+            kind_frame(&PI_KIND, observation.clone()).ask,
+            harness_state::HumanAsk::Unknown,
+            "a channel that cannot see the axis cannot vouch for somebody else's claim about it"
+        );
+        assert_eq!(
+            kind_frame(&PI_KIND, observation.clone()).ask.pending(),
+            None
+        );
+        // The same frame on a kind that DOES see the axis reads it, which is what makes the pi
+        // answer a statement about pi rather than a decoder that lost the field.
+        assert_eq!(
+            kind_frame(&OMP_KIND, observation).ask,
+            harness_state::HumanAsk::Pending(harness_state::AskKind::Permission)
+        );
+        assert_eq!(
+            kind_frame(
+                &PI_KIND,
+                state_observation(&json!({"type":"state","state":"idle"})).unwrap()
+            )
+            .ask,
+            harness_state::HumanAsk::Unknown
+        );
+    }
+
+    /// The channel writes no terminal record on any axis. `src/pi_session.rs` — the outer wrapper,
+    /// the only process that sees the provider die — owns that word, so neither an `ended` state
+    /// word nor a fault claiming terminal recovery may produce one.
+    #[test]
+    fn no_pi_frame_can_write_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"state","state":"active"}"#,
+            r#"{"type":"state","state":"ended","exit":"signal 9"}"#,
+            r#"{"type":"condition","op":"raise","category":"harness","code":"pi/assistantError","recovery":"terminal"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &PI_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(harness_state::harness_state_path(agent_dir)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["state"], "active", "no channel frame may terminate a session");
+        assert!(raw["exit"].is_null());
+        // The decoder itself has no terminal operation: `terminal` is a recovery word — nothing
+        // clears this fault for this incarnation — and never a session outcome.
+        let edge = condition_frame(
+            &json!({"type":"condition","op":"raise","category":"harness",
+                    "code":"pi/assistantError","recovery":"terminal"}),
+            1_000,
+        )
+        .unwrap();
+        assert!(matches!(edge, ConditionEdge::Raise(_)));
+    }
+
+    /// Protocol 1 acceptance, which is what keeps every already-published hook set delivering
+    /// mail: the pinned asset compares `protocol` for strict equality and closes the channel on a
+    /// mismatch, so the floor stays 1 and the newer wire is offered beside it.
+    #[test]
+    fn protocol_one_assets_still_accept_the_hello() {
+        let hello = hello("h.worker", "restored");
+        assert_eq!(hello["protocol"], json!(1));
+        assert_eq!(PROTOCOL, 1);
+        assert_eq!(hello["protocols"], json!([1, 2]));
+        assert_eq!(PROTOCOLS, [1, 2]);
+        assert!(
+            PROTOCOLS.contains(&PROTOCOL),
+            "the floor must be one of the offered versions"
+        );
+        assert_eq!(hello["identity"], json!("h.worker"));
+        assert_eq!(hello["sessionContext"], json!("restored"));
+    }
+
+    /// On a writer that emits version 2 the condition axis has nowhere to live, and this record
+    /// has exactly one source of truth — so a condition edge is dropped, not cached, and the
+    /// legacy bytes are exactly the ones this channel already wrote. Production emits version 3
+    /// now; this is the rollback and already-on-disk shape, reached through the test-only seam.
+    #[test]
+    fn condition_frames_change_nothing_while_the_record_carries_no_condition_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let record = harness_state::harness_state_path(agent_dir);
+        let run = |frames: &[&str], writer: &mut harness_state::Writer| {
+            let (tx, rx) = mpsc::channel();
+            for frame in frames {
+                tx.send(Ok((*frame).to_string())).unwrap();
+            }
+            drop(tx);
+            channel_loop(
+                &rx,
+                &mut Vec::new(),
+                &message::inbox_dir(agent_dir),
+                agent_dir,
+                writer,
+                None,
+                "h.worker",
+                &PI_KIND,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        };
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
+                .with_emitted_schema(harness_state::SCHEMA_V2);
+        assert!(
+            !writer.writes_condition_axis(),
+            "the branch under test is the legacy one, reached through the version 2 seam"
+        );
+        run(&[r#"{"type":"state","state":"idle"}"#], &mut writer);
+        let legacy = std::fs::read(&record).unwrap();
+
+        run(
+            &[
+                r#"{"type":"condition","op":"raise","category":"harness","code":"pi/assistantError","recovery":"unknown","detail":"provider said no"}"#,
+                r#"{"type":"condition","op":"clear","category":"context","code":"pi/session_compact_failed"}"#,
+                r#"{"type":"condition","op":"clearAll","proof":"turnCompleted"}"#,
+            ],
+            &mut writer,
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            legacy,
+            "a condition edge may not touch the version 2 record"
+        );
+        let raw: Value = serde_json::from_slice(&legacy).unwrap();
+        assert_eq!(raw["state"], "idle");
+        assert!(raw["condition"].is_null());
+        assert!(raw["blockedOn"] == json!("none") || raw["blockedOn"].is_null());
+    }
+
+    /// One omp channel loop over a fixed incarnation, so two runs are comparable byte for byte.
+    fn omp_record(frames: &[&str]) -> Value {
+        omp_record_emitting(frames, harness_state::SCHEMA_V3)
+    }
+
+    /// One omp channel loop over a fixed incarnation and an explicit emitted version, so two runs
+    /// are comparable byte for byte and the version 2 projection stays provable after activation.
+    fn omp_record_emitting(frames: &[&str], schema: &'static str) -> Value {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        let inbox = message::inbox_dir(agent_dir);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_emitted_schema(schema)
+                .with_ownership("session-1", 1);
+        let (tx, rx) = mpsc::channel();
+        for frame in frames {
+            tx.send(Ok((*frame).to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &inbox,
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &OMP_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut record: Value = serde_json::from_slice(
+            &std::fs::read(harness_state::harness_state_path(agent_dir)).unwrap(),
+        )
+        .unwrap();
+        // The two clocks are the only fields two identical runs may legitimately differ on.
+        for volatile in ["writtenAtMs", "sinceMs"] {
+            record.as_object_mut().unwrap().remove(volatile);
+        }
+        record
+    }
+
+    /// The measured omp 18.1.7 table once more, now as the version 3 condition tuple: exactly one
+    /// (category, code, recovery) per class, beside the credential axis it must not disturb.
+    ///
+    /// The two rows that motivated this whole mapping are asserted by name. `0x1081000` (403 "out
+    /// of credits") is `quota` and `0x100d000` (403 `cyber_policy`) is `policy`, even though BOTH
+    /// set omp's `AuthFailed` flag: a classifier that stopped at that flag would send the operator
+    /// of a wedged, fully-paid seat to re-login.
+    #[test]
+    fn every_measured_omp_classification_maps_to_one_v3_condition() {
+        use harness_state::{FaultCategory as Category, Recovery};
+        let observed_at_ms = 1_787_999_000_000;
+        // (case, errorId, category, code, recovery, is a rejected credential)
+        let cases = [
+            (
+                "401 invalid x-api-key",
+                0x100_1000_u64,
+                Category::Authentication,
+                "omp/authFailed",
+                Recovery::Human,
+                true,
+            ),
+            (
+                "401 OAuth invalid_grant",
+                0x100_1000,
+                Category::Authentication,
+                "omp/authFailed",
+                Recovery::Human,
+                true,
+            ),
+            (
+                "403 key lacks permission",
+                0x100_1000,
+                Category::Authentication,
+                "omp/authFailed",
+                Recovery::Human,
+                true,
+            ),
+            (
+                "403 run out of credits",
+                0x108_1000,
+                Category::Quota,
+                "omp/usageLimit",
+                Recovery::Human,
+                false,
+            ),
+            (
+                "402 insufficient balance",
+                0x08_1000,
+                Category::Quota,
+                "omp/usageLimit",
+                Recovery::Human,
+                false,
+            ),
+            (
+                "403 cyber_policy",
+                0x100_d000,
+                Category::Policy,
+                "omp/accountPolicy",
+                Recovery::Human,
+                false,
+            ),
+            (
+                "403 CONCURRENT_LIMIT",
+                0x102_1000,
+                Category::RateLimit,
+                "omp/transientExhausted",
+                Recovery::Unknown,
+                false,
+            ),
+            (
+                "429 rate limit",
+                0x02_1000,
+                Category::RateLimit,
+                "omp/transientExhausted",
+                Recovery::Unknown,
+                false,
+            ),
+            // The residual classified row: omp classified it and none of the flags above is set.
+            // It is the shape of a provider-side failure rather than a captured case, and it must
+            // stay VISIBLE rather than becoming a credential rejection by elimination.
+            (
+                "500 upstream failure",
+                0x00_1000,
+                Category::Provider,
+                "omp/providerError",
+                Recovery::Unknown,
+                false,
+            ),
+        ];
+
+        for (case, error_id, category, code, recovery, rejected) in cases {
+            let frame = json!({"type":"turn","error":{"reason":case,"errorId":error_id}});
+            let result = turn_result(&frame).expect("a turn frame decodes");
+            let fault = turn_fault(&result, observed_at_ms).expect("a failed turn is a condition");
+            assert_eq!(fault.category, category, "{case}");
+            assert_eq!(fault.code.as_deref(), Some(code), "{case}");
+            assert_eq!(fault.recovery, recovery, "{case}");
+            assert_eq!(
+                fault.observed_at_ms, observed_at_ms,
+                "the SEMANTIC clock is the producer's own observation instant: {case}"
+            );
+            assert_eq!(
+                fault.next_observation_due_ms, None,
+                "the turn frame carries no deadline, so no omp fault may claim one: {case}"
+            );
+            assert_eq!(
+                fault.detail, None,
+                "omp's prose rides the record's `reason`, never the fault's clock-bearing \
+                 identity: {case}"
+            );
+            assert_ne!(
+                fault.recovery,
+                Recovery::Automatic,
+                "an automatic recovery with no deadline can never escalate: {case}"
+            );
+            // The credential axis is the SAME rule, stated once for two records, and unchanged.
+            assert_eq!(
+                provider_auth_edge(&result),
+                rejected.then_some(ProviderAuthEdge::Rejected),
+                "{case}"
+            );
+            assert_eq!(
+                fault.category == Category::Authentication,
+                rejected,
+                "`authentication` and the credential edge are one rule: {case}"
+            );
+            // And the legacy observation is byte-for-byte what it always was.
+            let observation = turn_observation(&result).expect("a failed turn is an observation");
+            assert_eq!(observation.state, harness_state::Activity::Active, "{case}");
+            assert_eq!(observation.blocked_on, harness_state::BlockedOn::None, "{case}");
+            assert_eq!(
+                observation.reason.as_deref(),
+                Some(if rejected { PROVIDER_AUTH_REASON } else { case }),
+                "{case}"
+            );
+        }
+
+        // A turn that reached its ordinary end states no fault at all. It is the ONLY positive
+        // success edge, and what it authorizes is the blanket clear — never a fault of its own.
+        let ordinary_frame = json!({"type": "turn"});
+        let ordinary = turn_result(&ordinary_frame).expect("an ordinary end decodes");
+        assert!(
+            turn_fault(&ordinary, observed_at_ms).is_none(),
+            "an ordinary turn end is progress, not a condition"
+        );
+        assert_eq!(
+            provider_auth_edge(&ordinary),
+            Some(ProviderAuthEdge::Accepted)
+        );
+    }
+
+    /// An error omp itself did not classify stays VISIBLE, under the most conservative category
+    /// that is still true: the turn died between omp and the provider. `harness` would claim st2's
+    /// own plumbing broke and a `clear` would launder a wedged seat; both are false statements.
+    #[test]
+    fn an_unclassified_error_id_is_a_visible_provider_fault_not_a_credential_rejection() {
+        // A bare HTTP status (no `qe.Class` bit), an absent field, and a field this decoder
+        // cannot read as a number are all the same thing: no classification.
+        for unclassified in [json!(403), json!(0), json!(429), Value::Null, json!("403")] {
+            let frame = json!({"type":"turn","error":{"reason":"403 …","errorId":unclassified}});
+            let result = turn_result(&frame).expect("a turn frame decodes");
+            let fault = turn_fault(&result, 7).expect("an unreadable class is still a fault");
+            assert_eq!(fault.category, harness_state::FaultCategory::Provider, "{unclassified}");
+            assert_eq!(fault.code.as_deref(), Some("omp/unclassified"), "{unclassified}");
+            assert_eq!(fault.recovery, harness_state::Recovery::Unknown, "{unclassified}");
+            assert_eq!(
+                provider_auth_edge(&result),
+                None,
+                "silence about the class is not a verdict on the credential: {unclassified}"
+            );
+        }
+    }
+
+    /// The axes are independent: an activity edge, an ask, a compaction, an approval denial, the
+    /// negotiation answer, and the conversation statement all state NOTHING about the condition.
+    /// A producer forced to pick `clear` on any of them would fabricate health several times a
+    /// turn, and a retry in flight — which omp reports by sending no frame at all — would be the
+    /// worst of them.
+    #[test]
+    fn the_edges_that_are_not_faults_state_no_condition() {
+        for frame in [
+            json!({"type":"state","state":"active"}),
+            json!({"type":"state","state":"idle"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"question","reason":"Which target?"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"permission","reason":"bash"}),
+            json!({"type":"state","state":"idle","reason":"approvalDenied"}),
+            json!({"type":"context","reading":{"usedPercent":42.0}}),
+            json!({"type":"pre_compact"}),
+            json!({"type":"client_hello","protocol":2}),
+            json!({"type":"conversation","sessionId":"2f8c"}),
+            json!({"type":"delivered","meta":{}}),
+        ] {
+            assert!(
+                turn_result(&frame).is_none(),
+                "only a turn result carries a condition: {frame}"
+            );
+        }
+        // A denied approval is an interruption, not a fault: the ask is simply over, the word is
+        // prose, and the condition axis is untouched.
+        let denied =
+            state_observation(&json!({"type":"state","state":"idle","reason":"approvalDenied"}))
+                .expect("a denial resolves the ask");
+        assert_eq!(denied.blocked_on, harness_state::BlockedOn::None);
+        assert_eq!(denied.ask, harness_state::Ask::None);
+        assert_eq!(denied.reason.as_deref(), Some("approvalDenied"));
+    }
+
+    /// The axes are independent in the WRITE, not just in the decode: every activity and ask edge
+    /// carries the condition forward `Unchanged`, so a standing fault survives a whole turn of
+    /// traffic. And omp's ask axis is positive: it owns both ask surfaces, so `none` is an
+    /// observation rather than an absence of one.
+    #[test]
+    fn an_activity_edge_carries_the_condition_forward_untouched() {
+        use harness_state::{AskKind, HumanAsk};
+        let rows = [
+            (json!({"type":"state","state":"active"}), HumanAsk::None),
+            (json!({"type":"state","state":"idle"}), HumanAsk::None),
+            (
+                json!({"type":"state","state":"idle","reason":"approvalDenied"}),
+                HumanAsk::None,
+            ),
+            (
+                json!({"type":"state","state":"active","blockedOn":"human","ask":"question","reason":"Which target?"}),
+                HumanAsk::Pending(AskKind::Question),
+            ),
+            (
+                json!({"type":"state","state":"active","blockedOn":"human","ask":"permission","reason":"bash"}),
+                HumanAsk::Pending(AskKind::Permission),
+            ),
+            (
+                json!({"type":"state","state":"active","blockedOn":"human","ask":"sacrifice"}),
+                HumanAsk::Pending(AskKind::Unknown),
+            ),
+        ];
+        for (raw, ask) in rows {
+            let observation = state_observation(&raw).expect("a state frame decodes");
+            let published = kind_frame(&OMP_KIND, observation);
+            assert!(
+                matches!(
+                    published.condition,
+                    harness_state::ConditionReport::Unchanged
+                ),
+                "an activity edge has learned nothing about the provider: {raw}"
+            );
+            assert_eq!(published.ask, ask, "{raw}");
+            assert_eq!(published.input_buffer, harness_state::InputBuffer::Unknown);
+            assert_eq!(
+                published.conversation, None,
+                "the axis is stated from wire evidence only: {raw}"
+            );
+        }
+
+        // A failed turn is the one row that states a condition, and it still says `active`: the
+        // seat needs an operator, and `idle` would read as a healthy yield.
+        let credits = json!({
+            "type":"turn","error":{"reason":"403 run out of credits","errorId":17305600}
+        });
+        let result = turn_result(&credits).unwrap();
+        let faulted = kind_frame(&OMP_KIND, turn_observation(&result).unwrap());
+        assert_eq!(faulted.state, harness_state::Activity::Active);
+        assert_eq!(faulted.ask, HumanAsk::None);
+        assert_eq!(
+            OMP_KIND.conversation, None,
+            "omp never states `unsupported`: it demonstrably has sessions"
+        );
+        assert_eq!(OMP_KIND.default_ask, HumanAsk::None);
+    }
+
+    /// The condition axis is not writable as `absent`, so a virgin version 3 record refuses the
+    /// first activity-only frame — and ONLY that refusal authorizes restating it as `clear`. Every
+    /// other refusal is a fact about ownership or a terminal record that a restatement cannot fix,
+    /// and a frame that already states a condition is never rewritten into one that does not.
+    #[test]
+    fn only_an_unstated_axis_is_restated_as_clear() {
+        let observation = state_observation(&json!({"type":"state","state":"idle"})).unwrap();
+        let frame = kind_frame(&OMP_KIND, observation);
+        let unstated = harness_state::WriteOutcome::Refused(harness_state::Refusal::Unstated);
+        let restated = restate_condition(&frame, &unstated).expect("an unstated axis is stated");
+        assert!(matches!(
+            restated.condition,
+            harness_state::ConditionReport::Clear
+        ));
+        assert_eq!(restated.state, frame.state, "only the condition axis moves");
+        assert_eq!(restated.ask, frame.ask);
+        assert_eq!(restated.input_buffer, frame.input_buffer);
+        assert_eq!(restated.conversation, frame.conversation);
+        assert_eq!(restated.reason, frame.reason);
+
+        for outcome in [
+            harness_state::WriteOutcome::Landed,
+            harness_state::WriteOutcome::Coalesced,
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Terminal),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unobserved),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unfenced),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unclaimed),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Unreadable),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::ConditionMismatch {
+                current: None,
+            }),
+            harness_state::WriteOutcome::Refused(harness_state::Refusal::Superseded {
+                on_disk_seq: 4,
+                ours: 1,
+            }),
+        ] {
+            assert!(
+                restate_condition(&frame, &outcome).is_none(),
+                "nothing else authorizes stating the axis: {outcome:?}"
+            );
+        }
+
+        // A frame that already carries a fault is never rewritten into one that clears it.
+        let mut faulted = frame.clone();
+        faulted.condition =
+            harness_state::ConditionReport::Fault(pre_compact_fault(message::now_ms()));
+        assert!(restate_condition(&faulted, &unstated).is_none());
+    }
+
+    /// Which wire is written is the writer's business; negotiation narrows two axes, not the
+    /// write. Under version 3 an un-negotiated peer is still published — its faults ride the same
+    /// typed turn frame, so withholding the tuple would hide a wedged seat — but the ask axis
+    /// reads `unknown`, because the promise that makes a positive `none` provable (retiring a
+    /// never-answered ask on a turn boundary) was never made, and no conversation is claimed.
+    #[test]
+    fn an_un_negotiated_peer_is_published_without_the_promoted_axes() {
+        use harness_state::{AskKind, ConversationState, HumanAsk};
+        let link = ConversationState::Linked(harness_state::ConversationClaim {
+            driver: "omp".to_owned(),
+            conversation: "2f8c-4d11".to_owned(),
+            history_mutability: harness_state::HistoryMutability::Rewritable,
+            capability_evidence: harness_state::CapabilityEvidence::Probed,
+            verified_through_ms: 1_787_999_000_000,
+        });
+        for raw in [
+            json!({"type":"state","state":"idle"}),
+            json!({"type":"state","state":"active"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"question","reason":"Which target?"}),
+        ] {
+            let observation = state_observation(&raw).unwrap();
+            let bare = connection_frame(&OMP_KIND, observation.clone(), false, Some(link.clone()));
+            let legacy_pending = observation.blocked_on == harness_state::BlockedOn::Human;
+            if legacy_pending {
+                assert_eq!(
+                    bare.ask,
+                    kind_frame(&OMP_KIND, observation.clone()).ask,
+                    "a waiting human is equally proven on either protocol: {raw}"
+                );
+                assert!(bare.ask.pending().is_some(), "{raw}");
+            } else {
+                assert_eq!(
+                    bare.ask,
+                    HumanAsk::Unknown,
+                    "only a positive `none` is unprovable without the retirement promise: {raw}"
+                );
+            }
+            assert_eq!(
+                bare.conversation, None,
+                "no promise, no claimed conversation: {raw}"
+            );
+            assert!(
+                matches!(bare.condition, harness_state::ConditionReport::Unchanged),
+                "{raw}"
+            );
+            assert_eq!(
+                bare.state,
+                state_observation(&raw).unwrap().state,
+                "the activity axis is stated on every connection: {raw}"
+            );
+
+            // The same frame from a negotiated asset states both promoted axes.
+            let promoted = connection_frame(&OMP_KIND, observation, true, Some(link.clone()));
+            assert_eq!(promoted.conversation, Some(link.clone()), "{raw}");
+            assert_ne!(promoted.ask, HumanAsk::Unknown, "{raw}");
+        }
+        assert_eq!(
+            connection_frame(
+                &OMP_KIND,
+                state_observation(&json!({"type":"state","state":"idle"})).unwrap(),
+                true,
+                None,
+            )
+            .ask,
+            HumanAsk::None,
+            "omp owns both ask surfaces, so a negotiated `none` is a positive observation"
+        );
+        assert_eq!(
+            connection_frame(
+                &OMP_KIND,
+                state_observation(
+                    &json!({"type":"state","state":"active","blockedOn":"human","ask":"permission"})
+                )
+                .unwrap(),
+                true,
+                None,
+            )
+            .ask,
+            HumanAsk::Pending(AskKind::Permission)
+        );
+        // A blocked frame with no nameable kind is a waiting human whose question is unstated —
+        // `Pending(Unknown)` — and never a dropped ask.
+        assert_eq!(
+            connection_frame(
+                &OMP_KIND,
+                state_observation(&json!({"type":"state","state":"active","blockedOn":"human"}))
+                    .unwrap(),
+                false,
+                None,
+            )
+            .ask,
+            HumanAsk::Pending(AskKind::Unknown)
+        );
+
+        // A fault is stated on either connection: it rides the typed turn frame, which every
+        // protocol version sends identically.
+        let credits = json!({"type":"turn","error":{"reason":"403 run out of credits","errorId":17305600}});
+        let result = turn_result(&credits).unwrap();
+        assert!(turn_fault(&result, 5).is_some());
+        // A driver-level capability claim is not a negotiated axis: pi's `unsupported` is a fact
+        // about pi and stands on every connection.
+        assert_eq!(
+            connection_frame(
+                &PI_KIND,
+                state_observation(&json!({"type":"state","state":"idle"})).unwrap(),
+                false,
+                None,
+            )
+            .conversation,
+            Some(ConversationState::Unsupported)
+        );
+    }
+
+    /// The mixed-version seat that motivates the whole downgrade rule: a version 3 record written
+    /// for an UN-NEGOTIATED asset that is blocked on a human must still summon one. The ask
+    /// survives the downgrade, so the shared disposition reads `waitingHuman` / `now` / `answer` —
+    /// the same verdict the legacy projection of that frame produces, which is the property that
+    /// makes the version 3 rollout invisible to an operator.
+    #[test]
+    fn an_un_negotiated_blocked_frame_still_summons_a_human() {
+        let raw = json!({
+            "type":"state","state":"active","blockedOn":"human","ask":"question",
+            "reason":"Which deployment target?"
+        });
+        let observation = state_observation(&raw).unwrap();
+        let published = connection_frame(&OMP_KIND, observation.clone(), false, None);
+        assert_eq!(
+            published.ask,
+            harness_state::HumanAsk::Pending(harness_state::AskKind::Question)
+        );
+
+        // The record such a frame projects, read back through the shared disposition. Nothing is
+        // faulted and no diagnostic stands: the ask alone must carry the verdict.
+        let observed = harness_state::Observed {
+            state: published.state,
+            blocked_on: harness_state::BlockedOn::Human,
+            input_buffer: published.input_buffer,
+            ask: harness_state::Ask::Question,
+            harness: Some("omp".to_owned()),
+            since_ms: Some(message::now_ms()),
+            exit: None,
+            reason: published.reason.clone(),
+            subject: None,
+            schema: Some(harness_state::SCHEMA_V3.to_owned()),
+            indeterminacy: None,
+            condition: harness_state::ConditionView::Clear,
+            human_ask: published.ask,
+            conversation: None,
+        };
+        let disposition =
+            harness_state::disposition(Some(&observed), &driver_diagnostic::Observed::Absent);
+        assert_eq!(
+            disposition.state,
+            harness_state::DispositionState::WaitingHuman
+        );
+        assert_eq!(disposition.attention, harness_state::Attention::Now);
+        assert_eq!(
+            disposition.primary_action,
+            harness_state::PrimaryAction::Answer
+        );
+
+        // Had the downgrade swallowed the pending ask, the same seat would read as merely worth
+        // observing — nobody would be summoned.
+        let muted = harness_state::Observed {
+            human_ask: harness_state::HumanAsk::Unknown,
+            ..observed
+        };
+        let muted =
+            harness_state::disposition(Some(&muted), &driver_diagnostic::Observed::Absent);
+        assert_ne!(
+            muted.state,
+            harness_state::DispositionState::WaitingHuman,
+            "this is the regression the downgrade rule exists to prevent"
+        );
+    }
+
+    /// The adapter-owned fault outlives provider progress. A completed turn is evidence about the
+    /// PROVIDER; st2's own failed pre-compact write is a different fact, and only the next
+    /// successful pre-compact edge retires it — by category and full code, never by the blanket
+    /// clear that a turn authorizes.
+    #[test]
+    fn a_completed_turn_never_retires_the_adapter_owned_fault() {
+        let mut standing: Option<harness_state::FaultReport> = None;
+
+        // With nothing of ours standing, a completed turn clears the whole axis.
+        assert_eq!(
+            turn_completed_edge(standing.as_ref()),
+            ConditionEdge::ClearAll(harness_state::ProgressProof::TurnCompleted)
+        );
+
+        // The stub write fails: the fault is raised AND remembered.
+        let raised = pre_compact_edge(false, 1_787_999_000_000);
+        let ConditionEdge::Raise(fault) = &raised else {
+            panic!("a failed stub write raises: {raised:?}")
+        };
+        assert_eq!(fault.key(), pre_compact_fault_key());
+        standing = Some(fault.clone());
+
+        // Two ordinary turn ends later it still stands, restated rather than swept up — and
+        // restating the same fault is what preserves the instant it was first observed.
+        for _turn in 0..2 {
+            assert_eq!(
+                turn_completed_edge(standing.as_ref()),
+                ConditionEdge::Raise(fault.clone()),
+                "a working provider says nothing about st2's own failed write"
+            );
+        }
+        // Even a provider fault that displaced it in the record's single condition slot does not
+        // retire it: the next completed turn restates ours rather than clearing everything.
+        assert_ne!(
+            turn_completed_edge(standing.as_ref()),
+            ConditionEdge::ClearAll(harness_state::ProgressProof::TurnCompleted)
+        );
+
+        // Only the successful edge retires it, and only by its exact key.
+        let recovered = pre_compact_edge(true, 1_787_999_100_000);
+        assert_eq!(
+            recovered,
+            ConditionEdge::ClearPaired(pre_compact_fault_key())
+        );
+        standing = None;
+        assert_eq!(
+            turn_completed_edge(standing.as_ref()),
+            ConditionEdge::ClearAll(harness_state::ProgressProof::TurnCompleted)
+        );
+    }
+
+    /// The negotiated vocabulary is inert on the version 2 wire in BOTH directions: the denial
+    /// prose a negotiated asset narrates is withheld rather than becoming a novel `reason` on an
+    /// unblocked frame, while every reason version 2 already carried rides through verbatim.
+    #[test]
+    fn the_denial_diagnostic_never_reaches_the_version_two_wire() {
+        let denial = state_observation(&json!({
+            "type":"state","state":"idle","reason":"approvalDenied"
+        }))
+        .unwrap();
+        assert_eq!(denial.reason.as_deref(), Some(APPROVAL_DENIED_REASON));
+        assert_eq!(
+            legacy_observation(denial).reason, None,
+            "version 2 has no ask axis that makes this word meaningful"
+        );
+
+        // Everything the version 2 wire already said keeps saying it.
+        for raw in [
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"permission","reason":"bash"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"question","reason":"Which target?"}),
+            json!({"type":"state","state":"active","blockedOn":"human","ask":"permission","reason":"approvalDenied"}),
+        ] {
+            let observation = state_observation(&raw).unwrap();
+            let reason = observation.reason.clone();
+            assert_eq!(
+                legacy_observation(observation).reason,
+                reason,
+                "a blocked frame's prose is untouched: {raw}"
+            );
+        }
+        let credits = json!({"type":"turn","error":{"reason":"403 run out of credits","errorId":17305600}});
+        let faulted = turn_observation(&turn_result(&credits).unwrap()).unwrap();
+        assert_eq!(
+            legacy_observation(faulted).reason.as_deref(),
+            Some("403 run out of credits"),
+            "a turn error's own words are how a reader learns which 4xx it was"
+        );
+        let recovery = harness_state::Observation::new(
+            harness_state::Activity::Active,
+            harness_state::BlockedOn::None,
+            harness_state::InputBuffer::Unknown,
+        )
+        .with_reason(PRE_COMPACT_ERROR_REASON);
+        assert_eq!(
+            legacy_observation(recovery).reason.as_deref(),
+            Some(PRE_COMPACT_ERROR_REASON)
+        );
+
+        // And end to end on the version 2 wire: a denial leaves a record indistinguishable from
+        // the plain idle frame it resolved to, so no reader pinned to version 2 sees a new field.
+        let v2 = |frames: &[&str]| omp_record_emitting(frames, harness_state::SCHEMA_V2);
+        assert_eq!(
+            v2(&[
+                r#"{"type":"client_hello","protocol":2}"#,
+                r#"{"type":"state","state":"idle","reason":"approvalDenied"}"#,
+            ]),
+            v2(&[r#"{"type":"state","state":"idle"}"#]),
+        );
+    }
+
+    /// The adapter-owned harness fault, and the exactness of its clear. A compaction whose stub
+    /// write now succeeds retires THAT fault and only that fault: a standing credential rejection
+    /// must survive it, so the key names the category AND the full code — a category-wide key
+    /// would be how one healthy compaction silences a wedged seat.
+    #[test]
+    fn the_pre_compact_fault_is_cleared_by_category_and_full_code() {
+        let fault = pre_compact_fault(9);
+        assert_eq!(fault.category, harness_state::FaultCategory::Harness);
+        assert_eq!(fault.recovery, harness_state::Recovery::Human);
+        assert_eq!(
+            fault.code.as_deref(),
+            Some("omp/preCompactContextWriteFailed")
+        );
+        assert_eq!(fault.observed_at_ms, 9);
+        assert_eq!(fault.next_observation_due_ms, None);
+        assert_eq!(pre_compact_fault_key(), fault.key());
+        assert_ne!(
+            pre_compact_fault_key(),
+            harness_state::FaultKey::new(harness_state::FaultCategory::Harness),
+            "a codeless key matches a codeless fault, which is not this one"
+        );
+        let credential = turn_fault(
+            &turn_result(&json!({"type":"turn","error":{"errorId":0x100_1000}})).unwrap(),
+            9,
+        )
+        .unwrap();
+        assert_ne!(
+            pre_compact_fault_key(),
+            credential.key(),
+            "a healthy compaction must not clear a refused credential"
+        );
+    }
+
+    /// The conversation axis is populated from omp's OWN typed evidence — the `sessionId` measured
+    /// on both halves of the approval pair — and from nothing else. Before one is observed the
+    /// axis is omitted; it is never `Unsupported`, because omp demonstrably has sessions and
+    /// claiming otherwise would be a false capability claim.
+    #[test]
+    fn a_conversation_is_linked_only_from_typed_session_evidence() {
+        let state = conversation_claim(
+            &json!({"type":"conversation","sessionId":"  2f8c-4d11  "}),
+            1_787_999_000_000,
+        )
+        .expect("a session id is a link");
+        let link = match state {
+            harness_state::ConversationState::Linked(link) => link,
+            other => panic!("omp states a LINK or nothing at all: {other:?}"),
+        };
+        assert_eq!(link.driver, "omp");
+        assert_eq!(link.conversation, "2f8c-4d11");
+        assert_eq!(
+            link.history_mutability,
+            harness_state::HistoryMutability::Rewritable,
+            "omp compacts its own session store, so a prefix read once may be gone"
+        );
+        assert_eq!(
+            link.capability_evidence,
+            harness_state::CapabilityEvidence::Probed,
+            "read off a live event, not declared from typings"
+        );
+        assert_eq!(link.verified_through_ms, 1_787_999_000_000);
+
+        for frame in [
+            json!({"type":"conversation"}),
+            json!({"type":"conversation","sessionId":"   "}),
+            json!({"type":"conversation","sessionId":42}),
+            json!({"type":"state","state":"idle","sessionId":"2f8c"}),
+        ] {
+            assert!(
+                conversation_claim(&frame, 1_787_999_000_000).is_none(),
+                "nothing to prove, nothing to state: {frame}"
+            );
+        }
+        assert!(
+            conversation_claim(&json!({"type":"conversation","sessionId":"2f8c"}), 0).is_none(),
+            "a link with no positive verification bound is refused at the write boundary"
+        );
+    }
+
+    /// Negotiation. st2's hello version never rises — the asset refuses a hello it cannot read,
+    /// and a refusal costs that seat its mail — so the offer is additive and the AGREEMENT is the
+    /// asset's answer. Anything else, including an answer naming a version st2 never offered, is
+    /// dropped like every other frame this channel cannot vouch for.
+    #[test]
+    fn only_an_answer_to_the_offer_negotiates_the_condition_axis() {
+        assert_eq!(PROTOCOL, 1);
+        assert_eq!(
+            negotiated_protocol(&json!({"type":"client_hello","protocol":2})),
+            Some(PROTOCOL_CONDITION_AXIS)
+        );
+        for frame in [
+            json!({"type":"client_hello"}),
+            json!({"type":"client_hello","protocol":1}),
+            json!({"type":"client_hello","protocol":3}),
+            json!({"type":"client_hello","protocol":"2"}),
+            json!({"type":"client_hello","protocol":-2}),
+            json!({"type":"state","state":"idle","protocol":2}),
+            json!({"protocol":2}),
+        ] {
+            assert_eq!(negotiated_protocol(&frame), None, "frame: {frame}");
+        }
+    }
+
+    /// On a writer emitting version 2 the whole negotiated vocabulary is INERT: the answer and
+    /// the conversation statement change no byte of the record, because the version 2 wire has
+    /// nowhere to carry them and this record has exactly one source of truth. That was what made
+    /// the adapter safe to land before the selector flipped, and it is now what makes a rollback
+    /// and every version 2 record already on disk safe.
+    #[test]
+    fn a_negotiated_peers_new_frames_never_reach_the_version_two_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = harness_state::Writer::new(tmp.path(), "h.worker", "omp", Some("w".into()))
+            .with_emitted_schema(harness_state::SCHEMA_V2);
+        assert!(
+            !writer.writes_condition_axis(),
+            "this test is the proof of the version 2 projection, reached through the seam"
+        );
+
+        let v2 = |frames: &[&str]| omp_record_emitting(frames, harness_state::SCHEMA_V2);
+        let legacy = v2(&[r#"{"type":"state","state":"active"}"#]);
+        let negotiated = v2(&[
+            r#"{"type":"client_hello","protocol":2}"#,
+            r#"{"type":"conversation","sessionId":"2f8c-4d11"}"#,
+            r#"{"type":"state","state":"active"}"#,
+        ]);
+        assert_eq!(legacy, negotiated);
+        assert_eq!(legacy["schema"], harness_state::SCHEMA_V2);
+        assert_eq!(legacy["state"], "active");
+        assert_eq!(legacy["blockedOn"], "none");
+        assert!(
+            legacy.get("condition").is_none() && legacy.get("conversationRef").is_none(),
+            "neither axis exists on this wire: {legacy}"
+        );
+
+        // A failed turn still publishes exactly the legacy row it always did — the condition it
+        // now also implies is representable nowhere, so it changes nothing here.
+        let faulted = v2(&[
+            r#"{"type":"client_hello","protocol":2}"#,
+            r#"{"type":"turn","error":{"reason":"401 invalid x-api-key","errorId":16781312}}"#,
+        ]);
+        assert_eq!(faulted["state"], "active");
+        assert_eq!(faulted["reason"], PROVIDER_AUTH_REASON);
+        assert!(faulted.get("condition").is_none());
+    }
+
+    /// The whole negotiated vocabulary respects the incarnation's last word. `src/omp_session.rs`
+    /// alone writes `ended`, and every frame the extension queued before the wrapper reaped the
+    /// session — the answer, an activity edge, a failed turn, the conversation statement, and the
+    /// success edge that would otherwise clear everything — is refused rather than resurrecting
+    /// a session nobody is watching.
+    #[test]
+    fn no_negotiated_frame_resurrects_the_wrappers_terminal_omp_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let record = harness_state::harness_state_path(agent_dir);
+        // The wrapper mints the token and the channel adopts it: that sharing is what makes the
+        // wrapper's terminal record this session's last word rather than a foreign one.
+        let session = harness_state::session_token();
+        let mut channel_writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_session(session.clone());
+        let mut wrapper_writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_session(session);
+        // Exactly what `src/omp_session.rs` does, bootstrap retry included.
+        crate::provider_session::write_terminal(
+            &mut wrapper_writer,
+            "exit 0",
+            None,
+            harness_state::ConditionReport::Clear,
+        )
+        .unwrap();
+        let terminal = std::fs::read(&record).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"client_hello","protocol":2}"#,
+            r#"{"type":"state","state":"active"}"#,
+            r#"{"type":"turn","error":{"reason":"401 invalid x-api-key","errorId":16781312}}"#,
+            r#"{"type":"conversation","sessionId":"2f8c-4d11"}"#,
+            r#"{"type":"turn"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut channel_writer,
+            None,
+            "h.worker",
+            &OMP_KIND,
+            Duration::from_millis(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            terminal,
+            "a refused write changes no byte"
+        );
+    }
+
+    /// Activation, end to end for pi: the REAL channel loop drives the REAL production writer,
+    /// and the record is read back through [`harness_state::read`] rather than inspected as an
+    /// in-memory frame. A pi assistant failure lands as a version 3 fault, and the idle edge that
+    /// follows leaves the seat honestly idle WITH the fault still standing — activity never
+    /// clears a condition, which is the whole ordering rule of this adapter.
+    #[test]
+    fn a_pi_failure_lands_a_version_three_fault_beside_an_honest_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let path = harness_state::harness_state_path(agent_dir);
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        assert!(
+            writer.writes_condition_axis(),
+            "this is the production writer after activation"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"state","state":"active"}"#,
+            r#"{"type":"condition","op":"raise","category":"harness","code":"pi/assistantError","recovery":"unknown","detail":"401 Unauthorized"}"#,
+            r#"{"type":"state","state":"idle"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &PI_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let observed = harness_state::read(&path, None).expect("a version 3 record");
+        assert_eq!(observed.schema.as_deref(), Some(harness_state::SCHEMA_V3));
+        assert_eq!(observed.state, harness_state::Activity::Idle);
+        let harness_state::ConditionView::Fault(fault) = &observed.condition else {
+            panic!("the raise must reach the record: {observed:?}");
+        };
+        assert_eq!(
+            fault.category,
+            Some(harness_state::FaultCategory::Harness)
+        );
+        assert_eq!(fault.code.as_deref(), Some("pi/assistantError"));
+        assert_eq!(
+            observed.human_ask,
+            harness_state::HumanAsk::Unknown,
+            "pi exposes no ask surface and says so positively"
+        );
+    }
+
+    /// Activation, end to end for omp: a negotiated approval pair lands a version 3 ask and the
+    /// conversation identity omp forwarded, read back through the real reader. Both axes exist
+    /// only on this wire, so before the flip this record could not have carried either.
+    #[test]
+    fn an_omp_approval_lands_a_version_three_ask_and_links_its_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let path = harness_state::harness_state_path(agent_dir);
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_ownership("session-1", 1);
+
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"client_hello","protocol":2}"#,
+            r#"{"type":"conversation","sessionId":"2f8c-4d11"}"#,
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"permission"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &OMP_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let observed = harness_state::read(&path, None).expect("a version 3 record");
+        assert_eq!(observed.schema.as_deref(), Some(harness_state::SCHEMA_V3));
+        assert_eq!(
+            observed.human_ask,
+            harness_state::HumanAsk::Pending(harness_state::AskKind::Permission)
+        );
+        let link = observed
+            .conversation
+            .as_ref()
+            .expect("the forwarded session id is a link");
+        assert!(
+            format!("{link:?}").contains("2f8c-4d11"),
+            "the link carries omp's own conversation identity: {link:?}"
         );
     }
 }
