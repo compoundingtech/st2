@@ -1,39 +1,30 @@
 version 2
 
 subgraph {
-  scope "eval/context-resource-continuity/${ST_PLAN_RUN}" retention="temporary" {
-    plan "eval/context-resource-continuity" state="ready" {
-      agentless
-      completion { when "all-steps-exhausted" }
-      goal "Complete plan eval/context-resource-continuity."
-      step "contract" timeout="2m" {
-        title "Context and resources survive two daemon restarts"
-        subgraph {
-          exec "eval/context-resource-continuity/contract/${ST_PLAN_RUN}" {
-            host "local"
-            workspace "${ST_WORKSPACE}/fixture"
-            cwd "${ST_WORKSPACE}/fixture"
-            command "bash ./run.sh"
-            restart "never"
-          }
-        }
-        gate "condition-1" { field "status" "exec/eval/context-resource-continuity/contract/${ST_PLAN_RUN}" "is" "exited" }
-        gate "condition-2" { field "exit_code" "exec/eval/context-resource-continuity/contract/${ST_PLAN_RUN}" "is" 0 }
-      }
-      step "gate" timeout="1m" {
-        depends-on { step "contract" completed }
-        gate "the exact context decision and resource remain readable" {
-          exec "bash ./judge.sh"
+  plan "eval/context-resource-continuity" state="ready" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete plan eval/context-resource-continuity."
+    step "contract" timeout="2m" {
+      title "Context and resources survive two daemon restarts"
+      subgraph {
+        exec "eval/context-resource-continuity/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
-          time-limit "1m"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
         }
       }
-      finally {
-        step "cleanup" {
-        subgraph { scope "eval/context-resource-continuity/${ST_PLAN_RUN}" { stop } }
-        gate "condition" { empty "scope/eval/context-resource-continuity/${ST_PLAN_RUN}" }
-      }
+      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/context-resource-continuity/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/context-resource-continuity/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the exact context decision and resource remain readable" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+        time-limit "1m"
       }
     }
   }

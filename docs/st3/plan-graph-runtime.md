@@ -23,8 +23,12 @@ A plan run has one stable subject. Each immutable run generation binds that run 
 - A missing `depends-on` makes a step a root. It does not imply a dependency on the previous step.
 - st3 rejects missing step references and dependency cycles.
 - st3 does not accept `outcome`, `judges`, or `judge`.
-- `assigned-to`, `available-to`, and `agentless` select who can claim work.
+- `assigned-to` and `available-to` can set a plan default or select one step.
+- `agentless` is step-only. A step with no inherited selector is also agentless.
 - A selector does not grant revision authority.
+- A plan allows one active run by default.
+- `concurrent-runs` enables concurrent active runs. An optional `max` property bounds them.
+- A plan can declare exact text and resource inputs.
 
 ## Complete example
 
@@ -32,108 +36,96 @@ A plan run has one stable subject. Each immutable run generation binds that run 
 version 2
 
 subgraph {
-  scope "release/${ST_PLAN_RUN}" retention="temporary" {
-    plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
-      goal "Produce a verified release decision."
-      goal "Keep the source and test evidence visible in the graph."
+  plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
+    input "source" kind="resource"
+    goal "Produce a verified release decision."
+    goal "Keep the source and test evidence visible in the graph."
+    completion { when "all-steps-exhausted" }
+
+    subgraph {
+      agent "release.lead" {
+        workspace "${ST_WORKSPACE}/lead"
+        harness "codex" {
+          model "gpt-5.6-sol"
+          effort "medium"
+          prompt "Claim assigned st3 work and publish the release decision."
+        }
+      }
+      agent "release.test" {
+        under "release.lead" reason="the lead combines the test evidence"
+        workspace "${ST_WORKSPACE}/test"
+        harness "codex" {
+          model "gpt-5.6-sol"
+          effort "medium"
+          prompt "Claim assigned st3 work and publish the test evidence."
+        }
+      }
+    }
+
+    baseline "the release request is ready" {
+      field "status" "${input.source}" "is" "ready"
+    }
+
+    produces {
+      resource "plan-run/${ST_PLAN_RUN}/release-decision" {
+        kind "release.decision"
+        state "published"
+      }
+    }
+
+    gate "the requester approves the release" type="human" {
+      reviewer "person/nathan"
+      question "Is this release ready?"
+      review "resource/plan-run/${ST_PLAN_RUN}/release-decision"
+    }
+
+    step "start-team" {
       agentless
-      completion { when "all-steps-exhausted" }
+      title "The release team is ready"
+      gate "the lead exists" { exists "agent/${ST_PLAN_RUN}/release.lead" }
+      gate "the test agent exists" { exists "agent/${ST_PLAN_RUN}/release.test" }
+    }
 
-      subgraph {
-        agent "release.lead" {
-          workspace "${ST_WORKSPACE}/lead"
-          harness "codex" {
-            model "gpt-5.6-sol"
-            effort "medium"
-            prompt "Claim assigned st3 work and publish the release decision."
-          }
-        }
-        agent "release.test" {
-          under "release.lead" reason="the lead combines the test evidence"
-          workspace "${ST_WORKSPACE}/test"
-          harness "codex" {
-            model "gpt-5.6-sol"
-            effort "medium"
-            prompt "Claim assigned st3 work and publish the test evidence."
-          }
-        }
-      }
-
-      baseline "the release request is ready" {
-        field "status" "resource/release-request" "is" "ready"
-      }
-
+    step "inspect" timeout="20m" {
+      title "The source is inspected"
+      goal "Inspect the exact release source and publish an inspection report."
+      assigned-to "agent/${ST_PLAN_RUN}/release.lead"
+      depends-on { step "start-team" completed }
       produces {
-        resource "plan-run/${ST_PLAN_RUN}/release-decision" {
-          kind "release.decision"
+        resource "plan-run/${ST_PLAN_RUN}/inspection" {
+          kind "release.inspection"
           state "published"
         }
       }
-
-      gate "the requester approves the release" type="human" {
-        reviewer "person/nathan"
-        question "Is this release ready?"
-        review "resource/plan-run/${ST_PLAN_RUN}/release-decision"
+      gate "the report contains a revision" {
+        field "revision" "resource/plan-run/${ST_PLAN_RUN}/inspection" "starts-with" "git:"
       }
+    }
 
-      step "start-team" {
-        title "The release team is ready"
-        gate "the lead exists" { exists "agent/release.lead" }
-        gate "the test agent exists" { exists "agent/release.test" }
-      }
-
-      step "inspect" timeout="20m" {
-        title "The source is inspected"
-        goal "Inspect the exact release source and publish an inspection report."
-        assigned-to "agent/release.lead"
-        depends-on { step "start-team" completed }
-        baseline "the source is present" {
-          exists "resource/release-source"
-        }
-        produces {
-          resource "plan-run/${ST_PLAN_RUN}/inspection" {
-            kind "release.inspection"
-            state "published"
-          }
-        }
-        gate "the report contains a revision" {
-          field "revision" "resource/plan-run/${ST_PLAN_RUN}/inspection" "starts-with" "git:"
-        }
-      }
-
-      step "verify" timeout="20m" {
-        title "The release decision is verified"
-        goal "Run the tests and publish the final release decision."
-        assigned-to "agent/release.test"
-        depends-on { step "inspect" completed }
-        retry { attempts 2; backoff "30s" }
-        gate "the release tests pass" {
-          exec "./verify-release.sh"
-          host "local"
-          workspace "${ST_WORKSPACE}/test"
-          time-limit "5m"
-        }
-      }
-
-      finally {
-        step "cleanup" {
-          title "The temporary release scope is empty"
-          subgraph { scope "release/${ST_PLAN_RUN}" { stop } }
-          gate "the scope has no live member" {
-            empty "scope/release/${ST_PLAN_RUN}"
-          }
-        }
+    step "verify" timeout="20m" {
+      title "The release decision is verified"
+      goal "Run the tests and publish the final release decision."
+      assigned-to "agent/${ST_PLAN_RUN}/release.test"
+      depends-on { step "inspect" completed }
+      retry { attempts 2; backoff "30s" }
+      gate "the release tests pass" {
+        exec "./verify-release.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/test"
+        time-limit "5m"
       }
     }
   }
 }
 ```
 
-The plan subgraph owns the complete plan revision. Its agents start for each run generation.
+The plan subgraph owns the complete plan revision. Its agents use stable subjects inside one plan run.
 
 The plan baseline protects the run admission boundary. The inspection product is intermediate step output.
 
 The release decision is a final plan product. The human gate is a plan-level acceptance condition.
+
+After acceptance, cleanup stops both agents before the run becomes completed.
 
 ## Plan syntax
 
@@ -147,8 +139,12 @@ plan "PLAN_ID"
   goal "An optional second goal."
   goal "An optional third goal."
 
-  assigned-to "agent/node.owner"
-  // Or repeat available-to, or use bare agentless.
+  input "message" kind="text"
+  input "source" kind="resource"
+  concurrent-runs max=4
+
+  assigned-to "agent/${ST_PLAN_RUN}/owner"
+  // Or repeat available-to. A plan cannot declare agentless.
 
   completion { when "all-steps-exhausted" }
   // Or: completion { depends-on { step "publish" completed } }
@@ -164,13 +160,23 @@ plan "PLAN_ID"
 }
 ```
 
-The `state` property is required for a top-level or scoped plan. A nested plan defaults to ready because it is already part of a submitted parent revision.
+The `state` property is required for a top-level plan. A nested plan defaults to ready because it is already part of a submitted parent revision.
 
 Plan IDs can contain path separators. Step IDs cannot. IDs cannot be empty, contain whitespace, start or end with `/`, or contain `//`.
 
 Plan goal order is preserved. Each plan must have one, two, or three goals.
 
 A plan can repeat baselines and gates. Their names must be unique within that plan. A plan has at most one `produces` block.
+
+A plan can repeat `input`. Each input name is unique and uses `kind="text"` or `kind="resource"`.
+
+The input set and kinds cannot change across revisions of an active run. Input values remain immutable across all run generations.
+
+The default active run limit is one. Bare `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a positive limit.
+
+When active revisions declare different limits, st3 uses the strictest limit. A lower limit does not cancel existing runs.
+
+An exact idempotent retry returns its existing run before the capacity check. A direct start error lists the active run subjects.
 
 `revisions="human-only"` is optional and inherited by child steps. `revision-reviewer` requires that protection.
 
@@ -190,6 +196,33 @@ A completion dependency cannot reference a final step.
 
 Without `completion`, the plan never becomes terminal because it exhausted its steps.
 
+## Run ownership and concurrency
+
+A plan run is the sole owner of execution state. An agent cannot exist outside a plan run.
+
+An authored runtime ID is local to the run. st3 expands it to these subjects:
+
+- `agent/RUN/LOCAL_ID`;
+- `exec/RUN/LOCAL_ID`;
+- `pty/RUN/LOCAL_ID`;
+- `observer/RUN/LOCAL_ID`;
+- `subscription/RUN/LOCAL_ID`;
+- `schedule/RUN/LOCAL_ID`.
+
+Two concurrent runs can use the same local IDs. Two subgraphs in one generation cannot declare the same runtime subject.
+
+An open plan keeps its runtimes present. This rule supports long-lived chat agents without a second plan type.
+
+A runtime `stop` can occur only inside the owner plan. Root control uses `plan-run { cancel }` instead.
+
+The default plan permits one nonterminal run. This default also lets `st3 plan show PLAN` identify the current run.
+
+Bare `concurrent-runs` permits unlimited nonterminal runs. `concurrent-runs max=N` sets a positive limit.
+
+The capacity check runs after the idempotency check. A child start waits when capacity is full, but a direct start returns `plan-run-capacity`.
+
+Plans and agents do not support in-place ownership changes. Publish a replacement subgraph and cancel the old run when ownership must change.
+
 ## Step syntax
 
 ```kdl
@@ -198,8 +231,8 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   goal "One optional goal."
   goal "A second optional goal."
   goal "A third optional goal."
-  available-to "agent/node.worker-a"
-  available-to "agent/node.worker-b"
+  available-to "agent/${ST_PLAN_RUN}/worker-a"
+  available-to "agent/${ST_PLAN_RUN}/worker-b"
   document "doc/project/request@SHA256"
 
   depends-on {
@@ -239,6 +272,38 @@ Use one `goal` node for one statement. Use up to three nodes when the plan or st
 
 Do not use source order or bullet syntax inside one string to create hidden execution structure. Steps and `depends-on` own execution structure.
 
+## Plan inputs
+
+A ready top-level plan can declare text and resource inputs.
+
+```kdl
+input "message" kind="text"
+input "source" kind="resource"
+```
+
+A start request must provide exactly the declared names. Missing and extra names are errors.
+
+Use `${input.message}` and `${input.source}` in execution content. st3 preserves quoted and multiline text when it writes interpolated KDL.
+
+A resource input accepts `resource/NAME` or `resource/NAME@CLAIM_ID`. st3 resolves a bare subject to its latest accepted claim atomically.
+
+The run stores the exact resource subject and claim ID. Later claims do not change gates, inspection, or execution for that input.
+
+Inputs do not support defaults, lists, secrets, schemas, or automatic environment export. Put an input in `env` when a process needs it.
+
+Nested child plans cannot declare inputs in this version.
+
+```sh
+st3 run plan.kdl \
+  --input message="Review this release." \
+  --input source=resource/release-source
+
+st3 claim resource/plan-inputs/source resource.observed --field state=ready
+st3 eval ./evals/st3/plan-inputs \
+  --input message="Input proof." \
+  --input source=resource/plan-inputs/source
+```
+
 ## Baselines
 
 A baseline records state that must be true before new work starts.
@@ -254,7 +319,11 @@ A baseline contains one or more graph predicates. Its predicates form an AND rel
 
 Baselines accept `exists`, `empty`, `field`, `has`, and `lacks`. They do not execute shell, LLM, human, or deadline work.
 
-Plan baselines run before root work admission. A false plan baseline puts the plan run in blocked state, and st3 rechecks it after relevant graph changes while admission remains blocked. Once normal work is admitted, the plan baseline is latched and is not re-evaluated as a continuous gate.
+Plan baselines run before root work admission. st3 does not materialize a plan runtime before these baselines pass.
+
+A false plan baseline puts the plan run in blocked state. st3 rechecks it after relevant graph changes while admission remains blocked.
+
+Once normal work is admitted, the plan baseline is latched. st3 does not re-evaluate it as a continuous gate.
 
 Step baselines run after dependencies hold and before each attempt becomes ready. A false step baseline blocks the step. It does not consume an attempt. A retry checks the baseline again.
 
@@ -276,7 +345,7 @@ produces {
 }
 ```
 
-Products can match `resource`, `message`, `agent`, `exec`, `pty`, or `scope` subjects. Each product can require scalar fields.
+Products can match `resource`, `message`, `agent`, `exec`, or `pty` subjects. Each product can require scalar fields.
 
 All products in one block must hold.
 
@@ -307,7 +376,7 @@ Each running gate records `gate.requested` and `gate.result`. The result cites o
 
 ```kdl
 gate "subject exists" { exists "resource/result" }
-gate "scope is empty" { empty "scope/temporary-work" }
+gate "run has no live runtime" { empty "plan-run/${ST_PLAN_RUN}" }
 gate "field matches" { field "status" "resource/result" "is" "green" }
 gate "prefix matches" { field "revision" "resource/result" "starts-with" "git:" }
 gate "text contains value" { has "doc/report@SHA256" "GREEN" }
@@ -477,7 +546,6 @@ st3 supplies these exact context names:
 | `ST_PLAN_RUN` | Stable plan run ID without the `plan-run/` prefix. |
 | `ST_RUN_GENERATION` | Current generation ID without the `run-generation/` prefix. |
 | `ST_ROOT_PLAN_RUN` | Full root `plan-run/...` subject. |
-| `ST_SCOPE` | Expanded run scope, or an empty value. |
 | `ST_WORKSPACE` | Absolute run workspace. |
 | `ST_REQUESTER` | Normalized requester subject. |
 | `ST_STEP` | Step path in a step context. |
@@ -509,7 +577,7 @@ agent "researcher" {
 }
 ```
 
-A bare target uses the local host identity. A full `agent/host.name` target stays full.
+A bare target inside a plan uses the same plan run. A full external agent subject stays full.
 
 The relation is visible in `st3 agents --json`, status, and assigned work. It is suitable for a tree or graph UI.
 
@@ -519,17 +587,17 @@ Missing targets, self-relations, and cycles create warnings during preview. They
 
 ## Work selection
 
-A plan or step can declare exactly one selector kind.
+A plan or step can declare one agent selector kind. Only a step can declare `agentless`.
 
 ```kdl
-assigned-to "agent/node.only-worker"
+assigned-to "agent/${ST_PLAN_RUN}/only-worker"
 ```
 
 `assigned-to` means that only the named agent can claim the work.
 
 ```kdl
-available-to "agent/node.worker-a"
-available-to "agent/node.worker-b"
+available-to "agent/${ST_PLAN_RUN}/worker-a"
+available-to "agent/${ST_PLAN_RUN}/worker-b"
 ```
 
 `available-to` creates an explicit pool. The first eligible claim wins one step atomically.
@@ -546,9 +614,9 @@ A local selector replaces the inherited selector. It does not add to it.
 
 The inheritance order is the step, its plan, its parent step, and its parent plan. The nearest selector wins.
 
-A plan or step without an explicit or inherited selector is agentless.
+A step without an explicit or inherited selector is agentless.
 
-A duplicate pool member is invalid. Combining selector kinds in one scope is invalid.
+A duplicate pool member is invalid. Combining selector kinds in one plan or step is invalid.
 
 A missing eligible agent creates a preview warning. A step blocks only when none of its eligible agents exist in desired state.
 
@@ -557,9 +625,9 @@ A missing eligible agent creates a preview warning. A step blocks only when none
 Claimed work uses a renewable claim bound to the agent identity and runtime incarnation.
 
 ```sh
-st3 work ls --as agent/node.worker
+st3 work ls --as agent/RUN/node.worker
 st3 work show step-run/GENERATION/step
-st3 work claim step-run/GENERATION/step --as agent/node.worker
+st3 work claim step-run/GENERATION/step --as agent/RUN/node.worker
 st3 work progress step-run/GENERATION/step --summary "The tests are running."
 st3 work complete step-run/GENERATION/step --summary "The product is published."
 st3 work fail step-run/GENERATION/step --reason "The compiler rejected the source."
@@ -609,7 +677,9 @@ Cancellation also cancels active descendant plan runs. Each descendant uses its 
 
 The terminal state is `cancelled` after successful final work. A final failure makes the run failed.
 
-After a run becomes terminal, st3 stops the desired subjects in its generation scope.
+After final work, st3 enters cleanup and stops every runtime owned by the plan run.
+
+The run becomes terminal only after those runtime subjects report a stopped, absent, or exited state.
 
 An exact repeated cancellation is idempotent. The old run and its immutable generations remain readable.
 
@@ -635,7 +705,7 @@ All distinct reviewers for the changed paths must approve. Each approval names t
 
 ```sh
 st3 work revise PLAN_RUN replacement.kdl \
-  --as agent/node.worker \
+  --as agent/RUN/worker \
   --reason "The generated source adds one verification step."
 
 st3 work revision show PLAN_RUN
@@ -662,7 +732,9 @@ Every compatible state carries to the successor. Compatible claimed, working, or
 
 The old generation remains readable. A late work action against it fails with `stale-run-generation`.
 
-Plan and step members belong to an internal generation scope. The reconciler stops members left only in the superseded generation lineage. A member used by the successor moves to its new generation scope.
+Plan and step members record their owner run and generation. The reconciler stops members left only in the superseded generation lineage.
+
+A compatible member keeps the same run-local subject in the successor. A plan revision cannot move it to another plan run.
 
 A cutover cancels active descendant plan runs that started from predecessor steps. `when-idle` also waits for claimed, working, or verifying descendant work before cutover.
 
@@ -694,35 +766,39 @@ Bare document names can appear in an intent before preview. The preview resolves
 
 If a file contains multiple ready plans, select one with `--plan`.
 
+`st3 plan show PLAN_RUN` reads one exact run. `st3 plan show PLAN` works only when that plan has exactly one nonterminal run.
+
+The plan shortcut fails when it finds zero or multiple active runs. The error tells the caller to use an exact plan-run subject.
+
 ## Planning mode
 
 Planning mode asks one durable Codex harness to author Markdown and KDL for review.
 
 ```sh
-st3 plan start --id release-plan request.md \
+st3 planning start --id release-plan request.md \
   --workspace ./project \
   --as person/nathan \
   --model gpt-5.6-sol \
   --effort medium
 
-st3 plan show SESSION
-st3 plan preview SESSION
-st3 plan revise SESSION feedback.md --as person/nathan
-st3 plan approve SESSION PREVIEW_HASH --as person/nathan
-st3 plan cancel SESSION --as person/nathan --reason "The request changed."
+st3 planning show SESSION
+st3 planning preview SESSION
+st3 planning revise SESSION feedback.md --as person/nathan
+st3 planning approve SESSION PREVIEW_HASH --as person/nathan
+st3 planning cancel SESSION --as person/nathan --reason "The request changed."
 ```
 
 Planning can also prepare a revision for one current plan run:
 
 ```sh
-st3 plan start --run PLAN_RUN request.md \
+st3 planning start --run PLAN_RUN request.md \
   --workspace ./project \
   --as person/nathan
 
-st3 plan preview SESSION --variant compact
-st3 plan preview SESSION --variant extended
-st3 plan compare SESSION compact extended
-st3 plan propose SESSION extended \
+st3 planning preview SESSION --variant compact
+st3 planning preview SESSION --variant extended
+st3 planning compare SESSION compact extended
+st3 planning propose SESSION extended \
   --as person/nathan \
   --reason "The extended variant covers the discovered risk."
 ```
@@ -730,7 +806,7 @@ st3 plan propose SESSION extended \
 The planner uses this command:
 
 ```sh
-st3 plan submit SESSION --variant compact --markdown PLAN.md --kdl plan.kdl
+st3 planning submit SESSION --variant compact --markdown PLAN.md --kdl plan.kdl
 ```
 
 The session stores the request, feedback, Markdown, and KDL as immutable documents. Small Talk carries document references, not mutable file paths.

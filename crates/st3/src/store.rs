@@ -12,13 +12,13 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
-    DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent, PlanOutputView,
-    PlanResponse, PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction,
-    PlanningCandidateView, PlanningPreviewView, PlanningSessionView, PlanningVariantView,
-    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, ResourceObservationOutcome,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView, St3Error,
-    StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec, WorkRequest,
-    WorkSelector,
+    DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent, PlanInputKind,
+    PlanOutputView, PlanResponse, PlanRunInput, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
+    PlannedAction, PlanningCandidateView, PlanningPreviewView, PlanningSessionView,
+    PlanningVariantView, ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse,
+    ResourceObservationOutcome, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionSpec, WorkRequest, WorkSelector,
 };
 
 const SCHEMA: &str = r#"
@@ -79,12 +79,19 @@ CREATE TABLE IF NOT EXISTS desired (
     body TEXT NOT NULL,
     member TEXT,
     activation TEXT,
-    scopes TEXT NOT NULL
+    owner_run TEXT,
+    owner_generation TEXT,
+    owner_step TEXT
 );
 
 CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY,
     response TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_run_requests (
+    key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -142,7 +149,7 @@ CREATE TABLE IF NOT EXISTS plan_runs (
     parent_step_run TEXT,
     workspace TEXT NOT NULL,
     requester TEXT NOT NULL,
-    run_scope TEXT,
+    inputs TEXT NOT NULL,
     mode TEXT NOT NULL,
     status TEXT NOT NULL,
     phase TEXT NOT NULL,
@@ -701,6 +708,45 @@ impl Store {
                 format!("plan `{plan_id}` is not ready"),
             ));
         }
+        if child.is_some() && !plan.inputs.is_empty() {
+            return Err(St3Error::new(
+                "child-plan-inputs-unsupported",
+                "a child plan cannot declare inputs in this version",
+            ));
+        }
+        let request_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "request": request,
+                "parent": child.as_ref().map(|child| json!({
+                    "root_revision": child.root_revision,
+                    "root_run_id": child.root_run_id,
+                    "parent_step_run": child.parent_step_run,
+                    "default_selector": child.default_selector,
+                })),
+            }))
+            .map_err(internal)?,
+        ));
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        if let Some((response, stored_hash)) = connection
+            .query_row(
+                "SELECT i.response, r.request_hash FROM idempotency i JOIN plan_run_requests r ON r.key=i.key WHERE i.key=?1",
+                [&request.idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+        {
+            if stored_hash != request_hash {
+                return Err(St3Error::new(
+                    "idempotency-mismatch",
+                    "the plan-run idempotency key was used with different input",
+                ));
+            }
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let transaction = connection.transaction().map_err(internal)?;
+        let inputs = resolve_plan_run_inputs(&transaction, &plan, &request.inputs)?;
+        enforce_plan_run_capacity(&transaction, &plan)?;
         let run_id = hex::encode(Sha256::digest(
             format!("{}:{}", self.origin, request.idempotency_key).as_bytes(),
         ))[..32]
@@ -748,31 +794,15 @@ impl Store {
                 parent_step_run.clone().unwrap_or_default(),
             ),
         ]);
-        let run_scope = plan
-            .scope_template
-            .as_deref()
-            .map(|scope| crate::plan::interpolate(scope, &variables))
-            .transpose()?;
-        variables.insert("ST_SCOPE".into(), run_scope.clone().unwrap_or_default());
-        let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [&request.idempotency_key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
+        for (name, input) in &inputs {
+            variables.insert(format!("input.{name}"), input.value.clone());
         }
-        let transaction = connection.transaction().map_err(internal)?;
+        let now = now_ms();
         transaction
             .execute(
-                "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-                params![run_id, plan.id, plan.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, run_scope, mode, now.to_string()],
+                params![run_id, plan.id, plan.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, now.to_string()],
             )
             .map_err(internal)?;
         transaction
@@ -826,7 +856,7 @@ impl Store {
                 "default_selector": default_selector,
                 "workspace": request.workspace,
                 "requester": requester,
-                "run_scope": run_scope,
+                "inputs": inputs,
                 "mode": mode,
             }
         });
@@ -865,6 +895,12 @@ impl Store {
                     request.idempotency_key,
                     serde_json::to_string(&view).map_err(internal)?
                 ],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO plan_run_requests(key, request_hash) VALUES (?1, ?2)",
+                params![request.idempotency_key, request_hash],
             )
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
@@ -1162,10 +1198,10 @@ impl Store {
                 format!("the proposal does not contain ready plan `{plan_id}`"),
             ));
         }
-        if old.scope_template != plan.scope_template {
+        if old.inputs != plan.inputs {
             return Err(St3Error::new(
-                "run-scope-mutation",
-                "a run revision cannot change its enclosing scope",
+                "run-input-mutation",
+                "a run revision cannot change its input declarations",
             ));
         }
         let actor = normalize_actor(actor, "agent");
@@ -1683,21 +1719,6 @@ impl Store {
         )
     }
 
-    pub fn plan_run_for_scope(&self, scope: &str) -> Result<Option<PlanRunView>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
-        let run_id = connection
-            .query_row(
-                "SELECT id FROM plan_runs WHERE run_scope=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
-                [scope],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        run_id
-            .map(|run_id| plan_run_view_tx(&connection, &run_id))
-            .transpose()
-            .map_err(Into::into)
-    }
-
     pub fn plan_run_for_parent_step(&self, step: &str) -> Result<Option<PlanRunView>> {
         let step = normalize_step_run(step);
         let connection = self.connection.lock().expect("store mutex poisoned");
@@ -1817,10 +1838,10 @@ impl Store {
                     "the current plan revision is unavailable",
                 )
             })?;
-        if old.scope_template != plan.scope_template {
+        if old.inputs != plan.inputs {
             return Err(St3Error::new(
-                "run-scope-mutation",
-                "a run revision cannot change its enclosing scope",
+                "run-input-mutation",
+                "a run revision cannot change its input declarations",
             ));
         }
 
@@ -2039,6 +2060,22 @@ impl Store {
         )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn active_plan_runs_for_plan(&self, plan: &str) -> Result<Vec<PlanRunView>> {
+        let plan = plan.strip_prefix("plan/").unwrap_or(plan);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id FROM plan_runs
+             WHERE plan_id=?1 AND status IN ('running','standing','blocked')
+             ORDER BY created_at_unix_ms, id",
+        )?;
+        let ids = statement
+            .query_map([plan], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
@@ -2442,6 +2479,14 @@ impl Store {
             .is_some_and(|current| current.0 == status && current.1 == phase)
             || current.is_none()
         {
+            return Ok(false);
+        }
+        if current.as_ref().is_some_and(|(_, current_phase)| {
+            current_phase == "terminal"
+                || (current_phase.starts_with("cleanup-") && phase != "terminal")
+                || (current_phase == "final-cancelled"
+                    && !matches!(phase, "final-cancelled" | "cleanup-cancelled" | "terminal"))
+        }) {
             return Ok(false);
         }
         let now = now_ms();
@@ -3086,8 +3131,8 @@ impl Store {
             .map_err(internal)?;
             transaction
                 .execute(
-                    "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, scopes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, scopes=excluded.scopes",
+                    "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
                     params![
                         subject,
                         desired.kind,
@@ -3096,7 +3141,9 @@ impl Store {
                         serde_json::to_string(&desired.desired).map_err(internal)?,
                         desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
                         desired.activation.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
-                        serde_json::to_string(&desired.scopes).map_err(internal)?,
+                        desired.owner_run,
+                        desired.owner_generation,
+                        desired.owner_step,
                     ],
                 )
                 .map_err(internal)?;
@@ -3439,7 +3486,7 @@ impl Store {
     pub fn status_at(
         &self,
         selected: Option<&str>,
-        selected_scope: Option<&str>,
+        selected_owner_run: Option<&str>,
         at_index: Option<u64>,
     ) -> Result<StatusResponse> {
         let connection = self.connection.lock().expect("store mutex poisoned");
@@ -3468,14 +3515,8 @@ impl Store {
                 at_index,
             )?;
             let kind = desired.as_ref().map(|row| row.kind.clone());
-            let scopes = desired
-                .as_ref()
-                .and_then(|row| serde_json::from_str::<BTreeSet<String>>(&row.scopes).ok())
-                .map(|values| values.into_iter().collect::<Vec<_>>())
-                .unwrap_or_default();
-            if selected_scope.is_some_and(|scope| {
-                subject != scope && !scopes.iter().any(|candidate| candidate == scope)
-            }) {
+            let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
+            if selected_owner_run.is_some_and(|run| owner_run.as_deref() != Some(run)) {
                 continue;
             }
             let member = desired
@@ -3506,10 +3547,8 @@ impl Store {
                     .to_owned()
             };
             let gap = match (kind.as_deref(), member.as_ref(), status) {
-                (Some("stop" | "scope-stop"), _, Some("stopped" | "absent" | "exited")) => None,
-                (Some("stop" | "scope-stop"), _, _) => {
-                    Some("the desired state is stopped".to_owned())
-                }
+                (Some("stop"), _, Some("stopped" | "absent" | "exited")) => None,
+                (Some("stop"), _, _) => Some("the desired state is stopped".to_owned()),
                 (_, Some(_), Some("running" | "ready" | "working" | "idle")) => None,
                 (_, Some(member), Some("exited"))
                     if member.restart == crate::model::RestartType::Never =>
@@ -3523,7 +3562,7 @@ impl Store {
             if let Some(reason) = &gap {
                 pending_actions.push(PlannedAction {
                     subject: subject.clone(),
-                    action: if matches!(kind.as_deref(), Some("stop" | "scope-stop")) {
+                    action: if matches!(kind.as_deref(), Some("stop")) {
                         "stop"
                     } else {
                         "reconcile"
@@ -3558,7 +3597,7 @@ impl Store {
                 actual,
                 conflicts,
                 claims,
-                scopes,
+                owner_run,
                 gap,
                 reachability,
                 reason,
@@ -3580,7 +3619,7 @@ impl Store {
         &self,
         after: u64,
         subject: Option<&str>,
-        scope: Option<&str>,
+        owner_run: Option<&str>,
     ) -> Result<Vec<EventRecord>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
@@ -3598,8 +3637,8 @@ impl Store {
         })?;
         rows.filter_map(|row| match row {
             Ok(event)
-                if scope
-                    .is_some_and(|scope| !subject_in_scope(&connection, &event.subject, scope)) =>
+                if owner_run
+                    .is_some_and(|run| !subject_owned_by(&connection, &event.subject, run)) =>
             {
                 None
             }
@@ -3612,7 +3651,7 @@ impl Store {
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT subject, kind, body, member, activation, scopes FROM desired ORDER BY subject",
+            "SELECT subject, kind, body, member, activation, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
         let rows = statement.query_map([], |row| {
             let subject = row.get::<_, String>(0)?;
@@ -3620,14 +3659,15 @@ impl Store {
             let desired = row.get::<_, String>(2)?;
             let member = row.get::<_, Option<String>>(3)?;
             let activation = row.get::<_, Option<String>>(4)?;
-            let scopes = row.get::<_, String>(5)?;
             Ok(DesiredSubject {
                 subject,
                 kind,
                 desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
                 member: member.and_then(|value| serde_json::from_str(&value).ok()),
                 activation: activation.and_then(|value| serde_json::from_str(&value).ok()),
-                scopes: serde_json::from_str(&scopes).unwrap_or_default(),
+                owner_run: row.get(5)?,
+                owner_generation: row.get(6)?,
+                owner_step: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3735,6 +3775,19 @@ impl Store {
                      FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index DESC LIMIT 1";
         connection
             .query_row(query, params![subject, kind], claim_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+                 FROM claims WHERE id=?1",
+                [id],
+                claim_from_row,
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -4042,7 +4095,7 @@ impl Store {
     pub fn claims_page(
         &self,
         subject: Option<&str>,
-        scope: Option<&str>,
+        owner_run: Option<&str>,
         after_index: u64,
         before_index: Option<u64>,
         descending: bool,
@@ -4060,7 +4113,7 @@ impl Store {
         let mut claims = Vec::new();
         for row in rows {
             let claim = row?;
-            if scope.is_some_and(|scope| !subject_in_scope(&connection, &claim.subject, scope)) {
+            if owner_run.is_some_and(|run| !subject_owned_by(&connection, &claim.subject, run)) {
                 continue;
             }
             claims.push(claim);
@@ -4517,13 +4570,148 @@ struct DesiredRow {
     claim_id: String,
     body: String,
     member: Option<String>,
-    scopes: String,
+    owner_run: Option<String>,
+}
+
+fn resolve_plan_run_inputs(
+    transaction: &Transaction<'_>,
+    plan: &PlanSpec,
+    supplied: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, PlanRunInput>, St3Error> {
+    let declared = plan.inputs.keys().cloned().collect::<BTreeSet<_>>();
+    let provided = supplied.keys().cloned().collect::<BTreeSet<_>>();
+    if declared != provided {
+        let missing = declared.difference(&provided).cloned().collect::<Vec<_>>();
+        let extra = provided.difference(&declared).cloned().collect::<Vec<_>>();
+        return Err(St3Error::new(
+            "invalid-plan-inputs",
+            format!(
+                "the plan inputs do not match; missing [{}]; extra [{}]",
+                missing.join(", "),
+                extra.join(", ")
+            ),
+        ));
+    }
+    let mut resolved = BTreeMap::new();
+    for (name, declaration) in &plan.inputs {
+        let value = supplied.get(name).expect("the exact input set was checked");
+        let input = match declaration.kind {
+            PlanInputKind::Text => PlanRunInput {
+                kind: PlanInputKind::Text,
+                value: value.clone(),
+                subject: None,
+                claim_id: None,
+            },
+            PlanInputKind::Resource => {
+                let (subject, requested_claim) = value
+                    .rsplit_once('@')
+                    .map_or((value.as_str(), None), |(subject, claim)| {
+                        (subject, Some(claim))
+                    });
+                if !subject.starts_with("resource/") {
+                    return Err(St3Error::new(
+                        "invalid-resource-input",
+                        format!("plan input `{name}` needs a resource subject"),
+                    ));
+                }
+                let claim_id = if let Some(claim_id) = requested_claim {
+                    let exists = transaction
+                        .query_row(
+                            "SELECT 1 FROM claims WHERE id=?1 AND subject=?2",
+                            params![claim_id, subject],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .is_some();
+                    if !exists {
+                        return Err(St3Error::new(
+                            "missing-resource-input-version",
+                            format!("plan input `{name}` references an unavailable claim"),
+                        ));
+                    }
+                    claim_id.to_owned()
+                } else {
+                    latest_claim_id_tx(transaction, subject)
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            St3Error::new(
+                                "missing-resource-input",
+                                format!("plan input `{name}` references an unavailable resource"),
+                            )
+                        })?
+                };
+                PlanRunInput {
+                    kind: PlanInputKind::Resource,
+                    value: format!("{subject}@{claim_id}"),
+                    subject: Some(subject.to_owned()),
+                    claim_id: Some(claim_id),
+                }
+            }
+        };
+        resolved.insert(name.clone(), input);
+    }
+    Ok(resolved)
+}
+
+fn enforce_plan_run_capacity(
+    transaction: &Transaction<'_>,
+    requested: &PlanSpec,
+) -> Result<(), St3Error> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT plan_runs.id, run_generations.revision
+             FROM plan_runs JOIN run_generations
+               ON run_generations.id=plan_runs.current_generation_id
+             WHERE plan_runs.plan_id=?1
+               AND plan_runs.status IN ('running','standing','blocked')
+             ORDER BY plan_runs.created_at_unix_ms, plan_runs.id",
+        )
+        .map_err(internal)?;
+    let active = statement
+        .query_map([&requested.id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    let mut limit = requested.max_active_runs;
+    for (_, revision) in &active {
+        let body = transaction
+            .query_row(
+                "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+                params![requested.id, revision],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(internal)?;
+        let revision = serde_json::from_str::<PlanSpec>(&body).map_err(internal)?;
+        limit = match (limit, revision.max_active_runs) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+    }
+    if limit.is_some_and(|limit| active.len() >= limit as usize) {
+        return Err(St3Error::new(
+            "plan-run-capacity",
+            format!(
+                "plan `{}` reached its active run limit; active runs: {}",
+                requested.id,
+                active
+                    .iter()
+                    .map(|(id, _)| format!("plan-run/{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<DesiredRow>> {
     connection
         .query_row(
-            "SELECT kind, revision, claim_id, body, member, scopes FROM desired WHERE subject=?1",
+            "SELECT kind, revision, claim_id, body, member, owner_run FROM desired WHERE subject=?1",
             [subject],
             |row| {
                 Ok(DesiredRow {
@@ -4532,7 +4720,7 @@ fn current_desired_row(connection: &Connection, subject: &str) -> Result<Option<
                     claim_id: row.get(2)?,
                     body: row.get(3)?,
                     member: row.get(4)?,
-                    scopes: row.get(5)?,
+                    owner_run: row.get(5)?,
                 })
             },
         )
@@ -4548,15 +4736,12 @@ fn normalize_message_party(value: &str) -> String {
     }
 }
 
-fn subject_in_scope(connection: &Connection, subject: &str, scope: &str) -> bool {
-    if subject == scope {
-        return true;
-    }
+fn subject_owned_by(connection: &Connection, subject: &str, owner_run: &str) -> bool {
     current_desired_row(connection, subject)
         .ok()
         .flatten()
-        .and_then(|row| serde_json::from_str::<BTreeSet<String>>(&row.scopes).ok())
-        .is_some_and(|scopes| scopes.contains(scope))
+        .and_then(|row| row.owner_run)
+        .is_some_and(|owner| owner == owner_run)
 }
 
 fn desired_row_at(
@@ -4613,7 +4798,7 @@ fn desired_row_at(
                     .member
                     .map(|member| serde_json::to_string(&member))
                     .transpose()?,
-                scopes: serde_json::to_string(&desired.scopes)?,
+                owner_run: desired.owner_run,
             })
         })
         .transpose()
@@ -4625,7 +4810,7 @@ fn current_desired_row_tx(
 ) -> Result<Option<DesiredRow>> {
     transaction
         .query_row(
-            "SELECT kind, revision, claim_id, body, member, scopes FROM desired WHERE subject=?1",
+            "SELECT kind, revision, claim_id, body, member, owner_run FROM desired WHERE subject=?1",
             [subject],
             |row| {
                 Ok(DesiredRow {
@@ -4634,7 +4819,7 @@ fn current_desired_row_tx(
                     claim_id: row.get(2)?,
                     body: row.get(3)?,
                     member: row.get(4)?,
-                    scopes: row.get(5)?,
+                    owner_run: row.get(5)?,
                 })
             },
         )
@@ -4887,7 +5072,6 @@ fn registered_client_claim_kind(kind: &str) -> bool {
         "step-run.carried",
         "step-run.state",
         "step-run.retry",
-        "scope.members",
         "supervision.decision",
         "subscription.health",
         "terminal.input.requested",
@@ -5525,8 +5709,8 @@ fn select_replicated_desired(
     }
     transaction
         .execute(
-            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, scopes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, scopes=excluded.scopes",
+            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
             params![
                 claim.subject,
                 desired.kind,
@@ -5535,7 +5719,9 @@ fn select_replicated_desired(
                 serde_json::to_string(&desired.desired).map_err(internal)?,
                 desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
                 desired.activation.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
-                serde_json::to_string(&desired.scopes).map_err(internal)?,
+                desired.owner_run,
+                desired.owner_generation,
+                desired.owner_step,
             ],
         )
         .map_err(internal)?;
@@ -5623,7 +5809,13 @@ fn project_plan_run_created(
         .get("requester")
         .and_then(Value::as_str)
         .unwrap_or("person/requester");
-    let run_scope = fields.get("run_scope").and_then(Value::as_str);
+    let inputs = fields
+        .get("inputs")
+        .cloned()
+        .map(serde_json::from_value::<BTreeMap<String, PlanRunInput>>)
+        .transpose()
+        .map_err(internal)?
+        .unwrap_or_default();
     let mode = fields.get("mode").and_then(Value::as_str).unwrap_or("run");
     let root_revision = fields
         .get("root_revision")
@@ -5656,9 +5848,9 @@ fn project_plan_run_created(
     let generation_id = generation_id_from_subject(generation_subject);
     transaction
         .execute(
-            "INSERT OR IGNORE INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+            "INSERT OR IGNORE INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-            params![run_id, plan_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, run_scope, mode, claim.accepted_at_unix_ms.to_string()],
+            params![run_id, plan_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
     transaction
@@ -6326,7 +6518,7 @@ fn interpolate_selector(
 }
 
 pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut variables = BTreeMap::from([
         (
             "ST_PLAN".into(),
             run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
@@ -6337,7 +6529,6 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
             "ST_RUN_GENERATION".into(),
             generation_id_from_subject(&run.generation).into(),
         ),
-        ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_REQUESTER".into(), run.requester.clone()),
         (
@@ -6345,7 +6536,13 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
             run.parent_step_run.clone().unwrap_or_default(),
         ),
         ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
-    ])
+    ]);
+    variables.extend(
+        run.inputs
+            .iter()
+            .map(|(name, input)| (format!("input.{name}"), input.value.clone())),
+    );
+    variables
 }
 
 fn interpolate_goals(
@@ -6529,7 +6726,8 @@ fn plan_header_hash(plan: &PlanSpec) -> Result<String, St3Error> {
     let value = json!({
         "id": plan.id,
         "state": plan.state,
-        "scope": plan.scope_template,
+        "inputs": plan.inputs,
+        "max_active_runs": plan.max_active_runs,
         "owners": plan.revision_owners,
         "human_only": plan.revisions_human_only,
         "reviewer": plan.revision_reviewer,
@@ -6995,7 +7193,7 @@ fn cancel_plan_run_tx(
         claim_ids.push(claim.id);
     }
     let (next_status, next_phase) = if final_paths.is_empty() {
-        ("cancelled", "terminal")
+        ("running", "cleanup-cancelled")
     } else {
         ("running", "final-cancelled")
     };
@@ -7146,7 +7344,7 @@ fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<P
         "SELECT plan_runs.id, plan_runs.plan_id, plan_runs.initial_revision,
                 plan_runs.current_generation_id, run_generations.revision,
                 plan_runs.root_revision, plan_runs.root_run_id, plan_runs.parent_step_run,
-                plan_runs.workspace, plan_runs.requester, plan_runs.run_scope, plan_runs.mode,
+                plan_runs.workspace, plan_runs.requester, plan_runs.inputs, plan_runs.mode,
                 plan_runs.status, plan_runs.phase, plan_runs.created_at_unix_ms,
                 plan_runs.updated_at_unix_ms
          FROM plan_runs JOIN run_generations
@@ -7171,7 +7369,7 @@ fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<P
                 parent_step_run: row.get(7)?,
                 workspace: row.get(8)?,
                 requester: row.get(9)?,
-                run_scope: row.get(10)?,
+                inputs: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
                 mode: row.get(11)?,
                 status: row.get(12)?,
                 phase: row.get(13)?,
@@ -7305,7 +7503,7 @@ fn step_generation_is_current(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::parse_intent;
+    use crate::graph::parse_test_intent as parse_intent;
 
     fn simple(command: &str) -> NormalizedIntent {
         parse_intent(
@@ -7313,6 +7511,28 @@ mod tests {
             "node",
         )
         .expect("intent")
+    }
+
+    fn publish_plan(store: &Store, source: &str, key: &str) -> PlanSpec {
+        let intent = crate::graph::parse_intent(source, "node").expect("plan intent");
+        let planned = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .expect("plan preview");
+        store
+            .apply(&intent, &planned.subject_tokens, key)
+            .expect("plan publish");
+        intent
+            .plans
+            .values()
+            .next()
+            .expect("published plan")
+            .clone()
     }
 
     #[test]
@@ -7359,6 +7579,273 @@ mod tests {
         assert_eq!(error.details["subject"], "exec/work");
         assert_eq!(error.details["expected_heads"], json!([]));
         assert_eq!(error.details["current_heads"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plan_inputs_are_exact_immutable_snapshots() {
+        let store = Store::open_memory("node").unwrap();
+        publish_plan(
+            &store,
+            r#"
+version 2
+subgraph {
+  resource "source" { kind "document"; binding "late" }
+  plan "inputs" state="ready" {
+    input "message" kind="text"
+    input "source" kind="resource"
+    goal "Use the supplied values."
+    step "work" { agentless; goal "Write ${input.message}."; gate "source state" { field "state" "${input.source}" is "ready" } }
+  }
+}
+"#,
+            "publish-input-plan",
+        );
+        let first = store
+            .append_claim(&ClaimInput {
+                subject: "resource/source".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("ready".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("source-ready".into()),
+            })
+            .unwrap();
+        let request = PlanRunRequest {
+            plan: "inputs".into(),
+            revision: None,
+            workspace: ".".into(),
+            requester: Some("person/test".into()),
+            mode: None,
+            inputs: BTreeMap::from([
+                ("message".into(), "hello".into()),
+                ("source".into(), "resource/source".into()),
+            ]),
+            idempotency_key: "run-input-plan".into(),
+        };
+        let run = store.create_plan_run(&request).unwrap();
+        assert_eq!(run.inputs["message"].value, "hello");
+        assert_eq!(
+            run.inputs["source"].value,
+            format!("resource/source@{}", first.id)
+        );
+        assert_eq!(
+            store.create_plan_run(&request).unwrap().subject,
+            run.subject
+        );
+        let mut second_run = request.clone();
+        second_run.idempotency_key = "run-input-plan-two".into();
+        assert_eq!(
+            store.create_plan_run(&second_run).unwrap_err().code,
+            "plan-run-capacity"
+        );
+
+        let mut changed = request.clone();
+        changed.inputs.insert("message".into(), "changed".into());
+        assert_eq!(
+            store.create_plan_run(&changed).unwrap_err().code,
+            "idempotency-mismatch"
+        );
+        let mut missing = request.clone();
+        missing.idempotency_key = "run-input-missing".into();
+        missing.inputs.remove("source");
+        assert_eq!(
+            store.create_plan_run(&missing).unwrap_err().code,
+            "invalid-plan-inputs"
+        );
+        let mut extra = request.clone();
+        extra.idempotency_key = "run-input-extra".into();
+        extra.inputs.insert("other".into(), "value".into());
+        assert_eq!(
+            store.create_plan_run(&extra).unwrap_err().code,
+            "invalid-plan-inputs"
+        );
+
+        let second = store
+            .append_claim(&ClaimInput {
+                subject: "resource/source".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("changed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("source-changed".into()),
+            })
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().inputs["source"].claim_id,
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn child_runs_reject_inputs_and_revisions_cannot_change_them() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+subgraph {
+  plan "parent" state="ready" { goal "Keep the parent run open." }
+  plan "child" state="ready" {
+    input "message" kind="text"
+    goal "Use the supplied message."
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "publish-parent-child")
+            .unwrap();
+        let parent = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "parent".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "parent-run".into(),
+            })
+            .unwrap();
+        let child_error = store
+            .create_child_plan_run(
+                &PlanRunRequest {
+                    plan: "child".into(),
+                    revision: None,
+                    workspace: ".".into(),
+                    requester: None,
+                    mode: None,
+                    inputs: BTreeMap::from([("message".into(), "hello".into())]),
+                    idempotency_key: "child-run".into(),
+                },
+                &parent,
+                "step-run/test/child",
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(child_error.code, "child-plan-inputs-unsupported");
+
+        let original = publish_plan(
+            &store,
+            r#"
+version 2
+subgraph {
+  plan "revision-input" state="ready" {
+    input "message" kind="text"
+    goal "Use the supplied message."
+  }
+}
+"#,
+            "publish-revision-input",
+        );
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: original.id,
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::from([("message".into(), "hello".into())]),
+                idempotency_key: "revision-input-run".into(),
+            })
+            .unwrap();
+        let changed = publish_plan(
+            &store,
+            r#"
+version 2
+subgraph {
+  plan "revision-input" state="ready" {
+    input "source" kind="resource"
+    goal "Use the supplied resource."
+  }
+}
+"#,
+            "publish-changed-revision-input",
+        );
+        let revision_error = store
+            .adopt_plan_revision(
+                &run.id,
+                &changed,
+                "agent/node.worker",
+                "change the input declaration",
+                "adopt-changed-revision-input",
+            )
+            .unwrap_err();
+        assert_eq!(revision_error.code, "run-input-mutation");
+    }
+
+    #[test]
+    fn plan_run_capacity_uses_the_strictest_active_revision() {
+        let store = Store::open_memory("node").unwrap();
+        let first = publish_plan(
+            &store,
+            r#"version 2
+subgraph { plan "bounded" state="ready" { concurrent-runs max=3; goal "Keep this run open." } }"#,
+            "bounded-three",
+        );
+        for index in 1..=2 {
+            store
+                .create_plan_run(&PlanRunRequest {
+                    plan: "bounded".into(),
+                    revision: Some(first.revision.clone()),
+                    workspace: ".".into(),
+                    requester: None,
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("bounded-run-{index}"),
+                })
+                .unwrap();
+        }
+        let second = publish_plan(
+            &store,
+            r#"version 2
+subgraph { plan "bounded" state="ready" { concurrent-runs max=1; goal "Keep one run open." } }"#,
+            "bounded-one",
+        );
+        assert_eq!(store.active_plan_runs_for_plan("bounded").unwrap().len(), 2);
+        let error = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "bounded".into(),
+                revision: Some(second.revision),
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "bounded-run-three".into(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "plan-run-capacity");
+        assert!(error.message.contains("plan-run/"));
+
+        let unlimited = Store::open_memory("node").unwrap();
+        let plan = publish_plan(
+            &unlimited,
+            r#"version 2
+subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all runs." } }"#,
+            "unlimited-plan",
+        );
+        for index in 1..=3 {
+            unlimited
+                .create_plan_run(&PlanRunRequest {
+                    plan: "unlimited".into(),
+                    revision: Some(plan.revision.clone()),
+                    workspace: ".".into(),
+                    requester: None,
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("unlimited-run-{index}"),
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -7542,6 +8029,7 @@ subgraph { plan "remote" state="ready" { goal "Run remote work."; step "work" { 
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "remote-run".into(),
             })
             .unwrap();
@@ -7580,6 +8068,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "remote-work-run".into(),
             })
             .unwrap();
@@ -7664,6 +8153,7 @@ subgraph {{
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "lineage-run".into(),
             })
             .unwrap();
@@ -7766,6 +8256,7 @@ subgraph {{
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "proposal-run".into(),
             })
             .unwrap();
@@ -8090,7 +8581,7 @@ subgraph {{
     #[test]
     fn desired_messages_use_canonical_agent_parties_in_views() {
         let store = Store::open_memory("node").unwrap();
-        let intent = crate::graph::parse_intent(
+        let intent = crate::graph::parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -8155,7 +8646,7 @@ subgraph {
     #[test]
     fn work_actions_require_an_active_incarnation_bound_lease() {
         let store = Store::open_memory("node").unwrap();
-        let intent = crate::graph::parse_intent(
+        let intent = crate::graph::parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -8187,6 +8678,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "lease-run".into(),
             })
             .unwrap();
@@ -8246,7 +8738,7 @@ subgraph {
     fn an_active_nested_lease_can_publish_its_parent_plan_output() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8285,6 +8777,7 @@ subgraph { plan "project/work" state="ready" { goal "Run project work."; step "w
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "nested-output-run".into(),
             })
             .unwrap();
@@ -8347,7 +8840,7 @@ subgraph { plan "project/work" state="ready" { goal "Run project work."; step "w
     fn a_retry_records_its_backoff_boundary() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8371,6 +8864,7 @@ subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } 
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "retry-run".into(),
             })
             .unwrap();
@@ -8389,7 +8883,7 @@ subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } 
     fn an_authorized_revision_preserves_unrelated_work_and_resets_dependents() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8424,6 +8918,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "revision-run".into(),
             })
             .unwrap();
@@ -8472,7 +8967,7 @@ subgraph {
     fn a_revision_keeps_the_old_generation_and_fences_its_work() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8511,6 +9006,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "generation-run".into(),
             })
             .unwrap();
@@ -8630,7 +9126,7 @@ subgraph {
     fn assigned_work_does_not_grant_revision_authority() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
-            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8662,6 +9158,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "authority-run".into(),
             })
             .unwrap();
@@ -8757,7 +9254,7 @@ subgraph {{
 }}
 "#
             );
-            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8778,6 +9275,7 @@ subgraph {{
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "protected-run".into(),
             })
             .unwrap();
@@ -8860,7 +9358,7 @@ subgraph {{
 }}
 "#
             );
-            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8881,6 +9379,7 @@ subgraph {{
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "cancel-run".into(),
             })
             .unwrap();
@@ -8960,7 +9459,7 @@ subgraph {{
 }}
 "#
             );
-            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
                 .plan(
                     &intent,
@@ -8981,6 +9480,7 @@ subgraph {{
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "drain-run".into(),
             })
             .unwrap();
@@ -9014,7 +9514,7 @@ subgraph {
   }
 }
 "#;
-        let child_intent = crate::graph::parse_intent(child_source, "node").unwrap();
+        let child_intent = crate::graph::parse_test_intent(child_source, "node").unwrap();
         let child_planned = store
             .plan(
                 &child_intent,
@@ -9035,6 +9535,7 @@ subgraph {
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
                     mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
                     idempotency_key: "drain-child-run".into(),
                 },
                 &run,
@@ -9134,9 +9635,8 @@ subgraph {
   plan "cancel" state="ready" {
     goal "Cancel this plan through the graph."
     completion { when "all-steps-exhausted" }
-    agentless
-    step "work" { }
-    finally { step "cleanup" { } }
+    step "work" { agentless }
+    finally { step "cleanup" { agentless } }
   }
 }
 "#;
@@ -9160,6 +9660,7 @@ subgraph {
                 workspace: ".".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-cancel-plan".into(),
             })
             .unwrap();
@@ -9168,8 +9669,7 @@ version 2
 subgraph {
   plan "cancel-child" state="ready" {
     goal "Cancel with the parent run."
-    agentless
-    step "child-work" { }
+    step "child-work" { agentless }
   }
 }
 "#;
@@ -9198,6 +9698,7 @@ subgraph {
                     workspace: ".".into(),
                     requester: Some("person/test".into()),
                     mode: None,
+                    inputs: BTreeMap::new(),
                     idempotency_key: "run-cancel-child".into(),
                 },
                 &run,
@@ -9230,8 +9731,36 @@ subgraph {
         assert_eq!(cancelled.status, "running");
         assert_eq!(cancelled.phase, "final-cancelled");
         assert_eq!(
-            store.plan_run(&child.id).unwrap().unwrap().status,
-            "cancelled"
+            store.plan_run(&child.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        assert!(
+            !store
+                .set_plan_run_state(
+                    &child.id,
+                    "standing",
+                    "normal",
+                    Some("a stale evaluator tried to reopen the run"),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.plan_run(&child.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        assert!(
+            !store
+                .set_plan_run_state(
+                    &run.id,
+                    "standing",
+                    "normal",
+                    Some("a stale evaluator tried to reopen the run"),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.plan_run(&run.id).unwrap().unwrap().phase,
+            "final-cancelled"
         );
         assert_eq!(
             cancelled

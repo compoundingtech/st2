@@ -5,7 +5,7 @@ ledger="$CATALOG/worker"
 state="$CATALOG/.stev"
 stamp="$state/restart.done"
 log="$state/restart.log"
-subject="agent/rc.dev"
+subject="agent/${ST_PLAN_RUN}/rc.dev"
 mkdir -p "$state"
 
 actual() {
@@ -36,7 +36,7 @@ for _ in $(seq 1 1200); do
 done
 [ -n "$new_incarnation" ]
 
-duplicate_id="$(st3 message send rc.dev \
+duplicate_id="$(st3 message send "$subject" \
   --from "$ST_AGENT" \
   --subject "Repeated pre-restart work" \
   --tags "plan-run:$ST_PLAN_RUN,duplicate-work:process-before-restart" \

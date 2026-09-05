@@ -14,7 +14,6 @@ const ROOT_NODES: &[&str] = &[
     "agent",
     "exec",
     "pty",
-    "scope",
     "host",
     "resource",
     "observer",
@@ -36,11 +35,45 @@ struct ParseContext {
     checkpoints: Vec<CheckpointSpec>,
     document_refs: BTreeSet<String>,
     checkpoint: Option<CheckpointActivation>,
-    scopes: BTreeSet<String>,
+    owner_run: Option<String>,
+    allow_execution_root: bool,
     plan_run_cancellations: Vec<PlanRunCancellation>,
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
+    parse_intent_with_owner(source, default_host, None, false)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_test_intent(
+    source: &str,
+    default_host: &str,
+) -> Result<NormalizedIntent, St3Error> {
+    parse_intent_with_owner(source, default_host, None, true)
+}
+
+pub(crate) fn parse_execution_intent(
+    source: &str,
+    default_host: &str,
+    run_id: &str,
+) -> Result<NormalizedIntent, St3Error> {
+    let owner = format!(
+        "plan-run/{}",
+        run_id.strip_prefix("plan-run/").unwrap_or(run_id)
+    );
+    parse_intent_with_owner(source, default_host, Some(&owner), true)
+}
+
+fn owner_run_id(owner: &str) -> &str {
+    owner.strip_prefix("plan-run/").unwrap_or(owner)
+}
+
+fn parse_intent_with_owner(
+    source: &str,
+    default_host: &str,
+    owner_run: Option<&str>,
+    allow_execution_root: bool,
+) -> Result<NormalizedIntent, St3Error> {
     if source.len() > 16 * 1024 * 1024 {
         return Err(St3Error::new(
             "intent-too-large",
@@ -89,13 +122,17 @@ pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent
         checkpoints: Vec::new(),
         document_refs: BTreeSet::new(),
         checkpoint: None,
-        scopes: BTreeSet::new(),
+        owner_run: owner_run.map(str::to_owned),
+        allow_execution_root,
         plan_run_cancellations: Vec::new(),
     };
     for node in children.nodes() {
         parse_desired_node(node, None, &mut context)?;
     }
     collect_document_refs(root, &mut context.document_refs)?;
+    if let Some(run) = owner_run {
+        rewrite_owned_references(&mut context.subjects, owner_run_id(run));
+    }
     validate_links(&context.subjects)?;
 
     let normalized_nodes = children
@@ -163,9 +200,19 @@ fn parse_desired_node(
             format!("unknown desired-state node `{kind}`"),
         ));
     }
+    if !context.allow_execution_root
+        && matches!(
+            kind,
+            "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule" | "stop"
+        )
+    {
+        return Err(St3Error::new(
+            "runtime-outside-plan",
+            format!("`{kind}` must be inside a plan or step subgraph"),
+        ));
+    }
     match kind {
         "host" => parse_host(node, context),
-        "scope" => parse_scope(node, enclosing_host, context),
         "agent" => parse_agent(node, enclosing_host, context),
         "exec" | "pty" => parse_standalone_member(node, kind, enclosing_host, context),
         "plan" => Ok(()),
@@ -246,7 +293,9 @@ fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             desired: canonical_node(node)?,
             member: None,
             activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )?;
     if let Some(children) = node.children() {
@@ -260,103 +309,6 @@ fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             parse_desired_node(child, Some(&name), context)?;
         }
     }
-    Ok(())
-}
-
-fn parse_scope(
-    node: &KdlNode,
-    enclosing_host: Option<&str>,
-    context: &mut ParseContext,
-) -> Result<(), St3Error> {
-    let name = one_string_with_children(node)?;
-    let plan_only = node.children().is_some_and(|children| {
-        !children.nodes().is_empty()
-            && children
-                .nodes()
-                .iter()
-                .all(|child| child.name().value() == "plan")
-    });
-    if plan_only {
-        return Ok(());
-    }
-    if node.children().is_some_and(|children| {
-        children
-            .nodes()
-            .iter()
-            .any(|child| child.name().value() == "plan")
-    }) {
-        return Err(St3Error::new(
-            "mixed-plan-scope",
-            "a plan scope cannot mix plan definitions with immediate desired state",
-        ));
-    }
-    validate_name(&name, false)?;
-    ensure_only_properties(node, &["retention"])?;
-    let retention = property_string(node, "retention")?.unwrap_or_else(|| "persistent".into());
-    if !matches!(retention.as_str(), "persistent" | "temporary") {
-        return Err(St3Error::new(
-            "invalid-scope-retention",
-            format!("scope `{name}` has invalid retention `{retention}`"),
-        ));
-    }
-    let subject = namespaced("scope", &name);
-    let is_stop = node.children().is_some_and(|children| {
-        children.nodes().len() == 1 && children.nodes()[0].name().value() == "stop"
-    });
-    insert_subject(
-        context,
-        DesiredSubject {
-            subject: subject.clone(),
-            kind: if is_stop { "scope-stop" } else { "scope" }.into(),
-            desired: canonical_node(node)?,
-            member: None,
-            activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
-        },
-    )?;
-    let Some(children) = node.children() else {
-        return Err(St3Error::new(
-            "empty-scope",
-            format!("scope `{name}` must contain members or `stop`"),
-        ));
-    };
-    if is_stop {
-        ensure_bare(&children.nodes()[0])?;
-        return Ok(());
-    }
-    if children
-        .nodes()
-        .iter()
-        .any(|child| child.name().value() == "stop")
-    {
-        return Err(St3Error::new(
-            "mixed-scope-stop",
-            format!("scope `{name}` cannot mix `stop` with members"),
-        ));
-    }
-    let desired_children = children
-        .nodes()
-        .iter()
-        .filter(|child| child.name().value() != "plan")
-        .collect::<Vec<_>>();
-    if desired_children.is_empty() {
-        return Ok(());
-    }
-    let prior_scopes = context.scopes.clone();
-    context.scopes.insert(subject);
-    for child in desired_children {
-        if !matches!(
-            child.name().value(),
-            "agent" | "exec" | "pty" | "resource" | "message" | "stop"
-        ) {
-            return Err(St3Error::new(
-                "invalid-scope-child",
-                format!("scope `{name}` cannot contain `{}`", child.name().value()),
-            ));
-        }
-        parse_desired_node(child, enclosing_host, context)?;
-    }
-    context.scopes = prior_scopes;
     Ok(())
 }
 
@@ -385,7 +337,14 @@ fn parse_agent(
         format!("{host}.{identity}")
     };
     validate_name(&bus_id, false)?;
-    let subject = format!("agent/{bus_id}");
+    let subject = context.owner_run.as_ref().map_or_else(
+        || format!("agent/{bus_id}"),
+        |run| format!("agent/{}/{identity}", owner_run_id(run)),
+    );
+    let runtime_id = context.owner_run.as_ref().map_or_else(
+        || bus_id.clone(),
+        |run| format!("{}.{}", owner_run_id(run), identity.replace('/', ".")),
+    );
     let workspace = child_string(children, "workspace")?.unwrap_or_else(|| ".".into());
     let environment = parse_map_child(children, "env")?;
     let display_name = child_string(children, "name")?;
@@ -425,7 +384,7 @@ fn parse_agent(
         primary = Some(driver_member(
             driver,
             &subject,
-            &bus_id,
+            &runtime_id,
             &host,
             &workspace,
             &environment,
@@ -440,7 +399,7 @@ fn parse_agent(
         primary = Some(MemberSpec {
             kind: MemberKind::Agent,
             host: host.clone(),
-            runtime_id: bus_id.clone(),
+            runtime_id: runtime_id.clone(),
             workspace: workspace.clone(),
             cwd: workspace.clone(),
             terminal: true,
@@ -458,7 +417,7 @@ fn parse_agent(
     }
 
     let mut desired = canonical_node(node)?;
-    normalize_agent_under(&mut desired, &host);
+    normalize_agent_under(&mut desired, &host, context.owner_run.as_deref());
     insert_subject(
         context,
         DesiredSubject {
@@ -467,7 +426,9 @@ fn parse_agent(
             desired,
             member: primary,
             activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )?;
 
@@ -483,7 +444,16 @@ fn parse_agent(
                 format!("agent `{bus_id}` repeats task `{task_name}`"),
             ));
         }
-        let task_subject = format!("{}/{bus_id}/{task_name}", child.name().value());
+        let task_subject = context.owner_run.as_ref().map_or_else(
+            || format!("{}/{bus_id}/{task_name}", child.name().value()),
+            |run| {
+                format!(
+                    "{}/{}/{identity}/{task_name}",
+                    child.name().value(),
+                    owner_run_id(run)
+                )
+            },
+        );
         let member = task_member(
             child,
             &task_subject,
@@ -506,7 +476,9 @@ fn parse_agent(
                 desired: canonical_node(child)?,
                 member: Some(member),
                 activation: context.checkpoint.clone(),
-                scopes: context.scopes.clone(),
+                owner_run: context.owner_run.clone(),
+                owner_generation: None,
+                owner_step: None,
             },
         )?;
     }
@@ -533,7 +505,10 @@ fn parse_standalone_member(
     ensure_no_properties(node)?;
     let name = one_string_with_children(node)?;
     validate_name(&name, false)?;
-    let subject = namespaced(kind, &name);
+    let subject = context.owner_run.as_ref().map_or_else(
+        || namespaced(kind, &name),
+        |run| format!("{kind}/{}/{name}", owner_run_id(run)),
+    );
     let children = node.children().ok_or_else(|| {
         St3Error::new(
             "missing-member-body",
@@ -578,7 +553,9 @@ fn parse_standalone_member(
             desired: canonical_node(node)?,
             member: Some(member),
             activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )
 }
@@ -603,6 +580,13 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     }
     let subject = match kind {
         "resource" if name.starts_with("doc/") || name.starts_with("file/") => name,
+        "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
+            format!(
+                "{kind}/{}/{}",
+                owner_run_id(context.owner_run.as_deref().unwrap_or_default()),
+                name
+            )
+        }
         _ => namespaced(kind, &name),
     };
     insert_subject(
@@ -613,7 +597,9 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
             desired: canonical_node(node)?,
             member: None,
             activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )
 }
@@ -628,6 +614,18 @@ fn parse_stop(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             format!("stop requires a full agent, exec, or PTY subject; got `{subject}`"),
         ));
     }
+    let kind = subject.split('/').next().unwrap_or_default();
+    let local = subject
+        .strip_prefix(&format!("{kind}/"))
+        .unwrap_or(&subject);
+    let subject = context.owner_run.as_ref().map_or(subject.clone(), |run| {
+        let run = owner_run_id(run);
+        if local.starts_with(&format!("{run}/")) {
+            subject.clone()
+        } else {
+            format!("{kind}/{run}/{local}")
+        }
+    });
     insert_subject(
         context,
         DesiredSubject {
@@ -636,9 +634,94 @@ fn parse_stop(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             desired: json!({ "stop": subject }),
             member: None,
             activation: context.checkpoint.clone(),
-            scopes: context.scopes.clone(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )
+}
+
+fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run: &str) {
+    let mut aliases = BTreeMap::new();
+    for subject in subjects.keys() {
+        let Some((kind, rest)) = subject.split_once('/') else {
+            continue;
+        };
+        let Some(local) = rest.strip_prefix(&format!("{run}/")) else {
+            continue;
+        };
+        if matches!(
+            kind,
+            "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule"
+        ) {
+            aliases.insert(format!("{kind}/{local}"), subject.clone());
+            if kind == "agent" {
+                aliases.insert(local.to_owned(), subject.clone());
+            }
+        }
+    }
+    fn rewrite(value: &mut Value, aliases: &BTreeMap<String, String>) {
+        match value {
+            Value::String(value) => {
+                if let Some(replacement) = aliases.get(value) {
+                    *value = replacement.clone();
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    rewrite(value, aliases);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values_mut() {
+                    rewrite(value, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn rewrite_agent_parties(value: &mut Value, run: &str) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    rewrite_agent_parties(value, run);
+                }
+            }
+            Value::Object(values) => {
+                let agent_party = matches!(
+                    values.get("name").and_then(Value::as_str),
+                    Some("to" | "from" | "under")
+                );
+                if agent_party
+                    && let Some(party) = values
+                        .get_mut("arguments")
+                        .and_then(Value::as_array_mut)
+                        .and_then(|arguments| arguments.first_mut())
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                    && party != "requester"
+                    && !party.starts_with("person/")
+                {
+                    let local = party.strip_prefix("agent/").unwrap_or(&party);
+                    if !local.starts_with(&format!("{run}/")) {
+                        values
+                            .get_mut("arguments")
+                            .and_then(Value::as_array_mut)
+                            .and_then(|arguments| arguments.first_mut())
+                            .map(|value| *value = Value::String(format!("agent/{run}/{local}")));
+                    }
+                }
+                for value in values.values_mut() {
+                    rewrite_agent_parties(value, run);
+                }
+            }
+            _ => {}
+        }
+    }
+    for subject in subjects.values_mut() {
+        rewrite(&mut subject.desired, &aliases);
+        rewrite_agent_parties(&mut subject.desired, run);
+    }
 }
 
 #[allow(dead_code)]
@@ -649,20 +732,10 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
             "a checkpoint subgraph cannot contain checkpoints",
         ));
     }
-    ensure_only_properties(node, &["scope"])?;
+    ensure_no_properties(node)?;
     let name = one_string_with_children(node)?;
     let sequence = namespaced("checkpoint", &name);
     let sequence_subject = sequence.clone();
-    let sequence_scope = property_string(node, "scope")?;
-    if let Some(scope) = &sequence_scope {
-        if !scope.starts_with("scope/") {
-            return Err(St3Error::new(
-                "invalid-checkpoint-scope",
-                "a checkpoint scope must be a full scope subject",
-            ));
-        }
-        validate_name(scope, true)?;
-    }
     insert_subject(
         context,
         DesiredSubject {
@@ -671,7 +744,9 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
             desired: canonical_node(node)?,
             member: None,
             activation: None,
-            scopes: sequence_scope.clone().into_iter().collect(),
+            owner_run: context.owner_run.clone(),
+            owner_generation: None,
+            owner_step: None,
         },
     )?;
     let children = node.children().ok_or_else(|| {
@@ -760,10 +835,6 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
                 )
             })?;
             let prior_activation = context.checkpoint.replace(activation.clone());
-            let prior_scopes = context.scopes.clone();
-            if let Some(scope) = &sequence_scope {
-                context.scopes.insert(scope.clone());
-            }
             for child in body.nodes() {
                 if child.name().value() == "checkpoints" {
                     return Err(St3Error::new(
@@ -773,7 +844,6 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
                 }
                 parse_desired_node(child, None, context)?;
             }
-            context.scopes = prior_scopes;
             context.checkpoint = prior_activation;
         }
         let checkpoint_spec = CheckpointSpec {
@@ -793,7 +863,9 @@ fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), S
                 })?,
                 member: None,
                 activation: None,
-                scopes: sequence_scope.clone().into_iter().collect(),
+                owner_run: context.owner_run.clone(),
+                owner_generation: None,
+                owner_step: None,
             },
         )?;
         context.checkpoints.push(checkpoint_spec);
@@ -872,10 +944,10 @@ fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Er
         "empty" => {
             ensure_no_properties(child)?;
             let subject = one_string(child)?;
-            if !subject.starts_with("scope/") {
+            if !subject.starts_with("plan-run/") {
                 return Err(St3Error::new(
                     "invalid-empty-subject",
-                    "empty requires a full scope subject",
+                    "empty requires a full plan run subject",
                 ));
             }
             validate_full_subject(&subject)?;
@@ -2567,7 +2639,7 @@ pub fn agent_under(value: &Value) -> Vec<crate::model::UnderSpec> {
         .collect()
 }
 
-fn normalize_agent_under(value: &mut Value, default_host: &str) {
+fn normalize_agent_under(value: &mut Value, default_host: &str, owner_run: Option<&str>) {
     let Some(children) = value.get_mut("children").and_then(Value::as_array_mut) else {
         return;
     };
@@ -2586,7 +2658,11 @@ fn normalize_agent_under(value: &mut Value, default_host: &str) {
             continue;
         };
         let name = name.strip_prefix("agent/").unwrap_or(name);
-        let identity = if name.contains('.') {
+        let identity = if name.contains('/') {
+            name.to_owned()
+        } else if let Some(run) = owner_run {
+            format!("{}/{name}", owner_run_id(run))
+        } else if name.contains('.') {
             name.to_owned()
         } else {
             format!("{default_host}.{name}")
@@ -2734,25 +2810,10 @@ fn validate_links(subjects: &BTreeMap<String, DesiredSubject>) -> Result<(), St3
             continue;
         };
         if spec.on_unreachable == "void" {
-            let temporary = desired.scopes.iter().any(|scope| {
-                subjects.get(scope).is_some_and(|scope| {
-                    scope
-                        .desired
-                        .get("properties")
-                        .and_then(|properties| properties.get("retention"))
-                        .and_then(Value::as_str)
-                        == Some("temporary")
-                })
-            });
-            if !temporary {
-                return Err(St3Error::new(
-                    "invalid-link-policy",
-                    format!(
-                        "link `{}` uses void outside a temporary scope",
-                        desired.subject
-                    ),
-                ));
-            }
+            return Err(St3Error::new(
+                "invalid-link-policy",
+                format!("link `{}` uses removed void policy", desired.subject),
+            ));
         }
         if spec.required {
             edges.insert(spec.from, spec.to);
@@ -3169,6 +3230,14 @@ fn validate_name(value: &str, full: bool) -> Result<(), St3Error> {
 
 fn validate_full_subject(value: &str) -> Result<(), St3Error> {
     if value.contains("${") {
+        if value.starts_with("${")
+            && value.ends_with('}')
+            && value[2..value.len() - 1].chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '.')
+            })
+        {
+            return Ok(());
+        }
         let mut concrete = String::with_capacity(value.len());
         let mut rest = value;
         while let Some(start) = rest.find("${") {
@@ -3255,7 +3324,7 @@ mod tests {
 
     #[test]
     fn parses_plain_agent_and_document_version() {
-        let intent = parse_intent(
+        let intent = parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -3282,7 +3351,7 @@ subgraph {
 
     #[test]
     fn claude_uses_the_approved_st3_channel_identity() {
-        let intent = parse_intent(
+        let intent = parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -3374,7 +3443,7 @@ subgraph {
             }
         "#;
 
-        let intent = parse_intent(source, "node-a").unwrap();
+        let intent = parse_test_intent(source, "node-a").unwrap();
 
         assert_eq!(
             intent.subjects["exec/setup"].member.as_ref().unwrap().host,
@@ -3389,7 +3458,7 @@ subgraph {
 
     #[test]
     fn nested_tasks_inherit_lifecycle_and_restart_controls() {
-        let intent = parse_intent(
+        let intent = parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -3442,7 +3511,7 @@ subgraph {
   }
 }
 "#;
-        let intent = parse_intent(source, "node").unwrap();
+        let intent = parse_test_intent(source, "node").unwrap();
         let worker = agent_under(&intent.subjects["agent/node.worker"].desired);
         assert_eq!(worker.len(), 2);
         assert_eq!(worker[0].agent, "agent/node.lead");
@@ -3478,7 +3547,7 @@ subgraph {
 
     #[test]
     fn observer_fields_are_provider_neutral() {
-        let intent = parse_intent(
+        let intent = parse_test_intent(
             r#"
 version 2
 subgraph {
@@ -3503,7 +3572,7 @@ subgraph {
 
     #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {
-        let child = parse_intent(
+        let child = parse_test_intent(
             r#"version 2
 subgraph { agent "worker" { command "true"; retired #true } }"#,
             "node",
@@ -3511,7 +3580,7 @@ subgraph { agent "worker" { command "true"; retired #true } }"#,
         .expect_err("retired is old syntax");
         assert_eq!(child.code, "unknown-child");
 
-        let property = parse_intent(
+        let property = parse_test_intent(
             r#"version 2
 subgraph { exec "work" mystery="value" { command "true" } }"#,
             "node",

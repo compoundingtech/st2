@@ -2,16 +2,16 @@
 set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
-work="$(env -u ST_AGENT st3 work ls --all --json)"
 agents="$(env -u ST_AGENT st3 agents --json)"
 run="plan-run/$ST_PLAN_RUN"
+plan="$(env -u ST_AGENT st3 --json plan show "$run")"
 grouping_reason="the supervisor combines the panel recommendation"
 
 for member in fd.a fd.b fd.c; do
-  jq -e --arg subject "agent/$member" --arg reason "$grouping_reason" '
+  jq -e --arg subject "agent/$ST_PLAN_RUN/$member" --arg sup "agent/$ST_PLAN_RUN/fd.sup" --arg reason "$grouping_reason" '
     [.[] | select(.subject == $subject)] as $agents
     | ($agents | length) == 1
-      and ($agents[0].under == [{"agent":"agent/fd.sup","reason":$reason}])
+      and ($agents[0].under == [{"agent":$sup,"reason":$reason}])
   ' <<<"$agents" >/dev/null
 done
 
@@ -31,8 +31,8 @@ completed_steps=(
 
 for step in "${completed_steps[@]}"; do
   count="$(jq --arg run "$run" --arg step "$step" \
-    '[.[] | select(.run == $run and .step == $step and .status == "completed")] | length' \
-    <<<"$work")"
+    '[.steps[] | select(.step == $step and .status == "completed")] | length' \
+    <<<"$plan")"
   test "$count" -eq 1
 done
 

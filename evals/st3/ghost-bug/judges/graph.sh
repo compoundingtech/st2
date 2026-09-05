@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 run="plan-run/$ST_PLAN_RUN"
-work="$(env -u ST_AGENT st3 work ls --all --json)"
+plan="$(env -u ST_AGENT st3 --json plan show "$run")"
 
 steps=(
   start-team
@@ -27,8 +27,8 @@ steps=(
 
 for step in "${steps[@]}"; do
   jq -e --arg run "$run" --arg step "$step" \
-    'any(.[]; .run == $run and .step == $step and .status == "completed")' \
-    <<<"$work" >/dev/null
+    'any(.steps[]; .step == $step and .status == "completed")' \
+    <<<"$plan" >/dev/null
 done
 
 while read -r name kind; do

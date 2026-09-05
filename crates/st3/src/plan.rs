@@ -6,8 +6,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, PlanSpec, PlanState, ProductSpec,
-    RetrySpec, RevisionCutover, St3Error, StepSpec, UsedPlanSpec, WorkSelector,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, PlanInputKind, PlanInputSpec, PlanSpec,
+    PlanState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec, UsedPlanSpec,
+    WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
@@ -16,7 +17,6 @@ const VARIABLES: &[&str] = &[
     "ST_PLAN_RUN",
     "ST_RUN_GENERATION",
     "ST_ROOT_PLAN_RUN",
-    "ST_SCOPE",
     "ST_WORKSPACE",
     "ST_REQUESTER",
     "ST_STEP",
@@ -49,9 +49,8 @@ pub fn parse_plans(
         match node.name().value() {
             "plan" => insert_plan(
                 &mut plans,
-                parse_plan(node, None, outer_owners.clone(), default_host, true)?,
+                parse_plan(node, outer_owners.clone(), default_host, true)?,
             )?,
-            "scope" => parse_scope_plans(node, default_host, &mut plans)?,
             _ => {}
         }
     }
@@ -91,34 +90,6 @@ pub fn parent_step_path<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a str> {
     find(plan, path, None)
 }
 
-fn parse_scope_plans(
-    node: &KdlNode,
-    default_host: &str,
-    plans: &mut BTreeMap<String, PlanSpec>,
-) -> Result<(), St3Error> {
-    let scope_name = first_string(node)?;
-    let scope = if scope_name.starts_with("scope/") {
-        scope_name
-    } else {
-        format!("scope/{scope_name}")
-    };
-    ensure_only_properties(node, &["retention"])?;
-    if let Some(children) = node.children() {
-        let owners = direct_agent_owners(children, default_host)?;
-        for child in children
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "plan")
-        {
-            insert_plan(
-                plans,
-                parse_plan(child, Some(&scope), owners.clone(), default_host, true)?,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn insert_plan(plans: &mut BTreeMap<String, PlanSpec>, plan: PlanSpec) -> Result<(), St3Error> {
     if plans.insert(plan.id.clone(), plan.clone()).is_some() {
         return Err(St3Error::new(
@@ -131,7 +102,6 @@ fn insert_plan(plans: &mut BTreeMap<String, PlanSpec>, plan: PlanSpec) -> Result
 
 fn parse_plan(
     node: &KdlNode,
-    scope: Option<&str>,
     outer_owners: Vec<String>,
     default_host: &str,
     require_state: bool,
@@ -174,15 +144,31 @@ fn parse_plan(
     let children = node
         .children()
         .ok_or_else(|| St3Error::new("empty-plan", format!("plan `{id}` has no steps")))?;
+    let mut inputs = BTreeMap::new();
+    for input_node in children
+        .nodes()
+        .iter()
+        .filter(|child| child.name().value() == "input")
+    {
+        let input = parse_plan_input(input_node)?;
+        if inputs.insert(input.name.clone(), input.clone()).is_some() {
+            return Err(St3Error::new(
+                "duplicate-plan-input",
+                format!("plan `{id}` repeats input `{}`", input.name),
+            ));
+        }
+    }
+    let input_names = inputs.keys().cloned().collect::<BTreeSet<_>>();
     let mut goals = Vec::new();
     let mut baselines = Vec::new();
     let mut products = Vec::new();
     let mut gates = Vec::new();
     let mut steps = BTreeMap::new();
     let mut display_order = Vec::new();
+    let mut max_active_runs = Some(1);
+    let mut concurrent_runs_seen = false;
     let mut assigned_to = None;
     let mut available_to = Vec::new();
-    let mut agentless = false;
     let mut completion = None;
     let mut finally_seen = false;
     let mut produces_seen = false;
@@ -193,6 +179,17 @@ fn parse_plan(
     for child in children.nodes() {
         match child.name().value() {
             "goal" => goals.push(plain_string(child)?),
+            "input" => {}
+            "concurrent-runs" => {
+                if concurrent_runs_seen {
+                    return Err(St3Error::new(
+                        "duplicate-plan-field",
+                        format!("plan `{id}` repeats `concurrent-runs`"),
+                    ));
+                }
+                max_active_runs = parse_concurrent_runs(child)?;
+                concurrent_runs_seen = true;
+            }
             "assigned-to" => {
                 if assigned_to.is_some() {
                     return Err(St3Error::new(
@@ -211,16 +208,6 @@ fn parse_plan(
                     ));
                 }
                 available_to.push(agent);
-            }
-            "agentless" => {
-                if agentless {
-                    return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `agentless`"),
-                    ));
-                }
-                ensure_bare(child)?;
-                agentless = true;
             }
             "baseline" => {
                 let baseline = parse_baseline(child)?;
@@ -256,7 +243,7 @@ fn parse_plan(
                 gates.push(gate);
             }
             "step" => {
-                let step = parse_step(child, "", default_host, false)?;
+                let step = parse_step(child, "", default_host, false, &input_names)?;
                 if steps.insert(step.id.clone(), step.clone()).is_some() {
                     return Err(St3Error::new(
                         "duplicate-step",
@@ -304,7 +291,7 @@ fn parse_plan(
                             ),
                         ));
                     }
-                    let step = parse_step(final_node, "", default_host, true)?;
+                    let step = parse_step(final_node, "", default_host, true, &input_names)?;
                     if steps.insert(step.id.clone(), step.clone()).is_some() {
                         return Err(St3Error::new(
                             "duplicate-step",
@@ -350,12 +337,8 @@ fn parse_plan(
         }
     }
     validate_goal_count(&format!("plan `{id}`"), &goals, true)?;
-    let work_selector = build_work_selector(
-        &format!("plan `{id}`"),
-        assigned_to,
-        available_to,
-        agentless,
-    )?;
+    let work_selector =
+        build_work_selector(&format!("plan `{id}`"), assigned_to, available_to, false)?;
     validate_dependencies(&id, &steps)?;
     if let Some(CompletionSpec::Dependencies { dependencies }) = &completion {
         validate_dependency_targets(&id, "completion", dependencies, &steps)?;
@@ -375,7 +358,8 @@ fn parse_plan(
         id,
         state,
         revision: String::new(),
-        scope_template: scope.map(str::to_owned),
+        inputs,
+        max_active_runs,
         revision_owners,
         revisions_human_only,
         revision_reviewer,
@@ -390,6 +374,10 @@ fn parse_plan(
         steps,
         display_order,
     };
+    validate_variables(
+        &serde_json::to_value(&plan).map_err(internal)?,
+        &input_names,
+    )?;
     plan.revision = hash(&plan)?;
     Ok(plan)
 }
@@ -399,6 +387,7 @@ fn parse_step(
     parent_path: &str,
     default_host: &str,
     finally: bool,
+    input_names: &BTreeSet<String>,
 ) -> Result<StepSpec, St3Error> {
     reject_type(node)?;
     ensure_only_properties(node, &["timeout", "revisions", "revision-reviewer"])?;
@@ -517,7 +506,7 @@ fn parse_step(
                     gates.push(gate);
                 }
                 "plan" => {
-                    let mut plan = parse_plan(child, None, Vec::new(), default_host, false)?;
+                    let mut plan = parse_plan(child, Vec::new(), default_host, false)?;
                     rewrite_nested_paths(&mut plan, &path)?;
                     nested_plan = Some(Box::new(plan));
                 }
@@ -561,7 +550,7 @@ fn parse_step(
         nested_plan,
         definition_hash: String::new(),
     };
-    validate_variables(&serde_json::to_value(&step).map_err(internal)?)?;
+    validate_variables(&serde_json::to_value(&step).map_err(internal)?, input_names)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
 }
@@ -593,6 +582,68 @@ fn build_work_selector(
     } else {
         None
     })
+}
+
+fn parse_plan_input(node: &KdlNode) -> Result<PlanInputSpec, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["kind"])?;
+    ensure_no_children(node)?;
+    let name = first_string(node)?;
+    if name.contains('/') {
+        return Err(St3Error::new(
+            "invalid-plan-input",
+            format!("plan input `{name}` cannot contain `/`"),
+        ));
+    }
+    validate_id(&name, "plan input")?;
+    let kind = match property_string(node, "kind")?.as_deref() {
+        Some("text") => PlanInputKind::Text,
+        Some("resource") => PlanInputKind::Resource,
+        Some(value) => {
+            return Err(St3Error::new(
+                "invalid-plan-input-kind",
+                format!("plan input `{name}` has invalid kind `{value}`"),
+            ));
+        }
+        None => {
+            return Err(St3Error::new(
+                "missing-plan-input-kind",
+                format!("plan input `{name}` needs `kind`"),
+            ));
+        }
+    };
+    Ok(PlanInputSpec { name, kind })
+}
+
+fn parse_concurrent_runs(node: &KdlNode) -> Result<Option<u32>, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &["max"])?;
+    ensure_no_children(node)?;
+    if node.entries().iter().any(|entry| entry.name().is_none()) {
+        return Err(St3Error::new(
+            "invalid-concurrent-runs",
+            "`concurrent-runs` does not accept positional values",
+        ));
+    }
+    let Some(entry) = node.get("max") else {
+        return Ok(None);
+    };
+    let Some(value) = entry.as_integer() else {
+        return Err(St3Error::new(
+            "invalid-concurrent-runs",
+            "`concurrent-runs max` must be a positive integer",
+        ));
+    };
+    let value = u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            St3Error::new(
+                "invalid-concurrent-runs",
+                "`concurrent-runs max` must be a positive integer",
+            )
+        })?;
+    Ok(Some(value))
 }
 
 fn parse_completion(node: &KdlNode, default_host: &str) -> Result<CompletionSpec, St3Error> {
@@ -901,10 +952,7 @@ fn parse_products(node: &KdlNode) -> Result<Vec<ProductSpec>, St3Error> {
     for product in children.nodes() {
         reject_type(product)?;
         let kind = product.name().value();
-        if !matches!(
-            kind,
-            "resource" | "message" | "agent" | "exec" | "pty" | "scope"
-        ) {
+        if !matches!(kind, "resource" | "message" | "agent" | "exec" | "pty") {
             return Err(St3Error::new(
                 "invalid-product-kind",
                 format!("produces cannot match `{kind}`"),
@@ -1154,7 +1202,7 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
             ));
         };
         let name = &tail[..end];
-        if !VARIABLES.contains(&name) {
+        if !VARIABLES.contains(&name) && !name.starts_with("input.") {
             return Err(St3Error::new(
                 "unknown-variable",
                 format!("variable `{name}` is not registered"),
@@ -1173,7 +1221,38 @@ pub fn interpolate(source: &str, variables: &BTreeMap<String, String>) -> Result
     Ok(output)
 }
 
-fn validate_variables(value: &Value) -> Result<(), St3Error> {
+pub fn interpolate_kdl(
+    source: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String, St3Error> {
+    fn interpolate_document(
+        document: &mut KdlDocument,
+        variables: &BTreeMap<String, String>,
+    ) -> Result<(), St3Error> {
+        for node in document.nodes_mut() {
+            for entry in node.entries_mut() {
+                let Some(value) = entry.value().as_string() else {
+                    continue;
+                };
+                let value = interpolate(value, variables)?;
+                *entry.value_mut() = KdlValue::String(value);
+            }
+            if let Some(children) = node.children_mut() {
+                interpolate_document(children, variables)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut document = source
+        .parse::<KdlDocument>()
+        .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
+    interpolate_document(&mut document, variables)?;
+    document.autoformat();
+    Ok(document.to_string())
+}
+
+fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(), St3Error> {
     match value {
         Value::String(value) => {
             let mut rest = value.as_str();
@@ -1186,7 +1265,10 @@ fn validate_variables(value: &Value) -> Result<(), St3Error> {
                     ));
                 };
                 let name = &tail[..end];
-                if !VARIABLES.contains(&name) {
+                let declared_input = name
+                    .strip_prefix("input.")
+                    .is_some_and(|name| input_names.contains(name));
+                if !VARIABLES.contains(&name) && !declared_input {
                     return Err(St3Error::new(
                         "unknown-variable",
                         format!("variable `{name}` is not registered"),
@@ -1197,12 +1279,12 @@ fn validate_variables(value: &Value) -> Result<(), St3Error> {
         }
         Value::Array(values) => {
             for value in values {
-                validate_variables(value)?;
+                validate_variables(value, input_names)?;
             }
         }
         Value::Object(values) => {
             for value in values.values() {
-                validate_variables(value)?;
+                validate_variables(value, input_names)?;
             }
         }
         _ => {}
@@ -1312,6 +1394,17 @@ fn ensure_bare(node: &KdlNode) -> Result<(), St3Error> {
                 node.name().value()
             ),
         ))
+    }
+}
+
+fn ensure_no_children(node: &KdlNode) -> Result<(), St3Error> {
+    if node.children().is_some() {
+        Err(St3Error::new(
+            "invalid-node",
+            format!("`{}` must not have children", node.name().value()),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1449,30 +1542,32 @@ mod tests {
         let source = r#"
 version 2
 subgraph {
-  scope "eval/demo/${ST_PLAN_RUN}" retention="temporary" {
-    plan "demo" state="ready" {
-      goal "Complete plan demo."
-      step "start" {
-        subgraph {
-          agent "worker.${ST_PLAN_RUN}" {
-            workspace "."
-            harness "codex" { prompt "Run durable work." }
-          }
+  plan "demo" state="ready" {
+    goal "Complete plan demo."
+    step "start" {
+      agentless
+      subgraph {
+        agent "worker" {
+          workspace "."
+          harness "codex" { prompt "Run durable work." }
         }
       }
-      step "one" {
-        assigned-to "agent/worker.${ST_PLAN_RUN}"
-        depends-on { step "start" completed }
-        plan "work" { goal "Complete plan work."; step "inspect" { } }
-        produces {
-          resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.revision"; state "published" }
-        }
+    }
+    step "one" {
+      assigned-to "agent/${ST_PLAN_RUN}/worker"
+      depends-on { step "start" completed }
+      plan "work" { goal "Complete plan work."; step "inspect" { } }
+      produces {
+        resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.revision"; state "published" }
       }
-      step "two" { depends-on { step "start" completed } }
-      step "join" { depends-on { step "one" completed; step "two" completed } }
-      completion { when "all-steps-exhausted" }
-      finally {
-        step "cleanup" { subgraph { scope "eval/demo/${ST_PLAN_RUN}" { stop } } }
+    }
+    step "two" { agentless; depends-on { step "start" completed } }
+    step "join" { agentless; depends-on { step "one" completed; step "two" completed } }
+    completion { when "all-steps-exhausted" }
+    finally {
+      step "cleanup" {
+        agentless
+        subgraph { stop "agent/${ST_PLAN_RUN}/worker" }
       }
     }
   }
@@ -1481,10 +1576,7 @@ subgraph {
         let intent = crate::graph::parse_intent(source, "node").unwrap();
         let plan = &intent.plans["demo"];
         assert_eq!(plan.steps.len(), 5);
-        assert_eq!(
-            plan.scope_template.as_deref(),
-            Some("scope/eval/demo/${ST_PLAN_RUN}")
-        );
+        assert_eq!(plan.max_active_runs, Some(1));
         assert!(plan.steps["one"].nested_plan.is_some());
         assert_eq!(
             plan.steps["one"].products[0].subject,
@@ -1741,7 +1833,7 @@ subgraph { plan "bad" state="ready" { goal "Reject a cross-phase dependency."; s
     fn a_zero_step_plan_is_valid_and_has_no_implicit_completion() {
         let intent = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "standing" state="ready" { goal "Keep the agent available."; agentless } }"#,
+subgraph { plan "standing" state="ready" { goal "Keep the agent available." } }"#,
             "node",
         )
         .unwrap();
@@ -1787,7 +1879,6 @@ subgraph { plan "old" state="ready" change-authority="agent/worker" { goal "Run.
             r#"
 version 2
 subgraph {
-  agent "outer" { workspace "."; command "true" }
   plan "placed" state="ready" revisions="human-only" revision-reviewer="person/plan" revision-cutover="when-idle" {
     goal "Test revision placement."
     subgraph { agent "plan-owner" { workspace "."; command "true" } }
@@ -1802,10 +1893,7 @@ subgraph {
         )
         .unwrap();
         let plan = &intent.plans["placed"];
-        assert_eq!(
-            plan.revision_owners,
-            vec!["agent/node.outer", "agent/node.plan-owner"]
-        );
+        assert_eq!(plan.revision_owners, vec!["agent/node.plan-owner"]);
         assert!(plan.revisions_human_only);
         assert_eq!(plan.revision_reviewer.as_deref(), Some("person/plan"));
         assert_eq!(
@@ -1853,5 +1941,84 @@ subgraph {
             "node",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn plan_inputs_and_run_limits_use_the_explicit_language() {
+        let intent = crate::graph::parse_intent(
+            r#"
+version 2
+subgraph {
+  plan "parameterized" state="ready" {
+    input "message" kind="text"
+    input "source" kind="resource"
+    concurrent-runs max=4
+    goal "Process ${input.message}."
+    step "work" {
+      agentless
+      subgraph { exec "task" { command "printf '%s' '${input.message}'"; restart "never" } }
+      gate "the source is ready" { field "state" "${input.source}" is "ready" }
+    }
+  }
+  plan "unbounded" state="ready" {
+    concurrent-runs
+    goal "Allow concurrent runs."
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let parameterized = &intent.plans["parameterized"];
+        assert_eq!(parameterized.inputs.len(), 2);
+        assert_eq!(
+            parameterized.inputs["message"].kind,
+            crate::model::PlanInputKind::Text
+        );
+        assert_eq!(
+            parameterized.inputs["source"].kind,
+            crate::model::PlanInputKind::Resource
+        );
+        assert_eq!(parameterized.max_active_runs, Some(4));
+        assert_eq!(intent.plans["unbounded"].max_active_runs, None);
+
+        for source in [
+            r#"version 2
+subgraph { plan "bad" state="ready" { input "x" kind="text"; input "x" kind="text"; goal "Reject duplicate input." } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { input "x" kind="secret"; goal "Reject the input kind." } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { concurrent-runs max=0; goal "Reject the run limit." } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { goal "Use ${input.missing}." } }"#,
+            r#"version 2
+subgraph { plan "bad" state="ready" { agentless; goal "Reject a plan selector." } }"#,
+        ] {
+            assert!(crate::graph::parse_intent(source, "node").is_err());
+        }
+    }
+
+    #[test]
+    fn kdl_interpolation_preserves_arbitrary_text_input() {
+        let source = r#"version 2
+subgraph {
+  exec "task" { command "printf '%s' '${input.message}'" }
+}
+"#;
+        let message = "a \"quoted\" line\nand another line";
+        let variables =
+            std::collections::BTreeMap::from([("input.message".into(), message.into())]);
+        let interpolated = super::interpolate_kdl(source, &variables).unwrap();
+        let document = interpolated.parse::<kdl::KdlDocument>().unwrap();
+        let command = document
+            .get("subgraph")
+            .and_then(kdl::KdlNode::children)
+            .and_then(|subgraph| subgraph.get("exec"))
+            .and_then(kdl::KdlNode::children)
+            .and_then(|exec| exec.get("command"))
+            .and_then(|command| command.entries().first())
+            .and_then(|entry| entry.value().as_string())
+            .unwrap();
+        assert_eq!(command, format!("printf '%s' '{message}'"));
     }
 }

@@ -5,39 +5,26 @@ subgraph {
     kind "human.review"
   }
 
-  scope "release-example" retention="temporary" {
-    plan "release" state="ready" {
-      agentless
-      completion { when "all-steps-exhausted" }
-      goal "Complete plan release."
-      step "build" timeout="20m" {
-        title "The build command passes"
-        subgraph {
-          exec "release-example/build/${ST_PLAN_RUN}" {
-            workspace "."
-            command "cargo test --workspace"
-            restart "never"
-          }
+  plan "release" state="ready" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete plan release."
+    step "build" timeout="20m" {
+      title "The build command passes"
+      subgraph {
+        exec "release-example/build" {
+          workspace "."
+          command "cargo test --workspace"
+          restart "never"
         }
-        gate "condition-1" { field "status" "exec/release-example/build/${ST_PLAN_RUN}" "is" "exited" }
-        gate "condition-2" { field "exit_code" "exec/release-example/build/${ST_PLAN_RUN}" "is" 0 }
       }
+      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/release-example/build" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/release-example/build" "is" 0 }
+    }
 
-      step "approval" {
-        title "A person approves the release"
-        depends-on { step "build" completed }
-        gate "condition-1" { field "decision" "resource/release-review" "is" "approved" }
-      }
-
-      finally {
-        step "cleanup" {
-        title "The temporary release scope is empty"
-        subgraph {
-          scope "release-example" { stop }
-        }
-        gate "condition-1" { empty "scope/release-example" }
-      }
-      }
+    step "approval" {
+      title "A person approves the release"
+      depends-on { step "build" completed }
+      gate "condition-1" { field "decision" "resource/release-review" "is" "approved" }
     }
   }
 }

@@ -3,12 +3,14 @@ set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 
-dev_messages="$(st3 message ls rc.dev --archive --json)"
-sup_messages="$(st3 message ls rc.sup --archive --json)"
+dev_agent="agent/$ST_PLAN_RUN/rc.dev"
+sup_agent="agent/$ST_PLAN_RUN/rc.sup"
+dev_messages="$(st3 message ls "$dev_agent" --archive --json)"
+sup_messages="$(st3 message ls "$sup_agent" --archive --json)"
 requester_messages="$(st3 message ls person/eval-requester --archive --json)"
 work_tag="plan-run:plan-run/$ST_PLAN_RUN"
 direct_tag="plan-run:$ST_PLAN_RUN"
-injector="exec/eval/restart-continuity/inject/$ST_PLAN_RUN"
+injector="exec/$ST_PLAN_RUN/eval/restart-continuity/inject"
 
 assignments="$(jq --arg tag "$work_tag" \
   '[.[] | select(.from == "st3/runtime" and (.tags | index($tag)))]' <<<"$dev_messages")"
@@ -19,10 +21,10 @@ duplicates="$(jq --arg tag "$direct_tag" --arg injector "$injector" \
     and (.tags | index("duplicate-work:process-before-restart"))
     and (.content | contains("DUPLICATE-BATCH-RC-7B9D"))
   )]' <<<"$dev_messages")"
-reports="$(jq --arg tag "$direct_tag" \
-  '[.[] | select(.from == "agent/rc.dev" and (.tags | index($tag)))]' <<<"$sup_messages")"
-confirmations="$(jq --arg tag "$direct_tag" \
-  '[.[] | select(.from == "agent/rc.sup" and (.tags | index($tag)))]' <<<"$requester_messages")"
+reports="$(jq --arg tag "$direct_tag" --arg dev "$dev_agent" \
+  '[.[] | select(.from == $dev and (.tags | index($tag)))]' <<<"$sup_messages")"
+confirmations="$(jq --arg tag "$direct_tag" --arg sup "$sup_agent" \
+  '[.[] | select(.from == $sup and (.tags | index($tag)))]' <<<"$requester_messages")"
 
 test "$(jq 'length' <<<"$assignments")" -eq 2
 test "$(jq '[.[] | select(.status == "closed")] | length' <<<"$assignments")" -eq 2

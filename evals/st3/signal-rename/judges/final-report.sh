@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
 
-messages="$(st3 message ls local.morgan --from sig.sup --json)"
+messages="$(st3 message ls local.morgan --from "agent/$ST_PLAN_RUN/sig.sup" --json)"
 matching="$(
   jq \
     --arg tag "plan-run:$ST_PLAN_RUN" \

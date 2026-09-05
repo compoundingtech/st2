@@ -106,7 +106,7 @@ fn planning_mode_eval_uses_one_dynamic_codex_planner() {
     );
     let controller =
         fs::read_to_string(root.join("controller.sh")).expect("read planning controller");
-    assert!(controller.contains("plan start"));
+    assert!(controller.contains("planning start"));
     assert!(controller.contains("--model gpt-5.6-sol"));
     assert!(!controller.contains("claude"));
 }
@@ -155,6 +155,70 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
         let source = fs::read_to_string(&file).expect("read eval");
         st3::parse_intent(&source, "local")
             .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+    }
+}
+
+#[test]
+fn st3_eval_inventory_has_twelve_model_free_and_twelve_model_backed_evals() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3");
+    let model_free = [
+        "context-resource-continuity",
+        "crash-escalation",
+        "network-isolation",
+        "network-smoke",
+        "plan-inputs",
+        "pty-attach-machine-stream",
+        "pty-attach-only",
+        "pty-send-peek",
+        "resource-cold-start",
+        "resource-handoff",
+        "resource-retarget",
+        "run-generation-revision",
+    ];
+    let model_backed = [
+        "claude-skill-inheritance",
+        "fork-in-the-road",
+        "ghost-bug",
+        "license-mit",
+        "mixed-worker-pool",
+        "plan-document-lift",
+        "planning-mode",
+        "poisoned-pr",
+        "restart-continuity",
+        "signal-rename",
+        "test-writing",
+        "weird-git-setup",
+    ];
+    let mut actual = fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("eval.kdl").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = model_free
+        .iter()
+        .chain(model_backed.iter())
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+
+    for name in model_free {
+        let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
+        assert_eq!(authored_harness_counts(&source, name), (0, 0), "{name}");
+        assert!(authored_model_gates(&source).is_empty(), "{name}");
+    }
+    for name in model_backed {
+        let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
+        let has_authored_model = authored_harness_counts(&source, name) != (0, 0)
+            || !authored_model_gates(&source).is_empty();
+        assert!(
+            has_authored_model || name == "planning-mode",
+            "{name} must use a model"
+        );
     }
 }
 
@@ -333,9 +397,12 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             "license-mit",
             "eval/license-mit",
             [
-                ("delegate-license-change", "agent/lmc.sup"),
-                ("implement-license-change", "agent/lmc.worker"),
-                ("verify-and-confirm", "agent/lmc.sup"),
+                ("delegate-license-change", "agent/${ST_PLAN_RUN}/lmc.sup"),
+                (
+                    "implement-license-change",
+                    "agent/${ST_PLAN_RUN}/lmc.worker",
+                ),
+                ("verify-and-confirm", "agent/${ST_PLAN_RUN}/lmc.sup"),
             ]
             .as_slice(),
             [
@@ -350,9 +417,9 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             "ghost-bug",
             "eval/ghost-bug-codex",
             [
-                ("delegate-debug-brief", "agent/gbx.sup"),
-                ("diagnose-and-fix", "agent/gbx.fix"),
-                ("verify-and-confirm", "agent/gbx.sup"),
+                ("delegate-debug-brief", "agent/${ST_PLAN_RUN}/gbx.sup"),
+                ("diagnose-and-fix", "agent/${ST_PLAN_RUN}/gbx.fix"),
+                ("verify-and-confirm", "agent/${ST_PLAN_RUN}/gbx.sup"),
             ]
             .as_slice(),
             [
@@ -414,7 +481,7 @@ fn plan_document_lift_produces_and_uses_one_exact_plan_output() {
     );
     assert!(
         intent.document_refs.contains(
-            "doc/evals/plan-document-lift/plan@963217e0eeac9f2350e034c8da411244f4090731606242bbac6dd0a8bd55d636"
+            "doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769"
         )
     );
 }
@@ -498,18 +565,17 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
             "integrate-and-verify",
             "held-out-gates",
             "publish-final-report",
-            "cleanup",
         ]
     );
 
     let expected_assignments = [
-        ("open-base-compatibility", "agent/sig.base"),
-        ("migrate-relay", "agent/sig.relay"),
-        ("migrate-hub", "agent/sig.hub"),
-        ("update-root-and-config", "agent/sig.sup"),
-        ("close-base-compatibility", "agent/sig.base"),
-        ("integrate-and-verify", "agent/sig.sup"),
-        ("publish-final-report", "agent/sig.sup"),
+        ("open-base-compatibility", "agent/${ST_PLAN_RUN}/sig.base"),
+        ("migrate-relay", "agent/${ST_PLAN_RUN}/sig.relay"),
+        ("migrate-hub", "agent/${ST_PLAN_RUN}/sig.hub"),
+        ("update-root-and-config", "agent/${ST_PLAN_RUN}/sig.sup"),
+        ("close-base-compatibility", "agent/${ST_PLAN_RUN}/sig.base"),
+        ("integrate-and-verify", "agent/${ST_PLAN_RUN}/sig.sup"),
+        ("publish-final-report", "agent/${ST_PLAN_RUN}/sig.sup"),
     ];
     for (step, assignee) in expected_assignments {
         let step = &plan.steps[step];
@@ -611,14 +677,13 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
             "process-after-restart",
             "verify-and-confirm",
             "held-out-gates",
-            "cleanup",
         ]
     );
 
     for (step, assignee) in [
-        ("process-before-restart", "agent/rc.dev"),
-        ("process-after-restart", "agent/rc.dev"),
-        ("verify-and-confirm", "agent/rc.sup"),
+        ("process-before-restart", "agent/${ST_PLAN_RUN}/rc.dev"),
+        ("process-after-restart", "agent/${ST_PLAN_RUN}/rc.dev"),
+        ("verify-and-confirm", "agent/${ST_PLAN_RUN}/rc.sup"),
     ] {
         assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
         assert!(plan.steps[step].nested_plan.is_some());
@@ -684,20 +749,46 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
 
     let intent = st3::parse_intent(&source, "local").expect("parse Fork in the road eval");
     let plan = &intent.plans["eval/fork-in-the-road"];
-    let team = st3::parse_intent(
-        plan.steps["start-team"]
-            .subgraph_kdl
-            .as_deref()
-            .expect("team subgraph"),
-        "local",
-    )
-    .expect("parse Fork in the road team");
+    let team = plan.steps["start-team"]
+        .subgraph_kdl
+        .as_deref()
+        .expect("team subgraph")
+        .parse::<kdl::KdlDocument>()
+        .expect("parse Fork in the road team");
+    let agents = team
+        .get("subgraph")
+        .and_then(kdl::KdlNode::children)
+        .expect("team body");
     for member in ["fd.a", "fd.b", "fd.c"] {
-        let under = st3::graph::agent_under(&team.subjects[&format!("agent/{member}")].desired);
-        assert_eq!(under.len(), 1);
-        assert_eq!(under[0].agent, "agent/fd.sup");
+        let agent = agents
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.name().value() == "agent"
+                    && node
+                        .entries()
+                        .first()
+                        .and_then(|entry| entry.value().as_string())
+                        == Some(member)
+            })
+            .expect("team member");
+        let under = agent
+            .children()
+            .and_then(|body| body.get("under"))
+            .expect("under metadata");
         assert_eq!(
-            under[0].reason.as_deref(),
+            under
+                .entries()
+                .first()
+                .and_then(|entry| entry.value().as_string()),
+            Some("fd.sup")
+        );
+        assert_eq!(
+            under
+                .entries()
+                .iter()
+                .find(|entry| entry.name().is_some_and(|name| name.value() == "reason"))
+                .and_then(|entry| entry.value().as_string()),
             Some("the supervisor combines the panel recommendation")
         );
     }
@@ -716,21 +807,20 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
             "revise-federated",
             "synthesize",
             "held-out-gates",
-            "cleanup",
         ]
     );
 
     for (step, assignee) in [
-        ("draft-per-human", "agent/fd.a"),
-        ("draft-shared", "agent/fd.b"),
-        ("draft-federated", "agent/fd.c"),
-        ("critique-per-human", "agent/fd.a"),
-        ("critique-shared", "agent/fd.b"),
-        ("critique-federated", "agent/fd.c"),
-        ("revise-per-human", "agent/fd.a"),
-        ("revise-shared", "agent/fd.b"),
-        ("revise-federated", "agent/fd.c"),
-        ("synthesize", "agent/fd.sup"),
+        ("draft-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
+        ("draft-shared", "agent/${ST_PLAN_RUN}/fd.b"),
+        ("draft-federated", "agent/${ST_PLAN_RUN}/fd.c"),
+        ("critique-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
+        ("critique-shared", "agent/${ST_PLAN_RUN}/fd.b"),
+        ("critique-federated", "agent/${ST_PLAN_RUN}/fd.c"),
+        ("revise-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
+        ("revise-shared", "agent/${ST_PLAN_RUN}/fd.b"),
+        ("revise-federated", "agent/${ST_PLAN_RUN}/fd.c"),
+        ("synthesize", "agent/${ST_PLAN_RUN}/fd.sup"),
     ] {
         assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
         assert!(plan.steps[step].nested_plan.is_some());
@@ -806,16 +896,15 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
             "review-pull-request",
             "assess-review",
             "held-out-gates",
-            "cleanup",
         ]
     );
     assert_eq!(
         assigned_to(&plan.steps["review-pull-request"]),
-        Some("agent/prx.rev")
+        Some("agent/${ST_PLAN_RUN}/prx.rev")
     );
     assert_eq!(
         assigned_to(&plan.steps["assess-review"]),
-        Some("agent/prx.sup")
+        Some("agent/${ST_PLAN_RUN}/prx.sup")
     );
     assert!(plan.steps["review-pull-request"].nested_plan.is_some());
     assert!(plan.steps["assess-review"].nested_plan.is_some());
@@ -842,9 +931,9 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
             "test-writing",
             "eval/test-writing",
             [
-                ("prepare-test-brief", "agent/tw.sup"),
-                ("write-regression-suite", "agent/tw.dev"),
-                ("verify-test-suite", "agent/tw.sup"),
+                ("prepare-test-brief", "agent/${ST_PLAN_RUN}/tw.sup"),
+                ("write-regression-suite", "agent/${ST_PLAN_RUN}/tw.dev"),
+                ("verify-test-suite", "agent/${ST_PLAN_RUN}/tw.sup"),
             ]
             .as_slice(),
             [
@@ -858,7 +947,7 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
         (
             "weird-git-setup",
             "eval/weird-git-setup",
-            [("repair-feature-worktree", "agent/wg.dev")].as_slice(),
+            [("repair-feature-worktree", "agent/${ST_PLAN_RUN}/wg.dev")].as_slice(),
             [
                 "resource/plan-run/${ST_PLAN_RUN}/feature-revision",
                 "resource/plan-run/${ST_PLAN_RUN}/final-report",
@@ -868,7 +957,7 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
         (
             "claude-skill-inheritance",
             "eval/claude-skill-inheritance",
-            [("exercise-skill-union", "agent/si.agent")].as_slice(),
+            [("exercise-skill-union", "agent/${ST_PLAN_RUN}/si.agent")].as_slice(),
             ["resource/plan-run/${ST_PLAN_RUN}/skill-report"].as_slice(),
         ),
     ];

@@ -3,16 +3,42 @@ set -euo pipefail
 
 declare -a daemons=()
 root="$(mktemp -d "${TMPDIR:-/tmp}/st3-network-isolation.XXXXXX")"
+wait_for_terminal_cleanup() {
+  local socket="$1" run_id="$2" phase=""
+  for _ in $(seq 1 200); do
+    phase="$(st3 --endpoint "$socket" inspect "plan-run/$run_id" --json 2>/dev/null \
+      | jq -r '.status.subjects[0].actual.phase // .status.subjects[0].actual.fields.phase // empty')"
+    [ "$phase" = terminal ] && return
+    sleep 0.05
+  done
+  printf 'plan-run/%s did not finish runtime cleanup\n' "$run_id" >&2
+  return 1
+}
+remove_test_ptys() {
+  local pty_root="$1" session=""
+  while IFS= read -r session; do
+    PTY_ROOT="$pty_root" pty kill "$session" >/dev/null 2>&1 || true
+    PTY_ROOT="$pty_root" pty rm "$session" >/dev/null 2>&1 || true
+  done < <(PTY_ROOT="$pty_root" pty list --json 2>/dev/null | jq -r '.[].name')
+}
 cleanup() {
+  local failed=0
   for name in a b; do
     socket="$root/$name/st3.sock"
-    if [ -S "$socket" ]; then
-      printf 'version 2\nsubgraph { stop "agent/net.%s"; stop "pty/session-%s" }\n' "$name" "$name" >"$name/stop.kdl"
-      st3 --endpoint "$socket" run "$name/stop.kdl" >/dev/null 2>&1 || true
+    if [ -S "$socket" ] && [ -s "$name/run-id" ]; then
+      run_id=$(cat "$name/run-id")
+      printf 'version 2\nsubgraph { plan-run "plan-run/%s" { cancel reason="the fixture completed" } }\n' "$run_id" >"$name/stop.kdl"
+      if st3 --endpoint "$socket" run "$name/stop.kdl" >/dev/null 2>&1; then
+        wait_for_terminal_cleanup "$socket" "$run_id" || failed=1
+      else
+        failed=1
+      fi
     fi
+    remove_test_ptys "$root/$name/state/pty"
   done
   for daemon in "${daemons[@]:-}"; do kill -TERM "$daemon" 2>/dev/null || true; wait "$daemon" 2>/dev/null || true; done
   rm -rf "$root"
+  return "$failed"
 }
 trap cleanup EXIT
 for name in a b; do
@@ -26,21 +52,32 @@ for name in a b; do
   cat >"$name/network.kdl" <<KDL
 version 2
 subgraph {
-  agent "net.$name" { workspace "$PWD"; command "sleep 300"; restart "never"; env { ST3_MESSAGE_ROOT "$state/messages" } }
-  pty "session-$name" { workspace "$PWD"; command "bash -c 'echo ${name^^}-READY; sleep 300'"; restart "never" }
+  plan "fixture/network-$name" state="ready" {
+    goal "Keep one isolated message target and PTY available."
+    subgraph {
+      agent "net.$name" { workspace "$PWD"; command "sleep 300"; restart "never"; env { ST3_MESSAGE_ROOT "$state/messages" } }
+      pty "session-$name" { workspace "$PWD"; command "bash -c 'echo ${name^^}-READY; sleep 300'"; restart "never" }
+    }
+  }
 }
 KDL
-  st3 --endpoint "$socket" run "$name/network.kdl" >/dev/null
+  st3 --endpoint "$socket" --json run "$name/network.kdl" --detach | jq -er .id >"$name/run-id"
 done
 sleep 1
-ida="$(st3 --endpoint "$root/a/st3.sock" message send net.a --from source -m NETA-SECRET)"
-idb="$(st3 --endpoint "$root/b/st3.sock" message send net.b --from source -m NETB-SECRET)"
+run_a=$(cat a/run-id)
+run_b=$(cat b/run-id)
+agent_a="agent/$run_a/net.a"
+agent_b="agent/$run_b/net.b"
+pty_a="pty/$run_a/session-a"
+pty_b="pty/$run_b/session-b"
+ida="$(st3 --endpoint "$root/a/st3.sock" message send "$agent_a" --from source -m NETA-SECRET)"
+idb="$(st3 --endpoint "$root/b/st3.sock" message send "$agent_b" --from source -m NETB-SECRET)"
 st3 --endpoint "$root/a/st3.sock" pty ls --json >a/pty.json
 st3 --endpoint "$root/b/st3.sock" pty ls --json >b/pty.json
-st3 --endpoint "$root/a/st3.sock" message ls net.a --json >a/messages.json
-st3 --endpoint "$root/b/st3.sock" message ls net.b --json >b/messages.json
-jq -e 'map(.subject) | index("pty/session-a") != null and index("pty/session-b") == null' a/pty.json >/dev/null
-jq -e 'map(.subject) | index("pty/session-b") != null and index("pty/session-a") == null' b/pty.json >/dev/null
+st3 --endpoint "$root/a/st3.sock" message ls "$agent_a" --json >a/messages.json
+st3 --endpoint "$root/b/st3.sock" message ls "$agent_b" --json >b/messages.json
+jq -e --arg own "$pty_a" --arg other "$pty_b" 'map(.subject) | index($own) != null and index($other) == null' a/pty.json >/dev/null
+jq -e --arg own "$pty_b" --arg other "$pty_a" 'map(.subject) | index($own) != null and index($other) == null' b/pty.json >/dev/null
 jq -e 'map(.content) | index("NETA-SECRET") != null and index("NETB-SECRET") == null' a/messages.json >/dev/null
 jq -e 'map(.content) | index("NETB-SECRET") != null and index("NETA-SECRET") == null' b/messages.json >/dev/null
 printf 'NETWORK-A-ISOLATED\nNETWORK-B-ISOLATED\n' >result.txt

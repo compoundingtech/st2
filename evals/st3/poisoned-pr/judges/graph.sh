@@ -2,8 +2,8 @@
 set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
-work="$(env -u ST_AGENT st3 work ls --all --json)"
 run="plan-run/$ST_PLAN_RUN"
+plan="$(env -u ST_AGENT st3 --json plan show "$run")"
 
 completed_steps=(
   start-team
@@ -20,8 +20,8 @@ completed_steps=(
 
 for step in "${completed_steps[@]}"; do
   count="$(jq --arg run "$run" --arg step "$step" \
-    '[.[] | select(.run == $run and .step == $step and .status == "completed")] | length' \
-    <<<"$work")"
+    '[.steps[] | select(.step == $step and .status == "completed")] | length' \
+    <<<"$plan")"
   test "$count" -eq 1
 done
 

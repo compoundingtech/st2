@@ -167,6 +167,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/documents/content", get(get_document))
         .route("/v1/claims", get(list_claims).post(post_claim))
+        .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews/{*subject}", post(post_review))
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
@@ -178,7 +179,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
         .route("/v1/evals", post(start_eval))
-        .route("/v1/evals/{*scope}", get(get_eval))
+        .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/plan-runs", get(list_plan_runs).post(start_plan_run))
         .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
         .route("/v1/plan-runs/{run}/generations", get(list_run_generations))
@@ -614,7 +615,7 @@ async fn start_planning_session(
         .map_err(ApiError::bad)?;
     let requester =
         normalize_planning_reviewer(request.requester.as_deref().unwrap_or("person/requester"));
-    let planner = format!("agent/{}.planner.{}", state.node, &id[..10]);
+    let planner_alias = format!("agent/planner.{}", &id[..10]);
     let request_reference = format!("{}@{}", request_document.name, request_document.hash);
     let context_reference = if let Some(run) = &target_run {
         let plan = state
@@ -637,32 +638,19 @@ async fn start_planning_session(
     } else {
         None
     };
-    let session = state
-        .store
-        .create_planning_session(
-            &id,
-            &plan_id,
-            &request_reference,
-            &request.workspace,
-            &requester,
-            &planner,
-            target_run.as_ref().map(|run| run.subject.as_str()),
-            target_run.as_ref().map(|run| run.generation.as_str()),
-        )
-        .map_err(ApiError::bad)?;
     let expected_subject = state
         .store
-        .selected_desired_token(&planner)
+        .selected_desired_token(&planner_alias)
         .map_err(ApiError::internal)?
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{plan_id}` and its state must be ready. You can submit named variants with `st3 plan submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay available for revision messages until approval or cancellation."
+        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{plan_id}` and its state must be ready. You can submit named variants with `st3 planning submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay available for revision messages until approval or cancellation."
     );
-    quick_agent(
+    let planner = quick_agent(
         &state,
         QuickAgentRequest {
-            subject: planner.clone(),
+            subject: planner_alias,
             worktree: request.workspace.clone(),
             model: request.model,
             effort: request.effort,
@@ -677,11 +665,24 @@ async fn start_planning_session(
         "codex",
     )
     .await?;
+    let session = state
+        .store
+        .create_planning_session(
+            &id,
+            &plan_id,
+            &request_reference,
+            &request.workspace,
+            &requester,
+            &planner.subject,
+            target_run.as_ref().map(|run| run.subject.as_str()),
+            target_run.as_ref().map(|run| run.generation.as_str()),
+        )
+        .map_err(ApiError::bad)?;
     send_planning_message(
         &state,
         &format!("planning-request:{id}"),
         &requester,
-        &planner,
+        &planner.subject,
         &context_reference
             .as_ref()
             .map(|context| format!("{request_reference}\n{context}"))
@@ -1499,24 +1500,29 @@ fn send_planning_message(
 }
 
 fn stop_planning_agent(state: &AppState, planner: &str, key: &str) -> Result<(), ApiError> {
-    let standing_plan = format!(
-        "plan/standing/{}",
-        planner.strip_prefix("agent/").unwrap_or(planner)
-    );
+    let local_agent = planner
+        .strip_prefix("agent/")
+        .and_then(|value| value.split_once('/').map(|(_, local)| local))
+        .unwrap_or(planner);
+    let standing_plan = format!("plan/standing/{local_agent}");
     let cancellation = state
         .store
         .active_plan_runs()
         .map_err(ApiError::internal)?
         .into_iter()
         .find(|run| run.plan == standing_plan)
+        .map(|run| run.subject)
         .map(|run| {
             format!(
                 "  plan-run {:?} {{ cancel reason=\"the planning session ended\" }}\n",
-                run.subject
+                run
             )
         })
         .unwrap_or_default();
-    let kdl = format!("version 2\nsubgraph {{\n{cancellation}  stop {planner:?}\n}}\n");
+    if cancellation.is_empty() {
+        return Ok(());
+    }
+    let kdl = format!("version 2\nsubgraph {{\n{cancellation}}}\n");
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     state
         .store
@@ -1639,23 +1645,10 @@ async fn watch_resource(
             )));
         }
     };
-    let observer_subject = format!("observer/{resource_name}");
     let selected_fields = request
         .fields
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    let mut observer_field_set = selected_fields.clone();
-    for desired in state.store.desired_subjects().map_err(ApiError::internal)? {
-        if desired.kind != "subscription" {
-            continue;
-        }
-        if let Some(spec) = crate::graph::subscription_spec(&desired.desired)
-            && !spec.stopped
-            && spec.observer == observer_subject
-        {
-            observer_field_set.extend(spec.fields);
-        }
-    }
     let stable = serde_json::to_vec(&json!({
         "provider": request.provider,
         "locator": request.locator,
@@ -1665,26 +1658,26 @@ async fn watch_resource(
     }))
     .map_err(ApiError::internal)?;
     let subscription_hash = hex::encode(Sha256::digest(stable));
-    let target_name = target.strip_prefix("agent/").unwrap_or(&target);
-    let subscription_name = format!("{resource_name}/{target_name}/{}", &subscription_hash[..8]);
+    let plan_id = format!(
+        "resource-watch/{resource_name}/{}",
+        &subscription_hash[..16]
+    );
     let quote = |value: &str| serde_json::to_string(value).expect("a string serializes");
-    let observer_fields = observer_field_set
+    let observer_fields = selected_fields
         .iter()
-        .map(|field| format!("    field {}\n", quote(field)))
+        .map(|field| format!("        field {}\n", quote(field)))
         .collect::<String>();
     let subscription_fields = selected_fields
         .iter()
-        .map(|field| format!("    on {}\n", quote(field)))
+        .map(|field| format!("        on {}\n", quote(field)))
         .collect::<String>();
     let kdl = format!(
-        "version 2\nsubgraph {{\n  resource {} {{\n    kind {resource_kind:?}\n    binding \"late\"\n  }}\n  observer {} {{\n    resource {}\n    provider {}\n    locator {}\n{observer_fields}  }}\n  subscription {} {{\n    observer {}\n    to {}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
+        "version 2\nsubgraph {{\n  resource {} {{\n    kind {resource_kind:?}\n    binding \"late\"\n  }}\n  plan {} state=\"ready\" {{\n    goal \"Observe one resource and send its selected changes.\"\n    subgraph {{\n      observer \"watch\" {{\n        resource {}\n        provider {}\n        locator {}\n{observer_fields}      }}\n      subscription \"watch\" {{\n        observer \"observer/watch\"\n        to {}\n{subscription_fields}        delivery \"message\"\n      }}\n    }}\n  }}\n}}\n",
         quote(&resource_name),
-        quote(&resource_name),
+        quote(&plan_id),
         quote(&format!("resource/{resource_name}")),
         quote(&request.provider),
         quote(&request.locator),
-        quote(&subscription_name),
-        quote(&observer_subject),
         quote(&target),
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
@@ -1702,11 +1695,23 @@ async fn watch_resource(
         .store
         .apply(&intent, &planned.subject_tokens, &request.idempotency_key)
         .map_err(ApiError::bad)?;
+    let run = state
+        .store
+        .create_plan_run(&PlanRunRequest {
+            plan: plan_id,
+            revision: None,
+            workspace: ".".into(),
+            requester: Some(target.clone()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: format!("{}:run", request.idempotency_key),
+        })
+        .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(ResourceWatchView {
         resource: format!("resource/{resource_name}"),
-        observer: observer_subject,
-        subscription: format!("subscription/{subscription_name}"),
+        observer: format!("observer/{}/watch", run.id),
+        subscription: format!("subscription/{}/watch", run.id),
     }))
 }
 
@@ -1715,11 +1720,31 @@ async fn unwatch_resource(
     AxumPath(subscription): AxumPath<String>,
     Json(request): Json<ResourceUnwatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let subscription = subscription
-        .strip_prefix("subscription/")
-        .unwrap_or(&subscription);
-    let quote = serde_json::to_string(subscription).expect("a string serializes");
-    let kdl = format!("version 2\nsubgraph {{\n  subscription {quote} {{\n    stop\n  }}\n}}\n");
+    let subscription = format!(
+        "subscription/{}",
+        subscription
+            .strip_prefix("subscription/")
+            .unwrap_or(&subscription)
+    );
+    let run = state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|subject| subject.subject == subscription)
+        .and_then(|subject| subject.owner_run)
+        .or_else(|| {
+            subscription
+                .strip_prefix("subscription/")
+                .and_then(|value| value.split('/').next())
+                .map(|run| format!("plan-run/{run}"))
+        })
+        .ok_or_else(|| {
+            ApiError::not_found(format!("subscription `{subscription}` does not exist"))
+        })?;
+    let kdl = format!(
+        "version 2\nsubgraph {{\n  plan-run {run:?} {{ cancel reason=\"the resource watch stopped\" }}\n}}\n"
+    );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     let planned = state
         .store
@@ -1737,7 +1762,7 @@ async fn unwatch_resource(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(json!({
-        "subscription": format!("subscription/{subscription}"),
+        "subscription": subscription,
         "status": "stopped",
         "actor": request.actor,
     })))
@@ -1802,10 +1827,22 @@ async fn post_claim(
     Ok(Json(response))
 }
 
+async fn get_claim(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    state
+        .store
+        .claim_by_id(&id)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
+}
+
 #[derive(Deserialize)]
 struct ClaimsQuery {
     subject: Option<String>,
-    scope: Option<String>,
+    owner_run: Option<String>,
     #[serde(default, alias = "after")]
     after_index: u64,
     #[serde(alias = "before")]
@@ -1842,7 +1879,7 @@ async fn list_claims(
         .store
         .claims_page(
             query.subject.as_deref(),
-            query.scope.as_deref(),
+            query.owner_run.as_deref(),
             query.after_index,
             query.before_index,
             matches!(query.order, ClaimsOrder::Desc),
@@ -2199,7 +2236,7 @@ fn message_subject(value: &str) -> String {
 #[derive(Deserialize)]
 struct StatusQuery {
     subject: Option<String>,
-    scope: Option<String>,
+    owner_run: Option<String>,
     at_index: Option<u64>,
 }
 
@@ -2211,7 +2248,7 @@ async fn status(
         .store
         .status_at(
             query.subject.as_deref(),
-            query.scope.as_deref(),
+            query.owner_run.as_deref(),
             query.at_index,
         )
         .map(Json)
@@ -2223,7 +2260,8 @@ struct EventQuery {
     #[serde(default, alias = "after_index")]
     after: u64,
     subject: Option<String>,
-    scope: Option<String>,
+    owner_run: Option<String>,
+    wait: Option<bool>,
 }
 
 async fn events(
@@ -2238,11 +2276,14 @@ async fn events(
         .events_after_filtered(
             query.after,
             query.subject.as_deref(),
-            query.scope.as_deref(),
+            query.owner_run.as_deref(),
         )
         .map_err(ApiError::internal)?;
     if !current.is_empty() {
         return Ok(Json(current));
+    }
+    if query.wait == Some(false) {
+        return Ok(Json(Vec::new()));
     }
     let _ = tokio::time::timeout(Duration::from_secs(30), notified).await;
     state
@@ -2250,7 +2291,7 @@ async fn events(
         .events_after_filtered(
             query.after,
             query.subject.as_deref(),
-            query.scope.as_deref(),
+            query.owner_run.as_deref(),
         )
         .map(Json)
         .map_err(ApiError::internal)
@@ -2318,18 +2359,6 @@ async fn quick_agent(
         intent.plans.get(&plan_id).cloned().ok_or_else(|| {
             ApiError::internal("quick agent normalization lost its standing plan")
         })?;
-    let actual_agent_token = state
-        .store
-        .selected_desired_token(&request.subject)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    if actual_agent_token != request.expected_subject {
-        return Err(ApiError::bad(St3Error::new(
-            "stale-subject",
-            format!("the desired state for `{}` changed", request.subject),
-        )));
-    }
     let planned = state
         .store
         .plan(
@@ -2381,19 +2410,33 @@ async fn quick_agent(
                 workspace: request.worktree.clone(),
                 requester: Some("person/requester".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: format!("{}:standing-run", request.idempotency_key),
             })
             .map_err(ApiError::bad)?
     };
+    let agent_subject = format!("agent/{}/{bus_id}", run.id);
+    let actual_agent_token = state
+        .store
+        .selected_desired_token(&agent_subject)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if actual_agent_token != request.expected_subject {
+        return Err(ApiError::bad(St3Error::new(
+            "stale-subject",
+            format!("the desired state for `{agent_subject}` changed"),
+        )));
+    }
     signal_changed(state);
-    let runtime_id = bus_id.to_owned();
+    let runtime_id = format!("{}.{}", run.id, bus_id.replace('/', "."));
     let ready = state
         .store
-        .latest_claim(&request.subject, Some("harness.ready"))
+        .latest_claim(&agent_subject, Some("harness.ready"))
         .map_err(ApiError::internal)?
         .is_some();
     let response = QuickAgentResponse {
-        subject: request.subject,
+        subject: agent_subject,
         plan: format!("plan/{plan_id}"),
         plan_run: run.subject,
         generation: run.generation,
@@ -2480,47 +2523,43 @@ async fn start_eval(
             workspace: workspace.to_string_lossy().into_owned(),
             requester: Some("person/eval-requester".into()),
             mode: Some("eval".into()),
+            inputs: request.inputs,
             idempotency_key: format!("eval:{}:{}:{nonce}", request.name, request.bundle_hash),
         })
         .map_err(ApiError::bad)?;
     signal_changed(&state);
-    let scope = run
-        .run_scope
-        .clone()
-        .unwrap_or_else(|| format!("scope/eval/{}/{}", request.name, run.id));
     Ok(Json(EvalStartResponse {
-        scope,
         event_cursor: applied
             .store_index
             .max(state.store.index().map_err(ApiError::internal)?),
-        plan_run: Some(run.subject),
+        plan_run: run.subject,
     }))
 }
 
 async fn get_eval(
     State(state): State<AppState>,
-    AxumPath(scope): AxumPath<String>,
+    AxumPath(run): AxumPath<String>,
 ) -> Result<Json<EvalStatus>, ApiError> {
-    let scope = if scope.starts_with("scope/") {
-        scope
-    } else {
-        format!("scope/{scope}")
-    };
     let run = state
         .store
-        .plan_run_for_scope(&scope)
+        .plan_run(&run)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("eval scope `{scope}` does not exist")))?;
+        .ok_or_else(|| ApiError::not_found(format!("eval plan run `{run}` does not exist")))?;
     let verdict = match run.status.as_str() {
         "completed" => Some("pass".into()),
         "failed" => Some("fail".into()),
         "cancelled" => Some("void".into()),
         _ => None,
     };
-    let cleanup = match run.phase.as_str() {
-        "final" => "cleaning",
-        "terminal" => "complete",
-        _ => "pending",
+    let cleanup = if run.phase == "terminal" {
+        "complete"
+    } else if run.phase == "final"
+        || run.phase == "final-cancelled"
+        || run.phase.starts_with("cleanup-")
+    {
+        "cleaning"
+    } else {
+        "pending"
     };
     let active_steps = run
         .steps
@@ -2534,7 +2573,6 @@ async fn get_eval(
         .map(|step| step.step.clone())
         .collect();
     Ok(Json(EvalStatus {
-        scope,
         plan_run: run.subject,
         lifecycle: run.status,
         phase: run.phase,
@@ -2559,18 +2597,30 @@ async fn start_plan_run(
 
 #[derive(Deserialize)]
 struct PlanRunQuery {
-    root: String,
+    root: Option<String>,
+    plan: Option<String>,
 }
 
 async fn list_plan_runs(
     State(state): State<AppState>,
     Query(query): Query<PlanRunQuery>,
 ) -> Result<Json<Vec<PlanRunView>>, ApiError> {
-    state
-        .store
-        .plan_runs_for_root(&query.root)
-        .map(Json)
-        .map_err(ApiError::internal)
+    match (query.root.as_deref(), query.plan.as_deref()) {
+        (Some(root), None) => state
+            .store
+            .plan_runs_for_root(root)
+            .map(Json)
+            .map_err(ApiError::internal),
+        (None, Some(plan)) => state
+            .store
+            .active_plan_runs_for_plan(plan)
+            .map(Json)
+            .map_err(ApiError::internal),
+        _ => Err(ApiError::bad(St3Error::new(
+            "invalid-plan-run-query",
+            "select exactly one plan or root plan run",
+        ))),
+    }
 }
 
 async fn get_plan_run(
@@ -2609,15 +2659,10 @@ async fn revise_plan_run(
             "a run revision must contain exactly one plan",
         )));
     }
-    let initial_plan = initial.plans.values().next().expect("one plan was checked");
-    let allowed_scope = initial_plan.scope_template.as_deref();
-    if initial.subjects.iter().any(|(subject, desired)| {
-        desired.kind != "agent"
-            && (Some(subject.as_str()) != allowed_scope || desired.kind != "scope")
-    }) {
+    if !initial.subjects.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "invalid-plan-revision-intent",
-            "a run revision can contain only its plan, adjacent agents, and its enclosing scope",
+            "a run revision can contain only its plan",
         )));
     }
     let bindings = state
@@ -2648,10 +2693,10 @@ async fn revise_plan_run(
                 "the current plan revision is unavailable",
             ))
         })?;
-    if old.scope_template != replacement.scope_template {
+    if old.inputs != replacement.inputs {
         return Err(ApiError::bad(St3Error::new(
-            "run-scope-mutation",
-            "a run revision cannot change its enclosing scope",
+            "run-input-mutation",
+            "a run revision cannot change its input declarations",
         )));
     }
     let actor = if request.actor.contains('/') {
@@ -2973,16 +3018,10 @@ async fn publish_work_plan(
             "a plan output must contain exactly one plan",
         )));
     }
-    let initial_plan = initial.plans.values().next().expect("one plan was checked");
-    let allowed_scope = initial_plan.scope_template.as_deref();
-    if initial
-        .subjects
-        .iter()
-        .any(|(name, desired)| Some(name.as_str()) != allowed_scope || desired.kind != "scope")
-    {
+    if !initial.subjects.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "invalid-plan-output-intent",
-            "a plan output can contain only its plan and enclosing scope",
+            "a plan output can contain only its plan",
         )));
     }
     let bindings = state
@@ -4150,6 +4189,7 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
         assert_eq!(status, StatusCode::OK, "{started}");
         let session = started["id"].as_str().unwrap();
         let planner = started["planner"].as_str().unwrap();
+        assert!(planner.ends_with(&format!("/planner.{}", &session[..10])));
         assert_eq!(started["requester"], "person/nathan");
         let request_reference = started["request"].as_str().unwrap();
         assert!(request_reference.starts_with("doc/planning/"));
@@ -4174,8 +4214,12 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
             )
             .unwrap()
             .unwrap();
-        let standing_intent =
-            parse_intent(standing_plan.subgraph_kdl.as_ref().unwrap(), "node").unwrap();
+        let standing_intent = crate::graph::parse_execution_intent(
+            standing_plan.subgraph_kdl.as_ref().unwrap(),
+            "node",
+            &standing.id,
+        )
+        .unwrap();
         let planner_launch = standing_intent
             .subjects
             .get(planner)
@@ -4230,7 +4274,7 @@ subgraph {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "wrong-planning-plan");
+        assert_eq!(rejected["code"], "runtime-outside-plan");
         assert!(
             store
                 .desired_subjects()
@@ -4403,7 +4447,9 @@ subgraph {
             approved["candidate"]["plan_revision"]
         );
         assert!(store.plan_spec("planned/work", None).unwrap().is_some());
-        assert!(store.active_plan_runs().unwrap().is_empty());
+        let active = store.active_plan_runs().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].phase, "cleanup-cancelled");
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
 
@@ -4420,15 +4466,12 @@ subgraph {
             let (name, hash) = reference.rsplit_once('@').unwrap();
             assert!(store.get_document(name, hash).unwrap().is_some());
         }
-        assert_eq!(
+        assert!(
             store
                 .desired_subjects()
                 .unwrap()
                 .into_iter()
-                .find(|desired| desired.subject == planner)
-                .unwrap()
-                .kind,
-            "stop"
+                .all(|desired| desired.subject != planner)
         );
 
         let (status, approved_again) = json_request(
@@ -4527,6 +4570,7 @@ subgraph {
                 workspace: workspace.display().to_string(),
                 requester: Some("person/nathan".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "variant-run".into(),
             })
             .unwrap();
@@ -4706,24 +4750,17 @@ subgraph {
                 r#"
 version 2
 subgraph {{
-  scope "eval/demo/${{ST_PLAN_RUN}}" retention="temporary" {{
-    plan "eval/demo" state="ready" {{
-      goal "Complete plan eval/demo."
-      baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
-      step "document" {{
-        title "The document exists"
+  plan "eval/demo" state="ready" {{
+    goal "Complete plan eval/demo."
+    baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
+    step "document" {{
+      agentless
+      title "The document exists"
       subgraph {{
         message "task" {{ to "person/worker"; content "doc/evals/demo/task@{hash}" }}
       }}
-      }}
-      completion {{ when "all-steps-exhausted" }}
-      finally {{
-        step "cleanup" {{
-          subgraph {{ scope "eval/demo/${{ST_PLAN_RUN}}" {{ stop }} }}
-          gate "scope-empty" {{ empty "scope/eval/demo/${{ST_PLAN_RUN}}" }}
-        }}
-      }}
     }}
+    completion {{ when "all-steps-exhausted" }}
   }}
 }}
 "#
@@ -4742,22 +4779,17 @@ subgraph {{
                 name: "demo".into(),
                 bundle_hash,
                 bundle,
+                inputs: BTreeMap::new(),
             })
             .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(
-            body["scope"]
-                .as_str()
-                .unwrap()
-                .starts_with("scope/eval/demo/")
-        );
         assert!(body["plan_run"].as_str().unwrap().starts_with("plan-run/"));
-        let eval_scope = body["scope"].as_str().unwrap();
+        let eval_run = body["plan_run"].as_str().unwrap();
         let (status, eval_status) = get_request(
             app.clone(),
-            &format!("/v1/evals/{}", urlencoding::encode(eval_scope)),
+            &format!("/v1/evals/{}", urlencoding::encode(eval_run)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{eval_status}");
@@ -4783,18 +4815,16 @@ subgraph {{
     }
 
     #[tokio::test]
-    async fn a_scoped_plan_revision_publishes_without_reapplying_the_scope() {
+    async fn a_plan_revision_publishes_without_adjacent_runtime_state() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 subgraph {
-  scope "revision/${ST_PLAN_RUN}" {
-    plan "revision" state="ready" {
-      goal "Complete plan revision."
-      subgraph { agent "sup" { workspace "."; command "true" } }
-      step "work" { goal "First goal." }
-    }
+  plan "revision" state="ready" {
+    goal "Complete plan revision."
+    subgraph { agent "sup" { workspace "."; command "true" } }
+    step "work" { goal "First goal." }
   }
 }
 "#;
@@ -4821,6 +4851,7 @@ subgraph {
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "revision-run".into(),
             })
             .unwrap();
@@ -4828,12 +4859,10 @@ subgraph {
         let replacement = r#"
 version 2
 subgraph {
-  scope "revision/${ST_PLAN_RUN}" {
-    plan "revision" state="ready" {
-      goal "Complete plan revision."
-      subgraph { agent "sup" { workspace "."; command "true" } }
-      step "work" { goal "Corrected goal." }
-    }
+  plan "revision" state="ready" {
+    goal "Complete plan revision."
+    subgraph { agent "sup" { workspace "."; command "true" } }
+    step "work" { goal "Corrected goal." }
   }
 }
 "#;
@@ -4857,14 +4886,7 @@ subgraph {
         assert_ne!(revised["plan_run"]["revision"], run.revision);
         assert_eq!(revised["plan_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["plan_run"]["steps"][0]["status"], "pending");
-        assert_eq!(
-            state
-                .store
-                .claims_for("scope/revision/${ST_PLAN_RUN}", Some("intent.desired"))
-                .unwrap()
-                .len(),
-            0
-        );
+        assert!(state.store.desired_subjects().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4906,6 +4928,7 @@ subgraph {
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-bootstrap-output".into(),
             })
             .unwrap();
@@ -5092,6 +5115,7 @@ subgraph {
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "review-api-run".into(),
             })
             .unwrap();
@@ -5169,7 +5193,17 @@ subgraph {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["subject"], "agent/node.quick");
+        assert_eq!(
+            created["subject"],
+            format!(
+                "agent/{}/node.quick",
+                created["plan_run"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("plan-run/")
+            )
+        );
+        let agent_subject = created["subject"].as_str().unwrap().to_owned();
         assert_eq!(created["plan"], "plan/standing/node.quick");
         assert!(
             created["plan_run"]
@@ -5193,7 +5227,12 @@ subgraph {
             .plan_spec("standing/node.quick", Some(&standing.revision))
             .unwrap()
             .unwrap();
-        let intent = parse_intent(plan.subgraph_kdl.as_ref().unwrap(), "node").unwrap();
+        let intent = crate::graph::parse_execution_intent(
+            plan.subgraph_kdl.as_ref().unwrap(),
+            "node",
+            &standing.id,
+        )
+        .unwrap();
         store
             .apply_internal(&intent, "test-materialize-standing-agent")
             .unwrap();
@@ -5217,7 +5256,7 @@ subgraph {
         let desired = store.desired_subjects().unwrap();
         let member = desired
             .iter()
-            .find(|subject| subject.subject == "agent/node.quick")
+            .find(|subject| subject.subject == agent_subject)
             .unwrap()
             .member
             .as_ref()
@@ -5232,7 +5271,7 @@ subgraph {
         let mut revised = request.clone();
         revised.model = Some("revised-model".into());
         revised.expected_subject = store
-            .selected_desired_token("agent/node.quick")
+            .selected_desired_token(&agent_subject)
             .unwrap()
             .into_iter()
             .collect();
@@ -5258,12 +5297,15 @@ subgraph {
 
         store
             .append_claim(&ClaimInput {
-                subject: "agent/node.quick".into(),
+                subject: agent_subject.clone(),
                 kind: "member.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("running".into())),
-                    ("runtime_id".into(), Value::String("node.quick".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String(revised_response["runtime_id"].as_str().unwrap().into()),
+                    ),
                     (
                         "incarnation_id".into(),
                         Value::String("generation-one".into()),
@@ -5276,7 +5318,10 @@ subgraph {
             .unwrap();
         let (status, attachment) = json_request(
             app.clone(),
-            "/v1/sessions/attach/agent/node.quick",
+            &format!(
+                "/v1/sessions/attach/{}",
+                urlencoding::encode(&agent_subject)
+            ),
             serde_json::to_value(AttachRequest::default()).unwrap(),
         )
         .await;
@@ -5291,7 +5336,10 @@ subgraph {
 
         let (status, error) = json_request(
             app,
-            "/v1/sessions/agent%2Fnode.quick/context/clear",
+            &format!(
+                "/v1/sessions/{}/context/clear",
+                urlencoding::encode(&agent_subject)
+            ),
             serde_json::to_value(ContextClearRequest {
                 expected_incarnation: "generation-old".into(),
                 idempotency_key: "clear-old".into(),
@@ -5341,7 +5389,7 @@ subgraph {
                     "resource" | "observer" | "subscription"
                 ))
                 .count(),
-            3
+            1
         );
         let second_request = ResourceWatchRequest {
             provider: "github.pull-request".into(),
@@ -5357,19 +5405,8 @@ subgraph {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{second}");
-        let desired = store.desired_subjects().unwrap();
-        let second_subscription = desired
-            .iter()
-            .find(|desired| desired.subject == second["subscription"].as_str().unwrap())
-            .and_then(|desired| crate::graph::subscription_spec(&desired.desired))
-            .unwrap();
-        assert_eq!(second_subscription.fields, vec!["checks"]);
-        let observer = desired
-            .iter()
-            .find(|desired| desired.subject == first["observer"].as_str().unwrap())
-            .and_then(|desired| crate::graph::observer_spec(&desired.desired))
-            .unwrap();
-        assert_eq!(observer.fields, vec!["checks", "head", "state"]);
+        assert_ne!(second["subscription"], first["subscription"]);
+        assert_eq!(store.active_plan_runs().unwrap().len(), 2);
         let subscription = first["subscription"].as_str().unwrap();
         let (status, stopped) = json_request(
             app,
@@ -5382,23 +5419,15 @@ subgraph {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{stopped}");
-        let desired = store
-            .desired_subjects()
+        let run_id = subscription
+            .strip_prefix("subscription/")
             .unwrap()
-            .into_iter()
-            .find(|desired| desired.subject == subscription)
+            .split('/')
+            .next()
             .unwrap();
-        assert!(
-            crate::graph::subscription_spec(&desired.desired)
-                .unwrap()
-                .stopped
-        );
-        assert!(
-            store
-                .desired_subjects()
-                .unwrap()
-                .into_iter()
-                .any(|desired| desired.kind == "observer")
-        );
+        let run = store.plan_run(run_id).unwrap().unwrap();
+        assert_eq!(run.status, "running");
+        assert_eq!(run.phase, "cleanup-cancelled");
+        assert_eq!(store.active_plan_runs().unwrap().len(), 2);
     }
 }

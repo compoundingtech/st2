@@ -98,4 +98,4 @@ The migration writes an explicit completion checkpoint. Its judge uses the coord
 
 Mechanical judges run through the asynchronous exec runtime. The coordination wait does not block reconciliation.
 
-Run only the translated `license-mit` eval. It must produce a pass verdict and an empty final eval scope.
+Run only the translated `license-mit` eval. It must produce a pass verdict and stop every runtime owned by the plan run.

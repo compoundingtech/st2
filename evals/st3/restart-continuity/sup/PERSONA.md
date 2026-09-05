@@ -25,5 +25,5 @@ Never use Claude teams, subagents, `SendMessage`, or another message channel.
 
 1. Run `st3 message ls`.
 2. Read and archive every message.
-3. Claim only a ready assignment for `agent/rc.sup`.
+3. Claim only a ready assignment for `agent/${ST_PLAN_RUN}/rc.sup`.
 4. End the turn when no message or ready work remains.

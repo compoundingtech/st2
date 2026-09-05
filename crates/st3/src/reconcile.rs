@@ -281,7 +281,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
-        self.reconcile_terminal_generation_scopes()?;
         let desired = self.store.desired_subjects()?;
         let ptys = match self.runtime.snapshot_ptys() {
             Ok(snapshot) => snapshot
@@ -302,16 +301,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
 
         let active = self.active_subjects(&desired)?;
-        let stopped_scopes = active
-            .iter()
-            .filter(|subject| subject.kind == "scope-stop")
-            .map(|subject| subject.subject.clone())
-            .collect::<std::collections::BTreeSet<_>>();
         for subject in &active {
-            if subject.kind == "scope-stop" {
-                self.reconcile_scope_stop(subject, &desired, &ptys)?;
-                continue;
-            }
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
                 continue;
@@ -319,13 +309,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             let Some(member) = &subject.member else {
                 continue;
             };
-            if subject
-                .scopes
-                .iter()
-                .any(|scope| stopped_scopes.contains(scope))
-            {
-                continue;
-            }
             if member.host != self.host {
                 continue;
             }
@@ -425,21 +408,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.deliver_messages(&desired)?;
         self.evaluate_plan_runs()?;
         self.evaluate_checkpoints(&desired)?;
-        Ok(())
-    }
-
-    fn reconcile_terminal_generation_scopes(&self) -> Result<()> {
-        for run in self.store.terminal_plan_runs()? {
-            let source = format!(
-                "version 2\nsubgraph {{\n  scope {:?} {{ stop }}\n}}",
-                run.generation
-            );
-            let intent = crate::graph::parse_intent(&source, &self.host)?;
-            self.store.apply_internal(
-                &intent,
-                &format!("retire-terminal-generation:{}", run.generation),
-            )?;
-        }
         Ok(())
     }
 
@@ -711,58 +679,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(false)
     }
 
-    fn reconcile_scope_stop(
-        &self,
-        scope: &DesiredSubject,
-        desired: &[DesiredSubject],
-        ptys: &HashMap<String, RuntimeObservation>,
-    ) -> Result<()> {
-        let mut live = Vec::new();
-        for member in desired
-            .iter()
-            .filter(|member| member.scopes.contains(&scope.subject))
-            .filter_map(|member| member.member.as_ref().map(|spec| (member, spec)))
-        {
-            let (subject, spec) = member;
-            let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
-                continue;
-            };
-            let observation = if spec.terminal {
-                ptys.get(&spec.runtime_id).cloned()
-            } else {
-                self.runtime.observe_exec(&spec.runtime_id)?
-            };
-            let incarnation = observation
-                .as_ref()
-                .and_then(|value| value.incarnation_id.as_deref())
-                .or_else(|| actual_field(&actual, "incarnation_id").and_then(Value::as_str));
-            if !self.reconcile_runtime_stop(
-                &subject.subject,
-                &spec.runtime_id,
-                spec.terminal,
-                incarnation,
-                spec.shutdown_timeout_ms,
-                observation.as_ref(),
-            )? {
-                live.push(Value::String(subject.subject.clone()));
-            }
-        }
-        let status = if live.is_empty() {
-            "stopped"
-        } else {
-            "stopping"
-        };
-        self.record_once(
-            &scope.subject,
-            "scope.members",
-            BTreeMap::from([
-                ("status".into(), Value::String(status.into())),
-                ("members".into(), Value::Array(live)),
-            ]),
-        )?;
-        Ok(())
-    }
-
     fn perform_start(
         &self,
         subject: &DesiredSubject,
@@ -823,9 +739,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             wrapper.extend(original);
             launch_member.launch = crate::model::LaunchSpec::Argv(wrapper);
         }
-        self.perform_action(&subject.subject, "start", || {
-            self.runtime.start(&launch_member)
-        })?;
+        let operation = format!("{}:start", subject.subject);
+        self.record_once(
+            &subject.subject,
+            "action.requested",
+            BTreeMap::from([
+                ("action".into(), Value::String("start".into())),
+                ("operation".into(), Value::String(operation.clone())),
+            ]),
+        )?;
+        if let Err(error) = self.runtime.start(&launch_member) {
+            self.record_once(
+                &subject.subject,
+                "action.failed",
+                BTreeMap::from([
+                    ("action".into(), Value::String("start".into())),
+                    ("operation".into(), Value::String(operation)),
+                    ("reason".into(), Value::String(error.to_string())),
+                ]),
+            )?;
+            return Ok(());
+        }
         let desired_token = self
             .store
             .selected_desired_token(&subject.subject)?
@@ -1184,9 +1118,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn evaluate_plan_run(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
+        if run.phase.starts_with("cleanup-") {
+            return self.reconcile_plan_run_cleanup(run);
+        }
         let mut changed = false;
-        changed |= self.retire_predecessor_generation(run)?;
-        changed |= self.materialize_plan_subgraph(run, plan)?;
         let flat = flatten_plan_steps(plan);
         let normal_paths = flat
             .iter()
@@ -1259,6 +1194,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .set_plan_run_state(&run.id, "running", "normal", None)?;
             }
         }
+        changed |= self.materialize_plan_subgraph(run, plan)?;
+        changed |= self.retire_predecessor_generation(run)?;
         let mut normal_failed = flat.iter().any(|step| {
             !step.spec.finally
                 && views.get(step.spec.path.as_str()).is_some_and(|view| {
@@ -1319,8 +1256,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 changed |= self.store.set_plan_run_state(
                     &run.id,
-                    if normal_failed { "failed" } else { "completed" },
-                    "terminal",
+                    "running",
+                    if normal_failed {
+                        "cleanup-failed"
+                    } else {
+                        "cleanup-completed"
+                    },
                     normal_failure_reason.as_deref(),
                 )?;
             }
@@ -1353,8 +1294,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 };
                 changed |= self.store.set_plan_run_state(
                     &run.id,
-                    terminal_status,
-                    "terminal",
+                    "running",
+                    &format!("cleanup-{terminal_status}"),
                     (final_failed || failed).then_some("one or more plan steps failed"),
                 )?;
                 return Ok(changed);
@@ -1587,6 +1528,48 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(changed)
     }
 
+    fn reconcile_plan_run_cleanup(&self, run: &PlanRunView) -> Result<bool> {
+        let owned = self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
+            .filter(|subject| subject.member.is_some() || subject.kind == "stop")
+            .collect::<Vec<_>>();
+        let mut live = Vec::new();
+        for subject in &owned {
+            let status = self
+                .store
+                .latest_actual_value(&subject.subject)?
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if !matches!(status.as_deref(), Some("stopped" | "absent" | "exited")) {
+                live.push(subject);
+            }
+        }
+        let running = live
+            .iter()
+            .filter(|subject| subject.kind != "stop")
+            .map(|subject| format!("  stop {:?}", subject.subject))
+            .collect::<Vec<_>>();
+        if !running.is_empty() {
+            let source = format!("version 2\nsubgraph {{\n{}\n}}", running.join("\n"));
+            let intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
+            let response = self
+                .store
+                .apply_internal(&intent, &format!("cleanup-plan-run:{}", run.generation))?;
+            return Ok(response.changed);
+        }
+        if !live.is_empty() {
+            return Ok(false);
+        }
+        let status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
+        self.store
+            .set_plan_run_state(&run.id, status, "terminal", None)
+    }
+
     fn plan_completion_selected(
         &self,
         run: &PlanRunView,
@@ -1729,13 +1712,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 (child, false)
             } else {
                 let selector = step_run_selector(view);
-                let child = self.store.create_child_plan_run(
+                let child = match self.store.create_child_plan_run(
                     &PlanRunRequest {
                         plan: plan.clone(),
                         revision: Some(revision.clone()),
                         workspace: run.workspace.clone(),
                         requester: Some(run.requester.clone()),
                         mode: Some(run.mode.clone()),
+                        inputs: BTreeMap::new(),
                         idempotency_key: format!(
                             "uses-plan:{}:{}:plan/{plan}@{revision}",
                             view.subject, view.attempt
@@ -1744,7 +1728,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                     run,
                     &view.subject,
                     Some(&selector),
-                )?;
+                ) {
+                    Ok(child) => child,
+                    Err(error) if error.code == "plan-run-capacity" => {
+                        return Ok((false, UsedPlanOutcome::Pending));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 (child, true)
             };
         if child.plan != format!("plan/{plan}") || child.revision != revision {
@@ -1859,16 +1849,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         };
         let variables = run_variables(run, step, view);
-        let source = crate::plan::interpolate(source, &variables)?;
-        let mut intent = crate::graph::parse_intent(&source, &self.host)?;
-        let step_scope = format!("scope/{}", view.subject);
-        let generation_scope = format!("scope/{}", run.generation);
+        let source = crate::plan::interpolate_kdl(source, &variables)?;
+        let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         for subject in intent.subjects.values_mut() {
-            subject.scopes.insert(step_scope.clone());
-            subject.scopes.insert(generation_scope.clone());
-            if let Some(scope) = &run.run_scope {
-                subject.scopes.insert(scope.clone());
-            }
+            subject.owner_run = Some(run.subject.clone());
+            subject.owner_generation = Some(run.generation.clone());
+            subject.owner_step = Some(view.subject.clone());
             if let Some(member) = subject.member.as_mut() {
                 let workspace = PathBuf::from(&member.workspace);
                 if workspace.is_relative() {
@@ -1893,22 +1879,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
                 member
                     .environment
-                    .insert("ST_AGENT".into(), member.runtime_id.clone());
+                    .insert("ST_AGENT".into(), subject.subject.clone());
             }
         }
-        if let Some(scope) = &run.run_scope {
-            intent
-                .subjects
-                .entry(scope.clone())
-                .or_insert_with(|| DesiredSubject {
-                    subject: scope.clone(),
-                    kind: "scope".into(),
-                    desired: serde_json::json!({"scope": scope, "retention": "temporary"}),
-                    member: None,
-                    activation: None,
-                    scopes: BTreeSet::new(),
-                });
-        }
+        self.reject_runtime_collisions(&intent, run, Some(&view.subject))?;
         let response = self.store.apply_internal(
             &intent,
             &format!("materialize:{}:{}", view.subject, view.attempt),
@@ -1917,24 +1891,24 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn retire_predecessor_generation(&self, run: &PlanRunView) -> Result<bool> {
-        let Some(predecessor) = self
+        let stops = self
             .store
-            .run_generation(&run.generation)?
-            .and_then(|generation| generation.predecessor)
-        else {
-            return Ok(false);
-        };
-        let mut generations = vec![predecessor.clone()];
-        generations.extend(self.store.descendant_run_generations(&predecessor)?);
-        generations.sort();
-        generations.dedup();
-        let stops = generations
-            .iter()
-            .map(|generation| format!("scope {generation:?} {{ stop }}"))
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
+            .filter(|subject| subject.owner_generation.as_deref() != Some(run.generation.as_str()))
+            .filter(|subject| subject.member.is_some() && subject.kind != "stop")
+            .map(|subject| format!("stop {:?}", subject.subject))
             .collect::<Vec<_>>()
             .join("\n");
+        if stops.is_empty() {
+            return Ok(false);
+        }
         let source = format!("version 2\nsubgraph {{\n{stops}\n}}");
-        let intent = crate::graph::parse_intent(&source, &self.host)?;
+        let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
+        for subject in intent.subjects.values_mut() {
+            subject.owner_generation = Some(run.generation.clone());
+        }
         let response = self
             .store
             .apply_internal(&intent, &format!("retire-generation:{}", run.generation))?;
@@ -1946,14 +1920,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         };
         let variables = crate::store::plan_run_variables(run, &plan.revision);
-        let source = crate::plan::interpolate(source, &variables)?;
-        let mut intent = crate::graph::parse_intent(&source, &self.host)?;
-        let generation_scope = format!("scope/{}", run.generation);
+        let source = crate::plan::interpolate_kdl(source, &variables)?;
+        let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         for subject in intent.subjects.values_mut() {
-            subject.scopes.insert(generation_scope.clone());
-            if let Some(scope) = &run.run_scope {
-                subject.scopes.insert(scope.clone());
-            }
+            subject.owner_run = Some(run.subject.clone());
+            subject.owner_generation = Some(run.generation.clone());
+            subject.owner_step = None;
             if let Some(member) = subject.member.as_mut() {
                 let workspace = PathBuf::from(&member.workspace);
                 if workspace.is_relative() {
@@ -1978,22 +1950,60 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
                 member
                     .environment
-                    .insert("ST_AGENT".into(), member.runtime_id.clone());
+                    .insert("ST_AGENT".into(), subject.subject.clone());
             }
         }
+        self.reject_runtime_collisions(&intent, run, None)?;
         let response = self
             .store
             .apply_internal(&intent, &format!("materialize:{}", run.generation))?;
         Ok(response.changed)
     }
 
+    fn reject_runtime_collisions(
+        &self,
+        intent: &crate::model::NormalizedIntent,
+        run: &PlanRunView,
+        owner_step: Option<&str>,
+    ) -> Result<()> {
+        let existing = self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .map(|subject| (subject.subject.clone(), subject))
+            .collect::<BTreeMap<_, _>>();
+        for subject in intent.subjects.values().filter(|subject| {
+            matches!(
+                subject.kind.as_str(),
+                "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule"
+            )
+        }) {
+            let Some(current) = existing.get(&subject.subject) else {
+                continue;
+            };
+            if current.owner_run.as_deref() == Some(run.subject.as_str())
+                && current.owner_generation.as_deref() == Some(run.generation.as_str())
+                && current.owner_step.as_deref() != owner_step
+            {
+                return Err(crate::model::St3Error::new(
+                    "duplicate-runtime-subject",
+                    format!(
+                        "plan run `{}` declares runtime `{}` in more than one subgraph",
+                        run.subject, subject.subject
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     fn step_subgraph_holds(&self, step_subject: &str) -> Result<bool> {
-        let scope = format!("scope/{step_subject}");
         for subject in self
             .store
             .desired_subjects()?
             .into_iter()
-            .filter(|subject| subject.scopes.contains(&scope))
+            .filter(|subject| subject.owner_step.as_deref() == Some(step_subject))
         {
             let status = self
                 .store
@@ -2003,7 +2013,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let holds = match subject.kind.as_str() {
-                "scope-stop" | "stop" => {
+                "stop" => {
                     matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
                 }
                 "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
@@ -2042,7 +2052,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<bool> {
         for product in products {
             let subject = crate::plan::interpolate(&product.subject, variables)?;
-            let Some(actual) = self.store.latest_actual_value(&subject)? else {
+            let Some(actual) = self.subject_value(&subject)? else {
                 return Ok(false);
             };
             for (field, expected) in &product.fields {
@@ -2226,7 +2236,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .filter_map(|subject| {
                 serde_json::from_value::<CheckpointSpec>(subject.desired.clone())
                     .ok()
-                    .map(|stage| (stage, subject.scopes.clone()))
+                    .map(|stage| (stage, subject.owner_run.clone()))
             })
             .collect::<Vec<_>>();
         stages.sort_by_key(|(stage, _)| (stage.sequence.clone(), stage.ordinal));
@@ -2239,7 +2249,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .or_insert(stage.ordinal);
                     map
                 });
-        for (stage, scopes) in stages {
+        for (stage, owner_run) in stages {
             let reached = self.current_checkpoint_reached(&stage.sequence, desired)?;
             let terminal = self
                 .store
@@ -2274,7 +2284,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     _ => None,
                 });
             if let Some(reason) = deadline_failure {
-                self.fail_checkpoint(&stage, &scopes, &reason)?;
+                self.fail_checkpoint(&stage, owner_run.as_deref(), &reason)?;
                 continue;
             }
             if !self.checkpoint_subgraph_holds(&stage, desired)? {
@@ -2292,7 +2302,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         break;
                     }
                     GateOutcome::Fail(reason) => {
-                        self.fail_checkpoint(&stage, &scopes, &reason)?;
+                        self.fail_checkpoint(&stage, owner_run.as_deref(), &reason)?;
                         all_pass = false;
                         break;
                     }
@@ -2319,14 +2329,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let establishes_verdict = final_ordinal == Some(stage.ordinal)
                     || final_ordinal == Some(stage.ordinal.saturating_add(1));
                 if establishes_verdict
-                    && let Some(scope) = scopes.iter().next()
+                    && let Some(owner_run) = owner_run.as_deref()
                     && self
                         .store
-                        .latest_claim(scope, Some("eval.verdict"))?
+                        .latest_claim(owner_run, Some("eval.verdict"))?
                         .is_none()
                 {
                     self.record_once(
-                        scope,
+                        owner_run,
                         "eval.verdict",
                         BTreeMap::from([
                             ("verdict".into(), Value::String("pass".into())),
@@ -2358,7 +2368,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let holds = match subject.kind.as_str() {
-                "scope-stop" | "stop" => {
+                "stop" => {
                     matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
                 }
                 "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
@@ -2440,7 +2450,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn fail_checkpoint(
         &self,
         stage: &CheckpointSpec,
-        scopes: &std::collections::BTreeSet<String>,
+        owner_run: Option<&str>,
         reason: &str,
     ) -> Result<()> {
         self.record_once(
@@ -2451,14 +2461,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("reason".into(), Value::String(reason.into())),
             ]),
         )?;
-        if let Some(scope) = scopes.iter().next()
+        if let Some(owner_run) = owner_run
             && self
                 .store
-                .latest_claim(scope, Some("eval.verdict"))?
+                .latest_claim(owner_run, Some("eval.verdict"))?
                 .is_none()
         {
             self.record_once(
-                scope,
+                owner_run,
                 "eval.verdict",
                 BTreeMap::from([
                     ("verdict".into(), Value::String("fail".into())),
@@ -2570,24 +2580,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ("reachability".into(), Value::String("unreachable".into())),
                 ]),
             )?;
-            if spec.on_unreachable == "void"
-                && let Some(scope) = subject.scopes.iter().next()
-            {
-                self.record_once(
-                    scope,
-                    "eval.verdict",
-                    BTreeMap::from([
-                        ("verdict".into(), Value::String("void".into())),
-                        (
-                            "reason".into(),
-                            Value::String(format!(
-                                "required link `{}` is unreachable",
-                                link.subject
-                            )),
-                        ),
-                    ]),
-                )?;
-            }
             return Ok(true);
         }
         Ok(false)
@@ -3064,14 +3056,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let outcome = match gate {
             GateSpec::Exists { subject, .. } => {
                 self.ensure_file_observation(subject)?;
-                if self
-                    .store
-                    .latest_actual_value(subject)?
-                    .is_some_and(|actual| {
-                        actual_field(&actual, "status").and_then(Value::as_str)
-                            != Some("unreadable")
-                    })
-                {
+                if self.subject_value(subject)?.is_some_and(|actual| {
+                    actual_field(&actual, "status").and_then(Value::as_str) != Some("unreadable")
+                }) {
                     GateOutcome::Pass
                 } else {
                     GateOutcome::Pending
@@ -3082,7 +3069,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .store
                     .desired_subjects()?
                     .into_iter()
-                    .filter(|item| item.scopes.contains(subject) && item.member.is_some())
+                    .filter(|item| {
+                        item.owner_run.as_deref() == Some(subject) && item.member.is_some()
+                    })
                     .collect::<Vec<_>>();
                 let mut empty = true;
                 for member in members {
@@ -3113,7 +3102,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ..
             } => {
                 self.ensure_file_observation(subject)?;
-                let Some(actual) = self.store.latest_actual_value(subject)? else {
+                let Some(actual) = self.subject_value(subject)? else {
                     return Ok(GateOutcome::Pending);
                 };
                 let found = if subject.starts_with("file/") {
@@ -3386,7 +3375,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             desired: Value::Null,
             member: Some(member.clone()),
             activation: None,
-            scopes: Default::default(),
+            owner_run: None,
+            owner_generation: None,
+            owner_step: None,
         };
         self.perform_start(&desired, &member, "the mechanical gate was requested")?;
         self.arm_gate_poll();
@@ -3620,7 +3611,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             desired: Value::Null,
             member: Some(member.clone()),
             activation: None,
-            scopes: Default::default(),
+            owner_run: None,
+            owner_generation: None,
+            owner_step: None,
         };
         self.perform_start(&desired, &member, "the LLM gate was requested")?;
         Ok(GateOutcome::Pending)
@@ -3714,7 +3707,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .map(|bytes| String::from_utf8(bytes).map_err(Into::into))
                 .transpose();
         }
-        let Some(actual) = self.store.latest_actual_value(subject)? else {
+        let Some(actual) = self.subject_value(subject)? else {
             return Ok(None);
         };
         if let Some(content) = actual_field(&actual, "content").and_then(Value::as_str) {
@@ -3727,6 +3720,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             .get_blob(hash)?
             .map(|bytes| String::from_utf8(bytes).map_err(Into::into))
             .transpose()
+    }
+
+    fn subject_value(&self, subject: &str) -> Result<Option<Value>> {
+        if subject.starts_with("resource/")
+            && let Some((name, claim_id)) = subject.rsplit_once('@')
+        {
+            return Ok(self
+                .store
+                .claim_by_id(claim_id)?
+                .filter(|claim| claim.subject == name)
+                .map(|claim| claim.body));
+        }
+        self.store.latest_actual_value(subject)
     }
 
     fn ensure_file_observation(&self, subject: &str) -> Result<()> {
@@ -3871,7 +3877,7 @@ fn run_variables(
         })
         .or_else(|| run.parent_step_run.clone())
         .unwrap_or_default();
-    BTreeMap::from([
+    let mut variables = BTreeMap::from([
         (
             "ST_PLAN".into(),
             run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
@@ -3885,7 +3891,6 @@ fn run_variables(
                 .unwrap_or(&run.generation)
                 .into(),
         ),
-        ("ST_SCOPE".into(), run.run_scope.clone().unwrap_or_default()),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_STEP".into(), step.spec.path.clone()),
         ("ST_STEP_RUN".into(), view.subject.clone()),
@@ -3897,7 +3902,13 @@ fn run_variables(
         ("ST_REQUESTER".into(), run.requester.clone()),
         ("ST_PARENT_STEP_RUN".into(), parent_step_run),
         ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
-    ])
+    ]);
+    variables.extend(
+        run.inputs
+            .iter()
+            .map(|(name, input)| (format!("input.{name}"), input.value.clone())),
+    );
+    variables
 }
 
 fn expand_gate(
@@ -4177,7 +4188,7 @@ mod tests {
     use chrono::{SecondsFormat, Utc};
 
     use super::*;
-    use crate::graph::parse_intent;
+    use crate::graph::parse_test_intent as parse_intent;
 
     #[derive(Default)]
     struct FakeRuntime {
@@ -4185,6 +4196,7 @@ mod tests {
         execs: Mutex<HashMap<String, RuntimeObservation>>,
         logs: Mutex<HashMap<String, String>>,
         starts: Mutex<Vec<String>>,
+        failed_starts: Mutex<std::collections::HashSet<String>>,
         started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
         kills: Mutex<Vec<String>>,
@@ -4202,6 +4214,14 @@ mod tests {
         }
         fn start(&self, member: &MemberSpec) -> Result<()> {
             self.starts.lock().unwrap().push(member.runtime_id.clone());
+            if self
+                .failed_starts
+                .lock()
+                .unwrap()
+                .contains(&member.runtime_id)
+            {
+                anyhow::bail!("the fake runtime rejected the start")
+            }
             self.started_members.lock().unwrap().push(member.clone());
             Ok(())
         }
@@ -4304,6 +4324,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-dag".into(),
             })
             .unwrap();
@@ -4330,6 +4351,9 @@ subgraph {
               plan "baseline" state="ready" {
                 goal "Run only from an admitted baseline."
                 completion { when "all-steps-exhausted" }
+                subgraph {
+                  agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+                }
                 baseline "the release is open" {
                   field "state" "resource/release" is "open"
                 }
@@ -4350,6 +4374,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "baseline-run".into(),
             })
             .unwrap();
@@ -4364,6 +4389,13 @@ subgraph {
         let blocked = store.plan_run(&run.id).unwrap().unwrap();
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.steps[0].status, "pending");
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|subject| subject.subject != format!("agent/{}/worker", run.id))
+        );
 
         for (subject, state, key) in [
             ("resource/release", "open", "release-open"),
@@ -4385,6 +4417,13 @@ subgraph {
         let admitted = store.plan_run(&run.id).unwrap().unwrap();
         assert_eq!(admitted.status, "running");
         assert_eq!(admitted.steps[0].status, "ready");
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(|subject| subject.subject == format!("agent/{}/worker", run.id))
+        );
 
         store
             .append_claim(&ClaimInput {
@@ -4454,6 +4493,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "release-run".into(),
             })
             .unwrap();
@@ -4498,6 +4538,7 @@ subgraph {
                 idempotency_key: Some("result-approved".into()),
             })
             .unwrap();
+        reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store.plan_run(&run.id).unwrap().unwrap().status,
@@ -4556,6 +4597,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "context-run".into(),
             })
             .unwrap();
@@ -4583,7 +4625,6 @@ subgraph {
             "ST_PLAN_RUN",
             "ST_RUN_GENERATION",
             "ST_ROOT_PLAN_RUN",
-            "ST_SCOPE",
             "ST_WORKSPACE",
             "ST_REQUESTER",
             "ST_STEP",
@@ -4647,6 +4688,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-wake".into(),
             })
             .unwrap();
@@ -4663,6 +4705,66 @@ subgraph {
         tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
             .await
             .expect("the materialized subgraph did not request another reconcile pass");
+    }
+
+    #[test]
+    fn one_failed_runtime_start_does_not_block_other_runtime_starts() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+subgraph {
+  plan "start-failure" state="ready" {
+    goal "Start all independent plan members."
+    step "team" {
+      subgraph {
+        agent "bad" { workspace "/tmp"; command "true"; restart "never" }
+        agent "good" { workspace "/tmp"; command "true"; restart "never" }
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-start-failure");
+        let run = store
+            .create_plan_run(&crate::model::PlanRunRequest {
+                plan: "start-failure".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-start-failure".into(),
+            })
+            .unwrap();
+        let bad_runtime = format!("{}.bad", run.id);
+        let good_runtime = format!("{}.good", run.id);
+        let bad_subject = format!("agent/{}/bad", run.id);
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_starts
+            .lock()
+            .unwrap()
+            .insert(bad_runtime.clone());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let starts = runtime.starts.lock().unwrap();
+        assert!(starts.contains(&bad_runtime));
+        assert!(starts.contains(&good_runtime));
+        assert!(
+            store
+                .latest_claim(&bad_subject, Some("action.failed"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -4711,6 +4813,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "retire-run".into(),
             })
             .unwrap();
@@ -4723,14 +4826,17 @@ subgraph {
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        let predecessor_scope = format!("scope/{}", run.generation);
         let worker = store
             .desired_subjects()
             .unwrap()
             .into_iter()
-            .find(|subject| subject.subject == "agent/node.worker")
+            .find(|subject| subject.subject == format!("agent/{}/worker", run.id))
             .expect("the first generation member is materialized");
-        assert!(worker.scopes.contains(&predecessor_scope));
+        assert_eq!(worker.owner_run.as_deref(), Some(run.subject.as_str()));
+        assert_eq!(
+            worker.owner_generation.as_deref(),
+            Some(run.generation.as_str())
+        );
 
         let child_plan = publish(
             r#"
@@ -4752,6 +4858,7 @@ subgraph {
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
                     mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
                     idempotency_key: "retire-child-run".into(),
                 },
                 &run,
@@ -4779,6 +4886,7 @@ subgraph {
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
                     mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
                     idempotency_key: "retire-grandchild-run".into(),
                 },
                 &child,
@@ -4811,17 +4919,12 @@ subgraph {
         reconciler.reconcile_once().unwrap();
 
         let desired = store.desired_subjects().unwrap();
-        for scope in [
-            predecessor_scope,
-            format!("scope/{}", child.generation),
-            format!("scope/{}", grandchild.generation),
-        ] {
-            let stop = desired
-                .iter()
-                .find(|subject| subject.subject == scope)
-                .expect("the predecessor lineage has a teardown scope");
-            assert_eq!(stop.kind, "scope-stop");
-        }
+        let stop = desired
+            .iter()
+            .find(|subject| subject.subject == format!("agent/{}/worker", run.id))
+            .expect("the predecessor runtime has a teardown declaration");
+        assert_eq!(stop.kind, "stop");
+        assert_eq!(stop.owner_run.as_deref(), Some(revised.subject.as_str()));
         assert_eq!(
             store.plan_run(&child.id).unwrap().unwrap().status,
             "cancelled"
@@ -4863,6 +4966,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-product".into(),
             })
             .unwrap();
@@ -4965,6 +5069,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-bootstrap".into(),
             })
             .unwrap();
@@ -5181,6 +5286,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "assignment-run".into(),
             })
             .unwrap();
@@ -5255,6 +5361,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "review-run".into(),
             })
             .unwrap();
@@ -5431,7 +5538,7 @@ subgraph {
                     }
                     message "kick" {
                       from "requester"
-                      to "node.worker"
+                      to "worker"
                       content "Start."
                     }
                   }
@@ -5446,16 +5553,19 @@ subgraph {
             }
         "#;
         apply_source(&store, source, "plan-native-ready");
-        store
+        let run = store
             .create_plan_run(&crate::model::PlanRunRequest {
                 plan: "proof".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-native-ready".into(),
             })
             .unwrap();
+        let runtime_id = format!("{}.worker", run.id);
+        let agent_subject = format!("agent/{}/worker", run.id);
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -5467,23 +5577,23 @@ subgraph {
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+        assert_eq!(&*runtime.starts.lock().unwrap(), &[runtime_id.clone()]);
 
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
-            runtime_id: "node.worker".into(),
+            runtime_id: runtime_id.clone(),
             terminal: true,
             status: "running".into(),
             exit_code: None,
             incarnation_id: Some("worker-one".into()),
         });
         reconciler.reconcile_once().unwrap();
-        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+        assert_eq!(&*runtime.starts.lock().unwrap(), &[runtime_id.clone()]);
 
         store
             .append_claim(&ClaimInput {
-                subject: "agent/node.worker".into(),
+                subject: agent_subject.clone(),
                 kind: "harness.ready".into(),
-                actor: Some("agent/node.worker".into()),
+                actor: Some(agent_subject.clone()),
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("ready".into())),
                     ("transport".into(), Value::String("app-server".into())),
@@ -5494,13 +5604,13 @@ subgraph {
             })
             .unwrap();
         reconciler.reconcile_once().unwrap();
-        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.worker"]);
+        assert_eq!(&*runtime.starts.lock().unwrap(), &[runtime_id]);
 
         store
             .append_claim(&ClaimInput {
                 subject: "message/kick".into(),
                 kind: "message.delivered".into(),
-                actor: Some("agent/node.worker".into()),
+                actor: Some(agent_subject),
                 fields: BTreeMap::from([("status".into(), Value::String("delivered".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -5515,14 +5625,13 @@ subgraph {
     }
 
     #[test]
-    fn a_simulated_codex_graph_reaches_verdict_and_cleans_its_scope() {
+    fn a_simulated_codex_graph_reaches_completion_and_cleans_its_runtimes() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
-              scope "eval/simulated-codex" retention="temporary" {
-                plan "eval/simulated-codex" state="ready" {
-                  goal "Complete plan eval/simulated-codex."
+              plan "eval/simulated-codex" state="ready" {
+                goal "Complete plan eval/simulated-codex."
                 step "team" {
                   title "The Codex team is ready"
                   subgraph {
@@ -5536,20 +5645,20 @@ subgraph {
                     }
                     message "kickoff" {
                       from "requester"
-                      to "node.sup"
+                      to "sup"
                       content "Start."
                     }
                   }
-                  gate "condition-1" { exists "agent/node.sup" }
-                  gate "condition-2" { exists "agent/node.worker" }
+                  gate "condition-1" { exists "agent/${ST_PLAN_RUN}/sup" }
+                  gate "condition-2" { exists "agent/${ST_PLAN_RUN}/worker" }
                 }
                 step "worker-report" {
                   title "The worker report is delivered"
                   depends-on { step "team" completed }
                   subgraph {
                     message "worker-report" {
-                      from "node.worker"
-                      to "node.sup"
+                      from "worker"
+                      to "sup"
                       content "The work is complete."
                     }
                   }
@@ -5559,7 +5668,7 @@ subgraph {
                   depends-on { step "worker-report" completed }
                   subgraph {
                     message "confirmation" {
-                      from "node.sup"
+                      from "sup"
                       to "requester"
                       content "The result is verified."
                     }
@@ -5589,14 +5698,6 @@ subgraph {
                   }
                 }
                 completion { when "all-steps-exhausted" }
-                finally {
-                  step "cleanup" {
-                    title "The temporary eval scope is empty"
-                    subgraph { scope "eval/simulated-codex" { stop } }
-                    gate "condition-1" { empty "scope/eval/simulated-codex" }
-                  }
-                }
-                }
               }
             }
         "#;
@@ -5608,6 +5709,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-simulated-codex".into(),
             })
             .unwrap();
@@ -5636,16 +5738,20 @@ subgraph {
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(runtime.started_members.lock().unwrap().len(), 2);
+        let sup_runtime = format!("{}.sup", plan_run.id);
+        let worker_runtime = format!("{}.worker", plan_run.id);
+        let sup_subject = format!("agent/{}/sup", plan_run.id);
+        let worker_subject = format!("agent/{}/worker", plan_run.id);
         runtime.ptys.lock().unwrap().extend([
             RuntimeObservation {
-                runtime_id: "node.sup".into(),
+                runtime_id: sup_runtime,
                 terminal: true,
                 status: "running".into(),
                 exit_code: None,
                 incarnation_id: Some("sup-one".into()),
             },
             RuntimeObservation {
-                runtime_id: "node.worker".into(),
+                runtime_id: worker_runtime,
                 terminal: true,
                 status: "running".into(),
                 exit_code: None,
@@ -5653,12 +5759,12 @@ subgraph {
             },
         ]);
         reconciler.reconcile_once().unwrap();
-        for subject in ["agent/node.sup", "agent/node.worker"] {
+        for subject in [&sup_subject, &worker_subject] {
             store
                 .append_claim(&ClaimInput {
-                    subject: subject.into(),
+                    subject: subject.clone(),
                     kind: "harness.ready".into(),
-                    actor: Some(subject.into()),
+                    actor: Some(subject.clone()),
                     fields: BTreeMap::from([
                         ("status".into(), Value::String("ready".into())),
                         ("transport".into(), Value::String("app-server".into())),
@@ -5669,11 +5775,11 @@ subgraph {
                 })
                 .unwrap();
         }
-        deliver("message/kickoff", "agent/node.sup");
+        deliver("message/kickoff", &sup_subject);
         for _ in 0..4 {
             reconciler.reconcile_once().unwrap();
         }
-        deliver("message/worker-report", "agent/node.sup");
+        deliver("message/worker-report", &sup_subject);
         for _ in 0..4 {
             reconciler.reconcile_once().unwrap();
         }
@@ -5759,13 +5865,10 @@ subgraph {
 
         let completed = store.plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed", "{completed:?}");
-        assert_eq!(
-            store
-                .latest_actual_value("scope/eval/simulated-codex")
-                .unwrap()
-                .and_then(|actual| actual.get("status").cloned()),
-            Some(Value::String("stopped".into()))
-        );
+        assert!(store.desired_subjects().unwrap().iter().any(|desired| {
+            desired.owner_run.as_deref() == Some(plan_run.subject.as_str())
+                && desired.kind == "stop"
+        }));
     }
 
     #[test]
@@ -5797,6 +5900,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-async-gate".into(),
             })
             .unwrap();
@@ -5867,6 +5971,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-llm-budget".into(),
             })
             .unwrap();
@@ -6597,21 +6702,19 @@ subgraph { schedule "reminder" { stop } }"#,
         let source = r#"
             version 2
             subgraph {
-              scope "eval/demo" retention="temporary" {
-                plan "eval/demo" state="ready" {
-                  goal "Complete plan eval/demo."
+              plan "eval/demo" state="ready" {
+                goal "Complete plan eval/demo."
                 step "result" timeout="1ms" {
+                  agentless
                   title "The result appears"
                   gate "condition-1" { field "status" "resource/result" "is" "ok" }
                 }
                 completion { when "all-steps-exhausted" }
                 finally {
                   step "cleanup" {
-                    title "The temporary eval scope is empty"
-                    subgraph { scope "eval/demo" { stop } }
-                    gate "condition-2" { empty "scope/eval/demo" }
+                    agentless
+                    title "The final work completes"
                   }
-                }
                 }
               }
               resource "result" { kind "human.review" }
@@ -6625,6 +6728,7 @@ subgraph { schedule "reminder" { stop } }"#,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-cleanup".into(),
             })
             .unwrap();
@@ -6645,15 +6749,7 @@ subgraph { schedule "reminder" { stop } }"#,
 
         let run = store.plan_run(&run.id).unwrap().unwrap();
         assert_eq!(run.status, "failed");
-        assert_eq!(
-            store
-                .latest_actual_value("scope/eval/demo")
-                .unwrap()
-                .unwrap()
-                .get("status")
-                .and_then(Value::as_str),
-            Some("stopped")
-        );
+        assert_eq!(run.phase, "terminal");
         assert_eq!(
             run.steps
                 .iter()
@@ -6691,6 +6787,7 @@ subgraph { schedule "reminder" { stop } }"#,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-latched-dependency".into(),
             })
             .unwrap();
@@ -6744,8 +6841,7 @@ version 2
 subgraph {
   plan "standing" state="ready" {
     goal "Remain open without implicit completion."
-    agentless
-    step "prepare" { }
+    step "prepare" { agentless }
   }
 }
 "#;
@@ -6757,6 +6853,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-standing".into(),
             })
             .unwrap();
@@ -6775,7 +6872,7 @@ subgraph {
 
         let zero_source = r#"
 version 2
-subgraph { plan "zero" state="ready" { goal "Remain open with no steps."; agentless } }
+subgraph { plan "zero" state="ready" { goal "Remain open with no steps." } }
 "#;
         apply_source(&store, zero_source, "publish-zero");
         let zero = store
@@ -6785,6 +6882,7 @@ subgraph { plan "zero" state="ready" { goal "Remain open with no steps."; agentl
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-zero".into(),
             })
             .unwrap();
@@ -6796,17 +6894,16 @@ subgraph { plan "zero" state="ready" { goal "Remain open with no steps."; agentl
     }
 
     #[test]
-    fn a_terminal_plan_retires_its_generation_scope() {
+    fn a_terminal_plan_stops_its_owned_runtimes() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 subgraph {
   plan "finite" state="ready" {
     goal "Complete and stop the generation assertions."
-    agentless
     completion { when "all-steps-exhausted" }
     subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } }
-    step "finish" { }
+    step "finish" { agentless }
   }
 }
 "#;
@@ -6818,6 +6915,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-finite".into(),
             })
             .unwrap();
@@ -6835,7 +6933,9 @@ subgraph {
             "completed"
         );
         assert!(store.desired_subjects().unwrap().iter().any(|desired| {
-            desired.subject == format!("scope/{}", run.generation) && desired.kind == "scope-stop"
+            desired.subject == format!("agent/{}/worker", run.id)
+                && desired.kind == "stop"
+                && desired.owner_run.as_deref() == Some(run.subject.as_str())
         }));
     }
 
@@ -6847,10 +6947,9 @@ version 2
 subgraph {
   plan "blocked" state="ready" {
     goal "Expose an unreachable explicit completion frontier."
-    agentless
     completion { when "all-steps-exhausted" }
-    step "failed" { }
-    step "dependent" { depends-on { step "failed" completed } }
+    step "failed" { agentless }
+    step "dependent" { agentless; depends-on { step "failed" completed } }
   }
 }
 "#;
@@ -6862,6 +6961,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-blocked".into(),
             })
             .unwrap();
@@ -6929,6 +7029,7 @@ subgraph {
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
                 mode: None,
+                inputs: BTreeMap::new(),
                 idempotency_key: "run-pool".into(),
             })
             .unwrap();
@@ -6991,6 +7092,108 @@ subgraph {
     }
 
     struct FakeResourceProvider;
+
+    #[test]
+    fn a_resource_input_gate_reads_its_exact_start_claim() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+subgraph {
+  resource "source" { kind "document"; binding "late" }
+  plan "resource-input" state="ready" {
+    input "source" kind="resource"
+    goal "Check the start snapshot."
+    completion { when "all-steps-exhausted" }
+    step "check" {
+      agentless
+      gate "the start snapshot is ready" { field "state" "${input.source}" is "ready" }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-resource-input");
+        let first = store
+            .append_claim(&ClaimInput {
+                subject: "resource/source".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("ready".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("resource-input-ready".into()),
+            })
+            .unwrap();
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "resource-input".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::from([("source".into(), "resource/source".into())]),
+                idempotency_key: "resource-input-run".into(),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "resource/source".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("changed".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("resource-input-changed".into()),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let completed = store.plan_run(&run.id).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.inputs["source"].claim_id, Some(first.id));
+    }
+
+    #[test]
+    fn one_plan_run_rejects_a_runtime_id_in_two_step_subgraphs() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+subgraph {
+  plan "collision" state="ready" {
+    goal "Reject two owners for one runtime."
+    step "one" { agentless; subgraph { exec "same" { command "true"; restart "never" } } }
+    step "two" { agentless; subgraph { exec "same" { command "true"; restart "never" } } }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-collision");
+        store
+            .create_plan_run(&PlanRunRequest {
+                plan: "collision".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "collision-run".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let error = reconciler.reconcile_once().unwrap_err();
+        assert!(error.to_string().contains("more than one subgraph"));
+    }
 
     impl ResourceProvider for FakeResourceProvider {
         fn observe(

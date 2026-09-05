@@ -12,14 +12,16 @@ This document defines the system design. [plan-graph-runtime.md](./plan-graph-ru
 
 st3 gives a person or an agent one durable graph for these objects:
 
-- desired agents, processes, scopes, messages, and observed resources;
+- plan definitions, plan-owned runtimes, messages, and observed resources;
 - immutable documents and plan revisions;
 - plan runs, immutable run generations, revision proposals, products, gates, and reviews;
 - Small Talk delivery and work ownership;
 - runtime observations and operation evidence;
 - peer replication and historical reads.
 
-An intent changes only the subjects that it names. Omission never means deletion or stop. An explicit `stop` declaration changes a subject or scope to stopped state.
+An intent changes only the subjects that it names. Omission never means deletion or stop.
+
+A runtime `stop` can occur only inside its owning plan. Root control cancels a complete plan run.
 
 A published plan is a definition. Publication does not start a run.
 
@@ -33,9 +35,11 @@ The daemon does not watch a catalog folder. `st3 import`, `st3 eval`, and other 
 
 st3 uses one graph for desired state, observations, work, and evidence.
 
-Every graph item has a stable subject such as `agent/node.builder`, `plan/release`, `plan-run/abc`, `run-generation/def`, or `step-run/def/test`.
+Every graph item has a stable subject such as `agent/abc/builder`, `plan/release`, `plan-run/abc`, `run-generation/def`, or `step-run/def/test`.
 
-A scope groups subjects for observation and teardown. It is not a second graph namespace.
+A plan run is the sole execution owner. Its runtimes use subjects such as `agent/RUN/LOCAL_ID` and `exec/RUN/LOCAL_ID`.
+
+Plans and agents do not support in-place reparenting. A replacement plan run creates a new ownership boundary.
 
 ### Immutable claims
 
@@ -197,22 +201,21 @@ st3 and st2 do not share a live control loop. They can share an existing PTY reg
 
 Every st3 intent starts with `version 2` and contains exactly one untyped `subgraph` root.
 
-The root can contain these subject nodes:
+The root can contain plan definitions, durable resources, people, accounts, supervisors, links, messages, and plan-run cancellation.
 
-- controlled members: `agent`, `exec`, and `pty`;
-- structural nodes: `scope`, `host`, `supervisor`, `link`, `message`, `schedule`, `plan`, `observer`, and `subscription`;
-- observed nodes: `resource`, `person`, and `account`;
-- explicit `stop` state.
+An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` must occur in a plan or step subgraph.
+
+A runtime `stop` must occur in the same owning plan. It cannot target a runtime from another plan run.
 
 The parser is strict. Unknown fields, duplicate single fields, invalid identifiers, and invalid child types are errors.
 
-A plan can be at the root or inside a plan-only scope. A scope cannot mix plan definitions with immediate desired members.
+A plan occurs at the root. A nested plan occurs inside one step.
 
 The graph also supports ordered checkpoint stages for direct desired-state convergence. Checkpoint stages now use repeated named `gate` nodes. The durable plan runtime is the work execution model and does not use a second plan-specific checkpoint language.
 
 ## Identity and authority
 
-The subject is the durable identity. A display name, file path, scope tag, or runtime PID is not an identity.
+The subject is the durable identity. A display name, file path, owner field, or runtime PID is not an identity.
 
 Each runtime start has a new incarnation ID. A restart does not change the member subject.
 
@@ -292,9 +295,9 @@ All plans use this state machine. st3 has no separate standing plan type.
 
 The quick Codex and Claude commands publish deterministic zero-step plans. Their runs become standing and continue to assert their agents.
 
-Graph cancellation revokes active claims and enters `finally`. The run becomes cancelled after successful final work.
+Graph cancellation revokes active claims and enters `finally`. The run then enters cleanup.
 
-Cancellation cascades to descendant runs. A terminal run retires the desired subjects in its generation scope.
+Cancellation cascades to descendant runs. A run becomes terminal only after all owned runtimes stop.
 
 ## Run revisions and generations
 
@@ -302,7 +305,9 @@ A plan revision does not mutate an active generation. st3 creates one successor 
 
 The transaction marks the old generation as superseded. It creates new step-run subjects and moves the plan run pointer to the successor.
 
-Plan and step members carry an internal generation scope. After cutover, the reconciler stops members that remain only in the predecessor lineage. A member reused by the successor moves to the successor scope.
+Plan and step members carry their owner run and generation. After cutover, the reconciler stops members that remain only in the predecessor lineage.
+
+A compatible runtime keeps its stable run-local subject across generations. st3 does not transfer that runtime to another plan run.
 
 A restart cutover cancels active descendant plan runs that started from predecessor steps. An idle cutover waits for active descendant work before it makes the same cancellation.
 
@@ -322,11 +327,11 @@ All distinct affected reviewers must approve the exact preview. Cancellation ret
 
 Planning mode is a durable review workflow. It is not a plan run.
 
-`st3 plan start` creates one planning session, stores the request as an immutable document, starts one Codex planner, and sends the request through Small Talk.
+`st3 planning start` creates one planning session, stores the request as an immutable document, starts one Codex planner, and sends the request through Small Talk.
 
 The planner can submit multiple named variants. Each variant contains one Markdown document and one complete ready KDL plan.
 
-`st3 plan preview` validates one named variant, renders a dependency graph and diff, and records one preview hash.
+`st3 planning preview` validates one named variant, renders a dependency graph and diff, and records one preview hash.
 
 A planning session can target a current plan run. The session stores the exact source generation and rejects proposal after that generation changes.
 
@@ -349,7 +354,7 @@ Main endpoint groups are:
 - intent: `/v1/intent/plan`, `/v1/intent/apply`;
 - planning: `/v1/planning-sessions` and its session actions;
 - plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
-- graph data: `/v1/claims`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
+- graph data: `/v1/claims`, `/v1/claims/by-id/{id}`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
 - documents: `/v1/documents` and `/v1/documents/content`;
 - Small Talk: `/v1/messages` and message lifecycle actions;
 - sessions: `/v1/sessions/...` for logs, screens, input, signals, and attach;

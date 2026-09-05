@@ -15,6 +15,16 @@ if [ "${#evals[@]}" -eq 0 ]; then
 fi
 
 for eval_dir in "${evals[@]}"; do
-  echo "running $(basename "$eval_dir")"
-  st3 eval "$eval_dir"
+  name=$(basename "$eval_dir")
+  echo "running $name"
+  if [ "$name" = plan-inputs ]; then
+    message=$'A "quoted" input\nand a second line.'
+    st3 claim resource/plan-inputs/source resource.observed \
+      --field state=ready >/dev/null
+    st3 eval "$eval_dir" \
+      --input "message=$message" \
+      --input source=resource/plan-inputs/source
+  else
+    st3 eval "$eval_dir"
+  fi
 done

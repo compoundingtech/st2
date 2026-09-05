@@ -32,12 +32,18 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Network smoke | `st2/network-smoke` | `st3/network-smoke` |
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
 | Plan Document Lift | Not supported | `st3/plan-document-lift` |
+| Mixed Worker Pool | Not supported | `st3/mixed-worker-pool` |
+| Planning Mode | Not supported | `st3/planning-mode` |
+| Run Generation Revision | Not supported | `st3/run-generation-revision` |
+| Plan Inputs | Not supported | `st3/plan-inputs` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
 The Ghost bug, Signal rename, Fork in the road, Poisoned pull request, Test Writing, and Weird Git Setup pairs use Codex.
 
-The other ten pairs are model-free. They use deterministic processes and mechanical judges.
+The ten remaining pairs are model-free. Run Generation Revision and Plan Inputs are also model-free.
+
+The st3 corpus has 24 evals. Twelve are model-free, and twelve use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -68,10 +74,12 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st2 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Plan Document Lift | Codex × 1 | None |
+| st3 | Mixed Worker Pool | Claude Sonnet × 1, Codex × 1 | None |
+| st3 | Planning Mode | Codex × 1, created by the planning API | None |
 
-The current corpus has 10 Claude seats and 32 Codex seats. It also has three Codex LLM judges.
+The paired and st3-only corpus has 11 Claude seats and 34 Codex seats. It also has three Codex LLM judges.
 
-The ten model-free pairs add no model seats and no LLM judges.
+The twelve model-free st3 evals add no model seats and no LLM judges.
 
 All Claude seats use `claude-sonnet-5`.
 
@@ -116,6 +124,10 @@ st2 eval ./evals/st2/license-mit
 st3 eval ./evals/st3/license-mit
 st2 eval ./evals/st2/network-smoke
 st3 eval ./evals/st3/network-smoke
+st3 claim resource/plan-inputs/source resource.observed --field state=ready
+st3 eval ./evals/st3/plan-inputs \
+  --input message="Input proof." \
+  --input source=resource/plan-inputs/source
 ```
 
 Use the matching command for the selected runtime directory.

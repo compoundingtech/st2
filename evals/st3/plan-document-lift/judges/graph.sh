@@ -3,10 +3,11 @@ set -euo pipefail
 
 : "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the root plan run}"
 root="plan-run/$ST_PLAN_RUN"
-producer="step-run/$ST_PLAN_RUN/lift-plan-document"
-publisher="$producer/work/publish-ready-graph-plan"
-consumer="step-run/$ST_PLAN_RUN/execute-lifted-plan"
 work="$(env -u ST_AGENT st3 work ls --all --json)"
+root_view="$(env -u ST_AGENT st3 --json plan show "$root")"
+producer="$(jq -r '.steps[] | select(.step == "lift-plan-document") | .subject' <<<"$root_view")"
+publisher="$(jq -r '.steps[] | select(.step == "lift-plan-document/work/publish-ready-graph-plan") | .subject' <<<"$root_view")"
+consumer="$(jq -r '.steps[] | select(.step == "execute-lifted-plan") | .subject' <<<"$root_view")"
 
 for step in \
   start-planner \
@@ -16,8 +17,8 @@ for step in \
   lift-plan-document/work/publish-ready-graph-plan \
   execute-lifted-plan; do
   jq -e --arg run "$root" --arg step "$step" \
-    'any(.[]; .run == $run and .step == $step and .status == "completed")' \
-    <<<"$work" >/dev/null
+    'any(.steps[]; .step == $step and .status == "completed")' \
+    <<<"$root_view" >/dev/null
 done
 
 output="$(st3 trace "$producer" --json --limit 100 | jq -s '[.[] | select(.kind == "plan.produced")] | last')"
@@ -32,7 +33,7 @@ publisher_complete="$(st3 trace "$publisher" --json --limit 100 | jq -s '[.[] | 
 test "$output_index" -gt "$publisher_claim"
 test "$output_index" -lt "$publisher_complete"
 
-child_runs="$(jq -r --arg root "$root" '[.[] | select(.run != $root) | .run] | unique | .[]' <<<"$work")"
+child_runs="$(jq -r --arg root "$root" --arg agent "agent/$ST_PLAN_RUN/pdl.agent" '[.[] | select(.run != $root and .assigned_to == $agent) | .run] | unique | .[]' <<<"$work")"
 test "$(grep -c . <<<"$child_runs")" -eq 1
 child="$(head -n 1 <<<"$child_runs")"
 
@@ -44,8 +45,8 @@ test "$(jq -r '.body.fields.parent_step_run' <<<"$created")" = "$consumer"
 test "$(jq -r '.store_index' <<<"$created")" -gt "$output_index"
 
 for step in inspect-inventory write-result verify-result publish-result; do
-  jq -e --arg run "$child" --arg step "$step" \
-    'any(.[]; .run == $run and .step == $step and .status == "completed" and .assigned_to == "agent/pdl.agent" and (.title | length > 0) and (.goals | length > 0))' \
+  jq -e --arg run "$child" --arg step "$step" --arg agent "agent/$ST_PLAN_RUN/pdl.agent" \
+    'any(.[]; .run == $run and .step == $step and .status == "completed" and .assigned_to == $agent and (.title | length > 0) and (.goals | length > 0))' \
     <<<"$work" >/dev/null
 done
 

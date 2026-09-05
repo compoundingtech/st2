@@ -91,7 +91,7 @@ Nested command rows follow it.
 | `describe` | Edit `description` through `run` | Unfinished | No targeted authoring command exists. Share the presentation patch path with `rename`. | S |
 | `agent` | `plan` and `run` | Deliberate | Subject-token compare-and-swap replaces file digests and targeted publication. A compatibility wrapper can preserve old receipts. | M |
 | `catalog` | `doc`, `plan`, `run`, `import`, and claim history | Deliberate | The claims store replaces declaration-root transactions. Exact snapshot and repair gaps appear below. | L |
-| `down` | Publish member stops or a scope stop | Deliberate | st3 never ties member lifetime to daemon lifetime. Add a helper that plans explicit stops for one selected host or scope. | S |
+| `down` | Cancel a plan run or publish an owner-local stop | Deliberate | st3 never ties member lifetime to daemon lifetime. Add a helper that cancels selected plan runs. | S |
 | `env` | `ST3_ENDPOINT` and config | Unfinished | No command prints shell exports for the selected daemon and PTY registry. Add a quoted export command. | XS |
 | `pretrust` | Native driver startup | Deliberate | Typed drivers own trust and channel setup. Add an operator command only for opaque harness commands. | S |
 | `eval` | `eval` | Unfinished | The version-2 runner exists. Complete opaque-driver migration and decide whether old host and retained-run options need compatibility forms. | L across corpus |
@@ -260,8 +260,8 @@ These surfaces are additions, not st2 parity gaps.
 
 | st3 surface | Purpose |
 |---|---|
-| `scope` | Groups desired members and gives them one explicit stop boundary. |
-| Standalone `exec` and `pty` | Runs a member without an aggregate agent declaration. |
+| Plan-run ownership | Gives every runtime one execution owner and one cleanup boundary. |
+| Plan-owned `exec` and `pty` | Runs a member without an aggregate agent declaration. |
 | Root `resource`, `person`, and `account` | Declares observed graph subjects and actor identities. |
 | `supervisor` and `terminal-control` | Applies declared bounded screen input and durable supervision decisions. |
 | `link` | Holds or voids work when a required subject is unreachable. |
@@ -303,14 +303,14 @@ These surfaces are additions, not st2 parity gaps.
 | Claude fallback channel | Implemented | Deliberate | The development-channel fallback can require confirmation. Keep the warning and refuse unattended use when policy requires it. | S |
 | Codex typed launch | Implemented with shared st2 code | Parity | Controlled app-server delivery and readiness exist. | None |
 | Codex protocol compatibility | Exact version allow-list | Unfinished | Generate compatibility from the installed protocol schema and add a tested upgrade process. Avoid a startup outage after an automatic CLI update. | M |
-| Codex process cleanup | Not proved | Unfinished | Put the wrapper and app-server in one owned scope. Reap the complete process group on success, failure, signal, and daemon recovery. | L |
+| Codex process cleanup | Not proved | Unfinished | Put the wrapper and app-server in one owned process group. Reap the group on success, failure, signal, and daemon recovery. | L |
 | Codex orphan recovery | Socket ownership refusal only | Unfinished | Diagnose stale holders, prove the owner is absent, clear stale records, and retry without killing a live controller. | M |
 | Pi typed launch and channel | Implemented but not provider-proved | Unfinished | Run lifecycle, delivery, restart, and cleanup tests with the real provider. | M |
 | OpenCode typed launch and server delivery | Implemented but not provider-proved | Unfinished | Run lifecycle, delivery, restart, and cleanup tests with the real provider. | M |
 | Generic command-agent delivery | One terminal notice | Unfinished | Implement FIFO, DND deferral, startup backlog coalescing, staged ownership, receipt inspection, and safe retries. | L |
 | Presence vocabulary | `available`, `busy`, `dnd`, and `offline` | Unfinished | Add `away` or formally retire it. Define stale presence and automatic recovery rules. | S |
 | Harness state history | Claims | Parity | st3 records readiness, work, idle, errors, compaction, and terminal state as typed claims. | None |
-| Driver capability diagnostics | Partial `doctor` checks | Unfinished | Report executable version, protocol support, channel setup, socket ownership, and cleanup scope before launch. | M |
+| Driver capability diagnostics | Partial `doctor` checks | Unfinished | Report executable version, protocol support, channel setup, socket ownership, and cleanup boundary before launch. | M |
 
 A fleet incident found one cohort of 50 orphaned Codex app-server processes.
 One orphan held a control socket and prevented two agents from starting.
@@ -347,10 +347,10 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 | Restart type | Implemented | Parity | Always, on-failure, and never work. | None |
 | Targeted unpark | Missing | Unfinished | Add a fenced reset claim and command. | S |
 | `adopt-only` | Implemented | Parity | A missing member remains absent, and an existing member can be adopted. | None |
-| Keep pin | Ignored | Unfinished | Prevent normal garbage collection while pinned. Define how explicit stop and scope teardown interact with the pin. | M |
+| Keep pin | Ignored | Unfinished | Prevent normal garbage collection while pinned. Define how explicit stop and plan-run cleanup interact with the pin. | M |
 | Suspended state | Generic stop | Deliberate | Add a distinct reversible state if operators need intent separate from retirement. | M |
 | Retired state | Generic stop | Deliberate | Add a distinct terminal declaration state if roster and audit readers need it. | M |
-| Explicit teardown | Stop intent and scope stop | Parity | st3 does not kill members when the daemon exits. This matches the durable runtime direction. | None |
+| Explicit teardown | Plan-run cancellation and owner-local stop | Parity | st3 does not kill members when the daemon exits. This matches the durable runtime direction. | None |
 | st2 supervisor crash recipient | No direct equivalent | Unfinished | Publish a typed crash alert message to an explicit agent or supervision policy. | M |
 | st3 terminal controls | Implemented | New | Terminal controls can send bounded input and record decisions. | None |
 | Required links | Implemented | New | A link can hold work or void an eval when a dependency is unreachable. | None |

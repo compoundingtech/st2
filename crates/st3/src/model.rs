@@ -144,8 +144,12 @@ pub struct DesiredSubject {
     pub member: Option<MemberSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<CheckpointActivation>,
-    #[serde(default)]
-    pub scopes: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_step: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -260,7 +264,10 @@ pub struct PlanSpec {
     pub subject: String,
     pub state: PlanState,
     pub revision: String,
-    pub scope_template: Option<String>,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, PlanInputSpec>,
+    #[serde(default = "default_plan_run_limit")]
+    pub max_active_runs: Option<u32>,
     #[serde(default)]
     pub revision_owners: Vec<String>,
     #[serde(default)]
@@ -284,6 +291,33 @@ pub struct PlanSpec {
     pub gates: Vec<GateSpec>,
     pub steps: BTreeMap<String, StepSpec>,
     pub display_order: Vec<String>,
+}
+
+fn default_plan_run_limit() -> Option<u32> {
+    Some(1)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanInputKind {
+    Text,
+    Resource,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanInputSpec {
+    pub name: String,
+    pub kind: PlanInputKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanRunInput {
+    pub kind: PlanInputKind,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -715,7 +749,6 @@ pub struct ClaimsPage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalStatus {
-    pub scope: String,
     pub plan_run: String,
     pub lifecycle: String,
     pub phase: String,
@@ -742,7 +775,7 @@ pub struct SubjectStatus {
     pub actual: Option<Value>,
     pub conflicts: Vec<String>,
     pub claims: Vec<String>,
-    pub scopes: Vec<String>,
+    pub owner_run: Option<String>,
     pub gap: Option<String>,
     pub reachability: String,
     pub reason: Option<String>,
@@ -950,14 +983,14 @@ pub struct EvalStartRequest {
     pub name: String,
     pub bundle_hash: String,
     pub bundle: Vec<u8>,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalStartResponse {
-    pub scope: String,
     pub event_cursor: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_run: Option<String>,
+    pub plan_run: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -970,6 +1003,8 @@ pub struct PlanRunRequest {
     pub requester: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
     pub idempotency_key: String,
 }
 
@@ -987,7 +1022,8 @@ pub struct PlanRunView {
     pub parent_step_run: Option<String>,
     pub workspace: String,
     pub requester: String,
-    pub run_scope: Option<String>,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, PlanRunInput>,
     pub mode: String,
     pub status: String,
     pub phase: String,

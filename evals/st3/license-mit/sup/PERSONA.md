@@ -17,7 +17,7 @@ st3 assigns each parent plan when its dependencies hold. The graph contains the 
 - After the worker reports, verify that `LICENSE` is canonical MIT.
 - Verify that `package.json` declares MIT.
 - Verify that the change is committed and the worktree is clean.
-- Send `requester` exactly one final message after verification.
+- Send `person/eval-requester` exactly one final message after verification.
 - Cite the actual commit and the verification in the final message.
 - Run the complete loop without more human input.
 - When confirmed, set your status and stop.

@@ -19,7 +19,7 @@ The script uses a fresh root for each run. It traps INT, TERM, and HUP.
 
 An independent guard cleans the root if the terminal wrapper kills the script before a trap runs.
 
-Cleanup stops the graph, daemon, and demo sessions. It then removes the fresh root.
+Cleanup cancels the plan run and stops its owned runtimes. It then stops the daemon and removes the fresh root.
 
 The manual workflow below explains each action that the script performs.
 
@@ -126,10 +126,10 @@ Run this command in terminal 2:
   eval ./evals/st3/weird-git-setup --graph
 ```
 
-The command first prints a scope such as this one:
+The command first prints a plan run such as this one:
 
 ```text
-started scope/eval/weird-git-setup/RUN_ID
+started plan-run/RUN_ID
 ```
 
 The command then clears the terminal and draws `ST3 EVAL GRAPH`. The first frame appears in less than one second.
@@ -176,12 +176,12 @@ st3 archives the directory when this command starts. Later file changes do not c
 
 The viewer cannot show a partial eval during authoring. It starts after st3 accepts the complete eval bundle.
 
-If the viewer disconnects, keep the daemon running. Attach again from a real terminal with the printed scope:
+If the viewer disconnects, keep the daemon running. Attach again from a real terminal with the printed plan run:
 
 ```sh
 "$DEMO_ROOT/st3" \
   --endpoint "$DEMO_ROOT/st3.sock" \
-  graph scope/eval/EVAL_NAME/RUN_ID
+  graph plan-run/RUN_ID
 ```
 
 ## Why the first demonstration is not fork-in-the-road

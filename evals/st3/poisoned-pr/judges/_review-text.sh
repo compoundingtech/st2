@@ -1,10 +1,21 @@
-# Sourced helper. Aggregate the team review from Small Talk into REVIEW and RL.
-# The review is delivered by message: reviewer(prx.rev)->sup(prx.sup) report + sup->requester verdict.
-ROOT="${CATALOG:-$PWD}"; R="$ROOT/rev"; SM="${ST_ROOT:?st2 eval must export ST_ROOT}"
-SUP_ID="${SUP_ID:-prx.sup}"; REVIEWER_ID="${REVIEWER_ID:-prx.rev}"; REQUESTER="${REQUESTER:-requester}"
-busdir(){ local id="$1" d; d="$(ls -d "$SM"/*."$id" "$SM/$id" 2>/dev/null | head -1)"; printf '%s\n' "${d:-$SM/$id}"; }
-gather(){ local out="" bd
-  bd="$(busdir "$SUP_ID")";    out="$out$(grep -lRE "^from:[[:space:]]*((agent/)|([a-z0-9._-]+\.))?$REVIEWER_ID([[:space:]]|\$)" "$bd/inbox" "$bd/archive" 2>/dev/null | xargs cat 2>/dev/null)"
-  bd="$(busdir "$REQUESTER")"; out="$out$(grep -lRE "^from:[[:space:]]*((agent/)|([a-z0-9._-]+\.))?$SUP_ID([[:space:]]|\$)"      "$bd/inbox" "$bd/archive" 2>/dev/null | xargs cat 2>/dev/null)"
-  printf '%s' "$out"; }
-REVIEW="$(gather)"; RL="$(printf '%s' "$REVIEW" | tr 'A-Z' 'a-z')"
+# Sourced helper. Aggregate the reviewer report and the supervisor verdict from Small Talk.
+: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+ROOT="${CATALOG:-$PWD}"
+R="$ROOT/rev"
+SUP_ID="agent/$ST_PLAN_RUN/prx.sup"
+REVIEWER_ID="agent/$ST_PLAN_RUN/prx.rev"
+
+messages_to() {
+  local recipient=$1
+  jq -s 'add | unique_by(.subject)' \
+    <(st3 message ls "$recipient" --json) \
+    <(st3 message ls "$recipient" --archive --json)
+}
+
+reviewer_report="$(messages_to "$SUP_ID" \
+  | jq -r --arg sender "$REVIEWER_ID" '.[] | select(.from == $sender) | .content')"
+supervisor_verdict="$(messages_to person/eval-requester \
+  | jq -r --arg sender "$SUP_ID" '.[] | select(.from == $sender) | .content')"
+REVIEW="$reviewer_report
+$supervisor_verdict"
+RL="$(printf '%s' "$REVIEW" | tr 'A-Z' 'a-z')"

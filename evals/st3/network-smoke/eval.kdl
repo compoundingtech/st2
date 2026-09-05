@@ -1,38 +1,29 @@
 version 2
 
 subgraph {
-  scope "eval/network-smoke/${ST_PLAN_RUN}" retention="temporary" {
-    plan "eval/network-smoke" state="ready" {
-      agentless
-      completion { when "all-steps-exhausted" }
-      goal "Complete plan eval/network-smoke."
-      step "contract" timeout="2m" {
-        title "An isolated st3 daemon hosts a subject and delivers Small Talk"
-        subgraph {
-          exec "eval/network-smoke/contract/${ST_PLAN_RUN}" {
-            host "local"
-            workspace "${ST_WORKSPACE}/fixture"
-            cwd "${ST_WORKSPACE}/fixture"
-            command "bash ./run.sh"
-            restart "never"
-          }
-        }
-        gate "condition-1" { field "status" "exec/eval/network-smoke/contract/${ST_PLAN_RUN}" "is" "exited" }
-        gate "condition-2" { field "exit_code" "exec/eval/network-smoke/contract/${ST_PLAN_RUN}" "is" 0 }
-      }
-      step "gate" timeout="1m" {
-        depends-on { step "contract" completed }
-        gate "the nested daemon recorded health and delivery" {
-          exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
+  plan "eval/network-smoke" state="ready" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete plan eval/network-smoke."
+    step "contract" timeout="2m" {
+      title "An isolated st3 daemon hosts a subject and delivers Small Talk"
+      subgraph {
+        exec "eval/network-smoke/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
         }
       }
-      finally {
-        step "cleanup" {
-        subgraph { scope "eval/network-smoke/${ST_PLAN_RUN}" { stop } }
-        gate "condition" { empty "scope/eval/network-smoke/${ST_PLAN_RUN}" }
-      }
+      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/network-smoke/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/network-smoke/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the nested daemon recorded health and delivery" {
+        exec "grep -Fq NETWORK-SMOKE-HEALTH-GREEN result.txt && grep -Fq NETWORK-SMOKE-DELIVERY-GREEN result.txt"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
       }
     }
   }

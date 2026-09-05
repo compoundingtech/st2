@@ -67,7 +67,7 @@ wait_for_event() {
 
 before_digest=$(workspace_digest)
 
-st3 --json plan start \
+st3 --json planning start \
   --id "$PLAN_ID" \
   "$REQUEST" \
   --workspace "$TARGET_WORKSPACE" \
@@ -87,7 +87,8 @@ wait_for_event \
   "$EVAL_ROOT/planning-events.jsonl"
 assert_plan_is_unpublished
 
-st3 --json plan preview "$session_id" > "$EVAL_ROOT/preview.json"
+variant=$(st3 --json planning show "$session_id" | jq -er '.candidate.variant')
+st3 --json planning preview "$session_id" --variant "$variant" > "$EVAL_ROOT/preview.json"
 preview_hash=$(jq -er '.preview.hash' "$EVAL_ROOT/preview.json")
 jq -e '
   .status == "review"
@@ -97,7 +98,7 @@ jq -e '
   and (.preview.plan.blockers | length == 0)
 ' "$EVAL_ROOT/preview.json" >/dev/null
 
-st3 --json plan approve \
+st3 --json planning approve \
   "$session_id" \
   "$preview_hash" \
   --as "$REQUESTER" \

@@ -23,7 +23,7 @@ st3 resource watch github.pull-request compoundingtech/st2#403 \
 
 `ST_AGENT` supplies the delivery target. A person can use `--to agent/HOST.IDENTITY`.
 
-The command returns the resource, observer, and subscription subjects. The operation creates all three subjects atomically.
+The command returns the resource, observer, and subscription subjects. It also creates one standing watch plan run.
 
 The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
 
@@ -37,28 +37,35 @@ resource "github/compoundingtech/st2/pull/403" {
   binding "late"
 }
 
-observer "github/compoundingtech/st2/pull/403" {
-  resource "resource/github/compoundingtech/st2/pull/403"
-  provider "github.pull-request"
-  locator "compoundingtech/st2#403"
-  field "head"
-  field "state"
-  field "review"
-  field "checks"
-}
+plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
+  goal "Observe one resource and send its selected changes."
+  subgraph {
+    observer "watch" {
+      resource "resource/github/compoundingtech/st2/pull/403"
+      provider "github.pull-request"
+      locator "compoundingtech/st2#403"
+      field "head"
+      field "state"
+      field "review"
+      field "checks"
+    }
 
-subscription "github/compoundingtech/st2/pull/403/hetz.st2/7bf411a0" {
-  observer "observer/github/compoundingtech/st2/pull/403"
-  to "agent/hetz.st2"
-  on "head"
-  on "state"
-  on "review"
-  on "checks"
-  delivery "message"
+    subscription "watch" {
+      observer "observer/watch"
+      to "agent/hetz.st2"
+      on "head"
+      on "state"
+      on "review"
+      on "checks"
+      delivery "message"
+    }
+  }
 }
 ```
 
-The resource stores normalized external facts. The observer stores observation intent and health.
+The resource stores normalized external facts. The plan run owns the observer and subscription.
+
+The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
 
 The subscription stores the selected changes and delivery intent. The agent declaration does not change.
 
@@ -102,9 +109,9 @@ The subscription becomes active when its delivery target appears.
 
 ## Lifecycle
 
-`st3 resource unwatch SUBSCRIPTION` stops one subscription. It does not remove the resource or other subscriptions.
+`st3 resource unwatch SUBSCRIPTION` cancels its watch plan run. It does not remove the resource or other watch runs.
 
-The observer stops after its last subscription stops unless another graph relation keeps it active.
+Cleanup stops the owned observer and subscription before the watch run becomes cancelled.
 
 The GitHub pull request provider observes the final merge or closure change. The subscription remains active until an explicit unwatch in the MVP.
 

@@ -1,39 +1,30 @@
 version 2
 
 subgraph {
-  scope "eval/resource-handoff/${ST_PLAN_RUN}" retention="temporary" {
-    plan "eval/resource-handoff" state="ready" {
-      agentless
-      completion { when "all-steps-exhausted" }
-      goal "Complete plan eval/resource-handoff."
-      step "contract" timeout="1m" {
-        title "The resource moves from A to B without overlap"
-        subgraph {
-          exec "eval/resource-handoff/contract/${ST_PLAN_RUN}" {
-            host "local"
-            workspace "${ST_WORKSPACE}/fixture"
-            cwd "${ST_WORKSPACE}/fixture"
-            command "bash ./run.sh"
-            restart "never"
-          }
-        }
-        gate "condition-1" { field "status" "exec/eval/resource-handoff/contract/${ST_PLAN_RUN}" "is" "exited" }
-        gate "condition-2" { field "exit_code" "exec/eval/resource-handoff/contract/${ST_PLAN_RUN}" "is" 0 }
-      }
-      step "gate" timeout="1m" {
-        depends-on { step "contract" completed }
-        gate "the resource history revokes A before granting B" {
-          exec "bash ./judge.sh"
+  plan "eval/resource-handoff" state="ready" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete plan eval/resource-handoff."
+    step "contract" timeout="1m" {
+      title "The resource moves from A to B without overlap"
+      subgraph {
+        exec "eval/resource-handoff/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
-          time-limit "1m"
+          cwd "${ST_WORKSPACE}/fixture"
+          command "bash ./run.sh"
+          restart "never"
         }
       }
-      finally {
-        step "cleanup" {
-        subgraph { scope "eval/resource-handoff/${ST_PLAN_RUN}" { stop } }
-        gate "condition" { empty "scope/eval/resource-handoff/${ST_PLAN_RUN}" }
-      }
+      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/resource-handoff/contract" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/resource-handoff/contract" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "contract" completed }
+      gate "the resource history revokes A before granting B" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+        time-limit "1m"
       }
     }
   }

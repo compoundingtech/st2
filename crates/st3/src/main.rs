@@ -59,9 +59,14 @@ enum Command {
     /// Preview a new-format KDL intent.
     Preview(FileArgs),
     /// Create and review a durable Codex planning session.
+    Planning {
+        #[command(subcommand)]
+        command: PlanningCommand,
+    },
+    /// Inspect a plan or its one active run.
     Plan {
         #[command(subcommand)]
-        command: PlanCommand,
+        command: PlanViewCommand,
     },
     /// Apply a new-format KDL intent.
     Run(RunArgs),
@@ -176,7 +181,7 @@ struct FileArgs {
 }
 
 #[derive(Subcommand)]
-enum PlanCommand {
+enum PlanningCommand {
     Start(PlanStartArgs),
     Show(PlanSessionArgs),
     Preview(PlanPreviewArgs),
@@ -186,6 +191,16 @@ enum PlanCommand {
     Cancel(PlanCancelArgs),
     Compare(PlanCompareArgs),
     Propose(PlanProposeArgs),
+}
+
+#[derive(Subcommand)]
+enum PlanViewCommand {
+    Show(PlanShowArgs),
+}
+
+#[derive(Args)]
+struct PlanShowArgs {
+    plan_or_run: String,
 }
 
 #[derive(Args)]
@@ -281,6 +296,8 @@ struct RunArgs {
     workspace: Option<PathBuf>,
     #[arg(long, env = "ST_AGENT")]
     requester: Option<String>,
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
     #[arg(long)]
     detach: bool,
     #[arg(long, visible_alias = "at")]
@@ -362,7 +379,7 @@ struct InspectArgs {
 struct TraceArgs {
     subject: Option<String>,
     #[arg(long)]
-    scope: Option<String>,
+    owner_run: Option<String>,
     #[arg(long, default_value_t = 100)]
     limit: usize,
     #[arg(long)]
@@ -416,6 +433,8 @@ enum DocCommand {
 #[derive(Args)]
 struct EvalArgs {
     eval: PathBuf,
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
     /// Show one live graph screen with semantic state transitions.
     #[arg(long)]
     graph: bool,
@@ -423,7 +442,7 @@ struct EvalArgs {
 
 #[derive(Args)]
 struct GraphArgs {
-    scope: String,
+    plan_run: String,
 }
 
 #[derive(Args)]
@@ -431,7 +450,7 @@ struct StatusArgs {
     #[arg(env = "ST_AGENT")]
     subject: Option<String>,
     #[arg(long)]
-    scope: Option<String>,
+    owner_run: Option<String>,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
     #[arg(long, value_parser = ["available", "busy", "dnd", "offline"])]
@@ -838,7 +857,8 @@ async fn run(cli: Cli) -> Result<()> {
             run_quick(&client, endpoint, &config, args, "codex", cli.json).await
         }
         Command::Preview(args) => run_preview(&client, args, cli.json).await,
-        Command::Plan { command } => run_planning(&client, command, cli.json).await,
+        Command::Planning { command } => run_planning(&client, command, cli.json).await,
+        Command::Plan { command } => run_plan_view(&client, command, cli.json).await,
         Command::Run(args) => run_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
         Command::Exec(args) => run_exec(&client, args, cli.json).await,
@@ -986,10 +1006,10 @@ async fn run_preview(client: &Client, args: FileArgs, json_output: bool) -> Resu
     print_plan(&response, json_output)
 }
 
-async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) -> Result<()> {
+async fn run_planning(client: &Client, command: PlanningCommand, json_output: bool) -> Result<()> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let response = match command {
-        PlanCommand::Start(args) => {
+        PlanningCommand::Start(args) => {
             let (request, _) = read_intent(args.request.as_deref())?;
             let workspace = fs::canonicalize(&args.workspace)
                 .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
@@ -1009,7 +1029,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 )
                 .await?
         }
-        PlanCommand::Show(args) => {
+        PlanningCommand::Show(args) => {
             client
                 .get::<PlanningSessionView>(&format!(
                     "/v1/planning-sessions/{}",
@@ -1017,7 +1037,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 ))
                 .await?
         }
-        PlanCommand::Preview(args) => {
+        PlanningCommand::Preview(args) => {
             let path = args.variant.as_deref().map_or_else(
                 || {
                     format!(
@@ -1037,7 +1057,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 .post::<_, PlanningSessionView>(&path, &json!({}))
                 .await?
         }
-        PlanCommand::Submit(args) => {
+        PlanningCommand::Submit(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
@@ -1057,7 +1077,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 )
                 .await?
         }
-        PlanCommand::Revise(args) => {
+        PlanningCommand::Revise(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
@@ -1074,7 +1094,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 )
                 .await?
         }
-        PlanCommand::Approve(args) => {
+        PlanningCommand::Approve(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
@@ -1089,7 +1109,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 )
                 .await?
         }
-        PlanCommand::Cancel(args) => {
+        PlanningCommand::Cancel(args) => {
             client
                 .post::<_, PlanningSessionView>(
                     &format!(
@@ -1104,7 +1124,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 )
                 .await?
         }
-        PlanCommand::Compare(args) => {
+        PlanningCommand::Compare(args) => {
             let response: Value = client
                 .get(&format!(
                     "/v1/planning-sessions/{}/variants/{}/compare/{}",
@@ -1115,7 +1135,7 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
                 .await?;
             return print_value(&response, json_output);
         }
-        PlanCommand::Propose(args) => {
+        PlanningCommand::Propose(args) => {
             let actor = args
                 .actor
                 .context("a planning proposal needs --as or ST_AGENT")?;
@@ -1160,6 +1180,30 @@ async fn run_planning(client: &Client, command: PlanCommand, json_output: bool) 
         }
     }
     Ok(())
+}
+
+async fn run_plan_view(client: &Client, command: PlanViewCommand, json_output: bool) -> Result<()> {
+    let PlanViewCommand::Show(args) = command;
+    let selected = args.plan_or_run;
+    let run = if selected.starts_with("plan-run/") {
+        client
+            .get::<PlanRunView>(&format!("/v1/plan-runs/{}", urlencoding::encode(&selected)))
+            .await?
+    } else {
+        let runs: Vec<PlanRunView> = client
+            .get(&format!(
+                "/v1/plan-runs?plan={}",
+                urlencoding::encode(&selected)
+            ))
+            .await?;
+        anyhow::ensure!(
+            runs.len() == 1,
+            "plan `{selected}` has {} active runs; use an exact plan run subject",
+            runs.len()
+        );
+        runs.into_iter().next().expect("one active run was checked")
+    };
+    print_value(&run, json_output)
 }
 
 async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<()> {
@@ -1211,16 +1255,7 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
         );
         ready[0]
     };
-    let workspace = args
-        .workspace
-        .or_else(|| {
-            file.as_deref()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-        })
-        .unwrap_or(std::env::current_dir()?)
-        .canonicalize()
-        .context("resolve the plan run workspace")?;
+    let workspace = resolve_plan_run_workspace(args.workspace, file.as_deref())?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let started: PlanRunView = client
         .post(
@@ -1231,6 +1266,7 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
                 workspace: workspace.to_string_lossy().into_owned(),
                 requester: args.requester,
                 mode: Some("run".into()),
+                inputs: unique_pairs(args.inputs, "input")?,
                 idempotency_key: format!(
                     "run:{}:{nonce}:{}",
                     selected.revision,
@@ -1243,6 +1279,18 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
         return print_value(&started, json_output);
     }
     follow_plan_run(client, started, json_output).await
+}
+
+fn resolve_plan_run_workspace(workspace: Option<PathBuf>, file: Option<&Path>) -> Result<PathBuf> {
+    workspace
+        .or_else(|| {
+            file.and_then(Path::parent)
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()
+        .context("resolve the plan run workspace")
 }
 
 async fn follow_plan_run(client: &Client, mut run: PlanRunView, json_output: bool) -> Result<()> {
@@ -1337,7 +1385,6 @@ async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Res
 }
 
 async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<()> {
-    let explicit_name = args.name.is_some();
     let name = args.name.unwrap_or_else(|| {
         format!(
             "cli-{}-{}",
@@ -1348,23 +1395,28 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
                 .as_millis()
         )
     });
-    let subject = format!("exec/{name}");
-    if explicit_name {
-        let status = status_for(client, &subject).await?;
-        anyhow::ensure!(
-            status
-                .subjects
-                .first()
-                .is_none_or(|item| item.desired.is_none() && item.actual.is_none()),
-            "subject `{subject}` already exists"
-        );
-    }
     let cwd = args.cwd.unwrap_or(std::env::current_dir()?);
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("resolve working directory {}", cwd.display()))?;
     let kdl = exec_intent(&name, &args.host, &cwd, &args.environment, &args.argv);
     let applied = apply_generated(client, kdl, format!("st3 exec {name}")).await?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let run: PlanRunView = client
+        .post(
+            "/v1/plan-runs",
+            &PlanRunRequest {
+                plan: format!("exec/{name}"),
+                revision: None,
+                workspace: cwd.to_string_lossy().into_owned(),
+                requester: std::env::var("ST_AGENT").ok(),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("st3-exec:{name}:{nonce}"),
+            },
+        )
+        .await?;
+    let subject = format!("exec/{}/{name}", run.id);
     if args.detach {
         if json_output {
             return print_value(
@@ -1379,17 +1431,39 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
         println!("{subject}");
         return Ok(());
     }
-    wait_for_actual(client, &subject, applied.store_index).await?;
+    #[cfg(unix)]
+    let interrupt = {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        async move {
+            signal.recv().await;
+            Ok::<(), std::io::Error>(())
+        }
+    };
+    #[cfg(not(unix))]
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
     if !json_output {
-        eprintln!("{}", subject);
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "{}", subject)?;
+        stderr.flush()?;
+    }
+    tokio::select! {
+        result = wait_for_actual(client, &subject, applied.store_index) => result?,
+        signal = &mut interrupt => {
+            signal?;
+            if args.cancel_on_interrupt {
+                apply_generated(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}")).await?;
+            }
+            return Err(CommandExit(130).into());
+        }
     }
     let follow = follow_logs(client, &subject, false, true, true, !json_output);
     let final_chunk = tokio::select! {
         result = follow => result?,
-        signal = tokio::signal::ctrl_c() => {
+        signal = &mut interrupt => {
             signal?;
             if args.cancel_on_interrupt {
-                apply_generated(client, stop_intent(&subject), format!("st3 exec stop {name}")).await?;
+                apply_generated(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}")).await?;
             }
             return Err(CommandExit(130).into());
         }
@@ -1461,13 +1535,52 @@ fn exec_intent(
     }
     body.nodes_mut().push(kdl_node("restart", ["never"]));
     task.set_children(body);
-    subgraph_document(task)
+
+    let mut execution = KdlNode::new("subgraph");
+    let mut execution_body = KdlDocument::new();
+    execution_body.nodes_mut().push(task);
+    execution.set_children(execution_body);
+    let mut step = KdlNode::new("step");
+    step.entries_mut().push(KdlEntry::new("execute"));
+    let mut step_body = KdlDocument::new();
+    step_body.nodes_mut().push(KdlNode::new("agentless"));
+    step_body.nodes_mut().push(execution);
+    let mut gate = KdlNode::new("gate");
+    gate.entries_mut().push(KdlEntry::new("the command exits"));
+    let mut gate_body = KdlDocument::new();
+    let subject = format!("exec/${{ST_PLAN_RUN}}/{name}");
+    gate_body.nodes_mut().push(kdl_node(
+        "field",
+        ["status", subject.as_str(), "is", "exited"],
+    ));
+    gate.set_children(gate_body);
+    step_body.nodes_mut().push(gate);
+    step.set_children(step_body);
+    let mut completion = KdlNode::new("completion");
+    let mut completion_body = KdlDocument::new();
+    completion_body
+        .nodes_mut()
+        .push(kdl_node("when", ["all-steps-exhausted"]));
+    completion.set_children(completion_body);
+    let mut plan = KdlNode::new("plan");
+    plan.entries_mut()
+        .push(KdlEntry::new(format!("exec/{name}")));
+    plan.entries_mut()
+        .push(KdlEntry::new_prop("state", "ready"));
+    let mut plan_body = KdlDocument::new();
+    plan_body
+        .nodes_mut()
+        .push(kdl_node("goal", ["Run the command to completion."]));
+    plan_body.nodes_mut().push(step);
+    plan_body.nodes_mut().push(completion);
+    plan.set_children(plan_body);
+    subgraph_document(plan)
 }
 
-fn stop_intent(subject: &str) -> String {
-    let mut stop = KdlNode::new("stop");
-    stop.entries_mut().push(KdlEntry::new(subject));
-    subgraph_document(stop)
+fn cancel_run_intent(subject: &str) -> String {
+    format!(
+        "version 2\nsubgraph {{\n  plan-run {subject:?} {{ cancel reason=\"the command was interrupted\" }}\n}}\n"
+    )
 }
 
 fn kdl_node<'a>(name: &str, values: impl IntoIterator<Item = &'a str>) -> KdlNode {
@@ -1544,7 +1657,7 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
         }
         let events: Vec<EventRecord> = client
             .get(&format!(
-                "/v1/events?after={cursor}&subject={}",
+                "/v1/events?after={cursor}&subject={}&wait=false",
                 urlencoding::encode(subject)
             ))
             .await?;
@@ -1554,6 +1667,7 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
                 anyhow::bail!("{} failed: {}", subject, event.body);
             }
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1744,6 +1858,29 @@ async fn run_pty(
 }
 
 async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> Result<()> {
+    if args.subject.starts_with("resource/")
+        && let Some((subject, claim_id)) = args.subject.rsplit_once('@')
+    {
+        let claim: ClaimRecord = client
+            .get(&format!(
+                "/v1/claims/by-id/{}",
+                urlencoding::encode(claim_id)
+            ))
+            .await?;
+        anyhow::ensure!(
+            claim.subject == subject,
+            "claim `{claim_id}` belongs to `{}`, not `{subject}`",
+            claim.subject
+        );
+        return print_value(
+            &json!({
+                "reference": args.subject,
+                "actual": claim.body,
+                "claim": claim,
+            }),
+            json_output,
+        );
+    }
     let status = status_for(client, &args.subject).await?;
     let claims: ClaimsPage = client
         .get(&format!(
@@ -1766,8 +1903,8 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
     if let Some(subject) = &args.subject {
         query.push(format!("subject={}", urlencoding::encode(subject)));
     }
-    if let Some(scope) = &args.scope {
-        query.push(format!("scope={}", urlencoding::encode(scope)));
+    if let Some(owner_run) = &args.owner_run {
+        query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
     }
     if let Some(after) = args.after_index {
         query.push(format!("after_index={after}"));
@@ -1794,8 +1931,8 @@ async fn run_trace(client: &Client, args: TraceArgs, json_output: bool) -> Resul
         if let Some(subject) = &args.subject {
             event_query.push(format!("subject={}", urlencoding::encode(subject)));
         }
-        if let Some(scope) = &args.scope {
-            event_query.push(format!("scope={}", urlencoding::encode(scope)));
+        if let Some(owner_run) = &args.owner_run {
+            event_query.push(format!("owner_run={}", urlencoding::encode(owner_run)));
         }
         let events: Vec<EventRecord> = client
             .get(&format!("/v1/events?{}", event_query.join("&")))
@@ -2168,8 +2305,8 @@ async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Res
     if let Some(subject) = args.subject {
         query.push(format!("subject={}", urlencoding::encode(&subject)));
     }
-    if let Some(scope) = args.scope {
-        query.push(format!("scope={}", urlencoding::encode(&scope)));
+    if let Some(owner_run) = args.owner_run {
+        query.push(format!("owner_run={}", urlencoding::encode(&owner_run)));
     }
     if let Some(at_index) = args.at_index {
         query.push(format!("at_index={at_index}"));
@@ -3222,22 +3359,21 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
                 name,
                 bundle_hash,
                 bundle,
+                inputs: unique_pairs(args.inputs, "input")?,
             },
         )
         .await?;
     if json_output {
         print_value(&started, true)?;
     } else {
-        println!("started {}", started.scope);
+        println!("started {}", started.plan_run);
     }
-    let subject = started
-        .plan_run
-        .context("the eval API did not return a plan run")?;
+    let subject = started.plan_run;
     let run: PlanRunView = client
         .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
         .await?;
     if args.graph {
-        follow_eval_graph(client, &started.scope, &run.subject).await
+        follow_eval_graph(client, &run.subject).await
     } else {
         follow_plan_run(client, run, json_output).await
     }
@@ -3250,9 +3386,12 @@ async fn run_graph(client: &Client, args: GraphArgs, json_output: bool) -> Resul
         "graph needs an interactive terminal"
     );
     let eval: EvalStatus = client
-        .get(&format!("/v1/evals/{}", urlencoding::encode(&args.scope)))
+        .get(&format!(
+            "/v1/evals/{}",
+            urlencoding::encode(&args.plan_run)
+        ))
         .await?;
-    follow_eval_graph(client, &eval.scope, &eval.plan_run).await
+    follow_eval_graph(client, &eval.plan_run).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3293,14 +3432,14 @@ impl Drop for TerminalScreen {
     }
 }
 
-async fn follow_eval_graph(client: &Client, scope: &str, root: &str) -> Result<()> {
+async fn follow_eval_graph(client: &Client, root: &str) -> Result<()> {
     let _screen = TerminalScreen::open()?;
     let started_at = Instant::now();
     let mut previous = BTreeMap::new();
     let mut transitions = Vec::new();
     let mut prior_signature = String::new();
     loop {
-        let snapshot = load_eval_graph(client, scope, root).await?;
+        let snapshot = load_eval_graph(client, root).await?;
         let current = graph_node_states(&snapshot);
         if !previous.is_empty() {
             record_graph_transitions(&previous, &current, started_at.elapsed(), &mut transitions);
@@ -3321,7 +3460,7 @@ async fn follow_eval_graph(client: &Client, scope: &str, root: &str) -> Result<(
             "failed" | "cancelled" => {
                 anyhow::bail!(
                     "eval {} is {}",
-                    snapshot.eval.scope,
+                    snapshot.eval.plan_run,
                     snapshot.eval.lifecycle
                 )
             }
@@ -3331,9 +3470,9 @@ async fn follow_eval_graph(client: &Client, scope: &str, root: &str) -> Result<(
     }
 }
 
-async fn load_eval_graph(client: &Client, scope: &str, root: &str) -> Result<EvalGraphSnapshot> {
+async fn load_eval_graph(client: &Client, root: &str) -> Result<EvalGraphSnapshot> {
     let eval: EvalStatus = client
-        .get(&format!("/v1/evals/{}", urlencoding::encode(scope)))
+        .get(&format!("/v1/evals/{}", urlencoding::encode(root)))
         .await?;
     let runs: Vec<PlanRunView> = client
         .get(&format!("/v1/plan-runs?root={}", urlencoding::encode(root)))
@@ -3345,7 +3484,7 @@ async fn load_eval_graph(client: &Client, scope: &str, root: &str) -> Result<Eva
 fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNodeState> {
     let mut states = BTreeMap::new();
     states.insert(
-        snapshot.eval.scope.clone(),
+        snapshot.eval.plan_run.clone(),
         GraphNodeState {
             label: "eval".into(),
             state: format!("{} / {}", snapshot.eval.lifecycle, snapshot.eval.phase),
@@ -3437,9 +3576,9 @@ fn render_eval_graph(
     let mut output = String::new();
     let name = snapshot
         .eval
-        .scope
-        .strip_prefix("scope/eval/")
-        .unwrap_or(&snapshot.eval.scope);
+        .plan_run
+        .strip_prefix("plan-run/")
+        .unwrap_or(&snapshot.eval.plan_run);
     let steps = snapshot
         .runs
         .iter()
@@ -4993,9 +5132,38 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
     Ok((name.into(), value.into()))
 }
 
+fn parse_input(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "a plan input must use NAME=VALUE".to_owned())?;
+    if name.is_empty() || name.contains('/') || name.chars().any(char::is_whitespace) {
+        return Err("a plan input name is invalid".into());
+    }
+    Ok((name.into(), value.into()))
+}
+
+fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<String, String>> {
+    let mut output = BTreeMap::new();
+    for (name, value) in values {
+        anyhow::ensure!(
+            output.insert(name.clone(), value).is_none(),
+            "the {kind} `{name}` repeats"
+        );
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_run_workspace_accepts_a_file_basename() {
+        assert_eq!(
+            resolve_plan_run_workspace(None, Some(Path::new("plan.kdl"))).unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
 
     #[test]
     fn exec_cli_builds_a_normal_st3_member() {
@@ -5008,15 +5176,24 @@ mod tests {
         );
         assert!(source.starts_with("version 2\n"));
         let intent = st3::parse_intent(&source, "node").unwrap();
-        let member = intent.subjects["exec/cli-test"].member.as_ref().unwrap();
-        assert_eq!(member.host, "node");
-        assert_eq!(member.cwd, "/work/tree");
-        assert_eq!(member.environment["MODE"], "test");
-        assert_eq!(member.restart, st3::model::RestartType::Never);
-        assert_eq!(
-            member.launch,
-            st3::model::LaunchSpec::Argv(vec!["printf".into(), "%s".into(), "hello".into()])
-        );
+        let plan = &intent.plans["exec/cli-test"];
+        assert!(matches!(
+            plan.completion,
+            Some(st3::model::CompletionSpec::AllStepsExhausted)
+        ));
+        let execution = plan.steps["execute"].subgraph_kdl.as_deref().unwrap();
+        assert!(execution.contains("exec cli-test"), "{execution}");
+        assert!(execution.contains("host local"));
+        assert!(execution.contains("workspace \"/work/tree\""));
+        assert!(execution.contains("cwd \"/work/tree\""));
+        assert!(execution.contains("argv printf %s hello"));
+        assert!(execution.contains("MODE test"));
+        assert!(execution.contains("restart never"));
+        assert!(matches!(
+            &plan.steps["execute"].gates[0],
+            st3::model::GateSpec::Field { subject, .. }
+                if subject == "exec/${ST_PLAN_RUN}/cli-test"
+        ));
     }
 
     #[test]
@@ -5361,7 +5538,6 @@ mod tests {
         );
         let snapshot = EvalGraphSnapshot {
             eval: EvalStatus {
-                scope: "scope/eval/demo/root".into(),
                 plan_run: root_subject.into(),
                 lifecycle: "running".into(),
                 phase: "normal".into(),
@@ -5382,7 +5558,7 @@ mod tests {
 
         let rendered = render_eval_graph(&snapshot, &transitions, Duration::from_secs(9));
 
-        assert!(rendered.contains("ST3 EVAL GRAPH  demo/root"));
+        assert!(rendered.contains("ST3 EVAL GRAPH  root"));
         assert!(rendered.contains("STATE      running · normal"));
         assert!(rendered.contains("1/3 completed · 2 active"));
         assert!(rendered.contains("rename — Change the package · base"));
@@ -5448,7 +5624,7 @@ mod tests {
             parent_step_run: parent_step_run.map(str::to_owned),
             workspace: "/tmp/eval".into(),
             requester: "person/eval-requester".into(),
-            run_scope: Some("scope/eval/demo/root".into()),
+            inputs: BTreeMap::new(),
             mode: "eval".into(),
             status: "running".into(),
             phase: "normal".into(),

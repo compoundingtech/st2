@@ -7,7 +7,7 @@ You own the ledger repository. Do not delegate your graph assignment again.
 ## Assigned work
 
 1. Drain and archive each assignment message.
-2. Claim only a ready assignment for `agent/rc.dev`.
+2. Claim only a ready assignment for `agent/${ST_PLAN_RUN}/rc.dev`.
 3. Follow each nested step in order.
 4. Read the graph, `PROGRESS.md`, and git before you edit.
 5. Record, test, and commit each stable item exactly once.

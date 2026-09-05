@@ -2,6 +2,7 @@ version 2
 
 subgraph {
   plan "generation-proof" state="ready" revisions="human-only" {
+    completion { when "all-steps-exhausted" }
     goal "Prove a live plan revision."
 
     step "stable" {

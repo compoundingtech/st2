@@ -1,48 +1,39 @@
 version 2
 
 subgraph {
-  scope "eval/crash-escalation/${ST_PLAN_RUN}" retention="temporary" {
-    plan "eval/crash-escalation" state="ready" {
-      agentless
-      completion { when "all-steps-exhausted" }
-      goal "Complete plan eval/crash-escalation."
-      step "faults" timeout="1m" {
-        title "The runtime classifies abnormal and clean exits"
-        subgraph {
-          exec "eval/crash-escalation/crash/${ST_PLAN_RUN}" {
-            host "local"
-            workspace "${ST_WORKSPACE}"
-            command "exit 17"
-            restart "always"
-            restart { attempts 1; interval "60s"; mode "fail" }
-          }
-          exec "eval/crash-escalation/clean/${ST_PLAN_RUN}" {
-            host "local"
-            workspace "${ST_WORKSPACE}"
-            command "exit 0"
-            restart "never"
-          }
-        }
-        gate "condition-1" { field "reachability" "exec/eval/crash-escalation/crash/${ST_PLAN_RUN}" "is" "unreachable" }
-        gate "condition-2" { field "exit_code" "exec/eval/crash-escalation/crash/${ST_PLAN_RUN}" "is" 17 }
-        gate "condition-3" { field "status" "exec/eval/crash-escalation/clean/${ST_PLAN_RUN}" "is" "exited" }
-        gate "condition-4" { field "exit_code" "exec/eval/crash-escalation/clean/${ST_PLAN_RUN}" "is" 0 }
-      }
-      step "gate" timeout="1m" {
-        depends-on { step "faults" completed }
-        gate "only the abnormal exit has a raised supervision decision" {
-          exec "bash ./judge.sh"
+  plan "eval/crash-escalation" state="ready" {
+    completion { when "all-steps-exhausted" }
+    goal "Complete plan eval/crash-escalation."
+    step "faults" timeout="1m" {
+      title "The runtime classifies abnormal and clean exits"
+      subgraph {
+        exec "eval/crash-escalation/crash" {
           host "local"
-          workspace "${ST_WORKSPACE}/fixture"
-
-          time-limit "1m"
+          workspace "${ST_WORKSPACE}"
+          command "exit 17"
+          restart "always"
+          restart { attempts 1; interval "60s"; mode "fail" }
+        }
+        exec "eval/crash-escalation/clean" {
+          host "local"
+          workspace "${ST_WORKSPACE}"
+          command "exit 0"
+          restart "never"
         }
       }
-      finally {
-        step "cleanup" {
-        subgraph { scope "eval/crash-escalation/${ST_PLAN_RUN}" { stop } }
-        gate "condition" { empty "scope/eval/crash-escalation/${ST_PLAN_RUN}" }
-      }
+      gate "condition-1" { field "reachability" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" "unreachable" }
+      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" 17 }
+      gate "condition-3" { field "status" "exec/${ST_PLAN_RUN}/eval/crash-escalation/clean" "is" "exited" }
+      gate "condition-4" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/crash-escalation/clean" "is" 0 }
+    }
+    step "gate" timeout="1m" {
+      depends-on { step "faults" completed }
+      gate "only the abnormal exit has a raised supervision decision" {
+        exec "bash ./judge.sh"
+        host "local"
+        workspace "${ST_WORKSPACE}/fixture"
+
+        time-limit "1m"
       }
     }
   }
