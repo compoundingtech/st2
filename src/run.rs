@@ -3231,7 +3231,11 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         );
         return;
     };
-    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
+    let Ok(Some(agent_dir)) = message::resolve_agent_dir(
+        catalog_root,
+        &crate::identity::AgentSelector::Address(supervisor.to_owned()),
+        this_host,
+    )
     else {
         tracing::warn!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",

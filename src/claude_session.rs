@@ -30,7 +30,7 @@ pub fn run(
     claude_argv: Vec<String>,
 ) -> Result<()> {
     let agent_dir =
-        message::resolve_agent_dir(catalog_root, &identity, &crate::run::detect_host())?
+        message::resolve_actor_dir(catalog_root, &identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !claude_argv.is_empty(),
@@ -159,7 +159,7 @@ pub fn run_observe(
     runtime_id: Option<&str>,
     event: &str,
 ) -> Result<()> {
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_actor_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     // Counted only once the invocation has its application target: a hook for an undeclared
     // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
@@ -464,7 +464,7 @@ pub fn run_statusline(catalog_root: &Path, identity: &str) -> Result<()> {
 
 fn record_statusline(catalog_root: &Path, identity: &str, raw: &[u8]) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_slice(raw).unwrap_or(serde_json::Value::Null);
-    let agent_dir = message::resolve_agent_dir(catalog_root, identity, &crate::run::detect_host())?
+    let agent_dir = message::resolve_actor_dir(catalog_root, identity, &crate::run::detect_host())?
         .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
     // Deliberately uncounted. The tee builds no telemetry pipeline at all (`DQ-C13`, see
     // `main`), so a `record_hook_invocation` here could never reach a collector — and a metric

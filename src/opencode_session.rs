@@ -85,7 +85,7 @@ pub fn run(
     opencode_argv: Vec<String>,
 ) -> Result<()> {
     let this_host = crate::run::detect_host();
-    let agent_dir = message::resolve_agent_dir(catalog_root, &identity, &this_host)?
+    let agent_dir = message::resolve_actor_dir(catalog_root, &identity, &this_host)?
         .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
     anyhow::ensure!(
         !opencode_argv.is_empty(),
