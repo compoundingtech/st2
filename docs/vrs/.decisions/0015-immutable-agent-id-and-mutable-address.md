@@ -101,6 +101,74 @@ host-qualified bus identity are the sole stable routing keys.
   the open implementation delta prevents the target VRS from being mistaken for
   shipped behavior.
 
+## Amendment 1 — 2026-09-05: the address ships first, the ID half is staged
+
+The decision above stands as the target. Its two halves ship separately, because
+only one of them answers the Context: the mutable address does, with no
+migration, no record version, and no activation gate. Splitting a provisional
+route from a durable key needs one new field; freezing an explicit ID buys
+host-move invariance and live/archive collision attribution, both real and both
+with no observed instance on any admitted host.
+
+Shipped now: the optional `id` and `address` grammar with catalog-global `dup-id`
+and host-local `dup-address` admission, `effective_id`/`effective_address`/
+`bus_address`, roster and graph projection, `st2 agent address`, and the
+fail-closed bare-or-qualified reference resolution — which every reference plane
+now shares, including stream ingress. Positional `identity` remains the durable
+key, so `ST_AGENT`, task IDs, session socket paths, declaration-parent state,
+harness records, PTY tags, and supervisor edges are untouched by a cutover.
+
+Deferred: UUIDv7 creation, the `st2 catalog migrate-ids` freeze transaction,
+ID-keyed durable records (message version 2, harness-state and harness-context
+version 2, PTY schema 2), collision metadata and collision-aware attribution of
+reassigned legacy endpoints, and the activation gate that would sequence them.
+No part of it is contradicted by shipping the address first: `id` and `address`
+are independent fields, and the freeze migration is unchanged by their order.
+
+The ID half re-enters on any one of these observations, each of which turns a
+latent argument into a live obligation:
+
+- a completed cross-host seat move, or a concrete plan for one — the frozen ID is
+  the only thing that preserves `ST_AGENT`, task IDs, and socket paths across it;
+- a live/archive identity collision on any admitted host, which is what the
+  reassignment record and legacy-endpoint attribution exist for; or
+- a UUIDv7 creation call site — a generator that authors new subjects — because a
+  subject whose ID is in no address namespace cannot be reached without ID-keyed
+  resolution.
+
+Two corrections to the premises this decision was implemented against:
+
+- **Version-1 readers are additively tolerant, so a new field is not a version
+  bump.** `crates/st2-wire/src/lib.rs` states the opposite of the assumption as
+  policy: no type in the reader crate uses `deny_unknown_fields`, precisely so a
+  reader older than the binary it shells out to ignores unknown fields. The one
+  genuine cross-build hazard is single-field and about routing, not records: a
+  build that does not read `address` routes the positional identity and refuses
+  the new address, the exact inverse of a build that does. So the reader-first
+  obligation is "deploy an `address`-reading build on every admitted host before
+  authoring any address", and nothing more. A durable record that *does* reject
+  unknown fields — `SentRecord` — keeps its version-1 shape here, so its version-2
+  reader belongs with the writer that emits one.
+- **Ownership keys are not addresses.** An exact selector answers to either
+  immutable key: the explicit `id`, or the positional `<host>.<identity>` bus
+  identity that migration would freeze into it. Both are unique by admission and
+  neither moves when an address does, which is what keeps a running seat, its
+  resync stream, and an interrupted send bound to their own subject across a
+  cutover.
+
+Before the ID half can land, two defects found while auditing its
+implementation must be fixed:
+
+- `supervisor_chain::resolve_spec` resolves parents by `bus_id(host)` or bare
+  `identity` only, so it must accept `effective_id`; otherwise a subject born with
+  UUIDv7 loses its org-chart edge, which is the clause the migration transaction
+  exists to satisfy;
+- `st2 catalog migrate-ids` must exempt `agent-id-missing` from its own
+  pre-admission gate. A partially migrated catalog is inadmissible by that
+  diagnostic, and the migration verb refuses to write into a non-admitting
+  catalog, so the rollout order the decision prescribes — teach the projection to
+  emit `id`, then migrate — deadlocks on the only command that can clear it.
+
 ## Options
 
 | Option | Result | Reason |
