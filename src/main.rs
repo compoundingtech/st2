@@ -4059,6 +4059,7 @@ fn print_report(report: &UpReport) {
     report_line("adopted", &report.adopted);
     report_line("other-host", &report.other_host);
     report_line("unrunnable", &report.unrunnable);
+    report_line("archived", &report.archived);
     for w in &report.warnings {
         eprintln!("warning: {w}");
     }
