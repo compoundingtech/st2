@@ -92,6 +92,16 @@ pub struct SentMessageRow {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Display-only publication snapshot of the recipient's bus address at send time. Never a
+    /// selector. A version-1 row never carried one, so absence is absence.
+    #[serde(rename = "toAddress", default, skip_serializing_if = "Option::is_none")]
+    pub to_address: Option<String>,
+    /// What [`Self::to`] names: `agent` for an immutable agent ID, `principal` or `external` for
+    /// that endpoint's canonical address. Absent means the row never declared a kind — a
+    /// consumer that reads a version-1 row as `agent` makes that inference itself, because the
+    /// wire shape must not manufacture an authority the writer never published.
+    #[serde(rename = "toKind", default, skip_serializing_if = "Option::is_none")]
+    pub to_kind: Option<String>,
 }
 
 /// The stable `st2 message sent --json` envelope.
@@ -258,11 +268,46 @@ mod tests {
                 priority: None,
                 idempotency_key: None,
                 body: None,
+                to_address: None,
+                to_kind: None,
             }],
         };
         let json = serde_json::to_value(indexed).unwrap();
         assert_eq!(json["messages"][0]["to"], "h.recipient");
         assert!(json["messages"][0].get("from").is_none());
         assert!(json["messages"][0].get("body").is_none());
+    }
+
+    /// A version-1 row declared neither a recipient address snapshot nor an endpoint kind, so it
+    /// emits neither key; a version-2 row emits both. Absence is never rendered as `null` and
+    /// never defaulted to `agent`, because that inference belongs to the consumer.
+    #[test]
+    fn recipient_address_and_kind_are_emitted_only_when_the_row_declared_them() {
+        let row = |to_address: Option<&str>, to_kind: Option<&str>| SentMessageRow {
+            filename: "1785000000000-abcdef.md".to_string(),
+            ts: 1_785_000_000_000,
+            to: "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3".to_string(),
+            subject: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            body: None,
+            to_address: to_address.map(str::to_string),
+            to_kind: to_kind.map(str::to_string),
+        };
+
+        let legacy = serde_json::to_value(row(None, None)).unwrap();
+        assert!(legacy.get("toAddress").is_none());
+        assert!(legacy.get("toKind").is_none());
+
+        let activated =
+            serde_json::to_value(row(Some("dev4.fractal.chat"), Some("agent"))).unwrap();
+        assert_eq!(activated["toAddress"], "dev4.fractal.chat");
+        assert_eq!(activated["toKind"], "agent");
+
+        // Both keys are optional on the way in, so a version-1 reader's output still parses.
+        let parsed = serde_json::from_value::<SentMessageRow>(legacy).unwrap();
+        assert!(parsed.to_address.is_none() && parsed.to_kind.is_none());
     }
 }

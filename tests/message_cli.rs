@@ -28,12 +28,17 @@ fn write_message(inbox: &Path, ts_ms: u64, suffix: &str, from: &str) {
 }
 
 fn write_agent(root: &Path, identity: &str) {
+    write_agent_with(root, identity, "");
+}
+
+/// [`write_agent`] plus extra declaration fields, one per line, already indented.
+fn write_agent_with(root: &Path, identity: &str, extra: &str) {
     let directory = root.join("h").join(identity);
     fs::create_dir_all(&directory).unwrap();
     fs::write(
         directory.join("agent.kdl"),
         format!(
-            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"h\"\n  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
+            "agent \"{identity}\" {{\n  identity \"{identity}\"\n  host \"h\"\n{extra}  type \"service\"\n  pty \"agent\" {{ command \"x\" }}\n}}\n"
         ),
     )
     .unwrap();
@@ -1421,4 +1426,103 @@ fn malformed_catalog_declarations_disable_implicit_flat_fallback() {
             String::from_utf8_lossy(&out.stderr).contains("no agent 'missing' found in catalog")
         );
     }
+}
+
+/// `$ST_AGENT` is the acting subject's *exact immutable agent ID*, never an address
+/// (`docs/vrs/03-message/spec.md` "Selection follows one total order"). An activated subject whose
+/// declared `address` differs from its identity is therefore only reachable through ID resolution:
+/// resolving those bytes as an address would find nothing, so `send` and `sent` would refuse the
+/// caller its own identity. The rendered sender still shows the address a human reads, with the ID
+/// as the authority beside it.
+#[test]
+fn the_acting_subject_comes_from_st_agent_as_an_exact_id_and_publishes_its_current_address() {
+    const SENDER_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+    const RECIPIENT_ID: &str = "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_agent_with(root, "sender", &format!("  id \"{SENDER_ID}\"\n  address \"chat\"\n"));
+    write_agent_with(root, "recipient", &format!("  id \"{RECIPIENT_ID}\"\n"));
+
+    let send = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(root)
+        .args(["--host", "h", "-m", "body"])
+        .env("ST_AGENT", SENDER_ID)
+        .output()
+        .unwrap();
+    assert!(
+        send.status.success(),
+        "{}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let filename = String::from_utf8_lossy(&send.stdout).trim().to_string();
+
+    let delivered =
+        fs::read_to_string(root.join("h/recipient/resources/inbox").join(&filename)).unwrap();
+    assert!(
+        delivered.starts_with(&format!("---\nfrom: h.chat\nfrom-id: {SENDER_ID}\n")),
+        "{delivered}"
+    );
+
+    // The same ambient ID selects the sender's own durable index, whose public row is ID-keyed and
+    // carries the recipient's display-only address snapshot.
+    let listed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "sent", "--root"])
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .env("ST_AGENT", SENDER_ID)
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(view["messages"][0]["to"], RECIPIENT_ID);
+    assert_eq!(view["messages"][0]["toAddress"], "h.recipient");
+    assert_eq!(view["messages"][0]["toKind"], "agent");
+}
+
+/// The same ambient path on an unmigrated catalog stays byte-for-byte legacy: `$ST_AGENT` holds
+/// `<host>.<identity>`, whose frozen-ID and address spellings coincide, and the published record
+/// grows no version-2 field.
+#[test]
+fn an_unmigrated_catalog_keeps_the_ambient_legacy_bus_identity_normative() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_agent(root, "sender");
+    write_agent(root, "recipient");
+
+    let send = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "send", "recipient", "--root"])
+        .arg(root)
+        .args(["--host", "h", "-m", "body"])
+        .env("ST_AGENT", "h.sender")
+        .output()
+        .unwrap();
+    assert!(
+        send.status.success(),
+        "{}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let filename = String::from_utf8_lossy(&send.stdout).trim().to_string();
+
+    let delivered =
+        fs::read_to_string(root.join("h/recipient/resources/inbox").join(&filename)).unwrap();
+    assert_eq!(delivered, "---\nfrom: h.sender\n---\nbody\n", "{delivered}");
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .args(["message", "sent", "--root"])
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .env("ST_AGENT", "h.sender")
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(view["messages"][0]["to"], "h.recipient");
+    assert!(view["messages"][0].get("toAddress").is_none());
+    assert!(view["messages"][0].get("toKind").is_none());
 }

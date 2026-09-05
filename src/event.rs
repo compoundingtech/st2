@@ -91,7 +91,12 @@ pub enum EventReceiptStatus {
 }
 
 struct ResolvedStream {
+    /// The agent key this publication is owned by and persisted under: the immutable agent ID
+    /// once the identity model is active, else today's legacy bus identity.
     recipient: String,
+    /// How to reach that subject's own directories again — an exact ID under activation, so a
+    /// UUIDv7-created subject is reachable at all, and today's address reference otherwise.
+    selector: crate::identity::AgentSelector,
 }
 
 enum StreamAdmission {
@@ -299,13 +304,26 @@ pub(crate) fn refusal_kind(error: &anyhow::Error) -> Option<RefusalKind> {
         .map(|refusal| refusal.kind)
 }
 
+/// Resolve one publication's recipient.
+///
+/// `recipient` states which namespace the caller named the subject in, and that statement is only
+/// consulted once the identity model is active: resync names its recipient by the catalog-global
+/// agent ID reconciliation gave it, while `st2 event emit` names an ordinary bus address. Under
+/// `IdentityActivation::Legacy` both spellings collapse onto today's single precedence rule and
+/// the raw bytes the caller passed, so nothing about a partially migrated catalog changes.
 fn resolve_stream(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &crate::identity::AgentSelector,
     stream: &str,
     admission: StreamAdmission,
 ) -> anyhow::Result<ResolvedStream> {
+    use crate::identity::AgentSelector;
+
+    let reference = match recipient {
+        AgentSelector::Id(id) => id.as_str(),
+        AgentSelector::Address(address) => address.as_str(),
+    };
     let discovered = crate::discover_strict(root);
     anyhow::ensure!(
         discovered.errors.is_empty(),
@@ -317,24 +335,39 @@ fn resolve_stream(
             .collect::<Vec<_>>()
             .join("; ")
     );
+    // Decided once per publication from the discovery this function already performed. A
+    // partially migrated catalog has no coherent ID namespace, so it keeps today's recipient
+    // precedence, today's `canonical_recipient` bytes, and every current refusal normative.
+    let activated = stream_identity_activated(root, &discovered.specs);
     let mut matches = discovered
         .specs
         .into_iter()
-        .filter(|spec| {
-            spec.bus_id(this_host) == recipient
-                || (spec.resolved_host(this_host) == this_host && spec.identity == recipient)
+        .filter(|spec| match recipient {
+            // An exact ID and nothing else: an address must never answer for an ID (`R24`).
+            AgentSelector::Id(id) if activated => spec.effective_id(this_host) == *id,
+            // Ordinary address resolution: the host-qualified spelling, or the bare address when
+            // this host owns the subject.
+            AgentSelector::Address(address) if activated => {
+                spec.bus_address(this_host) == *address
+                    || (spec.resolved_host(this_host) == this_host
+                        && spec.effective_address() == *address)
+            }
+            _ => {
+                spec.bus_id(this_host) == reference
+                    || (spec.resolved_host(this_host) == this_host && spec.identity == reference)
+            }
         })
         .collect::<Vec<_>>();
     anyhow::ensure!(
         !matches.is_empty(),
-        "no agent '{recipient}' found in catalog {}",
+        "no agent '{reference}' found in catalog {}",
         root.display()
     );
     if matches.len() > 1 {
         return Err(StreamRefusal::new(
             RefusalKind::Permanent,
             format!(
-                "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
+                "agent recipient '{reference}' is ambiguous; matched {} declarations: {}",
                 matches.len(),
                 matches
                     .iter()
@@ -347,12 +380,17 @@ fn resolve_stream(
     let spec = matches
         .pop()
         .context("exactly one matching agent expected")?;
+    // Under Legacy this is exactly `bus_id`, so every diagnostic below keeps its current bytes.
+    let key = if activated {
+        spec.effective_id(this_host)
+    } else {
+        spec.bus_id(this_host)
+    };
     if spec.resolved_host(this_host) != this_host {
         return Err(StreamRefusal::new(
             RefusalKind::Permanent,
             format!(
-                "agent '{}' is owned by host '{}'; event publication must run on that host",
-                spec.bus_id(this_host),
+                "agent '{key}' is owned by host '{}'; event publication must run on that host",
                 spec.resolved_host(this_host)
             ),
         ));
@@ -362,10 +400,7 @@ fn resolve_stream(
             if !spec.streams.iter().any(|declared| declared.name == stream) {
                 return Err(StreamRefusal::new(
                     RefusalKind::Permanent,
-                    format!(
-                        "agent '{}' does not declare stream '{stream}'",
-                        spec.bus_id(this_host)
-                    ),
+                    format!("agent '{key}' does not declare stream '{stream}'"),
                 ));
             }
         }
@@ -378,15 +413,40 @@ fn resolve_stream(
         return Err(StreamRefusal::new(
             RefusalKind::RecipientNotRunning,
             format!(
-                "agent '{}' is {}; refusing event while its eyes are closed",
-                spec.bus_id(this_host),
+                "agent '{key}' is {}; refusing event while its eyes are closed",
                 spec.desired_state.as_str()
             ),
         ));
     }
+    let selector = if activated {
+        crate::identity::AgentSelector::Id(key.clone())
+    } else {
+        crate::identity::AgentSelector::Address(key.clone())
+    };
     Ok(ResolvedStream {
-        recipient: spec.bus_id(this_host),
+        recipient: key,
+        selector,
     })
+}
+
+/// The identity gate for one publication, reusing the caller's already-discovered live catalog.
+///
+/// An unreadable or unexplained structural archive is not a migrated catalog: an unmigrated
+/// archived subject could still re-enter this catalog, so activation stays off rather than
+/// guessing. Everything here is fail-safe toward today's normative behavior.
+fn stream_identity_activated(root: &Path, specs: &[crate::AgentSpec]) -> bool {
+    let Ok(observation) = crate::catalog_archive::observe(root) else {
+        return false;
+    };
+    if !observation.issues.is_empty() {
+        return false;
+    }
+    crate::identity::activation_from(
+        specs,
+        &observation.archived,
+        crate::catalog_migrate_ids::marker_path(root).exists(),
+    )
+    .is_activated()
 }
 
 pub fn render_event(
@@ -415,6 +475,7 @@ pub fn render_event(
     rendered
 }
 
+/// Publish an event to a recipient named by an ordinary bus address — the CLI surface.
 #[allow(clippy::too_many_arguments)]
 pub fn emit(
     root: &Path,
@@ -430,7 +491,7 @@ pub fn emit(
     emit_admitted(
         root,
         this_host,
-        recipient,
+        &crate::identity::AgentSelector::Address(recipient.to_owned()),
         stream,
         event_id,
         key,
@@ -441,6 +502,9 @@ pub fn emit(
     )
 }
 
+/// Publish a built-in resync event to a recipient named by its agent key: reconciliation hands
+/// resync the catalog-global immutable agent ID once the identity model is active, and today's
+/// legacy bus identity while it is not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_builtin_resync(
     root: &Path,
@@ -455,7 +519,7 @@ pub(crate) fn emit_builtin_resync(
     emit_admitted(
         root,
         this_host,
-        recipient,
+        &crate::identity::AgentSelector::Id(recipient.to_owned()),
         crate::resync::RESYNC_STREAM,
         event_id,
         key,
@@ -470,7 +534,7 @@ pub(crate) fn emit_builtin_resync(
 fn emit_admitted(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &crate::identity::AgentSelector,
     stream: &str,
     event_id: &str,
     key: Option<&str>,
@@ -491,13 +555,15 @@ fn emit_admitted(
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
     let catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
     validate_owner_binding(root, this_host, &catalog_lock)?;
-    let resolved = resolve_stream(root, this_host, recipient, stream, admission)?;
-    let canonical_recipient = resolved.recipient;
+    let ResolvedStream {
+        recipient: canonical_recipient,
+        selector,
+    } = resolve_stream(root, this_host, recipient, stream, admission)?;
     let from = format!("{canonical_recipient}/{stream}");
     let rendered = render_event(&from, subject, stream, event_id, key, body);
-    message::with_resolved_state_dir(
+    message::with_selected_state_dir(
         root,
-        &canonical_recipient,
+        &selector,
         this_host,
         &["resources", "streams", stream],
         true,
@@ -507,11 +573,19 @@ fn emit_admitted(
             let mut record = read_record(&record_path)?
                 .unwrap_or_else(|| StreamRecord::fresh(stream, &canonical_recipient));
             anyhow::ensure!(
-                record.version == EVENT_VERSION
-                    && record.stream == stream
-                    && record.recipient == canonical_recipient,
-                "stream state for '{}#{stream}' is not readable at version {EVENT_VERSION}",
-                canonical_recipient
+                record.version == EVENT_VERSION && record.stream == stream,
+                "stream state for '{canonical_recipient}#{stream}' is not readable at version {EVENT_VERSION}"
+            );
+            // The persisted key is durable state written under whichever identity model was active
+            // at the time. Activation cannot move it for a subject that existed before: migration
+            // freezes a live subject's ID to its former bus identity, so these bytes are equal by
+            // construction. A mismatch therefore means the record belongs to a different subject
+            // than the one just resolved, and says so instead of blaming the record version.
+            anyhow::ensure!(
+                record.recipient == canonical_recipient,
+                "stream state at {} is owned by '{}', not by the resolved recipient '{canonical_recipient}'",
+                record_path.display(),
+                record.recipient
             );
 
             if record
@@ -523,9 +597,9 @@ fn emit_admitted(
                     .pending
                     .take()
                     .expect("different pending event was just observed");
-                let materialized = message::with_resolved_message_boxes(
+                let materialized = message::with_selected_message_boxes(
                     root,
-                    &canonical_recipient,
+                    &selector,
                     this_host,
                     |inbox, archive| {
                         let inbox_bytes = read_message_entry(inbox, &pending.filename)?;
@@ -606,9 +680,9 @@ fn emit_admitted(
                 ),
                 None => {
                     let predecessor = if supersede {
-                        message::with_resolved_message_boxes(
+                        message::with_selected_message_boxes(
                             root,
-                            &canonical_recipient,
+                            &selector,
                             this_host,
                             |inbox, archive| {
                                 for entry in record.recent.iter().filter(|entry| {
@@ -642,9 +716,9 @@ fn emit_admitted(
                 test_event_checkpoint(event_id, "pending")?;
             }
 
-            let created = message::with_resolved_message_boxes(
+            let created = message::with_selected_message_boxes(
                 root,
-                &canonical_recipient,
+                &selector,
                 this_host,
                 |inbox, archive| {
                     // Publish before compacting. If predecessor archival fails or the process
@@ -1189,5 +1263,163 @@ impl Drop for StreamLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// A subject created after activation: its ID is a UUIDv7 that is in no address namespace.
+    const WORKER_ID: &str = "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1";
+
+    fn declare_worker(root: &Path, extra: &str) -> PathBuf {
+        let directory = root.join("agents/hetz/worker");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("agent.kdl"),
+            format!(
+                "agent \"worker\" {{\n  host \"hetz\"\n{extra}  desired-state \"running\"\n  command \"agent\"\n}}\n"
+            ),
+        )
+        .unwrap();
+        publish_owner_binding_for_test(root, "hetz").unwrap();
+        directory
+    }
+
+    fn stream_state(agent: &Path, stream: &str) -> StreamRecord {
+        let path = agent
+            .join("resources/streams")
+            .join(stream)
+            .join("state.json");
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Under activation the recipient is named by its immutable agent ID. A UUIDv7-created subject
+    /// has no address spelling of that ID at all, so ID resolution is the only thing that can reach
+    /// it: resolving the same bytes as an address would refuse the publication as unknown, and its
+    /// former bus identity is no longer a recipient name.
+    #[test]
+    fn an_activated_recipient_is_reached_and_persisted_by_its_immutable_id() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = declare_worker(root.path(), &format!("  id \"{WORKER_ID}\"\n"));
+
+        let receipt = emit_builtin_resync(
+            root.path(),
+            "hetz",
+            WORKER_ID,
+            "resync-1",
+            None,
+            None,
+            "{}",
+            false,
+        )
+        .expect("an activated catalog resolves its recipient by exact id");
+        assert_eq!(receipt.recipient, WORKER_ID);
+        assert_eq!(receipt.status, EventReceiptStatus::Created);
+
+        // Ownership is keyed on the ID in the durable record and in the rendered sender.
+        assert_eq!(stream_state(&agent, crate::resync::RESYNC_STREAM).recipient, WORKER_ID);
+        let inbox = crate::message::list_inbox(&crate::message::inbox_dir(&agent)).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(
+            inbox[0].from.as_deref(),
+            Some(format!("{WORKER_ID}/{}", crate::resync::RESYNC_STREAM).as_str())
+        );
+
+        // The legacy bus identity is not a second route to an activated subject.
+        let refused = emit_builtin_resync(
+            root.path(),
+            "hetz",
+            "hetz.worker",
+            "resync-2",
+            None,
+            None,
+            "{}",
+            false,
+        )
+        .expect_err("an address must not answer for an id");
+        assert!(
+            format!("{refused:#}").contains("no agent 'hetz.worker' found"),
+            "{refused:#}"
+        );
+    }
+
+    /// `st2 event emit` names its recipient by ordinary bus address, and activation does not turn
+    /// that surface into an ID lookup: the subject's *current* address routes, its released
+    /// identity spelling does not, and ownership is still keyed on the immutable ID.
+    #[test]
+    fn an_activated_recipient_is_still_reachable_at_its_current_address() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = declare_worker(
+            root.path(),
+            &format!("  id \"{WORKER_ID}\"\n  address \"chat\"\n  stream \"gh-ci\" {{}}\n"),
+        );
+
+        for reference in ["hetz.chat", "chat"] {
+            let receipt = emit(
+                root.path(),
+                "hetz",
+                reference,
+                "gh-ci",
+                &format!("run-{reference}"),
+                None,
+                None,
+                "{}",
+                false,
+            )
+            .expect("the current address routes");
+            assert_eq!(receipt.recipient, WORKER_ID);
+        }
+        assert_eq!(stream_state(&agent, "gh-ci").recipient, WORKER_ID);
+
+        let refused = emit(
+            root.path(),
+            "hetz",
+            "hetz.worker",
+            "gh-ci",
+            "run-legacy",
+            None,
+            None,
+            "{}",
+            false,
+        )
+        .expect_err("the identity spelling is not an address once one is declared");
+        assert!(
+            format!("{refused:#}").contains("no agent 'hetz.worker' found"),
+            "{refused:#}"
+        );
+    }
+
+    /// One unmigrated subject keeps the whole catalog on today's precedence: the legacy bus
+    /// identity and the bare local identity both resolve, and the persisted key is unchanged.
+    #[test]
+    fn an_unmigrated_catalog_keeps_the_legacy_recipient_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = declare_worker(root.path(), "");
+
+        for (index, recipient) in ["hetz.worker", "worker"].into_iter().enumerate() {
+            let receipt = emit_builtin_resync(
+                root.path(),
+                "hetz",
+                recipient,
+                &format!("resync-{index}"),
+                None,
+                None,
+                "{}",
+                false,
+            )
+            .expect("legacy resolution accepts both spellings");
+            assert_eq!(receipt.recipient, "hetz.worker");
+        }
+        assert_eq!(stream_state(&agent, crate::resync::RESYNC_STREAM).recipient, "hetz.worker");
+        let inbox = crate::message::list_inbox(&crate::message::inbox_dir(&agent)).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(
+            inbox[0].from.as_deref(),
+            Some(format!("hetz.worker/{}", crate::resync::RESYNC_STREAM).as_str())
+        );
     }
 }

@@ -100,15 +100,93 @@ fn normalize_field(value: Option<&str>, fallback: &str, max_chars: usize) -> Str
 struct RelationshipResolver {
     specs: Vec<crate::AgentSpec>,
     valid: bool,
+    /// The migration's durable collision metadata, so a version-1 sender endpoint is attributed
+    /// rather than universally retyped (`MESSAGE-R04`).
+    migration: Option<crate::catalog_migrate_ids::MigrationRecord>,
 }
 
 impl RelationshipResolver {
     fn read(catalog_root: &Path) -> Self {
         let discovered = crate::discover_strict(catalog_root);
+        // An unreadable or foreign-schema migration record proves nothing about which subject kept
+        // which legacy bytes, so it invalidates the resolver rather than reading as "nothing
+        // collided" — that reading is exactly what would address a live replacement.
+        let migration = crate::catalog_migrate_ids::read_migration_record(catalog_root);
         Self {
             specs: discovered.specs,
-            valid: discovered.errors.is_empty(),
+            valid: discovered.errors.is_empty() && migration.is_ok(),
+            migration: migration.ok().flatten(),
         }
+    }
+
+    fn by_id(&self, this_host: &str, id: &str) -> Option<&crate::AgentSpec> {
+        self.specs
+            .iter()
+            .find(|spec| spec.effective_id(this_host) == id)
+    }
+}
+
+/// The sender of one message as a reader must see it: the current bus address for humans, the
+/// immutable agent ID as the only authority (`docs/vrs/03-message/spec.md`).
+struct ProjectedSender<'a> {
+    /// What the DING line shows. `None` when the message claims no sender at all.
+    display: Option<String>,
+    /// The declaration this sender provably is. `None` when the endpoint carries no authority: an
+    /// unattributable historical address, or a subject that no longer exists.
+    spec: Option<&'a crate::AgentSpec>,
+}
+
+fn project_sender<'a>(
+    resolver: &'a RelationshipResolver,
+    this_host: &str,
+    recipient: &str,
+    msg: &Message,
+) -> ProjectedSender<'a> {
+    let recorded = msg.from.as_deref();
+    // A version-2 rendered message states its sender's immutable ID, and `from` is only the
+    // publication-time address snapshot: the current address wins for display, and the snapshot is
+    // the cosmetic fallback for a subject that no longer has a resolvable address.
+    if let Some(id) = msg.from_id.as_deref() {
+        let spec = resolver.by_id(this_host, id);
+        let display = spec
+            .map(|spec| spec.bus_address(this_host))
+            .or_else(|| recorded.map(str::to_owned))
+            .unwrap_or_else(|| id.to_owned());
+        return ProjectedSender {
+            display: Some(display),
+            spec,
+        };
+    }
+    let Some(recorded) = recorded else {
+        return ProjectedSender {
+            display: None,
+            spec: None,
+        };
+    };
+    // A version-1 message carries legacy bytes. This is an inbox row, so its state owner is the
+    // recipient reading it.
+    match message::attribute_endpoint(resolver.migration.as_ref(), recorded, Some(recipient)) {
+        // Untouched bytes are both the subject's frozen ID and its address.
+        message::LegacyAttribution::Frozen { .. } => ProjectedSender {
+            display: Some(recorded.to_owned()),
+            spec: resolve_spec(&resolver.specs, recorded, this_host),
+        },
+        message::LegacyAttribution::Owned { id } => {
+            let spec = resolver.by_id(this_host, &id);
+            ProjectedSender {
+                display: Some(
+                    spec.map(|spec| spec.bus_address(this_host))
+                        .unwrap_or_else(|| recorded.to_owned()),
+                ),
+                spec,
+            }
+        }
+        // Two subjects claimed these bytes and this endpoint is not the row's state owner: show the
+        // historical address, and grant it no authority at all.
+        message::LegacyAttribution::Historical { address } => ProjectedSender {
+            display: Some(address),
+            spec: None,
+        },
     }
 }
 
@@ -116,13 +194,12 @@ fn relationship_marker(
     resolver: &RelationshipResolver,
     this_host: &str,
     recipient: &str,
-    claimed_sender: Option<&str>,
+    sender: Option<&crate::AgentSpec>,
 ) -> String {
     if !resolver.valid {
         return "?".to_string();
     }
-    let Some(sender) = claimed_sender.and_then(|id| resolve_spec(&resolver.specs, id, this_host))
-    else {
+    let Some(sender) = sender else {
         return "?".to_string();
     };
     let Some(recipient) = resolve_spec(&resolver.specs, recipient, this_host) else {
@@ -180,11 +257,12 @@ fn poke_text_with_resolver(
     msg: &Message,
 ) -> String {
     let subject = normalize_field(msg.subject.as_deref(), "(no subject)", SUBJECT_MAX_CHARS);
-    let from = normalize_field(msg.from.as_deref(), "unknown", SENDER_MAX_CHARS);
+    let projected = project_sender(resolver, this_host, recipient, msg);
+    let from = normalize_field(projected.display.as_deref(), "unknown", SENDER_MAX_CHARS);
     let marker = if msg.stream.is_some() && msg.event_id.is_some() {
         SOURCE_MARKER.to_string()
     } else {
-        relationship_marker(resolver, this_host, recipient, msg.from.as_deref())
+        relationship_marker(resolver, this_host, recipient, projected.spec)
     };
     format!(
         "[DING] {marker} {from}: {subject} [id:{}]",
@@ -1290,6 +1368,7 @@ mod tests {
                 .and_then(|(timestamp, _)| timestamp.parse().ok())
                 .unwrap_or_default(),
             from: Some(from.to_string()),
+            from_id: None,
             subject: subject.map(str::to_string),
             in_reply_to: None,
             tags: vec![],
@@ -1530,6 +1609,86 @@ mod tests {
                 &msg("1785070000000-abc123.md", "h.root", Some("dangling"))
             ),
             "[DING] ? h.root: dangling [id:abc123]"
+        );
+    }
+
+    /// A version-2 message states its sender's immutable ID, so the line a human reads carries the
+    /// sender's *current* bus address even after a cutover, while the recorded `from` snapshot is
+    /// only the cosmetic fallback for a subject that no longer resolves.
+    #[test]
+    fn ding_projects_the_current_sender_address_with_the_id_as_authority() {
+        let catalog = tempfile::tempdir().unwrap();
+        let directory = catalog.path().join("h").join("root");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("agent.kdl"),
+            "agent \"root\" {\n  identity \"root\"\n  host \"h\"\n  id \"0199b8f4-8d3a-7c21-9a44-6f85b7320ea1\"\n  address \"chat-v2\"\n  type \"service\"\n  pty \"agent\" { command \"x\" }\n}\n",
+        )
+        .unwrap();
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+
+        let published = Message {
+            from: Some("h.chat".to_string()),
+            from_id: Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".to_string()),
+            ..msg("1785070000000-abc123.md", "h.chat", Some("cutover"))
+        };
+        assert_eq!(
+            poke_text(catalog.path(), "h", "h.recipient", &published),
+            "[DING] ↓ h.chat-v2: cutover [id:abc123]",
+            "the current address is shown, and the ID still proves the supervision relationship"
+        );
+
+        // Cosmetic fallback: the ID names no live subject, so the publication-time snapshot is
+        // shown as written and the endpoint carries no relationship authority.
+        let gone = Message {
+            from_id: Some("0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3".to_string()),
+            ..published
+        };
+        assert_eq!(
+            poke_text(catalog.path(), "h", "h.recipient", &gone),
+            "[DING] ? h.chat: cutover [id:abc123]"
+        );
+    }
+
+    /// A version-1 sender endpoint that catalog ID migration reassigned denotes two subjects, and
+    /// an inbox row's state owner is its recipient — never its sender. The bytes are therefore
+    /// rendered as a historical address with no authority, rather than as the live subject that
+    /// kept them (`MESSAGE-R04`).
+    #[test]
+    fn ding_refuses_authority_for_an_unattributable_legacy_sender() {
+        let catalog = tempfile::tempdir().unwrap();
+        declare_agent(catalog.path(), "h", "root", None);
+        declare_agent(catalog.path(), "h", "recipient", Some("root"));
+        let control = catalog.path().join(".st2");
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::write(
+            control.join("agent-id-migration.json"),
+            serde_json::to_vec(&crate::catalog_migrate_ids::MigrationRecord {
+                schema: crate::catalog_migrate_ids::MIGRATION_RECORD_SCHEMA.to_owned(),
+                migrated_at_ms: 1,
+                reassigned: vec![crate::catalog_migrate_ids::Reassignment {
+                    legacy_bus_identity: "h.root".to_owned(),
+                    kept_by_agent_id: "h.root".to_owned(),
+                    kept_by_plane: crate::catalog_migrate_ids::Plane::Live,
+                    reassigned_agent_id: "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3".to_owned(),
+                    reassigned_host: "h".to_owned(),
+                    reassigned_identity: "root".to_owned(),
+                    reassigned_plane: crate::catalog_migrate_ids::Plane::Archived,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            poke_text(
+                catalog.path(),
+                "h",
+                "h.recipient",
+                &msg("1785070000000-abc123.md", "h.root", Some("colliding"))
+            ),
+            "[DING] ? h.root: colliding [id:abc123]",
+            "a reassigned legacy sender must not project the keeping subject's supervision marker"
         );
     }
 
