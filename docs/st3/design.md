@@ -178,6 +178,8 @@ Providers can use webhooks, streams, or conditional requests with one-shot deadl
 
 [resource-subscriptions.md](./resource-subscriptions.md) defines the provider contract, graph shape, lifecycle, and acceptance proof.
 
+[account-usage-reactions.md](./account-usage-reactions.md) proposes the missing account contract and condition-to-subgraph action path. It does not define implemented behavior.
+
 ## System boundary
 
 st3 has these components:
