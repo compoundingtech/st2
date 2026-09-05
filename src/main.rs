@@ -2262,10 +2262,16 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                         ),
                         st2::driver_diagnostic::repair_text(&diagnostic),
                     ),
-                    st2::driver_diagnostic::Observed::Absent => report_advisory(
-                        &format!("{bus_id} native driver diagnostic absent"),
-                        st2::driver_diagnostic::repair_text(&diagnostic),
-                    ),
+                    // Absence is only a fault where the driver publishes a boundary result on
+                    // every launch; for Claude and Codex it is the healthy steady state.
+                    st2::driver_diagnostic::Observed::Absent => {
+                        if st2::driver_diagnostic::absence_is_a_fault(spec) {
+                            report_advisory(
+                                &format!("{bus_id} native driver diagnostic absent"),
+                                st2::driver_diagnostic::repair_text(&diagnostic),
+                            );
+                        }
+                    }
                 }
             }
         }

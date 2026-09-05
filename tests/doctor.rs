@@ -727,6 +727,83 @@ fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
     );
 }
 
+/// A Claude seat publishes this record only when its own typed turn result names a rejected
+/// credential, so its two Doctor lines are the failure advisory and NOTHING at all: absence is the
+/// healthy steady state for every Claude and Codex seat in a fleet, and warning under each of them
+/// would bury the one seat that actually needs a human.
+#[test]
+fn a_rejected_claude_credential_advises_while_absence_stays_silent() {
+    use st2::driver_diagnostic::{Driver, Publisher, Reason, Source, Stage, Support};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; claude { prompt "go" } }"#,
+    )
+    .unwrap();
+    let agent_dir = declaration.parent().unwrap();
+    fs::write(agent_dir.join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let healthy = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&healthy.stdout);
+    assert!(healthy.status.success(), "{stdout}");
+    assert!(
+        !stdout.contains("native driver diagnostic"),
+        "a Claude seat that never had a credential refused says nothing: {stdout}"
+    );
+
+    let mut publisher = Publisher::new(agent_dir, Driver::Claude, None, Support::Unknown);
+    publisher.publish(
+        Stage::ProviderAuth,
+        Reason::ProviderAuthRejected,
+        Source::TurnResult,
+    );
+
+    let roster = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&catalog)
+        .args(["--host", "h", "--identity", "h.worker", "--json"])
+        .output()
+        .unwrap();
+    assert!(roster.status.success());
+    let wire: serde_json::Value = serde_json::from_slice(&roster.stdout).unwrap();
+    assert_eq!(wire[0]["driverDiagnostic"]["status"], "failure");
+    assert_eq!(wire[0]["driverDiagnostic"]["driver"], "claude");
+    assert_eq!(wire[0]["driverDiagnostic"]["stage"], "providerAuth");
+    assert_eq!(
+        wire[0]["driverDiagnostic"]["reason"],
+        "providerAuthRejected"
+    );
+    assert_eq!(wire[0]["driverDiagnostic"]["source"], "turnResult");
+
+    let rejected = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&rejected.stdout);
+    assert!(rejected.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic: providerAuth/providerAuthRejected"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("re-login with the account's own client"),
+        "{stdout}"
+    );
+
+    publisher.clear(Stage::ProviderAuth);
+    let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&recovered.stdout);
+    assert!(recovered.status.success(), "{stdout}");
+    assert!(!stdout.contains("native driver diagnostic"), "{stdout}");
+}
+
 /// HC-R17: Doctor's harness-context lines are advisory in both directions — a reading at or above
 /// st2's attention threshold and a stale record beside a `running` desired state each print a
 /// warning and leave the exit status alone, while a fresh reading below the threshold prints

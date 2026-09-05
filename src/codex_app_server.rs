@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tungstenite::{Message as WebSocketMessage, WebSocket};
 
-use crate::{ding, harness_context, harness_state, message, run, status};
+use crate::{ding, driver_diagnostic, harness_context, harness_state, message, run, status};
 
 const REQUIRED_CODEX_CLIENT_REQUESTS: &[&str] = &[
     "hooks/list",
@@ -251,6 +251,48 @@ pub enum CodexHoldReason {
 #[serde(rename_all = "camelCase")]
 pub enum CodexTerminalError {
     SystemError,
+    ProviderAuthRejected,
+}
+
+/// The `CodexErrorInfo` word that names a rejected provider credential.
+///
+/// It is the 401/invalid-credential arm of Codex's own closed error vocabulary and is distinct
+/// from both quota words (`usageLimitExceeded`, `rateLimitExceeded`) — the protocol gate pins all
+/// three present so a release that merged them refuses the launch instead of silently making st2
+/// call an exhausted allowance a rejected credential.
+const CODEX_PROVIDER_AUTH_REJECTED: &str = "unauthorized";
+
+/// What one `turn/completed` notification proves about this thread's provider credential.
+///
+/// `Turn.status` is required and `Turn.error` is populated only on `failed`, so both edges come
+/// from the notification st2 already consumes — no second signal, and no inference from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTurnOutcome {
+    /// `completed` — the provider accepted the credential for this turn.
+    Accepted,
+    /// `failed` with `error.codexErrorInfo: unauthorized`.
+    ProviderAuthRejected,
+    /// `interrupted`, `inProgress`, or a failure this version does not classify: no evidence
+    /// either way, so a standing rejection must stand.
+    Indeterminate,
+}
+
+fn codex_turn_outcome(turn: Option<&Value>) -> CodexTurnOutcome {
+    let Some(turn) = turn else {
+        return CodexTurnOutcome::Indeterminate;
+    };
+    match turn.get("status").and_then(Value::as_str) {
+        Some("completed") => CodexTurnOutcome::Accepted,
+        Some("failed")
+            if turn
+                .pointer("/error/codexErrorInfo")
+                .and_then(Value::as_str)
+                == Some(CODEX_PROVIDER_AUTH_REJECTED) =>
+        {
+            CodexTurnOutcome::ProviderAuthRejected
+        }
+        _ => CodexTurnOutcome::Indeterminate,
+    }
 }
 
 impl CodexObservedState {
@@ -268,9 +310,15 @@ impl CodexObservedState {
         match self {
             CodexObservedState::AwaitingStatus => None,
             CodexObservedState::Idle => Some(observation(Activity::Idle, BlockedOn::None)),
-            CodexObservedState::TerminalError { .. } => {
-                Some(observation(Activity::Ended, BlockedOn::None).with_reason("systemError"))
-            }
+            // Both terminals project to `ended`, exactly as before; the reason is what names the
+            // cause. `providerAuth` is the same word OpenCode's `ProviderAuthError` already
+            // publishes, so one roster consumer classifies the credential class across harnesses.
+            CodexObservedState::TerminalError { reason } => Some(
+                observation(Activity::Ended, BlockedOn::None).with_reason(match reason {
+                    CodexTerminalError::SystemError => "systemError",
+                    CodexTerminalError::ProviderAuthRejected => "providerAuth",
+                }),
+            ),
             CodexObservedState::Active { .. } => {
                 Some(observation(Activity::Active, BlockedOn::None))
             }
@@ -334,6 +382,9 @@ struct CodexDeliveryConfig {
     identity: String,
     this_host: String,
     supervisor: Option<String>,
+    /// The codex-cli version the protocol gate admitted, carried for the native-driver
+    /// diagnostic's `producerVersion`. `None` only in tests that build a config without a gate.
+    producer_version: Option<String>,
 }
 
 impl CodexDeliveryConfig {
@@ -358,6 +409,7 @@ impl CodexDeliveryConfig {
             identity: identity.to_string(),
             this_host,
             supervisor,
+            producer_version: None,
         })
     }
 
@@ -770,6 +822,10 @@ struct CodexInboxDelivery {
     /// The numeric axis's producer, beside the categorical one. `None` only where the record has
     /// nowhere safe to stage — observability never blocks a launch.
     context: Option<CodexContextProducer>,
+    /// The native-driver boundary record. Codex publishes exactly one stage on it — the provider
+    /// credential — because every earlier boundary is already fail-closed at admission: an
+    /// incompatible protocol refuses the launch instead of degrading into an observation.
+    diagnostics: driver_diagnostic::Publisher,
 }
 
 impl CodexInboxDelivery {
@@ -841,6 +897,14 @@ impl CodexInboxDelivery {
                 None
             }
         };
+        // The record belongs to this incarnation: the protocol gate already admitted the version
+        // it names, so `support` is a measured fact rather than a probe result.
+        let diagnostics = driver_diagnostic::Publisher::new(
+            &config.agent_dir,
+            driver_diagnostic::Driver::Codex,
+            config.producer_version.clone(),
+            driver_diagnostic::Support::Supported,
+        );
         Ok(Self {
             config,
             state_path,
@@ -859,6 +923,7 @@ impl CodexInboxDelivery {
             harness_evidence: false,
             pending_observation: None,
             context,
+            diagnostics,
         })
     }
 
@@ -891,6 +956,33 @@ impl CodexInboxDelivery {
             && let Err(error) = context.observe(message, thread_id)
         {
             tracing::warn!("st2 codex: harness-context write failed: {error:#}");
+        }
+    }
+
+    /// Record what one inbound frame proves about this thread's provider credential.
+    ///
+    /// Frame-level like [`Self::observe_context`] and for the same reason: the credential is its
+    /// own axis, and the earliest-boundary projection inside the publisher — not this call site —
+    /// decides what a reader sees. Both edges come from `turn/completed`: a turn that reached
+    /// `completed` is positive proof the account was accepted, and a `failed` turn whose typed
+    /// error names `unauthorized` is the rejection. Anything else leaves a standing rejection
+    /// alone; only positive evidence clears it.
+    fn observe_provider_auth(&mut self, message: &Value, thread_id: &str) {
+        if message.get("method").and_then(Value::as_str) != Some("turn/completed")
+            || message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id)
+        {
+            return;
+        }
+        match codex_turn_outcome(message.pointer("/params/turn")) {
+            CodexTurnOutcome::ProviderAuthRejected => self.diagnostics.publish(
+                driver_diagnostic::Stage::ProviderAuth,
+                driver_diagnostic::Reason::ProviderAuthRejected,
+                driver_diagnostic::Source::TurnResult,
+            ),
+            CodexTurnOutcome::Accepted => self
+                .diagnostics
+                .clear(driver_diagnostic::Stage::ProviderAuth),
+            CodexTurnOutcome::Indeterminate => {}
         }
     }
 
@@ -1326,7 +1418,8 @@ impl CodexControlState {
                     return Ok(false);
                 }
                 let turn_id = required_string(message, "/params/turn/id", method)?;
-                self.observe_turn_completed(turn_id);
+                let outcome = codex_turn_outcome(message.pointer("/params/turn"));
+                self.observe_turn_completed(turn_id, outcome);
             }
             "item/started" | "item/completed" => {
                 let thread_id = required_string(message, "/params/threadId", method)?;
@@ -1464,7 +1557,18 @@ impl CodexControlState {
         };
     }
 
-    fn observe_turn_completed(&mut self, turn_id: &str) {
+    fn observe_turn_completed(&mut self, turn_id: &str, outcome: CodexTurnOutcome) {
+        // A failed turn whose typed error names a rejected credential is a SEAT-level fact: the
+        // account was refused, which does not depend on which turn st2 believed live. It is
+        // therefore settled before the turn-identity match below, and it outranks a plain
+        // `systemError` terminal because it names the same failure's cause. Delivery semantics are
+        // untouched: every `TerminalError` already permits `turn/start`.
+        if outcome == CodexTurnOutcome::ProviderAuthRejected {
+            self.observed = CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderAuthRejected,
+            };
+            return;
+        }
         self.observed = match &self.observed {
             CodexObservedState::Idle => CodexObservedState::Idle,
             CodexObservedState::TerminalError { .. } => self.observed.clone(),
@@ -1628,10 +1732,15 @@ pub fn run_controlled(
         !codex_argv.is_empty(),
         "Codex controlled launch argv is empty"
     );
-    let delivery = CodexDeliveryConfig::resolve(catalog_root, &identity)?;
-    if let Err(error) = ensure_supported_protocol(&codex_argv[0]) {
-        delivery.report_protocol_rejection(&codex_argv[0], &error);
-        return Err(error);
+    let mut delivery = CodexDeliveryConfig::resolve(catalog_root, &identity)?;
+    match ensure_supported_protocol(&codex_argv[0]) {
+        // The admitted version is the one fact the gate learns that outlives it: the diagnostic
+        // record names the producer it was measured against, exactly as the OpenCode driver does.
+        Ok(version) => delivery.producer_version = Some(version),
+        Err(error) => {
+            delivery.report_protocol_rejection(&codex_argv[0], &error);
+            return Err(error);
+        }
     }
 
     let state_dir = state_dir(catalog_root, &identity);
@@ -2856,6 +2965,9 @@ fn pump_control(
             // binding handshake to hold observability frames it has no state to attribute yet.
             if let Some(delivery) = delivery.as_mut() {
                 delivery.observe_context(&message, state.thread_id());
+                // The credential axis, taken here for the same reason: it reads a typed turn
+                // result no branch below looks at, and every one of them may `continue`.
+                delivery.observe_provider_auth(&message, state.thread_id());
             }
             let delivery_response = match delivery.as_mut() {
                 Some(delivery) => {
@@ -3064,7 +3176,8 @@ struct CodexProtocolSchemas {
     server_notifications: Value,
 }
 
-fn ensure_supported_protocol(codex: &str) -> Result<()> {
+/// Admit the installed Codex app-server protocol, returning the version that passed.
+fn ensure_supported_protocol(codex: &str) -> Result<String> {
     let version = codex_version(codex)?;
     let generated = tempfile::Builder::new()
         .prefix("st2-codex-protocol-")
@@ -3100,7 +3213,8 @@ fn ensure_supported_protocol(codex: &str) -> Result<()> {
         server_notifications: read_schema("ServerNotification.json")?,
     };
     verify_codex_protocol_schemas(&schemas)
-        .with_context(|| format!("Codex app-server schema from {version} is incompatible"))
+        .with_context(|| format!("Codex app-server schema from {version} is incompatible"))?;
+    Ok(version)
 }
 
 fn codex_version(codex: &str) -> Result<String> {
@@ -3312,6 +3426,61 @@ fn verify_codex_protocol_schemas(schemas: &CodexProtocolSchemas) -> Result<()> {
         item == schema_definition(definitions, "ThreadItem")?,
         "Turn.items does not contain ThreadItem"
     );
+    // The typed turn result the provider-credential classifier reads. A release that renames the
+    // status word, drops the failure's typed error, or merges the credential arm into a quota arm
+    // must refuse the launch rather than let st2 silently stop classifying rejections — or, worse,
+    // report an exhausted allowance as a rejected credential.
+    let turn_status = required_schema_path(definitions, "Turn", &["status"])?;
+    anyhow::ensure!(
+        turn_status == schema_definition(definitions, "TurnStatus")?,
+        "Turn.status does not use TurnStatus"
+    );
+    let turn_statuses = schema_enum(definitions, "TurnStatus")?;
+    for status in ["completed", "failed"] {
+        anyhow::ensure!(
+            turn_statuses.contains(status),
+            "TurnStatus has no '{status}' variant"
+        );
+    }
+    let turn_error = nullable_schema(
+        definitions,
+        property(
+            definitions,
+            schema_definition(definitions, "Turn")?,
+            "error",
+            "Turn",
+        )?,
+        "Turn.error",
+    )?;
+    anyhow::ensure!(
+        turn_error == schema_definition(definitions, "TurnError")?,
+        "Turn.error does not use TurnError"
+    );
+    let error_info = nullable_schema(
+        definitions,
+        property(
+            definitions,
+            schema_definition(definitions, "TurnError")?,
+            "codexErrorInfo",
+            "TurnError",
+        )?,
+        "TurnError.codexErrorInfo",
+    )?;
+    anyhow::ensure!(
+        error_info == schema_definition(definitions, "CodexErrorInfo")?,
+        "TurnError.codexErrorInfo does not use CodexErrorInfo"
+    );
+    let error_words = schema_variant_words(definitions, "CodexErrorInfo")?;
+    for word in [
+        CODEX_PROVIDER_AUTH_REJECTED,
+        "rateLimitExceeded",
+        "usageLimitExceeded",
+    ] {
+        anyhow::ensure!(
+            error_words.contains(word),
+            "CodexErrorInfo has no '{word}' word"
+        );
+    }
     for notification in ["ItemStartedNotification", "ItemCompletedNotification"] {
         let item = required_schema_path(definitions, notification, &["item"])?;
         anyhow::ensure!(
@@ -3477,6 +3646,60 @@ fn resolve_schema<'a>(
         return Ok(schema);
     }
     anyhow::bail!("schema reference depth exceeds 16")
+}
+
+/// Resolve `anyOf: [T, null]` — the shape the Codex generator emits for an optional typed field —
+/// to `T`. A field that is not exactly one typed arm beside `null` is refused rather than guessed.
+fn nullable_schema<'a>(
+    definitions: &'a serde_json::Map<String, Value>,
+    schema: &'a Value,
+    label: &str,
+) -> Result<&'a Value> {
+    let schema = resolve_schema(definitions, schema)?;
+    let arms = schema
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} is not a nullable schema"))?;
+    let mut typed = arms
+        .iter()
+        .filter(|arm| arm.get("type").and_then(Value::as_str) != Some("null"));
+    let only = typed
+        .next()
+        .with_context(|| format!("{label} has no typed arm"))?;
+    anyhow::ensure!(
+        typed.next().is_none(),
+        "{label} has more than one typed arm"
+    );
+    resolve_schema(definitions, only)
+}
+
+/// Every unit word of a `oneOf` union that mixes a string enum with data-carrying object arms —
+/// the shape `CodexErrorInfo` has. Only the enum arms carry words st2 can match on.
+fn schema_variant_words(
+    definitions: &serde_json::Map<String, Value>,
+    definition: &str,
+) -> Result<BTreeSet<String>> {
+    let arms = schema_definition(definitions, definition)?
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{definition} has no oneOf variants"))?;
+    let mut words = BTreeSet::new();
+    for arm in arms {
+        let Some(values) = resolve_schema(definitions, arm)?
+            .get("enum")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for value in values {
+            let word = value
+                .as_str()
+                .with_context(|| format!("{definition} has a non-string enum value"))?;
+            words.insert(word.to_string());
+        }
+    }
+    anyhow::ensure!(!words.is_empty(), "{definition} has no enum words");
+    Ok(words)
 }
 
 fn schema_variants<'a>(
@@ -4274,12 +4497,57 @@ mod tests {
         definitions.insert(
             "Turn".into(),
             object_schema(
-                &["id", "items"],
+                &["id", "items", "status"],
                 &[
                     ("id", json!({ "type": "string" })),
                     ("items", array_of(reference("ThreadItem"))),
+                    ("status", reference("TurnStatus")),
+                    (
+                        "error",
+                        json!({ "anyOf": [reference("TurnError"), { "type": "null" }] }),
+                    ),
                 ],
             ),
+        );
+        definitions.insert(
+            "TurnStatus".into(),
+            json!({
+                "type": "string",
+                "enum": ["completed", "interrupted", "failed", "inProgress"]
+            }),
+        );
+        definitions.insert(
+            "TurnError".into(),
+            object_schema(
+                &["message"],
+                &[
+                    ("message", json!({ "type": "string" })),
+                    (
+                        "codexErrorInfo",
+                        json!({ "anyOf": [reference("CodexErrorInfo"), { "type": "null" }] }),
+                    ),
+                ],
+            ),
+        );
+        definitions.insert(
+            "CodexErrorInfo".into(),
+            json!({
+                "oneOf": [
+                    {
+                        "type": "string",
+                        "enum": [
+                            "usageLimitExceeded",
+                            "rateLimitExceeded",
+                            "unauthorized",
+                            "other"
+                        ]
+                    },
+                    object_schema(
+                        &["httpConnectionFailed"],
+                        &[("httpConnectionFailed", object_schema(&[], &[]))],
+                    )
+                ]
+            }),
         );
         for notification in ["TurnStartedNotification", "TurnCompletedNotification"] {
             definitions.insert(
@@ -4503,6 +4771,54 @@ mod tests {
         verify_codex_protocol_schemas(&schemas).unwrap();
     }
 
+    /// The classifier reads one word out of `Turn.error.codexErrorInfo` and depends on it being
+    /// distinct from the quota words. A release that dropped or merged it must refuse the launch
+    /// rather than let st2 report an exhausted allowance as a rejected credential.
+    #[test]
+    fn protocol_schema_gate_requires_the_distinct_credential_and_quota_error_words() {
+        let mut schemas = compatible_protocol_schemas();
+        let words = schemas
+            .protocol
+            .pointer_mut("/definitions/CodexErrorInfo/oneOf/0/enum")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        words.retain(|word| word.as_str() != Some("unauthorized"));
+        let error = verify_codex_protocol_schemas(&schemas).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("CodexErrorInfo has no 'unauthorized' word"),
+            "{error:#}"
+        );
+
+        let mut merged = compatible_protocol_schemas();
+        merged
+            .protocol
+            .pointer_mut("/definitions/CodexErrorInfo/oneOf/0/enum")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .retain(|word| word.as_str() != Some("rateLimitExceeded"));
+        let error = verify_codex_protocol_schemas(&merged).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("CodexErrorInfo has no 'rateLimitExceeded' word"),
+            "{error:#}"
+        );
+
+        let mut untyped = compatible_protocol_schemas();
+        untyped
+            .protocol
+            .pointer_mut("/definitions/Turn/properties")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("error");
+        let error = verify_codex_protocol_schemas(&untyped).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Turn has no error property"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn protocol_rejection_reaches_the_declared_supervisor_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4578,7 +4894,7 @@ mod tests {
                 turn_id: None,
             }
         );
-        state.observe_turn_completed("turn-future");
+        state.observe_turn_completed("turn-future", CodexTurnOutcome::Indeterminate);
         assert_eq!(
             state.observed(),
             &CodexObservedState::Held {
@@ -4987,6 +5303,7 @@ mod tests {
             identity: "h.worker".into(),
             this_host: "h".into(),
             supervisor: None,
+            producer_version: Some("codex-cli 0.153.0".into()),
         }
     }
 
@@ -5397,6 +5714,115 @@ mod tests {
             .unwrap()
             .expect("a captured terminal system error must permit the next native delivery");
         assert_eq!(request["method"], "turn/start");
+    }
+
+    /// The credential class and the quota class arrive through the SAME frame sequence, differing
+    /// only in one word of `Turn.error.codexErrorInfo`. This replays the auth-rejected shape and
+    /// asserts the fork: `providerAuth` on the observed record, a native-driver diagnostic, and
+    /// delivery still permitted — while the captured usage-limit fixture beside it keeps reading
+    /// `systemError` with no diagnostic at all.
+    #[test]
+    fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_not() {
+        let rejected = include_str!("../tests/fixtures/codex_provider_auth_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let quota = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        message::send_to_inbox(
+            &config.inbox,
+            "h.sender",
+            Some("after rejection"),
+            None,
+            &[],
+            "body",
+        )
+        .unwrap();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+        for frame in &rejected {
+            state.observe(frame).unwrap();
+            delivery.observe_provider_auth(frame, "thread-main");
+        }
+
+        assert_eq!(
+            state.observed(),
+            &CodexObservedState::TerminalError {
+                reason: CodexTerminalError::ProviderAuthRejected,
+            }
+        );
+        let observation = state.observed().harness_observation().unwrap();
+        assert_eq!(observation.state, harness_state::Activity::Ended);
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("providerAuth"),
+            "the same word OpenCode's ProviderAuthError already publishes"
+        );
+        let record = driver_diagnostic::path(&agent_dir);
+        let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
+            panic!("a rejected credential must publish a native-driver diagnostic")
+        };
+        assert_eq!(failure.driver, driver_diagnostic::Driver::Codex);
+        assert_eq!(failure.stage, driver_diagnostic::Stage::ProviderAuth);
+        assert_eq!(
+            failure.reason,
+            driver_diagnostic::Reason::ProviderAuthRejected
+        );
+        assert_eq!(failure.source, driver_diagnostic::Source::TurnResult);
+        assert_eq!(
+            failure.producer_version.as_deref(),
+            Some("codex-cli 0.153.0")
+        );
+        assert_eq!(failure.support, driver_diagnostic::Support::Supported);
+        let request = delivery
+            .maybe_request(&state)
+            .unwrap()
+            .expect("a rejected credential must not block the next native delivery");
+        assert_eq!(request["method"], "turn/start");
+
+        // A turn that reaches its ordinary end is the recovery edge.
+        delivery.observe_provider_auth(
+            &json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-main",
+                    "turn": { "id": "turn-ok", "status": "completed" }
+                }
+            }),
+            "thread-main",
+        );
+        assert_eq!(
+            driver_diagnostic::read(&record),
+            driver_diagnostic::Observed::Absent
+        );
+
+        // The quota capture walks the same methods and must stay unclassified.
+        let quota_tmp = tempfile::tempdir().unwrap();
+        let quota_config = delivery_config(quota_tmp.path());
+        let quota_agent_dir = quota_config.agent_dir.clone();
+        let mut quota_delivery = inbox_delivery(quota_tmp.path(), quota_config);
+        let mut quota_state = subscribed_state(CodexObservedState::AwaitingStatus);
+        for frame in &quota {
+            quota_state.observe(frame).unwrap();
+            quota_delivery.observe_provider_auth(frame, "thread-main");
+        }
+        assert_eq!(
+            quota_state.observed(),
+            &CodexObservedState::TerminalError {
+                reason: CodexTerminalError::SystemError,
+            }
+        );
+        assert_eq!(
+            driver_diagnostic::read(&driver_diagnostic::path(&quota_agent_dir)),
+            driver_diagnostic::Observed::Absent,
+            "an exhausted allowance is not a rejected credential"
+        );
     }
 
     #[test]

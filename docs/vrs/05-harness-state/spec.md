@@ -211,6 +211,7 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Idle` | `idle` | `none` | `none` | |
 | `Active { turnId }` | `active` | `none` | `none` | |
 | `TerminalError { systemError }` | `ended` | `none` | `none` | `systemError` |
+| `TerminalError { providerAuthRejected }` | `ended` | `none` | `none` | `providerAuth` — a failed turn whose typed error names `unauthorized`; the same word the OpenCode producer publishes |
 | `Held { ActiveWithoutTurn }` | `active` | `none` | `none` | `activeWithoutTurn` — Codex said active; st2 merely cannot name a steerable turn |
 | `Held { ConflictingTurn }` | `active` | `none` | `none` | `conflictingTurn` — two turns believed live is maximally active |
 | `Held { Review }` | `active` | `none` | `none` | `review` — review's enter and exit are model-emitted items inside a running turn; nothing awaits a human |
@@ -246,7 +247,14 @@ observation.
 ## Claude producer (OHS-R05, OHS-R06)
 
 Two cooperating writers. The hook side classifies turn lifecycle: a submitted
-prompt or tool activity writes `active`; `Stop` writes `idle`;
+prompt or tool activity writes `active`; `Stop` writes `idle`; `StopFailure`
+— which Claude fires *instead of* `Stop` when an API error ended the turn —
+also writes `idle`, because the turn is over at the same lifecycle point, with
+reason `providerAuth` for the credential class and `apiError` for every other
+word in that closed vocabulary. It is deliberately not `ended`: the TUI is
+still live, a human can re-login and carry on, and the wrapper owns this seat's
+terminal record (OHS-T04). The event carries a second registered command, the
+pre-existing wedge reporter, so both jobs run on one edge;
 `PermissionRequest` writes `active` + `blockedOn: human` with its ask kind
 classified from the payload's `tool_name` (`AskUserQuestion` → `question`,
 anything else → `permission`) — (its meaning is
@@ -379,11 +387,11 @@ pending. The status seed trusts exactly the pinned words (`busy`, `retry`,
 pre-signal escalation cover with the exit the grace-window reap actually
 observed.
 
-## Native driver diagnostic snapshot (OHS-R11–OHS-R15)
+## Native driver diagnostic snapshot (OHS-R11–OHS-R16)
 
 ```text
-version gate -> API gate -> SSE -> seed -> delivery -> read-back
-      \_____________ typed failure/recovery transitions ____________/
+version gate -> API gate -> SSE -> seed -> provider auth -> delivery -> read-back
+      \______________ typed failure/recovery transitions ______________/
                                 |
                                 v
               <agent-dir>/driver-diagnostic
@@ -429,6 +437,7 @@ The closed stage/reason/source matrix is:
 | `seed` | `statusUnavailable`, `malformedStatus`, `unknownStatus` | `statusSnapshot` |
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
+| `providerAuth` | `providerAuthRejected` | `turnResult` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
@@ -455,6 +464,31 @@ Diagnostic persistence errors log and do not escape into those operations.
 The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
+
+Claude and Codex publish exactly one of those stages — `providerAuth` — from
+their own typed turn-failure signal, and nothing else: every earlier boundary
+is already fail-closed at admission for them (an incompatible Codex protocol
+refuses the launch rather than degrading into an observation, and st2 gates no
+Claude version at all). Both edges come from the signal that ends a turn, so
+neither driver reads provider prose:
+
+| Driver | Rejection | Recovery | `producerVersion` / `support` |
+| --- | --- | --- | --- |
+| Claude | `StopFailure` hook with `error: authentication_failed` — Claude's own name for every 401/403 provider response, fired *instead of* `Stop` | the next `Stop`, i.e. a turn that reached its ordinary end | omitted / `unknown` — a hook payload names no version and st2 gates none |
+| Codex | `turn/completed` with `turn.status: failed` and `turn.error.codexErrorInfo: unauthorized` | `turn/completed` with `turn.status: completed` | the version the protocol gate admitted / `supported` |
+
+Neither driver borrows the word for a neighbouring class: Claude's
+`rate_limit`, `overloaded`, `oauth_org_not_allowed`, `account_on_hold` and
+`billing_error`, and Codex's `usageLimitExceeded` and `rateLimitExceeded`, are
+capacity, policy, or account state that a re-login cannot fix. Claude's
+`StopFailure` still writes `idle` with reason `apiError` for them — the turn
+did end — and Codex keeps its `systemError` terminal. The Codex startup gate
+pins `unauthorized` and both quota words present in `CodexErrorInfo`, so a
+release that merged them refuses the launch instead of letting st2 report an
+exhausted allowance as a rejected credential. Because Claude and Codex publish
+only on rejection, an absent record is their healthy steady state and Doctor
+advises nothing for it; OpenCode, which resolves its version gate on every
+launch, still advises on absence.
 
 The roster projection always has one fixed shape. `failure` fills every
 evidence field; `absent` and `indeterminate` preserve the same keys with null

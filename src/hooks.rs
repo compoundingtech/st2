@@ -155,10 +155,20 @@ pub fn claude_settings_registration() -> serde_json::Value {
             // The completion edge. It never increments the count `PreCompact` already made — see
             // `claude_session::observe_compaction` for why the dedupe is positional.
             "PostCompact": observe("PostCompact"),
-            "StopFailure": [{ "hooks": [{
-                "type": "command",
-                "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
-            }] }],
+            // Two commands again: the wedge reporter moves declared presence and notifies the
+            // supervisor, while the observe hook records the turn's end and, for the credential
+            // class, the native-driver diagnostic. `StopFailure` fires INSTEAD of `Stop`, so
+            // without the observe entry an API-error-ended turn would leave `active` standing.
+            "StopFailure": [{ "hooks": [
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-stop-failure.sh\"",
+                },
+                {
+                    "type": "command",
+                    "command": "\"$ST_HOOKS/claude-observe.sh\" StopFailure",
+                },
+            ] }],
             "UserPromptSubmit": observe("UserPromptSubmit"),
             "Stop": observe("Stop"),
             "PermissionRequest": observe("PermissionRequest"),
