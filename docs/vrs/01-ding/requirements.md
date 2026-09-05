@@ -100,6 +100,12 @@ is in [`spec.md`](./spec.md).
   prove `NotRetained`; this is never delivery and releases only an already
   archived staged head. Unread, unreadable, unrecognized, and ambiguous attempts
   retain staged ownership and retry by inspection without re-pasting.
+- **DING-R11 Readable immutable sender:** A notice resolves the message's
+  canonical sender agent ID to the current bus address immediately before
+  rendering. When the subject has no current route, DING uses the message's
+  publication-time address snapshot, then the immutable ID. Display fallback
+  never changes reply targeting, staged ownership, or the exact notice used for
+  receipt classification.
 
 ## Evidence
 

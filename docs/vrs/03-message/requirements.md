@@ -2,11 +2,12 @@
 
 ## Context
 
-This subsystem defines the native message bus beyond terminal delivery. It refines root requirement
-[`R05`](../requirements.md) for durable message publication and inherits stable identity from `R19`
-and `R24`. DING consumes the recipient inbox under
-[`01-ding/requirements.md`](../01-ding/requirements.md); this subsystem does not redefine terminal
-delivery.
+This subsystem defines the native message bus beyond terminal delivery. It
+refines root requirement [`R05`](../requirements.md) for durable message
+publication and inherits immutable agent ID and mutable address semantics from
+`R19` and `R24`. DING consumes the recipient inbox under
+[`01-ding/requirements.md`](../01-ding/requirements.md); this subsystem does not
+redefine terminal delivery.
 
 ## Assumptions
 
@@ -41,9 +42,16 @@ delivery.
 - **MESSAGE-R01 Sender-owned enumeration:** Every successful ordinary `message send` and `message
   reply` by an indexed sender creates one durable sender-owned row. `message sent` enumerates only
   that sender-owned state; recipient inbox and archive state cannot remove or supply its rows.
-- **MESSAGE-R02 Canonical direction:** Catalog-backed publication resolves and persists canonical
-  sender and recipient bus identities. A sent row carries `to`; it does not repurpose the inbound
-  row's `from` field.
+- **MESSAGE-R02 Canonical direction and readable projection:** Catalog-backed
+  publication resolves an ordinary sender or recipient address to one immutable
+  agent ID and persists those IDs as canonical direction and provenance. It
+  also appends each endpoint's publication-time bus address as display-only
+  snapshot metadata. A sent row carries canonical `to`; it does not repurpose
+  the inbound row's `from` field. Inbox rendering includes canonical sender ID
+  and readable sender address. DING resolves the sender ID to its current bus
+  address at delivery, falling back to the publication snapshot and then the ID
+  when no current route exists. Replies and automation always use the persisted
+  ID.
 - **MESSAGE-R03 Explicit coverage:** Machine output distinguishes an unavailable index, coverage
   beginning at one unix-millisecond boundary, and partial coverage with pending intents. An absent
   or interrupted index must never serialize as a complete empty history. Count output refuses

@@ -63,8 +63,9 @@ resolution first resolves the binding's own carrier, then validates and walks
 the seat's supervisor chain against the pass's complete discovered spec vector.
 At every non-retired ancestor it resolves active bindings with the same profile
 scheme against that ancestor's own declaration directory. Each inherited
-subscription retains the ancestor's binding label qualified by owner bus ID
-(`goal@hetz.root`), so mutations in two layers cannot share a supersession key.
+subscription retains the ancestor's binding label qualified by immutable agent
+ID (`goal@<agent-id>`), so address changes cannot create a new supersession key
+and mutations in two layers cannot share one.
 A suspended ancestor contributes its layer and traversal continues, but the
 suspended seat itself owns no active subscription. A retired ancestor
 contributes no layer, but traversal continues to its ancestors.
@@ -142,11 +143,12 @@ meaningful.
   If strict discovery temporarily rejects a declaration whose exact canonical
   seat remains observed alive, its prior declaration subscription survives with
   its carrier state and pending transition; it drops as soon as that seat is
-  not live. Existing valid subscriptions are matched by declaration path and
-  binding label. Each refresh takes bus id, canonical seat id, carrier path,
-  label, and class from the current declaration while retaining carrier state,
-  the per-subscription occurrence sequence, any immutable pending transition,
-  and dirty state; only new subscriptions seed silently with sequence zero.
+  not live. Existing valid subscriptions are matched by immutable agent ID and
+  binding label. Each refresh takes agent ID, current bus address, canonical
+  seat ID, carrier path, label, and class from the current declaration while
+  retaining carrier state, the per-subscription occurrence sequence, any
+  immutable pending transition, and dirty state; only new subscriptions seed
+  silently with sequence zero.
 - A previously blind path is state-diffed both before and after its recovered
   parent watch is registered, closing the poll-to-registration gap.
 - Installation failure degrades to timer-based carrier polling over the watch

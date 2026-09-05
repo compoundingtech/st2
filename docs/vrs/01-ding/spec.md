@@ -26,6 +26,15 @@ notice, yields exactly one state:
 `Ambiguous` is the default for anything not positively understood, per
 `DING-R03`. It is not an error state and carries no diagnostic obligation.
 
+## Sender projection
+
+The durable message carries canonical sender ID plus a publication-time bus
+address snapshot. Immediately before constructing the notice, DING resolves the
+ID against one coherent current address book. The displayed sender is the
+current bus address when routable, otherwise the stored snapshot when present,
+otherwise the ID. Replies retain the canonical ID from the message; rendered
+text is never reparsed as authority.
+
 ## Delivery
 
 ```text

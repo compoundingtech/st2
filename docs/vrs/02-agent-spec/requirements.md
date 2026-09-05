@@ -28,8 +28,8 @@ Field lookup: [F01](./spec.md#f01), [F02](./spec.md#f02),
 [F06](./spec.md#f06), [F07](./spec.md#f07), [F08](./spec.md#f08),
 [F09](./spec.md#f09), [F10](./spec.md#f10), [F11](./spec.md#f11),
 [F12](./spec.md#f12), [F13](./spec.md#f13), [F14](./spec.md#f14),
-[F15](./spec.md#f15), [F16](./spec.md#f16), [F17](./spec.md#f17), and F18 in
-the same field-rules specification.
+[F15](./spec.md#f15), [F16](./spec.md#f16), [F17](./spec.md#f17), and F18-F20
+in the same field-rules specification.
 
 ## Shared invariants
 
@@ -64,14 +64,20 @@ the same field-rules specification.
   Presentation changes use exact-ID metadata projection only; they do not alter
   launch fingerprints or authorize lifecycle work.
 
-- **SPEC-R04 Change membership and lifecycle only for exact IDs.** Add only a
-  missing ID. Remove only an exactly attributed old ID. Retirement stops the
-  declared set and prevents relaunch. An identity, task name, or task ID change
-  is remove-old then add-new, not an inferred rename. Each host acts only on its
-  local projection. A host change is independent removal on the old host and
-  addition on the new host, never process migration. The hosts require no shared
-  order, receipt, or proof. Catalog skew can cause temporary overlap or absence;
-  each host retains its local last-known-good ownership.
+- **SPEC-R04 Preserve immutable subject identity; change runtime membership
+  only for exact IDs.** Agent-declaration addition and removal are keyed by
+  immutable agent ID. Adding a newly generated ID creates a subject;
+  reintroducing an earlier ID denotes the same subject. A declaration-source
+  edit cannot change an ID in place. Add only a missing task ID. Remove only an
+  exactly attributed old task ID. Retirement stops the declared set, prevents
+  relaunch, releases address routing, and preserves the subject ID. Suspension
+  retains address routing. An address change is metadata and routing projection,
+  not remove-old/add-new; a task name or task ID change remains remove-old then
+  add-new. Each host acts only on its local runtime projection. A host change
+  preserves the logical agent ID but is independent removal on the old host and
+  addition on the new host, never process migration. The hosts require no
+  shared order, receipt, or proof. Catalog skew can cause temporary overlap or
+  absence; each host retains its local last-known-good ownership.
 
   Suspension is reversible desired absence, not a second runtime state
   machine. It tears down the same exact owned task set as retirement, including

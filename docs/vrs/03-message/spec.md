@@ -65,15 +65,17 @@ The version-1 record is:
   "version": 1,
   "filename": "1786550000123-abc123.md",
   "ts": 1786550000123,
-  "from": "h.sender",
-  "to": "h.recipient",
+  "from": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+  "to": "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3",
   "subject": null,
   "inReplyTo": null,
   "tags": [],
   "priority": null,
   "idempotencyKey": null,
   "body": "message body\n",
-  "renderedMessage": "---\nfrom: h.sender\n---\nmessage body\n"
+  "renderedMessage": "---\nfrom: dev3.dotfiles.fractal.keymap.verifier\nfrom-id: 0199b8f4-8d3a-7c21-9a44-6f85b7320ea1\n---\nmessage body\n",
+  "fromAddress": "dev3.dotfiles.fractal.keymap.verifier",
+  "toAddress": "dev4.fractal.chat"
 }
 ```
 
@@ -106,8 +108,12 @@ steps (`MESSAGE-R05`, `MESSAGE-R06`, `MESSAGE-R08`):
 
 1. Atomically create `index.json` if absent. Its `since` precedes every indexed send attempt.
 2. Recover the single pending/active publication, if present.
-3. Resolve both Agent endpoints to canonical bus identities. A message using the explicit eval
-   external requester capability at either endpoint bypasses ordinary Sent indexing.
+3. Resolve each ordinary Agent address to one immutable agent ID and capture
+   its current bus address. Persist the IDs as canonical endpoints and the
+   addresses as display-only publication snapshots. An explicit exact-ID
+   endpoint bypasses address lookup but joins its current address when one
+   exists. A message using the eval external-requester capability at either
+   endpoint bypasses ordinary Sent indexing.
 4. Atomically create one pending record with a fresh canonical message filename.
 5. Atomically create `active.json` containing its filename and record digest.
 6. Materialize the exact recipient bytes under that filename. An identical inbox file or archive
@@ -132,10 +138,11 @@ or node. A pending record for an older committed row still fails closed.
 
 ## Retry identity
 
-`--idempotency-key` is optional on `send` and `reply`. The durable key scope is `(canonical sender,
-canonical recipient, key)`. Under the sender lock, a matching completed record returns its original
-filename. Different content under the same scoped key fails. Different recipients may reuse a key
-(`MESSAGE-R07`).
+`--idempotency-key` is optional on `send` and `reply`. The durable key scope is
+`(canonical sender agent ID, canonical recipient agent ID, key)`. Under the
+sender lock, a matching completed record returns its original filename.
+Different content under the same scoped key fails. Different recipients may
+reuse a key (`MESSAGE-R07`).
 
 Without a key, pending recovery can reuse the interrupted intent. After the pending record is
 cleared, a crash before stdout creates unavoidable response ambiguity. Repeating identical unkeyed
@@ -145,23 +152,31 @@ identical messages (`MESSAGE-T03`, `MESSAGE-R08`).
 ## Sent API and wire shape
 
 ```text
-st2 message sent [identity]
+st2 message sent [address]
+  [--id <agent-id>]
   [--count]
   [--include-body]
   [--since <unix-ms>]
-  [--to <canonical-recipient>]
+  [--to <canonical-recipient-id>]
   [--json]
 ```
 
-Identity defaults to `--as`, then `ST_AGENT`. Rows sort by `(ts, filename)`. `--since` is strict;
-`--to` compares the canonical persisted recipient. `--include-body` adds `body`; otherwise the key
-is absent. `--count` prints a number only for `since` coverage and refuses unavailable or partial
-coverage (`MESSAGE-R03`, `MESSAGE-R09`).
+The subject resolves an ordinary `--as <address>` when supplied, otherwise it
+uses the exact immutable ID in `ST_AGENT`. An ordinary positional reference
+resolves an address; `--id` performs exact subject lookup and the two forms are
+mutually exclusive. Rows sort by
+`(ts, filename)`. `--since` is strict; `--to` compares the canonical persisted
+recipient ID. `--include-body` adds `body`; otherwise the key is absent.
+`--count` prints a number only for `since` coverage and refuses unavailable or
+partial coverage (`MESSAGE-R03`, `MESSAGE-R09`).
 
-The optional identity follows the existing catalog read-authority model of `message ls [identity]`:
-catalog filesystem read access permits observation of any declared Agent selected by bare identity
-or canonical bus ID. Selecting an identity does not grant publication authority or change the acting
-identity.
+Catalog filesystem read access permits observation of any declared Agent
+selected by current address or explicit immutable ID. Selecting a subject does
+not grant publication authority or change the acting ID. Human output may join
+the current bus address for display. Persisted `from` and `to` fields and JSON
+authority remain immutable endpoint IDs so address changes do not rewrite
+history or break replies. Appended nullable `fromAddress` and `toAddress` fields
+preserve publication-time display snapshots without becoming selectors.
 
 The shared JSON envelope is a tagged coverage union:
 
@@ -172,11 +187,12 @@ The shared JSON envelope is a tagged coverage union:
     {
       "filename": "1786550000123-abc123.md",
       "ts": 1786550000123,
-      "to": "h.recipient",
+      "to": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
       "subject": null,
       "inReplyTo": null,
       "tags": [],
-      "priority": null
+      "priority": null,
+      "toAddress": "dev3.dotfiles.fractal.keymap.verifier"
     }
   ]
 }
@@ -190,9 +206,10 @@ Coverage variants are exact:
 | `since` | `since` | All successful indexed sends at or after the boundary are represented. |
 | `partial` | `since`, `pending` | The boundary exists, but one or more intents are incomplete. |
 
-`SentMessages`, `SentCoverage`, and `SentMessageRow` live in `st2-wire`. A sent row has `to`, never
-`from`; optional fields remain nullable and an unrequested body remains absent
-(`MESSAGE-R02`, `MESSAGE-R04`).
+`SentMessages`, `SentCoverage`, and `SentMessageRow` live in `st2-wire`. A sent
+row has canonical `to`, never `from`; nullable display-only `toAddress` is
+appended after the existing fields. Optional fields remain nullable and an
+unrequested body remains absent (`MESSAGE-R02`, `MESSAGE-R04`).
 
 ### Fractal consumer semantics (non-normative)
 
