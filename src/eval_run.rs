@@ -18,7 +18,7 @@ use crate::expand::expand_catalog;
 use crate::flapping::FlappingCap;
 #[cfg(test)]
 use crate::reconcile::compile_generated_ding_tasks;
-use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile};
+use crate::reconcile::{TaskCompileContext, compile_generated_tasks, reconcile, task_runtime_id};
 use crate::run::{Runner, SystemRunner, UpReport, detect_host, execute};
 use agent_spec::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
@@ -171,12 +171,6 @@ fn admitted_route<'a>(
     routes
         .get(id)
         .unwrap_or_else(|| panic!("strict canonical admission did not freeze route for `{id}`"))
-}
-
-fn task_runtime_id(spec: &AgentSpec, task: &Task, host: &str) -> String {
-    task.id
-        .clone()
-        .unwrap_or_else(|| format!("{}.{}", spec.agent_id(host), task.name))
 }
 
 fn task_is_launchable(task: &Task) -> bool {

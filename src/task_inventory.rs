@@ -463,10 +463,7 @@ pub fn inventory(
             if spec.desired_state.is_running() && task.command.is_none() && task.argv.is_none() {
                 continue;
             }
-            let runtime_id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{agent_id}.{}", task.name));
+            let runtime_id = crate::reconcile::task_runtime_id(spec, task, host);
             runtime_owners
                 .entry(runtime_id.clone())
                 .or_default()
