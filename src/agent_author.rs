@@ -1720,7 +1720,7 @@ fn verify_desired_state_candidate(
     ))
 }
 
-fn exact_agent_node<'a>(
+pub(crate) fn exact_agent_node<'a>(
     document: &'a KdlDocument,
     expected_identity: &str,
     expected_host: &str,
@@ -1764,7 +1764,7 @@ fn exact_agent_node<'a>(
     }
 }
 
-fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
+pub(crate) fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
     let mut identity = node
         .get(0)
         .and_then(|value| value.as_string())
@@ -1793,7 +1793,7 @@ fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<String>) {
     (host, identity)
 }
 
-fn is_nix_managed(node: &KdlNode) -> bool {
+pub(crate) fn is_nix_managed(node: &KdlNode) -> bool {
     node.children().is_some_and(|children| {
         children
             .nodes()
@@ -1855,7 +1855,7 @@ fn parse_field_value(node: &KdlNode, field: PresentationField) -> Result<&str, A
         })
 }
 
-fn quoted(value: &str) -> Result<String, AuthorError> {
+pub(crate) fn quoted(value: &str) -> Result<String, AuthorError> {
     serde_json::to_string(value).map_err(|error| {
         AuthorError::new(
             "unsafe-source-edit",
@@ -1900,7 +1900,7 @@ fn insert_field(
     )
 }
 
-fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, AuthorError> {
+pub(crate) fn insert_node(text: &str, target: &KdlNode, authored: &str) -> Result<String, AuthorError> {
     let span = target.span();
     let start = span.offset();
     let end = start + span.len();
@@ -2038,7 +2038,7 @@ fn remove_field(text: &str, node: &KdlNode) -> Result<String, AuthorError> {
     Ok(replacement)
 }
 
-fn line_indent(text: &str, offset: usize) -> Option<String> {
+pub(crate) fn line_indent(text: &str, offset: usize) -> Option<String> {
     let prefix = text.get(..offset)?;
     let start = prefix.rfind('\n').map_or(0, |newline| newline + 1);
     let indent = prefix.get(start..)?;

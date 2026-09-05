@@ -618,6 +618,24 @@ enum CatalogCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Freeze every live and structurally archived legacy subject's immutable agent `id` and
+    /// rewrite every supervisor reference to the parent's migrated id, in one transaction.
+    MigrateIds {
+        /// Host used to freeze a `<host>.<identity>` bus identity for a declaration that omits
+        /// `host`, and to resolve a bare-identity supervisor reference. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Decide every id and rewrite and print the plan without writing anything.
+        #[arg(long, conflicts_with = "resume")]
+        dry_run: bool,
+        /// Finish an interrupted migration. Only work the interrupted transaction planned is
+        /// applied.
+        #[arg(long)]
+        resume: bool,
+        /// Emit the typed migration receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Move one archived identity back into the live catalog. The exact reverse of `archive`.
     Unarchive {
         /// Archived identity to restore.
@@ -1539,6 +1557,69 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                         refusal.id, refusal.code, refusal.message
                     );
                 }
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::MigrateIds {
+            host,
+            dry_run,
+            resume,
+            json,
+        }) => {
+            let result =
+                st2::catalog_migrate_ids::migrate_ids(st2::catalog_migrate_ids::MigrateRequest {
+                    catalog: catalog_arg(None)?,
+                    host: host.unwrap_or_else(detect_host),
+                    dry_run,
+                    resume,
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let verb = if result.dry_run { "would-freeze" } else { "froze" };
+                for planned in &result.assigned {
+                    println!(
+                        "{verb} {} {}.{} [{}] {}",
+                        planned.agent_id,
+                        planned.host,
+                        planned.identity,
+                        match planned.plane {
+                            st2::catalog_migrate_ids::Plane::Live => "live",
+                            st2::catalog_migrate_ids::Plane::Archived => "archived",
+                        },
+                        planned.declaration
+                    );
+                }
+                for reassignment in &result.reassigned {
+                    println!(
+                        "reassigned {} kept by {} -> {} ({}.{})",
+                        reassignment.legacy_bus_identity,
+                        reassignment.kept_by_agent_id,
+                        reassignment.reassigned_agent_id,
+                        reassignment.reassigned_host,
+                        reassignment.reassigned_identity
+                    );
+                }
+                for rewrite in &result.supervisor_rewrites {
+                    println!(
+                        "supervisor {} {} -> {}",
+                        rewrite.declaration, rewrite.from, rewrite.to_agent_id
+                    );
+                }
+                for declaration in &result.nix_owned {
+                    println!("nix-owned {declaration}");
+                }
+                println!(
+                    "{} assigned={} reassigned={} rewrites={} already={}",
+                    match result.status {
+                        st2::catalog_migrate_ids::MigrateStatus::Migrated => "migrated",
+                        st2::catalog_migrate_ids::MigrateStatus::Unchanged => "unchanged",
+                    },
+                    result.assigned.len(),
+                    result.reassigned.len(),
+                    result.supervisor_rewrites.len(),
+                    result.already_migrated.len()
+                );
             }
             Ok(())
         }
