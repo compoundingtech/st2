@@ -415,7 +415,7 @@ number (HC-R02); where st2 computes it, the row says so.
 | --- | --- | --- | --- | --- | --- |
 | claude | 2.1.250 | `statusLine` command stdin JSON | `context_window.total_input_tokens` = `input + cache_creation + cache_read` of the last response | `context_window.context_window_size` | `context_window.used_percentage` — Claude's own integer, clamped 0..100 |
 | codex | codex-cli 0.151.0 | app-server `thread/tokenUsage/updated` | `tokenUsage.last.totalTokens` | `tokenUsage.modelContextWindow` | st2 computes with the baseline rule below; equals `100 −` Codex's displayed "% context left" |
-| pi | 0.84.2 | injected extension `ctx.getContextUsage()` | `.tokens` = last assistant `totalTokens` (input + output + cacheRead + cacheWrite) | `.contextWindow` | `.percent` (float) |
+| pi | 0.84.4 | injected extension `ctx.getContextUsage()` | `.tokens` = last assistant `totalTokens` (input + output + cacheRead + cacheWrite) | `.contextWindow` | `.percent` (float) |
 | omp | 18.0.9 (and 18.0.3) | injected extension `ctx.getContextUsage()` | `.tokens` = last assistant **`input`** only | `.contextWindow` | `.percent` (float) |
 | opencode | 1.18.25 | SSE `message.updated` joined with `GET /config/providers` | last **non-summary** assistant `tokens.total` | `providers[].models[<modelID>].limit.context` | st2 computes `usedTokens / windowTokens`; the server displays none |
 
@@ -727,7 +727,7 @@ turn the measurement into a semantic-version promise. Every later Codex release
 still requires its own source comparison and live delivery proof before the exact
 launch gate moves.
 
-### pi (0.84.2)
+### pi (0.84.4)
 
 One call answers everything, present on the `ctx` of every lifecycle event:
 `getContextUsage()` returns `{ tokens, contextWindow, percent }`.
@@ -1126,7 +1126,7 @@ each only once a real test proves it (per `CLAUDE.md`):
   baseline-free `last.totalTokens / window` reads 36, the truth is 33).
 
   **Shipped for pi and omp**:
-  `src/pi_channel.rs::the_pi_0_84_2_fixture_pins_total_tokens_as_the_numerator`,
+  `src/pi_channel.rs::the_pinned_pi_fixture_pins_total_tokens_as_the_numerator`,
   `src/pi_channel.rs::the_omp_18_0_9_fixture_pins_prompt_input_as_the_numerator`,
   `src/pi_channel.rs::a_pi_compaction_withholds_the_reading_it_emptied_in_the_same_write`,
   `src/pi_channel.rs::an_omp_compaction_yields_unknown_because_the_event_names_no_reason`,

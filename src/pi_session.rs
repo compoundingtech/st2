@@ -32,7 +32,13 @@ const EXTENSION: &str = "pi-channel.ts";
 /// type-checks and runtime-smokes the shipped asset against exactly this tarball. That makes the
 /// flake pin the gate for this constant, and `pi_channel`'s fixture asserts the two agree: a pi
 /// bump that changes what `getContextUsage().tokens` means must move both together or fail.
-pub const MEASURED_CONTEXT_VERSION: &str = "0.84.2";
+///
+/// Moved 0.84.2 -> 0.84.4 with the flake pin, and the arithmetic was re-verified rather than
+/// assumed: `getContextUsage()` (`dist/core/agent-session.js`) and `calculateContextTokens`
+/// (`dist/core/compaction/compaction.js:86-88`, `usage.totalTokens || input + output + cacheRead
+/// + cacheWrite`) are byte-identical between the two published tarballs, so the recorded fixture
+/// still means what it says under the newer pin.
+pub const MEASURED_CONTEXT_VERSION: &str = "0.84.4";
 
 /// The exact st2 executable the pi extension must spawn for its channel.
 pub const CHANNEL_BIN: &str = "ST2_PI_CHANNEL_BIN";
