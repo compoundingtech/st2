@@ -6,11 +6,16 @@ Status: open
 
 [Decision 0015](../.decisions/0015-immutable-agent-id-and-mutable-address.md)
 and root requirements R19 and R24-R26 define the accepted target identity
-model. The implementation still uses positional `identity` plus current host as
-logical subject ID, human route, ownership key, task prefix, state selector, and
-`ST_AGENT`. `AgentSpec` has no explicit `id` or `address`; ordinary resolution,
-roster output, graph output, supervisor edges, messages, authoring, and PTY
-metadata all retain the pre-decision behavior.
+model. st2 now implements it behind one catalog-scoped activation gate
+(`src/identity.rs`): `AgentSpec` carries an optional explicit `id` and
+`address`, `st2 catalog migrate-ids` freezes every live and structurally
+archived subject's ID in one transaction, and the target writers apply once the
+catalog is fully migrated. Two things keep this delta open. The canonical Agent
+Spec grammar still makes `id` optional rather than required, so a declaration
+with no ID is admissible in an unmigrated catalog. And no admitted host is
+migrated yet: the model is proved on fixtures and on a scratch copy of a real
+722-declaration plane, not on the live fleet, and no supported downstream
+generator emits `id`.
 
 ## VRS
 
@@ -42,9 +47,8 @@ reject the new endpoint and snapshot fields.
 
 ## Implementation
 
-No runtime code changes are part of the VRS pull request that opens this delta.
-Implementation must begin with tests at the Agent Spec and address-book
-boundaries. It must then propagate one typed ID/address distinction through:
+Implementation began with tests at the Agent Spec and address-book boundaries
+and propagated one typed ID/address distinction through:
 
 - live and archived catalog validation, explicit-ID migration, unarchive, and
   ID-keyed supervisor references;
@@ -79,6 +83,37 @@ resolution and every current invariant remain normative implementation behavior.
 After activation, an unmigrated archived declaration cannot re-enter the
 catalog; unarchive validates ID uniqueness, and a transition from retired to
 routable validates full-catalog address uniqueness.
+
+Progress against those steps, at the time of writing:
+
+- **Step 1 is done.** Readers accept legacy and target Agent Specs, message
+  versions 1 and 2, harness-state and harness-context versions 1 and 2, and
+  appended roster/graph projections. PTY schema 2 is written only behind the
+  gate and its schema-1 reader is unchanged.
+- **Step 2 is not done.** Reader readiness has not been proved on any admitted
+  host: the readers exist in an unreleased build.
+- **Step 3 exists as `st2 catalog migrate-ids`** and is proved on fixtures
+  (including a 640-subject plane with a live/archived ID collision, refusal,
+  and crash-resume cases) and by a dry run plus a full migration against a
+  scratch copy of a real 722-declaration plane. It has not been run against any
+  live catalog.
+- **Step 4 is not done**, and cannot be until step 2 is.
+- **Step 5 is implemented but not activated anywhere**, because activation is a
+  property of a migrated catalog rather than a flag: `identity::activation`
+  answers `Activated` only when every live and structurally archived subject
+  carries an explicit ID and no migration transaction is outstanding. A mixed
+  catalog is separately inadmissible (`agent-id-missing`), which is what stops a
+  new declaration — including one published through a digest-bound path whose
+  exact bytes cannot carry an injected ID — from entering a migrated catalog
+  without one.
+
+One obligation has no owner yet: no path in st2 synthesizes a new agent
+declaration, so UUIDv7 creation has no call site here. Every new subject enters
+as operator- or generator-authored canonical KDL bound byte-exactly by a digest
+(`st2 agent publish --input-sha256`, `st2 catalog bootstrap|apply`). The target
+behavior therefore belongs to the grammar gate — the canonical Agent Spec
+requiring `id` — and to whichever generator authors the declaration, not to an
+st2 writer that would have to break the caller's digest binding to inject one.
 
 ## Direction
 

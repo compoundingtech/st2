@@ -16,15 +16,18 @@ unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
 Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
 are tracked in [open-questions.md](./open-questions.md).
 
-The `agent` field's immutable-ID meaning is the accepted target, and it ships
-as a new record version, `st2.harness-state.v2`: this record's version suffix
-is its read contract, so changing an existing field's meaning reserves the next
-version rather than reusing `v1`. Records and producers stay on
-`st2.harness-state.v1`, whose `agent` remains a bus identity, until
-[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
-Version 2 is otherwise identical to the shape below. The reader-first rollout
-accepts both versions — narrowing the `unsupported-schema` rule below to
-versions outside that pair — before any version-2 writer activates.
+The `agent` field's immutable-ID meaning ships as a new record version,
+`st2.harness-state.v2`: this record's version suffix is its read contract, so
+changing an existing field's meaning reserves the next version rather than
+reusing `v1`. Version 2 is otherwise identical to the shape below.
+Readers accept both versions — the `unsupported-schema` rule below narrows to
+versions outside that pair. A producer emits version 2 only once its catalog has
+migrated every live and structurally archived subject to an explicit agent ID;
+until then it emits `st2.harness-state.v1`, whose `agent` remains a bus
+identity. Write-side ownership stays exact own-version equality in both
+directions, so a writer never coalesces against, restamps, or supersedes a
+record of the other version — `agent` means different things under each, and
+restating one namespace's bytes under the other's promise is not a merge.
 
 ## Scope
 

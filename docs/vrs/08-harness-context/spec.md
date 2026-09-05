@@ -43,14 +43,16 @@ transport runs. Open questions are tracked in
 [open-questions.md](./open-questions.md); the direction this design deliberately
 does not take yet is in [roadmap.md](./roadmap.md).
 
-The `agent` field's immutable-ID meaning is the accepted target, and it ships
-as a new record version, `st2.harness-context.v2`: the version suffix is the
-read contract, so changing an existing field's meaning reserves the next
-version rather than reusing `v1`. Records and producers stay on
-`st2.harness-context.v1`, whose `agent` remains a bus identity, until
-[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
-Version 2 is otherwise identical to the shape below, and the reader-first
-rollout accepts both versions before any version-2 writer activates.
+The `agent` field's immutable-ID meaning ships as a new record version,
+`st2.harness-context.v2`: the version suffix is the read contract, so changing
+an existing field's meaning reserves the next version rather than reusing `v1`.
+Version 2 is otherwise identical to the shape below, and readers accept both
+versions. A producer emits version 2 only once its catalog has migrated every
+live and structurally archived subject to an explicit agent ID; until then it
+emits `st2.harness-context.v1`, whose `agent` remains a bus identity. The write
+guard coalesces only against a record of the writer's own version, so the two
+sibling records can never be versioned apart and a v1 straggler cannot downgrade
+a v2 record's numbers under a v1 reading of `agent`.
 
 ## Scope
 

@@ -62,9 +62,15 @@ legacy control in `tests/eval_run_e2e.rs`.
 
 ## Immutable agent ID, mutable address, and presentation (R02, R08, R11, R13, R19, R24-R26)
 
-This section is the accepted target contract. The current implementation remains
-on the pre-decision identity model until
-[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) closes.
+This section is the accepted target contract. It is implemented behind one
+catalog-scoped activation gate: the target writers apply once every live and
+structurally archived subject carries an explicit agent ID, and until then the
+pre-decision identity model remains normative implementation behavior. A mixed
+catalog is inadmissible (`agent-id-missing`), so the gate is all-or-nothing
+rather than per-subject, and only the whole-catalog ID migration holds a mixed
+state inside its own transaction.
+[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) records what
+remains before the gate is a permanent property rather than a transition.
 
 An Agent Spec separates four values that the current implementation overloads:
 
