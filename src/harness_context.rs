@@ -44,7 +44,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::harness_state::{lock_exclusive, write_json_atomic};
 
+/// The version this binary WRITES, and the exact string `write_locked` treats as its own record.
 const SCHEMA: &str = "st2.harness-context.v1";
+/// The reserved next version, whose `agent` field means the immutable agent ID instead of the
+/// bus identity. Otherwise identical to v1's shape; nothing here writes it yet (reader-first
+/// rollout, DELTA-003).
+const SCHEMA_NEXT: &str = "st2.harness-context.v2";
+
+/// Read admission: exactly the v1/v2 pair, never a prefix match. A foreign namespace
+/// (`com.example.harness-context.v1`), an unversioned string (`st2.harness-context`), and any
+/// further version stay refused — the version suffix is the read contract.
+fn is_supported_schema(schema: &str) -> bool {
+    schema == SCHEMA || schema == SCHEMA_NEXT
+}
+
 const LOCK_NAME: &str = ".harness-context.lock";
 const TMP_PREFIX: &str = ".harness-context";
 const STAGING_DIR_NAME: &str = "harness-context-staging";
@@ -477,9 +490,11 @@ impl Writer {
         compaction: Option<Compaction>,
     ) -> anyhow::Result<bool> {
         let _lock = lock_exclusive(&self.lock_path)?;
-        // A record this version cannot interpret — unparseable bytes, another schema, a harness
-        // whose arithmetic is unknown — is not coalesced against: it reads as absent to every
-        // consumer, so continuing its counters would be continuing something nobody can read.
+        // A record this writer does not own — unparseable bytes, any schema other than this
+        // binary's own write version (the tolerantly readable v2 included), a harness whose
+        // arithmetic is unknown — is not coalesced against. Ownership here is exact own-version
+        // equality, deliberately narrower than the reader's accepted pair: coalescing against a
+        // v2 record would silently downgrade it to v1 numbers under a v1 `agent` meaning.
         let current = read_record(&self.path)
             .filter(|record| record.schema == SCHEMA && record.harness != Harness::Unrecognized);
         let now_ms = crate::message::now_ms();
@@ -665,9 +680,9 @@ fn read_at(path: &Path, now_ms: u64) -> Option<Observed> {
         );
         return None;
     };
-    if record.schema != SCHEMA {
+    if !is_supported_schema(&record.schema) {
         tracing::warn!(
-            "st2 harness-context: {} carries schema `{}`, not `{SCHEMA}`",
+            "st2 harness-context: {} carries schema `{}`, neither `{SCHEMA}` nor `{SCHEMA_NEXT}`",
             path.display(),
             record.schema
         );
@@ -1184,10 +1199,10 @@ mod tests {
 
         fs::write(
             &path,
-            br#"{"schema":"st2.harness-context.v2","agent":"a","harness":"codex","observedAtMs":1}"#,
+            br#"{"schema":"com.example.harness-context.v1","agent":"a","harness":"codex","observedAtMs":1}"#,
         )
         .unwrap();
-        assert!(read(&path).is_none(), "a schema this version does not own");
+        assert!(read(&path).is_none(), "a foreign namespace is not this record");
 
         fs::write(
             &path,
@@ -1215,6 +1230,83 @@ mod tests {
             observed.last_compaction_trigger,
             Some(CompactionTrigger::Unknown)
         );
+    }
+
+    /// Reader-first rollout: the reserved version-2 shape is accepted (only the meaning of
+    /// `agent` changed), while anything outside the v1/v2 pair stays refused.
+    #[test]
+    fn the_reserved_next_version_is_accepted_but_other_schemas_stay_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_context_path(tmp.path());
+        let now = crate::message::now_ms();
+
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-context.v2","agent":"0199c0de-7000-7000-8000-00000000abcd","harness":"codex","usedPercent":50,"usedTokens":85000,"observedAtMs":{now}}}"#
+            ),
+        )
+        .unwrap();
+        let observed = read(&path).expect("a tolerant reader accepts the reserved next version");
+        assert_eq!(observed.harness, Harness::Codex);
+        assert_eq!(observed.used_percent, Some(50.0));
+        assert_eq!(observed.used_tokens, Some(85_000));
+
+        for refused in [
+            "st2.harness-context.v3",
+            "com.example.harness-context.v1",
+            "st2.harness-context",
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"schema":"{refused}","agent":"a","harness":"codex","usedPercent":50,"observedAtMs":{now}}}"#
+                ),
+            )
+            .unwrap();
+            assert!(read(&path).is_none(), "{refused} must stay refused");
+        }
+    }
+
+    /// Every writer here stays on version 1 until DELTA-003 activates version-2 writers.
+    #[test]
+    fn the_writer_still_emits_version_1_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let path = harness_context_path(&agent_dir);
+        let mut writer = writer(&agent_dir);
+        assert!(writer.observe(reading(85_000, 33.0)).unwrap());
+        let bytes = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            bytes.contains(r#""schema":"st2.harness-context.v1""#),
+            "observe wrote {bytes}"
+        );
+        assert!(!bytes.contains(SCHEMA_NEXT), "no writer emits v2 yet");
+    }
+
+    /// A record this writer does not own is never coalesced against or downgraded: the write
+    /// lands as this binary's own version with fresh counters, leaving nothing of the v2 record's
+    /// numbers behind.
+    #[test]
+    fn a_write_over_an_unowned_version_does_not_coalesce_or_downgrade_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = catalog(tmp.path());
+        let path = harness_context_path(&agent_dir);
+        let now = crate::message::now_ms();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"st2.harness-context.v2","agent":"0199c0de-7000-7000-8000-00000000abcd","harness":"codex","usedPercent":33,"compactions":9,"observedAtMs":{now}}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut writer = writer(&agent_dir);
+        // Not coalesced: an unowned record cannot suppress this write through the bucket guard.
+        assert!(writer.observe(reading(85_000, 33.0)).unwrap());
+        let record = read_record(&path).unwrap();
+        assert_eq!(record.schema, SCHEMA);
+        assert_eq!(record.compactions, 0, "no counter carried over");
     }
 
     /// A writer clock far enough ahead makes the derived age meaningless, so the record reads as

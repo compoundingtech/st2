@@ -24,7 +24,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
 
+/// The version every writer in this build emits for the sender-owned ledger records.
 const SENT_VERSION: u32 = 1;
+/// Reserved next version of the durable Sent *record* only (DELTA-003): identical to version 1
+/// except that `from`/`to` of an `agent` endpoint carry the immutable agent ID rather than the bus
+/// identity, plus the four nullable endpoint fields below. Readers accept it; nothing writes it yet
+/// — the head, active pointer, commit node and key receipt stay strictly version 1.
+const SENT_RECORD_VERSION_2: u32 = 2;
 const SENT_DIR: &str = "sent";
 const SENT_HEAD: &str = "index.json";
 const SENT_ACTIVE: &str = "active.json";
@@ -71,6 +77,16 @@ struct SentKey {
     record_digest: String,
 }
 
+/// Which kind of endpoint a version-2 `from`/`to` names. An `agent` endpoint holds an immutable
+/// agent ID; a `principal` or `external` endpoint holds that endpoint's canonical address.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum EndpointKind {
+    Agent,
+    Principal,
+    External,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SentRecord {
@@ -86,6 +102,19 @@ struct SentRecord {
     idempotency_key: Option<String>,
     body: String,
     rendered_message: String,
+    /// Version-2 only: publication-time display snapshot of the sender's bus address. Never a
+    /// selector, and absent — not defaulted — on a version-1 row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_address: Option<String>,
+    /// Version-2 only: publication-time display snapshot of the recipient's bus address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_address: Option<String>,
+    /// Version-2 only: what `from` names. `None` means the row never declared a kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_kind: Option<EndpointKind>,
+    /// Version-2 only: what `to` names. `None` means the row never declared a kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_kind: Option<EndpointKind>,
 }
 
 impl SentRecord {
@@ -104,7 +133,10 @@ impl SentRecord {
     }
 
     fn same_operation(&self, candidate: &Self) -> bool {
-        self.from == candidate.from
+        // Version participates in operation identity: rows of different versions mean different
+        // things by `from`/`to`, so a recovered row may only satisfy a retry of its own version.
+        self.version == candidate.version
+            && self.from == candidate.from
             && self.to == candidate.to
             && self.subject == candidate.subject
             && self.in_reply_to == candidate.in_reply_to
@@ -113,7 +145,37 @@ impl SentRecord {
             && self.idempotency_key == candidate.idempotency_key
             && self.body == candidate.body
             && self.rendered_message == candidate.rendered_message
+            && self.from_address == candidate.from_address
+            && self.to_address == candidate.to_address
+            && self.from_kind == candidate.from_kind
+            && self.to_kind == candidate.to_kind
     }
+}
+
+/// Accept exactly the reserved version pair for a durable Sent record; every other value stays a
+/// fail-closed refusal (`MESSAGE-R03`, `MESSAGE-R04`). Version 1 keeps today's meaning: `from`/`to`
+/// are legacy bus identities and the row declares no endpoint kind or address snapshot, so a
+/// version-1 row carrying those fields is refused rather than read as a version-2 row.
+///
+/// DELTA-003: still missing here is the collision-aware legacy attribution rule
+/// (`docs/vrs/03-message/spec.md` "An archived collision is the one exception"). Retyping a
+/// version-1 endpoint as an immutable agent ID needs the migration's durable collision metadata —
+/// which subject kept each reassigned bus identity — and lands with that metadata. Until then a
+/// version-1 endpoint is left exactly as written: a legacy bus identity, never an ID.
+fn validate_sent_record_version(record: &SentRecord) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        record.version == SENT_VERSION || record.version == SENT_RECORD_VERSION_2,
+        "unsupported sent record version"
+    );
+    anyhow::ensure!(
+        record.version == SENT_RECORD_VERSION_2
+            || (record.from_address.is_none()
+                && record.to_address.is_none()
+                && record.from_kind.is_none()
+                && record.to_kind.is_none()),
+        "version-1 sent record carries version-2 endpoint fields"
+    );
+    Ok(())
 }
 
 /// The alphabet st2 *generates* `<rand6>` from — Crockford base32 (`0-9a-z` minus `i l o u`). This is
@@ -718,10 +780,7 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(name.ends_with(".json"), "unexpected sent record entry");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading sent record {}", entry.path().display()))?;
-        anyhow::ensure!(
-            record.version == SENT_VERSION,
-            "unsupported sent record version"
-        );
+        validate_sent_record_version(&record)?;
         anyhow::ensure!(
             sent_record_name(&record.filename) == name,
             "sent record filename does not match its payload"
@@ -754,10 +813,7 @@ fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         anyhow::ensure!(is_sha256(digest), "invalid pending sent record digest");
         let record: SentRecord = serde_json::from_slice(&fs::read(entry.path())?)
             .with_context(|| format!("reading pending sent record {}", entry.path().display()))?;
-        anyhow::ensure!(
-            record.version == SENT_VERSION,
-            "unsupported sent record version"
-        );
+        validate_sent_record_version(&record)?;
         anyhow::ensure!(
             is_message_filename(&record.filename),
             "invalid sent record filename"
@@ -1620,6 +1676,12 @@ fn send_with_ledger(
         idempotency_key: parsed.idempotency_key,
         body: parsed.body,
         rendered_message,
+        // Reader-first rollout: this writer stays on version 1, so `from`/`to` remain legacy bus
+        // identities and the version-2 endpoint fields stay absent from the written bytes.
+        from_address: None,
+        to_address: None,
+        from_kind: None,
+        to_kind: None,
     };
     if let Some(existing) = keyed_record(&root, &candidate)? {
         return Ok(existing.filename);
@@ -1717,10 +1779,7 @@ fn validate_sent_tip(root: &Path, head: &SentHead) -> anyhow::Result<()> {
         .join(SENT_MESSAGES)
         .join(sent_record_name(&node.filename));
     let row: SentRecord = serde_json::from_slice(&fs::read(row_path)?)?;
-    anyhow::ensure!(
-        row.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record_version(&row)?;
     anyhow::ensure!(
         row.filename == node.filename,
         "sent record filename does not match payload"
@@ -1870,10 +1929,7 @@ fn read_sent_record(root: &Path, filename: &str) -> anyhow::Result<SentRecord> {
     let path = root.join(SENT_MESSAGES).join(sent_record_name(filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(&path)?)
         .with_context(|| format!("reading sent record {}", path.display()))?;
-    anyhow::ensure!(
-        record.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record_version(&record)?;
     anyhow::ensure!(
         record.filename == filename,
         "sent record filename does not match payload"
@@ -1981,10 +2037,7 @@ fn keyed_record(root: &Path, candidate: &SentRecord) -> anyhow::Result<Option<Se
         .join(SENT_MESSAGES)
         .join(sent_record_name(&receipt.filename));
     let record: SentRecord = serde_json::from_slice(&fs::read(record_path)?)?;
-    anyhow::ensure!(
-        record.version == SENT_VERSION,
-        "unsupported sent record version"
-    );
+    validate_sent_record_version(&record)?;
     anyhow::ensure!(
         record.filename == receipt.filename,
         "sent key record filename mismatch"
@@ -2622,5 +2675,170 @@ mod tests {
                 "accepted unsafe external identity {identity:?}"
             );
         }
+    }
+
+    /// The exact key set a version-1 row may carry (`serde_json`'s map is ordered by key).
+    const VERSION_1_KEYS: [&str; 12] = [
+        "body",
+        "filename",
+        "from",
+        "idempotencyKey",
+        "inReplyTo",
+        "priority",
+        "renderedMessage",
+        "subject",
+        "tags",
+        "to",
+        "ts",
+        "version",
+    ];
+
+    fn sent_record_json(version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "filename": "1786550000123-abc123.md",
+            "ts": 1_786_550_000_123u64,
+            "from": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+            "to": "0199b8f4-b48d-75c0-baa2-5e0fe2a1f8a3",
+            "subject": serde_json::Value::Null,
+            "inReplyTo": serde_json::Value::Null,
+            "tags": [],
+            "priority": serde_json::Value::Null,
+            "idempotencyKey": serde_json::Value::Null,
+            "body": "message body\n",
+            "renderedMessage": "---\nfrom: dev3.keymap.verifier\n---\nmessage body\n",
+        })
+    }
+
+    fn decode_sent_record(value: &serde_json::Value) -> anyhow::Result<SentRecord> {
+        let record: SentRecord = serde_json::from_slice(&serde_json::to_vec(value)?)?;
+        validate_sent_record_version(&record)?;
+        Ok(record)
+    }
+
+    #[test]
+    fn version_2_sent_record_round_trips_each_endpoint_kind() {
+        for (from_kind, to_kind) in [
+            ("agent", "agent"),
+            ("principal", "agent"),
+            ("agent", "external"),
+            ("external", "principal"),
+        ] {
+            let mut value = sent_record_json(2);
+            value["fromAddress"] = "dev3.keymap.verifier".into();
+            value["toAddress"] = "dev4.fractal.chat".into();
+            value["fromKind"] = from_kind.into();
+            value["toKind"] = to_kind.into();
+
+            let record = decode_sent_record(&value).unwrap();
+
+            assert_eq!(record.version, SENT_RECORD_VERSION_2);
+            assert_eq!(record.from_address.as_deref(), Some("dev3.keymap.verifier"));
+            assert_eq!(record.to_address.as_deref(), Some("dev4.fractal.chat"));
+            let expected = |kind: &str| match kind {
+                "agent" => EndpointKind::Agent,
+                "principal" => EndpointKind::Principal,
+                "external" => EndpointKind::External,
+                _ => unreachable!(),
+            };
+            assert_eq!(record.from_kind, Some(expected(from_kind)));
+            assert_eq!(record.to_kind, Some(expected(to_kind)));
+            // `from`/`to` are carried verbatim: the reader never rewrites an endpoint.
+            assert_eq!(record.from, value["from"].as_str().unwrap());
+            assert_eq!(record.to, value["to"].as_str().unwrap());
+            assert_eq!(
+                serde_json::to_value(&record).unwrap(),
+                value,
+                "a version-2 row must re-serialize to its own bytes so digests still verify"
+            );
+        }
+    }
+
+    #[test]
+    fn version_2_sent_record_accepts_absent_endpoint_fields() {
+        let value = sent_record_json(2);
+
+        let record = decode_sent_record(&value).unwrap();
+
+        assert_eq!(record.version, SENT_RECORD_VERSION_2);
+        assert_eq!(record.from_address, None);
+        assert_eq!(record.to_address, None);
+        assert_eq!(record.from_kind, None);
+        assert_eq!(record.to_kind, None);
+        assert_eq!(serde_json::to_value(&record).unwrap(), value);
+    }
+
+    #[test]
+    fn version_1_sent_record_declares_no_endpoint_kind_or_address_snapshot() {
+        let record = decode_sent_record(&sent_record_json(1)).unwrap();
+
+        assert_eq!(record.version, SENT_VERSION);
+        assert_eq!(record.from_kind, None, "absent means absent, not `agent`");
+        assert_eq!(record.to_kind, None);
+        assert_eq!(record.from_address, None);
+        assert_eq!(record.to_address, None);
+
+        // A version-1 row that carries version-2 state is not a version-2 row.
+        let mut smuggled = sent_record_json(1);
+        smuggled["fromKind"] = "agent".into();
+        assert!(decode_sent_record(&smuggled).is_err());
+    }
+
+    #[test]
+    fn unsupported_sent_record_version_fails_closed_in_the_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let messages = tmp.path().join(SENT_MESSAGES);
+        fs::create_dir_all(&messages).unwrap();
+        let row = sent_record_json(3);
+        fs::write(
+            messages.join(sent_record_name(row["filename"].as_str().unwrap())),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_sent_records(&messages).unwrap_err();
+
+        assert!(
+            error.to_string().contains("unsupported sent record version"),
+            "unexpected error: {error}"
+        );
+        assert!(decode_sent_record(&sent_record_json(0)).is_err());
+    }
+
+    #[test]
+    fn the_writer_still_publishes_exactly_the_version_1_field_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let filename =
+            send_to_resolved_inbox(root, "bob", "h", "alice", None, None, &[], "hi", None, None)
+                .unwrap();
+
+        let bytes = fs::read(
+            sent_dir(&root.join("alice"))
+                .join(SENT_MESSAGES)
+                .join(sent_record_name(&filename)),
+        )
+        .unwrap();
+        let written: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(written["version"], serde_json::json!(1));
+        assert_eq!(
+            written.keys().map(String::as_str).collect::<Vec<_>>(),
+            VERSION_1_KEYS,
+            "a reader-first rollout must not add keys to written bytes"
+        );
+        for reserved in ["fromAddress", "toAddress", "fromKind", "toKind"] {
+            assert!(
+                !String::from_utf8(bytes.clone()).unwrap().contains(reserved),
+                "{reserved} must not appear in version-1 bytes"
+            );
+        }
+        // And the row the reader hands back declares nothing about endpoints.
+        let record = read_sent_records(&sent_dir(&root.join("alice")).join(SENT_MESSAGES)).unwrap();
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].version, SENT_VERSION);
+        assert!(record[0].from_kind.is_none() && record[0].to_kind.is_none());
+        assert!(record[0].from_address.is_none() && record[0].to_address.is_none());
     }
 }

@@ -32,7 +32,22 @@ pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
+/// The version this binary WRITES. Also the ownership key: a record is this writer's only when
+/// it carries exactly this string (see [`Writer::observe`]).
 const SCHEMA: &str = "st2.harness-state.v1";
+/// The reserved next version, whose `agent` field means the immutable agent ID instead of the
+/// bus identity. The shape is otherwise identical, so a tolerant reader decodes its axes exactly
+/// like v1's; nothing here writes it yet (reader-first rollout, DELTA-003).
+const SCHEMA_NEXT: &str = "st2.harness-state.v2";
+
+/// Read admission: exactly the v1/v2 pair, never a wider prefix match. A foreign namespace
+/// (`com.example.harness-state.v1`), an unversioned string (`st2.harness-state`), and any
+/// further version stay refused, because a future schema's words may be spelled like this
+/// version's while meaning something else.
+fn is_supported_schema(schema: &str) -> bool {
+    schema == SCHEMA || schema == SCHEMA_NEXT
+}
+
 /// The claim-sequence floor sidecar, beside the record: claims stay monotonic even across a
 /// record this version cannot parse.
 const SEQ_FLOOR_NAME: &str = ".harness-state.seq";
@@ -389,10 +404,12 @@ impl Writer {
         if on_disk.as_ref().is_some_and(|current| current.seq > seq) {
             return Ok(false);
         }
-        // A foreign schema's `seq` decodes as serde-default zero, which every claim exceeds — a
-        // v1 straggler would otherwise replace a v2 record it cannot even read. Non-claiming
-        // writers refuse foreign schemas outright; only the explicit written [`claim`]
-        // supersedes an unsupported schema.
+        // Write-side comparisons are EXACT own-version equality, deliberately narrower than the
+        // read admission in [`is_supported_schema`]: a v2 record is readable but is not this
+        // writer's record. A record this writer does not own decodes its `seq` as serde-default
+        // zero, which every claim exceeds — a v1 straggler would otherwise replace a v2 record
+        // it does not own. Non-claiming writers refuse any other version outright; only the
+        // explicit written [`claim`] supersedes one.
         if on_disk
             .as_ref()
             .is_some_and(|current| current.schema != SCHEMA)
@@ -401,8 +418,9 @@ impl Writer {
         }
         self.claimed_seq = Some(seq);
         // Ownership is token equality: a record is this writer's only when it carries both this
-        // version's schema and this session's incarnation. Anything else — a foreign schema, a
-        // predecessor's or successor's token, the empty pre-token form — is never coalesced
+        // binary's own write version and this session's incarnation. Anything else — any other
+        // schema (the tolerantly readable v2 included), a predecessor's or successor's token,
+        // the empty pre-token form — is never coalesced
         // against and never treated as this session's terminal word; a genuine observation
         // replaces it wholesale (one logical owner per record), continuing the counter for
         // byte-distinctness. Timestamps deliberately play no part: a same-millisecond takeover
@@ -496,7 +514,8 @@ impl Writer {
         let Some(mut current) = read_record(&self.path) else {
             return Ok(());
         };
-        // A schema this writer does not own must not be round-tripped through this version's
+        // A schema this writer does not own — exact own-version equality, not the wider read
+        // admission — must not be round-tripped through this version's
         // record type, and a record this *session* does not own must never be kept fresh: a
         // lingering predecessor re-stamping its successor's record would keep a dead seat's
         // state alive for cross-host readers, and a successor re-stamping a predecessor's would
@@ -594,9 +613,11 @@ fn read_raw_at(
         return Observed::indeterminate("malformed-record", None);
     };
     let harness = Some(record.harness.clone());
-    // The discriminator gates interpretation: a future schema's words may be spelled like this
-    // version's while meaning something else, so nothing definite may be derived from them.
-    if record.schema != SCHEMA {
+    // The discriminator gates interpretation: a schema outside the accepted version pair may
+    // spell its words like this version's while meaning something else, so nothing definite may
+    // be derived from them. Inside the pair the shape is identical (v2 only reinterprets
+    // `agent` as the immutable agent ID), so every axis below decodes the same way.
+    if !is_supported_schema(&record.schema) {
         return Observed::indeterminate("unsupported-schema", harness);
     }
     if record.written_at_ms > now_ms {
@@ -1252,16 +1273,40 @@ mod tests {
         );
     }
 
+    /// The reserved version-2 shape is identical to v1's — only the meaning of `agent` changed —
+    /// so a tolerant reader decodes its axes exactly like v1's rather than refusing it.
+    #[test]
+    fn the_reserved_next_version_decodes_its_axes_exactly_like_v1() {
+        let raw = br#"{"schema":"st2.harness-state.v2","agent":"0199c0de-7000-7000-8000-00000000abcd","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        let observed = read_raw_at(raw, None, 9_999_999_999_999);
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(observed.reason, None);
+        assert_eq!(observed.blocked_on, BlockedOn::None);
+        assert_eq!(observed.input_buffer, InputBuffer::Empty);
+
+        // Byte-for-byte the same axes as the v1 spelling.
+        let v1 = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        let from_v1 = read_raw_at(v1, None, 9_999_999_999_999);
+        assert_eq!(from_v1.state, observed.state);
+        assert_eq!(from_v1.blocked_on, observed.blocked_on);
+        assert_eq!(from_v1.input_buffer, observed.input_buffer);
+    }
+
     #[test]
     fn future_vocabulary_degrades_to_indeterminate_not_none() {
-        // A future schema gates interpretation entirely — even words spelled exactly like this
-        // version's must not decode as anything definite, because v2 may have changed what the
-        // same spelling means.
-        let raw = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
-        let observed = read_raw_at(raw, None, 9_999_999_999_999);
-        assert_eq!(observed.state, Activity::Unknown);
-        assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
-        assert_eq!(observed.blocked_on, BlockedOn::Unknown);
+        // Outside the accepted version pair the schema gates interpretation entirely — even words
+        // spelled exactly like this version's must not decode as anything definite, because a
+        // later version may have changed what the same spelling means.
+        for raw in [
+            br#"{"schema":"st2.harness-state.v3","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#.as_slice(),
+            br#"{"schema":"com.example.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#.as_slice(),
+            br#"{"schema":"st2.harness-state","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#.as_slice(),
+        ] {
+            let observed = read_raw_at(raw, None, 9_999_999_999_999);
+            assert_eq!(observed.state, Activity::Unknown);
+            assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
+            assert_eq!(observed.blocked_on, BlockedOn::Unknown);
+        }
 
         // And on a v1 record with a known state, unknown axis words stay indeterminate.
         let raw = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#;
@@ -1493,28 +1538,66 @@ mod tests {
         );
     }
 
+    /// Write-side ownership is exact own-version equality, which is deliberately narrower than
+    /// the reader's accepted version pair: the tolerantly readable v2 record is still not this
+    /// writer's record, so it is treated exactly like a genuinely foreign one here.
     #[test]
-    fn foreign_schemas_are_never_coalesced_restamped_or_treated_as_terminal() {
+    fn records_this_writer_does_not_own_are_never_coalesced_restamped_or_treated_as_terminal() {
+        for unowned in [
+            br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#.as_slice(),
+            br#"{"schema":"com.example.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#.as_slice(),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = harness_state_path(tmp.path());
+            fs::write(&path, unowned).unwrap();
+
+            // Heartbeat leaves an unowned record byte-identical rather than stripping its fields
+            // — and a token-only writer cannot replace it either: supersession is a claim's job.
+            let mut unclaimed = writer(tmp.path());
+            unclaimed.heartbeat().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), unowned.to_vec());
+            assert!(!unclaimed.observe_unless_ended(active()).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), unowned.to_vec());
+
+            // A claiming session replaces it wholesale, continuing the counter for
+            // byte-distinctness — and writes THIS binary's version, never the one it found.
+            let mut writer = takeover(tmp.path(), "codex");
+            assert!(writer.observe_unless_ended(active()).unwrap());
+            let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(record.schema, SCHEMA);
+            assert_eq!(record.state, Activity::Active);
+            assert_eq!(record.transitions, 9);
+        }
+    }
+
+    /// Reader-first rollout: readers accept the v1/v2 pair, but every writer here stays on v1.
+    #[test]
+    fn every_writer_path_emits_version_1_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let foreign = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
-        fs::write(&path, foreign).unwrap();
 
-        // Heartbeat leaves a foreign record byte-identical rather than stripping its fields —
-        // and a token-only writer cannot replace it either: supersession is a claim's job.
-        let mut unclaimed = writer(tmp.path());
-        unclaimed.heartbeat().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), foreign.to_vec());
-        assert!(!unclaimed.observe_unless_ended(active()).unwrap());
-        assert_eq!(fs::read(&path).unwrap(), foreign.to_vec());
+        let mut writer = writer(tmp.path());
+        writer.observe(active()).unwrap();
+        let observed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            observed.contains(r#""schema":"st2.harness-state.v1""#),
+            "observe wrote {observed}"
+        );
 
-        // A claiming session replaces it wholesale, continuing the counter for byte-distinctness.
-        let mut writer = takeover(tmp.path(), "codex");
-        assert!(writer.observe_unless_ended(active()).unwrap());
-        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.schema, SCHEMA);
-        assert_eq!(record.state, Activity::Active);
-        assert_eq!(record.transitions, 9);
+        writer.ended("exit 0").unwrap();
+        let terminal = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            terminal.contains(r#""schema":"st2.harness-state.v1""#),
+            "ended wrote {terminal}"
+        );
+
+        claim(tmp.path(), "hetz.worker", "codex", &session_token()).unwrap();
+        let claimed = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            claimed.contains(r#""schema":"st2.harness-state.v1""#),
+            "claim wrote {claimed}"
+        );
+        assert!(!claimed.contains(SCHEMA_NEXT), "no writer emits v2 yet");
     }
 
     #[test]
@@ -1814,9 +1897,10 @@ mod tests {
     }
 
     /// W8-6: a v2 record's serde-default sequence of zero is below every claim — but a v1
-    /// straggler must not replace a record it cannot read. Only the written claim supersedes.
+    /// straggler must not replace a record it does not own. A tolerant reader can now READ v2;
+    /// writing over it is a separate, narrower right. Only the written claim supersedes.
     #[test]
-    fn non_claiming_writers_refuse_foreign_schemas_outright() {
+    fn non_claiming_writers_refuse_versions_they_do_not_own_outright() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let v2 = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
