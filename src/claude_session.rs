@@ -111,7 +111,7 @@ fn development_channel_argv(
                     catalog_root,
                     "driver",
                     "claude-mcp",
-                    "--identity",
+                    "--id",
                     identity
                 ]
             }
@@ -722,7 +722,7 @@ mod tests {
                 "/var/lib/st2/catalog",
                 "driver",
                 "claude-mcp",
-                "--identity",
+                "--id",
                 "host.worker"
             ])
         );
