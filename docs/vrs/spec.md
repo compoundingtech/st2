@@ -204,7 +204,7 @@ edit canonical KDL only. Each operation:
    original inode/version and bytes, atomically renames it through retained
    no-follow directory capabilities, then fsyncs the declaration directory.
 
-`ST_AGENT` carries the catalog-global agent ID and remains an exact actor
+`ST_AGENT` carries the catalog-global agent ID and remains an exact subject
 selector supplied by reconciliation, not the mutable bus address. Host
 placement comes from the declaration/runtime context rather than being encoded
 into `ST_AGENT`. `ST_AGENT` is a trusted-fleet convention rather than an
@@ -237,8 +237,8 @@ preserves every legacy task ID and socket path because each frozen ID equals its
 former bus identity and the lowering rule itself does not change. Host placement
 is not separately concatenated into a default ID; host-looking bytes inside a
 legacy ID are opaque. Every PTY receives the exact owned tag snapshot
-`agent.presentation.schema=2`, `agent.actor.id=<agent-id>`,
-`agent.actor.address=<bus-address>`, and optional
+`agent.presentation.schema=2`, `agent.subject.id=<agent-id>`,
+`agent.subject.address=<bus-address>`, and optional
 `agent.presentation.description=<description>`. Clearing a value removes only
 its owned tag. Unrelated tags remain unchanged. Only the canonical compact agent
 task whose task ID equals the agent ID carries the compatibility tag
@@ -761,7 +761,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   exact match is accepted, and a conflicting authored value refuses the
   declaration before workspace materialization or runner access. The value is
   part of the persisted launch environment, so initial launch, supervised
-  replay, and manual PTY restart preserve the same actor ID.
+  replay, and manual PTY restart preserve the same subject ID.
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares

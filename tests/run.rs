@@ -776,25 +776,30 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
     assert_eq!(compact_agent.presentation, explicit_agent.presentation);
     assert_eq!(compact_agent.tags, explicit_agent.tags);
 
-    // Schema 2: the actor is named by immutable ID, the current route is a separate owned tag, and
-    // schema 1's `agent.actor.path` route alias is explicitly deleted on every managed PTY.
+    // Schema 2: the subject is named by immutable ID, the current route is a separate owned tag,
+    // and schema 1's `agent.actor.path` route alias is explicitly deleted on every managed PTY.
+    // `agent.actor.id` names the external actor and is never in an st2-owned snapshot.
     let primary_tags = &compact_agent.presentation.as_ref().unwrap().tags;
     assert_eq!(
         primary_tags.get("agent.presentation.schema"),
         Some(&Some("2".to_owned()))
     );
     assert_eq!(
-        primary_tags.get("agent.actor.id"),
+        primary_tags.get("agent.subject.id"),
         Some(&Some("hetz.demo".to_owned()))
     );
     assert_eq!(
-        primary_tags.get("agent.actor.address"),
+        primary_tags.get("agent.subject.address"),
         Some(&Some("hetz.demo".to_owned()))
     );
     assert_eq!(
         primary_tags.get("agent.actor.path"),
         Some(&None),
         "the schema-1 route alias is deleted, not carried"
+    );
+    assert!(
+        !primary_tags.contains_key("agent.actor.id"),
+        "the external actor tag is not st2-owned: {primary_tags:?}"
     );
     assert_eq!(primary_tags.get("role"), Some(&Some("agent".to_owned())));
     assert!(!primary_tags.contains_key("run.role"));
@@ -805,9 +810,9 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
         .unwrap();
     let secondary_tags = &secondary.presentation.as_ref().unwrap().tags;
     assert_eq!(
-        secondary_tags.get("agent.actor.id"),
+        secondary_tags.get("agent.subject.id"),
         Some(&Some("hetz.demo".to_owned())),
-        "a secondary PTY is owned by the same immutable actor"
+        "a secondary PTY belongs to the same immutable subject"
     );
     assert_eq!(secondary_tags.get("agent.actor.path"), Some(&None));
     assert_eq!(secondary_tags.get("role"), Some(&None));

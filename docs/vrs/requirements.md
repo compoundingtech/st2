@@ -375,9 +375,11 @@ accepted.
   `<agent-id>.<task-name>`, including a task named `agent`; an explicitly
   authored task ID remains authoritative. State and Resource paths remain
   anchored at the declaration parent under R02. For every healthy managed PTY,
-  st2 reconciles a versioned owned metadata snapshot containing immutable actor
-  ID, current bus address, and optional description through one exact task-ID
-  metadata patch. Only the canonical compact agent task whose task ID equals
+  st2 reconciles a versioned owned metadata snapshot containing immutable
+  subject ID, current bus address, and optional description through one exact
+  task-ID metadata patch. The external-actor tag `agent.actor.id` is outside
+  that snapshot and is never written or removed.
+  Only the canonical compact agent task whose task ID equals
   the agent ID maps optional name to native PTY display metadata; other PTYs
   preserve their task-specific display convention. Projection
   preserves unrelated tags, removes absent owned values, reports and retries
