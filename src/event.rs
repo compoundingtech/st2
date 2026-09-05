@@ -17,6 +17,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::identity::AgentSelector;
 use crate::message;
 
 const EVENT_VERSION: u32 = 1;
@@ -91,7 +92,12 @@ pub enum EventReceiptStatus {
 }
 
 struct ResolvedStream {
+    /// The agent key this publication is owned by and persisted under: the positional
+    /// `<host>.<identity>` bus identity, which an address cutover never moves.
     recipient: String,
+    /// How to reach that subject's own directories again — an exact selector, so a publication
+    /// keeps working across an address cutover.
+    selector: AgentSelector,
 }
 
 enum StreamAdmission {
@@ -299,13 +305,25 @@ pub(crate) fn refusal_kind(error: &anyhow::Error) -> Option<RefusalKind> {
         .map(|refusal| refusal.kind)
 }
 
+/// Resolve one publication's recipient.
+///
+/// Ordinary references go through [`crate::identity::resolve_address`] — the same fail-closed
+/// bare-or-qualified algorithm every other reference uses, with dedupe by agent ID — rather than
+/// a hand-rolled precedence filter. The local host is tried first, so a bare address still names
+/// this host's subject when another host declares the same address; a reference that only a
+/// foreign host answers still resolves, and then meets the owner refusal below with its own
+/// diagnostic instead of an unhelpful absence.
 fn resolve_stream(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &AgentSelector,
     stream: &str,
     admission: StreamAdmission,
 ) -> anyhow::Result<ResolvedStream> {
+    let reference = match recipient {
+        AgentSelector::Id(id) => id.as_str(),
+        AgentSelector::Address(address) => address.as_str(),
+    };
     let discovered = crate::discover_strict(root);
     anyhow::ensure!(
         discovered.errors.is_empty(),
@@ -317,36 +335,44 @@ fn resolve_stream(
             .collect::<Vec<_>>()
             .join("; ")
     );
-    let mut matches = discovered
-        .specs
-        .into_iter()
-        .filter(|spec| {
-            spec.bus_id(this_host) == recipient
-                || (spec.resolved_host(this_host) == this_host && spec.identity == recipient)
-        })
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        !matches.is_empty(),
-        "no agent '{recipient}' found in catalog {}",
-        root.display()
-    );
-    if matches.len() > 1 {
-        return Err(StreamRefusal::new(
+    // Two books, as everywhere else a reference resolves: retirement releases the address, so a
+    // retired subject must not make a live claimant ambiguous — but it still answers to its own
+    // address when nothing routable does, which is what turns "no such agent" into the
+    // `RecipientNotRunning` refusal a supervisor can act on.
+    let book = crate::identity::address_book(&discovered.specs, this_host);
+    let selected = match pinned_then_unpinned(&book, recipient, this_host) {
+        Err(crate::identity::ResolveError::Unknown { .. }) => {
+            let every_subject = discovered
+                .specs
+                .iter()
+                .map(|spec| crate::identity::AddressBookEntry {
+                    id: spec.effective_id(this_host),
+                    bus_identity: spec.bus_id(this_host),
+                    host: spec.resolved_host(this_host).to_owned(),
+                    address: spec.effective_address().to_owned(),
+                })
+                .collect::<Vec<_>>();
+            pinned_then_unpinned(&every_subject, recipient, this_host)
+                .map(|entry| (entry.id.clone(), entry.bus_identity.clone()))
+        }
+        other => other.map(|entry| (entry.id.clone(), entry.bus_identity.clone())),
+    };
+    let (agent_id, bus_identity) = selected.map_err(|error| match error {
+        crate::identity::ResolveError::Unknown { .. } => anyhow::anyhow!(
+            "no agent '{reference}' found in catalog {}",
+            root.display()
+        ),
+        error @ crate::identity::ResolveError::Ambiguous { .. } => StreamRefusal::new(
             RefusalKind::Permanent,
-            format!(
-                "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
-                matches.len(),
-                matches
-                    .iter()
-                    .map(|spec| spec.path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
-    }
-    let spec = matches
-        .pop()
-        .context("exactly one matching agent expected")?;
+            format!("agent recipient '{reference}' is ambiguous; {error}"),
+        ),
+    })?;
+    let spec = discovered
+        .specs
+        .iter()
+        .find(|spec| spec.bus_id(this_host) == bus_identity)
+        .context("the resolved agent left the discovery it was resolved against")?;
+    let key = bus_identity;
     if spec.resolved_host(this_host) != this_host {
         return Err(StreamRefusal::new(
             RefusalKind::Permanent,
@@ -385,8 +411,29 @@ fn resolve_stream(
         ));
     }
     Ok(ResolvedStream {
-        recipient: spec.bus_id(this_host),
+        // The exact selector, not the address just resolved: the subject's own directories must
+        // stay reachable through a later address cutover.
+        selector: AgentSelector::Id(agent_id),
+        recipient: key,
     })
+}
+
+/// Try the local host first, then the whole catalog.
+///
+/// A bare address names this host's subject even when another host declares the same address —
+/// today's behavior — while a reference only a foreign host answers still resolves, so the caller
+/// can refuse it by name.
+fn pinned_then_unpinned<'a>(
+    book: &'a [crate::identity::AddressBookEntry],
+    recipient: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<&'a crate::identity::AddressBookEntry, crate::identity::ResolveError> {
+    match crate::identity::resolve(book, recipient, Some(this_host)) {
+        Err(crate::identity::ResolveError::Unknown { .. }) => {
+            crate::identity::resolve(book, recipient, None)
+        }
+        other => other,
+    }
 }
 
 pub fn render_event(
@@ -430,7 +477,7 @@ pub fn emit(
     emit_admitted(
         root,
         this_host,
-        recipient,
+        &AgentSelector::Address(recipient.to_owned()),
         stream,
         event_id,
         key,
@@ -455,7 +502,7 @@ pub(crate) fn emit_builtin_resync(
     emit_admitted(
         root,
         this_host,
-        recipient,
+        &AgentSelector::Id(recipient.to_owned()),
         crate::resync::RESYNC_STREAM,
         event_id,
         key,
@@ -470,7 +517,7 @@ pub(crate) fn emit_builtin_resync(
 fn emit_admitted(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &AgentSelector,
     stream: &str,
     event_id: &str,
     key: Option<&str>,
@@ -491,13 +538,15 @@ fn emit_admitted(
     // suspension edit owns this lock, no later emit can publish from a stale running observation.
     let catalog_lock = crate::catalog_lock::CatalogLock::shared(root)?;
     validate_owner_binding(root, this_host, &catalog_lock)?;
-    let resolved = resolve_stream(root, this_host, recipient, stream, admission)?;
-    let canonical_recipient = resolved.recipient;
+    let ResolvedStream {
+        recipient: canonical_recipient,
+        selector,
+    } = resolve_stream(root, this_host, recipient, stream, admission)?;
     let from = format!("{canonical_recipient}/{stream}");
     let rendered = render_event(&from, subject, stream, event_id, key, body);
     message::with_resolved_state_dir(
         root,
-        &canonical_recipient,
+        &selector,
         this_host,
         &["resources", "streams", stream],
         true,
@@ -525,7 +574,7 @@ fn emit_admitted(
                     .expect("different pending event was just observed");
                 let materialized = message::with_resolved_message_boxes(
                     root,
-                    &canonical_recipient,
+                    &selector,
                     this_host,
                     |inbox, archive| {
                         let inbox_bytes = read_message_entry(inbox, &pending.filename)?;
@@ -608,7 +657,7 @@ fn emit_admitted(
                     let predecessor = if supersede {
                         message::with_resolved_message_boxes(
                             root,
-                            &canonical_recipient,
+                            &selector,
                             this_host,
                             |inbox, archive| {
                                 for entry in record.recent.iter().filter(|entry| {
@@ -644,7 +693,7 @@ fn emit_admitted(
 
             let created = message::with_resolved_message_boxes(
                 root,
-                &canonical_recipient,
+                &selector,
                 this_host,
                 |inbox, archive| {
                     // Publish before compacting. If predecessor archival fails or the process
@@ -1189,5 +1238,114 @@ impl Drop for StreamLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn declare_worker(root: &Path, extra: &str) -> PathBuf {
+        let directory = root.join("agents/hetz/worker");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("agent.kdl"),
+            format!(
+                "agent \"worker\" {{\n  host \"hetz\"\n{extra}  desired-state \"running\"\n  command \"agent\"\n}}\n"
+            ),
+        )
+        .unwrap();
+        publish_owner_binding_for_test(root, "hetz").unwrap();
+        directory
+    }
+
+    fn stream_state(agent: &Path, stream: &str) -> StreamRecord {
+        let path = agent
+            .join("resources/streams")
+            .join(stream)
+            .join("state.json");
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// `st2 event emit` names its recipient by ordinary bus address, so a declared `address` is
+    /// what routes — bare or host-qualified — and the released identity spelling refuses at once.
+    /// Ownership stays on the positional bus identity, which the cutover never moved.
+    #[test]
+    fn a_declared_address_routes_an_event_while_ownership_stays_on_the_bus_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = declare_worker(
+            root.path(),
+            "  address \"chat\"\n  stream \"gh-ci\" {}\n",
+        );
+
+        for reference in ["hetz.chat", "chat"] {
+            let receipt = emit(
+                root.path(),
+                "hetz",
+                reference,
+                "gh-ci",
+                &format!("run-{reference}"),
+                None,
+                None,
+                "{}",
+                false,
+            )
+            .expect("the declared address routes");
+            assert_eq!(receipt.recipient, "hetz.worker");
+        }
+        assert_eq!(stream_state(&agent, "gh-ci").recipient, "hetz.worker");
+
+        let refused = emit(
+            root.path(),
+            "hetz",
+            "hetz.worker",
+            "gh-ci",
+            "run-legacy",
+            None,
+            None,
+            "{}",
+            false,
+        )
+        .expect_err("the identity spelling is not an address once one is declared");
+        assert!(
+            format!("{refused:#}").contains("no agent 'hetz.worker' found"),
+            "{refused:#}"
+        );
+    }
+
+    /// Built-in resync names its recipient by the agent key reconciliation holds — the positional
+    /// bus identity — so an address cutover cannot disconnect a running seat from its own resync
+    /// stream. This is the nondisruptive half of the cutover, and it is why the exact selector
+    /// answers to the positional key as well as to an explicit `id`.
+    #[test]
+    fn resync_still_reaches_a_subject_whose_address_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = declare_worker(root.path(), "  address \"chat\"\n");
+
+        let receipt = emit_builtin_resync(
+            root.path(),
+            "hetz",
+            "hetz.worker",
+            "resync-1",
+            None,
+            None,
+            "{}",
+            false,
+        )
+        .expect("the agent key reaches its own subject after a cutover");
+        assert_eq!(receipt.recipient, "hetz.worker");
+        assert_eq!(receipt.status, EventReceiptStatus::Created);
+        assert_eq!(
+            stream_state(&agent, crate::resync::RESYNC_STREAM).recipient,
+            "hetz.worker"
+        );
+        let inbox = crate::message::list_inbox(&crate::message::inbox_dir(&agent)).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(
+            inbox[0].from.as_deref(),
+            Some(format!("hetz.worker/{}", crate::resync::RESYNC_STREAM).as_str())
+        );
     }
 }
