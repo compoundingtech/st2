@@ -132,9 +132,10 @@ shape named by decision 0015.
 Update these load-bearing invariant rows and their named tests in the same
 implementation:
 
-- `Runner-owned task identity`, including its PTY actor-tag clause, from
+- `Runner-owned task identity`, including its PTY subject-tag clause, from
   host-qualified `ST_AGENT` and schema-1 `agent.actor.path` to raw immutable ID
-  and schema-2 `agent.actor.id` plus `agent.actor.address`;
+  and schema-2 `agent.subject.id` plus `agent.subject.address`, leaving the
+  external-actor tag `agent.actor.id` untouched;
 - `Stable roster JSON` for appended immutable ID, nullable current bus address,
   presentation, and migrated supervisor projection;
 - `R23 fail-closed diagnostic inventory` for ID-keyed ownership and nullable

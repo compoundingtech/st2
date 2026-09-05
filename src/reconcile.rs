@@ -525,12 +525,15 @@ pub struct PtyPresentation {
 }
 
 pub const AGENT_PRESENTATION_SCHEMA_TAG: &str = "agent.presentation.schema";
-/// Owned-metadata schema carried by every managed PTY: immutable actor ID plus current address.
+/// Owned-metadata schema carried by every managed PTY: immutable subject ID plus current address.
 pub const AGENT_PRESENTATION_SCHEMA: &str = "2";
-/// The immutable agent ID of the actor that owns this PTY.
-pub const AGENT_ACTOR_ID_TAG: &str = "agent.actor.id";
-/// The actor's current bus address. Removed when the subject is non-routable.
-pub const AGENT_ACTOR_ADDRESS_TAG: &str = "agent.actor.address";
+/// The immutable Agent Spec ID of the subject this PTY belongs to.
+///
+/// This is deliberately NOT `agent.actor.id`: that key names the *external actor* driving the
+/// session and belongs to whoever writes it. st2 never writes it and never deletes it.
+pub const AGENT_SUBJECT_ID_TAG: &str = "agent.subject.id";
+/// The subject's current bus address. Removed when the subject is non-routable.
+pub const AGENT_SUBJECT_ADDRESS_TAG: &str = "agent.subject.address";
 /// The schema-1 owned key this schema replaces. It held a *route*, which after an address cutover
 /// may name a different subject entirely, so leaving it behind would strand a stale alias on the
 /// session forever. It is st2-owned, so the schema-2 patch deletes it: the projection always
@@ -614,10 +617,13 @@ fn runner_task_env(
 
 /// The exact owned metadata snapshot (schema 2) desired for one managed PTY.
 ///
-/// Immutable actor ID, the current bus address, and the optional description. A non-routable
+/// Immutable subject ID, the current bus address, and the optional description. A non-routable
 /// subject has released its address, so its owned address tag is removed rather than frozen at
 /// the last route. Only the canonical compact agent task — the one whose task ID *is* the agent
 /// ID — carries `role=agent` and maps `name` to native display metadata.
+///
+/// The snapshot never mentions `agent.actor.id`: that key names the external actor driving the
+/// session, is not st2-owned, and is therefore neither written nor deleted here.
 ///
 /// The snapshot also always carries [`LEGACY_AGENT_ACTOR_PATH_TAG`] with `None`. Schema 1 stored a
 /// route under that key; leaving it on a session that predates this schema would strand an alias
@@ -646,9 +652,9 @@ fn pty_presentation(
                 AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
                 Some(AGENT_PRESENTATION_SCHEMA.to_owned()),
             ),
-            (AGENT_ACTOR_ID_TAG.to_owned(), Some(agent_id.to_owned())),
+            (AGENT_SUBJECT_ID_TAG.to_owned(), Some(agent_id.to_owned())),
             (
-                AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                AGENT_SUBJECT_ADDRESS_TAG.to_owned(),
                 bus_address.map(str::to_owned),
             ),
             (LEGACY_AGENT_ACTOR_PATH_TAG.to_owned(), None),
@@ -1266,9 +1272,9 @@ mod tests {
                     AGENT_PRESENTATION_SCHEMA_TAG.to_owned(),
                     Some("2".to_owned())
                 ),
-                (AGENT_ACTOR_ID_TAG.to_owned(), Some(ID.to_owned())),
+                (AGENT_SUBJECT_ID_TAG.to_owned(), Some(ID.to_owned())),
                 (
-                    AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    AGENT_SUBJECT_ADDRESS_TAG.to_owned(),
                     Some("dev3.fractal.keymap.verifier".to_owned())
                 ),
                 (LEGACY_AGENT_ACTOR_PATH_TAG.to_owned(), None),
@@ -1297,8 +1303,8 @@ mod tests {
 
         let projected =
             pty_presentation(&declared, &declared.tasks[0], ID, ID, address.as_deref()).unwrap();
-        assert_eq!(projected.tags[AGENT_ACTOR_ADDRESS_TAG], None);
-        assert_eq!(projected.tags[AGENT_ACTOR_ID_TAG], Some(ID.to_owned()));
+        assert_eq!(projected.tags[AGENT_SUBJECT_ADDRESS_TAG], None);
+        assert_eq!(projected.tags[AGENT_SUBJECT_ID_TAG], Some(ID.to_owned()));
     }
 
     /// Only the canonical compact agent task — the one whose task ID *is* the agent ID — carries
@@ -1347,9 +1353,9 @@ mod tests {
                 display_name: None,
                 tags: BTreeMap::from([
                     (AGENT_PRESENTATION_SCHEMA_TAG.to_owned(), "2".to_owned()),
-                    (AGENT_ACTOR_ID_TAG.to_owned(), ID.to_owned()),
+                    (AGENT_SUBJECT_ID_TAG.to_owned(), ID.to_owned()),
                     (
-                        AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                        AGENT_SUBJECT_ADDRESS_TAG.to_owned(),
                         "dev3.fractal.keymap.verifier".to_owned(),
                     ),
                     (
@@ -1378,7 +1384,7 @@ mod tests {
         // A stale address is the one effective delta, and it patches without touching lifecycle.
         let mut stale = observed.clone();
         let stale_tags = &mut stale.presentation.as_mut().unwrap().tags;
-        stale_tags.insert(AGENT_ACTOR_ADDRESS_TAG.to_owned(), "dev3.worker".to_owned());
+        stale_tags.insert(AGENT_SUBJECT_ADDRESS_TAG.to_owned(), "dev3.worker".to_owned());
         let repaired = reconcile(
             std::slice::from_ref(&declared),
             std::slice::from_ref(&stale),
@@ -1387,7 +1393,7 @@ mod tests {
         .unwrap();
         assert_eq!(repaired.presentation.len(), 1);
         assert_eq!(
-            repaired.presentation[0].tags[AGENT_ACTOR_ADDRESS_TAG],
+            repaired.presentation[0].tags[AGENT_SUBJECT_ADDRESS_TAG],
             Some("dev3.fractal.keymap.verifier".to_owned())
         );
         assert!(repaired.launch.is_empty() && repaired.teardown.is_empty());
@@ -1473,7 +1479,8 @@ mod tests {
 
     /// A session tagged under schema 1 carries `agent.actor.path`, which is a ROUTE: after an
     /// address cutover those bytes can name a different subject. The first schema-2 patch must
-    /// delete that owned key, leave unrelated tags alone, and then stay idempotent.
+    /// delete that owned key, leave unrelated tags alone — including the external actor's
+    /// `agent.actor.id`, which st2 neither writes nor deletes — and then stay idempotent.
     #[test]
     fn the_first_schema_two_patch_deletes_a_stale_schema_one_actor_path() {
         let mut declared = migrated(vec![task("agent", TaskKind::Pty, Some(ID))]);
@@ -1492,6 +1499,8 @@ mod tests {
             ),
             (COMPATIBILITY_ROLE_TAG.to_owned(), "agent".to_owned()),
             ("unrelated".to_owned(), "preserved".to_owned()),
+            // The external actor driving this session. Not st2-owned: never written, never deleted.
+            ("agent.actor.id".to_owned(), "claude-code".to_owned()),
         ]);
         let session = |tags: &BTreeMap<String, String>| Session {
             pty_id: ID.to_owned(),
@@ -1519,10 +1528,15 @@ mod tests {
             patch.tags[AGENT_PRESENTATION_SCHEMA_TAG],
             Some("2".to_owned())
         );
-        assert_eq!(patch.tags[AGENT_ACTOR_ID_TAG], Some(ID.to_owned()));
+        assert_eq!(patch.tags[AGENT_SUBJECT_ID_TAG], Some(ID.to_owned()));
         assert!(
             !patch.tags.contains_key("unrelated"),
             "an unrelated tag is not ours to touch: {:?}",
+            patch.tags
+        );
+        assert!(
+            !patch.tags.contains_key("agent.actor.id"),
+            "the external actor tag is not st2-owned and must never be written or deleted: {:?}",
             patch.tags
         );
 
@@ -1541,6 +1555,11 @@ mod tests {
             observed_tags.get("unrelated").map(String::as_str),
             Some("preserved"),
             "the unrelated tag survived the patch"
+        );
+        assert_eq!(
+            observed_tags.get("agent.actor.id").map(String::as_str),
+            Some("claude-code"),
+            "the external actor tag survived the patch untouched"
         );
         assert!(!observed_tags.contains_key(LEGACY_AGENT_ACTOR_PATH_TAG));
 

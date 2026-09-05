@@ -642,9 +642,9 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         primary.tags,
         BTreeMap::from([
             ("agent.presentation.schema".to_owned(), Some("2".to_owned())),
-            ("agent.actor.id".to_owned(), Some("hetz.worker".to_owned())),
+            ("agent.subject.id".to_owned(), Some("hetz.worker".to_owned())),
             (
-                "agent.actor.address".to_owned(),
+                "agent.subject.address".to_owned(),
                 Some("hetz.worker".to_owned())
             ),
             ("agent.actor.path".to_owned(), None),
@@ -665,9 +665,9 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         secondary.tags,
         BTreeMap::from([
             ("agent.presentation.schema".to_owned(), Some("2".to_owned())),
-            ("agent.actor.id".to_owned(), Some("hetz.worker".to_owned())),
+            ("agent.subject.id".to_owned(), Some("hetz.worker".to_owned())),
             (
-                "agent.actor.address".to_owned(),
+                "agent.subject.address".to_owned(),
                 Some("hetz.worker".to_owned())
             ),
             ("agent.actor.path".to_owned(), None),
@@ -717,8 +717,8 @@ fn live_pty_presentation_only_queues_observed_drift() {
     let specs = [owner];
     let exact_tags = BTreeMap::from([
         ("agent.presentation.schema".to_owned(), "2".to_owned()),
-        ("agent.actor.id".to_owned(), "hetz.worker".to_owned()),
-        ("agent.actor.address".to_owned(), "hetz.worker".to_owned()),
+        ("agent.subject.id".to_owned(), "hetz.worker".to_owned()),
+        ("agent.subject.address".to_owned(), "hetz.worker".to_owned()),
         (
             "agent.presentation.description".to_owned(),
             "Owns build delivery".to_owned(),

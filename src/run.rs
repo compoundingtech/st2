@@ -5831,11 +5831,11 @@ mod tests {
                     Some(crate::reconcile::AGENT_PRESENTATION_SCHEMA.to_owned()),
                 ),
                 (
-                    crate::reconcile::AGENT_ACTOR_ID_TAG.to_owned(),
+                    crate::reconcile::AGENT_SUBJECT_ID_TAG.to_owned(),
                     Some("hetz.demo".to_owned()),
                 ),
                 (
-                    crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    crate::reconcile::AGENT_SUBJECT_ADDRESS_TAG.to_owned(),
                     Some("hetz.demo".to_owned()),
                 ),
                 (
@@ -5859,8 +5859,8 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(tags.contains("unrelated=preserved"));
         assert!(tags.contains("agent.presentation.schema=2"));
-        assert!(tags.contains("agent.actor.id=hetz.demo"));
-        assert!(tags.contains("agent.actor.address=hetz.demo"));
+        assert!(tags.contains("agent.subject.id=hetz.demo"));
+        assert!(tags.contains("agent.subject.address=hetz.demo"));
         assert!(
             !tags.iter().any(|tag| tag.starts_with("agent.actor.path")),
             "schema 1's actor path is replaced, not carried alongside: {tags:?}"
@@ -6957,7 +6957,7 @@ esac
         std::fs::write(
             &fake,
             r#"#!/bin/sh
-printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"2","agent.actor.id":"h.live","agent.actor.address":"h.build","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"2","agent.subject.id":"h.live","agent.subject.address":"h.build","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
 "#,
         )
         .unwrap();
@@ -6994,13 +6994,13 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
             Some("2")
         );
         assert_eq!(
-            presentation.tags.get("agent.actor.id").map(String::as_str),
+            presentation.tags.get("agent.subject.id").map(String::as_str),
             Some("h.live")
         );
         assert_eq!(
             presentation
                 .tags
-                .get("agent.actor.address")
+                .get("agent.subject.address")
                 .map(String::as_str),
             Some("h.build")
         );
@@ -7106,11 +7106,11 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
                     Some(crate::reconcile::AGENT_PRESENTATION_SCHEMA.to_owned()),
                 ),
                 (
-                    crate::reconcile::AGENT_ACTOR_ID_TAG.to_owned(),
+                    crate::reconcile::AGENT_SUBJECT_ID_TAG.to_owned(),
                     Some("dev3.worker".to_owned()),
                 ),
                 // A non-routable subject has released its address.
-                (crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(), None),
+                (crate::reconcile::AGENT_SUBJECT_ADDRESS_TAG.to_owned(), None),
                 (crate::reconcile::AGENT_DESCRIPTION_TAG.to_owned(), None),
                 (crate::reconcile::COMPATIBILITY_ROLE_TAG.to_owned(), None),
             ]),
@@ -7129,11 +7129,11 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
 
         assert!(tags.contains("unrelated=preserved"));
         assert!(tags.contains("agent.presentation.schema=2"));
-        assert!(tags.contains("agent.actor.id=dev3.worker"));
+        assert!(tags.contains("agent.subject.id=dev3.worker"));
         assert!(
             !tags
                 .iter()
-                .any(|tag| tag.starts_with("agent.actor.address")),
+                .any(|tag| tag.starts_with("agent.subject.address")),
             "an absent owned value is removed, never written empty: {tags:?}"
         );
         assert!(
@@ -7177,7 +7177,7 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
                 pty_id: "dev3.worker".to_owned(),
                 display_name: None,
                 tags: BTreeMap::from([(
-                    crate::reconcile::AGENT_ACTOR_ADDRESS_TAG.to_owned(),
+                    crate::reconcile::AGENT_SUBJECT_ADDRESS_TAG.to_owned(),
                     Some("dev3.renamed".to_owned()),
                 )]),
             }],
