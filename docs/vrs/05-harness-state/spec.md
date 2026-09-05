@@ -169,7 +169,7 @@ What a reader reports, in evaluation order:
 | --- | --- | --- |
 | No record file | no observation (`null`) | never observed ≠ `unknown` |
 | File exists but cannot be read | `unknown` | `unreadable-record`; an IO error is indeterminate, never absence |
-| Unparseable / non-v1-shaped bytes | `unknown` | `malformed-record`; never falls back to mtime |
+| Unparseable bytes, or bytes not shaped like an accepted version | `unknown` | `malformed-record`; never falls back to mtime |
 | `schema` is neither `st2.harness-state.v1` nor, once tolerant readers ship, `st2.harness-state.v2` | `unknown` | `unsupported-schema`; a future schema's words may be spelled like this version's while meaning something else |
 | `writtenAtMs` > now + 60 s | `unknown` | `future-skew` |
 | `writtenAtMs` ≤ now − 15 min | `unknown` | `stale` |

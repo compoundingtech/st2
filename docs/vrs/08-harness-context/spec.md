@@ -228,11 +228,14 @@ What a reader projects, in evaluation order:
 | Evidence | Projects as | Reason |
 | --- | --- | --- |
 | No record file | `null` | never observed |
-| Unreadable, unparseable, or non-v1 `schema` | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
+| Unreadable, unparseable, or a `schema` outside the accepted versions | `null`, warning logged | nothing trustworthy to report; `DQ-C5` asks whether this deserves an explicit `indeterminate` the way `driverDiagnostic` has one |
 | Unrecognized `harness` | `null`, warning logged | the arithmetic is unknown, so the numbers have no meaning |
 | `observedAtMs` > now + `HARNESS_CONTEXT_FUTURE_SKEW` | `null` | a clock this wrong makes the derived age meaningless |
 | `observedAtMs` ≤ now − `HARNESS_CONTEXT_STALE` | the reading, `stale: true`, with `ageMs` | HC-R06: returned with its age, never derived away |
 | Otherwise | the reading, `stale: false`, with `ageMs` | — |
+
+The accepted versions are `st2.harness-context.v1` and, once tolerant readers
+ship, `st2.harness-context.v2`; any other schema string is refused.
 
 `ageMs` is derived by the reader from `observedAtMs`; no read path consults file
 mtime. There is no `unknown` vocabulary on this axis and no path from any
