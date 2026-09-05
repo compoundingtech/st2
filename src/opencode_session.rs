@@ -491,45 +491,27 @@ fn note_write(outcome: Result<harness_state::WriteOutcome>) {
     }
 }
 
-/// THE terminal record, in whichever vocabulary this writer emits. Every process-exit owner goes
-/// through here — the launch failure, the STOP path and its reap, the ordinary child exit, and the
-/// failed liveness check — because they are the only writers of `ended` and the version they
-/// write it in must be decided once.
+/// THE terminal record for this driver's four process-exit owners — the launch failure, the STOP
+/// path and its reap, the ordinary child exit, and the failed liveness check.
 ///
-/// Under version 2 this is the EXACT legacy statement [`Writer::ended`] makes, so the shipped
-/// bytes do not move. Under version 3 it is a terminal `Frame` whose condition rides `Unchanged`:
-/// an exit says nothing new about a fault, and whatever stood is the incarnation's last word about
-/// that too. A session that exits before it ever stated the axis — a launch failure, an immediate
-/// reap — hits the same `Unstated` refusal a first live frame does, so it takes the same one-shot
-/// retry with the axis the reducer projects.
+/// The vocabulary decision, the `Unchanged`-first attempt, and the one-shot `Unstated` retry are
+/// [`crate::provider_session::write_terminal`]'s: every terminal owner in the crate must write
+/// the same shape, so that rule lives in one place. What stays here is what is OpenCode's alone —
+/// the `bootstrap` this driver hands it is the axis its own reducer projects for the winning
+/// session rather than a blanket `clear`, and a refusal is reported through this module's
+/// [`note_write`] rather than swallowed.
 fn write_terminal(
     writer: &mut Writer,
     exit: &str,
     reason: Option<&str>,
     bootstrap: ConditionReport,
 ) {
-    if !writer.writes_condition_axis() {
-        let mut observation =
-            Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown).with_exit(exit);
-        if let Some(reason) = reason {
-            observation = observation.with_reason(reason);
-        }
-        let _ = writer.observe(observation);
-        return;
-    }
-    let terminal = |condition: ConditionReport| {
-        let mut frame = Frame::new(Activity::Ended, InputBuffer::Unknown, condition, HumanAsk::None)
-            .with_exit(exit);
-        if let Some(reason) = reason {
-            frame = frame.with_reason(reason);
-        }
-        frame
-    };
-    let outcome = writer.publish(terminal(ConditionReport::Unchanged));
-    if matches!(&outcome, Ok(WriteOutcome::Refused(Refusal::Unstated))) {
-        note_write(writer.publish(terminal(bootstrap)));
-    } else {
-        note_write(outcome);
+    match crate::provider_session::write_terminal(writer, exit, reason, bootstrap) {
+        // The legacy surface has no typed outcome: it made the exact statement `Writer::ended`
+        // makes and there is nothing to report.
+        Ok(None) => {}
+        Ok(Some(outcome)) => note_write(Ok(outcome)),
+        Err(error) => note_write(Err(error)),
     }
 }
 
@@ -2559,16 +2541,14 @@ mod tests {
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
     }
 
-    /// The LEGACY (schema 2) projection, pinned unchanged. While the writer emits version 2 this
-    /// is the ONLY thing this adapter writes, so its bytes must not move — including the terminal
-    /// word version 2 has to spell a rejected credential with, having no condition axis to put it
-    /// on. The version 3 projection of the same replay is the test below.
+    /// The LEGACY (schema 2) projection, pinned unchanged. Production now emits version 3, so
+    /// this is no longer the live shape — which is exactly why it is pinned: a version 1 or 2
+    /// record still on disk, and any seat a rollback puts back on version 2, must keep reading
+    /// the same way, including the terminal word version 2 has to spell a rejected credential
+    /// with, having no condition axis to put it on. The version 3 projection of the same replay
+    /// is the test below.
     #[test]
     fn the_legacy_projection_keeps_its_terminal_auth_word_and_idle_reasons() {
-        assert!(
-            harness_state::EMIT_SCHEMA_V2,
-            "production still emits schema 2, so this projection is still the live one"
-        );
         let mut machine = EventMachine::default();
         machine.apply(&event(
             r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,

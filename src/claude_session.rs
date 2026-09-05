@@ -1014,6 +1014,20 @@ mod tests {
     use super::*;
     use crate::harness_state::harness_state_path;
 
+    /// One hook write on the surface `run_observe` uses after activation: the version 3 frame,
+    /// through the real locked writer. The outcome is returned rather than unwrapped into a bool
+    /// because a refusal is a VALUE here — a successor's claim, a terminal record, or an axis
+    /// nobody has stated — and several tests below assert exactly which one.
+    fn hook_publish(
+        writer: &mut harness_state::Writer,
+        event: &str,
+        payload: &serde_json::Value,
+    ) -> harness_state::WriteOutcome {
+        writer
+            .publish_unless_ended(observe_hook_event(event, payload).unwrap().frame())
+            .unwrap()
+    }
+
     #[test]
     fn only_the_packaged_channel_requests_the_installation_preflight() {
         assert!(requires_st2_channel(&[
@@ -1324,20 +1338,18 @@ mod tests {
             SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
 
         // A hook process wrote a blocked observation between wrapper ticks — carrying the
-        // wrapper's exported token, exactly as the env plumbing arranges in a real seat.
-        harness_state::Writer::new(
+        // wrapper's exported token, exactly as the env plumbing arranges in a real seat, and on
+        // the surface `run_observe` uses: the boundary event states the condition axis over the
+        // claim fence, and later hooks ride on top of it.
+        let mut hook = harness_state::Writer::new(
             tmp.path(),
             "hetz.worker",
             "claude",
             Some("hetz.worker".to_string()),
         )
-        .with_session(observer.session())
-        .observe(
-            observe_hook_event("PermissionRequest", &serde_json::Value::Null)
-                .unwrap()
-                .observation(),
-        )
-        .unwrap();
+        .with_session(observer.session());
+        hook_publish(&mut hook, "SessionStart", &serde_json::Value::Null);
+        hook_publish(&mut hook, "PermissionRequest", &serde_json::Value::Null);
         let before = fs::read(&record).unwrap();
 
         std::thread::sleep(Duration::from_millis(2));
@@ -1799,14 +1811,11 @@ mod tests {
             "claude",
             Some("hetz.worker".to_string()),
         );
+        // The boundary event states the condition axis once; version 3 refuses an activity-only
+        // frame before that, which is the same bootstrap `run_observe` relies on in production.
+        hook_publish(&mut writer, "SessionStart", &payload);
         let publish = |writer: &mut harness_state::Writer| {
-            writer
-                .observe_unless_ended(
-                    observe_hook_event("PostToolUse", &payload)
-                        .unwrap()
-                        .observation(),
-                )
-                .unwrap()
+            hook_publish(writer, "PostToolUse", &payload).accepted()
         };
 
         assert!(publish(&mut writer));
@@ -1880,10 +1889,12 @@ mod tests {
         );
     }
 
-    /// Source compatibility: while the writer does not emit the condition axis, every Claude hook
+    /// Source compatibility: on a writer that does not emit the condition axis, every Claude hook
     /// writes exactly the bytes it always did. The condition and conversation axes are DROPPED
     /// rather than half-written or stashed in a sidecar, and their absence reads as `absent` —
-    /// never as health.
+    /// never as health. Production emits version 3 now, so the version 2 writer comes from the
+    /// test-only emitted-schema seam: this is the shape of every legacy record still on disk and
+    /// of anything a rollback writes.
     #[test]
     fn the_legacy_wire_is_unchanged_while_the_writer_omits_the_condition_axis() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1894,10 +1905,11 @@ mod tests {
             "hetz.worker",
             "claude",
             Some("hetz.worker".to_string()),
-        );
+        )
+        .with_emitted_schema(harness_state::SCHEMA_V2);
         assert!(
             !writer.writes_condition_axis(),
-            "this build's production writer is still on version 2"
+            "the legacy projection is reached through the version 2 seam"
         );
         assert!(
             writer
@@ -1984,15 +1996,7 @@ mod tests {
             Some("hetz.worker".to_string()),
         )
         .with_session(observer.session());
-        assert!(
-            !late
-                .observe_unless_ended(
-                    observe_hook_event("PostToolUse", &serde_json::Value::Null)
-                        .unwrap()
-                        .observation()
-                )
-                .unwrap()
-        );
+        assert!(!hook_publish(&mut late, "PostToolUse", &serde_json::Value::Null).accepted());
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Ended
@@ -2009,13 +2013,7 @@ mod tests {
         .with_session("claude-session-fresh");
         fallback.interrupt();
         assert!(
-            !fallback
-                .observe_unless_ended(
-                    observe_hook_event("SessionStart", &serde_json::Value::Null)
-                        .unwrap()
-                        .observation()
-                )
-                .unwrap()
+            !hook_publish(&mut fallback, "SessionStart", &serde_json::Value::Null).accepted()
         );
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
@@ -2032,15 +2030,7 @@ mod tests {
             Some("hetz.worker".to_string()),
         )
         .with_ownership(next.session().to_string(), next.seq());
-        assert!(
-            fresh
-                .observe_unless_ended(
-                    observe_hook_event("SessionStart", &serde_json::Value::Null)
-                        .unwrap()
-                        .observation()
-                )
-                .unwrap()
-        );
+        assert!(hook_publish(&mut fresh, "SessionStart", &serde_json::Value::Null).accepted());
         assert_eq!(
             harness_state::read(&record, None).unwrap().state,
             Activity::Idle
@@ -2057,12 +2047,11 @@ mod tests {
         let record = harness_state_path(tmp.path());
         let payload_a = serde_json::json!({ "session_id": "aaa" });
         let payload_b = serde_json::json!({ "session_id": "bbb" });
+        // The whole ownership selection plus the write, exactly as `run_observe` performs them.
         let drive = |event: &str, payload: &serde_json::Value| {
             let mut writer =
                 observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
-            writer
-                .observe_unless_ended(observe_hook_event(event, payload).unwrap().observation())
-                .unwrap()
+            hook_publish(&mut writer, event, payload).accepted()
         };
 
         assert!(drive("SessionStart", &payload_a), "A claims");
@@ -2090,8 +2079,9 @@ mod tests {
     /// excluded from what an unstated axis inherits, so claiming on a mid-process `SessionStart`
     /// would drop a standing fault by OWNERSHIP — the same laundering the mapping refuses to do
     /// with `clear`, arriving through the other door. Pinned as a pure function of
-    /// `(writes_condition_axis, event, payload)` because this build's writer emits version 2 and
-    /// cannot exercise the other arm end-to-end; the writer-activation change owns that proof.
+    /// `(writes_condition_axis, event, payload)` so BOTH arms stay decidable from one build; the
+    /// version 3 arm is now also proved end-to-end, against the real writer, by
+    /// `a_wrapperless_session_start_claims_only_for_a_fresh_incarnation`.
     #[test]
     fn a_mid_process_session_start_claims_only_while_the_condition_axis_is_unwritable() {
         for source in [
@@ -2141,50 +2131,57 @@ mod tests {
         }
     }
 
-    /// The legacy path is byte- and sequence-exact: on the wire this build emits, a mid-process
-    /// `SessionStart` claims exactly as a startup one does. Proved by parity rather than by a
-    /// hardcoded sequence number, so the claim's own arithmetic stays owned by `harness_state`.
+    /// The version 3 arm of the predicate above, end to end against the real writer — the proof
+    /// activation makes reachable.
+    ///
+    /// A mid-process `SessionStart` (`compact`, `clear`) keeps the token-only path, so no claim
+    /// fence is written and the standing fault this session already stated CARRIES: laundering it
+    /// away by ownership is exactly the defect the predicate exists to prevent. A genuinely fresh
+    /// incarnation (`startup`, `resume`) claims, and superseding the axis there is the truth.
     #[test]
-    fn a_wrapperless_mid_process_session_start_still_claims_on_the_legacy_wire() {
-        let succeed = |source: &str| {
+    fn a_wrapperless_session_start_claims_only_for_a_fresh_incarnation() {
+        let seat = |source: &str| {
             let tmp = tempfile::tempdir().unwrap();
             let record = harness_state_path(tmp.path());
-            let predecessor = serde_json::json!({"session_id": "aaa"});
-            let mut successor = serde_json::json!({"session_id": "bbb"});
-            successor["source"] = source.into();
             let drive = |event: &str, payload: &serde_json::Value| {
                 let mut writer =
                     observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
-                writer
-                    .observe_unless_ended(observe_hook_event(event, payload).unwrap().observation())
-                    .unwrap()
+                hook_publish(&mut writer, event, payload)
             };
-            assert!(drive("SessionStart", &predecessor), "{source}");
-            assert!(drive("UserPromptSubmit", &predecessor), "{source}");
-            assert!(
-                drive("SessionStart", &successor),
-                "{source} claims over aaa"
-            );
-            let bytes: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+            // Claude's session id does NOT change across a compaction, so the successor differs
+            // from the predecessor by `source` alone — which is the whole question.
+            let mut session = serde_json::json!({"session_id": "aaa"});
+            drive("SessionStart", &session);
+            let mut failed = session.clone();
+            failed["error"] = "authentication_failed".into();
+            drive("StopFailure", &failed);
+            let before = harness_state::read(&record, None).expect("a stated record");
+            session["source"] = source.into();
+            drive("SessionStart", &session);
             (
-                bytes["seq"].as_u64().unwrap(),
-                bytes["incarnation"].as_str().unwrap().to_string(),
-                bytes["state"].as_str().unwrap().to_string(),
+                before,
+                harness_state::read(&record, None).expect("a stated record"),
             )
         };
 
-        let startup = succeed("startup");
-        assert_eq!(
-            startup.1, "claude-session-bbb",
-            "the successor owns the record"
-        );
-        assert_eq!(startup.2, "idle");
-        for source in ["compact", "clear", "resume"] {
+        for mid_process in ["compact", "clear"] {
+            let (before, after) = seat(mid_process);
+            assert!(
+                matches!(before.condition, harness_state::ConditionView::Fault(_)),
+                "{mid_process}: the fault must stand before the boundary event"
+            );
+            assert!(
+                matches!(after.condition, harness_state::ConditionView::Fault(_)),
+                "{mid_process}: a mid-process boundary must not launder a standing fault by \
+                 ownership"
+            );
+        }
+        for fresh in ["startup", "resume"] {
+            let (_, after) = seat(fresh);
             assert_eq!(
-                succeed(source),
-                startup,
-                "{source} must claim exactly as startup does while the wire has no condition axis"
+                after.condition,
+                harness_state::ConditionView::Clear,
+                "{fresh}: a fresh incarnation legitimately supersedes the axis"
             );
         }
     }

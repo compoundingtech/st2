@@ -145,23 +145,93 @@ impl SessionObserver {
     }
 
     /// Best-effort terminal record; observation must never turn a clean teardown into an error.
+    ///
+    /// A wrapper observed nothing about its harness, so `clear` is the only axis it may state:
+    /// see [`write_terminal`] for why that is truthful rather than fabricated health.
     pub(crate) fn ended(&self, exit: &str) {
-        let _ = self.writer().ended(exit);
+        let _ = write_terminal(
+            &mut self.writer(),
+            exit,
+            None,
+            harness_state::ConditionReport::Clear,
+        );
     }
 
     /// The terminal record for a session whose provider never ran (or could no longer be
     /// checked): a real ended record, so the claim placeholder is not the last word.
     pub(crate) fn launch_error(&self) {
-        let _ = self.writer().observe(
-            harness_state::Observation::new(
-                harness_state::Activity::Ended,
-                harness_state::BlockedOn::None,
-                harness_state::InputBuffer::Unknown,
-            )
-            .with_reason("launch-error")
-            .with_exit("exit unknown"),
+        let _ = write_terminal(
+            &mut self.writer(),
+            "exit unknown",
+            Some("launch-error"),
+            harness_state::ConditionReport::Clear,
         );
     }
+}
+
+/// THE terminal record, in whichever vocabulary this writer emits, with the one bootstrap retry
+/// version 3 requires. Every process-exit owner in this crate goes through here — the wrappers,
+/// the pi and omp session drivers, Codex's TUI end, and OpenCode's four exit paths — because they
+/// are the only writers of `ended` and the version they write it in must be decided once.
+///
+/// A terminal write is the FIRST write of many incarnations: `claim` planted a fence, fences are
+/// deliberately excluded from carry-forward, and a provider that died before any producer
+/// published leaves the condition axis never stated. Version 3 refuses that write as
+/// [`harness_state::Refusal::Unstated`] rather than inventing an `absent` it cannot serialize, so
+/// without this retry a wrapper-only `ended` would silently stop landing and the seat would read
+/// `unknown` for every consumer.
+///
+/// The first attempt always rides `Unchanged`: an exit says nothing new about a fault, and
+/// whatever stood is the incarnation's last word about that too. Only the refusal — which is
+/// itself the proof that no condition of this session's stands, because a standing one would have
+/// been inherited and stated — admits the retry, and the retry states `bootstrap` exactly ONCE.
+/// The caller names that value because only it knows what it observed: a wrapper that never saw
+/// its harness passes `clear`, while a driver holding a reduced verdict passes what its own
+/// reducer projects.
+///
+/// Under version 2 nothing can be unstated and the refusal never occurs, so this makes the EXACT
+/// legacy statement [`harness_state::Writer::ended`] makes and the shipped bytes do not move.
+/// `None` is returned there: the legacy surface has no typed outcome to report.
+pub(crate) fn write_terminal(
+    writer: &mut harness_state::Writer,
+    exit: &str,
+    reason: Option<&str>,
+    bootstrap: harness_state::ConditionReport,
+) -> anyhow::Result<Option<harness_state::WriteOutcome>> {
+    if !writer.writes_condition_axis() {
+        let mut observation = harness_state::Observation::new(
+            harness_state::Activity::Ended,
+            harness_state::BlockedOn::None,
+            harness_state::InputBuffer::Unknown,
+        )
+        .with_exit(exit);
+        if let Some(reason) = reason {
+            observation = observation.with_reason(reason);
+        }
+        writer.observe(observation)?;
+        return Ok(None);
+    }
+    let terminal = |condition: harness_state::ConditionReport| {
+        let mut frame = harness_state::Frame::new(
+            harness_state::Activity::Ended,
+            harness_state::InputBuffer::Unknown,
+            condition,
+            harness_state::HumanAsk::None,
+        )
+        .with_exit(exit);
+        if let Some(reason) = reason {
+            frame = frame.with_reason(reason);
+        }
+        frame
+    };
+    let outcome = writer.publish(terminal(harness_state::ConditionReport::Unchanged))?;
+    if matches!(
+        outcome.refusal(),
+        Some(harness_state::Refusal::Unstated)
+    ) {
+        return writer.publish(terminal(bootstrap)).map(Some);
+    }
+    Ok(Some(outcome))
 }
 
 fn describe_exit(exit: ExitStatus) -> String {

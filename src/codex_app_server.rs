@@ -2699,19 +2699,30 @@ fn run_connected(
         Some(runtime.runtime_id().to_string()),
     )
     .with_session(runtime.incarnation());
+    // Wrapper-owned, so it goes through the shared terminal write: a codex TUI that died before
+    // the pump published anything leaves the condition axis unstated behind the claim fence, and
+    // version 3 refuses that write rather than serializing an axis nobody stated. This process
+    // watched a child, not a provider turn, so `clear` is the only axis it may state.
     let _ = match &result {
-        Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
-        Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
+        Ok(TuiEnd::Exited(status)) => crate::provider_session::write_terminal(
+            &mut harness_writer,
+            &describe_tui_exit(Some(*status)),
+            None,
+            harness_state::ConditionReport::Clear,
+        ),
+        Ok(TuiEnd::Stopped(status)) => crate::provider_session::write_terminal(
+            &mut harness_writer,
+            &describe_tui_exit(*status),
+            None,
+            harness_state::ConditionReport::Clear,
+        ),
         Err(error) => {
             let observed_exit = tui.try_wait().ok().flatten();
-            harness_writer.observe(
-                harness_state::Observation::new(
-                    harness_state::Activity::Ended,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Unknown,
-                )
-                .with_exit(describe_tui_exit(observed_exit))
-                .with_reason(format!("{error}")),
+            crate::provider_session::write_terminal(
+                &mut harness_writer,
+                &describe_tui_exit(observed_exit),
+                Some(&format!("{error}")),
+                harness_state::ConditionReport::Clear,
             )
         }
     };
@@ -7364,9 +7375,11 @@ mod tests {
         );
     }
 
-    /// The version 2 wire has no condition axis and this build still emits it: every version 3
-    /// operation stays inert, and the legacy projection — including its terminal reading of a
-    /// provider failure — is exactly what it was.
+    /// The version 2 wire has no condition axis: on a writer emitting it, every version 3
+    /// operation stays inert and the legacy projection — including its terminal reading of a
+    /// provider failure — is exactly what it was. Production emits version 3 now, so the version
+    /// 2 writer is substituted through the test-only seam; this is the shape of every legacy
+    /// record still on disk.
     #[test]
     fn version_two_delivery_keeps_the_legacy_projection_and_states_no_condition() {
         use crate::harness_state::{self, Activity};
@@ -7374,9 +7387,17 @@ mod tests {
         let config = delivery_config(tmp.path());
         let record_path = harness_state::harness_state_path(&config.agent_dir);
         let mut delivery = inbox_delivery(tmp.path(), config);
+        // The whole session on the version 2 wire. `CodexInboxDelivery::new` performed a
+        // PRODUCTION claim, so the seam substitutes the writer's version and the now-foreign
+        // version 3 fence that claim wrote is removed: a version 2 build would have written a
+        // version 2 fence there, and what this test pins is what the pump writes afterwards.
+        delivery
+            .harness_writer
+            .emit_schema(harness_state::SCHEMA_V2);
+        std::fs::remove_file(&record_path).unwrap();
         assert!(
             !delivery.harness_writer.writes_condition_axis(),
-            "this build emits version 2"
+            "the legacy projection is reached through the version 2 seam"
         );
 
         let error = json!({

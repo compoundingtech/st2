@@ -1486,6 +1486,11 @@ mod tests {
 
     /// A pre-compaction edge creates a last-resort checkpoint only for whitespace-only state. The
     /// channel, not the TypeScript extension, resolves the durable path and performs the write.
+    ///
+    /// The record assertion at the end is the VERSION 2 projection of a failed stub write — an
+    /// `active` frame carrying the recovery reason — so the loop runs on a version 2 writer here.
+    /// Version 3 states the same failure as an adapter-owned fault instead, which is proved by
+    /// `the_pre_compact_fault_is_cleared_by_category_and_full_code` and the omp condition table.
     #[test]
     fn pre_compact_frame_writes_only_over_blank_context() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1497,7 +1502,8 @@ mod tests {
 
         let run_frame = || {
             let mut writer =
-                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                    .with_emitted_schema(harness_state::SCHEMA_V2);
             let (tx, rx) = mpsc::channel();
             tx.send(Ok(r#"{"type":"pre_compact"}"#.to_string()))
                 .unwrap();
@@ -1611,7 +1617,15 @@ mod tests {
         let mut wrapper_writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
                 .with_session(session);
-        wrapper_writer.ended("signal 9").unwrap();
+        // Exactly what `src/pi_session.rs` does, including the one bootstrap retry version 3
+        // needs: this wrapper observed nothing, so the axis is unstated until it states it.
+        crate::provider_session::write_terminal(
+            &mut wrapper_writer,
+            "signal 9",
+            None,
+            harness_state::ConditionReport::Clear,
+        )
+        .unwrap();
         let terminal = std::fs::read(&record).unwrap();
 
         let (tx, rx) = mpsc::channel();
@@ -2664,9 +2678,10 @@ mod tests {
         assert_eq!(hello["sessionContext"], json!("restored"));
     }
 
-    /// While this build's writer emits version 2 the condition axis has nowhere to live, and this
-    /// record has exactly one source of truth — so a condition edge is dropped, not cached, and
-    /// the legacy bytes are exactly the ones this channel already wrote.
+    /// On a writer that emits version 2 the condition axis has nowhere to live, and this record
+    /// has exactly one source of truth — so a condition edge is dropped, not cached, and the
+    /// legacy bytes are exactly the ones this channel already wrote. Production emits version 3
+    /// now; this is the rollback and already-on-disk shape, reached through the test-only seam.
     #[test]
     fn condition_frames_change_nothing_while_the_record_carries_no_condition_axis() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2694,10 +2709,11 @@ mod tests {
             .unwrap();
         };
         let mut writer =
-            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
+                .with_emitted_schema(harness_state::SCHEMA_V2);
         assert!(
             !writer.writes_condition_axis(),
-            "this build's writer emits version 2; the branch under test is the legacy one"
+            "the branch under test is the legacy one, reached through the version 2 seam"
         );
         run(&[r#"{"type":"state","state":"idle"}"#], &mut writer);
         let legacy = std::fs::read(&record).unwrap();
@@ -2723,12 +2739,19 @@ mod tests {
 
     /// One omp channel loop over a fixed incarnation, so two runs are comparable byte for byte.
     fn omp_record(frames: &[&str]) -> Value {
+        omp_record_emitting(frames, harness_state::SCHEMA_V3)
+    }
+
+    /// One omp channel loop over a fixed incarnation and an explicit emitted version, so two runs
+    /// are comparable byte for byte and the version 2 projection stays provable after activation.
+    fn omp_record_emitting(frames: &[&str], schema: &'static str) -> Value {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = tmp.path();
         let inbox = message::inbox_dir(agent_dir);
         std::fs::create_dir_all(&inbox).unwrap();
         let mut writer =
             harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_emitted_schema(schema)
                 .with_ownership("session-1", 1);
         let (tx, rx) = mpsc::channel();
         for frame in frames {
@@ -3350,14 +3373,15 @@ mod tests {
             Some(PRE_COMPACT_ERROR_REASON)
         );
 
-        // And end to end: a denial leaves a record indistinguishable from the plain idle frame it
-        // resolved to, so no reader pinned to version 2 sees a new field.
+        // And end to end on the version 2 wire: a denial leaves a record indistinguishable from
+        // the plain idle frame it resolved to, so no reader pinned to version 2 sees a new field.
+        let v2 = |frames: &[&str]| omp_record_emitting(frames, harness_state::SCHEMA_V2);
         assert_eq!(
-            omp_record(&[
+            v2(&[
                 r#"{"type":"client_hello","protocol":2}"#,
                 r#"{"type":"state","state":"idle","reason":"approvalDenied"}"#,
             ]),
-            omp_record(&[r#"{"type":"state","state":"idle"}"#]),
+            v2(&[r#"{"type":"state","state":"idle"}"#]),
         );
     }
 
@@ -3464,23 +3488,24 @@ mod tests {
         }
     }
 
-    /// While this build's writer emits version 2 the whole negotiated vocabulary is INERT: the
-    /// answer and the conversation statement change no byte of the record, because the version 2
-    /// wire has nowhere to carry them and this record has exactly one source of truth. That is
-    /// what makes the adapter safe to land before the writer selector flips.
+    /// On a writer emitting version 2 the whole negotiated vocabulary is INERT: the answer and
+    /// the conversation statement change no byte of the record, because the version 2 wire has
+    /// nowhere to carry them and this record has exactly one source of truth. That was what made
+    /// the adapter safe to land before the selector flipped, and it is now what makes a rollback
+    /// and every version 2 record already on disk safe.
     #[test]
     fn a_negotiated_peers_new_frames_never_reach_the_version_two_wire() {
         let tmp = tempfile::tempdir().unwrap();
-        let writer = harness_state::Writer::new(tmp.path(), "h.worker", "omp", Some("w".into()));
-        assert_eq!(
-            writer.writes_condition_axis(),
-            false,
-            "this test is the proof of the version 2 projection; it is meaningless once the \
-             selector flips"
+        let writer = harness_state::Writer::new(tmp.path(), "h.worker", "omp", Some("w".into()))
+            .with_emitted_schema(harness_state::SCHEMA_V2);
+        assert!(
+            !writer.writes_condition_axis(),
+            "this test is the proof of the version 2 projection, reached through the seam"
         );
 
-        let legacy = omp_record(&[r#"{"type":"state","state":"active"}"#]);
-        let negotiated = omp_record(&[
+        let v2 = |frames: &[&str]| omp_record_emitting(frames, harness_state::SCHEMA_V2);
+        let legacy = v2(&[r#"{"type":"state","state":"active"}"#]);
+        let negotiated = v2(&[
             r#"{"type":"client_hello","protocol":2}"#,
             r#"{"type":"conversation","sessionId":"2f8c-4d11"}"#,
             r#"{"type":"state","state":"active"}"#,
@@ -3496,7 +3521,7 @@ mod tests {
 
         // A failed turn still publishes exactly the legacy row it always did — the condition it
         // now also implies is representable nowhere, so it changes nothing here.
-        let faulted = omp_record(&[
+        let faulted = v2(&[
             r#"{"type":"client_hello","protocol":2}"#,
             r#"{"type":"turn","error":{"reason":"401 invalid x-api-key","errorId":16781312}}"#,
         ]);
@@ -3525,7 +3550,14 @@ mod tests {
         let mut wrapper_writer =
             harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
                 .with_session(session);
-        wrapper_writer.ended("exit 0").unwrap();
+        // Exactly what `src/omp_session.rs` does, bootstrap retry included.
+        crate::provider_session::write_terminal(
+            &mut wrapper_writer,
+            "exit 0",
+            None,
+            harness_state::ConditionReport::Clear,
+        )
+        .unwrap();
         let terminal = std::fs::read(&record).unwrap();
 
         let (tx, rx) = mpsc::channel();
@@ -3557,6 +3589,117 @@ mod tests {
             std::fs::read(&record).unwrap(),
             terminal,
             "a refused write changes no byte"
+        );
+    }
+
+    /// Activation, end to end for pi: the REAL channel loop drives the REAL production writer,
+    /// and the record is read back through [`harness_state::read`] rather than inspected as an
+    /// in-memory frame. A pi assistant failure lands as a version 3 fault, and the idle edge that
+    /// follows leaves the seat honestly idle WITH the fault still standing — activity never
+    /// clears a condition, which is the whole ordering rule of this adapter.
+    #[test]
+    fn a_pi_failure_lands_a_version_three_fault_beside_an_honest_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let path = harness_state::harness_state_path(agent_dir);
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        assert!(
+            writer.writes_condition_axis(),
+            "this is the production writer after activation"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"state","state":"active"}"#,
+            r#"{"type":"condition","op":"raise","category":"harness","code":"pi/assistantError","recovery":"unknown","detail":"401 Unauthorized"}"#,
+            r#"{"type":"state","state":"idle"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &PI_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let observed = harness_state::read(&path, None).expect("a version 3 record");
+        assert_eq!(observed.schema.as_deref(), Some(harness_state::SCHEMA_V3));
+        assert_eq!(observed.state, harness_state::Activity::Idle);
+        let harness_state::ConditionView::Fault(fault) = &observed.condition else {
+            panic!("the raise must reach the record: {observed:?}");
+        };
+        assert_eq!(
+            fault.category,
+            Some(harness_state::FaultCategory::Harness)
+        );
+        assert_eq!(fault.code.as_deref(), Some("pi/assistantError"));
+        assert_eq!(
+            observed.human_ask,
+            harness_state::HumanAsk::Unknown,
+            "pi exposes no ask surface and says so positively"
+        );
+    }
+
+    /// Activation, end to end for omp: a negotiated approval pair lands a version 3 ask and the
+    /// conversation identity omp forwarded, read back through the real reader. Both axes exist
+    /// only on this wire, so before the flip this record could not have carried either.
+    #[test]
+    fn an_omp_approval_lands_a_version_three_ask_and_links_its_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
+        let path = harness_state::harness_state_path(agent_dir);
+        let mut writer =
+            harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()))
+                .with_ownership("session-1", 1);
+
+        let (tx, rx) = mpsc::channel();
+        for frame in [
+            r#"{"type":"client_hello","protocol":2}"#,
+            r#"{"type":"conversation","sessionId":"2f8c-4d11"}"#,
+            r#"{"type":"state","state":"active","blockedOn":"human","ask":"permission"}"#,
+        ] {
+            tx.send(Ok(frame.to_string())).unwrap();
+        }
+        drop(tx);
+        channel_loop(
+            &rx,
+            &mut Vec::new(),
+            &message::inbox_dir(agent_dir),
+            agent_dir,
+            &mut writer,
+            None,
+            "h.worker",
+            &OMP_KIND,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let observed = harness_state::read(&path, None).expect("a version 3 record");
+        assert_eq!(observed.schema.as_deref(), Some(harness_state::SCHEMA_V3));
+        assert_eq!(
+            observed.human_ask,
+            harness_state::HumanAsk::Pending(harness_state::AskKind::Permission)
+        );
+        let link = observed
+            .conversation
+            .as_ref()
+            .expect("the forwarded session id is a link");
+        assert!(
+            format!("{link:?}").contains("2f8c-4d11"),
+            "the link carries omp's own conversation identity: {link:?}"
         );
     }
 }

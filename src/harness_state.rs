@@ -54,27 +54,30 @@ pub const SCHEMA_V2: &str = "st2.harness-state.v2";
 /// others.
 pub const SCHEMA_V3: &str = "st2.harness-state.v3";
 
-/// Whether the immutable-ID writer is active. **On**, with the rest of the DELTA-003 activation
-/// cohort (raw-ID `ST_AGENT`, ID-keyed runtime ownership, message record version 2, PTY schema 2).
+/// Whether the fault-axis writer is active. **On**: this build emits version 3.
 ///
-/// The driver wrappers hand this writer a raw immutable agent ID, and a version suffix is the read
-/// contract for this record family: stamping that ID under version 1, whose `agent` means a bus
-/// identity, would misattribute it to whichever subject holds those bytes as a route. The
-/// reader-first precondition is already met — [`read`] accepts both versions and reports which
-/// namespace each one names. The constant stays named so the cohort remains visible and one
-/// reversal point exists; it is not a per-record switch to flip alone.
+/// This is the one and only writer-selection point for this record family, and version 3
+/// activation SUPERSEDED the immutable-ID selector that preceded it rather than adding a second
+/// switch beside it. The DELTA-003 cohort it used to gate (raw-ID `ST_AGENT`, ID-keyed runtime
+/// ownership, message record version 2, PTY schema 2) is subsumed: version 3's `agent` means the
+/// immutable agent ID exactly as version 2's did, so turning this off falls back to version 2 and
+/// never to version 1 — the cohort cannot be un-activated by this constant.
 ///
-/// Version 3 activation SUPERSEDES this constant rather than adding a second selector beside it.
-/// This build is reader-first again: it reads, strictly validates, and projects version 3 while
-/// its writer stays on version 2, so exactly one writer-selection point exists to replace when
-/// the version 3 producers land, and no seat is ever written into a shape its readers do not yet
-/// interpret.
-pub const EMIT_SCHEMA_V2: bool = true;
+/// The reader-first precondition was met before the flip and stays met after it: [`read`] accepts
+/// versions 1, 2, and 3, reports which namespace each `agent` names, and projects a legacy
+/// record's condition as explicitly absent rather than as health. The fence is version-independent
+/// in both directions — a version 2 claim refuses a version 3 record, and a version 3 claim
+/// refuses to be superseded by one — so a mixed fleet during a rollout is safe from either side.
+///
+/// The constant stays named so exactly one reversal point exists, and the `#[cfg(test)]`
+/// [`Writer::with_emitted_schema`] seam keeps version 2 emission provable in this build: legacy
+/// records must stay readable and the refused fence direction must stay testable.
+pub const EMIT_SCHEMA_V3: bool = true;
 
 /// The version this build writes. Every ownership decision below — sequence adoption, own-record
 /// coalescing, heartbeat eligibility — is scoped to it: a writer owns only the shape it emits, so
-/// a v1 straggler still refuses to replace a v2 record and vice versa.
-const SCHEMA: &str = if EMIT_SCHEMA_V2 { SCHEMA_V2 } else { SCHEMA_V1 };
+/// a v2 straggler still refuses to replace a v3 record and vice versa.
+const SCHEMA: &str = if EMIT_SCHEMA_V3 { SCHEMA_V3 } else { SCHEMA_V2 };
 
 /// Whether a record's schema is one this version can interpret. Versions 1 and 2 describe the same
 /// axes and differ only in the meaning of `agent`, which [`RecordSubject`] carries. Version 3
@@ -1470,14 +1473,26 @@ impl Writer {
     }
 
     /// Emit a different version than [`SCHEMA`]. TEST ONLY, and deliberately not a second
-    /// production selector: version 3 activation replaces [`SCHEMA`] itself, which every writer
-    /// reads, so this seam exists purely to prove the version 3 serialization, ownership, and
-    /// condition semantics byte-for-byte in a build whose production writer is still on version
-    /// 2.
+    /// production selector: [`EMIT_SCHEMA_V3`] replaces [`SCHEMA`] itself, which every writer
+    /// reads. The seam exists because activation makes one direction of every version rule
+    /// unreachable from the production writer: with [`SCHEMA`] on version 3, the legacy byte
+    /// contract, the projection guarantee, and the refused fence direction (a version 2 claim
+    /// over a version 3 record) can only be exercised by naming version 2 explicitly. Both are
+    /// live facts — every legacy record on disk was written that way, and a rolled-back or
+    /// not-yet-replaced peer still writes that way — so both stay proved in one binary.
+    /// `pub(crate)` because the adapter modules own their own legacy-projection proofs and need
+    /// the same seam; it is compiled out of every shipped binary.
     #[cfg(test)]
-    fn with_emitted_schema(mut self, schema: &'static str) -> Self {
+    pub(crate) fn with_emitted_schema(mut self, schema: &'static str) -> Self {
         self.schema = schema;
         self
+    }
+
+    /// [`Writer::with_emitted_schema`] in place, for a writer a constructor already handed back
+    /// inside a larger driver value.
+    #[cfg(test)]
+    pub(crate) fn emit_schema(&mut self, schema: &'static str) {
+        self.schema = schema;
     }
 
     /// Mark this writer's observation stream discontinuous: its evidence was lost and has since
@@ -2821,8 +2836,8 @@ impl Snapshot {
 /// disk. Both writable shapes are decoded, because a hooks-only session must be able to claim a
 /// version 3 record for exactly the reasons it can claim a version 2 one — bytes it cannot decode
 /// would otherwise read as "somebody's live record" forever, and after the writer cutover that
-/// would be every record. Split out from [`claim_wrapperless`] so the version 3 eligibility is
-/// provable in a build whose own writer is still version 2.
+/// would be every record. Split out from [`claim_wrapperless`] so eligibility is provable for a
+/// version this build's own writer is not currently emitting, in either direction.
 fn wrapperless_eligible(ours: &str, current: &CurrentRecord, now_ms: u64) -> bool {
     let snapshot = match current {
         CurrentRecord::Absent => return true,
@@ -3186,26 +3201,126 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use super::*;
 
+    /// The LEGACY writer surface, pinned to version 2 through the emitted-schema seam.
+    ///
+    /// Everything reached through [`Writer::observe`] and [`Writer::ended`] is a version 2
+    /// statement by construction: the legacy pair is the whole vocabulary those calls have, and
+    /// version 3 refuses a write whose condition axis nobody stated. Pinning the helper is what
+    /// keeps the compatibility seam honest after activation — these tests assert the bytes and
+    /// the ownership rules a version 2 record still has, which every legacy record on disk and
+    /// every rolled-back seat depends on. The production version 3 surface is proved through
+    /// [`v3_writer`] and the producer block below, which now emits exactly what this build ships.
     fn writer(dir: &Path) -> Writer {
         Writer::new(dir, "hetz.worker", "codex", Some("worker".to_string()))
+            .with_emitted_schema(SCHEMA_V2)
     }
 
-    /// A new session arriving the way real wrappers do: a written claim, then adoption.
+    /// A new session arriving the way real wrappers do: a written claim, then adoption. Claim and
+    /// writer emit the SAME version — a claim is written by the version its writer emits, so a
+    /// mismatched pair would be refused by the schema fence rather than testing anything.
     fn takeover(dir: &Path, harness: &'static str) -> Writer {
+        takeover_emitting(dir, harness, SCHEMA_V2)
+    }
+
+    fn takeover_emitting(dir: &Path, harness: &'static str, schema: &'static str) -> Writer {
         let token = session_token();
-        let seq = claim(dir, "hetz.worker", harness, &token).unwrap();
+        let seq = claim_emitting(dir, "hetz.worker", harness, &token, schema).unwrap();
         Writer::new(dir, "hetz.worker", harness, Some("worker".to_string()))
+            .with_emitted_schema(schema)
             .with_ownership(token, seq)
+    }
+
+    /// [`claim`] and [`claim_wrapperless`] as a build emitting `schema` would perform them: the
+    /// same locked bodies and the same eligibility, with only the emitted version substituted.
+    /// The REFUSED fence direction is unreachable from a build that writes the newest version, so
+    /// this seam is the only way it stays provable in one binary — which is exactly what a
+    /// staged rollout with an older peer still running needs proved.
+    fn claim_emitting(
+        dir: &Path,
+        agent: &str,
+        harness: &'static str,
+        token: &str,
+        schema: &'static str,
+    ) -> anyhow::Result<u64> {
+        let writer = Writer::new(dir, agent, harness, None).with_emitted_schema(schema);
+        let _lock = writer.locked()?;
+        claim_locked(&writer, token)
+    }
+
+    fn claim_wrapperless_emitting(
+        dir: &Path,
+        agent: &str,
+        harness: &'static str,
+        token: &str,
+        schema: &'static str,
+    ) -> anyhow::Result<Option<u64>> {
+        let writer = Writer::new(dir, agent, harness, None).with_emitted_schema(schema);
+        let _lock = writer.locked()?;
+        if !wrapperless_eligible(
+            writer.schema,
+            &read_current(&writer.path),
+            crate::message::now_ms(),
+        ) {
+            return Ok(None);
+        }
+        claim_locked(&writer, token).map(Some)
+    }
+
+
+    /// The version the legacy-surface block below writes. Every test that states its observation
+    /// through [`Writer::observe`], [`Writer::ended`], or a written claim is a VERSION 2 test by
+    /// construction: the legacy pair is the whole vocabulary those calls have, and version 3
+    /// refuses a write whose condition axis nobody stated. Pinning the block keeps the
+    /// compatibility contract — the bytes, the ownership rules, and the claim behaviour every
+    /// legacy record on disk and every rolled-back seat depends on — proved after activation.
+    const LEGACY_SCHEMA: &str = SCHEMA_V2;
+
+    fn legacy_new(
+        dir: &Path,
+        agent: impl Into<String>,
+        harness: &'static str,
+        pty_session: Option<String>,
+    ) -> Writer {
+        Writer::new(dir, agent, harness, pty_session).with_emitted_schema(LEGACY_SCHEMA)
+    }
+
+    fn legacy_claim(
+        dir: &Path,
+        agent: impl Into<String>,
+        harness: &'static str,
+        token: &str,
+    ) -> anyhow::Result<u64> {
+        let agent: String = agent.into();
+        claim_emitting(dir, &agent, harness, token, LEGACY_SCHEMA)
+    }
+
+    fn legacy_claim_wrapperless(
+        dir: &Path,
+        agent: impl Into<String>,
+        harness: &'static str,
+        token: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let agent: String = agent.into();
+        claim_wrapperless_emitting(dir, &agent, harness, token, LEGACY_SCHEMA)
     }
 
     /// One record on disk under an explicit schema, with a live stamp and an orphan token, so
     /// every eligibility clause except the schema fence says "claimable".
+    ///
+    /// The BODY follows the schema: the two writable shapes are structurally disjoint, so a
+    /// version 3 label over a legacy body is unreadable bytes rather than a version 3 record, and
+    /// planting that would test the undecodable path instead of the fence.
     fn planted(dir: &Path, schema: &str, agent: &str, seq: u64) -> PathBuf {
         let path = harness_state_path(dir);
+        let axes = if schema == SCHEMA_V3 {
+            r#""condition":{"kind":"clear"},"ask":{"kind":"none"}"#
+        } else {
+            r#""blockedOn":"none","ask":"none""#
+        };
         fs::write(
             &path,
             format!(
-                r#"{{"schema":"{schema}","agent":"{agent}","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","exit":"exit 0","incarnation":"","seq":{seq},"sinceMs":1,"writtenAtMs":{},"transitions":4}}"#,
+                r#"{{"schema":"{schema}","agent":"{agent}","harness":"codex","state":"ended","inputBuffer":"unknown",{axes},"exit":"exit 0","incarnation":"","seq":{seq},"sinceMs":1,"writtenAtMs":{},"transitions":4}}"#,
                 crate::message::now_ms()
             ),
         )
@@ -3442,7 +3557,7 @@ mod tests {
         let skew_ms = duration_ms(HARNESS_STATE_FUTURE_SKEW);
         let raw = |written_at_ms: u64| {
             serde_json::to_vec(&Record {
-                schema: SCHEMA.to_string(),
+                schema: SCHEMA_V2.to_string(),
                 agent: "hetz.worker".to_string(),
                 harness: "codex".to_string(),
                 state: Activity::Active,
@@ -3622,29 +3737,49 @@ mod tests {
         );
     }
 
-    /// The activation cohort is on: the driver wrappers hand this writer a raw immutable agent ID,
-    /// so the record it writes must DECLARE version 2. Stamping that ID under version 1 — whose
-    /// `agent` means a bus identity — is the misattribution this version exists to prevent, and it
-    /// is exactly what the old writer default did.
+    /// The production writer's own declaration, after activation: this build emits version 3, so
+    /// the record it writes must DECLARE version 3 and carry the condition axis version 3's own
+    /// reader requires. The `agent` meaning the immutable-ID cohort activated is carried forward
+    /// unchanged — version 3's `agent` is the immutable ID exactly as version 2's was — so the
+    /// misattribution the cohort exists to prevent stays prevented, and stamping that ID under
+    /// version 1 remains impossible from this build.
+    ///
+    /// The claim fence is deliberately included: a production session's FIRST write follows a
+    /// fence whose axis is not a statement, so this exercises the same bootstrap every wrapper
+    /// and adapter does.
     #[test]
-    fn the_writer_declares_version_two_so_its_agent_field_means_an_immutable_id() {
-        assert!(EMIT_SCHEMA_V2);
-        assert_eq!(SCHEMA, SCHEMA_V2);
+    fn the_writer_declares_version_three_and_still_means_an_immutable_id() {
+        assert!(EMIT_SCHEMA_V3);
+        assert_eq!(SCHEMA, SCHEMA_V3);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let mut writer = takeover(tmp.path(), "codex");
-        writer.observe(active()).unwrap();
-        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.schema, SCHEMA_V2);
-        // And the reader hands that value back in the ID namespace, not as a route.
+        let mut writer = takeover_emitting(tmp.path(), "codex", SCHEMA);
+        writer
+            .publish(Frame::new(
+                Activity::Active,
+                InputBuffer::Unknown,
+                ConditionReport::Clear,
+                HumanAsk::None,
+            ))
+            .unwrap();
+        let record = record_json(&path);
+        assert_eq!(record["schema"], SCHEMA_V3);
+        assert_eq!(record["condition"]["kind"], "clear");
+        assert!(
+            record.get("blockedOn").is_none(),
+            "version 3 replaced the overloaded axis rather than keeping both: {record}"
+        );
+        // And the reader hands the subject back in the ID namespace, not as a route.
         assert_eq!(
             read(&path, None).unwrap().subject,
-            Some(RecordSubject::AgentId(record.agent.clone()))
+            Some(RecordSubject::AgentId(
+                record["agent"].as_str().unwrap().to_string()
+            ))
         );
 
-        // Writing version 2 does not retype the version-1 records already on disk: a v1 record
-        // still reads with bus-identity meaning, which is the whole point of keeping the pair.
+        // Writing version 3 does not retype the legacy records already on disk: a v1 record still
+        // reads with bus-identity meaning, which is the whole point of keeping the pair readable.
         let v1 = format!(
             r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":{},"transitions":3}}"#,
             crate::message::now_ms()
@@ -3655,6 +3790,11 @@ mod tests {
         assert_eq!(
             observed.subject,
             Some(RecordSubject::BusIdentity("hetz.worker".into()))
+        );
+        assert_eq!(
+            observed.condition,
+            ConditionView::Absent,
+            "a legacy record's condition is explicitly absent, never health"
         );
     }
 
@@ -3706,26 +3846,31 @@ mod tests {
         assert!(claim_may_supersede(SCHEMA_V1, Some("st2.harness-state.v4")));
     }
 
-    /// This build writes v2, so the v1 → v2 migration claim is the one it can exercise
-    /// end-to-end: it lands exactly once, keeps the sequence monotonic across the version change
-    /// (the counter is not a meaning, and restarting it would sit below a lingering predecessor's
-    /// claim and fence the new session out), and leaves the record declaring v2.
+    /// This build writes v3, so the v1 → v3 migration claim is the one it exercises end-to-end:
+    /// it lands exactly once, keeps the sequence monotonic across the version change (the counter
+    /// is not a meaning, and restarting it would sit below a lingering predecessor's claim and
+    /// fence the new session out), and leaves the record declaring the version this build emits.
+    /// The claim skips no version on the way: a v1 record is superseded directly, because the
+    /// fence is a comparison and not a migration ladder.
     #[test]
-    fn a_version_two_claim_migrates_a_version_one_record_once_and_keeps_the_sequence() {
-        assert_eq!(SCHEMA, SCHEMA_V2, "this build writes the newer version");
+    fn a_production_claim_migrates_a_version_one_record_once_and_keeps_the_sequence() {
+        assert_eq!(SCHEMA, SCHEMA_V3, "this build writes the newest version");
         let tmp = tempfile::tempdir().unwrap();
         let path = planted(tmp.path(), SCHEMA_V1, "hetz.worker", 7);
 
         let token = session_token();
         let seq = claim(tmp.path(), "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1", "codex", &token).unwrap();
         assert_eq!(seq, 8, "the sequence continues past the version change");
-        let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.schema, SCHEMA_V2);
-        assert_eq!(record.agent, "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        assert_eq!(record_json(&path)["schema"], SCHEMA_V3);
+        assert_eq!(
+            record_json(&path)["agent"],
+            "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+        );
 
         // The claim itself is a fence, not an observation, so it reads indeterminate (`claimed`)
-        // and proves no subject. The session's first real observation is what a consumer joins to
-        // a catalog, and that must land in the ID namespace.
+        // and proves no subject. The session's first real statement is what a consumer joins to a
+        // catalog, and that must land in the ID namespace — and because a fence states nothing,
+        // that first statement is the one that has to state the condition axis.
         assert!(read(&path, None).unwrap().subject.is_none());
         let mut owner = Writer::new(
             tmp.path(),
@@ -3734,7 +3879,29 @@ mod tests {
             Some("worker".into()),
         )
         .with_ownership(token, seq);
-        owner.observe(active()).unwrap();
+        assert_eq!(
+            owner
+                .publish(Frame::new(
+                    Activity::Active,
+                    InputBuffer::Unknown,
+                    ConditionReport::Unchanged,
+                    HumanAsk::None,
+                ))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::Unstated),
+            "the fence is not carried forward, so nothing is inherited to ride on"
+        );
+        assert!(
+            owner
+                .publish(Frame::new(
+                    Activity::Active,
+                    InputBuffer::Unknown,
+                    ConditionReport::Clear,
+                    HumanAsk::None,
+                ))
+                .unwrap()
+                .landed()
+        );
         let observed = read(&path, None).unwrap();
         assert_eq!(observed.state, Activity::Active);
         assert_eq!(
@@ -3784,7 +3951,7 @@ mod tests {
         .unwrap();
         let before = fs::read(&path).unwrap();
 
-        let mut token_only = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
+        let mut token_only = legacy_new(tmp.path(), "hetz.worker", "codex", Some("worker".into()));
         token_only.session = token.clone();
         assert!(
             !token_only.observe_unless_ended(active()).unwrap(),
@@ -3846,7 +4013,7 @@ mod tests {
 
         // A wrapper relaunch: claim the state record, and the sibling goes with it.
         let token = session_token();
-        claim(&agent_dir, "hetz.worker", "claude", &token).unwrap();
+        legacy_claim(&agent_dir, "hetz.worker", "claude", &token).unwrap();
         assert!(
             harness_context::read(&context_path).is_none(),
             "the new incarnation must read `no context yet`"
@@ -3863,7 +4030,7 @@ mod tests {
         );
 
         // Claiming a seat that never had a context record is not an error.
-        claim(&agent_dir, "hetz.worker", "claude", &session_token()).unwrap();
+        legacy_claim(&agent_dir, "hetz.worker", "claude", &session_token()).unwrap();
 
         // …and the wrapperless boundary, which routes through the same body. It is eligible only
         // over a seat no wrapper holds, so it gets its own.
@@ -3876,7 +4043,7 @@ mod tests {
             .unwrap();
         let wrapperless = format!("{WRAPPERLESS_PREFIX}abc");
         assert!(
-            claim_wrapperless(&hooks_dir, "hetz.hooked", "claude", &wrapperless)
+            legacy_claim_wrapperless(&hooks_dir, "hetz.hooked", "claude", &wrapperless)
                 .unwrap()
                 .is_some(),
             "the claim must actually have happened"
@@ -3889,7 +4056,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let predecessor = Record {
-            schema: SCHEMA.to_string(),
+            schema: SCHEMA_V2.to_string(),
             agent: "hetz.worker".to_string(),
             harness: "codex".to_string(),
             state: Activity::Active,
@@ -3947,10 +4114,10 @@ mod tests {
         // The channel and wrapper are sibling processes of ONE session and share its token —
         // that sharing is what makes the wrapper's terminal record the session's last word.
         let token = session_token();
-        let mut channel = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
+        let mut channel = legacy_new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
             .with_session(token.clone());
         let mut wrapper =
-            Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into())).with_session(token);
+            legacy_new(tmp.path(), "hetz.worker", "pi", Some("worker".into())).with_session(token);
 
         assert!(channel.observe_unless_ended(active()).unwrap());
         wrapper.ended("signal 9").unwrap();
@@ -4041,7 +4208,7 @@ mod tests {
         let mut writer = takeover(tmp.path(), "codex");
         assert!(writer.observe_unless_ended(active()).unwrap());
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.schema, SCHEMA);
+        assert_eq!(record.schema, SCHEMA_V2);
         assert_eq!(record.state, Activity::Active);
         assert_eq!(record.transitions, 9);
     }
@@ -4069,7 +4236,7 @@ mod tests {
     fn live_observations_require_a_pty_session_and_unfenced_live_records_read_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let mut unfenced = Writer::new(tmp.path(), "hetz.worker", "codex", None);
+        let mut unfenced = legacy_new(tmp.path(), "hetz.worker", "codex", None);
         assert!(
             unfenced.observe(active()).is_err(),
             "live states need a fence"
@@ -4183,16 +4350,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let token = session_token();
-        let mut wrapper = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut wrapper = legacy_new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
             .with_session(token.clone());
-        let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut hook = legacy_new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
             .with_session(token);
 
         hook.observe(active()).unwrap();
         let entered: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
         // A sibling's restatement coalesces (no transition churn across hook processes)…
-        let mut hook2 = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut hook2 = legacy_new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
             .with_session(entered.incarnation.clone());
         hook2.observe(active()).unwrap();
         let restated: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -4248,8 +4415,8 @@ mod tests {
 
         // The wrapper writes the claim and exports it; the hook adopts the pair.
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
-        let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
+        let mut hook = legacy_new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
             .with_ownership(token.clone(), seq);
         hook.observe(Observation::new(
             Activity::Idle,
@@ -4260,7 +4427,7 @@ mod tests {
         assert_eq!(read(&path, None).unwrap().state, Activity::Idle);
 
         // A later session claims past it; the adopted writer becomes the straggler.
-        let mut next = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()));
+        let mut next = legacy_new(tmp.path(), "hetz.worker", "claude", Some("worker".into()));
         next.observe(active()).unwrap();
         let after = fs::read(&path).unwrap();
         hook.observe(Observation::new(
@@ -4306,7 +4473,7 @@ mod tests {
             .map(|_| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    claim(&dir, "hetz.worker", "codex", &session_token()).unwrap()
+                    legacy_claim(&dir, "hetz.worker", "codex", &session_token()).unwrap()
                 })
             })
             .collect();
@@ -4326,7 +4493,7 @@ mod tests {
         writer(tmp.path()).observe(active()).unwrap();
 
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
         let observed = read(&path, None).unwrap();
         assert_eq!(
             observed.state,
@@ -4336,7 +4503,7 @@ mod tests {
         assert_eq!(observed.reason.as_deref(), Some("claimed"));
         assert_eq!(observed.exit, None);
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut successor = legacy_new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
             .with_ownership(token, seq);
         successor.observe(active()).unwrap();
         assert_eq!(read(&path, None).unwrap().state, Activity::Active);
@@ -4353,7 +4520,7 @@ mod tests {
         fs::write(&path, v2).unwrap();
 
         let token = session_token();
-        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut adopted = legacy_new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
             .with_ownership(token, 5);
         adopted.observe(active()).unwrap();
         assert_eq!(
@@ -4372,7 +4539,7 @@ mod tests {
         let mut claimed = takeover(tmp.path(), "codex");
         claimed.observe(active()).unwrap();
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(record.schema, SCHEMA, "only the written claim supersedes");
+        assert_eq!(record.schema, SCHEMA_V2, "only the written claim supersedes");
     }
 
     /// W8-7: a beyond-skew future stamp (a backward clock correction's leftover) must not make
@@ -4408,21 +4575,21 @@ mod tests {
     fn wrapperless_claims_are_atomic_and_never_supersede_a_live_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
         let wl =
-            |token: &str| claim_wrapperless(tmp.path(), "hetz.worker", "claude", token).unwrap();
+            |token: &str| legacy_claim_wrapperless(tmp.path(), "hetz.worker", "claude", token).unwrap();
         assert!(wl("claude-session-a").is_some(), "virgin dir");
 
         // A wrapper's FRESH claim placeholder is a session mid-startup, not an ended one: the
         // check-and-write is one act under the lock, so the racing hooks-only SessionStart
         // cannot steal the sequence between the wrapper's read and its write.
         let wrapper_token = session_token();
-        let wrapper_seq = claim(tmp.path(), "hetz.worker", "claude", &wrapper_token).unwrap();
+        let wrapper_seq = legacy_claim(tmp.path(), "hetz.worker", "claude", &wrapper_token).unwrap();
         assert!(
             wl("claude-session-b").is_none(),
             "fresh placeholder is owned"
         );
 
         // A live wrapper record stays off limits; a REAL terminal record is claimable.
-        let mut wrapper = Writer::new(
+        let mut wrapper = legacy_new(
             tmp.path(),
             "hetz.worker",
             "claude",
@@ -4447,9 +4614,9 @@ mod tests {
     fn an_abandoned_wrapper_placeholder_is_claimable_once_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        claim(tmp.path(), "hetz.worker", "claude", &session_token()).unwrap();
+        legacy_claim(tmp.path(), "hetz.worker", "claude", &session_token()).unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            legacy_claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_none()
         );
@@ -4458,7 +4625,7 @@ mod tests {
         aged.written_at_ms = crate::message::now_ms() - duration_ms(HARNESS_STATE_STALE) - 1;
         write_record(&path, &aged).unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            legacy_claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_some()
         );
@@ -4475,7 +4642,7 @@ mod tests {
             u64::MAX
         );
         fs::write(&path, saturated).unwrap();
-        assert!(claim(tmp.path(), "hetz.worker", "codex", "t").is_err());
+        assert!(legacy_claim(tmp.path(), "hetz.worker", "codex", "t").is_err());
 
         fs::write(&path, b"{not json").unwrap();
         let before = fs::read(&path).unwrap();
@@ -4486,7 +4653,7 @@ mod tests {
             before,
             "non-claiming writers refuse"
         );
-        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut adopted = legacy_new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
             .with_ownership(session_token(), 7);
         adopted.observe(active()).unwrap();
         assert_eq!(
@@ -4497,7 +4664,7 @@ mod tests {
 
         // The written claim supersedes even bytes it cannot parse; sequence and counter restart.
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
         assert_eq!(seq, 1);
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.transitions, 0);
@@ -4516,7 +4683,7 @@ mod tests {
 
         fs::write(&path, b"{corrupted").unwrap();
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
         assert!(
             seq > damaged_seq.seq,
             "the floor carries the sequence past the damage ({seq} vs {})",
@@ -4552,7 +4719,7 @@ mod tests {
         // lingering token-only predecessor stays fenced out.
         fs::write(&path, b"{corrupted").unwrap();
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
         assert!(
             seq > 1,
             "the persisted floor carries the claim past sequence one ({seq})"
@@ -4582,7 +4749,7 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            legacy_claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_none(),
             "wrapperless claims refuse unreadable records"
@@ -5222,13 +5389,18 @@ mod tests {
         )
     }
 
-    /// Reader-first means exactly this: this build READS a version 3 record and refuses to touch
-    /// it. The defect being fenced is subtle — a v3 record does not decode as this build's record
-    /// shape at all, so without the version-independent envelope the claim path would see "no
-    /// record on disk" and rename a version 2 claim over a live migrated record, destroying its
-    /// fault axis with no trace that it happened.
+    /// The one-way fence, now driven from the side activation left behind: a build whose writer
+    /// emits version 2 READS a version 3 record and refuses to touch it, by every path. This is
+    /// the rollout hazard in a mixed fleet — a not-yet-replaced peer, or a rolled-back binary,
+    /// running beside an activated one — and the defect it fences is subtle: a v3 record does not
+    /// decode as the legacy record shape at all, so without the version-independent envelope the
+    /// claim path would see "no record on disk" and rename a version 2 claim over a live migrated
+    /// record, destroying its fault axis with no trace that it happened.
+    ///
+    /// The version 2 writer is reached through the emitted-schema seam because this build's own
+    /// production writer is on version 3, where this direction is unreachable by construction.
     #[test]
-    fn a_version_three_record_is_read_but_never_written_over_by_this_builds_writer() {
+    fn a_version_two_writer_never_takes_over_a_version_three_record() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let planted = format!(
@@ -5237,7 +5409,7 @@ mod tests {
         );
         fs::write(&path, &planted).unwrap();
 
-        // Reading works — that is the whole point of shipping the reader first.
+        // Reading works from either side — that is what makes a staged rollout safe at all.
         let observed = read(&path, None).unwrap();
         assert_eq!(observed.condition, ConditionView::Clear);
         assert_eq!(observed.schema.as_deref(), Some(SCHEMA_V3));
@@ -5247,19 +5419,35 @@ mod tests {
         let mut token_only = writer(tmp.path());
         assert!(!token_only.observe_unless_ended(active()).unwrap());
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "codex", "claude-session-x")
-                .unwrap()
-                .is_none()
+            claim_wrapperless_emitting(
+                tmp.path(),
+                "hetz.worker",
+                "codex",
+                "claude-session-x",
+                SCHEMA_V2
+            )
+            .unwrap()
+            .is_none()
         );
-        let error = claim(tmp.path(), "hetz.worker", "codex", &session_token())
-            .unwrap_err()
-            .to_string();
+        let error = claim_emitting(
+            tmp.path(),
+            "hetz.worker",
+            "codex",
+            &session_token(),
+            SCHEMA_V2,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains(SCHEMA_V3), "{error}");
         assert_eq!(
             fs::read(&path).unwrap(),
             planted.as_bytes(),
             "the version 3 record is left byte-identical by every path"
         );
+
+        // And the other direction is open, which is what makes the fence one-way rather than a
+        // deadlock: this build's own production claim supersedes it.
+        assert!(claim(tmp.path(), FIXTURE_AGENT_ID, "codex", &session_token()).is_ok());
     }
 
     /// The other half of the envelope's job: bytes this build cannot decode as a record still
@@ -5278,7 +5466,7 @@ mod tests {
         )
         .unwrap();
 
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &session_token()).unwrap();
+        let seq = legacy_claim(tmp.path(), "hetz.worker", "codex", &session_token()).unwrap();
         assert_eq!(
             seq, 10,
             "the ownership sequence continues past bytes this build cannot read"
@@ -5291,11 +5479,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The version 3 producer surface. Every one of these runs the REAL locked
-    // writer path — same lock, same fences, same atomic rename — and the ones
-    // that need version 3 bytes get them through the test-only emitted-schema
-    // seam, because this build's production writer is still version 2 (proved
-    // by `the_writer_declares_version_two_so_its_agent_field_means_an_immutable_id`).
+    // The version 3 producer surface — this build's PRODUCTION surface since
+    // activation. Every one of these runs the REAL locked writer path: same
+    // lock, same fences, same atomic rename. `v3_writer` names the version
+    // explicitly rather than relying on `SCHEMA`, so these keep proving the
+    // version 3 semantics even from a build that has been rolled back (proved
+    // current by `the_writer_declares_version_three_and_still_means_an_immutable_id`).
     // -----------------------------------------------------------------------
 
     fn v3_writer(dir: &Path) -> Writer {
@@ -5328,12 +5517,13 @@ mod tests {
         )
     }
 
-    /// The rollout guarantee: while `EMIT_SCHEMA_V2` is true the producer API is a projection and
-    /// nothing more. The same tuple stated through the legacy API and through the version 3 API
-    /// produces the same bytes — the projection coalesces against the legacy record rather than
-    /// writing — the condition and conversation axes never reach the version 2 wire, and the
-    /// condition operations refuse as a VALUE rather than pretending to have stored an axis the
-    /// wire cannot carry.
+    /// The COMPATIBILITY guarantee, kept after activation: a writer emitting version 2 makes the
+    /// producer API a projection and nothing more. The same tuple stated through the legacy API
+    /// and through the version 3 API produces the same bytes — the projection coalesces against
+    /// the legacy record rather than writing — the condition and conversation axes never reach
+    /// the version 2 wire, and the condition operations refuse as a VALUE rather than pretending
+    /// to have stored an axis the wire cannot carry. This is what a rollback gets, and what every
+    /// version 2 record still on disk was written by.
     #[test]
     fn the_version_two_projection_is_byte_identical_and_carries_no_condition_axis() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5840,8 +6030,8 @@ mod tests {
 
         // The claim fence: a session that has claimed the seat and observed nothing. Its required
         // condition axis is not a statement, so nothing attaches to it and nothing is carried out
-        // of it — the fence is planted here in version 3 shape because this build's own [`claim`]
-        // writes the version it emits, which is still 2.
+        // of it — planted rather than claimed so the fence's exact bytes are the subject, not
+        // whichever version [`claim`] happens to emit.
         let claimed = tempfile::tempdir().unwrap();
         let fence_path = harness_state_path(claimed.path());
         let token = session_token();
@@ -6045,8 +6235,8 @@ mod tests {
     /// Wrapperless eligibility decodes BOTH writable shapes. A hooks-only session must be able to
     /// claim a version 3 record for exactly the reasons it can claim a version 2 one — otherwise,
     /// after the writer cutover, every record would look like undecodable bytes and no wrapperless
-    /// session could ever claim again. Decided as a pure function so the version 3 arm is provable
-    /// while this build's own writer is still version 2.
+    /// session could ever claim again. Decided as a pure function so BOTH arms stay provable from
+    /// one build whichever version its own writer emits.
     #[test]
     fn wrapperless_eligibility_decodes_version_three_records_too() {
         let now_ms = crate::message::now_ms();
@@ -6098,8 +6288,9 @@ mod tests {
             ),
             now_ms
         ));
-        // The one-way schema fence still holds: this build's version 2 writer has no eligible
-        // takeover of a version 3 record, however orphaned it looks.
+        // The one-way schema fence still holds from the other side: a version 2 writer — a peer
+        // not yet replaced, or a rollback — has no eligible takeover of a version 3 record,
+        // however orphaned it looks.
         assert!(!wrapperless_eligible(
             SCHEMA_V2,
             &v3(
@@ -6121,18 +6312,181 @@ mod tests {
             &CurrentRecord::Unreadable,
             now_ms
         ));
-        // And the legacy path is unchanged: the live wrapper record this build writes stays
-        // unclaimable and its terminal one stays claimable.
+        // And the legacy path is unchanged: a live wrapper record written by a version 2 writer
+        // stays unclaimable to a version 2 claimer, and its terminal one stays claimable.
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let mut wrapper = writer(tmp.path());
         wrapper.observe(active()).unwrap();
         assert!(!wrapperless_eligible(
-            SCHEMA,
+            SCHEMA_V2,
             &read_current(&path),
             now_ms
         ));
         wrapper.ended("exit 0").unwrap();
-        assert!(wrapperless_eligible(SCHEMA, &read_current(&path), now_ms));
+        assert!(wrapperless_eligible(
+            SCHEMA_V2,
+            &read_current(&path),
+            now_ms
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Activation proofs: what changed at the flip, and what must not have.
+    // -----------------------------------------------------------------------
+
+    /// A legacy `observe` call still works after the cutover — but only on top of a stated axis,
+    /// and it projects into the version 3 wire rather than into legacy bytes. This is what every
+    /// unmigrated legacy call site now does: the tagged ask is derived from the legacy pair, the
+    /// standing condition is carried forward untouched, and `blockedOn` is gone from the bytes.
+    #[test]
+    fn a_legacy_observation_projects_into_the_version_three_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+        let mut producer = v3_writer(tmp.path()).with_session(token.clone());
+        let fault = quota_fault(crate::message::now_ms() - 5_000);
+        assert!(
+            producer
+                .publish(v3_active(ConditionReport::Fault(fault.clone())))
+                .unwrap()
+                .landed()
+        );
+
+        let mut legacy = v3_writer(tmp.path()).with_session(token);
+        assert!(
+            legacy
+                .observe_unless_ended(
+                    Observation::new(Activity::Idle, BlockedOn::Human, InputBuffer::Empty)
+                        .with_ask(Ask::Permission)
+                )
+                .unwrap()
+        );
+        let record = record_json(&path);
+        assert_eq!(record["schema"], SCHEMA_V3);
+        assert!(
+            record.get("blockedOn").is_none(),
+            "the legacy pair is projected, not appended: {record}"
+        );
+        assert_eq!(record["ask"]["kind"], "pending");
+        assert_eq!(record["ask"]["ask"], "permission");
+        assert_eq!(
+            record["condition"]["kind"], "fault",
+            "an activity edge carries a standing fault forward and never clears it"
+        );
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Idle);
+        assert_eq!(observed.human_ask, HumanAsk::Pending(AskKind::Permission));
+        assert!(matches!(observed.condition, ConditionView::Fault(_)));
+    }
+
+    /// THE activation test. A wrapper is the one process that sees the provider die, and on many
+    /// incarnations its terminal write is the session's FIRST write: the claim fence states
+    /// nothing and is excluded from carry-forward, so version 3 refuses an unstated terminal
+    /// frame. The shared wrapper path states the axis once and the record lands anyway — without
+    /// it, wrapper-only `ended` would silently stop working and every such seat would age into
+    /// `unknown` instead of reporting how it ended.
+    #[test]
+    fn a_terminal_record_lands_even_when_no_producer_ever_stated_the_condition_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+        let seq = claim(tmp.path(), FIXTURE_AGENT_ID, "pi", &token).unwrap();
+        assert_eq!(record_json(&path)["schema"], SCHEMA_V3);
+        assert!(
+            read(&path, None).unwrap().state != Activity::Ended,
+            "the fence is indeterminate, not a terminal record"
+        );
+
+        let mut wrapper =
+            Writer::new(tmp.path(), FIXTURE_AGENT_ID, "pi", Some("worker".to_string()))
+                .with_ownership(token, seq);
+        // The legacy terminal call is exactly what refuses, which is why the wrappers moved.
+        assert!(
+            matches!(
+                wrapper
+                    .publish(
+                        Frame::new(
+                            Activity::Ended,
+                            InputBuffer::Unknown,
+                            ConditionReport::Unchanged,
+                            HumanAsk::None
+                        )
+                        .with_exit("signal 9")
+                    )
+                    .unwrap(),
+                WriteOutcome::Refused(Refusal::Unstated)
+            ),
+            "an unstated axis over a fence is refused, and that refusal is the retry's premise"
+        );
+        crate::provider_session::write_terminal(
+            &mut wrapper,
+            "signal 9",
+            None,
+            ConditionReport::Clear,
+        )
+        .unwrap();
+
+        let observed = read(&path, None).unwrap();
+        assert_eq!(observed.state, Activity::Ended);
+        assert_eq!(observed.exit.as_deref(), Some("signal 9"));
+        assert_eq!(
+            observed.condition,
+            ConditionView::Clear,
+            "the wrapper states the axis once rather than fabricating a fault"
+        );
+    }
+
+    /// The fence from the ACTIVATED side: this build's claim supersedes every supported version,
+    /// including its own, and no supported version supersedes it. Both halves matter during a
+    /// staged rollout — the first is why an activated binary can adopt any seat it finds, the
+    /// second is why a peer that has not been replaced cannot undo that.
+    #[test]
+    fn a_version_three_claim_supersedes_every_supported_version_and_is_never_superseded() {
+        for found in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3] {
+            assert!(
+                claim_may_supersede(SCHEMA_V3, Some(found)),
+                "a version 3 claim must supersede {found}"
+            );
+        }
+        for ours in [SCHEMA_V1, SCHEMA_V2] {
+            assert!(
+                !claim_may_supersede(ours, Some(SCHEMA_V3)),
+                "{ours} must never supersede a version 3 record"
+            );
+        }
+
+        // End to end, through the real locked claim: a version 2 record on disk is superseded by
+        // this build and the sequence continues across the version change.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = planted(tmp.path(), SCHEMA_V2, FIXTURE_AGENT_ID, 5);
+        let seq = claim(tmp.path(), FIXTURE_AGENT_ID, "codex", &session_token()).unwrap();
+        assert_eq!(seq, 6);
+        assert_eq!(record_json(&path)["schema"], SCHEMA_V3);
+    }
+
+    /// Legacy readability, after the writer moved: the frozen version 1 and version 2 fixtures
+    /// still project every axis a consumer joins to, and their condition reads as explicitly
+    /// ABSENT rather than as health. Nothing about the cutover may turn a record written by an
+    /// older binary into a claim that its harness was fine.
+    #[test]
+    fn a_legacy_record_is_still_read_and_projected_after_the_writer_cutover() {
+        assert_eq!(SCHEMA, SCHEMA_V3, "this is the post-cutover statement");
+        for raw in [
+            include_str!("../tests/fixtures/harness-state/v1-active.json"),
+            include_str!("../tests/fixtures/harness-state/v2-blocked.json"),
+        ] {
+            let observed = fixture(raw);
+            assert!(
+                observed.state != Activity::Unknown,
+                "a legacy record is a definite observation: {observed:?}"
+            );
+            assert!(observed.subject.is_some());
+            assert_eq!(
+                observed.condition,
+                ConditionView::Absent,
+                "a version without the axis states nothing on it: {observed:?}"
+            );
+        }
     }
 }
