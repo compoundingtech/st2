@@ -848,3 +848,111 @@ fn unarchive_refuses_when_the_tombstone_and_the_declaration_disagree_on_the_agen
     );
     assert!(!root.join(".st2/archive/h/gone.tombstone.json").exists());
 }
+
+// ---- DELTA-003: activation makes an unmigrated archive non-restorable ------------------------
+
+const KEEPER_ID: &str = "0199b8f4-8d3a-7c21-9a44-111111111111";
+
+/// A live declaration ID migration already reached, so the catalog reads as activated.
+fn migrated_keeper(root: &Path, id: &str) {
+    write(
+        root,
+        "agents/h/keeper/agent.kdl",
+        &format!("agent \"keeper\" {{\n  id \"{id}\"\n  host \"h\"\n  command \"true\"\n}}\n"),
+    );
+}
+
+/// Freeze an archived subject's ID in its declaration and its tombstone — what `migrate-ids`
+/// writes for a structurally archived subject.
+fn migrate_archived(root: &Path, identity: &str, id: &str) {
+    let declaration = root.join(format!(".st2/archive/h/{identity}/agent.kdl"));
+    let text = fs::read_to_string(&declaration).unwrap();
+    fs::write(
+        &declaration,
+        text.replace("  host \"h\"\n", &format!("  id \"{id}\"\n  host \"h\"\n")),
+    )
+    .unwrap();
+    let tombstone_path = root.join(format!(".st2/archive/h/{identity}.tombstone.json"));
+    let mut tombstone: serde_json::Value =
+        serde_json::from_slice(&fs::read(&tombstone_path).unwrap()).unwrap();
+    tombstone["agentId"] = serde_json::Value::String(id.to_owned());
+    fs::write(&tombstone_path, serde_json::to_vec(&tombstone).unwrap()).unwrap();
+}
+
+fn unarchive_gone(root: &Path, bin: &Path) -> Output {
+    st2(
+        root,
+        bin,
+        &["catalog", "unarchive", "gone", "--host", "h", "--json"],
+    )
+}
+
+#[test]
+fn unarchive_refuses_an_unmigrated_archive_once_the_live_catalog_is_migrated() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let root = catalog.as_path();
+    pty_shim(&bin, "[]");
+    retired_seat(root, "gone", RETIRED);
+    migrated_keeper(root, KEEPER_ID);
+    assert!(archive_gone(root, &bin).status.success());
+
+    // Every subject except the one under decision carries an explicit ID, so the target identity
+    // model is active and an unmigrated declaration has no ID to re-enter the catalog under.
+    let refused = unarchive_gone(root, &bin);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("st2 catalog migrate-ids"),
+        "the refusal must name the migration verb:\n{stderr}"
+    );
+    assert!(
+        root.join(".st2/archive/h/gone/agent.kdl").is_file()
+            && !root.join("agents/h/gone").exists(),
+        "a refused unarchive moves nothing"
+    );
+
+    // Migrating the archived subject admits the exact same restore.
+    migrate_archived(root, "gone", MIGRATED_ID);
+    let restored = unarchive_gone(root, &bin);
+    assert!(
+        restored.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(root.join("agents/h/gone/agent.kdl").is_file());
+    assert!(!root.join(".st2/archive/h/gone.tombstone.json").exists());
+}
+
+#[test]
+fn unarchive_refuses_an_id_the_prospective_live_and_archived_set_already_holds() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (catalog, bin) = fixture(&temporary);
+    let root = catalog.as_path();
+    pty_shim(&bin, "[]");
+    migrated_retired_seat(root, "gone", MIGRATED_ID);
+    migrated_keeper(root, KEEPER_ID);
+    assert!(archive_gone(root, &bin).status.success());
+
+    // A live subject took the archived subject's immutable ID while it was away. Validating
+    // against the live catalog alone would have missed this until the restore landed.
+    migrated_keeper(root, MIGRATED_ID);
+    let refused = unarchive_gone(root, &bin);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(MIGRATED_ID) && stderr.contains("already held by the live declaration"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!root.join("agents/h/gone").exists());
+
+    // Releasing the ID admits the restore.
+    migrated_keeper(root, KEEPER_ID);
+    let restored = unarchive_gone(root, &bin);
+    assert!(
+        restored.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(root.join("agents/h/gone/agent.kdl").is_file());
+}

@@ -340,33 +340,54 @@ pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
     // even for an archived directory the control plane can no longer explain.
     let tombstone = read_tombstone(&tombstone_path).ok().flatten();
     let archived_at = tombstone.as_ref().map(|tombstone| tombstone.archived_at);
-    if let Some(expected) = tombstone.as_ref().and_then(|it| it.agent_id.as_deref()) {
-        // A migrated tombstone froze this subject's immutable agent ID (R24). The declaration it
-        // covers must still carry the same one, or restoring it would re-enter the live plane
-        // under an identity the catalog never recorded for this subject.
-        let declaration = from.join("agent.kdl");
-        let shown = relative(&catalog, &declaration)
-            .unwrap_or_else(|| declaration.display().to_string());
-        let declared = agent_spec::discovery::parse_declared(&declaration).with_context(|| {
-            format!("read {shown} to check its agent ID against its tombstone's agentId")
-        })?;
-        let declared_id = match declared.as_slice() {
-            [single] => single.id.as_deref(),
+    // The archived declaration's own `id` is authoritative for both checks below, so read it once.
+    let declaration = from.join("agent.kdl");
+    let shown =
+        relative(&catalog, &declaration).unwrap_or_else(|| declaration.display().to_string());
+    let frozen = tombstone.as_ref().and_then(|it| it.agent_id.as_deref());
+    let declared_id = match agent_spec::discovery::parse_declared(&declaration) {
+        Ok(declared) => match declared.as_slice() {
+            [single] => single.id.clone(),
             many => anyhow::bail!(
                 "{shown} declares {} agents; a tombstoned identity must be one canonical declaration",
                 many.len()
             ),
-        };
+        },
+        // A legacy archive need not even hold a canonical `agent.kdl`, and that stays exactly as
+        // tolerated as it was. Only a migrated tombstone makes the declaration's ID load-bearing;
+        // otherwise the missing ID simply fails the activation gate closed below.
+        Err(error) if frozen.is_some() => {
+            return Err(error).with_context(|| {
+                format!("read {shown} to check its agent ID against its tombstone's agentId")
+            });
+        }
+        Err(_) => None,
+    };
+    if let Some(expected) = frozen {
+        // A migrated tombstone froze this subject's immutable agent ID (R24). The declaration it
+        // covers must still carry the same one, or restoring it would re-enter the live plane
+        // under an identity the catalog never recorded for this subject.
         anyhow::ensure!(
-            declared_id == Some(expected),
+            declared_id.as_deref() == Some(expected),
             "tombstone records agent ID '{expected}' but {shown} declares {}; repair one of them before unarchiving",
-            declared_id.map_or_else(|| "no explicit id".to_owned(), |id| format!("'{id}'"))
+            declared_id
+                .as_deref()
+                .map_or_else(|| "no explicit id".to_owned(), |id| format!("'{id}'"))
         );
     }
-    // DELTA-003: refusing an UNMIGRATED archive (a tombstone with no `agentId`) after ID migration
-    // has activated, and validating the restored ID's uniqueness against the prospective
-    // live-and-archived set, both land with the writer PR (D3). Until then a legacy tombstone
-    // restores exactly as it always did.
+    // DELTA-003: after activation an unmigrated archived declaration cannot re-enter the catalog,
+    // and the restored ID's uniqueness is decided against the prospective live-and-archived set
+    // rather than the live catalog alone. Before activation the legacy model stays normative and a
+    // legacy tombstone restores exactly as it always did.
+    if let Some(prospective) = prospective_identities(&catalog, &request.host, &request.identity) {
+        let restored = declared_id.as_deref().with_context(|| {
+            format!(
+                "{shown} carries no explicit agent `id` and this catalog's identity model is \
+                 active; run `st2 catalog migrate-ids` before restoring it"
+            )
+        })?;
+        prospective.refuse_duplicate(&catalog, &request.host, restored)?;
+    }
 
     let parent = to.parent().context("live identity path has no parent")?;
     fs::create_dir_all(parent)
@@ -396,6 +417,80 @@ pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
         to: relative(&catalog, &to).unwrap_or_else(|| to.display().to_string()),
         archived_at,
     })
+}
+
+/// The prospective live-and-archived subject index one restore is decided against.
+struct ProspectiveIdentities {
+    /// Every live subject the restore would join.
+    specs: Vec<agent_spec::spec::AgentSpec>,
+    /// Every archived subject except the one being restored.
+    others: Vec<Tombstone>,
+}
+
+/// The prospective index, or `None` when the target identity model is not active for this catalog.
+///
+/// The subject being restored is excluded from the activation question on purpose: it is the one
+/// under decision, and counting it would make "an unmigrated archive cannot re-enter an activated
+/// catalog" vacuous — the unmigrated archive would always force the catalog to read Legacy.
+///
+/// An undecidable catalog — incomplete discovery, or an archive with unexplained state — reads as
+/// not activated. DELTA-003 keeps every current invariant normative until activation is proven,
+/// so an unreadable plane must never invent a refusal that legacy st2 did not make.
+fn prospective_identities(
+    catalog: &Path,
+    host: &str,
+    identity: &str,
+) -> Option<ProspectiveIdentities> {
+    let found = crate::discover_strict(catalog);
+    if !found.errors.is_empty() {
+        return None;
+    }
+    let observation = observe(catalog).ok()?;
+    if !observation.issues.is_empty() {
+        return None;
+    }
+    let others = observation
+        .archived
+        .into_iter()
+        .filter(|tombstone| !(tombstone.host == host && tombstone.identity == identity))
+        .collect::<Vec<_>>();
+    crate::identity::activation_from(
+        &found.specs,
+        &others,
+        crate::catalog_migrate_ids::marker_path(catalog).exists(),
+    )
+    .is_activated()
+    .then_some(ProspectiveIdentities {
+        specs: found.specs,
+        others,
+    })
+}
+
+impl ProspectiveIdentities {
+    /// Refuse a restored agent ID that another live or archived subject already holds.
+    ///
+    /// An agent ID is catalog-global, so the live catalog alone is the wrong universe: an archived
+    /// subject keeps its frozen ID and may be restored next, and two subjects on one immutable ID
+    /// is exactly the state migration went to the trouble of ruling out.
+    fn refuse_duplicate(&self, catalog: &Path, host: &str, restored: &str) -> Result<()> {
+        for spec in &self.specs {
+            anyhow::ensure!(
+                spec.effective_id(host) != restored,
+                "agent id '{restored}' is already held by the live declaration {}; \
+                 unarchiving would put two subjects on one immutable id",
+                relative(catalog, &spec.path).unwrap_or_else(|| spec.path.display().to_string())
+            );
+        }
+        for tombstone in &self.others {
+            anyhow::ensure!(
+                tombstone.agent_id.as_deref() != Some(restored),
+                "agent id '{restored}' is already held by the archived subject {}.{}",
+                tombstone.host,
+                tombstone.identity
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Read every tombstone under the archive root, reporting entries that explain nothing.

@@ -115,6 +115,9 @@ enum Command {
         /// target when no positional session is given.
         #[arg(long)]
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--identity`.
+        #[arg(long = "agent-id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Catalog root. Defaults to `$CATALOG`.
         #[arg(long, conflicts_with = "catalog_path")]
         root: Option<PathBuf>,
@@ -149,6 +152,9 @@ enum Command {
     Status {
         /// Whose status — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Set your status to this state instead of printing it.
         #[arg(long = "set")]
         set: Option<String>,
@@ -277,6 +283,9 @@ enum Command {
         /// Select one exact Agent Spec by its fully qualified `<host>.<identity>`.
         #[arg(long, value_name = "HOST.IDENTITY")]
         identity: Option<String>,
+        /// Select one exact subject by its immutable agent ID (R24).
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Machine-readable JSON array, including retirement and declared Resource bindings.
         #[arg(long)]
         json: bool,
@@ -419,11 +428,20 @@ enum DriverCmd {
 enum AgentCmd {
     /// Author reversible whole-agent lifecycle intent in one canonical KDL declaration.
     DesiredState {
-        /// Exact bus identity, or a bare stable identity only when unique.
-        identity: String,
-        /// Desired whole-agent lifecycle state.
-        #[arg(value_parser = ["running", "suspended", "retired"])]
-        state: String,
+        /// Ordinary agent reference — an exact bus address, or a bare address unique in the
+        /// catalog — or the desired state when `--id` names the subject.
+        #[arg(value_name = "IDENTITY_OR_STATE")]
+        first: Option<String>,
+        /// The desired state, when the first positional is the agent reference.
+        #[arg(value_name = "STATE")]
+        second: Option<String>,
+        /// Exact immutable agent ID (R24). The first positional is then the desired state.
+        ///
+        /// Both positionals stay optional so the exact-ID form can shift them; clap refuses a
+        /// non-required positional ahead of a required one, which is why the state is validated in
+        /// the handler rather than by a positional `value_parser`.
+        #[arg(long = "id", conflicts_with = "second")]
+        agent_id: Option<String>,
         /// Required rationale for suspended/retired; forbidden for running.
         #[arg(long)]
         reason: Option<String>,
@@ -434,6 +452,9 @@ enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Assign or clear an agent's mutable address — one atomic address-book cutover with no
+    /// alias, redirect, or rename history. `--clear` restores the positional identity fallback.
+    Address(PresentationArgs),
     /// Compute the authoritative digest bound by `agent publish --input-sha256`.
     Digest {
         /// A canonical KDL file containing exactly one top-level `agent` node.
@@ -667,17 +688,23 @@ struct MsgCtx {
     host: Option<String>,
 }
 
+/// `[<reference>] <value>` plus the mutually exclusive exact-ID form.
+///
+/// `--id` takes the agent off the positional list, so the first positional is then the value —
+/// the same `[identity] <thing>` convention `st2 message read` and `st2 resource read` already
+/// use, and the reason clap's exclusion is expressed against the second positional.
 #[derive(Args)]
 struct PresentationArgs {
-    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog.
-    identity: String,
-    /// Presentation text. Use --clear to remove the field.
-    #[arg(
-        value_name = "TEXT",
-        required_unless_present = "clear",
-        conflicts_with = "clear"
-    )]
-    value: Option<String>,
+    /// Ordinary agent reference — an exact bus address, or a bare address unique in the catalog —
+    /// or the new value when `--id` names the subject.
+    #[arg(value_name = "IDENTITY_OR_TEXT")]
+    first: Option<String>,
+    /// The new value, when the first positional is the agent reference.
+    #[arg(value_name = "TEXT")]
+    second: Option<String>,
+    /// Exact immutable agent ID (R24). The first positional is then the new value.
+    #[arg(long = "id", conflicts_with = "second")]
+    agent_id: Option<String>,
     /// Remove the optional field.
     #[arg(long)]
     clear: bool,
@@ -687,6 +714,37 @@ struct PresentationArgs {
     /// Host used only to resolve declarations whose host is omitted.
     #[arg(long)]
     host: Option<String>,
+}
+
+impl PresentationArgs {
+    /// The selected subject and the requested value, where `None` is the cleared representation.
+    fn selection(self) -> Result<(st2::identity::AgentSelector, Option<String>, bool, Option<String>)>
+    {
+        let (selector, value) = match self.agent_id {
+            Some(id) => (st2::identity::AgentSelector::Id(id), self.first),
+            None => (
+                st2::identity::AgentSelector::Address(
+                    self.first
+                        .context("no agent selected: pass an agent reference or the `--id` form")?,
+                ),
+                self.second,
+            ),
+        };
+        anyhow::ensure!(
+            !(self.clear && value.is_some()),
+            "--clear removes the field and takes no value"
+        );
+        anyhow::ensure!(
+            self.clear || value.is_some(),
+            "a value is required unless --clear"
+        );
+        Ok((
+            selector,
+            if self.clear { None } else { value },
+            self.json,
+            self.host,
+        ))
+    }
 }
 
 #[derive(Subcommand)]
@@ -763,6 +821,9 @@ enum ResourceCmd {
     Ls {
         /// Whose declaration to read — bus id or bare identity. Defaults to you (`$ST_AGENT`).
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Emit the bindings as a JSON array.
         #[arg(long)]
         json: bool,
@@ -773,6 +834,9 @@ enum ResourceCmd {
     Read {
         first: String,
         second: Option<String>,
+        /// Exact immutable agent ID (R24); `first` is then the binding name.
+        #[arg(long = "id", conflicts_with = "second")]
+        agent_id: Option<String>,
         /// Emit the binding as a JSON object.
         #[arg(long)]
         json: bool,
@@ -788,6 +852,9 @@ enum ResourceCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long, conflicts_with = "second")]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with_all = ["second", "agent"])]
+        agent_id: Option<String>,
         /// Client-only wait bound in seconds. Expiry never cancels or retracts queued demand.
         #[arg(long, default_value_t = 30)]
         wait: u64,
@@ -816,6 +883,9 @@ enum ResourceCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with = "agent")]
+        agent_id: Option<String>,
         /// Emit a stable JSON receipt.
         #[arg(long)]
         json: bool,
@@ -829,6 +899,9 @@ enum ResourceCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with = "agent")]
+        agent_id: Option<String>,
         /// Emit a stable JSON receipt.
         #[arg(long)]
         json: bool,
@@ -844,6 +917,9 @@ enum ResourceCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with = "agent")]
+        agent_id: Option<String>,
         /// Emit a stable JSON receipt.
         #[arg(long)]
         json: bool,
@@ -858,6 +934,9 @@ enum ContextCmd {
     Read {
         /// Whose context — bus id or identity. Defaults to you (`$ST_AGENT`).
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Print the decision log instead of the working state.
         #[arg(long)]
         decisions: bool,
@@ -873,12 +952,18 @@ enum ContextCmd {
     /// Overwrite an agent's working state (`now.md`) from stdin.
     Write {
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
     /// Append a single decision (with its reasoning) to the log.
     Append {
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// The decision — a single line.
         #[arg(long)]
         decision: String,
@@ -894,8 +979,12 @@ enum ContextCmd {
 enum MessageCmd {
     /// Send a new message to a recipient's inbox.
     Send {
-        /// Recipient: a bus id (`<host>.<identity>`) or a bare identity in the catalog.
-        to: String,
+        /// Recipient: a bus address (`<host>.<address>`) or a bare address in the catalog.
+        #[arg(required_unless_present = "to_id", conflicts_with = "to_id")]
+        to: Option<String>,
+        /// Recipient by exact immutable agent ID (R24). Mutually exclusive with the positional.
+        #[arg(long = "to-id")]
+        to_id: Option<String>,
         /// The message body. Read from stdin when omitted.
         #[arg(short = 'm', long = "message")]
         body: Option<String>,
@@ -932,6 +1021,9 @@ enum MessageCmd {
     Ls {
         /// Whose inbox — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// List the archive instead of the inbox.
         #[arg(long)]
         archive: bool,
@@ -960,6 +1052,9 @@ enum MessageCmd {
     Sent {
         /// Whose sent index — bus id or identity. Defaults to you (`--as` / `$ST_AGENT`).
         identity: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with the positional reference.
+        #[arg(long = "id", conflicts_with = "identity")]
+        agent_id: Option<String>,
         /// Print only the indexed message count. Refuses unavailable or partial coverage.
         #[arg(long)]
         count: bool,
@@ -984,6 +1079,9 @@ enum MessageCmd {
         first: String,
         /// The message filename (when `first` is an identity).
         second: Option<String>,
+        /// Exact immutable agent ID (R24) owning the box; `first` is then the filename.
+        #[arg(long = "id", conflicts_with = "second")]
+        agent_id: Option<String>,
         /// Read from the archive instead of the inbox.
         #[arg(long)]
         archive: bool,
@@ -1002,6 +1100,9 @@ enum MessageCmd {
         first: String,
         /// The message filename (when `first` is an identity).
         second: Option<String>,
+        /// Exact immutable agent ID (R24) owning the box; `first` is then the filename.
+        #[arg(long = "id", conflicts_with = "second")]
+        agent_id: Option<String>,
         #[command(flatten)]
         ctx: MsgCtx,
     },
@@ -1024,8 +1125,12 @@ enum MessageCmd {
 enum EventCmd {
     /// Emit one producer-identified event into a declared agent stream.
     Emit {
-        /// Owning agent: `<host>.<identity>` or a bare local identity.
-        recipient: String,
+        /// Owning agent: a bus address (`<host>.<address>`) or a bare local address.
+        #[arg(required_unless_present = "recipient_id", conflicts_with = "recipient_id")]
+        recipient: Option<String>,
+        /// Owning agent by exact immutable agent ID (R24).
+        #[arg(long = "recipient-id")]
+        recipient_id: Option<String>,
         /// Declared stream name.
         #[arg(long)]
         stream: String,
@@ -1060,6 +1165,9 @@ enum StreamCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with = "agent")]
+        agent_id: Option<String>,
         /// Adapter command run under `sh -c`; omit both launch forms for external ingress.
         #[arg(long, conflicts_with = "adapter_argv")]
         command: Option<String>,
@@ -1077,6 +1185,9 @@ enum StreamCmd {
         /// Exact target agent; defaults to --as / $ST_AGENT.
         #[arg(long)]
         agent: Option<String>,
+        /// Exact immutable agent ID (R24). Mutually exclusive with `--agent`.
+        #[arg(long = "agent-id", conflicts_with = "agent")]
+        agent_id: Option<String>,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -1212,10 +1323,11 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Ding {
             session,
             identity,
+            agent_id,
             root,
             host,
             interval,
-        } => ding_cmd(session, identity, root, host, interval),
+        } => ding_cmd(session, identity, agent_id, root, host, interval),
         Command::CodexAppServer {
             identity,
             runtime_id,
@@ -1317,18 +1429,38 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             let catalog = catalog_arg(None)?;
             driver_expand_cmd(&catalog, &spec, agent.as_deref(), host.as_deref())
         }
-        Command::Status { identity, set, ctx } => status_cmd(identity, set, ctx),
+        Command::Status {
+            identity,
+            agent_id,
+            set,
+            ctx,
+        } => status_cmd(identity, agent_id, set, ctx),
         Command::Rename(args) => presentation_cmd(st2::agent_author::PresentationField::Name, args),
         Command::Describe(args) => {
             presentation_cmd(st2::agent_author::PresentationField::Description, args)
         }
+        Command::Agent(AgentCmd::Address(args)) => address_cmd(args),
         Command::Agent(AgentCmd::DesiredState {
-            identity,
-            state,
+            first,
+            second,
+            agent_id,
             reason,
             host,
             json,
-        }) => desired_state_cmd(identity, state, reason, host, json),
+        }) => {
+            let (identity, state) = match &agent_id {
+                Some(_) => (None, first),
+                None => (first, second),
+            };
+            let state = state.context(
+                "a desired state is required: `running`, `suspended`, or `retired`",
+            )?;
+            anyhow::ensure!(
+                matches!(state.as_str(), "running" | "suspended" | "retired"),
+                "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
+            );
+            desired_state_cmd(identity, agent_id, state, reason, host, json)
+        }
         Command::Agent(AgentCmd::Publish {
             spec,
             bundle,
@@ -1644,10 +1776,11 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             catalog,
             status,
             identity,
+            agent_id,
             json,
             enrich,
             ctx,
-        } => agents_cmd(catalog, status, identity, json, enrich, ctx),
+        } => agents_cmd(catalog, status, identity, agent_id, json, enrich, ctx),
         Command::Tasks { host, json } => {
             if !json {
                 anyhow::bail!("`st2 tasks` v1 requires --json");
@@ -2487,19 +2620,14 @@ fn presentation_cmd(
     field: st2::agent_author::PresentationField,
     args: PresentationArgs,
 ) -> Result<()> {
-    let PresentationArgs {
-        identity,
-        value,
-        clear,
-        json,
-        host,
-    } = args;
+    let (selector, requested, json, host) = args.selection()?;
     let root = catalog_arg(None)?;
     let host = host.unwrap_or_else(detect_host);
+    let identity = resolve_declaration(&root, &host, selector)?;
     let actor = std::env::var("ST_AGENT")
         .ok()
         .filter(|value| !value.is_empty());
-    let requested = if clear { None } else { value.as_deref() };
+    let requested = requested.as_deref();
     match st2::agent_author::set_presentation(
         &root,
         &identity,
@@ -2546,8 +2674,66 @@ fn presentation_cmd(
     }
 }
 
+/// Assign or clear one agent's mutable address (R25) — the third authoring sibling of `st2 rename`
+/// and `st2 describe`, classified by exactly the same receipt and refusal vocabulary.
+fn address_cmd(args: PresentationArgs) -> Result<()> {
+    let (selected, requested, json, host) = args.selection()?;
+    let root = catalog_arg(None)?;
+    let host = host.unwrap_or_else(detect_host);
+    let selector = resolve_declaration(&root, &host, selected)?;
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let requested = requested.as_deref();
+    match st2::agent_author::set_address(&root, &selector, &host, actor.as_deref(), requested) {
+        Ok(receipt) => {
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                let state = match (receipt.result, receipt.address.as_deref()) {
+                    (st2::agent_author::AuthorOutcome::Changed, Some(value)) => {
+                        format!("set to {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Changed, None) => "cleared".to_owned(),
+                    (st2::agent_author::AuthorOutcome::Unchanged, Some(value)) => {
+                        format!("already {value:?}")
+                    }
+                    (st2::agent_author::AuthorOutcome::Unchanged, None) => {
+                        "already clear".to_owned()
+                    }
+                };
+                println!(
+                    "{} address: {state} (bus address {})",
+                    receipt.id,
+                    receipt
+                        .bus_address
+                        .as_deref()
+                        .unwrap_or("none — the subject is retired and non-routable")
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "error",
+                        "code": error.code(),
+                        "identity": selector,
+                        "field": "address",
+                        "error": error.to_string(),
+                    })
+                );
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn desired_state_cmd(
-    identity: String,
+    identity: Option<String>,
+    agent_id: Option<String>,
     state: String,
     reason: Option<String>,
     host: Option<String>,
@@ -2561,6 +2747,7 @@ fn desired_state_cmd(
     };
     let root = catalog_arg(None)?;
     let host = host.unwrap_or_else(detect_host);
+    let identity = resolve_declaration(&root, &host, one_selector(identity, agent_id)?)?;
     let actor = std::env::var("ST_AGENT")
         .ok()
         .filter(|value| !value.is_empty());
@@ -2611,11 +2798,16 @@ fn desired_state_cmd(
     }
 }
 
-fn status_cmd(identity: Option<String>, set: Option<String>, ctx: MsgCtx) -> Result<()> {
+fn status_cmd(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    set: Option<String>,
+    ctx: MsgCtx,
+) -> Result<()> {
     let (root, host) = resolve_ctx(&ctx)?;
-    let id = match identity {
-        Some(i) => i,
-        None => acting_id(&ctx)?,
+    let id = match selected_route(&root, &host, identity, agent_id)? {
+        Some(id) => id,
+        None => acting_route(&root, &host, &ctx)?,
     };
     let sp = st2::status::status_path(&agent_dir_of(&root, &id, &host)?);
     match set {
@@ -2637,6 +2829,7 @@ fn agents_cmd(
     catalog: Option<PathBuf>,
     status_filter: Option<String>,
     identity: Option<String>,
+    agent_id: Option<String>,
     json: bool,
     enrich: bool,
     mut ctx: MsgCtx,
@@ -2651,12 +2844,13 @@ fn agents_cmd(
     let (root, host) = resolve_ctx(&ctx)?;
     let _catalog_lock = st2::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for agent roster")?;
-    let found = if identity.is_some() {
+    let selected = identity.is_some() || agent_id.is_some();
+    let found = if selected {
         st2::discover_strict(&root)
     } else {
         st2::discover(&root)
     };
-    if identity.is_some() && !found.errors.is_empty() {
+    if selected && !found.errors.is_empty() {
         let errors = found
             .errors
             .iter()
@@ -2674,6 +2868,16 @@ fn agents_cmd(
         anyhow::ensure!(
             rows.len() == 1,
             "expected exactly one Agent Spec with identity `{identity}`, found {}",
+            rows.len()
+        );
+    }
+    // An exact ID roster query is catalog-global and answers on the appended immutable `id`, not
+    // on the positional declaration key — equal bytes in the two namespaces never collide.
+    if let Some(agent_id) = &agent_id {
+        rows.retain(|row| row.id == *agent_id);
+        anyhow::ensure!(
+            rows.len() == 1,
+            "expected exactly one Agent Spec with agent id `{agent_id}`, found {}",
             rows.len()
         );
     }
@@ -2768,6 +2972,7 @@ fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
 fn ding_cmd(
     session: Option<String>,
     identity: Option<String>,
+    agent_id: Option<String>,
     root: Option<PathBuf>,
     host: Option<String>,
     interval: u64,
@@ -2778,11 +2983,25 @@ fn ding_cmd(
         host,
     };
     let (catalog_root, this_host) = resolve_ctx(&ctx)?;
-    let id = acting_id(&ctx)?;
+    // The poked pty session is a runtime task ID, so it keeps the exact bytes the caller named:
+    // under activation `ST_AGENT` carries the agent ID and the canonical agent task ID equals it.
+    // The inbox and status are declaration-parent state, so they resolve through the route.
+    let named = match &agent_id {
+        Some(id) => id.clone(),
+        None => acting_id(&ctx)?,
+    };
+    let id = match agent_id {
+        Some(id) => resolve_route(
+            &catalog_root,
+            &this_host,
+            st2::identity::AgentSelector::Id(id),
+        )?,
+        None => acting_route(&catalog_root, &this_host, &ctx)?,
+    };
     // The pty to poke defaults to the identity — an agent IS its pty, so the session id == the agent
     // id. So `st2 ding --identity mix.worker` pokes pty `mix.worker` (the redundant positional is now
     // optional). An explicit positional still overrides for the rare non-agent case.
-    let session = session.unwrap_or_else(|| id.clone());
+    let session = session.unwrap_or(named);
     // Flat-bus aware: a native catalog agent → its resources/inbox; a catalog-LESS bus (an eval's
     // ST_ROOT) → the flat <root>/<id>/inbox. Status lives beside it either way.
     let agent_dir = message::resolve_agent_dir(&catalog_root, &id, &this_host)?
@@ -2828,10 +3047,157 @@ fn acting_id(ctx: &MsgCtx) -> Result<String> {
         .context("no acting identity: pass --as or set $ST_AGENT")
 }
 
+/// The acting subject's route.
+///
+/// `--as` is an ordinary address reference; `$ST_AGENT` carries the exact immutable agent ID
+/// (`docs/vrs/03-message/spec.md`: selection follows one total order, and neither an address nor
+/// `ST_AGENT` is heuristically retyped). So the two are not interchangeable strings once a subject
+/// declares an explicit address. An ID that names no declared subject keeps its raw bytes, which
+/// is what leaves flat, orphan, and `$ST2_EVAL_REQUESTER` mailboxes resolving exactly as they do
+/// today; ambiguity cannot arise for a catalog-global ID, so absence is the only miss.
+fn acting_route(root: &Path, host: &str, ctx: &MsgCtx) -> Result<String> {
+    if let Some(address) = ctx.as_id.clone().filter(|value| !value.is_empty()) {
+        return Ok(address);
+    }
+    let id = acting_id(ctx)?;
+    match resolve_selected(root, host, st2::identity::AgentSelector::Id(id.clone())) {
+        Ok(selected) => Ok(selected.route),
+        Err(_) => Ok(id),
+    }
+}
+
 /// Resolve a recipient/identity to its agent folder in the catalog, or a clear error.
 fn agent_dir_of(root: &Path, id: &str, host: &str) -> Result<PathBuf> {
     message::resolve_agent_dir(root, id, host)?
         .with_context(|| format!("no agent '{id}' found in catalog {}", root.display()))
+}
+
+/// The one typed agent selector a CLI reference pair carries (R24).
+///
+/// Every agent-selecting command exposes both forms and clap's `conflicts_with` keeps them
+/// mutually exclusive, so at most one arrives here: an ordinary address reference, or an exact
+/// immutable agent ID.
+fn agent_selector(
+    reference: Option<String>,
+    id: Option<String>,
+) -> Option<st2::identity::AgentSelector> {
+    match (reference, id) {
+        (_, Some(id)) => Some(st2::identity::AgentSelector::Id(id)),
+        (Some(reference), None) => Some(st2::identity::AgentSelector::Address(reference)),
+        (None, None) => None,
+    }
+}
+
+/// [`agent_selector`] for a command that requires a target rather than defaulting to the actor.
+fn one_selector(
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<st2::identity::AgentSelector> {
+    agent_selector(reference, id)
+        .context("no agent selected: pass an agent reference or the exact `--id` form")
+}
+
+/// The one subject a typed selector names, in both namespaces its consumers accept.
+///
+/// These are two different strings once a subject declares an explicit `address`, and handing the
+/// wrong one onward is exactly the ID-through-a-mutable-address hop decision 0015 forbids:
+/// declaration-selecting commands match the positional key and never look at `address`, while
+/// reference resolution for inboxes, status, context, and recipients answers on the address.
+struct SelectedAgent {
+    /// `<host>.<identity>` — the positional declaration key, which no address cutover changes.
+    declaration: String,
+    /// `<host>.<effective address>` — the current route.
+    route: String,
+}
+
+/// Resolve one typed selector against the catalog.
+///
+/// The address form stays on st2's existing reference resolution, which DELTA-003 keeps normative
+/// until the identity model activates, so it carries the caller's bytes through unchanged. The ID
+/// form is a catalog-global exact lookup that never falls through to address lookup — that is what
+/// stops a renamed subject's old semantic ID from silently staying alive as a route.
+fn resolve_selected(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<SelectedAgent> {
+    let id = match selector {
+        st2::identity::AgentSelector::Address(reference) => {
+            return Ok(SelectedAgent {
+                declaration: reference.clone(),
+                route: reference,
+            });
+        }
+        st2::identity::AgentSelector::Id(id) => id,
+    };
+    let found = discover(root);
+    // Retired subjects are present here and absent from the routable address book on purpose:
+    // retirement releases the address, never the ID, so an exact-ID selector still names its
+    // subject and `st2 describe` can still edit a retired declaration.
+    let entries = found
+        .specs
+        .iter()
+        .map(|spec| st2::identity::AddressBookEntry {
+            id: spec.effective_id(host),
+            host: spec.resolved_host(host).to_owned(),
+            address: spec.effective_address().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let resolved = &st2::identity::resolve_id(&entries, &id)?.id;
+    let spec = found
+        .specs
+        .iter()
+        .find(|spec| &spec.effective_id(host) == resolved)
+        .context("the resolved agent id left the discovery it was resolved against")?;
+    Ok(SelectedAgent {
+        declaration: spec.bus_id(host),
+        route: spec.bus_address(host),
+    })
+}
+
+/// [`resolve_selected`] for a command that selects a declaration to read or author.
+fn resolve_declaration(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<String> {
+    resolve_selected(root, host, selector).map(|selected| selected.declaration)
+}
+
+/// [`resolve_selected`] for a command that resolves a route: an inbox, status, or recipient.
+fn resolve_route(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<String> {
+    resolve_selected(root, host, selector).map(|selected| selected.route)
+}
+
+/// The declaration selector for one CLI reference pair, or `None` when the command must fall back
+/// to the caller's own ambient actor.
+fn selected_declaration(
+    root: &Path,
+    host: &str,
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<Option<String>> {
+    match agent_selector(reference, id) {
+        None => Ok(None),
+        Some(selector) => resolve_declaration(root, host, selector).map(Some),
+    }
+}
+
+/// [`selected_declaration`] for a command that resolves a route rather than a declaration.
+fn selected_route(
+    root: &Path,
+    host: &str,
+    reference: Option<String>,
+    id: Option<String>,
+) -> Result<Option<String>> {
+    match agent_selector(reference, id) {
+        None => Ok(None),
+        Some(selector) => resolve_route(root, host, selector).map(Some),
+    }
 }
 
 /// Resolve ordinary declared messaging authority plus the exact external requester capability
@@ -2864,11 +3230,17 @@ fn body_or_stdin(body: Option<String>) -> Result<String> {
 }
 
 /// `[identity] <filename>` positionals: if `second` is present, `first` is the identity; otherwise
-/// `first` is the filename and the box belongs to the acting identity.
-fn box_target(first: String, second: Option<String>, ctx: &MsgCtx) -> Result<(String, String)> {
-    match second {
-        Some(filename) => Ok((first, filename)),
-        None => Ok((acting_id(ctx)?, first)),
+/// `first` is the filename and the box belongs to `--id`, else to the acting identity.
+fn box_target(
+    first: String,
+    second: Option<String>,
+    owner: Option<String>,
+    mine: impl FnOnce() -> Result<String>,
+) -> Result<(String, String)> {
+    match (second, owner) {
+        (Some(thing), _) => Ok((first, thing)),
+        (None, Some(owner)) => Ok((owner, first)),
+        (None, None) => Ok((mine()?, first)),
     }
 }
 
@@ -2876,6 +3248,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
     match cmd {
         MessageCmd::Send {
             to,
+            to_id,
             body,
             subject,
             in_reply_to,
@@ -2884,7 +3257,8 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let from = acting_id(&ctx)?;
+            let to = resolve_route(&root, &host, one_selector(to, to_id)?)?;
+            let from = acting_route(&root, &host, &ctx)?;
             let body = body_or_stdin(body)?;
             let filename = send_resolved_message(
                 &root,
@@ -2908,7 +3282,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let from = acting_id(&ctx)?;
+            let from = acting_route(&root, &host, &ctx)?;
             let my_inbox = resolve_message_inbox(&root, &from, &host)?;
             let original = message::read_msg(&my_inbox, &filename)
                 .or_else(|inbox_error| {
@@ -2919,10 +3293,14 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                     message::read_msg(&my_archive, &filename)
                 })
                 .with_context(|| format!("no message '{filename}' in {}'s inbox", from))?;
-            let to = original
-                .from
-                .clone()
-                .with_context(|| format!("message '{filename}' has no `from` to reply to"))?;
+            // The reply target comes from the message's own provenance, not from re-parsing its
+            // `from` bytes: a version-2 record names an exact agent ID, and a legacy record's
+            // reassigned bus identity is attributed against this box's owner or refused outright.
+            let to = resolve_route(
+                &root,
+                &host,
+                message::reply_recipient(&root, Some(&from), &original)?,
+            )?;
             let subject = subject.or_else(|| message::reply_subject(original.subject.as_deref()));
             let body = body_or_stdin(body)?;
             let sent = send_resolved_message(
@@ -2941,6 +3319,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Sent {
             identity,
+            agent_id,
             count,
             include_body,
             to,
@@ -2949,7 +3328,10 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = identity.unwrap_or(acting_id(&ctx)?);
+            let id = match selected_route(&root, &host, identity, agent_id)? {
+                Some(id) => id,
+                None => acting_route(&root, &host, &ctx)?,
+            };
             let mut view = message::with_resolved_agent_dir(&root, &id, &host, |agent_dir| {
                 message::list_sent(agent_dir, include_body)
             })?;
@@ -2997,6 +3379,7 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         }
         MessageCmd::Ls {
             identity,
+            agent_id,
             archive,
             orphan,
             count,
@@ -3007,9 +3390,9 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(id) => id,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let dir = message::resolve_list_box(&root, &id, &host, archive, orphan)?;
             let mut msgs = if archive {
@@ -3051,13 +3434,16 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
         MessageCmd::Read {
             first,
             second,
+            agent_id,
             archive,
             raw,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
+            let owner = selected_route(&root, &host, None, agent_id)?;
+            let (id, filename) =
+                box_target(first, second, owner, || acting_route(&root, &host, &ctx))?;
             let dir = if archive {
                 message::resolve_archive(&root, &id, &host)
             } else {
@@ -3086,9 +3472,16 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             print!("{}", m.body);
             Ok(())
         }
-        MessageCmd::Archive { first, second, ctx } => {
+        MessageCmd::Archive {
+            first,
+            second,
+            agent_id,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, filename) = box_target(first, second, &ctx)?;
+            let owner = selected_route(&root, &host, None, agent_id)?;
+            let (id, filename) =
+                box_target(first, second, owner, || acting_route(&root, &host, &ctx))?;
             message::archive_resolved_message(&root, &id, &host, &filename)?;
             println!("archived");
             Ok(())
@@ -3160,6 +3553,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
     match cmd {
         EventCmd::Emit {
             recipient,
+            recipient_id,
             stream,
             event_id,
             key,
@@ -3170,6 +3564,8 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
+            let recipient =
+                resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,
@@ -3193,10 +3589,11 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
 }
 
 fn stream_cmd(cmd: StreamCmd) -> Result<()> {
-    let (name, agent, json, ctx, launch, remove) = match cmd {
+    let (name, agent, agent_id, json, ctx, launch, remove) = match cmd {
         StreamCmd::Add {
             name,
             agent,
+            agent_id,
             command,
             adapter_argv,
             json,
@@ -3208,14 +3605,15 @@ fn stream_cmd(cmd: StreamCmd) -> Result<()> {
                 (None, true) => None,
                 (Some(_), false) => anyhow::bail!("stream add got both --command and adapter argv"),
             };
-            (name, agent, json, ctx, launch, false)
+            (name, agent, agent_id, json, ctx, launch, false)
         }
         StreamCmd::Rm {
             name,
             agent,
+            agent_id,
             json,
             ctx,
-        } => (name, agent, json, ctx, None, true),
+        } => (name, agent, agent_id, json, ctx, None, true),
     };
     let (root, host) = resolve_ctx(&ctx)?;
     let actor = ctx
@@ -3223,9 +3621,12 @@ fn stream_cmd(cmd: StreamCmd) -> Result<()> {
         .clone()
         .or_else(|| std::env::var("ST_AGENT").ok())
         .filter(|value| !value.is_empty());
-    let target = agent
-        .or_else(|| actor.clone())
-        .context("no stream target: pass --agent, --as, or set $ST_AGENT")?;
+    let target = match selected_declaration(&root, &host, agent, agent_id)? {
+        Some(target) => target,
+        None => actor
+            .clone()
+            .context("no stream target: pass --agent, --agent-id, --as, or set $ST_AGENT")?,
+    };
     if remove {
         let receipt =
             st2::agent_author::remove_stream(&root, &target, &host, actor.as_deref(), &name)?;
@@ -3471,12 +3872,13 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
     match cmd {
         ContextCmd::Read {
             identity,
+            agent_id,
             decisions,
             full,
             fresh_within,
             ctx,
         } => {
-            let dir = resolve_context_dir(identity, &ctx)?;
+            let dir = resolve_context_dir(identity, agent_id, &ctx)?;
             let view = if full {
                 View::Full
             } else if decisions {
@@ -3494,11 +3896,15 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
             print!("{content}");
             Ok(())
         }
-        ContextCmd::Write { identity, ctx } => {
+        ContextCmd::Write {
+            identity,
+            agent_id,
+            ctx,
+        } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(identity) => identity,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let content =
                 std::io::read_to_string(std::io::stdin()).context("reading context from stdin")?;
@@ -3515,14 +3921,15 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
         }
         ContextCmd::Append {
             identity,
+            agent_id,
             decision,
             why,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
+            let id = match selected_route(&root, &host, identity, agent_id)? {
                 Some(identity) => identity,
-                None => acting_id(&ctx)?,
+                None => acting_route(&root, &host, &ctx)?,
             };
             let filename = message::with_resolved_state_dir(
                 &root,
@@ -3653,12 +4060,13 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
     match cmd {
         ResourceCmd::Ls {
             identity,
+            agent_id,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let id = match identity {
-                Some(i) => i,
+            let id = match selected_declaration(&root, &host, identity, agent_id)? {
+                Some(id) => id,
                 None => acting_id(&ctx)?,
             };
             let (identity, bindings) = resource_bindings(&root, &id, &host)?;
@@ -3687,11 +4095,13 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Read {
             first,
             second,
+            agent_id,
             json,
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let (id, name) = box_target(first, second, &ctx)?;
+            let owner = selected_declaration(&root, &host, None, agent_id)?;
+            let (id, name) = box_target(first, second, owner, || acting_id(&ctx))?;
             let (identity, bindings) = resource_bindings(&root, &id, &host)?;
             let binding = bindings
                 .iter()
@@ -3716,6 +4126,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             first,
             second,
             agent,
+            agent_id,
             wait,
             json,
             ctx,
@@ -3724,7 +4135,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             let (selector, name) = match second {
                 Some(name) => (first, name),
                 None => {
-                    let selector = match agent {
+                    let selector = match selected_declaration(&root, &host, agent, agent_id)? {
                         Some(agent) => agent,
                         None => acting_id(&ctx)?,
                     };
@@ -3810,6 +4221,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             inactive_reason,
             selector_json,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
@@ -3818,7 +4230,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
                 .map(serde_json::from_str)
                 .transpose()
                 .map_err(|error| anyhow::anyhow!("--selector-json is not valid JSON: {error}"))?;
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt = st2::agent_author::add_resource_with_selector(
                 &root,
                 &target,
@@ -3843,10 +4255,11 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
         ResourceCmd::Remove {
             name,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt =
                 st2::agent_author::remove_resource(&root, &target, &host, actor.as_deref(), &name)?;
             if json {
@@ -3863,10 +4276,11 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
             old,
             new,
             agent,
+            agent_id,
             json,
             ctx,
         } => {
-            let (root, host, actor, target) = resource_author_target(agent, &ctx)?;
+            let (root, host, actor, target) = resource_author_target(agent, agent_id, &ctx)?;
             let receipt = st2::agent_author::rename_resource(
                 &root,
                 &target,
@@ -3891,6 +4305,7 @@ fn resource_cmd(cmd: ResourceCmd) -> Result<()> {
 /// The catalog root, host, acting actor, and authored target for one mediated binding edit.
 fn resource_author_target(
     agent: Option<String>,
+    agent_id: Option<String>,
     ctx: &MsgCtx,
 ) -> Result<(PathBuf, String, Option<String>, String)> {
     let (root, host) = resolve_ctx(ctx)?;
@@ -3899,18 +4314,25 @@ fn resource_author_target(
         .clone()
         .or_else(|| std::env::var("ST_AGENT").ok())
         .filter(|value| !value.is_empty());
-    let target = agent
-        .or_else(|| actor.clone())
-        .context("no resource binding target: pass --agent, --as, or set $ST_AGENT")?;
+    let target = match selected_declaration(&root, &host, agent, agent_id)? {
+        Some(target) => target,
+        None => actor.clone().context(
+            "no resource binding target: pass --agent, --agent-id, --as, or set $ST_AGENT",
+        )?,
+    };
     Ok((root, host, actor, target))
 }
 
 /// Resolve an agent's context dir (`<agent_dir>/resources/context`). Identity defaults to `$ST_AGENT`.
-fn resolve_context_dir(identity: Option<String>, ctx: &MsgCtx) -> Result<PathBuf> {
+fn resolve_context_dir(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    ctx: &MsgCtx,
+) -> Result<PathBuf> {
     let (root, host) = resolve_ctx(ctx)?;
-    let id = match identity {
-        Some(i) => i,
-        None => acting_id(ctx)?,
+    let id = match selected_route(&root, &host, identity, agent_id)? {
+        Some(identity) => identity,
+        None => acting_route(&root, &host, ctx)?,
     };
     Ok(st2::context::context_dir(&agent_dir_of(&root, &id, &host)?))
 }
@@ -4027,7 +4449,9 @@ fn up(
         let mut found = discover(&catalog_root);
         let ownership_specs = found.specs.clone();
         if let Some(selector) = task.as_deref() {
-            let (owner, _, _) = st2::reconcile::resolve_task(&found.specs, selector, &this_host)?;
+            let activation = st2::reconcile::discovered_identity_activation(&catalog_root, &found);
+            let (owner, _, _) =
+                st2::reconcile::resolve_task(&found.specs, selector, &this_host, &activation)?;
             let owner_identity = owner.identity.clone();
             let owner_path = owner.path.clone();
             found

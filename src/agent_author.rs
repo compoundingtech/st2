@@ -72,6 +72,32 @@ impl PresentationField {
     }
 }
 
+/// One single-positional-string child node these source-preserving edits may rewrite.
+///
+/// Address is not presentation — it is the mutable route (R24/R25), and it carries authority
+/// presentation never has — but it is edited by exactly the same span-bounded machinery: find,
+/// replace, insert, or remove one child node while every other byte of the declaration survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredField {
+    Presentation(PresentationField),
+    Address,
+}
+
+impl DeclaredField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Presentation(field) => field.as_str(),
+            Self::Address => "address",
+        }
+    }
+}
+
+impl From<PresentationField> for DeclaredField {
+    fn from(field: PresentationField) -> Self {
+        Self::Presentation(field)
+    }
+}
+
 /// Whether a request changed declaration bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,6 +113,23 @@ pub struct PresentationReceipt {
     pub identity: String,
     pub field: PresentationField,
     pub value: Option<String>,
+    pub retired: bool,
+}
+
+/// Stable machine-readable receipt from one agent-address cutover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressReceipt {
+    pub result: AuthorOutcome,
+    /// The subject's immutable agent ID (R24) — the value an address cutover must not touch.
+    pub id: String,
+    /// The positional declaration key, also unchanged: it stays the legacy address fallback.
+    pub identity: String,
+    /// The declared `address` after the edit. `None` means the positional fallback is effective.
+    pub address: Option<String>,
+    /// `<host>.<effective address>` after the cutover. `None` for a retired subject, which is
+    /// non-routable and released its address.
+    pub bus_address: Option<String>,
     pub retired: bool,
 }
 
@@ -196,6 +239,9 @@ impl std::error::Error for AuthorError {}
 #[derive(Debug)]
 struct AgentTarget {
     identity: String,
+    /// The subject's immutable catalog-global agent ID (R24): the explicit `id`, else the legacy
+    /// `<host>.<identity>` bus identity that migration freezes as this subject's ID.
+    agent_id: String,
     source_host: String,
     source_identity: String,
     declaration: PathBuf,
@@ -663,7 +709,7 @@ pub fn set_presentation(
         &target.identity,
         &target.source_host,
         &target.source_identity,
-        field,
+        field.into(),
         requested.as_deref(),
         || {},
     )?;
@@ -674,6 +720,125 @@ pub fn set_presentation(
         value: requested,
         retired: target.retired,
     })
+}
+
+/// Assign or clear one subject's mutable agent address — one atomic address-book cutover (R25).
+///
+/// The old address stops resolving as soon as the new catalog generation is visible; st2 stores no
+/// rename history, redirect, implicit alias, or time-bounded compatibility route, so a stale
+/// caller fails loudly and refreshes the roster. The edit rewrites exactly the `address` child
+/// node, which is what makes the cutover nondisruptive by construction: the declaration-parent
+/// state anchor, ID-keyed supervisor edges, task IDs, launch fingerprints, workspace, inbox,
+/// archive, context, Resource state, and runtime ownership are all keyed off values this edit
+/// never touches. `None` restores the positional `identity` fallback and is admitted only while
+/// that fallback address is itself still unique on the resolved host.
+pub fn set_address(
+    catalog_root: &Path,
+    selector: &str,
+    this_host: &str,
+    actor: Option<&str>,
+    requested: Option<&str>,
+) -> Result<AddressReceipt, AuthorError> {
+    let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
+        AuthorError::new(
+            "catalog-lock-failed",
+            format!("acquire catalog-authoring lock: {error:#}"),
+        )
+    })?;
+    let found = crate::discover(catalog_root);
+    if let Some(error) = found.errors.first() {
+        return Err(AuthorError::new(
+            "catalog-malformed",
+            format!(
+                "cannot prove an exact address target while {} is malformed: {}",
+                error.path.display(),
+                error.message
+            ),
+        ));
+    }
+    let target = resolve_target(&found.specs, selector, this_host)?;
+    authorize_actor(
+        &found.specs,
+        &target.identity,
+        this_host,
+        actor,
+        "address-not-authorized",
+    )?;
+    if let Some(value) = requested {
+        agent_spec::validate_agent_address(value)
+            .map_err(|error| AuthorError::new("invalid-address", error.to_string()))?;
+    }
+    refuse_address_collision(catalog_root, &found.specs, this_host, &target, requested)?;
+    let result = edit_declaration(
+        &catalog_lock,
+        catalog_root,
+        &crate::catalog_transaction::retained_dir_path(catalog_lock.control())
+            .map_err(|error| AuthorError::new("declaration-write-failed", error.to_string()))?,
+        &target.declaration,
+        &target.identity,
+        &target.source_host,
+        &target.source_identity,
+        DeclaredField::Address,
+        requested,
+        || {},
+    )?;
+    let effective = requested.unwrap_or(&target.source_identity);
+    Ok(AddressReceipt {
+        result,
+        // A retired subject is non-routable and released its address, so null is the honest bus
+        // address here — exactly what the roster projects for the same subject.
+        bus_address: (!target.retired).then(|| format!("{}.{effective}", target.source_host)),
+        address: requested.map(str::to_owned),
+        id: target.agent_id,
+        identity: target.identity,
+        retired: target.retired,
+    })
+}
+
+/// Refuse an effective address that would not be unique on the target's resolved logical host.
+///
+/// The prospective catalog is the discovery this command already holds with exactly this subject's
+/// `address` replaced, so `validate.rs`'s `dup-address` rule — the same rule whole-catalog
+/// validation enforces — decides explicit/explicit and explicit/identity-fallback collisions
+/// alike, including the `--clear` case where the restored fallback is the candidate address. Any
+/// duplicate address in the prospective catalog refuses: an address book with two claims on one
+/// route cannot answer an ordinary reference, so there is no cutover to admit.
+fn refuse_address_collision(
+    catalog_root: &Path,
+    specs: &[crate::AgentSpec],
+    this_host: &str,
+    target: &AgentTarget,
+    requested: Option<&str>,
+) -> Result<(), AuthorError> {
+    let mut prospective = crate::Discovered {
+        specs: specs.to_vec(),
+        ..Default::default()
+    };
+    for spec in &mut prospective.specs {
+        if spec.bus_id(this_host) == target.identity {
+            spec.address = requested.map(str::to_owned);
+        }
+    }
+    let report = crate::validate::validate_discovered(catalog_root, Some(this_host), &prospective);
+    match report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "dup-address")
+    {
+        None => Ok(()),
+        Some(issue) => Err(AuthorError::new(
+            "address-conflict",
+            format!(
+                "{} is not unique on host {:?}: {}",
+                requested.map_or_else(
+                    || format!("identity fallback address {:?}", target.source_identity),
+                    |value| format!("address {value:?}")
+                ),
+                target.source_host,
+                issue.message
+            ),
+        )),
+    }
 }
 
 fn resolve_target(
@@ -700,6 +865,7 @@ fn resolve_target(
         )),
         [spec] => Ok(AgentTarget {
             identity: spec.bus_id(this_host),
+            agent_id: spec.effective_id(this_host),
             source_host: spec.resolved_host(this_host).to_owned(),
             source_identity: spec.identity.clone(),
             declaration: spec.path.clone(),
@@ -795,7 +961,7 @@ fn edit_declaration_for_test(
         expected_identity,
         expected_host,
         expected_agent,
-        field,
+        field.into(),
         requested,
         before_commit,
     )
@@ -1470,7 +1636,7 @@ fn edit_declaration(
     expected_identity: &str,
     expected_host: &str,
     expected_agent: &str,
-    field: PresentationField,
+    field: DeclaredField,
     requested: Option<&str>,
     before_commit: impl FnOnce(),
 ) -> Result<AuthorOutcome, AuthorError> {
@@ -1524,6 +1690,11 @@ fn edit_declaration(
             ),
         ));
     }
+    // No span-bounded field edit may change the subject's immutable agent ID (R24). Address, name,
+    // and description are all mutable; `id` is the one value that identifies the subject across
+    // every one of those changes, so the candidate must read back with the exact same bytes — or
+    // with none, on a declaration ID migration has not reached yet.
+    let expected_id = declared_id(target);
     let Some(replacement) = presentation_edit(text, target, field, requested)? else {
         return Ok(AuthorOutcome::Unchanged);
     };
@@ -1534,6 +1705,7 @@ fn edit_declaration(
         expected_agent,
         field,
         requested,
+        expected_id.as_deref(),
     )?;
     atomic_replace_checked(
         catalog_lock,
@@ -1793,6 +1965,17 @@ pub(crate) fn agent_identity_parts(node: &KdlNode) -> (Option<String>, Option<St
     (host, identity)
 }
 
+/// The declaration's explicit immutable `id`, if it carries one.
+fn declared_id(node: &KdlNode) -> Option<String> {
+    node.children()?
+        .nodes()
+        .iter()
+        .find(|child| child.name().value() == "id")
+        .and_then(|child| child.get(0))
+        .and_then(|value| value.as_string())
+        .map(str::to_owned)
+}
+
 pub(crate) fn is_nix_managed(node: &KdlNode) -> bool {
     node.children().is_some_and(|children| {
         children
@@ -1809,7 +1992,7 @@ pub(crate) fn is_nix_managed(node: &KdlNode) -> bool {
 fn presentation_edit(
     text: &str,
     target: &KdlNode,
-    field: PresentationField,
+    field: DeclaredField,
     requested: Option<&str>,
 ) -> Result<Option<String>, AuthorError> {
     let fields = target
@@ -1834,7 +2017,7 @@ fn presentation_edit(
     }
 }
 
-fn parse_field_value(node: &KdlNode, field: PresentationField) -> Result<&str, AuthorError> {
+fn parse_field_value(node: &KdlNode, field: DeclaredField) -> Result<&str, AuthorError> {
     if node.children().is_some() || node.entries().len() != 1 || node.entries()[0].name().is_some()
     {
         return Err(AuthorError::new(
@@ -1867,7 +2050,7 @@ pub(crate) fn quoted(value: &str) -> Result<String, AuthorError> {
 fn replace_field(
     text: &str,
     node: &KdlNode,
-    field: PresentationField,
+    field: DeclaredField,
     value: &str,
 ) -> Result<Option<String>, AuthorError> {
     if parse_field_value(node, field)? == value {
@@ -1890,7 +2073,7 @@ fn replace_field(
 fn insert_field(
     text: &str,
     target: &KdlNode,
-    field: PresentationField,
+    field: DeclaredField,
     value: &str,
 ) -> Result<String, AuthorError> {
     insert_node(
@@ -2053,16 +2236,26 @@ fn verify_candidate(
     expected_identity: &str,
     expected_host: &str,
     expected_agent: &str,
-    field: PresentationField,
+    field: DeclaredField,
     expected: Option<&str>,
+    expected_id: Option<&str>,
 ) -> Result<(), AuthorError> {
     let document = KdlDocument::parse(candidate).map_err(|error| {
         AuthorError::new(
             "unsafe-source-edit",
-            format!("presentation edit did not produce valid KDL: {error}"),
+            format!("field edit did not produce valid KDL: {error}"),
         )
     })?;
     let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
+    if declared_id(target).as_deref() != expected_id {
+        return Err(AuthorError::new(
+            "agent-id-immutable",
+            format!(
+                "edit would change the immutable agent id of {expected_identity:?}; `id` is the \
+                 one declared value no authoring command may rewrite"
+            ),
+        ));
+    }
     let fields = target
         .children()
         .into_iter()
@@ -3163,5 +3356,57 @@ mod tests {
             .result,
             AuthorOutcome::Unchanged
         );
+    }
+
+    /// Direct ID mutation is the one thing no span-bounded field edit may do. `id` is what makes
+    /// a subject the same subject across an address, name, description, host, or graph change, so
+    /// the read-back gate compares it rather than trusting the edit that produced the candidate.
+    #[test]
+    fn no_field_edit_may_rewrite_the_immutable_agent_id() {
+        let tampered =
+            "agent \"worker\" { id \"b\"; host \"h\"; command \"true\"; name \"Owner\" }\n";
+        let error = verify_candidate(
+            tampered,
+            "h.worker",
+            "h",
+            "worker",
+            DeclaredField::Presentation(PresentationField::Name),
+            Some("Owner"),
+            Some("a"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "agent-id-immutable");
+
+        // Dropping the ID entirely is the same refusal: an unmigrated declaration is not a place
+        // to park a subject whose ID the catalog already froze.
+        let dropped = "agent \"worker\" { host \"h\"; command \"true\"; address \"ops\" }\n";
+        assert_eq!(
+            verify_candidate(
+                dropped,
+                "h.worker",
+                "h",
+                "worker",
+                DeclaredField::Address,
+                Some("ops"),
+                Some("a"),
+            )
+            .unwrap_err()
+            .code(),
+            "agent-id-immutable"
+        );
+
+        // The identical edit with the ID carried through is admitted.
+        let honest =
+            "agent \"worker\" { id \"a\"; host \"h\"; command \"true\"; address \"ops\" }\n";
+        verify_candidate(
+            honest,
+            "h.worker",
+            "h",
+            "worker",
+            DeclaredField::Address,
+            Some("ops"),
+            Some("a"),
+        )
+        .unwrap();
     }
 }
