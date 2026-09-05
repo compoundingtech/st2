@@ -8,38 +8,38 @@
 //! The fix: spawn each task into its own OS supervision domain, independent of BOTH the spawner and
 //! the transport daemon — one goal, per-OS mechanism.
 //!
-//! - **Linux**: `systemd-run --user --scope --collect --quiet --unit=<unit>`
+//! - **Linux with systemd 254+**: `systemd-run --user --scope --collect --quiet --unit=<unit>`
 //!   `--expand-environment=no -- <task>`. The task runs in its own transient scope = its own cgroup,
 //!   registered with the user manager as a **sibling** of the transport unit (a scope created inside
 //!   a service lands at `app.slice/<unit>`, not nested under the service). A cascade kill of the
 //!   transport unit's cgroup cannot reach a sibling. `--scope` (not `--service`) keeps st2 the logical
 //!   supervisor — systemd provides only the cgroup; adoption/teardown/restart stay st2's. `--collect`
 //!   GCs the scope once it empties.
-//! - **macOS / non-systemd Linux**: `setsid` + reparent to init/launchd is the whole defense — there
-//!   are no cgroups, and launchd does not cascade-kill detached children. Here [`wrap`] is a no-op
-//!   pass-through; the caller's existing `setsid` (exec) or the `pty` daemon (pty) provides detachment.
-//!   If isolation was *wanted* (a Linux box) but systemd is unreachable, we degrade to that same
-//!   pass-through and log a loud WARN — never a silent "isolated" claim.
+//! - **macOS / unsupported Linux**: `setsid` + reparent to init/launchd is the fallback. Here [`wrap`]
+//!   is a no-op pass-through; the caller's existing `setsid` (exec) or the `pty` daemon (pty) provides
+//!   detachment. If isolation was wanted but the systemd user manager or the exact-argv capability
+//!   is unavailable, we degrade to that pass-through and log a loud WARN — never a silent
+//!   "isolated" claim.
 //!
 //! Teardown is unchanged: the scope is for **survival only**. `pty kill` / the exec process-group kill
 //! still tear tasks down; the scope just prevents the transport from taking them as collateral.
 
 use std::ffi::OsStr;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How a task is isolated from its spawner and the transport daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// Linux: own transient systemd `--user` scope (own cgroup, sibling of the transport unit).
+    /// Linux with systemd 254+: own transient `--user` scope with opaque inner argv.
     Scope,
     /// macOS / non-systemd: `setsid` + reparent to init/launchd (no cgroup needed — the transport
     /// cannot cascade-kill a detached process on these platforms).
     Detached,
-    /// Isolation was wanted (a Linux host) but systemd is unreachable — degraded to `Detached` with a
-    /// logged WARN. Distinct from `Detached` so callers/tests can tell an intended pass-through from a
-    /// degraded one.
+    /// Isolation was wanted (a Linux host) but the required systemd user scope capability is
+    /// unavailable — degraded to `Detached` with a logged WARN. Distinct from `Detached` so
+    /// callers/tests can tell an intended pass-through from a degraded one.
     DegradedDetached,
 }
 
@@ -57,10 +57,10 @@ fn detect() -> Isolation {
         } else {
             // The old line embedded a manual "WARN" prefix; the facade carries severity now.
             tracing::warn!(
-                "st2: systemd user scopes unavailable (no `systemd-run --user` / no \
-                 $XDG_RUNTIME_DIR) — spawning tasks WITHOUT cgroup isolation. A transport/supervisor \
-                 restart may cascade-kill them. Enable a user systemd manager (loginctl enable-linger) \
-                 to restore isolation."
+                "st2: systemd user scopes with opaque argv unavailable (`systemd-run` 254+ and \
+                 $XDG_RUNTIME_DIR are required) — spawning tasks WITHOUT cgroup isolation. A \
+                 transport/supervisor restart may cascade-kill them. Upgrade systemd and enable a \
+                 user manager (`loginctl enable-linger`) to restore isolation."
             );
             Isolation::DegradedDetached
         }
@@ -70,18 +70,27 @@ fn detect() -> Isolation {
     }
 }
 
-/// Whether a `--user` systemd scope can be created here.
+/// Whether a `--user` systemd scope can preserve the inner argv exactly.
 fn systemd_user_available() -> bool {
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
         return false;
     }
     Command::new("systemd-run")
         .args(["--user", "--version"])
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|output| {
+            output.status.success() && systemd_version_supports_exact_argv(&output.stdout)
+        })
         .unwrap_or(false)
+}
+
+fn systemd_version_supports_exact_argv(output: &[u8]) -> bool {
+    std::str::from_utf8(output)
+        .ok()
+        .and_then(|output| output.split_ascii_whitespace().nth(1))
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version >= 254)
 }
 
 static SCOPE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -158,6 +167,23 @@ mod tests {
         assert!(scope_unit("a b/c").starts_with("st2-a_b_c-"));
         // UNIQUE, not deterministic — two spawns of the same id never collide on the scope name.
         assert_ne!(scope_unit("x"), scope_unit("x"));
+    }
+
+    #[test]
+    fn exact_argv_requires_systemd_254_or_newer() {
+        assert!(!systemd_version_supports_exact_argv(
+            b"systemd 249 (249.11)\n"
+        ));
+        assert!(!systemd_version_supports_exact_argv(
+            b"systemd 252 (252.38)\n"
+        ));
+        assert!(systemd_version_supports_exact_argv(
+            b"systemd 254 (254.5)\n"
+        ));
+        assert!(systemd_version_supports_exact_argv(
+            b"systemd 257 (257.7)\n"
+        ));
+        assert!(!systemd_version_supports_exact_argv(b"unexpected output\n"));
     }
 
     #[test]
