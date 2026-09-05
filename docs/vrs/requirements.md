@@ -126,6 +126,12 @@ accepted.
 - **R06 Restartable launch definitions:** A restarted PTY or exec receives the
   complete effective launch definition, including environment and supported
   launch fields.
+- **R40 Launch argv transparency:** Every st2-added launch wrapper preserves the
+  effective task program and each argument as ordered, opaque OS strings. A
+  Linux systemd scope launch disables systemd command-line environment
+  expansion before the wrapper separator, so dollar-bearing literals including
+  `$HOME`, `${UNSET}`, and `$$` reach the task byte-for-byte. Detached and
+  degraded-detached launches remain exact pass-throughs.
 - **R07 Verified hooks:** Required hook content is installed explicitly and
   verified before a rendered agent depends on it. The selected receipt carries
   the binary's real source identity regardless of build system. Ordered

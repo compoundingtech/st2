@@ -38,6 +38,19 @@ A terminal-backed or terminal-free unit declared for an agent.
 Authority: [Agent Spec task contract](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md#compact-and-explicit-tasks);
 [`Task`](../../crates/agent-spec/src/spec.rs#L121-L148)
 
+### launch argv
+
+The ordered, opaque OS-string sequence comprising a task program and each of
+its arguments at the launcher boundary. A platform wrapper may prepend its own
+outer arguments, but it does not parse, expand, escape, or otherwise rewrite
+the launch argv. This is not a shell command line. Use *provider argv* only
+when referring specifically to the canonical agent provider; *launch argv*
+applies to every PTY and exec task.
+
+Authority: [R06 restartable launch definitions and R40 launch argv
+transparency](requirements.md);
+[host-local scheduling and supervision](spec.md#host-local-scheduling-and-supervision)
+
 ### agent ID
 
 The explicit catalog-global immutable identifier of one logical agent subject.

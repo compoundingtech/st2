@@ -771,6 +771,28 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   manual PTY restart under a different ambient environment reconstructs the
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
+- **R40:** [Launch argv](ontology.md#launch-argv) is opaque at every
+  st2-added wrapper boundary. In Linux systemd scope mode the exact outer
+  command order is:
+
+  ```text
+  systemd-run --user --scope --collect --quiet --unit=<unit> --expand-environment=no -- <program> <arg>...
+  ```
+
+  `--expand-environment=no` is an outer `systemd-run` option immediately before
+  the `--` separator. `<program>` and every `<arg>` are appended as their
+  original OS strings, without shell rendering, dollar escaping, or
+  environment substitution. Detached and degraded-detached modes remain
+  `<program> <arg>...` pass-throughs with no outer command.
+
+  `src/isolate.rs::tests::wrap_scope_disables_expansion_and_preserves_dollar_bearing_argv`
+  fixes the complete wrapper order and proves literal `$HOME`, `${UNSET}`, and
+  `$$` after the separator.
+  `src/isolate.rs::tests::wrap_detached_modes_preserve_exact_program_and_argv`
+  proves both pass-through modes. The live-system distinction and unaffected
+  scope semantics are recorded in the
+  [systemd scope argv experiment](.experiments/2026-09-05-systemd-scope-argv-transparency.md)
+  and [decision 0016](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both
