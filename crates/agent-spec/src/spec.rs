@@ -1271,14 +1271,13 @@ impl RawSpec {
         if let Some(readiness) = delivery_readiness.as_mut() {
             readiness.validate()?;
         }
-        anyhow::ensure!(
-            !(self.ding && delivery.is_some()),
-            "agent '{identity}' declares both `ding` and `deliver`; choose one transport"
-        );
-        anyhow::ensure!(
-            !(self.ding && (has_driver || session_driver.is_some() || delivery_readiness.is_some())),
-            "agent '{identity}' declares managed native delivery together with `ding`; generic Ding is only for opaque non-harness PTYs"
-        );
+        // Native delivery owns the inbox when both forms are present. Treat `ding` as stale
+        // compatibility input and omit its sidecar instead of making the declaration invalid.
+        let ding = self.ding
+            && delivery.is_none()
+            && !has_driver
+            && session_driver.is_none()
+            && delivery_readiness.is_none();
         anyhow::ensure!(
             !(session_driver.is_some() && has_driver),
             "agent '{identity}' declares both `session-driver` and a typed driver; choose one session owner"
@@ -1355,7 +1354,7 @@ impl RawSpec {
                 lifecycle,
             });
         }
-        if self.ding {
+        if ding {
             tasks.push(Task {
                 kind: TaskKind::Exec,
                 derived: true,

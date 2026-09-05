@@ -395,22 +395,22 @@ agent "cos" {
 }
 
 #[test]
-fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
+fn deliver_preempts_the_legacy_ding_task() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "agents/h/claude/agent.kdl",
-        r#"agent "claude" { host "h"; command "claude"; deliver "mcp" }"#,
+        r#"agent "claude" { host "h"; command "claude"; ding; deliver "mcp" }"#,
     );
     write(
         tmp.path(),
         "agents/h/codex/agent.kdl",
-        r#"agent "codex" { host "h"; command "codex"; deliver "app-server" }"#,
+        r#"agent "codex" { host "h"; command "codex"; ding; deliver "app-server" }"#,
     );
     write(
         tmp.path(),
         "agents/h/pi/agent.kdl",
-        r#"agent "pi" { host "h"; command "pi"; deliver "pi-channel" }"#,
+        r#"agent "pi" { host "h"; command "pi"; ding; deliver "pi-channel" }"#,
     );
 
     let found = discover(tmp.path());
@@ -432,7 +432,7 @@ fn deliver_is_typed_without_lowering_to_the_legacy_ding_task() {
 }
 
 #[test]
-fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
+fn deliver_rejects_unknown_duplicate_and_malformed_declarations() {
     for (name, declaration, expected) in [
         (
             "unknown",
@@ -443,11 +443,6 @@ fn deliver_rejects_unknown_duplicate_mixed_and_malformed_declarations() {
             "duplicate",
             r#"agent "worker" { command "true"; deliver "mcp"; deliver "app-server" }"#,
             "declares `deliver` more than once",
-        ),
-        (
-            "mixed",
-            r#"agent "worker" { command "true"; ding; deliver "mcp" }"#,
-            "declares both `ding` and `deliver`",
         ),
         (
             "missing",
@@ -555,13 +550,23 @@ fn delivery_readiness_is_tagged_normalized_and_separate_from_activity() {
 }
 
 #[test]
-fn delivery_readiness_rejects_managed_ding_and_mismatched_native_ownership() {
+fn delivery_readiness_preempts_ding_and_rejects_mismatched_native_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/ding/agent.kdl",
+        r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
+    );
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(
+        find(&found.specs, "worker")
+            .tasks
+            .iter()
+            .all(|task| !task.derived)
+    );
+
     for (name, declaration, expected) in [
-        (
-            "ding",
-            r#"agent "worker" { argv "axe"; ding; delivery-readiness "credential" }"#,
-            "generic Ding is only for opaque non-harness PTYs",
-        ),
         (
             "transport",
             r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server"; delivery-readiness "credential" }"#,
@@ -625,11 +630,6 @@ fn session_driver_rejects_unknown_duplicate_malformed_and_conflicting_declaratio
             "must contain exactly one positional string",
         ),
         (
-            "ding",
-            r#"agent "worker" { argv "axe"; session-driver "claude"; ding }"#,
-            "generic Ding is only for opaque non-harness PTYs",
-        ),
-        (
             "deliver",
             r#"agent "worker" { argv "axe"; session-driver "claude"; deliver "app-server" }"#,
             "requires session-driver 'codex', not 'claude'",
@@ -690,7 +690,14 @@ fn session_driver_lowers_from_toml_and_json_and_rejects_null() {
 }
 
 #[test]
-fn typed_driver_blocks_reject_legacy_ding() {
+fn managed_session_owners_preempt_legacy_ding() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "agents/h/session/agent.kdl",
+        r#"agent "session" { argv "axe"; session-driver "claude"; ding }"#,
+    );
+
     for (name, driver) in [
         ("claude", r#"claude { prompt "go" }"#),
         ("codex", r#"codex { prompt "go" }"#),
@@ -698,21 +705,22 @@ fn typed_driver_blocks_reject_legacy_ding() {
         ("opencode", r#"opencode { prompt "go" }"#),
         ("omp", r#"omp { prompt "go" }"#),
     ] {
-        let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
             &format!("agents/h/{name}/agent.kdl"),
             &format!(r#"agent "{name}" {{ ding; {driver} }}"#),
         );
-        let found = discover(tmp.path());
-        assert!(found.specs.is_empty(), "{name}: {:?}", found.specs);
-        assert_eq!(found.errors.len(), 1, "{name}: {:?}", found.errors);
+    }
+
+    let found = discover(tmp.path());
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert_eq!(found.specs.len(), 6);
+    for spec in &found.specs {
         assert!(
-            found.errors[0]
-                .message
-                .contains("generic Ding is only for opaque non-harness PTYs"),
-            "{name}: {:?}",
-            found.errors[0]
+            spec.tasks.iter().all(|task| !task.derived),
+            "{} retained a derived Ding task: {:?}",
+            spec.identity,
+            spec.tasks
         );
     }
 }
