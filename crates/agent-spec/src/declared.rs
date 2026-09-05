@@ -185,6 +185,18 @@ impl DeclaredAgent {
             .or_else(|| self.node.argument(0))
     }
 
+    /// The explicit immutable agent ID as declared, if any (R24). There is no positional
+    /// fallback: an ID is only ever explicit.
+    pub fn id(&self) -> Option<&DeclaredValue> {
+        self.field("id").and_then(|node| node.argument(0))
+    }
+
+    /// The explicit mutable agent address as declared, if any (R24). Absence means the positional
+    /// identity is the effective legacy address.
+    pub fn address(&self) -> Option<&DeclaredValue> {
+        self.field("address").and_then(|node| node.argument(0))
+    }
+
     pub fn field(&self, name: &str) -> Option<&DeclaredNode> {
         self.node.child(name)
     }
@@ -284,6 +296,22 @@ pub fn parse_declared_document(source_name: &Path, source: &str) -> DeclaredPars
                 ),
             ));
             continue;
+        }
+        for field in node.children_named("id").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent id must be declared exactly once".to_owned(),
+            ));
+        }
+        for field in node.children_named("address").skip(1) {
+            diagnostics.push(shape_diagnostic(
+                source_name,
+                field.span,
+                DeclaredDiagnosticCode::DuplicateRoutingField,
+                "agent address must be declared exactly once".to_owned(),
+            ));
         }
         for field in node.children_named("identity").skip(1) {
             diagnostics.push(shape_diagnostic(

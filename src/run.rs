@@ -3398,6 +3398,8 @@ mod tests {
     #[test]
     fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         let spec = AgentSpec {
+            id: None,
+            address: None,
             identity: "codex".into(),
             name: None,
             description: None,
@@ -3455,6 +3457,8 @@ mod tests {
     #[test]
     fn selected_identity_conflict_refuses_before_hook_verification_or_inventory() {
         let mut spec = AgentSpec {
+            id: None,
+            address: None,
             identity: "codex".into(),
             name: None,
             description: None,
@@ -4012,6 +4016,8 @@ mod tests {
 
     fn spec_fixture() -> AgentSpec {
         AgentSpec {
+            id: None,
+            address: None,
             identity: "demo".into(),
             name: None,
             description: None,

@@ -112,6 +112,10 @@ fn unnamed_tasks_and_reserved_schedules_are_causal_red_shape_errors() {
 #[test]
 fn duplicate_routing_fields_are_shape_errors() {
     let source = r#"agent "worker" {
+  id "first"
+  id "second"
+  address "first"
+  address "second"
   identity "first"
   identity "second"
   host "first"
@@ -125,9 +129,52 @@ fn duplicate_routing_fields_are_shape_errors() {
             .iter()
             .map(|diagnostic| diagnostic.code.as_str())
             .collect::<Vec<_>>(),
-        ["duplicate-routing-field", "duplicate-routing-field"]
+        [
+            "duplicate-routing-field",
+            "duplicate-routing-field",
+            "duplicate-routing-field",
+            "duplicate-routing-field"
+        ]
     );
     assert!(!parsed.is_valid());
+}
+
+/// `id` and `address` are explicit-only: neither has a positional fallback, and the accessors must
+/// not silently answer with the positional identity (R24 keeps the namespaces separate).
+#[test]
+fn explicit_id_and_address_are_readable_without_a_positional_fallback() {
+    let declared = r#"agent "worker" {
+  id "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
+  address "dotfiles.fractal.keymap.verifier"
+  host "dev3"
+}"#;
+    let parsed = parse_declared_document(Path::new("candidate.kdl"), declared);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let agent = &parsed.document.expect("document").agents[0];
+    assert_eq!(
+        agent.id().and_then(DeclaredValue::as_str),
+        Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+    );
+    assert_eq!(
+        agent.address().and_then(DeclaredValue::as_str),
+        Some("dotfiles.fractal.keymap.verifier")
+    );
+    assert_eq!(
+        agent.identity().and_then(DeclaredValue::as_str),
+        Some("worker")
+    );
+
+    let legacy = parse_declared_document(Path::new("candidate.kdl"), r#"agent "worker" { }"#);
+    let legacy_agent = &legacy.document.expect("document").agents[0];
+    assert!(legacy_agent.id().is_none(), "no positional id fallback");
+    assert!(
+        legacy_agent.address().is_none(),
+        "no positional address fallback"
+    );
+    assert_eq!(
+        legacy_agent.identity().and_then(DeclaredValue::as_str),
+        Some("worker")
+    );
 }
 
 #[test]
