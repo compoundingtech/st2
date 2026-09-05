@@ -917,6 +917,487 @@ impl Observation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The version 3 producer surface: what a driver STATES, as distinct from what a
+// consumer reads. Deliberately its own vocabulary rather than the reader's:
+// every read type carries something a producer must not be able to forge — the
+// legacy projection `absent`, the read-time `overdue` normalization, st2's own
+// rejection words on a degraded conversation link, the derived `unknown`
+// activity — and a write type that could spell those is a write type that can
+// fabricate them.
+// ---------------------------------------------------------------------------
+
+/// One fault as a PRODUCER states it. Everything a consumer needs to route it, time it, and age
+/// it is required here, because a fault that cannot be routed or timed is not actionable and st2
+/// would rather refuse the write than publish one: the closed [`FaultCategory`] (the reader
+/// tolerates an untyped category from a future producer; a producer in this build has no excuse
+/// for one), the recovery class, and the SEMANTIC observation instant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultReport {
+    pub category: FaultCategory,
+    /// Provider-namespaced and OPEN (`claude/oauth_expired`), diagnostic granularity underneath a
+    /// routable category. Validated as `provider/code` so the namespace is real: a bare word is
+    /// how two providers' codes silently collide.
+    pub code: Option<String>,
+    pub recovery: Recovery,
+    /// When the producer OBSERVED this condition — the semantic clock, which the transport
+    /// heartbeat never advances and a restatement of the same fault never re-mints.
+    pub observed_at_ms: u64,
+    /// By when the producer expects to have observed an `automatic` recovery clear itself.
+    pub next_observation_due_ms: Option<u64>,
+    /// Diagnostic only. No consumer branches on it.
+    pub detail: Option<String>,
+}
+
+impl FaultReport {
+    pub fn new(category: FaultCategory, recovery: Recovery, observed_at_ms: u64) -> Self {
+        Self {
+            category,
+            code: None,
+            recovery,
+            observed_at_ms,
+            next_observation_due_ms: None,
+            detail: None,
+        }
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    pub fn with_observation_due(mut self, due_ms: u64) -> Self {
+        self.next_observation_due_ms = Some(due_ms);
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// The pairing identity a clear must name exactly.
+    pub fn key(&self) -> FaultKey {
+        FaultKey {
+            category: self.category,
+            code: self.code.clone(),
+        }
+    }
+
+    /// Whether two reports are the SAME fault, ignoring when it was observed. Everything a
+    /// consumer would route, time, or read differently counts; `observedAtMs` does not, because
+    /// that is precisely the field a restatement must not move.
+    fn same_fault(&self, other: &Self) -> bool {
+        self.category == other.category
+            && self.code == other.code
+            && self.recovery == other.recovery
+            && self.next_observation_due_ms == other.next_observation_due_ms
+            && self.detail == other.detail
+    }
+
+    /// Producer-side strictness mirroring the reader's, so a producer never writes bytes this
+    /// build's own reader would reject or normalize away.
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observed_at_ms > 0,
+            "a fault carries the instant it was observed; zero is not an observation"
+        );
+        if let Some(code) = &self.code {
+            let namespaced = code
+                .split_once('/')
+                .is_some_and(|(provider, rest)| !provider.is_empty() && !rest.is_empty());
+            anyhow::ensure!(
+                namespaced,
+                "a fault code is provider-namespaced (`provider/code`): got {code:?}"
+            );
+        }
+        if let Some(due) = self.next_observation_due_ms {
+            anyhow::ensure!(
+                !matches!(self.recovery, Recovery::Human | Recovery::Terminal),
+                "a next-observation deadline belongs to a recovery that happens by itself, not to \
+                 `{}`",
+                self.recovery.as_str()
+            );
+            anyhow::ensure!(
+                due >= self.observed_at_ms,
+                "a next-observation deadline cannot precede the observation it follows"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a paired clear names: EXACTLY the category and code of the fault it clears. A key with no
+/// code matches only a fault carrying none — a clear derived from a category alone is how one
+/// provider signal ("the rate limit lifted") silences a different live fault in the same
+/// category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultKey {
+    pub category: FaultCategory,
+    pub code: Option<String>,
+}
+
+impl FaultKey {
+    pub fn new(category: FaultCategory) -> Self {
+        Self {
+            category,
+            code: None,
+        }
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    fn matches(&self, fault: &FaultReport) -> bool {
+        self.category == fault.category && self.code == fault.code
+    }
+}
+
+/// The positive observation that authorizes clearing the WHOLE condition axis. There is
+/// deliberately no "assumed", "probably", or "unknown" member: an unkeyed clear is the one
+/// operation that can silence a fault nobody has seen resolve, so the caller must name the
+/// progress it actually witnessed. The word rides the record as the clear's diagnostic detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressProof {
+    /// A turn ran to completion against the provider.
+    TurnCompleted,
+    /// A request the standing fault would have blocked succeeded.
+    RequestSucceeded,
+}
+
+impl ProgressProof {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnCompleted => "cleared: turn completed",
+            Self::RequestSucceeded => "cleared: request succeeded",
+        }
+    }
+}
+
+/// The condition axis as a producer states it. Three statements, and `Unchanged` is the load
+/// bearing one: an activity edge (a turn started, the composer emptied) has learned NOTHING about
+/// whether the provider is faulted, and a producer forced to pick `clear` there would fabricate
+/// health on every frame. `Unchanged` carries the record's own condition forward untouched —
+/// including a fault's semantic clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionReport {
+    Unchanged,
+    Clear,
+    Fault(FaultReport),
+}
+
+/// A conversation link as a producer states it: the reader's [`ConversationLink`] minus the
+/// incarnation, which the writing session stamps. Two sources for one fact would make a
+/// disagreement with the record's own `incarnation` unfalsifiable for a reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationClaim {
+    pub driver: String,
+    /// The provider's own conversation identity, opaque to st2.
+    pub conversation: String,
+    pub history_mutability: HistoryMutability,
+    pub capability_evidence: CapabilityEvidence,
+    /// The FINITE verification bound; zero is not a bound.
+    pub verified_through_ms: u64,
+}
+
+/// The conversation bridge as a producer states it. A separate type from the reader's
+/// [`ConversationRef`] for one specific reason: `read_v3_at` degrades a half-stated link to
+/// `unavailable` carrying st2's OWN rejection word, and if producers wrote the same type they
+/// could emit those words as prose — after which no consumer could tell a driver's explanation
+/// from st2's verdict on the driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationState {
+    /// This driver has no conversation identity to expose at all.
+    Unsupported,
+    /// It has one and it is not available now; the reason is the producer's own prose.
+    Unavailable(Option<String>),
+    Linked(ConversationClaim),
+}
+
+/// st2's own conversation-axis rejection words, which [`read_v3_at`] mints when it degrades a
+/// half-stated link. A producer may not spell them: the whole point of the degradation word is
+/// that it means "st2 refused this link", and prose that borrows it is indistinguishable.
+const RESERVED_CONVERSATION_REASONS: [&str; 3] = [
+    "incomplete-conversation-link",
+    "unbounded-conversation-verification",
+    "unsupported-conversation-kind",
+];
+
+/// One version 3 observation as a producer states it: the resolved tuple, every axis at once.
+/// A producer decides all of these from one look at its harness, so it states them as one
+/// statement rather than as several writes that a reader could observe half-applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub state: Activity,
+    pub input_buffer: InputBuffer,
+    pub condition: ConditionReport,
+    /// The tagged ask. `Unknown` is WRITABLE here and means "this producer cannot see an ask
+    /// surface at all" — a maintained driver with no ask channel (pi) states it positively;
+    /// `None` would fabricate absence and `Pending(Unknown)` would fabricate a waiting human.
+    pub ask: HumanAsk,
+    /// `None` leaves the axis exactly as the record has it; `Some` states it.
+    pub conversation: Option<ConversationState>,
+    /// Diagnostic only. No consumer branches on it.
+    pub reason: Option<String>,
+    /// `Ended` only: the exit outcome.
+    pub exit: Option<String>,
+}
+
+impl Frame {
+    pub fn new(
+        state: Activity,
+        input_buffer: InputBuffer,
+        condition: ConditionReport,
+        ask: HumanAsk,
+    ) -> Self {
+        Self {
+            state,
+            input_buffer,
+            condition,
+            ask,
+            conversation: None,
+            reason: None,
+            exit: None,
+        }
+    }
+
+    pub fn with_conversation(mut self, conversation: ConversationState) -> Self {
+        self.conversation = Some(conversation);
+        self
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_exit(mut self, exit: impl Into<String>) -> Self {
+        self.exit = Some(exit.into());
+        self
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state != Activity::Unknown,
+            "unknown is derived and cannot be written"
+        );
+        // A terminal record is the incarnation's last word, and its exit is what makes it one.
+        // An exitless `ended` is the CLAIM FENCE, which only [`claim`] writes: letting a producer
+        // spell it would let any driver process forge a session boundary.
+        anyhow::ensure!(
+            self.state != Activity::Ended || self.exit.is_some(),
+            "a terminal frame carries its exit outcome; an exitless `ended` is the claim fence, \
+             which only a session claim writes"
+        );
+        if let ConditionReport::Fault(fault) = &self.condition {
+            fault.validate()?;
+        }
+        match &self.conversation {
+            Some(ConversationState::Linked(link)) => {
+                anyhow::ensure!(
+                    !link.driver.is_empty()
+                        && !link.conversation.is_empty()
+                        && link.verified_through_ms > 0,
+                    "a linked conversation names its driver and conversation and carries a finite \
+                     positive verification bound"
+                );
+            }
+            Some(ConversationState::Unavailable(Some(reason))) => {
+                anyhow::ensure!(
+                    !RESERVED_CONVERSATION_REASONS.contains(&reason.as_str()),
+                    "`{reason}` is st2's own rejection word for this axis and cannot be stated as \
+                     a producer reason"
+                );
+            }
+            Some(ConversationState::Unsupported | ConversationState::Unavailable(None)) | None => {}
+        }
+        Ok(())
+    }
+}
+
+/// What a producer write did. Landing and coalescing are both SUCCESS — a restatement inside the
+/// refresh cadence deliberately does not write — and everything else is a refusal the caller can
+/// read, which is why this replaces the older `Ok(false)`: a producer whose every write is being
+/// dropped because the record on disk speaks another version must be able to see that, and this
+/// record family has exactly one store and no second place to report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome {
+    Landed,
+    /// The record already said this, recently enough that a reader trusts it. Nothing was written.
+    Coalesced,
+    Refused(Refusal),
+}
+
+impl WriteOutcome {
+    /// Whether the record now says what the caller stated — written or already there.
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::Landed | Self::Coalesced)
+    }
+
+    pub fn landed(&self) -> bool {
+        matches!(self, Self::Landed)
+    }
+
+    pub fn refusal(&self) -> Option<&Refusal> {
+        match self {
+            Self::Refused(refusal) => Some(refusal),
+            Self::Landed | Self::Coalesced => None,
+        }
+    }
+}
+
+/// Why a write did not land. Each arm is a distinct thing for a caller to do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The record declares a version this writer does not emit. Only an explicit [`claim`]
+    /// supersedes it.
+    Schema { found: String },
+    /// A later session owns the record: its ownership sequence is beyond this writer's claim.
+    Superseded { on_disk_seq: u64, ours: u64 },
+    /// The record carries a foreign session's token and this writer has no claim to mint one
+    /// with; only [`claim`] establishes ownership.
+    Unclaimed,
+    /// The bytes on disk are somebody's record that this build cannot decode.
+    Unreadable,
+    /// This session's own exit-bearing terminal record stands: the incarnation's last word, which
+    /// an opt-in live frame and every condition operation refuse to overwrite.
+    Terminal,
+    /// A paired clear named a fault that is not the one standing. `current` is what is.
+    ConditionMismatch { current: Option<FaultKey> },
+    /// The emitted version has no condition axis, and this record has one source of truth: a
+    /// condition cannot be held anywhere else while the wire cannot carry it.
+    ConditionUnrepresentable { schema: &'static str },
+    /// A condition operation found no observation of this session's to attach to.
+    Unobserved,
+    /// A version 3 write whose condition axis nobody ever stated. Not writable as `absent`, so
+    /// the producer must state the axis once before an activity-only frame can ride on it.
+    Unstated,
+    /// A condition operation found a LIVE record naming no pty session. Writing it back would
+    /// restate an unfenced live state, which every same-host reader derives as `unknown`; the
+    /// producer must state its observation (with its fence) instead.
+    Unfenced,
+}
+
+/// The version 2 spelling of the tagged ask axis, for the projection this build still writes.
+/// Every arm round-trips through [`HumanAsk::from_legacy`], which is the property that makes the
+/// projection lossless rather than merely plausible.
+fn project_ask_legacy(ask: HumanAsk) -> (BlockedOn, Ask) {
+    match ask {
+        HumanAsk::None => (BlockedOn::None, Ask::None),
+        HumanAsk::Pending(AskKind::Permission) => (BlockedOn::Human, Ask::Permission),
+        HumanAsk::Pending(AskKind::Question) => (BlockedOn::Human, Ask::Question),
+        HumanAsk::Pending(AskKind::Review) => (BlockedOn::Human, Ask::Review),
+        // A real pending ask whose KIND the producer could not classify. `blockedOn: human` with
+        // `ask: none` is exactly the pre-axis legacy spelling of that, and `from_legacy` reads it
+        // back as `Pending(Unknown)`; writing `ask: unknown` instead would put a derived word on
+        // the wire.
+        HumanAsk::Pending(AskKind::Unknown) => (BlockedOn::Human, Ask::None),
+        // "This producer cannot see the ask axis at all." The only faithful legacy spelling is
+        // `blockedOn: unknown`, which `from_legacy` reads back as exactly this state and which no
+        // consumer reads as a waiting human. `none` would fabricate absence and `human` would
+        // fabricate a queue row nobody can answer.
+        HumanAsk::Unknown => (BlockedOn::Unknown, Ask::None),
+    }
+}
+
+fn ask_to_wire(ask: HumanAsk) -> WireAsk {
+    match ask {
+        HumanAsk::None => WireAsk {
+            kind: "none".to_string(),
+            ask: None,
+        },
+        HumanAsk::Unknown => WireAsk {
+            kind: "unknown".to_string(),
+            ask: None,
+        },
+        HumanAsk::Pending(kind) => WireAsk {
+            kind: "pending".to_string(),
+            ask: Some(kind.as_str().to_string()),
+        },
+    }
+}
+
+fn conversation_to_wire(state: &ConversationState, incarnation: &str) -> WireConversation {
+    let empty = WireConversation {
+        kind: String::new(),
+        driver: None,
+        conversation: None,
+        incarnation: None,
+        history_mutability: None,
+        capability_evidence: None,
+        verified_through_ms: None,
+        reason: None,
+    };
+    match state {
+        ConversationState::Unsupported => WireConversation {
+            kind: "unsupported".to_string(),
+            ..empty
+        },
+        ConversationState::Unavailable(reason) => WireConversation {
+            kind: "unavailable".to_string(),
+            reason: reason.clone(),
+            ..empty
+        },
+        ConversationState::Linked(link) => WireConversation {
+            kind: "linked".to_string(),
+            driver: Some(link.driver.clone()),
+            conversation: Some(link.conversation.clone()),
+            incarnation: Some(incarnation.to_string()),
+            history_mutability: Some(link.history_mutability.as_str().to_string()),
+            capability_evidence: Some(link.capability_evidence.as_str().to_string()),
+            verified_through_ms: Some(link.verified_through_ms),
+            ..empty
+        },
+    }
+}
+
+/// One mutation of the record, as the single locked path receives it. A closed set: every
+/// producer entry point becomes one of these, so no entry point can quietly acquire its own
+/// ownership or coalescing rules.
+enum Mutation {
+    Legacy {
+        observation: Observation,
+        skip_if_ended: bool,
+    },
+    Frame {
+        frame: Frame,
+        skip_if_ended: bool,
+    },
+    Condition(ConditionOp),
+}
+
+/// A mutation of the condition axis ALONE: it restates no activity, because a producer that
+/// learned its provider is throttled learned nothing about whether the model is working.
+enum ConditionOp {
+    Raise(FaultReport),
+    ClearPaired(FaultKey),
+    ClearAll(ProgressProof),
+}
+
+/// The resolved tuple a write is about to state, after carry-forward. `condition: None` means the
+/// axis was never stated by anyone — writable under version 2, which has no such axis, and a
+/// typed refusal under version 3, which requires one.
+struct Pending {
+    state: Activity,
+    input_buffer: InputBuffer,
+    legacy_ask: (BlockedOn, Ask),
+    ask: HumanAsk,
+    condition: Option<Stated>,
+    conversation: Option<ConversationState>,
+    reason: Option<String>,
+    exit: Option<String>,
+    skip_if_ended: bool,
+    /// The pty session to stamp: this writer's own for an observation, and the RECORD's for a
+    /// condition-only write, which observed no pty at all.
+    pty_session: Option<String>,
+    /// Whether this write states only the condition axis. Such a write restates the activity
+    /// verbatim, so it must not restart the activity's `sinceMs` — that field means "when this
+    /// state was entered", and a fault is not a state change.
+    condition_only: bool,
+}
+
 /// The writer a driver process owns over one agent's record. Several driver processes may
 /// legitimately hold writers over the same record — a wrapper heartbeat beside hook-process
 /// transitions — so every operation takes the record's cross-process lock and treats the on-disk
@@ -932,6 +1413,12 @@ pub struct Writer {
     pty_session: Option<String>,
     interrupted: bool,
     session: String,
+    /// The version this writer EMITS. Initialized from [`SCHEMA`] — the build's one
+    /// writer-selection point, which version 3 activation supersedes rather than sits beside — and
+    /// carried per writer so version 3 serialization is provable in this build without a second
+    /// production selector. Every ownership decision is scoped to it: a writer owns only the
+    /// shape it emits, so a v1 straggler still refuses to replace a v2 record and vice versa.
+    schema: &'static str,
     /// The ownership sequence this writer acts under. `None` = a claiming writer: it resolves at
     /// the first write — adopting the on-disk sequence when the record already carries this
     /// session's token, else claiming on-disk + 1. `Some` = adopted ownership handed down by the
@@ -958,6 +1445,7 @@ impl Writer {
             interrupted: false,
             session: session_token(),
             claimed_seq: None,
+            schema: SCHEMA,
         }
     }
 
@@ -978,6 +1466,17 @@ impl Writer {
     pub fn with_ownership(mut self, token: impl Into<String>, seq: u64) -> Self {
         self.session = token.into();
         self.claimed_seq = Some(seq);
+        self
+    }
+
+    /// Emit a different version than [`SCHEMA`]. TEST ONLY, and deliberately not a second
+    /// production selector: version 3 activation replaces [`SCHEMA`] itself, which every writer
+    /// reads, so this seam exists purely to prove the version 3 serialization, ownership, and
+    /// condition semantics byte-for-byte in a build whose production writer is still on version
+    /// 2.
+    #[cfg(test)]
+    fn with_emitted_schema(mut self, schema: &'static str) -> Self {
+        self.schema = schema;
         self
     }
 
@@ -1035,14 +1534,107 @@ impl Writer {
             observation.ask == Ask::None || observation.blocked_on == BlockedOn::Human,
             "an ask kind is meaningful only while blocked on a human"
         );
+        Ok(self
+            .mutate(Mutation::Legacy {
+                observation,
+                skip_if_ended,
+            })?
+            .accepted())
+    }
+
+    /// Whether the version this writer EMITS carries the condition axis at all. False while the
+    /// build's writer is on version 2, where a stated condition is projected away rather than
+    /// stored somewhere else: there is exactly one source of truth for this record, and inventing
+    /// a sidecar to hold an axis the wire cannot carry would create a second one. Adapters read
+    /// this to know whether [`Writer::raise_fault`] and the clears can do anything yet.
+    pub fn writes_condition_axis(&self) -> bool {
+        self.schema == SCHEMA_V3
+    }
+
+    /// Publish a fully resolved version 3 tuple: activity, composer, condition, ask, and the
+    /// optional conversation bridge as ONE statement, which is how a producer that just decided
+    /// all of them should state them. Coalescing, ownership, and the semantic clock work exactly
+    /// as they do for [`Writer::observe`]; the outcome is typed, so a refusal — a foreign schema,
+    /// a later session's claim, unreadable bytes — is a value the caller can act on rather than a
+    /// silent `false`.
+    ///
+    /// While the emitted version is 2 this projects to the existing legacy bytes with exactly the
+    /// existing behaviour: the tagged ask becomes the legacy pair, and the condition and
+    /// conversation axes are dropped because the version 2 wire has nowhere to carry them. A
+    /// condition-only change therefore coalesces (nothing in the bytes changed), which is
+    /// observable through [`Writer::writes_condition_axis`].
+    pub fn publish(&mut self, frame: Frame) -> anyhow::Result<WriteOutcome> {
+        self.publish_inner(frame, false)
+    }
+
+    /// [`Writer::publish`], with [`Writer::observe_unless_ended`]'s opt-in: a live frame is
+    /// refused once this session's own exit-bearing terminal record stands. Kept as a separate
+    /// entry point because reporting activity after a terminal error is legal for some harnesses
+    /// (Codex does it) and only a producer whose live frames and terminal record come from
+    /// different processes wants them suppressed.
+    pub fn publish_unless_ended(&mut self, frame: Frame) -> anyhow::Result<WriteOutcome> {
+        self.publish_inner(frame, true)
+    }
+
+    fn publish_inner(&mut self, frame: Frame, skip_if_ended: bool) -> anyhow::Result<WriteOutcome> {
+        frame.validate()?;
+        anyhow::ensure!(
+            frame.state == Activity::Ended || self.pty_session.is_some(),
+            "live observations require a pty session to vouch for them"
+        );
+        self.mutate(Mutation::Frame {
+            frame,
+            skip_if_ended,
+        })
+    }
+
+    /// Raise a fault, or replace the one that stands, WITHOUT restating the activity axis: a
+    /// producer that learned its provider is throttled has learned nothing new about whether the
+    /// model is working, and making it restate an activity it did not observe is how a stale
+    /// activity gets refreshed by a fault. The rest of the tuple — activity, composer, ask, and
+    /// the conversation bridge — is carried across from this session's own record verbatim.
+    ///
+    /// Replacing a fault with the SAME fault preserves its original `observedAtMs`: the semantic
+    /// clock records when the condition was first observed, so restating it cannot postpone an
+    /// automatic recovery's deadline.
+    pub fn raise_fault(&mut self, fault: FaultReport) -> anyhow::Result<WriteOutcome> {
+        fault.validate()?;
+        self.mutate(Mutation::Condition(ConditionOp::Raise(fault)))
+    }
+
+    /// Clear the fault this key names, and ONLY that one. The key is the exact `(category, code)`
+    /// pair — a key naming no code matches only a fault carrying none — because a clear derived
+    /// from a category alone is how one provider signal ("rate limit lifted") silences a different
+    /// live fault in the same category. A mismatch writes nothing and returns
+    /// [`Refusal::ConditionMismatch`] carrying the fault that actually stands, so the caller can
+    /// see what it failed to match instead of believing it cleared something.
+    pub fn clear_fault(&mut self, key: FaultKey) -> anyhow::Result<WriteOutcome> {
+        self.mutate(Mutation::Condition(ConditionOp::ClearPaired(key)))
+    }
+
+    /// Clear the WHOLE condition axis, whatever stands on it. Unlike the paired clear this needs
+    /// no key, so it requires a [`ProgressProof`]: a positive observation that the harness made
+    /// progress the standing fault would have prevented. The type has no "I assume so" member —
+    /// the caller must name what it saw — because an unproven blanket clear is exactly how a
+    /// fault that still holds stops paging.
+    pub fn clear_all(&mut self, proof: ProgressProof) -> anyhow::Result<WriteOutcome> {
+        self.mutate(Mutation::Condition(ConditionOp::ClearAll(proof)))
+    }
+
+    /// THE mutation path: one lock, one read of the authoritative record, one ownership decision,
+    /// one byte-distinct rename. Every producer entry point above resolves to this, so ownership
+    /// direction, coalescing, stamp monotonicity, and the transition counter are decided once and
+    /// cannot drift between the legacy and version 3 surfaces.
+    fn mutate(&mut self, mutation: Mutation) -> anyhow::Result<WriteOutcome> {
         let _lock = self.locked()?;
-        let on_disk = match read_stored(&self.path) {
-            StoredRecord::Parsed(record) => Some(record),
-            StoredRecord::Absent => None,
-            // Bytes this version cannot parse are somebody's record, not a virgin seat: a
-            // non-claiming writer refuses rather than restarting the sequence and counter over
-            // foreign state. Only the explicit written claim supersedes.
-            StoredRecord::Unreadable(_) => return Ok(false),
+        let on_disk = match read_current(&self.path) {
+            CurrentRecord::Absent => None,
+            // Bytes this build cannot decode as EITHER writable shape are somebody's record, not
+            // a virgin seat: a non-claiming writer refuses rather than restarting the sequence
+            // and counter over foreign state. Only the explicit written claim supersedes.
+            CurrentRecord::Unreadable => return Ok(WriteOutcome::Refused(Refusal::Unreadable)),
+            CurrentRecord::Legacy(record) => Some(Snapshot::from_legacy(record)),
+            CurrentRecord::V3(record) => Some(Snapshot::from_v3(record)),
         };
         // Resolve this writer's ownership sequence, then enforce its direction. A claiming
         // writer adopts the on-disk sequence when the record already carries its token (a
@@ -1068,29 +1660,37 @@ impl Writer {
                 }
                 // Adoption never crosses schemas: a record is this writer's own only when it
                 // carries both this build's version and this session's token. A same-token
-                // record under the other version belongs to a differently-versioned writer of
+                // record under another version belongs to a differently-versioned writer of
                 // this session, and inheriting its sequence would let this build write over a
                 // meaning it did not produce.
                 Some(current)
-                    if current.schema == SCHEMA && current.incarnation == self.session =>
+                    if current.schema == self.schema && current.incarnation == self.session =>
                 {
                     current.seq
                 }
-                Some(_) => return Ok(false),
+                Some(_) => return Ok(WriteOutcome::Refused(Refusal::Unclaimed)),
             },
         };
-        if on_disk.as_ref().is_some_and(|current| current.seq > seq) {
-            return Ok(false);
+        if let Some(current) = on_disk.as_ref().filter(|current| current.seq > seq) {
+            return Ok(WriteOutcome::Refused(Refusal::Superseded {
+                on_disk_seq: current.seq,
+                ours: seq,
+            }));
         }
         // A foreign schema's `seq` decodes as serde-default zero, which every claim exceeds — a
         // v1 straggler would otherwise replace a v2 record it cannot even read. Non-claiming
         // writers refuse foreign schemas outright; only the explicit written [`claim`]
-        // supersedes an unsupported schema.
-        if on_disk
+        // supersedes an unsupported schema. The refusal is TYPED rather than a silent no-op: a
+        // producer whose writes are all being dropped because the record on disk speaks a
+        // different version must be able to see that, and this record has no second store to
+        // report it through.
+        if let Some(current) = on_disk
             .as_ref()
-            .is_some_and(|current| current.schema != SCHEMA)
+            .filter(|current| current.schema != self.schema)
         {
-            return Ok(false);
+            return Ok(WriteOutcome::Refused(Refusal::Schema {
+                found: current.schema.clone(),
+            }));
         }
         self.claimed_seq = Some(seq);
         // Ownership is token equality: a record is this writer's only when it carries both this
@@ -1100,11 +1700,126 @@ impl Writer {
         // replaces it wholesale (one logical owner per record), continuing the counter for
         // byte-distinctness. Timestamps deliberately play no part: a same-millisecond takeover
         // and a lingering predecessor writer are both real and both ambiguous by clock.
-        let own_record = on_disk
+        let own = on_disk
             .as_ref()
-            .filter(|current| current.schema == SCHEMA && current.incarnation == self.session);
-        if skip_if_ended
-            && own_record.is_some_and(|current| {
+            .filter(|current| current.schema == self.schema && current.incarnation == self.session);
+        // What an UNSTATED axis inherits. A claim fence is excluded: it is a session that has
+        // observed nothing, so carrying its required-but-meaningless condition forward would turn
+        // a fence into a health claim.
+        let inherited = own.filter(|current| !current.is_fence());
+        let pending = match mutation {
+            Mutation::Legacy {
+                observation,
+                skip_if_ended,
+            } => Pending {
+                state: observation.state,
+                input_buffer: observation.input_buffer,
+                // The legacy pair rides VERBATIM: a legacy caller's bytes must not change
+                // because a tagged axis now exists to re-derive them from.
+                legacy_ask: (observation.blocked_on, observation.ask),
+                ask: HumanAsk::from_legacy(observation.blocked_on, observation.ask),
+                condition: inherited.and_then(|current| current.condition.clone()),
+                conversation: inherited.and_then(|current| current.conversation.clone()),
+                reason: observation.reason,
+                exit: observation.exit,
+                skip_if_ended,
+                pty_session: self.pty_session.clone(),
+                condition_only: false,
+            },
+            Mutation::Frame {
+                frame,
+                skip_if_ended,
+            } => Pending {
+                state: frame.state,
+                input_buffer: frame.input_buffer,
+                legacy_ask: project_ask_legacy(frame.ask),
+                ask: frame.ask,
+                condition: match frame.condition {
+                    ConditionReport::Unchanged => {
+                        inherited.and_then(|current| current.condition.clone())
+                    }
+                    ConditionReport::Clear => Some(Stated::Clear { detail: None }),
+                    ConditionReport::Fault(fault) => Some(Stated::Fault(fault)),
+                },
+                conversation: frame
+                    .conversation
+                    .or_else(|| inherited.and_then(|current| current.conversation.clone())),
+                reason: frame.reason,
+                exit: frame.exit,
+                skip_if_ended,
+                pty_session: self.pty_session.clone(),
+                condition_only: false,
+            },
+            Mutation::Condition(op) => {
+                // Version 2 has nowhere to carry a condition, and this record has exactly one
+                // source of truth: refuse, typed, rather than keeping the axis in a cache the
+                // session's sibling processes cannot see and coalescing cannot consult.
+                if !self.writes_condition_axis() {
+                    return Ok(WriteOutcome::Refused(Refusal::ConditionUnrepresentable {
+                        schema: self.schema,
+                    }));
+                }
+                // A condition attaches to an OBSERVATION. This session's own record is the only
+                // one that can hold it: stating a fault about a record this session never wrote
+                // would be speaking for another owner's observation.
+                let Some(base) = own else {
+                    return Ok(WriteOutcome::Refused(Refusal::Unobserved));
+                };
+                if base.is_fence() {
+                    return Ok(WriteOutcome::Refused(Refusal::Unobserved));
+                }
+                // A terminal record is the incarnation's last word, and a condition operation is
+                // never the thing that writes one: rewriting an `ended` record here would
+                // re-publish `ended` from a code path that observed no exit at all.
+                if base.state == Activity::Ended {
+                    return Ok(WriteOutcome::Refused(Refusal::Terminal));
+                }
+                let condition = match op {
+                    ConditionOp::Raise(fault) => Stated::Fault(fault),
+                    ConditionOp::ClearPaired(key) => {
+                        match base.condition.as_ref().and_then(Stated::fault) {
+                            Some(fault) if key.matches(fault) => Stated::Clear { detail: None },
+                            current => {
+                                return Ok(WriteOutcome::Refused(Refusal::ConditionMismatch {
+                                    current: current.map(FaultReport::key),
+                                }));
+                            }
+                        }
+                    }
+                    // The proof rides the wire as the clear's diagnostic detail — a `clear` may
+                    // carry one — so an operator can see what a blanket clear was based on.
+                    ConditionOp::ClearAll(proof) => Stated::Clear {
+                        detail: Some(proof.as_str().to_string()),
+                    },
+                };
+                // A condition operation restates the activity axis verbatim, INCLUDING the pty
+                // session that vouches for it: the caller may be a hook process with no pty of
+                // its own, and writing its own empty fence would strip a live record's only
+                // liveness evidence and flip the seat to `unknown` for every same-host reader.
+                let pty_session = base.pty_session.clone();
+                if pty_session.is_none() && base.state != Activity::Ended {
+                    return Ok(WriteOutcome::Refused(Refusal::Unfenced));
+                }
+                Pending {
+                    state: base.state,
+                    pty_session,
+                    input_buffer: base.input_buffer,
+                    legacy_ask: base.legacy_ask,
+                    ask: base.ask,
+                    condition: Some(condition),
+                    conversation: base.conversation.clone(),
+                    reason: base.reason.clone(),
+                    exit: base.exit.clone(),
+                    skip_if_ended: false,
+                    // The activity did not change, so its clock does not restart. The transition
+                    // counter still advances: the bytes changed, and every landed write must be
+                    // byte-distinct.
+                    condition_only: true,
+                }
+            }
+        };
+        if pending.skip_if_ended
+            && own.is_some_and(|current| {
                 // Only a REAL terminal record from this session suppresses queued live frames:
                 // one carrying an exit, which every wrapper's `ended` does. The claim record —
                 // this session's own `ended (superseded)` placeholder, deliberately exitless —
@@ -1113,20 +1828,13 @@ impl Writer {
                 current.state == Activity::Ended && current.exit.is_some()
             })
         {
-            return Ok(false);
+            return Ok(WriteOutcome::Refused(Refusal::Terminal));
         }
         let now_ms = crate::message::now_ms();
-        let unchanged = !self.interrupted
-            && own_record.is_some_and(|current| {
-                current.state == observation.state
-                    && current.blocked_on == observation.blocked_on
-                    && current.input_buffer == observation.input_buffer
-                    && current.ask == observation.ask
-                    && current.reason == observation.reason
-                    && current.exit == observation.exit
-            });
+        let unchanged =
+            !self.interrupted && own.is_some_and(|current| self.same_tuple(current, &pending));
         if unchanged
-            && let Some(current) = own_record
+            && let Some(current) = own
             // A restatement is a no-op only against a record this session already wrote (the
             // token filter above) whose stamp a reader would trust: a stamp beyond the
             // future-skew bound — a backward clock correction's leftover — would otherwise
@@ -1135,7 +1843,7 @@ impl Writer {
             && current.written_at_ms <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
             && now_ms.saturating_sub(current.written_at_ms) < duration_ms(HARNESS_STATE_REFRESH)
         {
-            return Ok(true);
+            return Ok(WriteOutcome::Coalesced);
         }
         // A landed write is byte-distinct even against a same-millisecond predecessor: the stamp
         // is strictly monotonic per record, at the cost of a bounded forward skew of at most one
@@ -1148,9 +1856,19 @@ impl Writer {
             on_disk.as_ref().map(|current| current.written_at_ms),
             now_ms,
         );
-        let (since_ms, transitions) = match (own_record, unchanged) {
+        let (since_ms, transitions) = match (own, unchanged) {
             (Some(current), true) => (current.since_ms, current.transitions),
-            (Some(current), false) => (written_at_ms, current.transitions.saturating_add(1)),
+            // A condition-only write states the same activity the record already holds, so
+            // `sinceMs` — when that state was ENTERED — carries across untouched while the
+            // counter still advances for byte-distinctness.
+            (Some(current), false) => (
+                if pending.condition_only {
+                    current.since_ms
+                } else {
+                    written_at_ms
+                },
+                current.transitions.saturating_add(1),
+            ),
             (None, _) => (
                 written_at_ms,
                 on_disk
@@ -1158,26 +1876,103 @@ impl Writer {
                     .map_or(0, |current| current.transitions.saturating_add(1)),
             ),
         };
-        let record = Record {
-            schema: SCHEMA.to_string(),
-            agent: self.agent.clone(),
-            harness: self.harness.to_string(),
-            state: observation.state,
-            blocked_on: observation.blocked_on,
-            input_buffer: observation.input_buffer,
-            ask: observation.ask,
-            reason: observation.reason,
-            exit: observation.exit,
-            pty_session: self.pty_session.clone(),
-            incarnation: self.session.clone(),
-            seq,
-            since_ms,
-            written_at_ms,
-            transitions,
+        // The semantic clock belongs to the FAULT, not to the write that carries it: a fault
+        // restated unchanged keeps the instant it was first observed. Without this an activity
+        // edge under a standing fault — several per turn on an SSE producer — would re-mint
+        // `observedAtMs` and an automatic recovery could outrun its own deadline forever.
+        let condition = match pending.condition {
+            Some(Stated::Fault(mut fault)) => {
+                if let Some(Stated::Fault(before)) = own.and_then(|current| current.condition.as_ref())
+                    && before.same_fault(&fault)
+                {
+                    fault.observed_at_ms = before.observed_at_ms;
+                }
+                Some(Stated::Fault(fault))
+            }
+            other => other,
         };
-        write_record(&self.path, &record)?;
+        if self.schema == SCHEMA_V3 {
+            // `absent` is not writable and neither is silence: a version 3 record whose condition
+            // axis nobody ever stated is not a weaker record, it is one this build's own reader
+            // rejects. Refuse it as a value — the producer must state the axis once (through
+            // [`Writer::publish`]) before an activity-only frame can ride on top of it.
+            let Some(condition) = condition else {
+                return Ok(WriteOutcome::Refused(Refusal::Unstated));
+            };
+            write_record_v3(
+                &self.path,
+                &RecordV3 {
+                    schema: self.schema.to_string(),
+                    agent: self.agent.clone(),
+                    harness: self.harness.to_string(),
+                    state: pending.state,
+                    input_buffer: pending.input_buffer,
+                    condition: condition.to_wire(),
+                    ask: ask_to_wire(pending.ask),
+                    conversation_ref: pending
+                        .conversation
+                        .as_ref()
+                        // The link's incarnation is the WRITING session's, stamped here rather
+                        // than taken from the producer: two sources for one fact make a mismatch
+                        // with the record's own `incarnation` unfalsifiable for a reader.
+                        .map(|state| conversation_to_wire(state, &self.session)),
+                    reason: pending.reason,
+                    exit: pending.exit,
+                    pty_session: pending.pty_session.clone(),
+                    incarnation: self.session.clone(),
+                    seq,
+                    since_ms,
+                    written_at_ms,
+                    transitions,
+                },
+            )?;
+        } else {
+            write_record(
+                &self.path,
+                &Record {
+                    schema: self.schema.to_string(),
+                    agent: self.agent.clone(),
+                    harness: self.harness.to_string(),
+                    state: pending.state,
+                    blocked_on: pending.legacy_ask.0,
+                    input_buffer: pending.input_buffer,
+                    ask: pending.legacy_ask.1,
+                    reason: pending.reason,
+                    exit: pending.exit,
+                    pty_session: pending.pty_session.clone(),
+                    incarnation: self.session.clone(),
+                    seq,
+                    since_ms,
+                    written_at_ms,
+                    transitions,
+                },
+            )?;
+        }
         self.interrupted = false;
-        Ok(true)
+        Ok(WriteOutcome::Landed)
+    }
+
+    /// Whether the pending write says exactly what the record already says, in the vocabulary the
+    /// emitted version can carry. Under versions 1 and 2 that is the legacy comparison unchanged,
+    /// so nothing version 3 adds can make a legacy restatement write.
+    fn same_tuple(&self, current: &Snapshot, pending: &Pending) -> bool {
+        if current.state != pending.state
+            || current.input_buffer != pending.input_buffer
+            || current.reason != pending.reason
+            || current.exit != pending.exit
+        {
+            return false;
+        }
+        if self.schema != SCHEMA_V3 {
+            return current.legacy_ask == pending.legacy_ask;
+        }
+        current.ask == pending.ask
+            && current.conversation == pending.conversation
+            && match (current.condition.as_ref(), pending.condition.as_ref()) {
+                (Some(before), Some(now)) => before.same_statement(now),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            }
     }
 
     /// Re-stamp the heartbeat for whatever live state is on disk. Nothing on disk means nothing
@@ -1187,36 +1982,55 @@ impl Writer {
     /// — one written before this session started — is preserved for counter continuity but is
     /// never heartbeat-eligible: re-stamping it would keep a dead session's state fresh forever.
     /// It becomes eligible once any writer of this session observes something.
+    ///
+    /// A heartbeat touches the TRANSPORT stamp and nothing else. Under version 3 that is the
+    /// whole point: `condition.observedAtMs` and `condition.nextObservationDueMs` are the
+    /// SEMANTIC clock, and a producer that stayed alive through a throttle window must not be
+    /// able to heartbeat its way out of an overdue automatic recovery. `sinceMs`, the transition
+    /// counter, the condition, the ask, and the conversation bridge are all carried across
+    /// byte-identically.
     pub fn heartbeat(&mut self) -> anyhow::Result<()> {
         let _lock = self.locked()?;
-        let Some(mut current) = read_record(&self.path) else {
-            return Ok(());
-        };
-        // A schema this writer does not own must not be round-tripped through this version's
-        // record type, and a record this *session* does not own must never be kept fresh: a
-        // lingering predecessor re-stamping its successor's record would keep a dead seat's
-        // state alive for cross-host readers, and a successor re-stamping a predecessor's would
-        // resurrect history. Token equality decides, in both directions.
-        if current.schema != SCHEMA
-            || current.state == Activity::Ended
-            || current.incarnation != self.session
-        {
-            return Ok(());
-        }
         let now_ms = crate::message::now_ms();
-        current.written_at_ms = if current.written_at_ms
-            <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW))
-        {
-            now_ms.max(current.written_at_ms.saturating_add(1))
-        } else {
-            // Never inherit an untrusted future stamp — reset to this writer's clock.
-            now_ms
-        };
-        write_record(&self.path, &current)
+        match read_current(&self.path) {
+            CurrentRecord::Legacy(mut current) => {
+                // A schema this writer does not own must not be round-tripped through this
+                // version's record type, and a record this *session* does not own must never be
+                // kept fresh: a lingering predecessor re-stamping its successor's record would
+                // keep a dead seat's state alive for cross-host readers, and a successor
+                // re-stamping a predecessor's would resurrect history. Token equality decides,
+                // in both directions.
+                if current.schema != self.schema
+                    || current.state == Activity::Ended
+                    || current.incarnation != self.session
+                {
+                    return Ok(());
+                }
+                current.written_at_ms = restamp(current.written_at_ms, now_ms);
+                write_record(&self.path, &current)
+            }
+            CurrentRecord::V3(mut current) => {
+                if current.schema != self.schema
+                    || current.state == Activity::Ended
+                    || current.incarnation != self.session
+                {
+                    return Ok(());
+                }
+                current.written_at_ms = restamp(current.written_at_ms, now_ms);
+                write_record_v3(&self.path, &current)
+            }
+            CurrentRecord::Absent | CurrentRecord::Unreadable => Ok(()),
+        }
     }
 
     /// Write the terminal record for this session. Idempotent-shaped: callers on racing teardown
     /// paths may both call it.
+    ///
+    /// This is the LEGACY terminal path and, like every legacy call, it states no condition axis:
+    /// under version 3 it carries forward whatever condition the session's own record already
+    /// holds and refuses — visibly, through [`Writer::publish`]'s typed refusal vocabulary — when
+    /// there is none to carry. A version 3 producer writes its terminal frame through
+    /// [`Writer::publish`], where the refusal is a value rather than a dropped write.
     pub fn ended(&mut self, exit: impl Into<String>) -> anyhow::Result<()> {
         self.observe(
             Observation::new(Activity::Ended, BlockedOn::None, InputBuffer::Unknown)
@@ -1783,19 +2597,261 @@ fn read_stored(path: &Path) -> StoredRecord {
     }
 }
 
-fn read_record(path: &Path) -> Option<Record> {
-    match read_stored(path) {
-        StoredRecord::Parsed(record) => Some(record),
-        StoredRecord::Absent | StoredRecord::Unreadable(_) => None,
-    }
-}
-
 fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     // This record stages beside itself, unchanged: the sibling driver record
     // ([`crate::harness_context`]) stages outside the agent subtree because a replicated
     // temporary name becomes a durable key, and moving this one's staging is a separate change.
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     write_json_atomic(path, record, &dir, ".harness-state")
+}
+
+/// The diagnostic detail a version 3 claim fence carries on its required condition axis. Named so
+/// the producer path can recognize its own fence and refuse to carry that `clear` forward as if a
+/// producer had stated it.
+const CLAIM_FENCE_DETAIL: &str = "claim fence: nothing observed yet";
+
+fn write_record_v3(path: &Path, record: &RecordV3) -> anyhow::Result<()> {
+    // Same staging discipline as its predecessor: beside the record, on the record's filesystem.
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    write_json_atomic(path, record, &dir, ".harness-state")
+}
+
+/// The record on disk decoded into whichever of the two WRITABLE shapes it is. The two shapes are
+/// structurally disjoint — a legacy record has no `condition` object and a version 3 record has
+/// no `blockedOn` — so this never guesses: it decodes, in the historical order, and reports what
+/// parsed. `Unreadable` carries nothing on purpose: the producer path refuses those bytes
+/// outright, and the ownership envelope inside them matters only to [`claim_locked`], which reads
+/// it through [`read_stored`].
+enum CurrentRecord {
+    Absent,
+    Unreadable,
+    Legacy(Record),
+    V3(RecordV3),
+}
+
+fn read_current(path: &Path) -> CurrentRecord {
+    let bytes = match fs::read(path) {
+        // Only proven absence is absence, exactly as [`read_stored`] decides it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CurrentRecord::Absent,
+        Err(_) => return CurrentRecord::Unreadable,
+        Ok(bytes) => bytes,
+    };
+    if let Ok(record) = serde_json::from_slice::<Record>(&bytes) {
+        return CurrentRecord::Legacy(record);
+    }
+    if let Ok(record) = serde_json::from_slice::<RecordV3>(&bytes) {
+        return CurrentRecord::V3(record);
+    }
+    CurrentRecord::Unreadable
+}
+
+/// The condition a write actually states, after carry-forward and semantic-clock preservation.
+/// Distinct from the producer's [`ConditionReport`], which additionally spells "leave this axis
+/// alone", and from the reader's [`ConditionView`], which additionally spells the legacy
+/// projection `absent` and carries read-time normalization no producer may forge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stated {
+    Clear { detail: Option<String> },
+    Fault(FaultReport),
+}
+
+impl Stated {
+    fn to_wire(&self) -> WireCondition {
+        match self {
+            Self::Clear { detail } => WireCondition {
+                kind: "clear".to_string(),
+                category: None,
+                code: None,
+                recovery: None,
+                observed_at_ms: None,
+                next_observation_due_ms: None,
+                detail: detail.clone(),
+            },
+            Self::Fault(fault) => WireCondition {
+                kind: "fault".to_string(),
+                category: Some(fault.category.as_str().to_string()),
+                code: fault.code.clone(),
+                recovery: Some(fault.recovery.as_str().to_string()),
+                observed_at_ms: Some(fault.observed_at_ms),
+                next_observation_due_ms: fault.next_observation_due_ms,
+                detail: fault.detail.clone(),
+            },
+        }
+    }
+
+    fn fault(&self) -> Option<&FaultReport> {
+        match self {
+            Self::Fault(fault) => Some(fault),
+            Self::Clear { .. } => None,
+        }
+    }
+
+    /// Whether two statements say the same thing about the harness, IGNORING when the fault was
+    /// observed: the semantic clock is when a fault started, not when it was last restated, so a
+    /// producer restating one fault every SSE frame must not look like a new statement.
+    fn same_statement(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Clear { detail: ours }, Self::Clear { detail: theirs }) => ours == theirs,
+            (Self::Fault(ours), Self::Fault(theirs)) => ours.same_fault(theirs),
+            _ => false,
+        }
+    }
+}
+
+/// The condition axis as the RECORD states it, or `None` when the bytes state nothing this build
+/// can continue. Lenient on purpose: this is the writer's view of its own previous statement, and
+/// a statement it cannot reconstruct is simply no statement to preserve.
+fn stated_condition(wire: &WireCondition) -> Option<Stated> {
+    match wire.kind.as_str() {
+        "clear" => Some(Stated::Clear {
+            detail: wire.detail.clone(),
+        }),
+        "fault" => Some(Stated::Fault(FaultReport {
+            category: FaultCategory::parse(wire.category.as_deref()?)?,
+            code: wire.code.clone(),
+            recovery: Recovery::parse(wire.recovery.as_deref()?),
+            observed_at_ms: wire.observed_at_ms?,
+            next_observation_due_ms: wire.next_observation_due_ms,
+            detail: wire.detail.clone(),
+        })),
+        _ => None,
+    }
+}
+
+/// The conversation bridge as the RECORD states it, in the producer's write vocabulary. The
+/// link's incarnation is deliberately dropped: the writing session stamps it, so a carried-forward
+/// link cannot claim an incarnation the record does not have.
+fn stated_conversation(wire: &WireConversation) -> Option<ConversationState> {
+    match wire.kind.as_str() {
+        "unsupported" => Some(ConversationState::Unsupported),
+        "unavailable" => Some(ConversationState::Unavailable(wire.reason.clone())),
+        "linked" => Some(ConversationState::Linked(ConversationClaim {
+            driver: wire.driver.clone()?,
+            conversation: wire.conversation.clone()?,
+            history_mutability: HistoryMutability::parse(wire.history_mutability.as_deref()?),
+            capability_evidence: CapabilityEvidence::parse(wire.capability_evidence.as_deref()?),
+            verified_through_ms: wire.verified_through_ms?,
+        })),
+        _ => None,
+    }
+}
+
+/// The on-disk record normalized to the axes a producer write must fence against and continue.
+/// One type for both writable shapes, so ownership — sequence direction, token equality, stamp
+/// continuity, transition counting — is decided in exactly one place whichever version is on
+/// disk and whichever version this build emits.
+struct Snapshot {
+    schema: String,
+    incarnation: String,
+    seq: u64,
+    transitions: u64,
+    written_at_ms: u64,
+    since_ms: u64,
+    state: Activity,
+    /// The pty session the RECORD names, which vouches for its live states. Carried so a
+    /// condition-only write — whose caller may be a hook process with no pty of its own — restates
+    /// the authoritative fence rather than stripping it.
+    pty_session: Option<String>,
+    input_buffer: InputBuffer,
+    /// The legacy pair VERBATIM, so a version 2 restatement compares byte-for-byte against what
+    /// the record actually holds rather than against a re-projection of it.
+    legacy_ask: (BlockedOn, Ask),
+    ask: HumanAsk,
+    condition: Option<Stated>,
+    conversation: Option<ConversationState>,
+    reason: Option<String>,
+    exit: Option<String>,
+}
+
+impl Snapshot {
+    fn from_legacy(record: Record) -> Self {
+        Self {
+            schema: record.schema,
+            incarnation: record.incarnation,
+            seq: record.seq,
+            transitions: record.transitions,
+            written_at_ms: record.written_at_ms,
+            since_ms: record.since_ms,
+            state: record.state,
+            pty_session: record.pty_session,
+            input_buffer: record.input_buffer,
+            legacy_ask: (record.blocked_on, record.ask),
+            ask: HumanAsk::from_legacy(record.blocked_on, record.ask),
+            // Versions 1 and 2 carry no condition axis at all, which is why the condition
+            // operations refuse under them rather than inventing a place to keep one.
+            condition: None,
+            conversation: None,
+            reason: record.reason,
+            exit: record.exit,
+        }
+    }
+
+    fn from_v3(record: RecordV3) -> Self {
+        let ask = decode_ask(&record.ask).unwrap_or(HumanAsk::Unknown);
+        Self {
+            schema: record.schema,
+            incarnation: record.incarnation,
+            seq: record.seq,
+            transitions: record.transitions,
+            written_at_ms: record.written_at_ms,
+            since_ms: record.since_ms,
+            state: record.state,
+            pty_session: record.pty_session,
+            input_buffer: record.input_buffer,
+            legacy_ask: project_ask_legacy(ask),
+            ask,
+            condition: stated_condition(&record.condition),
+            conversation: record
+                .conversation_ref
+                .as_ref()
+                .and_then(stated_conversation),
+            reason: record.reason,
+            exit: record.exit,
+        }
+    }
+
+    /// Whether this record is a claim fence: a session that has claimed the seat and observed
+    /// nothing. Its axes are a fence, not a statement, so nothing is carried forward from it.
+    fn is_fence(&self) -> bool {
+        is_claim_placeholder(self.state, self.exit.as_deref(), self.reason.as_deref())
+    }
+}
+
+/// Whether a WRAPPERLESS claimer may take the record over, decided from whichever version is on
+/// disk. Both writable shapes are decoded, because a hooks-only session must be able to claim a
+/// version 3 record for exactly the reasons it can claim a version 2 one — bytes it cannot decode
+/// would otherwise read as "somebody's live record" forever, and after the writer cutover that
+/// would be every record. Split out from [`claim_wrapperless`] so the version 3 eligibility is
+/// provable in a build whose own writer is still version 2.
+fn wrapperless_eligible(ours: &str, current: &CurrentRecord, now_ms: u64) -> bool {
+    let snapshot = match current {
+        CurrentRecord::Absent => return true,
+        // Unreadable bytes stay ineligible for this cautious path: a claimer that cannot read what
+        // it is replacing must not replace it.
+        CurrentRecord::Unreadable => return false,
+        CurrentRecord::Legacy(record) => Snapshot::from_legacy(record.clone()),
+        CurrentRecord::V3(record) => Snapshot::from_v3(record.clone()),
+    };
+    let stale = now_ms.saturating_sub(snapshot.written_at_ms) >= duration_ms(HARNESS_STATE_STALE);
+    let wrapperless_owner = snapshot.incarnation.is_empty()
+        || snapshot.incarnation.starts_with(WRAPPERLESS_PREFIX);
+    let real_terminal = snapshot.state == Activity::Ended && snapshot.exit.is_some();
+    // The same one-way schema fence as the written claim, applied here so the cautious path
+    // refuses (`Ok(None)`) instead of reaching `claim_locked` and erroring: a build whose writer
+    // is behind the record on disk has no eligible takeover at all, however stale or orphaned
+    // that record looks.
+    claim_may_supersede(ours, Some(snapshot.schema.as_str()))
+        && (wrapperless_owner || real_terminal || stale)
+}
+
+/// The heartbeat re-stamp, shared by both writable shapes: strictly beyond the record's own stamp
+/// so every landed heartbeat is byte-distinct, and never inheriting a stamp past the trust bound.
+fn restamp(previous: u64, now_ms: u64) -> u64 {
+    if previous <= now_ms.saturating_add(duration_ms(HARNESS_STATE_FUTURE_SKEW)) {
+        now_ms.max(previous.saturating_add(1))
+    } else {
+        now_ms
+    }
 }
 
 /// Take one driver record's exclusive cross-process lock, held for a read→decide→rename cycle.
@@ -1942,10 +2998,11 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     // restarting it at one would sit below a lingering predecessor's claim and fence the new
     // session out permanently — but the record's MEANING may only ever move forward.
     anyhow::ensure!(
-        claim_may_supersede(SCHEMA, on_disk_schema),
-        "refusing to claim a `{}` record while this build writes `{SCHEMA}`: \
+        claim_may_supersede(writer.schema, on_disk_schema),
+        "refusing to claim a `{}` record while this build writes `{}`: \
          taking it over would downgrade a migrated record's `agent` field to a bus address",
-        on_disk_schema.unwrap_or_default()
+        on_disk_schema.unwrap_or_default(),
+        writer.schema
     );
     let floor_path = writer.path.with_file_name(SEQ_FLOOR_NAME);
     let floor = fs::read_to_string(&floor_path)
@@ -1971,24 +3028,72 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
     let seq = highest.map_or(1, |seq| seq.saturating_add(1));
     let now_ms = crate::message::now_ms();
     let written_at_ms = next_stamp(previous_stamp, now_ms);
-    let record = Record {
-        schema: SCHEMA.to_string(),
-        agent: writer.agent.clone(),
-        harness: writer.harness.to_string(),
-        state: Activity::Ended,
-        blocked_on: BlockedOn::None,
-        input_buffer: InputBuffer::Unknown,
-        ask: Ask::None,
-        reason: Some("superseded".to_string()),
-        exit: None,
-        pty_session: None,
-        incarnation: token.to_string(),
-        seq,
-        since_ms: written_at_ms,
-        written_at_ms,
-        transitions: previous_transitions.map_or(0, |transitions| transitions.saturating_add(1)),
-    };
-    write_record(&writer.path, &record)?;
+    let transitions = previous_transitions.map_or(0, |transitions| transitions.saturating_add(1));
+    // The fence is written in the shape this build EMITS, so the one writer-selection point
+    // carries the claim with it: a version 2 claim over a version 3 record is already refused
+    // above, and a build whose writer moved to version 3 must not mint a fence its own reader
+    // would call malformed.
+    if writer.schema == SCHEMA_V3 {
+        write_record_v3(
+            &writer.path,
+            &RecordV3 {
+                schema: writer.schema.to_string(),
+                agent: writer.agent.clone(),
+                harness: writer.harness.to_string(),
+                state: Activity::Ended,
+                input_buffer: InputBuffer::Unknown,
+                // Version 3 requires the condition axis to be present, and the fence has
+                // observed nothing to say about it. Its value is structurally unreachable:
+                // [`is_claim_placeholder`] makes this record indeterminate (`claimed`) before any
+                // consumer sees a condition, and the producer path treats a fence as an UNSTATED
+                // condition rather than carrying this `clear` forward — so no health is claimed
+                // here, and the detail says so in the bytes.
+                condition: WireCondition {
+                    kind: "clear".to_string(),
+                    category: None,
+                    code: None,
+                    recovery: None,
+                    observed_at_ms: None,
+                    next_observation_due_ms: None,
+                    detail: Some(CLAIM_FENCE_DETAIL.to_string()),
+                },
+                ask: WireAsk {
+                    kind: "unknown".to_string(),
+                    ask: None,
+                },
+                conversation_ref: None,
+                reason: Some("superseded".to_string()),
+                exit: None,
+                pty_session: None,
+                incarnation: token.to_string(),
+                seq,
+                since_ms: written_at_ms,
+                written_at_ms,
+                transitions,
+            },
+        )?;
+    } else {
+        write_record(
+            &writer.path,
+            &Record {
+                schema: writer.schema.to_string(),
+                agent: writer.agent.clone(),
+                harness: writer.harness.to_string(),
+                state: Activity::Ended,
+                blocked_on: BlockedOn::None,
+                input_buffer: InputBuffer::Unknown,
+                ask: Ask::None,
+                reason: Some("superseded".to_string()),
+                exit: None,
+                pty_session: None,
+                incarnation: token.to_string(),
+                seq,
+                since_ms: written_at_ms,
+                written_at_ms,
+                transitions,
+            },
+        )?;
+    }
     // The floor accompanies every act that establishes ownership; its own failure
     // modes must never be quiet ones.
     persist_floor(&writer.path, seq);
@@ -2052,24 +3157,11 @@ pub fn claim_wrapperless(
 ) -> anyhow::Result<Option<u64>> {
     let writer = Writer::new(agent_dir, agent, harness, None);
     let _lock = writer.locked()?;
-    let eligible = match read_stored(&writer.path) {
-        StoredRecord::Absent => true,
-        StoredRecord::Unreadable(_) => false,
-        StoredRecord::Parsed(record) => {
-            let now_ms = crate::message::now_ms();
-            let stale =
-                now_ms.saturating_sub(record.written_at_ms) >= duration_ms(HARNESS_STATE_STALE);
-            let wrapperless_owner =
-                record.incarnation.is_empty() || record.incarnation.starts_with(WRAPPERLESS_PREFIX);
-            let real_terminal = record.state == Activity::Ended && record.exit.is_some();
-            // The same one-way schema fence as the written claim, applied here so the cautious
-            // path refuses (`Ok(None)`) instead of reaching `claim_locked` and erroring: a build
-            // whose writer is behind the record on disk has no eligible takeover at all, however
-            // stale or orphaned that record looks.
-            claim_may_supersede(SCHEMA, Some(record.schema.as_str()))
-                && (wrapperless_owner || real_terminal || stale)
-        }
-    };
+    let eligible = wrapperless_eligible(
+        writer.schema,
+        &read_current(&writer.path),
+        crate::message::now_ms(),
+    );
     if !eligible {
         return Ok(None);
     }
@@ -4196,5 +5288,851 @@ mod tests {
             record.transitions, 5,
             "and so does the counter that keeps writes byte-distinct"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The version 3 producer surface. Every one of these runs the REAL locked
+    // writer path — same lock, same fences, same atomic rename — and the ones
+    // that need version 3 bytes get them through the test-only emitted-schema
+    // seam, because this build's production writer is still version 2 (proved
+    // by `the_writer_declares_version_two_so_its_agent_field_means_an_immutable_id`).
+    // -----------------------------------------------------------------------
+
+    fn v3_writer(dir: &Path) -> Writer {
+        Writer::new(dir, FIXTURE_AGENT_ID, "codex", Some("worker".to_string()))
+            .with_emitted_schema(SCHEMA_V3)
+    }
+
+    fn record_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    const QUOTA_CODE: &str = "codex/usage_limit_reached";
+
+    fn quota_fault(observed_at_ms: u64) -> FaultReport {
+        FaultReport::new(FaultCategory::Quota, Recovery::Automatic, observed_at_ms)
+            .with_code(QUOTA_CODE)
+            .with_observation_due(observed_at_ms + 600_000)
+    }
+
+    fn quota_key() -> FaultKey {
+        FaultKey::new(FaultCategory::Quota).with_code(QUOTA_CODE)
+    }
+
+    fn v3_active(condition: ConditionReport) -> Frame {
+        Frame::new(
+            Activity::Active,
+            InputBuffer::Empty,
+            condition,
+            HumanAsk::None,
+        )
+    }
+
+    /// The rollout guarantee: while `EMIT_SCHEMA_V2` is true the producer API is a projection and
+    /// nothing more. The same tuple stated through the legacy API and through the version 3 API
+    /// produces the same bytes — the projection coalesces against the legacy record rather than
+    /// writing — the condition and conversation axes never reach the version 2 wire, and the
+    /// condition operations refuse as a VALUE rather than pretending to have stored an axis the
+    /// wire cannot carry.
+    #[test]
+    fn the_version_two_projection_is_byte_identical_and_carries_no_condition_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let token = session_token();
+        let mut legacy = writer(tmp.path()).with_session(token.clone());
+        legacy
+            .observe(Observation::new(
+                Activity::Active,
+                BlockedOn::None,
+                InputBuffer::Empty,
+            ))
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let mut producer = writer(tmp.path()).with_session(token);
+        assert!(!producer.writes_condition_axis());
+        assert_eq!(
+            producer
+                .publish(v3_active(ConditionReport::Fault(quota_fault(1_000))))
+                .unwrap(),
+            WriteOutcome::Coalesced,
+            "the same tuple plus a fault is the same version 2 bytes"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "so the projection writes nothing"
+        );
+        let record = record_json(&path);
+        assert_eq!(record["schema"], SCHEMA_V2);
+        assert_eq!(record["blockedOn"], "none");
+        assert_eq!(record["ask"], "none");
+        assert!(
+            record.get("condition").is_none() && record.get("conversationRef").is_none(),
+            "version 2 has no condition or conversation axis and gains none"
+        );
+        assert_eq!(
+            producer.raise_fault(quota_fault(1_000)).unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionUnrepresentable { schema: SCHEMA_V2 }),
+            "a condition operation refuses visibly rather than caching the axis elsewhere"
+        );
+        assert_eq!(
+            producer.clear_fault(quota_key()).unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionUnrepresentable { schema: SCHEMA_V2 })
+        );
+        assert_eq!(
+            producer.clear_all(ProgressProof::TurnCompleted).unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionUnrepresentable { schema: SCHEMA_V2 })
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// What the one selector replacement buys: the same producer calls serialize strict version 3
+    /// bytes that this build's own reader accepts, with the conversation link's incarnation
+    /// stamped by the WRITER rather than by the producer.
+    #[test]
+    fn the_version_three_writer_serializes_every_stated_axis_and_reads_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let mut writer = v3_writer(tmp.path());
+        let fault = quota_fault(now_ms - 5_000);
+        assert!(
+            writer
+                .publish(
+                    v3_active(ConditionReport::Fault(fault.clone()))
+                        .with_conversation(ConversationState::Linked(ConversationClaim {
+                            driver: "codex".to_string(),
+                            conversation: "thread_01JXPLACEHOLDER".to_string(),
+                            history_mutability: HistoryMutability::Rewritable,
+                            capability_evidence: CapabilityEvidence::Probed,
+                            verified_through_ms: now_ms,
+                        }))
+                        .with_reason("usage limit reached")
+                )
+                .unwrap()
+                .landed()
+        );
+
+        let record = record_json(&path);
+        assert_eq!(record["schema"], SCHEMA_V3);
+        assert_eq!(record["agent"], FIXTURE_AGENT_ID);
+        assert_eq!(record["condition"]["kind"], "fault");
+        assert_eq!(record["condition"]["category"], "quota");
+        assert_eq!(record["condition"]["code"], QUOTA_CODE);
+        assert_eq!(record["condition"]["recovery"], "automatic");
+        assert_eq!(record["condition"]["observedAtMs"], fault.observed_at_ms);
+        assert_eq!(
+            record["condition"]["nextObservationDueMs"],
+            fault.next_observation_due_ms.unwrap()
+        );
+        assert_eq!(record["ask"]["kind"], "none");
+        assert!(record["ask"].get("ask").is_none());
+        assert_eq!(
+            record["conversationRef"]["incarnation"], record["incarnation"],
+            "the link belongs to the writing session, which stamps it"
+        );
+        assert!(
+            record.get("blockedOn").is_none(),
+            "version 3 removes the overloaded axis rather than carrying both"
+        );
+
+        let observed = read(&path, None).expect("a fresh version 3 record");
+        assert_eq!(observed.schema.as_deref(), Some(SCHEMA_V3));
+        assert_eq!(observed.state, Activity::Active);
+        assert_eq!(observed.human_ask, HumanAsk::None);
+        let decoded = observed.condition.fault().expect("a fault");
+        assert_eq!(decoded.category, Some(FaultCategory::Quota));
+        assert_eq!(decoded.recovery, Recovery::Automatic);
+        assert!(!decoded.overdue);
+        assert_eq!(
+            observed
+                .conversation
+                .as_ref()
+                .and_then(ConversationRef::link)
+                .map(|link| link.driver.as_str()),
+            Some("codex")
+        );
+    }
+
+    /// A paired clear is exactly `(category, code)`. Neither the category alone nor a sibling code
+    /// in the same category clears the fault that stands, and a refused clear RETAINS it: the
+    /// mismatch is reported with what actually stands so the caller cannot believe it cleared
+    /// something.
+    #[test]
+    fn a_paired_clear_clears_only_the_exact_category_and_code_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let mut writer = v3_writer(tmp.path());
+        writer.publish(v3_active(ConditionReport::Clear)).unwrap();
+        assert!(writer.raise_fault(quota_fault(now_ms)).unwrap().landed());
+
+        assert_eq!(
+            writer
+                .clear_fault(FaultKey::new(FaultCategory::Quota))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionMismatch {
+                current: Some(quota_key())
+            }),
+            "a codeless key names a codeless fault, not this one"
+        );
+        assert_eq!(
+            writer
+                .clear_fault(FaultKey::new(FaultCategory::Quota).with_code("codex/other_limit"))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionMismatch {
+                current: Some(quota_key())
+            }),
+            "and neither does a sibling code in the same category"
+        );
+        assert_eq!(
+            writer
+                .clear_fault(FaultKey::new(FaultCategory::RateLimit).with_code(QUOTA_CODE))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionMismatch {
+                current: Some(quota_key())
+            })
+        );
+        let retained = record_json(&path);
+        assert_eq!(retained["condition"]["kind"], "fault");
+        assert_eq!(retained["condition"]["code"], QUOTA_CODE);
+
+        assert!(
+            writer.clear_fault(quota_key()).unwrap().landed(),
+            "the exact pair clears it"
+        );
+        let cleared = record_json(&path);
+        assert_eq!(cleared["condition"]["kind"], "clear");
+        assert!(cleared["condition"].get("category").is_none());
+        assert!(cleared["condition"].get("observedAtMs").is_none());
+        assert_eq!(
+            read(&path, None).expect("a record").condition,
+            ConditionView::Clear
+        );
+        assert_eq!(
+            cleared["state"], "active",
+            "a condition operation restates no activity it did not observe"
+        );
+        assert_eq!(
+            writer.clear_fault(quota_key()).unwrap(),
+            WriteOutcome::Refused(Refusal::ConditionMismatch { current: None }),
+            "and clearing a clear axis matches nothing"
+        );
+    }
+
+    /// The unkeyed clear: it takes no key, so it takes a positive proof instead, and the proof
+    /// rides the record as the clear's diagnostic detail.
+    #[test]
+    fn clear_all_states_its_proof_and_clears_whatever_stands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let mut writer = v3_writer(tmp.path());
+        writer.publish(v3_active(ConditionReport::Clear)).unwrap();
+        writer
+            .raise_fault(
+                FaultReport::new(FaultCategory::Authentication, Recovery::Human, now_ms)
+                    .with_code("codex/oauth_expired"),
+            )
+            .unwrap();
+        assert!(
+            writer
+                .clear_all(ProgressProof::RequestSucceeded)
+                .unwrap()
+                .landed()
+        );
+        let record = record_json(&path);
+        assert_eq!(record["condition"]["kind"], "clear");
+        assert_eq!(
+            record["condition"]["detail"],
+            ProgressProof::RequestSucceeded.as_str()
+        );
+        assert_eq!(
+            read(&path, None).expect("a record").condition,
+            ConditionView::Clear
+        );
+    }
+
+    /// The semantic clock belongs to the fault, not to the writes that carry it: a heartbeat moves
+    /// the transport stamp and NOTHING else, and restating one fault — which an SSE producer does
+    /// on every activity edge — keeps the instant it was first observed. Without both, an
+    /// automatic recovery could outrun its own deadline forever.
+    #[test]
+    fn neither_a_heartbeat_nor_a_restatement_moves_the_semantic_fault_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let due_ms = now_ms + 600_000;
+        let mut writer = v3_writer(tmp.path());
+        writer
+            .publish(v3_active(ConditionReport::Fault(quota_fault(now_ms))))
+            .unwrap();
+        let published = record_json(&path);
+
+        writer.heartbeat().unwrap();
+        let beaten = record_json(&path);
+        assert!(
+            beaten["writtenAtMs"].as_u64() > published["writtenAtMs"].as_u64(),
+            "the transport stamp advances and every landed write stays byte-distinct"
+        );
+        assert_eq!(
+            beaten["condition"], published["condition"],
+            "the semantic clock and its deadline do not"
+        );
+        assert_eq!(beaten["sinceMs"], published["sinceMs"]);
+        assert_eq!(beaten["transitions"], published["transitions"]);
+        assert_eq!(beaten["ask"], published["ask"]);
+
+        let restated = FaultReport::new(FaultCategory::Quota, Recovery::Automatic, now_ms + 30_000)
+            .with_code(QUOTA_CODE)
+            .with_observation_due(due_ms);
+        assert!(
+            writer
+                .publish(Frame::new(
+                    Activity::Idle,
+                    InputBuffer::Empty,
+                    ConditionReport::Fault(restated),
+                    HumanAsk::None,
+                ))
+                .unwrap()
+                .landed(),
+            "the activity edge itself is a real transition"
+        );
+        let edged = record_json(&path);
+        assert_eq!(edged["state"], "idle");
+        assert_eq!(
+            edged["condition"]["observedAtMs"].as_u64(),
+            Some(now_ms),
+            "restating one fault never re-mints its clock"
+        );
+
+        assert!(
+            writer
+                .publish(v3_active(ConditionReport::Unchanged))
+                .unwrap()
+                .landed()
+        );
+        let unchanged = record_json(&path);
+        assert_eq!(unchanged["state"], "active");
+        assert_eq!(
+            unchanged["condition"], edged["condition"],
+            "an activity-only frame carries the condition across untouched"
+        );
+    }
+
+    /// Producer-side strictness mirrors the reader's, at the write boundary and BEFORE the record
+    /// exists: a producer must not be able to write bytes this build's own reader rejects, and an
+    /// impossible combination is a producer bug — an error — rather than a refusal to route
+    /// around.
+    #[test]
+    fn impossible_producer_combinations_are_refused_before_anything_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let mut writer = v3_writer(tmp.path());
+        let linked = |verified_through_ms| {
+            ConversationState::Linked(ConversationClaim {
+                driver: "codex".to_string(),
+                conversation: "thread_01JXPLACEHOLDER".to_string(),
+                history_mutability: HistoryMutability::Stable,
+                capability_evidence: CapabilityEvidence::Declared,
+                verified_through_ms,
+            })
+        };
+        let invalid = [
+            // `unknown` activity is derived from missing evidence; there is no writing path to it.
+            Frame {
+                state: Activity::Unknown,
+                ..v3_active(ConditionReport::Clear)
+            },
+            // An exitless `ended` is the claim fence, which only a session claim writes.
+            Frame::new(
+                Activity::Ended,
+                InputBuffer::Unknown,
+                ConditionReport::Clear,
+                HumanAsk::None,
+            ),
+            // A fault with no semantic observation time cannot be aged.
+            v3_active(ConditionReport::Fault(FaultReport::new(
+                FaultCategory::Provider,
+                Recovery::Automatic,
+                0,
+            ))),
+            // A bare code has no namespace, which is how two providers' codes collide.
+            v3_active(ConditionReport::Fault(
+                FaultReport::new(FaultCategory::Provider, Recovery::Automatic, now_ms)
+                    .with_code("usage_limit_reached"),
+            )),
+            // A deadline on a recovery nobody automates is a producer error, not a hint.
+            v3_active(ConditionReport::Fault(
+                FaultReport::new(FaultCategory::Authentication, Recovery::Human, now_ms)
+                    .with_observation_due(now_ms + 1_000),
+            )),
+            // An inverted deadline claims the next observation was due before the observation.
+            v3_active(ConditionReport::Fault(
+                FaultReport::new(FaultCategory::RateLimit, Recovery::Automatic, now_ms)
+                    .with_observation_due(now_ms - 1),
+            )),
+            // A zero verification bound looks verified and is not.
+            v3_active(ConditionReport::Clear).with_conversation(linked(0)),
+            // st2's own rejection word, stated as if it were the driver's explanation.
+            v3_active(ConditionReport::Clear).with_conversation(ConversationState::Unavailable(
+                Some("incomplete-conversation-link".to_string()),
+            )),
+        ];
+        for frame in invalid {
+            assert!(
+                writer.publish(frame.clone()).is_err(),
+                "an invalid frame must not be publishable: {frame:?}"
+            );
+        }
+        assert!(
+            !path.exists(),
+            "and no invalid frame reached the record at all"
+        );
+        // The same strictness on the condition-only path, which validates before taking the lock.
+        assert!(
+            writer
+                .raise_fault(FaultReport::new(
+                    FaultCategory::Quota,
+                    Recovery::Automatic,
+                    0
+                ))
+                .is_err()
+        );
+    }
+
+    /// The producer path is the SAME fenced path: ownership direction, foreign schemas, and
+    /// unreadable bytes decide exactly as they always have — except that the outcome is a typed
+    /// value, so a producer whose writes are all being dropped can see why. Nothing here is a
+    /// silent `Ok(false)`.
+    #[test]
+    fn producer_writes_honor_the_existing_fences_and_report_refusals_as_values() {
+        // A foreign schema on disk: refused, named, and left untouched.
+        let foreign = tempfile::tempdir().unwrap();
+        let path = planted(foreign.path(), SCHEMA_V2, FIXTURE_AGENT_ID, 3);
+        let planted_bytes = fs::read(&path).unwrap();
+        let mut mismatched = v3_writer(foreign.path()).with_ownership(session_token(), 9);
+        assert_eq!(
+            mismatched.publish(v3_active(ConditionReport::Clear)).unwrap(),
+            WriteOutcome::Refused(Refusal::Schema {
+                found: SCHEMA_V2.to_string()
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), planted_bytes);
+
+        // A later session's claim fences the straggler out, live or terminal.
+        let live = tempfile::tempdir().unwrap();
+        let mut predecessor = v3_writer(live.path()).with_ownership(session_token(), 1);
+        assert!(
+            predecessor
+                .publish(v3_active(ConditionReport::Clear))
+                .unwrap()
+                .landed()
+        );
+        let mut successor = v3_writer(live.path()).with_ownership(session_token(), 2);
+        assert!(
+            successor
+                .publish(v3_active(ConditionReport::Clear))
+                .unwrap()
+                .landed()
+        );
+        assert_eq!(
+            predecessor
+                .publish(v3_active(ConditionReport::Clear))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::Superseded {
+                on_disk_seq: 2,
+                ours: 1
+            })
+        );
+
+        // Bytes this build cannot decode as either shape are somebody's record, never a virgin
+        // seat.
+        let unreadable = tempfile::tempdir().unwrap();
+        fs::write(harness_state_path(unreadable.path()), b"{not json").unwrap();
+        assert_eq!(
+            v3_writer(unreadable.path())
+                .publish(v3_active(ConditionReport::Clear))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::Unreadable)
+        );
+
+        // A condition needs an observation of this session's to attach to.
+        let virgin = tempfile::tempdir().unwrap();
+        assert_eq!(
+            v3_writer(virgin.path())
+                .raise_fault(quota_fault(crate::message::now_ms()))
+                .unwrap(),
+            WriteOutcome::Refused(Refusal::Unobserved)
+        );
+
+        // A legacy caller under version 3 states no condition axis, and `absent` is not writable:
+        // the refusal is a value on the producer surface, and the legacy signature keeps its
+        // exact current behaviour.
+        let legacy = tempfile::tempdir().unwrap();
+        let legacy_path = harness_state_path(legacy.path());
+        let mut unstated = v3_writer(legacy.path());
+        assert_eq!(
+            unstated.mutate(Mutation::Legacy {
+                observation: active(),
+                skip_if_ended: false
+            }).unwrap(),
+            WriteOutcome::Refused(Refusal::Unstated)
+        );
+        assert!(unstated.observe(active()).is_ok());
+        assert!(!legacy_path.exists());
+    }
+
+    /// A condition operation is never the thing that writes a terminal record: `ended` comes from
+    /// the wrapper or the process-exit owner, which knows the exit, through the resolved-tuple
+    /// path. A fault raised after that would re-publish `ended` from a caller that observed no
+    /// exit at all, and a fence is not an observation either.
+    #[test]
+    fn no_condition_operation_writes_ended_and_a_fence_is_not_an_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let mut writer = v3_writer(tmp.path());
+        writer
+            .publish(v3_active(ConditionReport::Fault(quota_fault(now_ms))))
+            .unwrap();
+        assert!(
+            writer
+                .publish(
+                    Frame::new(
+                        Activity::Ended,
+                        InputBuffer::Unknown,
+                        ConditionReport::Unchanged,
+                        HumanAsk::None,
+                    )
+                    .with_exit("exit 0")
+                )
+                .unwrap()
+                .landed(),
+            "the exit-bearing owner writes the terminal record"
+        );
+        let terminal = record_json(&path);
+        assert_eq!(terminal["state"], "ended");
+        assert_eq!(
+            terminal["condition"]["kind"], "fault",
+            "and the standing condition rides along untouched"
+        );
+
+        assert_eq!(
+            writer.raise_fault(quota_fault(now_ms + 1_000)).unwrap(),
+            WriteOutcome::Refused(Refusal::Terminal)
+        );
+        assert_eq!(
+            writer.clear_fault(quota_key()).unwrap(),
+            WriteOutcome::Refused(Refusal::Terminal)
+        );
+        assert_eq!(
+            writer.clear_all(ProgressProof::TurnCompleted).unwrap(),
+            WriteOutcome::Refused(Refusal::Terminal)
+        );
+        assert_eq!(
+            record_json(&path),
+            terminal,
+            "and none of them touched the incarnation's last word"
+        );
+
+        // The claim fence: a session that has claimed the seat and observed nothing. Its required
+        // condition axis is not a statement, so nothing attaches to it and nothing is carried out
+        // of it — the fence is planted here in version 3 shape because this build's own [`claim`]
+        // writes the version it emits, which is still 2.
+        let claimed = tempfile::tempdir().unwrap();
+        let fence_path = harness_state_path(claimed.path());
+        let token = session_token();
+        fs::write(
+            &fence_path,
+            format!(
+                r#"{{"schema":"{SCHEMA_V3}","agent":"{FIXTURE_AGENT_ID}","harness":"codex","state":"ended","inputBuffer":"unknown","condition":{{"kind":"clear","detail":"{CLAIM_FENCE_DETAIL}"}},"ask":{{"kind":"unknown"}},"reason":"superseded","incarnation":"{token}","seq":4,"sinceMs":1,"writtenAtMs":{now_ms},"transitions":1}}"#
+            ),
+        )
+        .unwrap();
+        let mut fenced = v3_writer(claimed.path()).with_ownership(token, 4);
+        assert_eq!(
+            fenced.raise_fault(quota_fault(now_ms)).unwrap(),
+            WriteOutcome::Refused(Refusal::Unobserved),
+            "a fence is a claim, not an observation a fault can attach to"
+        );
+        assert_eq!(
+            fenced.publish(v3_active(ConditionReport::Unchanged)).unwrap(),
+            WriteOutcome::Refused(Refusal::Unstated),
+            "and its required-but-meaningless `clear` is never carried forward as health"
+        );
+        assert_eq!(
+            read(&fence_path, None)
+                .expect("the fence")
+                .indeterminacy
+                .map(|indeterminacy| indeterminacy.reason),
+            Some("claimed".to_string())
+        );
+    }
+
+    /// OHS-R18: `none`, `pending(kind)`, and `unknown` are three DIFFERENT statements, and the
+    /// third is writable. A maintained driver that positively has no observable ask surface (pi)
+    /// states `unknown`: `none` would fabricate absence and `pending` would fabricate a human
+    /// waiting on a queue nobody can answer. Neither projection invents `blockedOn: human`, and
+    /// both round-trip.
+    #[test]
+    fn a_positively_unobservable_ask_is_writable_and_never_fabricates_a_waiting_human() {
+        let two = tempfile::tempdir().unwrap();
+        let two_path = harness_state_path(two.path());
+        assert!(
+            writer(two.path())
+                .publish(Frame::new(
+                    Activity::Active,
+                    InputBuffer::Unknown,
+                    ConditionReport::Clear,
+                    HumanAsk::Unknown,
+                ))
+                .unwrap()
+                .landed()
+        );
+        let record = record_json(&two_path);
+        assert_eq!(
+            record["blockedOn"], "unknown",
+            "the only faithful version 2 spelling of an unobservable ask axis"
+        );
+        assert_eq!(
+            record["ask"], "none",
+            "and never the derived `unknown` ask word"
+        );
+        assert_eq!(
+            read(&two_path, None).expect("a record").human_ask,
+            HumanAsk::Unknown,
+            "which reads back as exactly what was stated"
+        );
+
+        let three = tempfile::tempdir().unwrap();
+        let three_path = harness_state_path(three.path());
+        assert!(
+            v3_writer(three.path())
+                .publish(Frame::new(
+                    Activity::Active,
+                    InputBuffer::Unknown,
+                    ConditionReport::Clear,
+                    HumanAsk::Unknown,
+                ))
+                .unwrap()
+                .landed()
+        );
+        assert_eq!(record_json(&three_path)["ask"]["kind"], "unknown");
+        assert_eq!(
+            read(&three_path, None).expect("a record").human_ask,
+            HumanAsk::Unknown
+        );
+
+        // A real pending ask whose KIND is unclassified is a different statement again, and it
+        // survives both projections without becoming an absence.
+        let pending = tempfile::tempdir().unwrap();
+        let pending_path = harness_state_path(pending.path());
+        assert!(
+            writer(pending.path())
+                .publish(Frame::new(
+                    Activity::Idle,
+                    InputBuffer::Empty,
+                    ConditionReport::Clear,
+                    HumanAsk::Pending(AskKind::Unknown),
+                ))
+                .unwrap()
+                .landed()
+        );
+        let record = record_json(&pending_path);
+        assert_eq!(record["blockedOn"], "human");
+        assert_eq!(record["ask"], "none");
+        assert_eq!(
+            read(&pending_path, None).expect("a record").human_ask,
+            HumanAsk::Pending(AskKind::Unknown)
+        );
+
+        let tagged = tempfile::tempdir().unwrap();
+        let tagged_path = harness_state_path(tagged.path());
+        assert!(
+            v3_writer(tagged.path())
+                .publish(Frame::new(
+                    Activity::Idle,
+                    InputBuffer::Empty,
+                    ConditionReport::Clear,
+                    HumanAsk::Pending(AskKind::Unknown),
+                ))
+                .unwrap()
+                .landed()
+        );
+        let record = record_json(&tagged_path);
+        assert_eq!(record["ask"]["kind"], "pending");
+        assert_eq!(record["ask"]["ask"], "unknown");
+        assert_eq!(
+            read(&tagged_path, None).expect("a record").human_ask,
+            HumanAsk::Pending(AskKind::Unknown)
+        );
+    }
+
+    /// A fault is not a state change. A condition-only write restates the activity axis verbatim,
+    /// so `sinceMs` — when that state was ENTERED — must survive it, while the transition counter
+    /// still advances because the bytes changed. And it must restate the RECORD's pty session:
+    /// the caller is typically a hook process with no pty of its own, and stamping its own empty
+    /// fence would strip a live record's only liveness evidence and flip the seat to `unknown`
+    /// for every same-host reader.
+    #[test]
+    fn a_condition_only_write_keeps_the_activity_clock_and_the_records_own_pty_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let now_ms = crate::message::now_ms();
+        let token = session_token();
+        let mut wrapper = v3_writer(tmp.path()).with_session(token.clone());
+        wrapper.publish(v3_active(ConditionReport::Clear)).unwrap();
+        let observed = record_json(&path);
+        assert_eq!(observed["ptySession"], "worker");
+
+        // The hook process: same session, no pty of its own.
+        let mut hook = Writer::new(tmp.path(), FIXTURE_AGENT_ID, "codex", None)
+            .with_emitted_schema(SCHEMA_V3)
+            .with_session(token);
+        assert!(hook.raise_fault(quota_fault(now_ms)).unwrap().landed());
+        let faulted = record_json(&path);
+        assert_eq!(
+            faulted["sinceMs"], observed["sinceMs"],
+            "the activity did not change, so its clock did not restart"
+        );
+        assert_eq!(
+            faulted["transitions"].as_u64(),
+            observed["transitions"].as_u64().map(|count| count + 1),
+            "but the bytes did, so the counter advanced"
+        );
+        assert!(faulted["writtenAtMs"].as_u64() > observed["writtenAtMs"].as_u64());
+        assert_eq!(
+            faulted["ptySession"], "worker",
+            "the authoritative fence is restated, never replaced by the caller's absence"
+        );
+        assert_eq!(faulted["state"], "active");
+        let read_back = read(&path, None).expect("a record");
+        assert_eq!(
+            read_back.state,
+            Activity::Active,
+            "so the seat stays definite instead of deriving unknown"
+        );
+        assert!(read_back.condition.fault().is_some());
+
+        // The same holds for the clears.
+        assert!(hook.clear_fault(quota_key()).unwrap().landed());
+        let cleared = record_json(&path);
+        assert_eq!(cleared["sinceMs"], observed["sinceMs"]);
+        assert_eq!(cleared["ptySession"], "worker");
+
+        // And a LIVE record that names no fence is not something a condition operation may write
+        // back: an unfenced live state reads `unknown` for every same-host reader.
+        let unfenced = tempfile::tempdir().unwrap();
+        let unfenced_path = harness_state_path(unfenced.path());
+        let orphan = session_token();
+        let raw = format!(
+            r#"{{"schema":"{SCHEMA_V3}","agent":"{FIXTURE_AGENT_ID}","harness":"codex","state":"active","inputBuffer":"empty","condition":{{"kind":"clear"}},"ask":{{"kind":"none"}},"incarnation":"{orphan}","seq":1,"sinceMs":1,"writtenAtMs":{now_ms},"transitions":1}}"#
+        );
+        fs::write(&unfenced_path, &raw).unwrap();
+        let mut fenceless = Writer::new(unfenced.path(), FIXTURE_AGENT_ID, "codex", None)
+            .with_emitted_schema(SCHEMA_V3)
+            .with_ownership(orphan, 1);
+        assert_eq!(
+            fenceless.raise_fault(quota_fault(now_ms)).unwrap(),
+            WriteOutcome::Refused(Refusal::Unfenced)
+        );
+        assert_eq!(fs::read(&unfenced_path).unwrap(), raw.into_bytes());
+    }
+
+    /// Wrapperless eligibility decodes BOTH writable shapes. A hooks-only session must be able to
+    /// claim a version 3 record for exactly the reasons it can claim a version 2 one — otherwise,
+    /// after the writer cutover, every record would look like undecodable bytes and no wrapperless
+    /// session could ever claim again. Decided as a pure function so the version 3 arm is provable
+    /// while this build's own writer is still version 2.
+    #[test]
+    fn wrapperless_eligibility_decodes_version_three_records_too() {
+        let now_ms = crate::message::now_ms();
+        let planted = tempfile::tempdir().unwrap();
+        let planted_path = harness_state_path(planted.path());
+        let v3 = |incarnation: &str, state: &str, exit: &str, written_at_ms: u64| {
+            let raw = format!(
+                r#"{{"schema":"{SCHEMA_V3}","agent":"{FIXTURE_AGENT_ID}","harness":"claude","state":"{state}","inputBuffer":"unknown","condition":{{"kind":"clear"}},"ask":{{"kind":"none"}}{exit},"ptySession":"worker","incarnation":"{incarnation}","seq":2,"sinceMs":1,"writtenAtMs":{written_at_ms},"transitions":1}}"#
+            );
+            fs::write(&planted_path, &raw).unwrap();
+            let current = read_current(&planted_path);
+            assert!(
+                matches!(current, CurrentRecord::V3(_)),
+                "the fixture must decode as a version 3 record: {raw}"
+            );
+            current
+        };
+
+        // A live WRAPPER record is never claimable, whichever version states it.
+        assert!(!wrapperless_eligible(
+            SCHEMA_V3,
+            &v3("wrapper-1", "active", "", now_ms),
+            now_ms
+        ));
+        // A fellow wrapperless token is.
+        assert!(wrapperless_eligible(
+            SCHEMA_V3,
+            &v3(
+                &format!("{WRAPPERLESS_PREFIX}abc"),
+                "active",
+                "",
+                now_ms
+            ),
+            now_ms
+        ));
+        // So is a real terminal record, and so is an abandoned one past the horizon.
+        assert!(wrapperless_eligible(
+            SCHEMA_V3,
+            &v3("wrapper-1", "ended", r#","exit":"exit 0""#, now_ms),
+            now_ms
+        ));
+        assert!(wrapperless_eligible(
+            SCHEMA_V3,
+            &v3(
+                "wrapper-1",
+                "active",
+                "",
+                now_ms - duration_ms(HARNESS_STATE_STALE) - 1
+            ),
+            now_ms
+        ));
+        // The one-way schema fence still holds: this build's version 2 writer has no eligible
+        // takeover of a version 3 record, however orphaned it looks.
+        assert!(!wrapperless_eligible(
+            SCHEMA_V2,
+            &v3(
+                &format!("{WRAPPERLESS_PREFIX}abc"),
+                "active",
+                "",
+                now_ms
+            ),
+            now_ms
+        ));
+        // Absence is claimable; undecodable bytes are not.
+        assert!(wrapperless_eligible(
+            SCHEMA_V3,
+            &CurrentRecord::Absent,
+            now_ms
+        ));
+        assert!(!wrapperless_eligible(
+            SCHEMA_V3,
+            &CurrentRecord::Unreadable,
+            now_ms
+        ));
+        // And the legacy path is unchanged: the live wrapper record this build writes stays
+        // unclaimable and its terminal one stays claimable.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = harness_state_path(tmp.path());
+        let mut wrapper = writer(tmp.path());
+        wrapper.observe(active()).unwrap();
+        assert!(!wrapperless_eligible(
+            SCHEMA,
+            &read_current(&path),
+            now_ms
+        ));
+        wrapper.ended("exit 0").unwrap();
+        assert!(wrapperless_eligible(SCHEMA, &read_current(&path), now_ms));
     }
 }
