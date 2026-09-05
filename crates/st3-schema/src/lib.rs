@@ -27,6 +27,7 @@ pub enum ValueType {
 pub enum WritePolicy {
     SystemOnly,
     SameSubjectActor,
+    AuthorizedParticipant,
     AuthorizedRequester,
     CapabilityHolder,
     OrdinaryClient,
@@ -51,6 +52,8 @@ pub struct FieldSpec {
     pub immutable: bool,
     #[serde(default)]
     pub reference: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_families: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -195,12 +198,46 @@ impl Registry {
                 format!("subject `{subject}` does not use a registered family"),
             )
         })?;
+        let suffix = subject
+            .strip_prefix(&format!("{}/", spec.family))
+            .unwrap_or_default();
+        if suffix.is_empty() || suffix.split('/').any(str::is_empty) {
+            return Err(error(
+                "invalid-claim-subject",
+                "a subject needs a non-empty path after its registered family",
+            ));
+        }
         if spec.family == "custom" {
             let parts = subject.split('/').collect::<Vec<_>>();
             if parts.len() < 3 || !parts[1..].iter().all(|part| valid_identifier_part(part)) {
                 return Err(error(
                     "invalid-custom-subject",
                     "a custom subject must use custom/NAMESPACE/NAME",
+                ));
+            }
+        }
+        if spec.family == "file" {
+            let Some((host, path)) = suffix.split_once(':') else {
+                return Err(error(
+                    "invalid-file-subject",
+                    "a file subject must use file/HOST:/ABSOLUTE_PATH",
+                ));
+            };
+            let valid_host = host
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@')
+                });
+            if !valid_host
+                || !path.starts_with('/')
+                || path.contains("/../")
+                || path.ends_with("/..")
+            {
+                return Err(error(
+                    "invalid-file-subject",
+                    "a file subject must use file/HOST:/ABSOLUTE_PATH",
                 ));
             }
         }
@@ -270,6 +307,7 @@ impl Registry {
         for (name, value) in fields {
             if let Some(field) = spec.fields.get(name) {
                 validate_value(kind, name, value, field)?;
+                self.validate_reference(kind, name, value, field)?;
             }
         }
         Ok(spec)
@@ -304,9 +342,49 @@ impl Registry {
         for (name, value) in facts {
             if let Some(field) = spec.fields.get(name) {
                 validate_value(kind, name, value, field)?;
+                self.validate_reference(kind, name, value, field)?;
             }
         }
         Ok(spec)
+    }
+
+    fn validate_reference(
+        &self,
+        kind: &str,
+        name: &str,
+        value: &Value,
+        field: &FieldSpec,
+    ) -> Result<(), ValidationError> {
+        if !field.reference || value.is_null() {
+            return Ok(());
+        }
+        let reference = value.as_str().ok_or_else(|| {
+            error(
+                "invalid-claim-field",
+                format!("claim field `{name}` on `{kind}` must be a subject reference"),
+            )
+        })?;
+        let subject = self.validate_subject(reference).map_err(|_| {
+            error(
+                "invalid-subject-reference",
+                format!("claim field `{name}` on `{kind}` is not a valid subject reference"),
+            )
+        })?;
+        if !field.reference_families.is_empty()
+            && !field
+                .reference_families
+                .iter()
+                .any(|family| family == &subject.family)
+        {
+            return Err(error(
+                "invalid-subject-reference",
+                format!(
+                    "claim field `{name}` on `{kind}` requires a {} subject",
+                    field.reference_families.join(" or ")
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_public_claim(
@@ -349,10 +427,13 @@ fn field_summary(fields: &BTreeMap<String, FieldSpec>) -> String {
         .map(|(name, spec)| {
             let required = if spec.required { "!" } else { "" };
             let immutable = if spec.immutable { " immutable" } else { "" };
-            format!(
-                "`{name}{required}:{}{immutable}`",
-                enum_label(&spec.value_type)
-            )
+            let value_type = enum_label(&spec.value_type);
+            let value_type = if spec.reference_families.is_empty() {
+                value_type
+            } else {
+                format!("{value_type}({})", spec.reference_families.join("|"))
+            };
+            format!("`{name}{required}:{value_type}{immutable}`",)
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -423,6 +504,12 @@ fn validate_value(
 
 fn build_registry() -> Registry {
     let subjects = [
+        (
+            "account",
+            "account/NAME",
+            "An external provider account identity.",
+            false,
+        ),
         (
             "agent",
             "agent/RUN/LOCAL_ID",
@@ -678,6 +765,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
     let mut claims = BTreeMap::new();
     let definitions: &[ClaimDefinition<'_>] = &[
         (
+            "agent.account",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::StateTransition,
+            Some("agents"),
+            false,
+            &[],
+        ),
+        (
             "intent.desired",
             &["*"],
             WritePolicy::AuthorizedRequester,
@@ -788,7 +884,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.claimed",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::StateTransition,
             Some("work"),
             true,
@@ -797,7 +893,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.renewed",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Append,
             Some("work"),
             true,
@@ -806,7 +902,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.progress",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Append,
             Some("work"),
             true,
@@ -815,7 +911,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.submitted",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Once,
             Some("work"),
             true,
@@ -824,7 +920,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.failed",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Once,
             Some("work"),
             true,
@@ -833,7 +929,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "work.released",
             &["step-run"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Append,
             Some("work"),
             true,
@@ -865,6 +961,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("evals"),
             true,
             &[],
+        ),
+        (
+            "file.observed",
+            &["file"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("files"),
+            true,
+            &["gate"],
         ),
         (
             "resource.observed",
@@ -904,6 +1009,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "daemon.started",
+            &["daemon"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("daemons"),
+            true,
+            &[],
+        ),
+        (
+            "daemon.diagnostic",
             &["daemon"],
             WritePolicy::SystemOnly,
             Cardinality::Append,
@@ -967,7 +1081,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "runtime.reconcile-decision",
-            &["agent", "exec", "pty"],
+            &["agent", "exec", "pty", "schedule"],
             WritePolicy::SystemOnly,
             Cardinality::Append,
             Some("runtimes"),
@@ -1067,7 +1181,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "message.read",
             &["message"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::OncePerActor,
             Some("messages"),
             true,
@@ -1076,7 +1190,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "message.closed",
             &["message"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::OncePerActor,
             Some("messages"),
             true,
@@ -1094,7 +1208,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         (
             "planning-session.candidate-submitted",
             &["planning-session"],
-            WritePolicy::SameSubjectActor,
+            WritePolicy::AuthorizedParticipant,
             Cardinality::Append,
             Some("planning"),
             true,
@@ -1230,6 +1344,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
+        "agent.account" => &[("account", required_reference_to(&["account"]))],
         "intent.desired" => &[
             ("kind", string()),
             ("revision", string()),
@@ -1348,7 +1463,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("verdict", required_enum(&["pass", "fail", "error"])),
             ("reason", string()),
             ("operation", reference()),
-            ("request", reference()),
+            ("request", string()),
             ("gate", string()),
             ("baseline", boolean()),
             ("field", string()),
@@ -1361,10 +1476,23 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("reason", string()),
             ("residue", array()),
         ],
+        "file.observed" => &[
+            ("status", required_enum(&["observed", "unreadable"])),
+            ("path", required_string()),
+            ("content_hash", string()),
+            ("blob_hash", string()),
+            ("content", string()),
+            ("mode", integer()),
+            ("reason", string()),
+        ],
         "agent.presence" => &[
             (
                 "presence",
                 required_enum(&["available", "busy", "dnd", "offline"]),
+            ),
+            (
+                "reachability",
+                enumeration(&["reachable", "unreachable", "indeterminate"]),
             ),
             ("reason", string()),
         ],
@@ -1385,6 +1513,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                 required_enum(&["healthy", "unreachable", "stopped"]),
             ),
             ("reason", string()),
+            ("revision", string()),
+            ("next_check_unix_ms", string()),
         ],
         "subscription.state" => &[
             ("state", required_enum(&["pending", "active", "stopped"])),
@@ -1399,6 +1529,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("version", string()),
             ("schema", string()),
             ("schema_digest", string()),
+        ],
+        "daemon.diagnostic" => &[
+            ("severity", required_enum(&["warning", "error"])),
+            ("code", required_string()),
+            ("status", string()),
+            ("reason", required_string()),
         ],
         "transport.observed" => &[
             ("status", required_enum(&["up", "down", "unknown"])),
@@ -1670,11 +1806,24 @@ fn object() -> FieldSpec {
 fn string() -> FieldSpec {
     field(ValueType::String)
 }
+fn required_string() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..string()
+    }
+}
 fn reference() -> FieldSpec {
     FieldSpec {
         reference: true,
         value_type: ValueType::SubjectReference,
         ..field(ValueType::SubjectReference)
+    }
+}
+fn required_reference_to(families: &[&str]) -> FieldSpec {
+    FieldSpec {
+        required: true,
+        reference_families: families.iter().map(|family| (*family).into()).collect(),
+        ..reference()
     }
 }
 fn immutable_string() -> FieldSpec {
@@ -1708,6 +1857,7 @@ fn field(value_type: ValueType) -> FieldSpec {
         values: Vec::new(),
         immutable: false,
         reference: false,
+        reference_families: Vec::new(),
     }
 }
 
@@ -1748,12 +1898,281 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_the_final_claim_count_and_a_stable_digest() {
+    fn registry_matches_the_exact_manifests() {
         let registry = registry();
-        assert_eq!(registry.subjects.len(), 21);
-        assert_eq!(registry.claims.len(), 59);
+        assert_eq!(
+            registry
+                .subjects
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "account",
+                "agent",
+                "custom",
+                "daemon",
+                "doc",
+                "exec",
+                "file",
+                "gate-operation",
+                "host",
+                "message",
+                "observer",
+                "person",
+                "plan",
+                "plan-run",
+                "planning-session",
+                "pty",
+                "resource",
+                "revision-proposal",
+                "run-generation",
+                "schedule",
+                "step-run",
+                "subscription",
+            ]
+        );
+        assert_eq!(
+            registry
+                .resources
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "ci.run",
+                "human.review",
+                "vcs.commit",
+                "vcs.pull-request",
+                "vcs.ref",
+                "vcs.repository",
+            ]
+        );
+        assert_eq!(
+            registry
+                .claims
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "agent.account",
+                "agent.presence",
+                "daemon.diagnostic",
+                "daemon.started",
+                "doc.bound",
+                "eval.verdict",
+                "file.observed",
+                "gate.requested",
+                "gate.result",
+                "harness.context-clear.requested",
+                "harness.context-clear.result",
+                "harness.diagnostic",
+                "harness.observed",
+                "harness.usage",
+                "intent.desired",
+                "message.closed",
+                "message.delivered",
+                "message.read",
+                "message.sent",
+                "observer.observed",
+                "observer.state",
+                "plan-run.created",
+                "plan-run.state",
+                "plan.produced",
+                "plan.published",
+                "planning-session.approved",
+                "planning-session.cancelled",
+                "planning-session.candidate-submitted",
+                "planning-session.previewed",
+                "planning-session.revision-requested",
+                "planning-session.started",
+                "resource.observed",
+                "revision-proposal.applied",
+                "revision-proposal.approved",
+                "revision-proposal.cancelled",
+                "revision-proposal.created",
+                "run-generation.created",
+                "run-generation.state",
+                "run-generation.superseded",
+                "runtime.action.deadline-reached",
+                "runtime.action.failed",
+                "runtime.action.requested",
+                "runtime.action.succeeded",
+                "runtime.observed",
+                "runtime.reconcile-decision",
+                "runtime.restart-window-reset",
+                "schedule.occurrence-cancelled",
+                "schedule.occurrence-reached",
+                "schedule.occurrence-scheduled",
+                "step-run.carried",
+                "step-run.retried",
+                "step-run.state",
+                "subscription.state",
+                "terminal.input.requested",
+                "terminal.input.result",
+                "transport.observed",
+                "work.claimed",
+                "work.failed",
+                "work.progress",
+                "work.released",
+                "work.renewed",
+                "work.submitted",
+            ]
+        );
         assert_eq!(registry.digest().len(), 64);
         assert_eq!(registry.digest(), registry.digest());
+    }
+
+    #[test]
+    fn account_association_is_a_same_agent_state_transition() {
+        let fields = BTreeMap::from([(
+            "account".into(),
+            Value::String("account/claude/team-a".into()),
+        )]);
+        let spec = registry()
+            .validate_public_claim(
+                "agent/run/worker",
+                "agent.account",
+                &fields,
+                Some("agent/run/worker"),
+            )
+            .unwrap();
+        assert_eq!(spec.cardinality, Cardinality::StateTransition);
+        assert_eq!(spec.write_policy, WritePolicy::SameSubjectActor);
+
+        assert_eq!(
+            registry()
+                .validate_public_claim(
+                    "agent/run/worker",
+                    "agent.account",
+                    &fields,
+                    Some("agent/run/other"),
+                )
+                .unwrap_err()
+                .code,
+            "claim-write-forbidden"
+        );
+    }
+
+    #[test]
+    fn account_association_validates_reference_syntax_without_existence() {
+        let valid = BTreeMap::from([(
+            "account".into(),
+            Value::String("account/claude/missing-but-valid".into()),
+        )]);
+        registry()
+            .validate_claim("agent/run/worker", "agent.account", &valid)
+            .unwrap();
+
+        for invalid in ["resource/account", "account", "account//team-a"] {
+            let fields = BTreeMap::from([("account".into(), Value::String(invalid.into()))]);
+            assert_eq!(
+                registry()
+                    .validate_claim("agent/run/worker", "agent.account", &fields)
+                    .unwrap_err()
+                    .code,
+                "invalid-subject-reference"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_paths_and_file_subjects_are_strict() {
+        for invalid in [
+            "agent/",
+            "agent/run//worker",
+            "file/node/tmp/example",
+            "file/node:relative/path",
+            "file/:/tmp/example",
+            "file/node:/tmp/../example",
+        ] {
+            assert!(registry().validate_subject(invalid).is_err(), "{invalid}");
+        }
+        registry()
+            .validate_subject("file/node:/tmp/example")
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_emitter_shapes_match_the_registry() {
+        let cases = [
+            (
+                "agent/run/worker",
+                "agent.presence",
+                BTreeMap::from([
+                    ("presence".into(), Value::String("busy".into())),
+                    ("reachability".into(), Value::String("indeterminate".into())),
+                ]),
+            ),
+            (
+                "file/node:/tmp/result",
+                "file.observed",
+                BTreeMap::from([
+                    ("status".into(), Value::String("observed".into())),
+                    ("path".into(), Value::String("/tmp/result".into())),
+                    ("mode".into(), Value::from(0o644)),
+                ]),
+            ),
+            (
+                "daemon/node",
+                "daemon.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("reconcile-failed".into())),
+                    ("reason".into(), Value::String("the pass failed".into())),
+                ]),
+            ),
+            (
+                "schedule/run/reminder",
+                "runtime.reconcile-decision",
+                BTreeMap::from([("decision".into(), Value::String("raise".into()))]),
+            ),
+            (
+                "observer/run/watch",
+                "observer.state",
+                BTreeMap::from([
+                    ("state".into(), Value::String("unreachable".into())),
+                    ("revision".into(), Value::String("claim/revision".into())),
+                    ("next_check_unix_ms".into(), Value::String("1000".into())),
+                ]),
+            ),
+        ];
+        for (subject, kind, fields) in cases {
+            registry().validate_claim(subject, kind, &fields).unwrap();
+        }
+    }
+
+    #[test]
+    fn participant_claims_require_dedicated_operations() {
+        assert_eq!(
+            registry()
+                .claims
+                .values()
+                .filter(|claim| claim.write_policy == WritePolicy::AuthorizedParticipant)
+                .map(|claim| claim.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "message.closed",
+                "message.read",
+                "planning-session.candidate-submitted",
+                "work.claimed",
+                "work.failed",
+                "work.progress",
+                "work.released",
+                "work.renewed",
+                "work.submitted",
+            ]
+        );
+        assert_eq!(
+            registry()
+                .validate_public_claim(
+                    "message/example",
+                    "message.read",
+                    &BTreeMap::from([("status".into(), Value::String("read".into()))]),
+                    Some("agent/run/recipient"),
+                )
+                .unwrap_err()
+                .code,
+            "claim-write-forbidden"
+        );
     }
 
     #[test]

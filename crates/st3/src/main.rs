@@ -3987,7 +3987,10 @@ async fn run_quick(
                 {
                     ready = true;
                 }
-                if event.kind == "harness.diagnostic" || event.kind == "runtime.action.failed" {
+                if matches!(
+                    event.kind.as_str(),
+                    "harness.diagnostic" | "daemon.diagnostic" | "runtime.action.failed"
+                ) {
                     anyhow::bail!("{} became unreachable: {}", created.subject, event.body);
                 }
             }
@@ -4277,18 +4280,22 @@ fn prepare_native_driver_in(
     Ok((catalog, agent_dir, identity.clone(), identity))
 }
 
+fn harness_activity_state(activity: st2::harness_state::Activity) -> &'static str {
+    match activity {
+        st2::harness_state::Activity::Idle => "idle",
+        st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
+        st2::harness_state::Activity::Ended => "ended",
+        st2::harness_state::Activity::Unknown => "indeterminate",
+    }
+}
+
 async fn publish_harness_activity(
     client: &Client,
     subject: &str,
     driver: &str,
     observed: &st2::harness_state::Observed,
 ) -> Result<()> {
-    let status = match observed.state {
-        st2::harness_state::Activity::Idle => "idle",
-        st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
-        st2::harness_state::Activity::Ended => "exited",
-        st2::harness_state::Activity::Unknown => "indeterminate",
-    };
+    let status = harness_activity_state(observed.state);
     let fields = BTreeMap::from([
         ("state".into(), Value::String(status.into())),
         ("driver".into(), Value::String(driver.into())),
@@ -4568,12 +4575,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                     &st2::harness_state::harness_state_path(&agent_dir),
                     None,
                 ) {
-                    let status = match observed.state {
-                        st2::harness_state::Activity::Idle => "idle",
-                        st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
-                        st2::harness_state::Activity::Ended => "exited",
-                        st2::harness_state::Activity::Unknown => "indeterminate",
-                    };
+                    let status = harness_activity_state(observed.state);
                     let fields = BTreeMap::from([
                         ("state".into(), Value::String(status.into())),
                         ("driver".into(), Value::String("codex".into())),
@@ -5287,6 +5289,21 @@ mod tests {
         assert_eq!(parse_timeout("2m").unwrap(), Duration::from_secs(120));
         assert_eq!(parse_timeout("0").unwrap(), Duration::ZERO);
         assert!(parse_timeout("forever").is_err());
+    }
+
+    #[test]
+    fn an_ended_harness_uses_the_registered_state() {
+        assert_eq!(
+            harness_activity_state(st2::harness_state::Activity::Ended),
+            "ended"
+        );
+        st3_schema::registry()
+            .validate_claim(
+                "agent/run/worker",
+                "harness.observed",
+                &BTreeMap::from([("state".into(), Value::String("ended".into()))]),
+            )
+            .unwrap();
     }
 
     #[test]

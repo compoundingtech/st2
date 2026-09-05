@@ -282,9 +282,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.notify.notified().await;
             if let Err(error) = self.reconcile_once() {
                 let _ = self.record_once(
-                    "host/reconciler",
-                    "harness.diagnostic",
+                    &format!("daemon/{}", self.host),
+                    "daemon.diagnostic",
                     BTreeMap::from([
+                        ("severity".into(), Value::String("error".into())),
+                        ("code".into(), Value::String("reconcile-failed".into())),
                         ("status".into(), Value::String("unreachable".into())),
                         ("reason".into(), Value::String(error.to_string())),
                     ]),
@@ -307,9 +309,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .collect::<HashMap<_, _>>(),
             Err(error) => {
                 self.record_once(
-                    "host/runtime",
-                    "harness.diagnostic",
+                    &format!("daemon/{}", self.host),
+                    "daemon.diagnostic",
                     BTreeMap::from([
+                        ("severity".into(), Value::String("error".into())),
+                        (
+                            "code".into(),
+                            Value::String("runtime-snapshot-failed".into()),
+                        ),
                         ("status".into(), Value::String("indeterminate".into())),
                         ("reason".into(), Value::String(error.to_string())),
                     ]),
@@ -2478,13 +2485,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if let (Ok(reached), Some(template)) = (reached, template) {
                         let message_hash = hex::encode(sha2::Sha256::digest(operation.as_bytes()));
                         let message_subject = format!("message/schedule-{}", &message_hash[..20]);
+                        let from = canonical_message_party(&template.from);
+                        let to = canonical_message_party(&template.to);
                         let _ = store.append_claim(&ClaimInput {
                             subject: message_subject,
                             kind: "message.sent".into(),
                             actor: None,
                             fields: BTreeMap::from([
-                                ("from".into(), Value::String(template.from)),
-                                ("to".into(), Value::String(template.to)),
+                                ("from".into(), Value::String(from)),
+                                ("to".into(), Value::String(to)),
                                 ("content".into(), Value::String(template.content)),
                                 ("status".into(), Value::String("sent".into())),
                             ]),
@@ -2534,7 +2543,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .latest_actual_value(&observer.subject)?
                     .and_then(|actual| {
                         actual
-                            .get("status")
+                            .get("state")
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     })
@@ -2545,10 +2554,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         subject: observer.subject.clone(),
                         kind: "observer.state".into(),
                         actor: None,
-                        fields: BTreeMap::from([(
-                            "status".into(),
-                            Value::String("stopped".into()),
-                        )]),
+                        fields: BTreeMap::from([("state".into(), Value::String("stopped".into()))]),
                         evidence: Vec::new(),
                         expected_subject: None,
                         idempotency_key: None,
@@ -2650,7 +2656,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 kind: "observer.state".into(),
                                 actor: None,
                                 fields: BTreeMap::from([
-                                    ("status".into(), Value::String("unreachable".into())),
+                                    ("state".into(), Value::String("unreachable".into())),
                                     ("reason".into(), Value::String(error.to_string())),
                                     ("revision".into(), Value::String(revision.clone())),
                                     (
@@ -3389,12 +3395,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if let Some(mode) = mode {
                     fields.insert("mode".into(), Value::from(mode));
                 }
-                self.record_once(subject, "resource.observed", fields)?;
+                self.record_once(subject, "file.observed", fields)?;
             }
             Err(error) => {
                 self.record_once(
                     subject,
-                    "resource.observed",
+                    "file.observed",
                     BTreeMap::from([
                         ("status".into(), Value::String("unreadable".into())),
                         ("path".into(), Value::String(path.into())),
@@ -3780,6 +3786,16 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn canonical_message_party(value: &str) -> String {
+    if value == "requester" {
+        "person/requester".into()
+    } else if value.contains('/') {
+        value.into()
+    } else {
+        format!("agent/{value}")
+    }
 }
 
 fn prepend_executable_dir(
@@ -6214,12 +6230,14 @@ subgraph { stop "agent/node.worker" }"#,
         reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        let schedule_claims = store.claims_for("schedule/reminder", None).unwrap();
         assert_eq!(
-            store
-                .claims_for("schedule/reminder", Some("schedule.occurrence-reached"))
-                .unwrap()
-                .len(),
-            1
+            schedule_claims
+                .iter()
+                .filter(|claim| claim.kind == "schedule.occurrence-reached")
+                .count(),
+            1,
+            "{schedule_claims:#?}"
         );
         assert_eq!(store.messages(None, true).unwrap().len(), 1);
     }

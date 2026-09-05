@@ -321,7 +321,7 @@ fn parse_plan(
                         format!("plan `{id}` has an empty subgraph"),
                     ));
                 }
-                crate::graph::validate_deferred_environment(child)?;
+                crate::graph::validate_deferred_subgraph(child)?;
                 revision_owners.extend(direct_agent_owners(body, default_host)?);
                 revision_owners.sort();
                 revision_owners.dedup();
@@ -475,7 +475,7 @@ fn parse_step(
                         ));
                     }
                     let source = format!("version 2\n{child}\n");
-                    crate::graph::validate_deferred_environment(child)?;
+                    crate::graph::validate_deferred_subgraph(child)?;
                     revision_owners = direct_agent_owners(
                         child.children().expect("the subgraph body was checked"),
                         default_host,

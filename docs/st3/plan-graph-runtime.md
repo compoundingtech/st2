@@ -68,7 +68,7 @@ subgraph {
 
     produces {
       resource "plan-run/${ST_PLAN_RUN}/release-decision" {
-        kind "release.decision"
+        kind "custom.st3.release-decision"
         state "published"
       }
     }
@@ -93,7 +93,7 @@ subgraph {
       depends-on { step "start-team" completed }
       produces {
         resource "plan-run/${ST_PLAN_RUN}/inspection" {
-          kind "release.inspection"
+          kind "custom.st3.release-inspection"
           state "published"
         }
       }
@@ -339,7 +339,7 @@ A baseline is not historical storage by itself. The plan request or a prior clai
 ```kdl
 produces {
   resource "plan-run/${ST_PLAN_RUN}/artifact" {
-    kind "build.artifact"
+    kind "custom.st3.build-artifact"
     state "published"
   }
   message "plan-run/${ST_PLAN_RUN}/handoff" {

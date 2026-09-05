@@ -3431,7 +3431,7 @@ impl Store {
         if let Some(actor) = &input.actor {
             validate_actor(actor)?;
         }
-        let claim_spec = validate_claim_fields(input)?;
+        validate_claim_fields(input)?;
         let operation = claim_operation(input).map_err(internal)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((operation_id, request_digest)) = &operation
@@ -3485,7 +3485,6 @@ impl Store {
             }
         }
         let stored_fields = normalize_resource_observation(&transaction, input)?;
-        validate_claim_cardinality(&transaction, input, &claim_spec.cardinality)?;
         validate_message_transition(&transaction, input)?;
         let predecessor = latest_claim_id_tx(&transaction, &input.subject).map_err(internal)?;
         let predecessors = predecessor.into_iter().collect::<Vec<_>>();
@@ -3511,7 +3510,7 @@ impl Store {
             &predecessors,
             None,
         )
-        .map_err(internal)?;
+        .map_err(claim_append_error)?;
         if operation.is_some() {
             register_operation_tx(&transaction, &record).map_err(internal)?;
         }
@@ -4265,7 +4264,7 @@ impl Store {
                     "message.sent",
                     None,
                     &json!({"fields": {
-                        "from": "st3.resource-observer",
+                        "from": format!("daemon/{}", self.origin),
                         "to": subscription.to,
                         "title": format!("Resource changed: {resource}"),
                         "content": content,
@@ -4275,7 +4274,7 @@ impl Store {
                     &[],
                     Some(&batch_id),
                 )
-                .map_err(internal)?;
+                .map_err(claim_append_error)?;
                 message_subjects.push(message_subject);
             }
         }
@@ -5167,7 +5166,9 @@ fn validate_claim_fields(input: &ClaimInput) -> Result<&'static st3_schema::Clai
 
 fn validate_claim_cardinality(
     transaction: &Transaction<'_>,
-    input: &ClaimInput,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
     cardinality: &st3_schema::Cardinality,
 ) -> Result<(), St3Error> {
     let duplicate = match cardinality {
@@ -5175,7 +5176,7 @@ fn validate_claim_cardinality(
         st3_schema::Cardinality::Once => transaction
             .query_row(
                 "SELECT 1 FROM claims WHERE subject=?1 AND kind=?2 LIMIT 1",
-                params![input.subject, input.kind],
+                params![subject, kind],
                 |_| Ok(()),
             )
             .optional()
@@ -5184,7 +5185,7 @@ fn validate_claim_cardinality(
         st3_schema::Cardinality::OncePerActor => transaction
             .query_row(
                 "SELECT 1 FROM claims WHERE subject=?1 AND kind=?2 AND actor IS ?3 LIMIT 1",
-                params![input.subject, input.kind, input.actor],
+                params![subject, kind, actor],
                 |_| Ok(()),
             )
             .optional()
@@ -5196,7 +5197,7 @@ fn validate_claim_cardinality(
             "claim-cardinality",
             format!(
                 "claim kind `{}` already exists at its allowed cardinality for `{}`",
-                input.kind, input.subject
+                kind, subject
             ),
         ));
     }
@@ -5753,9 +5754,11 @@ fn append_claim_tx(
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
     let fields = schema_fields_for_body(kind, body)?;
-    st3_schema::registry()
+    let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
         .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+    validate_claim_cardinality(transaction, subject, kind, actor, &claim_spec.cardinality)
+        .map_err(anyhow::Error::new)?;
     let now = now_ms();
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
@@ -6148,6 +6151,13 @@ fn now_ms() -> u128 {
 
 fn internal(error: impl std::fmt::Display) -> St3Error {
     St3Error::new("internal", error.to_string())
+}
+
+fn claim_append_error(error: anyhow::Error) -> St3Error {
+    match error.downcast::<St3Error>() {
+        Ok(error) => error,
+        Err(error) => internal(error),
+    }
 }
 
 fn collect_referenced_blobs(
@@ -10568,7 +10578,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
-                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
                 100,
                 &subscriptions,
             )
@@ -10598,7 +10612,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
-                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
                 200,
                 &subscriptions,
             )
@@ -10611,7 +10629,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
-                &json!({"head": "a", "state": "closed", "checks": ["pending"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "closed",
+                    "checks": ["pending"]
+                }),
                 300,
                 &subscriptions,
             )
@@ -10624,7 +10646,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
-                &json!({"head": "a", "state": "closed", "checks": ["pending"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "closed",
+                    "checks": ["pending"]
+                }),
                 300,
                 &subscriptions,
             )
@@ -10655,7 +10681,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-after-stop"),
-                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["pending"]
+                }),
                 350,
                 &subscriptions,
             )
@@ -10668,7 +10698,11 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-three"),
-                &json!({"head": "a", "state": "open", "checks": ["passing"]}),
+                &json!({
+                    "head": "resource/github/acme/demo/ref/a",
+                    "state": "open",
+                    "checks": ["passing"]
+                }),
                 400,
                 &subscriptions,
             )
@@ -10778,6 +10812,44 @@ subgraph {
     }
 
     #[test]
+    fn an_agent_can_change_its_account_without_account_existence_coupling() {
+        let store = Store::open_memory("node").unwrap();
+        let association = |account: &str, actor: &str| ClaimInput {
+            subject: "agent/run/worker".into(),
+            kind: "agent.account".into(),
+            actor: Some(actor.into()),
+            fields: BTreeMap::from([("account".into(), Value::String(account.into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+
+        store
+            .append_client_claim(&association(
+                "account/claude/not-declared",
+                "agent/run/worker",
+            ))
+            .unwrap();
+        store
+            .append_client_claim(&association("account/claude/team-a", "agent/run/worker"))
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_actual_value("agent/run/worker")
+                .unwrap()
+                .unwrap()["account"],
+            "account/claude/team-a"
+        );
+        assert_eq!(
+            store
+                .append_client_claim(&association("account/claude/team-b", "agent/run/other",))
+                .unwrap_err()
+                .code,
+            "claim-write-forbidden"
+        );
+    }
+
+    #[test]
     fn once_cardinality_rejects_a_second_local_claim() {
         let store = Store::open_memory("node").unwrap();
         let request = ClaimInput {
@@ -10793,6 +10865,40 @@ subgraph {
         assert_eq!(
             store.append_claim(&request).unwrap_err().code,
             "claim-cardinality"
+        );
+    }
+
+    #[test]
+    fn replicated_once_claims_preserve_concurrent_history() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        for (store, verdict) in [(&left, "pass"), (&right, "fail")] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "plan-run/shared-eval".into(),
+                    kind: "eval.verdict".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("verdict".into(), Value::String(verdict.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("left", &left.export_replication(0).unwrap())
+            .unwrap();
+        target
+            .import_replication("right", &right.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            target
+                .claims_for("plan-run/shared-eval", Some("eval.verdict"))
+                .unwrap()
+                .len(),
+            2
         );
     }
 

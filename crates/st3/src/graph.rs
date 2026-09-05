@@ -11,6 +11,7 @@ use crate::model::{
 };
 
 const ROOT_NODES: &[&str] = &[
+    "account",
     "agent",
     "exec",
     "pty",
@@ -200,6 +201,12 @@ fn parse_desired_node(
         return Err(St3Error::new(
             "runtime-outside-plan",
             format!("`{kind}` must be inside a plan or step subgraph"),
+        ));
+    }
+    if kind == "account" && context.owner_run.is_some() {
+        return Err(St3Error::new(
+            "account-inside-plan",
+            "an account declaration must be at the root",
         ));
     }
     match kind {
@@ -541,6 +548,7 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     let name = first_string(node)?;
     validate_name(&name, false)?;
     match kind {
+        "account" => validate_account(node)?,
         "doc" => validate_doc(node)?,
         "resource" => validate_resource(node)?,
         "observer" => validate_observer(node)?,
@@ -583,6 +591,30 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
             &name,
         )?;
         context.document_refs.insert(format!("doc/{name}@{hash}"));
+    }
+    Ok(())
+}
+
+fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    one_string_with_children(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-account-body", "an account needs a body"))?;
+    reject_unknown_children(
+        body,
+        &["provider", "external-account", "auth-type"],
+        "account",
+        "account",
+    )?;
+    required_child_string(body, "provider", "account")?;
+    required_child_string(body, "external-account", "account")?;
+    let auth = required_child_string(body, "auth-type", "account")?;
+    if !matches!(auth.as_str(), "subscription" | "api-key") {
+        return Err(St3Error::new(
+            "invalid-auth-type",
+            format!("invalid account auth type `{auth}`"),
+        ));
     }
     Ok(())
 }
@@ -2016,13 +2048,19 @@ fn validate_string_map(node: &KdlNode, environment: bool) -> Result<(), St3Error
     Ok(())
 }
 
-pub(crate) fn validate_deferred_environment(node: &KdlNode) -> Result<(), St3Error> {
+pub(crate) fn validate_deferred_subgraph(node: &KdlNode) -> Result<(), St3Error> {
+    if node.name().value() == "account" {
+        return Err(St3Error::new(
+            "account-inside-plan",
+            "an account declaration must be at the root",
+        ));
+    }
     if node.name().value() == "env" {
         validate_string_map(node, true)?;
     }
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            validate_deferred_environment(child)?;
+            validate_deferred_subgraph(child)?;
         }
     }
     Ok(())
@@ -2911,6 +2949,63 @@ mod tests {
         let error = parse_intent("version 2\nagent \"worker\" { command \"true\" }", "host")
             .expect_err("old KDL must fail");
         assert_eq!(error.code, "invalid-root");
+    }
+
+    #[test]
+    fn account_declarations_are_root_only_and_strict() {
+        let source = r#"
+version 2
+subgraph {
+  account "claude/team-a" {
+    provider "anthropic"
+    external-account "team-a"
+    auth-type "subscription"
+  }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        assert!(intent.subjects.contains_key("account/claude/team-a"));
+
+        let nested = parse_execution_intent(source, "node", "run-1")
+            .expect_err("a plan run cannot own an account");
+        assert_eq!(nested.code, "account-inside-plan");
+
+        let deferred = r#"
+version 2
+subgraph {
+  plan "bad" state="ready" {
+    goal "Reject nested accounts."
+    step "work" {
+      subgraph {
+        account "claude/team-a" {
+          provider "anthropic"
+          external-account "team-a"
+          auth-type "subscription"
+        }
+      }
+    }
+  }
+}
+"#;
+        assert_eq!(
+            parse_intent(deferred, "node").unwrap_err().code,
+            "account-inside-plan"
+        );
+
+        let invalid_auth = source.replace("subscription", "session-cookie");
+        assert_eq!(
+            parse_intent(&invalid_auth, "node").unwrap_err().code,
+            "invalid-auth-type"
+        );
+
+        let unknown_field = source.replace(
+            "    auth-type \"subscription\"",
+            "    auth-type \"subscription\"\n    quota \"100\"",
+        );
+        assert_eq!(
+            parse_intent(&unknown_field, "node").unwrap_err().code,
+            "unknown-child"
+        );
     }
 
     #[test]

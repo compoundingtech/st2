@@ -180,13 +180,31 @@ Providers can use webhooks, streams, or conditional requests with one-shot deadl
 
 ### Accounts
 
-`account/NAME` is an observed subject in the st3 design. An agent records its selected account with an `agent.account` claim.
+An account is a root graph identity for an external provider account.
 
-The account contract still needs claims and facts for usage windows, used percentages, reset times, observation freshness, and provider status.
+```kdl
+account "claude/team-a" {
+  provider "anthropic"
+  external-account "team-a"
+  auth-type "subscription"
+}
+```
 
-The authoritative schema registry currently omits the existing account family and its claims. A later account design iteration must reconcile this omission.
+The declaration creates `account/claude/team-a`. The supported authentication types are `subscription` and `api-key`.
 
-An external tool will observe usage and send alerts until st3 implements account-driven changes.
+An account is not plan-owned. A plan or step subgraph cannot declare one.
+
+An agent records its selected account with an `agent.account` state transition. The agent must write its own association.
+
+```sh
+st3 claim agent/RUN/worker agent.account \
+  --actor agent/RUN/worker \
+  --field account=account/claude/team-a
+```
+
+The account reference must have valid `account/` syntax. The referenced account can arrive later.
+
+This contract records identity and association only. It does not define quota, usage, rotation, alerts, adapters, or automatic behavior.
 
 ## System boundary
 
@@ -211,7 +229,7 @@ st3 and st2 do not share a live control loop. They can share an existing PTY reg
 
 Every st3 intent starts with `version 2` and contains exactly one untyped `subgraph` root.
 
-The root can contain plan definitions, durable resources, people, documents, messages, and plan-run cancellation.
+The root can contain accounts, plan definitions, durable resources, people, documents, messages, and plan-run cancellation.
 
 An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` must occur in a plan or step subgraph.
 
@@ -382,6 +400,7 @@ The daemon exports the same registry through `/v1/schema`. The CLI exposes it th
 
 Important plan and gate kinds include:
 
+- `agent.account`;
 - `plan.published` and `plan.produced`;
 - `plan-run.created` and `plan-run.state`;
 - `run-generation.created`, `run-generation.superseded`, and `run-generation.state`;
@@ -391,6 +410,15 @@ Important plan and gate kinds include:
 - `planning-session.started`, `planning-session.candidate-submitted`, and `planning-session.previewed`;
 - `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`;
 - `observer.observed`, `observer.state`, `resource.observed`, and `subscription.state`.
+- `file.observed`, `daemon.started`, and `daemon.diagnostic`.
+
+The registry pins the exact subject, resource, and claim manifests. A registry change must update the generated schema document.
+
+A subject-reference field validates its subject syntax. It does not require the referenced subject to exist.
+
+Every local writer uses the same field and cardinality checks. A replicated concurrent claim stays in history so reducers can report its conflict.
+
+The `authorized-participant` policy requires a dedicated operation to verify participation. The generic claim endpoint cannot grant that authority.
 
 An unknown replicated claim remains in history and makes its subject indeterminate. A node does not silently interpret an unknown kind.
 
