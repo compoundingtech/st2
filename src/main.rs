@@ -592,6 +592,43 @@ enum CatalogCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Move retired, runtime-free identities out of the live catalog into `.st2/archive`, leaving a
+    /// tombstone row in `st2 catalog graph --json`. An archived spec is not discoverable.
+    Archive {
+        /// Identity to archive, repeatable. Every named identity must be eligible or nothing moves.
+        #[arg(
+            long,
+            value_name = "IDENTITY",
+            required_unless_present = "all_retired",
+            conflicts_with = "all_retired"
+        )]
+        identity: Vec<String>,
+        /// Archive every eligible retired identity of the selected host. Ineligible ones are
+        /// reported and skipped.
+        #[arg(long)]
+        all_retired: bool,
+        /// Host whose identities are archived. Defaults to this host; another host's runtime
+        /// records are not observable from here, so only the local host is eligible.
+        #[arg(long)]
+        host: Option<String>,
+        /// Decide eligibility and print the plan without moving anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit the typed archive receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move one archived identity back into the live catalog. The exact reverse of `archive`.
+    Unarchive {
+        /// Archived identity to restore.
+        identity: String,
+        /// Host the identity was archived under. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit the typed restoration receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Shared context for message subcommands: where the catalog is, who "I" am, and the local host.
@@ -1464,6 +1501,61 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                     },
                     result.after_sha256
                 );
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Archive {
+            identity,
+            all_retired,
+            host,
+            dry_run,
+            json,
+        }) => {
+            let selection = if all_retired {
+                st2::catalog_archive::Selection::AllRetired
+            } else {
+                st2::catalog_archive::Selection::Identities(identity)
+            };
+            let result = st2::catalog_archive::archive(st2::catalog_archive::ArchiveRequest {
+                catalog: catalog_arg(None)?,
+                host: host.unwrap_or_else(detect_host),
+                selection,
+                dry_run,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let verb = if result.dry_run {
+                    "would-archive"
+                } else {
+                    "archived"
+                };
+                for entry in &result.archived {
+                    println!("{verb} {} {} -> {}", entry.id, entry.from, entry.to);
+                }
+                for refusal in &result.refused {
+                    println!(
+                        "skipped {} [{}] {}",
+                        refusal.id, refusal.code, refusal.message
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Catalog(CatalogCmd::Unarchive {
+            identity,
+            host,
+            json,
+        }) => {
+            let result = st2::catalog_archive::unarchive(st2::catalog_archive::UnarchiveRequest {
+                catalog: catalog_arg(None)?,
+                host: host.unwrap_or_else(detect_host),
+                identity,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("unarchived {} {} -> {}", result.id, result.from, result.to);
             }
             Ok(())
         }

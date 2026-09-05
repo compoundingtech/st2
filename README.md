@@ -197,6 +197,31 @@ resumes without the original prepared source. Snapshots own the complete
 bounded `_templates` library and empty canonical per-agent `.workspace`
 directory facts, but never traverse, hash, copy, or delete workspace content.
 
+A retired declaration is runtime teardown only: it keeps its spec and `resources/` byte-identical
+and stays reversible, so a long-lived catalog accumulates retired identities. Archival is the
+pressure valve that keeps the live plane bounded:
+
+```sh
+st2 catalog archive --catalog "$CATALOG" --all-retired --dry-run --json
+st2 catalog archive --catalog "$CATALOG" --identity <identity> --json
+st2 catalog unarchive --catalog "$CATALOG" <identity> --json
+```
+
+Archival moves the whole identity directory from `agents/<host>/<identity>` to
+`.st2/archive/<host>/<identity>` under the exclusive catalog-authoring lock, in one generation
+commit, as a same-filesystem rename — the archive root is a child of the catalog root, so no bytes
+are copied and no partial bundle can exist. `.st2` is control space at any depth, so an archived
+declaration is undiscoverable rather than filtered, and the whole-catalog transaction never projects
+it. A tombstone beside the moved directory keeps the identity traceable as one `archived` row in
+`st2 catalog graph --json`.
+
+Eligibility fails closed against the local host only, because another host's runtime records are not
+observable from here: the declaration must sit at its canonical path, be retired in either spelling,
+have no live or dead record for any declared task (the rule `st2 doctor` already applies to
+retirement), and be named as `supervisor` by no declaration that stays behind. `--identity` refuses
+the whole run if any named identity is ineligible; `--all-retired` reports the ineligible ones and
+archives the rest. `st2 catalog unarchive` is the exact reverse move.
+
 The compact declaration shape is:
 
 ```kdl
@@ -622,7 +647,7 @@ message, ding, agents, status, context, resource, rename, describe
 env, pty, shell, pretrust
 hooks, service, claude-channel, eval
 agent digest, agent publish
-catalog bootstrap, catalog snapshot, catalog apply
+catalog bootstrap, catalog snapshot, catalog apply, catalog archive, catalog unarchive
 completions
 ```
 
