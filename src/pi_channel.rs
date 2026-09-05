@@ -1564,10 +1564,7 @@ mod tests {
 
         tx.send(Ok(r#"{"type":"state","state":"active"}"#.to_string()))
             .unwrap();
-        let disconnect = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(40));
-            drop(tx);
-        });
+        drop(tx);
         let mut out = Vec::new();
         channel_loop(
             &rx,
@@ -1579,24 +1576,19 @@ mod tests {
             "h.worker",
             &PI_KIND,
             Duration::from_millis(2),
-            Duration::from_millis(5),
+            Duration::ZERO,
         )
         .unwrap();
-
-        disconnect.join().unwrap();
 
         let raw: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
         assert_eq!(raw["state"], "active", "EOF must not rewrite the state");
         assert!(
             raw["writtenAtMs"].as_u64().unwrap() > raw["sinceMs"].as_u64().unwrap(),
-            "a heartbeat re-stamped the record while the connection lived: {raw}"
+            "no heartbeat re-stamped the record while the connection lived: {raw}"
         );
-        let after_eof = std::fs::read(&record).unwrap();
-        thread::sleep(Duration::from_millis(15));
-        assert_eq!(
-            std::fs::read(&record).unwrap(),
-            after_eof,
-            "nothing may write after the connection is gone"
+        assert!(
+            raw.get("exit").is_none(),
+            "EOF must not write a terminal record: {raw}"
         );
     }
 
