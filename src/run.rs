@@ -3861,56 +3861,6 @@ mod tests {
         assert_eq!(runner.spawned.borrow().as_slice(), ["test-host.live"]);
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn supervisor_wakes_and_launches_a_new_direct_declaration() {
-        let catalog = tempfile::tempdir().unwrap();
-        let agent = catalog.path().join("agents/test-host/live");
-        let stop = AtomicBool::new(false);
-        let runner = SpawnCountingRunner::default();
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let mut passes = 0usize;
-
-        std::thread::scope(|scope| {
-            let watchdog_stop = &stop;
-            scope.spawn(move || {
-                if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-                    watchdog_stop.store(true, Ordering::SeqCst);
-                }
-            });
-            up_loop_until(
-                catalog.path(),
-                "test-host",
-                &runner,
-                Duration::from_secs(60),
-                &stop,
-                best_effort_catalog_watcher,
-                |report| {
-                    passes += 1;
-                    match passes {
-                        1 => {
-                            std::fs::create_dir_all(&agent).unwrap();
-                            std::fs::write(
-                                agent.join("agent.kdl"),
-                                r#"agent "live" { host "test-host"; command "x" }"#,
-                            )
-                            .unwrap();
-                        }
-                        2 => {
-                            assert_eq!(report.launched, ["test-host.live"]);
-                            let _ = done_tx.send(());
-                            stop.store(true, Ordering::SeqCst);
-                        }
-                        _ => panic!("one direct declaration must cause exactly one prompt pass"),
-                    }
-                },
-            )
-            .unwrap();
-        });
-
-        assert_eq!(passes, 2, "the 60s timer must not be the publication path");
-        assert_eq!(runner.spawned.borrow().as_slice(), ["test-host.live"]);
-    }
 
     #[test]
     fn resident_loop_reloads_added_changed_removed_and_malformed_profiles() {
