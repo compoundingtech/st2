@@ -57,6 +57,16 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R40 Prompt catalog convergence:** A resident catalog supervisor begins a
+  new serialized reconciliation pass promptly after a supported declaration
+  publication becomes durably visible; it does not normally wait for the
+  periodic full-audit interval. Transactional st2 writers and authorized direct
+  atomic declaration replacement remain independent wake sources, so
+  degradation of one source does not disable the other. Accepted events
+  coalesce without concurrent passes. The periodic timer remains the
+  correctness fallback for event loss, unavailable platform watchers, and
+  unsupported direct filesystem mutation, and each degraded wake source emits
+  an operator-visible diagnostic.
 - **R31 Reachable restart bounds:** Within one supervisor run, restart
   accounting is per task and only successful launches spend the declared
   budget. `delay` is the minimum launch spacing in either mode. In delay mode,
