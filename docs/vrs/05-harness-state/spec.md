@@ -465,30 +465,36 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude and Codex publish exactly one of those stages — `providerAuth` — from
-their own typed turn-failure signal, and nothing else: every earlier boundary
-is already fail-closed at admission for them (an incompatible Codex protocol
-refuses the launch rather than degrading into an observation, and st2 gates no
-Claude version at all). Both edges come from the signal that ends a turn, so
-neither driver reads provider prose:
+Claude, Codex, and omp publish exactly one of those stages — `providerAuth` —
+from their own typed turn-failure signal, and nothing else: every earlier
+boundary is already fail-closed at admission for them (an incompatible Codex
+protocol refuses the launch rather than degrading into an observation, an
+unadmitted omp MINOR refuses it too under OMP-R05, and st2 gates no Claude
+version at all). Every edge comes from the signal that ends a turn, so no
+driver reads provider prose to decide this:
 
 | Driver | Rejection | Recovery | `producerVersion` / `support` |
 | --- | --- | --- | --- |
 | Claude | `StopFailure` hook with `error: authentication_failed` — Claude's own name for every 401/403 provider response, fired *instead of* `Stop` | the next `Stop`, i.e. a turn that reached its ordinary end | omitted / `unknown` — a hook payload names no version and st2 gates none |
 | Codex | `turn/completed` with `turn.status: failed` and `turn.error.codexErrorInfo: unauthorized` | `turn/completed` with `turn.status: completed` | the version the protocol gate admitted / `supported` |
+| omp | a `type: "turn"` channel frame whose error carries omp's own `errorId` classification with `AuthFailed` set and `UsageLimit`, `AccountPolicy`, and `Transient` clear | a `type: "turn"` frame with no error, i.e. an `agent_end` whose last assistant message did not stop on an error | omitted / `unknown` — the wrapper, not the channel, owns the version gate |
 
-Neither driver borrows the word for a neighbouring class: Claude's
-`rate_limit`, `overloaded`, `oauth_org_not_allowed`, `account_on_hold` and
-`billing_error`, and Codex's `usageLimitExceeded` and `rateLimitExceeded`, are
-capacity, policy, or account state that a re-login cannot fix. Claude's
-`StopFailure` still writes `idle` with reason `apiError` for them — the turn
-did end — and Codex keeps its `systemError` terminal. The Codex startup gate
-pins `unauthorized` and both quota words present in `CodexErrorInfo`, so a
-release that merged them refuses the launch instead of letting st2 report an
-exhausted allowance as a rejected credential. Because Claude and Codex publish
-only on rejection, an absent record is their healthy steady state and Doctor
-advises nothing for it; OpenCode, which resolves its version gate on every
-launch, still advises on absence.
+No driver borrows the word for a neighbouring class: Claude's `rate_limit`,
+`overloaded`, `oauth_org_not_allowed`, `account_on_hold` and `billing_error`,
+Codex's `usageLimitExceeded` and `rateLimitExceeded`, and omp's `UsageLimit`,
+`AccountPolicy` and `Transient` flags are capacity, policy, or account state
+that a re-login cannot fix. Claude's `StopFailure` still writes `idle` with
+reason `apiError` for them — the turn did end — Codex keeps its `systemError`
+terminal, and omp's frame still writes `active` with omp's own bounded prose,
+which is the only place a reader learns that a 403 was about credits. The Codex
+startup gate pins `unauthorized` and both quota words present in
+`CodexErrorInfo`, so a release that merged them refuses the launch instead of
+letting st2 report an exhausted allowance as a rejected credential; omp needs no
+such gate because its flags are separate bits that cannot merge, but it does
+need the `Class` bit checked, because an unclassified `errorId` is a bare HTTP
+status. Because these three publish only on rejection, an absent record is their
+healthy steady state and Doctor advises nothing for it; OpenCode, which resolves
+its version gate on every launch, still advises on absence.
 
 The roster projection always has one fixed shape. `failure` fills every
 evidence field; `absent` and `indeterminate` preserve the same keys with null

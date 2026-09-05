@@ -81,18 +81,20 @@ pub enum Driver {
     OpenCode,
     Claude,
     Codex,
+    Omp,
     #[serde(other)]
     Unknown,
 }
 
 impl Driver {
-    pub const ALL: [Self; 3] = [Self::OpenCode, Self::Claude, Self::Codex];
+    pub const ALL: [Self; 4] = [Self::OpenCode, Self::Claude, Self::Codex, Self::Omp];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Omp => "omp",
             Self::Unknown => "unknown",
         }
     }
@@ -403,7 +405,12 @@ pub fn path(agent_dir: &Path) -> PathBuf {
 pub fn expected_for(spec: &crate::AgentSpec) -> bool {
     matches!(
         spec.driver.as_ref(),
-        Some(crate::Driver::OpenCode(_) | crate::Driver::Claude(_) | crate::Driver::Codex(_))
+        Some(
+            crate::Driver::OpenCode(_)
+                | crate::Driver::Claude(_)
+                | crate::Driver::Codex(_)
+                | crate::Driver::Omp(_)
+        )
     )
 }
 
@@ -411,9 +418,9 @@ pub fn expected_for(spec: &crate::AgentSpec) -> bool {
 ///
 /// Only a driver that publishes a boundary result on EVERY launch can be missing one: OpenCode's
 /// version gate publishes or clears before the provider spawns, so absence there means the native
-/// driver never ran. Claude and Codex publish this record only when the provider's own typed turn
-/// result names a rejected credential, so absence is their healthy steady state and advising on it
-/// would put a warning under every seat in the fleet.
+/// driver never ran. Claude, Codex, and omp publish this record only when the provider's own typed
+/// turn result names a rejected credential, so absence is their healthy steady state and advising
+/// on it would put a warning under every seat in the fleet.
 pub fn absence_is_a_fault(spec: &crate::AgentSpec) -> bool {
     matches!(spec.driver.as_ref(), Some(crate::Driver::OpenCode(_)))
 }
@@ -718,9 +725,10 @@ mod tests {
         );
     }
 
-    /// The credential boundary is the one record a Claude hook or a Codex control pump writes, so
-    /// its wire pairing is pinned on its own: a rejection is evidence only when it came from the
-    /// harness's typed turn result, and only on the stage whose repair text says "re-login".
+    /// The credential boundary is the one record a Claude hook, a Codex control pump, or an omp
+    /// channel writes, so its wire pairing is pinned on its own: a rejection is evidence only when
+    /// it came from the harness's typed turn result, and only on the stage whose repair text says
+    /// "re-login".
     #[test]
     fn a_credential_rejection_is_evidence_only_from_a_typed_turn_result() {
         let valid = br#"{
@@ -750,10 +758,15 @@ mod tests {
             Observed::Indeterminate(InvalidReason::UnknownVocabulary),
             "the credential reason belongs to exactly one stage"
         );
-        let Observed::Failure(codex) = read_at(&valid.replace(b"\"claude\"", b"\"codex\""), 100) else {
-            panic!("codex is an admitted driver word")
-        };
-        assert_eq!(codex.driver, Driver::Codex);
+        for (word, driver) in [
+            (&b"\"codex\""[..], Driver::Codex),
+            (b"\"omp\"", Driver::Omp),
+        ] {
+            let Observed::Failure(other) = read_at(&valid.replace(b"\"claude\"", word), 100) else {
+                panic!("{driver:?} is an admitted driver word")
+            };
+            assert_eq!(other.driver, driver);
+        }
     }
 
     /// Projection order is load-bearing: a rejected credential is the CAUSE of the delivery and
