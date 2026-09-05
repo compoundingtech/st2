@@ -201,6 +201,9 @@ fn tasks_cli_emits_stable_complete_generation_without_mutation() {
     assert_eq!(value["complete"], true);
     assert_eq!(value["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(value["tasks"][0]["agent"], "h.worker");
+    // The route travels beside the ID on the wire. For this unmigrated declaration the two are
+    // the same bytes; the point is that they are two fields with two meanings.
+    assert_eq!(value["tasks"][0]["busAddress"], "h.worker");
     assert_eq!(value["tasks"][0]["task"], "agent");
     assert_eq!(value["tasks"][0]["runtimeId"], "h.worker");
     assert_eq!(value["tasks"][0]["desiredState"], "running");
@@ -330,6 +333,9 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
         .unwrap()
         .to_string();
     snapshot(&prepared_b);
+    // The B state only has to be a *different* admitted catalog: `catalog apply` validates fully,
+    // and retiring the host's sole agent would leave it with no counted root, refusing the apply
+    // for a reason that has nothing to do with the ABA this test is about.
     let b_spec = prepared_b.join("agents/h/worker/agent.kdl");
     let bytes = fs::read_to_string(&b_spec)
         .unwrap()
@@ -363,6 +369,8 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
         std::thread::yield_now();
     }
 
+    // `catalog apply` binds the exact prepared input it was handed, so the fixture computes that
+    // digest from the same transaction hash domain rather than restating a literal.
     let apply = |prepared: &Path, expected: &str| {
         let input_sha256 = st2::catalog_transaction::digest_prepared(&catalog, prepared)
             .unwrap()
@@ -500,8 +508,9 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
             }
         } else {
             for args in [
-                vec!["rename", "h.worker", "temporary", "--host", "h"],
-                vec!["rename", "h.worker", "--clear", "--host", "h"],
+                // `rename` takes the subject by exact immutable ID, never by a route.
+                vec!["rename", "--id", "h.worker", "temporary", "--host", "h"],
+                vec!["rename", "--id", "h.worker", "--clear", "--host", "h"],
             ] {
                 let output = Command::new(env!("CARGO_BIN_EXE_st2"))
                     .arg("--catalog")

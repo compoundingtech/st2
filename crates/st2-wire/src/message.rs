@@ -71,6 +71,32 @@ pub enum SentCoverage {
     Partial { since: u64, pending: usize },
 }
 
+/// Which kind of bus endpoint a durable message field names.
+///
+/// This is what stops a reader from mistaking a canonical service-principal or external route for
+/// an agent ID. An `agent` endpoint carries an immutable agent ID; every other kind carries that
+/// endpoint's own canonical address. Absent on a version-1 row, which means `agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointKind {
+    /// A declared Agent. The endpoint value is its catalog-global immutable agent ID.
+    Agent,
+    /// A declared service principal. The endpoint value is its canonical `<host>.<identity>` route.
+    Principal,
+    /// An eval-owned external requester mailbox. The endpoint value is its canonical route.
+    External,
+}
+
+impl EndpointKind {
+    /// The meaning of an absent `fromKind`/`toKind`: a version-1 row only ever carried agents.
+    pub const fn or_version_1_default(kind: Option<Self>) -> Self {
+        match kind {
+            Some(kind) => kind,
+            None => Self::Agent,
+        }
+    }
+}
+
 /// One sender-owned message row. The sender is the selected index owner; `to` is the directional
 /// field that varies between rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +118,15 @@ pub struct SentMessageRow {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// The recipient's bus address at publication time.
+    ///
+    /// Display only, and only meaningful for an `agent` endpoint: an address is mutable and a
+    /// released address is immediately reusable, so this is never a selector and never authority.
+    #[serde(rename = "toAddress", default, skip_serializing_if = "Option::is_none")]
+    pub to_address: Option<String>,
+    /// Whether `to` is an agent ID or a canonical non-Agent address. Absent means `agent`.
+    #[serde(rename = "toKind", default, skip_serializing_if = "Option::is_none")]
+    pub to_kind: Option<EndpointKind>,
 }
 
 /// The stable `st2 message sent --json` envelope.
@@ -258,11 +293,68 @@ mod tests {
                 priority: None,
                 idempotency_key: None,
                 body: None,
+                to_address: None,
+                to_kind: None,
             }],
         };
         let json = serde_json::to_value(indexed).unwrap();
         assert_eq!(json["messages"][0]["to"], "h.recipient");
         assert!(json["messages"][0].get("from").is_none());
         assert!(json["messages"][0].get("body").is_none());
+    }
+
+    /// A row emitted before typed endpoints existed carries neither key, and must still be read as
+    /// an agent endpoint — never as an unknown or non-Agent one.
+    #[test]
+    fn a_version_1_sent_row_without_to_kind_decodes_as_an_agent_endpoint() {
+        let json = r#"{"filename":"1785000000000-abcdef.md","ts":1785000000000,
+            "to":"h.recipient","subject":null,"inReplyTo":null,"tags":[],"priority":null}"#;
+        let row = serde_json::from_str::<SentMessageRow>(json).expect("a version-1 row parses");
+        assert_eq!(row.to_kind, None);
+        assert_eq!(row.to_address, None);
+        assert_eq!(
+            EndpointKind::or_version_1_default(row.to_kind),
+            EndpointKind::Agent
+        );
+        // Absent stays absent on re-emission: a reader must not invent a kind it was not told.
+        let reemitted = serde_json::to_value(&row).unwrap();
+        assert!(reemitted.get("toKind").is_none());
+        assert!(reemitted.get("toAddress").is_none());
+    }
+
+    /// A typed non-Agent endpoint keeps its canonical address in `to` and says so, so no reader
+    /// can mistake that address for an agent ID.
+    #[test]
+    fn a_typed_non_agent_sent_row_round_trips_its_kind_and_snapshot() {
+        let row = SentMessageRow {
+            filename: "1785000000000-abcdef.md".to_string(),
+            ts: 1_785_000_000_000,
+            to: "h.billing".to_string(),
+            subject: None,
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            body: None,
+            to_address: None,
+            to_kind: Some(EndpointKind::Principal),
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["toKind"], "principal");
+        assert_eq!(serde_json::from_value::<SentMessageRow>(json).unwrap(), row);
+
+        let agent = SentMessageRow {
+            to: "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".to_string(),
+            to_address: Some("dev4.fractal.chat".to_string()),
+            to_kind: Some(EndpointKind::Agent),
+            ..row
+        };
+        let json = serde_json::to_value(&agent).unwrap();
+        assert_eq!(json["toKind"], "agent");
+        assert_eq!(json["toAddress"], "dev4.fractal.chat");
+        assert_eq!(
+            serde_json::from_value::<SentMessageRow>(json).unwrap(),
+            agent
+        );
     }
 }

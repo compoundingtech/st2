@@ -90,7 +90,10 @@ pub enum EventReceiptStatus {
     Deduplicated,
 }
 
+#[derive(Debug)]
 struct ResolvedStream {
+    /// The recipient's immutable agent ID. Stream state, the derived companion runtime ID, and
+    /// event provenance are all ownership, so all three key on this and never on a route.
     recipient: String,
 }
 
@@ -302,7 +305,7 @@ pub(crate) fn refusal_kind(error: &anyhow::Error) -> Option<RefusalKind> {
 fn resolve_stream(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &crate::AgentSelector,
     stream: &str,
     admission: StreamAdmission,
 ) -> anyhow::Result<ResolvedStream> {
@@ -317,42 +320,55 @@ fn resolve_stream(
             .collect::<Vec<_>>()
             .join("; ")
     );
-    let mut matches = discovered
+    let input = recipient.as_input();
+    let book = crate::spec::address_book(&discovered.specs, this_host)?;
+    let subject = match book.resolve(recipient) {
+        Ok(subject) => subject,
+        // Both ambiguities are decided by the address book, which names every candidate. Neither
+        // can become admissible by retrying: a duplicated catalog-global ID is a broken catalog,
+        // and an ambiguous route is a reference that names more than one subject. Publishing into
+        // whichever one sorted first would silently pick a recipient.
+        Err(
+            error @ (crate::ResolveError::AmbiguousAddress { .. }
+            | crate::ResolveError::AmbiguousId { .. }),
+        ) => {
+            return Err(StreamRefusal::new(
+                RefusalKind::Permanent,
+                format!("agent recipient '{input}' is ambiguous: {error}"),
+            ));
+        }
+        Err(_) => anyhow::bail!("no agent '{input}' found in catalog {}", root.display()),
+    };
+    let agent_id = subject.id.as_str().to_owned();
+    // Back-mapping the resolved subject to its declaration proves ID uniqueness for BOTH selector
+    // kinds. Only `resolve_id` refuses `AmbiguousId` above; `resolve_address` dedups its
+    // candidates BY agent ID, so an address naming one of two subjects that share an ID resolves
+    // cleanly to a single Subject and a first-match scan would publish into — and host-check —
+    // whichever declaration discovery ordered first.
+    let mut declarations = discovered
         .specs
-        .into_iter()
-        .filter(|spec| {
-            spec.bus_id(this_host) == recipient
-                || (spec.resolved_host(this_host) == this_host && spec.identity == recipient)
-        })
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        !matches.is_empty(),
-        "no agent '{recipient}' found in catalog {}",
-        root.display()
-    );
-    if matches.len() > 1 {
+        .iter()
+        .filter(|spec| spec.agent_id(this_host) == agent_id);
+    let spec = declarations
+        .next()
+        .context("resolved subject has no declaration")?;
+    if let Some(duplicate) = declarations.next() {
         return Err(StreamRefusal::new(
             RefusalKind::Permanent,
             format!(
-                "agent recipient '{recipient}' is ambiguous; matched {} declarations: {}",
-                matches.len(),
-                matches
-                    .iter()
-                    .map(|spec| spec.path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "agent id '{agent_id}' is declared by more than one subject ({}, {}); refusing to \
+                 guess which declaration owns this stream",
+                spec.path.display(),
+                duplicate.path.display()
             ),
         ));
     }
-    let spec = matches
-        .pop()
-        .context("exactly one matching agent expected")?;
     if spec.resolved_host(this_host) != this_host {
         return Err(StreamRefusal::new(
             RefusalKind::Permanent,
             format!(
                 "agent '{}' is owned by host '{}'; event publication must run on that host",
-                spec.bus_id(this_host),
+                spec.bus_address(this_host),
                 spec.resolved_host(this_host)
             ),
         ));
@@ -364,7 +380,7 @@ fn resolve_stream(
                     RefusalKind::Permanent,
                     format!(
                         "agent '{}' does not declare stream '{stream}'",
-                        spec.bus_id(this_host)
+                        spec.bus_address(this_host)
                     ),
                 ));
             }
@@ -379,13 +395,13 @@ fn resolve_stream(
             RefusalKind::RecipientNotRunning,
             format!(
                 "agent '{}' is {}; refusing event while its eyes are closed",
-                spec.bus_id(this_host),
+                spec.bus_address(this_host),
                 spec.desired_state.as_str()
             ),
         ));
     }
     Ok(ResolvedStream {
-        recipient: spec.bus_id(this_host),
+        recipient: agent_id,
     })
 }
 
@@ -415,11 +431,16 @@ pub fn render_event(
     rendered
 }
 
+/// Publish one declared stream event.
+///
+/// `recipient` is typed, never a raw string: a CLI positional is an ordinary ADDRESS and an
+/// explicit `--id` is an EXACT ID, and wrapping an unresolved human reference in
+/// `AgentSelector::id` to satisfy this signature would make every migrated subject unreachable.
 #[allow(clippy::too_many_arguments)]
 pub fn emit(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &crate::AgentSelector,
     stream: &str,
     event_id: &str,
     key: Option<&str>,
@@ -441,6 +462,8 @@ pub fn emit(
     )
 }
 
+/// The supervisor-only built-in resync admission. `recipient` here is genuinely an exact agent ID:
+/// it comes from the watch set's own subscription key, not from anything a human typed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_builtin_resync(
     root: &Path,
@@ -455,7 +478,7 @@ pub(crate) fn emit_builtin_resync(
     emit_admitted(
         root,
         this_host,
-        recipient,
+        &crate::AgentSelector::id(recipient),
         crate::resync::RESYNC_STREAM,
         event_id,
         key,
@@ -470,7 +493,7 @@ pub(crate) fn emit_builtin_resync(
 fn emit_admitted(
     root: &Path,
     this_host: &str,
-    recipient: &str,
+    recipient: &crate::AgentSelector,
     stream: &str,
     event_id: &str,
     key: Option<&str>,
@@ -1189,5 +1212,122 @@ impl Drop for StreamLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentSelector;
+
+    fn declare(root: &Path, directory: &str, body: &str) {
+        let dir = root.join(directory);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent.kdl"), body).unwrap();
+    }
+
+    /// A migrated subject: immutable ID `worker-uuid`, mutable route `h.chat`.
+    fn migrated_catalog() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        declare(
+            temp.path(),
+            "h/worker",
+            "agent \"worker\" {\n  identity \"worker\"\n  id \"worker-uuid\"\n  address \"chat\"\n  host \"h\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+        );
+        temp
+    }
+
+    /// Decision 2's anti-pattern: the CLI positional is an ordinary ADDRESS. Wrapping it in
+    /// `AgentSelector::id` made every migrated subject unreachable by the only name a person has
+    /// for it, while an exact ID must still never fall through to address lookup.
+    #[test]
+    fn stream_ingress_resolves_an_address_and_keeps_the_id_namespace_disjoint() {
+        let temp = migrated_catalog();
+        let root = temp.path();
+
+        for reference in ["chat", "h.chat"] {
+            let resolved = resolve_stream(
+                root,
+                "h",
+                &AgentSelector::address(reference),
+                "gh-ci",
+                StreamAdmission::Declared,
+            )
+            .unwrap_or_else(|error| panic!("address {reference:?} must resolve: {error:#}"));
+            assert_eq!(
+                resolved.recipient, "worker-uuid",
+                "stream state keys on the immutable ID, never the route"
+            );
+        }
+
+        let by_id = resolve_stream(
+            root,
+            "h",
+            &AgentSelector::id("worker-uuid"),
+            "gh-ci",
+            StreamAdmission::Declared,
+        )
+        .unwrap();
+        assert_eq!(by_id.recipient, "worker-uuid");
+
+        assert!(
+            resolve_stream(
+                root,
+                "h",
+                &AgentSelector::id("chat"),
+                "gh-ci",
+                StreamAdmission::Declared,
+            )
+            .is_err(),
+            "an exact-ID selector must not fall through to address lookup"
+        );
+    }
+
+    /// A refusal a person reads names the bus ADDRESS, because that is how they reach the agent.
+    #[test]
+    fn a_stream_refusal_names_the_bus_address_not_the_immutable_id() {
+        let temp = tempfile::tempdir().unwrap();
+        declare(
+            temp.path(),
+            "h/worker",
+            "agent \"worker\" {\n  identity \"worker\"\n  id \"worker-uuid\"\n  address \"chat\"\n  host \"h\"\n  command \"agent\"\n}\n",
+        );
+        let error = resolve_stream(
+            temp.path(),
+            "h",
+            &AgentSelector::address("chat"),
+            "gh-ci",
+            StreamAdmission::Declared,
+        )
+        .expect_err("an undeclared stream is refused");
+        let rendered = format!("{error}");
+        assert!(rendered.contains("h.chat"), "{rendered}");
+        assert!(!rendered.contains("worker-uuid"), "{rendered}");
+        assert_eq!(refusal_kind(&error), Some(RefusalKind::Permanent));
+    }
+
+    /// A catalog-global ID claimed by two declarations is a broken catalog, not a winner-takes-all
+    /// lookup: publishing into whichever sorted first would silently pick a recipient.
+    #[test]
+    fn a_duplicate_agent_id_is_a_permanent_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        for directory in ["h/plain", "h/twin"] {
+            declare(
+                temp.path(),
+                directory,
+                "agent \"plain\" {\n  identity \"plain\"\n  host \"h\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+            );
+        }
+        let error = resolve_stream(
+            temp.path(),
+            "h",
+            &AgentSelector::id("h.plain"),
+            "gh-ci",
+            StreamAdmission::Declared,
+        )
+        .expect_err("a duplicated agent id cannot name one recipient");
+        assert!(format!("{error}").contains("ambiguous"), "{error:#}");
+        assert_eq!(refusal_kind(&error), Some(RefusalKind::Permanent));
     }
 }

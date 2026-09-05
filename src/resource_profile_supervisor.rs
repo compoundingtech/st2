@@ -172,7 +172,9 @@ impl ResourceProfileSupervisor {
 
     /// Fence one agent before its canonical seat is replaced. Completion is synchronous.
     pub fn deactivate(&self, spec: &AgentSpec) {
-        let recipient = spec.bus_id(&self.this_host);
+        // The fence targets the durable observation, which is keyed by immutable agent ID: an
+        // address cutover must not re-key an active Resource observation.
+        let recipient = spec.agent_id(&self.this_host);
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         if self
             .tx
@@ -478,7 +480,7 @@ fn desired_bindings(
                 warnings.push(format!(
                     "Resource Profile '{}' binding {} resource '{}': {error}",
                     scheme,
-                    spec.bus_id(this_host),
+                    spec.bus_address(this_host),
                     resource.name()
                 ));
                 continue;
@@ -489,7 +491,7 @@ fn desired_bindings(
                     warnings.push(format!(
                         "Resource Profile '{}' binding {} resource '{}': resolver returned no carrier",
                         scheme,
-                        spec.bus_id(this_host),
+                        spec.bus_address(this_host),
                         resource.name()
                     ));
                     continue;
@@ -498,7 +500,7 @@ fn desired_bindings(
                     warnings.push(format!(
                         "Resource Profile '{}' binding {} resource '{}': {error}",
                         scheme,
-                        spec.bus_id(this_host),
+                        spec.bus_address(this_host),
                         resource.name()
                     ));
                     continue;
@@ -510,13 +512,16 @@ fn desired_bindings(
                     warnings.push(format!(
                         "Resource Profile '{}' binding {} resource '{}': {error}",
                         scheme,
-                        spec.bus_id(this_host),
+                        spec.bus_address(this_host),
                         resource.name()
                     ));
                     continue;
                 }
             };
-            let recipient = spec.bus_id(this_host);
+            // The stable key is the agent ID, so a rename or an address cutover keeps one
+            // observation rather than starting a second beside it. The warnings above name the
+            // bus address instead: they are read by a person who has to go and reach the agent.
+            let recipient = spec.agent_id(this_host);
             let stable_key = format!("{recipient}\0{}", resource.name());
             desired.insert(
                 stable_key.clone(),

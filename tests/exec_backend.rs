@@ -16,7 +16,8 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
     TaskTarget {
         kind: TaskKind::Exec,
         pty_id: id.to_string(),
-        bus_id: "hetz.demo".to_string(),
+        agent_id: "hetz.demo".to_string(),
+        bus_address: "hetz.demo".to_string(),
         name: "ding".to_string(),
         derived: false,
         launch: TaskLaunch::Shell(command.to_string()),

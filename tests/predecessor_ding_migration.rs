@@ -435,7 +435,7 @@ fn predecessor_drains_only_legacy_ding_then_candidate_adopts_provider_and_replac
         [
             "/usr/bin/sh",
             "-c",
-            "st2 ding --identity h.provider --root $ST_ROOT"
+            "st2 ding --id h.provider --root $ST_ROOT"
         ],
         "candidate launched a non-canonical derived Ding command"
     );
@@ -516,9 +516,10 @@ fn assert_migration_catalog_safe(catalog: &Path, expected_ids: &[&str]) -> Resul
             ));
         }
         let task = &spec.tasks[0];
-        let bus = spec.bus_id(HOST);
-        let expected_id = format!("{bus}.ding");
-        let expected_command = format!("st2 ding --identity {bus} --root $ST_ROOT");
+        // The derived Ding companion is keyed by the immutable agent ID, never by a route.
+        let agent_id = spec.agent_id(HOST);
+        let expected_id = format!("{agent_id}.ding");
+        let expected_command = format!("st2 ding --id {agent_id} --root $ST_ROOT");
         if task.kind != TaskKind::Exec
             || !task.derived
             || task.name != "ding"

@@ -418,7 +418,10 @@ fn spec(
     tasks: Vec<Task>,
 ) -> AgentSpec {
     AgentSpec {
+        // An unmigrated legacy declaration: no explicit `id`, no explicit `address`.
+        id: None,
         identity: identity.to_string(),
+        address: None,
         name: None,
         description: None,
         host: host.map(String::from),
@@ -638,11 +641,13 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
     assert_eq!(
         primary.tags,
         BTreeMap::from([
-            ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+            ("agent.presentation.schema".to_owned(), Some("2".to_owned())),
+            ("agent.actor.id".to_owned(), Some("hetz.worker".to_owned())),
             (
-                "agent.actor.path".to_owned(),
+                "agent.actor.address".to_owned(),
                 Some("hetz.worker".to_owned())
             ),
+            ("agent.actor.path".to_owned(), None),
             (
                 "agent.presentation.description".to_owned(),
                 Some("Owns build delivery".to_owned()),
@@ -659,11 +664,13 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
     assert_eq!(
         secondary.tags,
         BTreeMap::from([
-            ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
+            ("agent.presentation.schema".to_owned(), Some("2".to_owned())),
+            ("agent.actor.id".to_owned(), Some("hetz.worker".to_owned())),
             (
-                "agent.actor.path".to_owned(),
-                Some("hetz.worker".to_owned()),
+                "agent.actor.address".to_owned(),
+                Some("hetz.worker".to_owned())
             ),
+            ("agent.actor.path".to_owned(), None),
             (
                 "agent.presentation.description".to_owned(),
                 Some("Owns build delivery".to_owned()),
@@ -709,8 +716,9 @@ fn live_pty_presentation_only_queues_observed_drift() {
     owner.description = Some("Owns build delivery".to_owned());
     let specs = [owner];
     let exact_tags = BTreeMap::from([
-        ("agent.presentation.schema".to_owned(), "1".to_owned()),
-        ("agent.actor.path".to_owned(), "hetz.worker".to_owned()),
+        ("agent.presentation.schema".to_owned(), "2".to_owned()),
+        ("agent.actor.id".to_owned(), "hetz.worker".to_owned()),
+        ("agent.actor.address".to_owned(), "hetz.worker".to_owned()),
         (
             "agent.presentation.description".to_owned(),
             "Owns build delivery".to_owned(),
@@ -969,7 +977,7 @@ fn generated_ding_only_job_is_unrunnable_and_does_not_launch() {
         TaskKind::Exec,
         "ding",
         Some("hetz.nr.ding"),
-        Some("st2 ding --identity hetz.nr --root $ST_ROOT"),
+        Some("st2 ding --id hetz.nr --root $ST_ROOT"),
     );
     ding.derived = true;
     let specs = vec![svc("nr", Some(HOST), vec![ding])];
@@ -985,7 +993,7 @@ fn generated_ding_launches_alongside_authored_work() {
         TaskKind::Exec,
         "ding",
         Some("hetz.runnable.ding"),
-        Some("st2 ding --identity hetz.runnable --root $ST_ROOT"),
+        Some("st2 ding --id hetz.runnable --root $ST_ROOT"),
     );
     ding.derived = true;
     let specs = vec![svc("runnable", Some(HOST), vec![agent, ding])];

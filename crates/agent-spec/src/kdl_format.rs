@@ -71,6 +71,37 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
 
     for child in &node.children {
         match child.name.as_str() {
+            "id" => {
+                anyhow::ensure!(raw.id.is_none(), "agent declares `id` more than once");
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `id` must contain exactly one positional string"
+                );
+                raw.id = Some(
+                    arg_string(child)
+                        .ok_or_else(|| anyhow::anyhow!("agent `id` value must be a string"))?,
+                );
+            }
+            "address" => {
+                anyhow::ensure!(
+                    raw.address.is_none(),
+                    "agent declares `address` more than once"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `address` must contain exactly one positional string"
+                );
+                raw.address = Some(
+                    arg_string(child)
+                        .ok_or_else(|| anyhow::anyhow!("agent `address` value must be a string"))?,
+                );
+            }
             "identity" => raw.identity = arg_string(child).or(raw.identity),
             "name" => parse_presentation(child, "name", &mut raw.name)?,
             "description" => parse_presentation(child, "description", &mut raw.description)?,

@@ -17,10 +17,41 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog_lock::CatalogLock;
 use crate::catalog_transaction::sync_dir;
+use crate::{AgentAddress, AgentId};
 
 const SCHEMA: &str = "st2.agent-publish.v2";
 const DIGEST_SCHEMA: &str = "st2.agent-source-digest.v1";
 const BUNDLE_DIGEST_DOMAIN: &[u8] = b"st2.agent-publish-bundle.v1\0";
+
+/// A classified publication refusal. `code` is stable for machine consumers.
+#[derive(Debug)]
+pub struct PublishRefusal {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl PublishRefusal {
+    fn new(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            code,
+            message: message.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for PublishRefusal {}
+
+/// A publication that would change an existing subject's immutable ID.
+pub const IMMUTABLE_AGENT_ID: &str = "immutable-agent-id";
+
+/// A creating publication that did not mint an explicit generated ID.
+pub const CREATION_REQUIRES_GENERATED_ID: &str = "creation-requires-generated-id";
 
 #[derive(Debug, Clone)]
 pub enum PublishSource {
@@ -56,7 +87,12 @@ pub struct PublishResult {
     pub policy_profile: &'static str,
     pub agent_spec_revision: &'static str,
     pub status: PublishStatus,
-    pub bus_id: String,
+    /// The published subject's catalog-global immutable ID: the ownership key every automation,
+    /// durable edge, and task ID uses.
+    pub agent_id: String,
+    /// How a human reaches the published subject right now, or `None` for a retired subject that
+    /// released its address.
+    pub bus_address: Option<String>,
     pub path: PathBuf,
     pub input_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,7 +112,15 @@ struct Candidate {
     kind: CandidateKind,
     bytes: Vec<u8>,
     host: String,
+    /// The positional declaration key. Also the legacy address fallback — never the ID.
     identity: String,
+    /// Explicit `id` as declared. `None` is an unmigrated legacy candidate whose ID is its frozen
+    /// legacy bus identity.
+    id: Option<AgentId>,
+    /// Explicit `address` as declared. `None` falls back to `identity`.
+    address: Option<AgentAddress>,
+    /// Whether ordinary address routing may reach the candidate once published.
+    routable: bool,
     input_sha256: String,
 }
 
@@ -199,11 +243,22 @@ impl Candidate {
             .context("candidate must declare a non-empty explicit identity")?;
         validate_component("host", host)?;
         validate_component("identity", identity)?;
+        // Lower the already strictly parsed candidate so `id`, `address`, and desired state come
+        // from the one canonical Agent Spec lowering rather than a second hand-rolled reader.
+        let (specs, _) = agent_spec::discover_file(stage.path(), &spec_path)
+            .context("lower the candidate Agent Spec")?;
+        let spec = match specs.as_slice() {
+            [spec] => spec,
+            _ => anyhow::bail!("candidate must lower to exactly one Agent Spec"),
+        };
         let input_sha256 = match kind {
             CandidateKind::Spec => sha256(&bytes),
             CandidateKind::Bundle => bundle_sha256(stage.path())?,
         };
         Ok(Self {
+            id: spec.id.clone(),
+            address: spec.address.clone(),
+            routable: !spec.desired_state.is_retired(),
             stage,
             kind,
             bytes,
@@ -213,9 +268,76 @@ impl Candidate {
         })
     }
 
-    fn bus_id(&self) -> String {
-        format!("{}.{}", self.host, self.identity)
+    /// The positional declaration key `<host>.<identity>`.
+    fn legacy_bus_identity(&self) -> String {
+        agent_spec::legacy_bus_identity(&self.host, &self.identity)
     }
+
+    /// The catalog-global immutable ID this publication claims.
+    fn agent_id(&self) -> String {
+        match &self.id {
+            Some(id) => id.as_str().to_owned(),
+            None => self.legacy_bus_identity(),
+        }
+    }
+
+    /// The human route the published subject answers on, or `None` once it is non-routable.
+    fn bus_address(&self) -> Option<String> {
+        let effective = match &self.address {
+            Some(address) => address.as_str(),
+            None => self.identity.as_str(),
+        };
+        self.routable
+            .then(|| agent_spec::bus_address(&self.host, effective))
+    }
+}
+
+/// Lower the incumbent declaration bytes under the lock and report the ID they own.
+///
+/// The bytes are staged at the same canonical placement they occupy in the live catalog, then read
+/// through exactly the Agent Spec lowering [`Candidate::stage_in`] uses, so this mints no second
+/// reader and no second precedence rule. An unmigrated incumbent yields its frozen legacy bus
+/// identity — the same value it will keep after migration.
+fn incumbent_agent_id(bytes: &[u8], host: &str, identity: &str) -> Result<String> {
+    let staging = tempfile::tempdir().context("create incumbent lowering staging root")?;
+    let directory = staging.path().join(host).join(identity);
+    fs::create_dir_all(&directory).context("stage the incumbent declaration directory")?;
+    let staged = directory.join("agent.kdl");
+    fs::write(&staged, bytes).context("stage the incumbent declaration")?;
+    let (specs, _) = agent_spec::discover_file(staging.path(), &staged)
+        .context("lower the incumbent Agent Spec")?;
+    match specs.as_slice() {
+        [spec] => Ok(spec.agent_id(host)),
+        [] => anyhow::bail!("the incumbent declaration lowers to no Agent Spec"),
+        many => anyhow::bail!(
+            "the incumbent declaration lowers to {} Agent Specs",
+            many.len()
+        ),
+    }
+}
+
+/// Whether `value` is a canonical lowercase hyphenated UUIDv7.
+///
+/// Creation mints a brand-new subject, and a brand-new subject's ID is generated, never derived
+/// from a route. Accepting a frozen-legacy-shaped ID here would let publication keep minting
+/// placement-shaped IDs forever, which is exactly what decision 0015 retires.
+fn is_canonical_uuid_v7(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        let expected_hyphen = matches!(index, 8 | 13 | 18 | 23);
+        let is_hyphen = *byte == b'-';
+        if expected_hyphen != is_hyphen {
+            return false;
+        }
+        if !is_hyphen && !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte) {
+            return false;
+        }
+    }
+    // Version 7 in the high nibble of octet 6, RFC 9562 variant `10xx` in octet 8.
+    bytes[14] == b'7' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
 pub fn digest_source(source: PublishSource) -> Result<SourceDigest> {
@@ -347,6 +469,47 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         }
     }
 
+    // The subject's ID is immutable, and a byte-level expectation cannot see identity: an
+    // `--expect-sha256` update that matches the incumbent bytes exactly would otherwise be free to
+    // re-key the subject, which F02 refuses rather than inferring a rename, a replacement, or a
+    // state migration. Compare the two IDs before anything is admitted or written.
+    match &before {
+        Some(current) => {
+            let incumbent = incumbent_agent_id(current, &candidate.host, &candidate.identity)?;
+            let proposed = candidate.agent_id();
+            if incumbent != proposed {
+                return Err(PublishRefusal::new(
+                    IMMUTABLE_AGENT_ID,
+                    format!(
+                        "{} already declares agent id '{incumbent}'; this candidate claims '{proposed}'. An agent ID is immutable: retire the subject and create a replacement instead of re-keying it.",
+                        target_spec.display()
+                    ),
+                ));
+            }
+        }
+        None => {
+            // Creation, not update: a brand-new subject mints a generated ID. The frozen-legacy
+            // fallback exists to read and update a subject that predates migration, never to keep
+            // minting new placement-shaped IDs.
+            let minted = candidate.id.as_ref().map(|id| id.as_str().to_owned());
+            if !minted.as_deref().is_some_and(is_canonical_uuid_v7) {
+                return Err(PublishRefusal::new(
+                    CREATION_REQUIRES_GENERATED_ID,
+                    match minted {
+                        Some(declared) => format!(
+                            "creating {} requires a generated canonical UUIDv7 `id`; '{declared}' is not one",
+                            target_spec.display()
+                        ),
+                        None => format!(
+                            "creating {} requires an explicit generated canonical UUIDv7 `id`",
+                            target_spec.display()
+                        ),
+                    },
+                ));
+            }
+        }
+    }
+
     validate_overlay(&catalog, &control, &candidate)?;
     ensure_real_dir_chain(
         &catalog,
@@ -367,7 +530,8 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
             verify_published_spec(&catalog, &target_spec, &candidate.bytes, &after_hash)?;
         return Ok(result(
             PublishStatus::Unchanged,
-            candidate.bus_id(),
+            candidate.agent_id(),
+            candidate.bus_address(),
             candidate.input_sha256.clone(),
             target_spec,
             before_hash,
@@ -377,7 +541,8 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
 
     test_before_publication();
     let generation = lock.begin_generation_commit()?;
-    let bus_id = candidate.bus_id();
+    let agent_id = candidate.agent_id();
+    let bus_address = candidate.bus_address();
     let input_sha256 = candidate.input_sha256.clone();
     match candidate.kind {
         CandidateKind::Spec => {
@@ -400,7 +565,8 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
     generation.commit()?;
     Ok(result(
         PublishStatus::Published,
-        bus_id,
+        agent_id,
+        bus_address,
         input_sha256,
         target_spec,
         before_hash,
@@ -410,7 +576,8 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
 
 fn result(
     status: PublishStatus,
-    bus_id: String,
+    agent_id: String,
+    bus_address: Option<String>,
     input_sha256: String,
     path: PathBuf,
     before_sha256: Option<String>,
@@ -421,7 +588,8 @@ fn result(
         policy_profile: crate::validate::CORE_CATALOG_POLICY_PROFILE,
         agent_spec_revision: agent_spec::AGENT_SPEC_REVISION,
         status,
-        bus_id,
+        agent_id,
+        bus_address,
         path,
         input_sha256,
         before_sha256,
@@ -442,7 +610,10 @@ fn verify_published_spec(
         observed_sha256 == expected_sha256 && observed == expected_bytes,
         "published Agent Spec readback mismatch: expected sha256 {expected_sha256}, found {observed_sha256}"
     );
-    crate::catalog_transaction::validate_full_catalog(catalog)
+    crate::catalog_transaction::validate_full_catalog(
+        catalog,
+        &crate::catalog_archive::archived_subjects(catalog)?,
+    )
         .context("published catalog fails locked core/catalog re-admission")?;
     Ok(observed_sha256)
 }
@@ -522,9 +693,15 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Admit the candidate as an overlay on the complete prospective catalog.
+///
+/// Agent IDs are catalog-global across the live plane and the structural archive, so the overlay
+/// is proved against both: publishing a spec whose ID an archived subject still holds must fail
+/// even though that subject is undiscoverable.
 fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
     let shadow = build_overlay(catalog, control, candidate)?;
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
+    let archived = crate::catalog_archive::archived_subjects(catalog)?;
+    crate::catalog_transaction::validate_full_catalog(shadow.path(), &archived)
         .context("candidate fails full-catalog validation")
 }
 

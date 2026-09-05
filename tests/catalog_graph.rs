@@ -163,6 +163,76 @@ fn graph_exposes_admitted_topology_and_delivery_readiness_facts() {
 }
 
 #[test]
+fn graph_edges_are_keyed_by_migrated_agent_id_and_carry_the_route_beside_them() {
+    // R24/R35: a migrated declaration's topology edges are its ID, not its route. `legacy` names
+    // its parent with an unmigrated positional reference; the edge published for it must still be
+    // the parent's migrated ID, because the reference is resolved once and only the ID travels.
+    let catalog = tempfile::tempdir().unwrap();
+    let root = catalog.path();
+    write(
+        root,
+        "agents/h/boss/agent.kdl",
+        r#"agent "boss" { host "h"; id "boss-id"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/worker/agent.kdl",
+        r#"agent "worker" {
+  host "h"
+  id "worker-id"
+  address "fleet.builder"
+  supervisor "boss-id"
+  command "true"
+}"#,
+    );
+    write(
+        root,
+        "agents/h/legacy/agent.kdl",
+        r#"agent "legacy" { host "h"; supervisor "boss"; command "true" }"#,
+    );
+    write(
+        root,
+        "agents/h/gone/agent.kdl",
+        r#"agent "gone" { host "h"; id "gone-id"; desired-state "retired" reason="Replaced by worker"; command "true" }"#,
+    );
+
+    let output = st2(root, &["catalog", "graph", "--host", "h", "--json"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph = json(&output);
+    assert_eq!(graph["complete"], true, "{graph:#}");
+    let rows = graph["agents"].as_array().unwrap();
+
+    let worker = rows.iter().find(|row| row["id"] == "worker-id").unwrap();
+    assert_eq!(worker["identity"], "worker", "the positional key is preserved");
+    assert_eq!(worker["address"], "fleet.builder");
+    assert_eq!(worker["busAddress"], "h.fleet.builder");
+    assert_eq!(worker["parentId"], "boss-id");
+    assert_eq!(worker["rootId"], "boss-id");
+    assert_eq!(worker["depth"], 1);
+    assert_eq!(worker["ancestorIds"], serde_json::json!(["boss-id"]));
+
+    let legacy = rows.iter().find(|row| row["id"] == "h.legacy").unwrap();
+    assert_eq!(
+        legacy["parentId"], "boss-id",
+        "a legacy positional reference resolves to the parent's migrated ID: {legacy:#}"
+    );
+    assert_eq!(legacy["rootId"], "boss-id");
+    assert_eq!(legacy["address"], "legacy");
+    assert_eq!(legacy["busAddress"], "h.legacy");
+
+    let gone = rows.iter().find(|row| row["id"] == "gone-id").unwrap();
+    assert_eq!(gone["address"], "gone", "the declaration still declares it");
+    assert!(
+        gone["busAddress"].is_null(),
+        "a retired subject keeps its ID and releases its route: {gone:#}"
+    );
+}
+
+#[test]
 fn graph_ignores_retired_roots_and_folds_legacy_retirement_into_declarations() {
     // #402 regression fixture: one active root plus root-shaped retired declarations — legacy
     // `retired #true` and new-style — must leave the host with exactly one counted root, admit

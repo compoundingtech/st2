@@ -164,6 +164,133 @@ struct Candidate {
     from: PathBuf,
 }
 
+/// One structurally archived declaration, read back out of the control plane.
+///
+/// Archived declarations are deliberately undiscoverable, so nothing else in st2 can see them.
+/// Agent IDs are catalog-global across the live plane *and* this archive, which is why the
+/// admission path has to be able to read them.
+#[derive(Debug, Clone)]
+pub struct ArchivedDeclaration {
+    pub host: String,
+    pub identity: String,
+    /// The archived declaration file, inside `<catalog>/.st2/archive`.
+    pub path: PathBuf,
+    pub spec: agent_spec::spec::AgentSpec,
+    pub tombstone_path: PathBuf,
+    /// `None` for an archived directory whose tombstone is missing — [`observe`] reports that as
+    /// an unexplained control-plane entry; identity admission still counts the declaration.
+    pub tombstone: Option<Tombstone>,
+}
+
+/// Read every structurally archived declaration.
+///
+/// Fails closed on anything it cannot explain. Every consumer of this reader feeds a
+/// catalog-global uniqueness or admission proof, so absence and uncertainty must not look alike: a
+/// symlinked host directory, an aliased identity bundle, or a stray entry could each be the thing
+/// holding the agent ID the caller is about to claim. Exactly two shapes are admitted under a host
+/// directory — a real identity directory, and the defined regular tombstone file beside it — and
+/// everything else refuses.
+pub fn archived_declarations(catalog: &Path) -> Result<Vec<ArchivedDeclaration>> {
+    let root = archive_root(catalog);
+    let Some(hosts) = read_real_dir_optional(&root)? else {
+        return Ok(Vec::new());
+    };
+    let mut archived = Vec::new();
+    for host_entry in hosts {
+        let host_path = host_entry.path();
+        let host_meta = fs::symlink_metadata(&host_path)
+            .with_context(|| format!("read archive host entry {}", host_path.display()))?;
+        anyhow::ensure!(
+            host_meta.is_dir() && !host_meta.file_type().is_symlink(),
+            "refusing to prove archived identity: {} is not a real archive host directory",
+            relative(catalog, &host_path).unwrap_or_else(|| host_path.display().to_string())
+        );
+        let host_dir = host_entry.file_name().to_string_lossy().into_owned();
+        for identity_entry in sorted_entries(&host_path)? {
+            let identity_path = identity_entry.path();
+            let name = identity_entry.file_name().to_string_lossy().into_owned();
+            let meta = fs::symlink_metadata(&identity_path).with_context(|| {
+                format!("read archived identity entry {}", identity_path.display())
+            })?;
+            if name.ends_with(TOMBSTONE_SUFFIX) {
+                // The defined sibling shape. It holds no declaration of its own: an interrupted
+                // `unarchive` legitimately leaves one behind after the directory moved back, and
+                // `observe` reports that as an unexplained control-plane entry.
+                anyhow::ensure!(
+                    meta.is_file() && !meta.file_type().is_symlink(),
+                    "refusing to prove archived identity: {} is not a real tombstone file",
+                    relative(catalog, &identity_path)
+                        .unwrap_or_else(|| identity_path.display().to_string())
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "refusing to prove archived identity: {} is neither a real archived identity directory nor a tombstone",
+                relative(catalog, &identity_path)
+                    .unwrap_or_else(|| identity_path.display().to_string())
+            );
+            let path = identity_path.join("agent.kdl");
+            let declaration_meta = fs::symlink_metadata(&path).with_context(|| {
+                format!(
+                    "archived identity {name} has no canonical declaration at {}",
+                    relative(catalog, &path).unwrap_or_else(|| path.display().to_string())
+                )
+            })?;
+            anyhow::ensure!(
+                declaration_meta.is_file() && !declaration_meta.file_type().is_symlink(),
+                "refusing to prove archived identity: {} is not a real declaration file",
+                relative(catalog, &path).unwrap_or_else(|| path.display().to_string())
+            );
+            let tombstone_path = host_path.join(format!("{name}{TOMBSTONE_SUFFIX}"));
+            let tombstone = read_tombstone(&tombstone_path)?;
+            // The archive layout is `<archive>/<host>/<identity>/agent.kdl`, which supplies
+            // exactly the host and identity path defaults ordinary discovery would.
+            let (specs, _) = agent_spec::discover_file(&root, &path).with_context(|| {
+                format!(
+                    "parse archived declaration {}",
+                    relative(catalog, &path).unwrap_or_else(|| path.display().to_string())
+                )
+            })?;
+            anyhow::ensure!(
+                !specs.is_empty(),
+                "refusing to prove archived identity: {} declares no agent",
+                relative(catalog, &path).unwrap_or_else(|| path.display().to_string())
+            );
+            for spec in specs {
+                archived.push(ArchivedDeclaration {
+                    host: spec.resolved_host(&host_dir).to_owned(),
+                    identity: spec.identity.clone(),
+                    path: path.clone(),
+                    spec,
+                    tombstone_path: tombstone_path.clone(),
+                    tombstone: tombstone.clone(),
+                });
+            }
+        }
+    }
+    archived.sort_by(|left, right| {
+        (&left.host, &left.identity, &left.path).cmp(&(&right.host, &right.identity, &right.path))
+    });
+    Ok(archived)
+}
+
+/// Every archived subject, for catalog-global agent-ID uniqueness.
+///
+/// Archived subjects are non-routable: archival released their effective address, so they occupy
+/// the ID namespace without occupying any host's address namespace. They keep their ID, and stay
+/// reachable by exact ID.
+pub fn archived_subjects(catalog: &Path) -> Result<Vec<agent_spec::Subject>> {
+    archived_declarations(catalog)?
+        .into_iter()
+        .map(|archived| {
+            let mut subject = archived.spec.subject(&archived.host)?;
+            subject.routable = false;
+            Ok(subject)
+        })
+        .collect()
+}
+
 /// Archive every selected identity under one exclusive authoring lock and one generation commit.
 pub fn archive(request: ArchiveRequest) -> Result<ArchiveResult> {
     let catalog = canonical(&request.catalog)?;
@@ -289,6 +416,13 @@ fn discovered(catalog: &Path) -> Result<crate::Discovered> {
 }
 
 /// Move one archived identity back into the live declaration plane.
+///
+/// The subject keeps the ID it was archived with — reintroducing the same ID denotes the same
+/// subject — so re-entry has to prove that ID is still free across the prospective live plane and
+/// the rest of the archive, and that it re-enters a host address namespace it does not collide
+/// with. Once the catalog is migrated, an archived declaration that never received an explicit ID
+/// cannot come back at all: its implicit legacy bytes are exactly what migration may have
+/// reassigned to another subject.
 pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
     let catalog = canonical(&request.catalog)?;
     validate_component("host", &request.host)?;
@@ -318,6 +452,52 @@ pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
         to.display()
     );
 
+    let archived = archived_declarations(&catalog)?;
+    let restored = archived
+        .iter()
+        .filter(|entry| entry.host == request.host && entry.identity == request.identity)
+        .collect::<Vec<_>>();
+    let restored = match restored.as_slice() {
+        [only] => *only,
+        [] => anyhow::bail!(
+            "archived identity {} declares no agent to restore",
+            crate::legacy_bus_identity(&request.host, &request.identity)
+        ),
+        many => anyhow::bail!(
+            "archived declaration for {} contains {} agents; unarchive restores exactly one",
+            crate::legacy_bus_identity(&request.host, &request.identity),
+            many.len()
+        ),
+    };
+    let found = discovered(&catalog)?;
+    let migrated_catalog = crate::catalog_migrate::is_migrated(&found.specs);
+    anyhow::ensure!(
+        restored.spec.id.is_some() || !migrated_catalog,
+        "refusing to unarchive {}: the catalog is migrated and this archived declaration has no explicit `id`; repair it through the pre-activation legacy authoring path first",
+        crate::legacy_bus_identity(&request.host, &request.identity)
+    );
+    let agent_id = restored.spec.agent_id(&request.host);
+    // The prospective catalog is the live plane plus this subject, restored as routable, plus every
+    // archived subject that stays archived.
+    let mut prospective = found.specs.clone();
+    prospective.push(restored.spec.clone());
+    let others = archived
+        .iter()
+        .filter(|entry| !std::ptr::eq(*entry, restored))
+        .map(|entry| {
+            let mut subject = entry.spec.subject(&entry.host)?;
+            subject.routable = false;
+            Ok(subject)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::catalog_transaction::validate_identity_uniqueness(&prospective, &others).with_context(
+        || {
+            format!(
+                "refusing to unarchive {agent_id}: it does not fit the prospective live-and-archived catalog"
+            )
+        },
+    )?;
+
     let tombstone_path = host_root.join(format!("{}{TOMBSTONE_SUFFIX}", request.identity));
     let archived_at = read_tombstone(&tombstone_path)
         .ok()
@@ -345,7 +525,7 @@ pub fn unarchive(request: UnarchiveRequest) -> Result<UnarchiveResult> {
 
     Ok(UnarchiveResult {
         schema: UNARCHIVE_SCHEMA,
-        id: format!("{}.{}", request.host, request.identity),
+        id: agent_id,
         host: request.host,
         identity: request.identity,
         from: relative(&catalog, &from).unwrap_or_else(|| from.display().to_string()),
@@ -365,7 +545,10 @@ pub fn observe(catalog: &Path) -> Result<ArchiveObservation> {
     let Some(hosts) = read_real_dir_optional(&root)? else {
         return Ok(observation);
     };
-    let mut tombstones: BTreeMap<String, Tombstone> = BTreeMap::new();
+    // Keyed structurally by placement, never by agent ID: an ID is opaque and two archived
+    // subjects that somehow claim one must both stay visible so the duplicate can be reported
+    // instead of one silently replacing the other.
+    let mut tombstones: BTreeMap<(String, String), Tombstone> = BTreeMap::new();
     for host_entry in hosts {
         let host_path = host_entry.path();
         if !host_entry.file_type()?.is_dir() {
@@ -401,7 +584,7 @@ pub fn observe(catalog: &Path) -> Result<ArchiveObservation> {
                 match read_tombstone(&path) {
                     Ok(Some(tombstone)) if tombstone.identity == identity => {
                         seen.insert(identity.to_owned());
-                        tombstones.insert(tombstone.id.clone(), tombstone);
+                        tombstones.insert((host.clone(), identity.to_owned()), tombstone);
                     }
                     Ok(_) => observation.issues.push(issue(
                         catalog,
@@ -435,7 +618,28 @@ pub fn observe(catalog: &Path) -> Result<ArchiveObservation> {
                 &host_path.join(format!("{identity}{TOMBSTONE_SUFFIX}")),
                 "archive tombstone has no archived identity directory",
             ));
-            tombstones.remove(&format!("{host}.{identity}"));
+            tombstones.remove(&(host.clone(), identity.clone()));
+        }
+    }
+    let mut by_id: BTreeMap<&str, Vec<&Tombstone>> = BTreeMap::new();
+    for tombstone in tombstones.values() {
+        by_id.entry(tombstone.id.as_str()).or_default().push(tombstone);
+    }
+    for (id, holders) in by_id {
+        if holders.len() > 1 {
+            let placements = holders
+                .iter()
+                .map(|tombstone| crate::legacy_bus_identity(&tombstone.host, &tombstone.identity))
+                .collect::<Vec<_>>()
+                .join(", ");
+            observation.issues.push(issue(
+                catalog,
+                &root,
+                &format!(
+                    "archived agent id '{id}' is claimed by {} archived identities: {placements}",
+                    holders.len()
+                ),
+            ));
         }
     }
     observation.archived = tombstones.into_values().collect();
@@ -487,12 +691,12 @@ fn plan(
                 match matches.as_slice() {
                     [spec] => selected.push(spec),
                     [] => refused.push(Refusal {
-                        id: format!("{host}.{identity}"),
+                        id: crate::legacy_bus_identity(host, identity),
                         code: "unknown-identity",
                         message: format!("no declaration for '{identity}' on host '{host}'"),
                     }),
                     many => refused.push(Refusal {
-                        id: format!("{host}.{identity}"),
+                        id: crate::legacy_bus_identity(host, identity),
                         code: "ambiguous-identity",
                         message: format!("{} declarations claim this identity", many.len()),
                     }),
@@ -520,7 +724,9 @@ fn plan(
     let leaving: BTreeSet<&Path> = selected.iter().map(|spec| spec.path.as_path()).collect();
     let mut candidates = Vec::new();
     for spec in &selected {
-        let id = spec.bus_id(host);
+        // Archival preserves the subject's frozen ID: the tombstone, the entry, and every task
+        // record this pass reads are ownership keys, not routes.
+        let id = spec.agent_id(host);
         let identity = spec.identity.clone();
         let from = catalog.join("agents").join(host).join(&identity);
         if spec.path != from.join("agent.kdl") {
@@ -573,16 +779,11 @@ fn plan(
             .iter()
             .filter(|other| !leaving.contains(other.path.as_path()))
             .filter(|other| {
-                other.supervisor.as_deref().is_some_and(|supervisor| {
-                    crate::supervisor_chain::resolve_spec(
-                        &found.specs,
-                        supervisor,
-                        other.resolved_host(host),
-                    )
+                crate::supervisor_chain::resolve_supervisor_spec(&found.specs, other, host)
                     .is_some_and(|resolved| resolved.path == spec.path)
-                })
             })
-            .map(|other| other.bus_id(host))
+            // A dependent is named for a human to go and repair, so it reads as a route.
+            .map(|other| other.bus_address(host))
             .collect::<Vec<_>>();
         if !dependents.is_empty() {
             refused.push(Refusal {
@@ -853,7 +1054,9 @@ fn pass_has_work_at(
     changed || !due.is_empty()
 }
 
-fn read_tombstone(path: &Path) -> Result<Option<Tombstone>> {
+/// Read one tombstone. An absent file is `Ok(None)`; a foreign schema or unreadable body is an
+/// error, because a tombstone is what makes an archived identity explainable.
+pub(crate) fn read_tombstone(path: &Path) -> Result<Option<Tombstone>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -874,10 +1077,13 @@ fn read_tombstone(path: &Path) -> Result<Option<Tombstone>> {
         "unknown archive tombstone schema '{}'",
         tombstone.schema
     );
-    anyhow::ensure!(
-        tombstone.id == format!("{}.{}", tombstone.host, tombstone.identity),
-        "archive tombstone id does not match its host and identity"
-    );
+    // `id` is the subject's frozen agent ID, which is opaque: a migrated legacy subject carries
+    // its former `<host>.<identity>` bytes, while an archived collision carries a generated
+    // UUIDv7. The positional declaration key lives in `host`/`identity`, which stay checkable.
+    crate::AgentId::parse(&tombstone.id)
+        .map_err(|error| anyhow::anyhow!("archive tombstone id is not an agent ID: {error}"))?;
+    validate_component("host", &tombstone.host)?;
+    validate_component("identity", &tombstone.identity)?;
     Ok(Some(tombstone))
 }
 

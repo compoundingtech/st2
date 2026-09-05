@@ -332,8 +332,12 @@ fn unobservable_entry_may_hide_declaration(
 /// gain fields without breaking readers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declared {
+    /// `id` as written in the file. `None` for an unmigrated legacy declaration.
+    pub id: Option<String>,
     /// `identity` as written in the file. `None` when the file relies on [`path_defaults`].
     pub identity: Option<String>,
+    /// `address` as written in the file. `None` when the positional identity is the fallback.
+    pub address: Option<String>,
     /// `host` as written in the file. `None` when the file relies on [`path_defaults`].
     pub host: Option<String>,
     /// `type` as written, before it is normalized to `JobType::Service`. `None` when unset.
@@ -343,6 +347,8 @@ pub struct Declared {
 impl From<&RawSpec> for Declared {
     fn from(raw: &RawSpec) -> Self {
         Self {
+            id: raw.id.clone(),
+            address: raw.address.clone(),
             identity: raw.identity.clone(),
             host: raw.host.clone(),
             job_type: raw.job_type.clone(),

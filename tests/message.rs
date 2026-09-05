@@ -6,9 +6,10 @@
 use std::fs;
 use std::path::Path;
 
+use st2::AgentSelector;
 use st2::message::{
     archive_dir, archive_msg, collect_thread, inbox_dir, list_dir, read_msg, reply_subject,
-    resolve_agent_dir, send_to_inbox,
+    resolve_agent_dir, select_agent_dir, send_to_inbox, send_to_resolved_inbox,
 };
 
 fn write(root: &Path, rel: &str, contents: &str) {
@@ -31,10 +32,27 @@ fn agent_kdl(identity: &str, host: &str) -> String {
     )
 }
 
+/// A migrated declaration: an explicit catalog-global immutable `id` and a mutable `address`.
+fn migrated_agent_kdl(identity: &str, host: &str, id: &str, address: &str) -> String {
+    format!(
+        r#"agent "{identity}" {{
+  identity "{identity}"
+  id "{id}"
+  address "{address}"
+  host "{host}"
+  type "service"
+  pty "agent" {{
+    command "exec claude boot"
+  }}
+}}
+"#
+    )
+}
+
 /// A two-agent catalog on host `hetz`. Send to one by bus id → lands in *its* `resources/inbox`,
 /// never the other's. List, then archive.
 #[test]
-fn send_by_bus_id_lands_in_recipient_inbox() {
+fn send_by_agent_id_lands_in_recipient_inbox() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(
@@ -48,15 +66,18 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
         &agent_kdl("cos-claude", "hetz"),
     );
 
-    // Resolve the recipient's agent folder by its bus id, then by bare identity — both must match.
-    let dir_by_bus = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
+    // Resolve by the subject's exact immutable ID. For an unmigrated declaration that ID is
+    // exactly its `<host>.<identity>` bytes, which is why migration moves no state.
+    let dir_by_id = resolve_agent_dir(root, "hetz.st2-claude", "hetz")
         .unwrap()
-        .expect("resolve by bus id");
-    let dir_by_ident = resolve_agent_dir(root, "st2-claude", "hetz")
+        .expect("resolve by immutable id");
+    // The same subject as an ordinary human reference, through the address algorithm.
+    let dir_by_address = select_agent_dir(root, &AgentSelector::address("st2-claude"), "hetz")
         .unwrap()
-        .expect("resolve by identity");
-    assert_eq!(dir_by_bus, dir_by_ident);
-    assert_eq!(dir_by_bus, root.join("hetz/st2-claude"));
+        .expect("resolve by address");
+    assert_eq!(dir_by_id, dir_by_address);
+    assert_eq!(dir_by_id, root.join("hetz/st2-claude"));
+    let dir_by_bus = dir_by_id;
 
     // Send lands under the recipient's resources/inbox — and nowhere near the other agent.
     let inbox = inbox_dir(&dir_by_bus);
@@ -290,5 +311,167 @@ fn a_concurrent_reader_never_observes_a_half_written_message() {
         reader.join().unwrap(),
         0,
         "reader observed a canonical message before it was complete"
+    );
+}
+
+/// The ordinary reference algorithm, end to end: a bare address, a host-qualified bus address, and
+/// a reference that names two distinct subjects, which must fail closed rather than pick one.
+#[test]
+fn an_ordinary_reference_resolves_by_address_and_fails_closed_when_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "hetz/worker/agent.kdl", &agent_kdl("worker", "hetz"));
+    write(root, "dev4/worker/agent.kdl", &agent_kdl("worker", "dev4"));
+    write(root, "hetz/solo/agent.kdl", &agent_kdl("solo", "hetz"));
+
+    // A bare address unique across the catalog resolves.
+    assert_eq!(
+        select_agent_dir(root, &AgentSelector::address("solo"), "hetz")
+            .unwrap()
+            .expect("a unique bare address resolves"),
+        root.join("hetz/solo")
+    );
+
+    // A host-qualified reference picks exactly that host's subject, including a remote one.
+    assert_eq!(
+        select_agent_dir(root, &AgentSelector::address("dev4.worker"), "hetz")
+            .unwrap()
+            .expect("a qualified bus address resolves"),
+        root.join("dev4/worker")
+    );
+
+    // Pinning the caller's host disambiguates the same bare address.
+    assert_eq!(
+        select_agent_dir(root, &AgentSelector::address_on_host("worker", "hetz"), "hetz")
+            .unwrap()
+            .expect("a host-pinned address resolves"),
+        root.join("hetz/worker")
+    );
+
+    // Unpinned, `worker` names two distinct subjects. Silently picking one would deliver a
+    // message to the wrong agent, so this is an error and not an absent subject.
+    let error = select_agent_dir(root, &AgentSelector::address("worker"), "hetz")
+        .expect_err("an ambiguous reference must fail closed");
+    let rendered = format!("{error}");
+    assert!(rendered.contains("dev4.worker"), "{rendered}");
+    assert!(rendered.contains("hetz.worker"), "{rendered}");
+}
+
+/// ID and address are separate typed namespaces. An exact-ID selection must never fall through to
+/// address lookup, and an ordinary reference must never reach the ID namespace.
+#[test]
+fn an_exact_id_selection_never_falls_through_to_address_lookup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "hetz/worker/agent.kdl",
+        &migrated_agent_kdl("worker", "hetz", "worker-uuid", "chat"),
+    );
+
+    assert_eq!(
+        resolve_agent_dir(root, "worker-uuid", "hetz")
+            .unwrap()
+            .expect("the exact immutable ID resolves"),
+        root.join("hetz/worker")
+    );
+    // The subject's current route is `hetz.chat`; asking for it as an ID must not find it.
+    assert!(resolve_agent_dir(root, "chat", "hetz").unwrap().is_none());
+    assert!(
+        resolve_agent_dir(root, "hetz.chat", "hetz")
+            .unwrap()
+            .is_none()
+    );
+    // And the ID is not a route: an address lookup must not reach the ID namespace.
+    assert!(
+        select_agent_dir(root, &AgentSelector::address("worker-uuid"), "hetz")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        select_agent_dir(root, &AgentSelector::address("chat"), "hetz")
+            .unwrap()
+            .expect("the address resolves as an address"),
+        root.join("hetz/worker")
+    );
+}
+
+/// An address change is an immediate atomic cutover of the ROUTE only. Durable state does not
+/// move: the inbox, the archive, and every reply that targets the persisted endpoint still land
+/// in the same boxes, and the old route stops resolving with no alias or redirect left behind.
+#[test]
+fn an_address_change_preserves_inbox_archive_and_reply_targeting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let worker = root.join("hetz/worker");
+    write(
+        root,
+        "hetz/sender/agent.kdl",
+        &migrated_agent_kdl("sender", "hetz", "sender-uuid", "sender"),
+    );
+    write(
+        root,
+        "hetz/worker/agent.kdl",
+        &migrated_agent_kdl("worker", "hetz", "worker-uuid", "chat"),
+    );
+
+    // Send by the recipient's current route.
+    let first = send_to_resolved_inbox(
+        root, "chat", "hetz", "sender-uuid", Some("before"), None, &[], "one", None, None,
+    )
+    .unwrap();
+    assert!(inbox_dir(&worker).join(&first).exists());
+    archive_msg(&inbox_dir(&worker), &archive_dir(&worker), &first).unwrap();
+
+    // Cut the address over. Nothing else about the declaration changes.
+    write(
+        root,
+        "hetz/worker/agent.kdl",
+        &migrated_agent_kdl("worker", "hetz", "worker-uuid", "renamed"),
+    );
+
+    // Durable state stayed exactly where it was — the archive receipt is still the subject's.
+    assert_eq!(
+        resolve_agent_dir(root, "worker-uuid", "hetz")
+            .unwrap()
+            .expect("the ID still resolves after the cutover"),
+        worker
+    );
+    let archived = list_dir(&archive_dir(&worker)).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].filename, first);
+
+    // The released address is gone immediately: no alias, no redirect, no history.
+    assert!(
+        select_agent_dir(root, &AgentSelector::address("chat"), "hetz")
+            .unwrap()
+            .is_none()
+    );
+
+    // A reply targeting the persisted canonical endpoint still lands in the same inbox, and so
+    // does a send by the new route.
+    let reply = send_to_inbox(
+        &inbox_dir(&worker),
+        "hetz.sender",
+        Some("re: before"),
+        Some(&first),
+        &[],
+        "two",
+    )
+    .unwrap();
+    let second = send_to_resolved_inbox(
+        root, "renamed", "hetz", "sender-uuid", Some("after"), None, &[], "three", None, None,
+    )
+    .unwrap();
+
+    let inbox = list_dir(&inbox_dir(&worker)).unwrap();
+    let mut names = inbox.iter().map(|m| m.filename.clone()).collect::<Vec<_>>();
+    names.sort();
+    let mut expected = vec![reply, second];
+    expected.sort();
+    assert_eq!(names, expected);
+    assert_eq!(
+        read_msg(&inbox_dir(&worker), &expected[0]).unwrap().ts_ms > 0,
+        true
     );
 }

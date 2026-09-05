@@ -462,6 +462,214 @@ fn a_duplicate_bus_id_is_an_error() {
     assert!(has(&validate(c.path()), "dup-id", Severity::Error));
 }
 
+// ---- R24 uniqueness: two typed namespaces, two admission rules -------------------------------
+
+#[test]
+fn a_duplicate_explicit_agent_id_is_an_error_even_with_distinct_addresses() {
+    // Catalog-global ID uniqueness, proved independently of routing: both declarations answer at
+    // their own address, so an address-only check would pass this catalog.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            "h/one/agent.kdl",
+            r#"agent "one" { host "h"; id "twin-id"; supervisor "root-id"; command "x" }"#,
+        ),
+        (
+            "h/two/agent.kdl",
+            r#"agent "two" { host "h"; id "twin-id"; supervisor "root-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("twin-id")),
+        "expected a dup-id naming the ID, got {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "distinct addresses must not also report an address collision: {:?}",
+        r.issues
+    );
+}
+
+#[test]
+fn an_explicit_address_colliding_with_an_identity_fallback_is_an_error() {
+    // The collision the pre-decision model could not see: `beta` claims `alpha`'s effective
+    // address explicitly, while `alpha` holds it only through the positional identity fallback.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            "h/alpha/agent.kdl",
+            r#"agent "alpha" { host "h"; id "id-a"; supervisor "root-id"; command "x" }"#,
+        ),
+        (
+            "h/beta/agent.kdl",
+            r#"agent "beta" { host "h"; id "id-b"; address "alpha"; supervisor "root-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-address"
+            && i.severity == Severity::Error
+            && i.message.contains("alpha")
+            && i.message.contains("id-a")
+            && i.message.contains("id-b")),
+        "expected a dup-address naming both claimants, got {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-id", Severity::Error),
+        "distinct IDs must not be reported as an ID duplicate: {:?}",
+        r.issues
+    );
+}
+
+#[test]
+fn an_id_that_shares_bytes_with_another_subjects_address_is_not_a_collision() {
+    // ID and address are separate typed namespaces: `alpha` carries the ID `beta`, and `beta`
+    // carries the effective address `beta`. Equal bytes across namespaces never collide.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            "h/alpha/agent.kdl",
+            r#"agent "alpha" { host "h"; id "beta"; supervisor "root-id"; command "x" }"#,
+        ),
+        (
+            "h/beta/agent.kdl",
+            r#"agent "beta" { host "h"; id "id-b"; supervisor "root-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+}
+
+#[test]
+fn a_retired_subject_does_not_occupy_the_address_namespace() {
+    // Retirement releases the effective address while keeping the ID, so a live subject may claim
+    // the retired one's route immediately — no alias, no reservation, no waiting period.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            "h/gone/agent.kdl",
+            r#"agent "gone" { host "h"; id "old-id"; desired-state "retired" reason="Replaced by live"; command "x" }"#,
+        ),
+        (
+            "h/live/agent.kdl",
+            r#"agent "live" { host "h"; id "new-id"; address "gone"; supervisor "root-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
+}
+
+#[test]
+fn a_live_id_colliding_with_an_archived_id_is_a_duplicate() {
+    // R24: agent IDs are unique across the live catalog AND the structural archive. An archived
+    // subject keeps its ID, so a live declaration reusing those bytes denotes the same subject
+    // twice — and live discovery alone cannot see it, which is why the archive must be read.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            "h/reused/agent.kdl",
+            r#"agent "reused" { host "h"; id "gone-id"; supervisor "root-id"; command "x" }"#,
+        ),
+        (
+            ".st2/archive/h/gone/agent.kdl",
+            r#"agent "gone" { host "h"; id "gone-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("gone-id")
+            && i.message.contains("structural archive")),
+        "expected a dup-id naming the archived holder, got {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "an archived subject released its address and occupies no host namespace: {:?}",
+        r.issues
+    );
+}
+
+#[test]
+fn two_archived_subjects_sharing_an_id_are_reported_even_with_no_live_declarant() {
+    // The conflict is attributed to a live declaration when there is one. When every holder is
+    // archived there is no declaration path to blame, and dropping the conflict for want of one
+    // would report zero errors for a catalog whose global ID namespace is provably broken —
+    // exactly the catalog `catalog apply` and `agent publish` refuse.
+    let c = catalog(&[
+        (
+            "h/root/agent.kdl",
+            r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+        ),
+        (
+            ".st2/archive/h/gone/agent.kdl",
+            r#"agent "gone" { host "h"; id "shared-id"; command "x" }"#,
+        ),
+        (
+            ".st2/archive/h/also-gone/agent.kdl",
+            r#"agent "also-gone" { host "h"; id "shared-id"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("shared-id")
+            && i.message.contains("structural archive")),
+        "an archived-only duplicate id must still be reported, got {:?}",
+        r.issues
+    );
+}
+
+#[test]
+fn an_unreadable_archive_refuses_instead_of_proving_uniqueness() {
+    // Decision 4: a reader feeding a global uniqueness proof must treat an entry it cannot explain
+    // as uncertainty. Silently skipping it would hide an occupied ID from the very check that is
+    // about to declare the namespace free.
+    let c = catalog(&[(
+        "h/root/agent.kdl",
+        r#"agent "root" { host "h"; id "root-id"; command "x" }"#,
+    )]);
+    let archived = c.path().join(".st2/archive/h/gone");
+    std::fs::create_dir_all(&archived).unwrap();
+    std::os::unix::fs::symlink(c.path().join("nowhere.kdl"), archived.join("agent.kdl")).unwrap();
+
+    let r = validate(c.path());
+    assert!(
+        has(&r, "uniqueness-unprovable", Severity::Error),
+        "an archive entry that cannot be explained must refuse, got {:?}",
+        r.issues
+    );
+}
+
+
 #[test]
 fn explicit_identity_and_host_are_path_independent_but_still_unique() {
     let c = catalog(&[(

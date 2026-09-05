@@ -112,7 +112,12 @@ pub fn spec_to_agent_specs(agents: &[SpecAgent], host: &str, root: &Path) -> Vec
                 });
             }
             AgentSpec {
+                // A compact eval agent is an unmigrated positional declaration: no explicit ID and
+                // no explicit address, so its agent ID is exactly `<host>.<identity>` — the same
+                // bytes `actor_id` above already assigned to its tasks.
+                id: None,
                 identity,
+                address: None,
                 name: a.name.clone(),
                 description: a.description.clone(),
                 host: Some(host.to_string()),
@@ -171,7 +176,7 @@ fn admitted_route<'a>(
 fn task_runtime_id(spec: &AgentSpec, task: &Task, host: &str) -> String {
     task.id
         .clone()
-        .unwrap_or_else(|| format!("{}.{}", spec.bus_id(host), task.name))
+        .unwrap_or_else(|| format!("{}.{}", spec.agent_id(host), task.name))
 }
 
 fn task_is_launchable(task: &Task) -> bool {
@@ -187,7 +192,7 @@ fn eval_runtime_tasks(specs: &[AgentSpec], host: &str) -> Vec<EvalRuntimeTask> {
                 .iter()
                 .filter(|task| task_is_launchable(task))
                 .map(|task| EvalRuntimeTask {
-                    agent_id: spec.bus_id(host),
+                    agent_id: spec.agent_id(host),
                     runtime_id: task_runtime_id(spec, task, host),
                     is_pty: task.kind == TaskKind::Pty,
                 })
@@ -255,17 +260,30 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
         );
     }
 
-    let mut bus_ids = HashSet::new();
+    // Two namespaces, one proof. The old single "duplicate bus identity" check conflated them:
+    // it could not tell a catalog-global ID duplicate from an explicit address colliding with
+    // another declaration's identity fallback, and it would have rejected an ID that merely
+    // shared bytes with somebody's address. The address book proves both admissions.
+    let conflicts = crate::spec::address_book(&local_specs, host)?
+        .conflicts()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        anyhow::bail!(
+            "canonical-agents refuses a non-unique Agent Spec catalog: {}",
+            conflicts.join("; ")
+        );
+    }
+
     let mut runtime_ids = BTreeMap::<String, String>::new();
     let mut routes = BTreeMap::new();
     for spec in &local_specs {
-        let bus_id = spec.bus_id(host);
-        if !bus_ids.insert(bus_id.clone()) {
-            anyhow::bail!("canonical-agents found duplicate Agent Spec bus identity `{bus_id}`");
-        }
+        // Runtime task ids and route ownership are the agent ID.
+        let agent_id = spec.agent_id(host);
         if !spec.desired_state.is_running() {
             anyhow::bail!(
-                "canonical-agents refuses non-running Agent Spec `{bus_id}` ({})",
+                "canonical-agents refuses non-running Agent Spec `{agent_id}` ({})",
                 spec.desired_state.as_str()
             );
         }
@@ -273,7 +291,7 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
                 if task.env.contains_key(root) {
                     anyhow::bail!(
-                        "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
+                        "canonical-agents Agent Spec `{agent_id}` must not override eval-owned `{root}`"
                     );
                 }
             }
@@ -282,13 +300,13 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             let runtime_id = task_runtime_id(spec, task, host);
             if runtime_id.trim().is_empty() {
                 anyhow::bail!(
-                    "canonical-agents Agent Spec `{bus_id}` task `{}` runtime task id must be nonempty",
+                    "canonical-agents Agent Spec `{agent_id}` task `{}` runtime task id must be nonempty",
                     task.name
                 );
             }
-            if let Some(previous) = runtime_ids.insert(runtime_id.clone(), bus_id.clone()) {
+            if let Some(previous) = runtime_ids.insert(runtime_id.clone(), agent_id.clone()) {
                 anyhow::bail!(
-                    "canonical-agents found duplicate runtime task id `{runtime_id}` in `{previous}` and `{bus_id}`"
+                    "canonical-agents found duplicate runtime task id `{runtime_id}` in `{previous}` and `{agent_id}`"
                 );
             }
         }
@@ -300,11 +318,21 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             inbox: crate::message::inbox_dir(agent_dir),
             archive: crate::message::archive_dir(agent_dir),
         };
-        for spelling in [bus_id, spec.identity.clone()] {
+        // Every spelling one eval participant can be named by: its exact ID, its bare effective
+        // address, and its qualified bus address. They collapse to two entries for an unmigrated
+        // declaration, whose ID and bus address are the same bytes — the same subject under two
+        // equal spellings is not a conflict, a second subject claiming one is.
+        for spelling in [
+            agent_id.clone(),
+            spec.effective_address().to_owned(),
+            spec.bus_address(host),
+        ] {
             match routes.entry(spelling.clone()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(route.clone());
                 }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().inbox == route.inbox => {}
                 std::collections::btree_map::Entry::Occupied(_) => {
                     anyhow::bail!(
                         "canonical-agents found duplicate canonical route spelling `{spelling}`"
@@ -593,6 +621,20 @@ fn from_is(from: Option<&str>, id: &str) -> bool {
     from.is_some_and(|f| f == id || f.ends_with(&format!(".{id}")))
 }
 
+/// Whether `message` was written by the participant whose immutable agent ID is `id`.
+///
+/// The eval's participant vector and its kickoff target are agent IDs, and `from-id:` is the
+/// authoritative sender field of a version-2 record. `from:` is the sender's mutable bus address,
+/// which for any subject whose ID differs from its address is neither equal to nor a dotted suffix
+/// of the ID — matching on it would burn the full `max_timeout` on a team that actually finished.
+/// A record predating `from-id:` still falls back to the route.
+fn sender_is(message: &crate::message::Message, id: &str) -> bool {
+    match message.from_id.as_deref() {
+        Some(from_id) => from_id == id,
+        None => from_is(message.from.as_deref(), id),
+    }
+}
+
 /// Wait for the DONE signal, message-driven (not grade-poll). Multi-agent teams require a
 /// `sup → requester` confirmation whose timestamp follows a `worker → sup` report. A canonical
 /// singleton instead requires a causally new requester-inbox entry at-or-after the exact kickoff
@@ -641,7 +683,7 @@ fn wait_done(
                 .iter()
                 .any(|m| {
                     !before.contains(&m.filename)
-                        && from_is(m.from.as_deref(), sup)
+                        && sender_is(m, sup)
                         && m.ts_ms >= kickoff_ts
                 });
             if confirmed {
@@ -651,7 +693,7 @@ fn wait_done(
         let report_ts = sup_msgs
             .iter()
             .chain(sup_archived.iter())
-            .filter(|m| workers.iter().any(|w| from_is(m.from.as_deref(), w)))
+            .filter(|m| workers.iter().any(|w| sender_is(m, w)))
             .map(|m| m.ts_ms)
             .min();
         if let Some(rt) = report_ts {
@@ -659,7 +701,7 @@ fn wait_done(
             let confirmed = crate::message::list_dir(&req_inbox)
                 .unwrap_or_default()
                 .iter()
-                .any(|m| from_is(m.from.as_deref(), sup) && m.ts_ms >= rt);
+                .any(|m| sender_is(m, sup) && m.ts_ms >= rt);
             if confirmed {
                 return true;
             }
@@ -1072,25 +1114,38 @@ fn env_key(id: &str) -> String {
         .collect()
 }
 
-/// The supervisor chain of `agent_id`, walked transitively via each agent's `supervisor` field to the
-/// root (whose supervisor is `None` — the cos). Returns the ancestor ids, nearest first. A cycle or a
-/// supervisor that names no declared agent terminates the walk (the named id is still included — we ding
-/// its inbox regardless of whether it has a running task).
+/// The supervisor chain of the agent whose ID is `agent_id`, walked transitively via each agent's
+/// `supervisor` field to the root (whose supervisor is `None` — the cos). Returns the ancestors'
+/// immutable agent IDs, nearest first. A cycle terminates the walk; a supervisor that names no
+/// declared agent terminates it with the unresolvable reference included, because we ding its
+/// inbox regardless of whether it has a running task and that reference is the only identity it
+/// has. Every resolvable hop carries the resolved ID, never the declared reference.
 fn supervisor_chain(agent_id: &str, specs: &[AgentSpec], host: &str) -> Vec<String> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let find = |identity: &str| {
-        specs
-            .iter()
-            .find(|spec| spec.identity == identity || spec.bus_id(host) == identity)
-    };
-    let mut current = find(agent_id).and_then(|s| s.supervisor.clone());
-    while let Some(sup) = current {
-        if !seen.insert(sup.clone()) {
-            break; // cycle guard
+    // The walk carries the CHILD spec, not a bare reference: each edge is resolved in the
+    // namespace that child's own migration state declares (`supervisor_chain::supervisor_selector`).
+    let mut current = specs.iter().find(|spec| spec.agent_id(host) == agent_id);
+    while let Some(child) = current {
+        let Some(reference) = child.supervisor.as_deref() else {
+            break;
+        };
+        match crate::supervisor_chain::resolve_supervisor_spec(specs, child, host) {
+            Some(parent) => {
+                let id = parent.agent_id(host);
+                if !seen.insert(id.clone()) {
+                    break; // cycle guard, keyed by subject rather than by spelling
+                }
+                chain.push(id);
+                current = Some(parent);
+            }
+            None => {
+                if seen.insert(reference.to_owned()) {
+                    chain.push(reference.to_owned());
+                }
+                break;
+            }
         }
-        chain.push(sup.clone());
-        current = find(&sup).and_then(|s| s.supervisor.clone());
     }
     chain
 }
@@ -1176,14 +1231,14 @@ fn run_eval_inner(
             let participants = team
                 .specs
                 .iter()
-                .map(|spec| spec.bus_id(host))
+                .map(|spec| spec.agent_id(host))
                 .collect::<Vec<_>>();
             (team.specs, participants, Some(team.routes))
         } else {
             let specs = spec_to_agent_specs(&compact_agents, host, catalog);
             let participants = specs
                 .iter()
-                .map(|spec| spec.bus_id(host))
+                .map(|spec| spec.agent_id(host))
                 .collect::<Vec<_>>();
             (specs, participants, None)
         };
@@ -1216,24 +1271,24 @@ fn run_eval_inner(
         let msg = eval.message.as_ref().ok_or_else(|| {
             anyhow::anyhow!("a team eval needs a message{{}} kickoff before any agent can launch")
         })?;
-        let matches = specs
-            .iter()
-            .filter(|agent| agent.identity == msg.to || agent.bus_id(host) == msg.to)
-            .map(|agent| agent.bus_id(host))
-            .collect::<Vec<_>>();
-        let [sup] = matches.as_slice() else {
-            let authority = if eval.canonical_agents {
-                "canonical-agents"
-            } else {
-                "compact"
-            };
-            anyhow::bail!(
-                "{authority} kickoff target `{}` must resolve to exactly one Agent Spec, found {}",
-                msg.to,
-                matches.len()
-            );
+        // The kickoff target is an ordinary human reference written in the eval spec, so it goes
+        // through the address algorithm — and what travels onward is the resolved agent ID, never
+        // the reference. Absence and ambiguity carry their own address-specific diagnostics.
+        let book = crate::spec::address_book(&specs, host)?;
+        let sup = match book.resolve_address(&msg.to, Some(host)) {
+            Ok(subject) => subject.id.as_str().to_owned(),
+            Err(error) => {
+                let authority = if eval.canonical_agents {
+                    "canonical-agents"
+                } else {
+                    "compact"
+                };
+                anyhow::bail!(
+                    "{authority} kickoff target `{}` must resolve to exactly one Agent Spec: {error}",
+                    msg.to
+                );
+            }
         };
-        let sup = sup.clone();
 
         if let Some(routes) = canonical_routes.as_ref() {
             if routes.contains_key(&requester) {
@@ -1686,6 +1741,95 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    /// The participant vector and the kickoff target are immutable agent IDs, so the done-detector
+    /// must read `from-id:`. A UUID ID is neither equal to nor a dotted suffix of the sender's bus
+    /// address, so matching on `from:` burns the full `max_timeout` on a team that finished.
+    #[test]
+    fn done_detection_matches_a_uuid_sender_by_its_immutable_id() {
+        const SUP_ID: &str = "0199c0de-0000-7000-8000-0000000000a1";
+        const WORKER_ID: &str = "0199c0de-0000-7000-8000-0000000000b2";
+        let bus = tempfile::tempdir().unwrap();
+        let sup_inbox = bus.path().join(SUP_ID).join("inbox");
+        let req_inbox = bus.path().join("requester").join("inbox");
+
+        // worker → sup report, then the sup → requester confirmation that post-dates it. Both
+        // carry a bus address in `from:` that shares no bytes with the sender's ID.
+        crate::message::send_to_inbox_from_agent(
+            &sup_inbox,
+            "h.worker",
+            Some(WORKER_ID),
+            Some("report"),
+            None,
+            &[],
+            "done",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        crate::message::send_to_inbox_from_agent(
+            &req_inbox,
+            "h.sup",
+            Some(SUP_ID),
+            Some("confirmation"),
+            None,
+            &[],
+            "done",
+        )
+        .unwrap();
+
+        assert!(
+            wait_done(
+                bus.path(),
+                None,
+                SUP_ID,
+                "requester",
+                &[WORKER_ID.to_owned()],
+                None,
+                None,
+                Duration::from_secs(2),
+                &mut || {},
+            ),
+            "a report and confirmation attributed by from-id must fire done"
+        );
+    }
+
+    /// A record predating `from-id:` still attributes by its route, so unmigrated fixtures and
+    /// eval-owned flat senders keep working.
+    #[test]
+    fn done_detection_falls_back_to_the_route_for_a_version_1_record() {
+        let bus = tempfile::tempdir().unwrap();
+        crate::message::send_to_inbox(
+            &bus.path().join("sup").join("inbox"),
+            "h.worker",
+            Some("report"),
+            None,
+            &[],
+            "done",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        crate::message::send_to_inbox(
+            &bus.path().join("requester").join("inbox"),
+            "h.sup",
+            Some("confirmation"),
+            None,
+            &[],
+            "done",
+        )
+        .unwrap();
+
+        assert!(wait_done(
+            bus.path(),
+            None,
+            "sup",
+            "requester",
+            &["worker".to_owned()],
+            None,
+            None,
+            Duration::from_secs(2),
+            &mut || {},
+        ));
+    }
+
     #[test]
     fn canonical_eval_team_uses_exact_catalog_declarations_and_runtime_ids() {
         let catalog = tempfile::tempdir().unwrap();
@@ -1800,7 +1944,7 @@ mod tests {
         assert_eq!(
             team.specs
                 .iter()
-                .map(|spec| spec.bus_id("evalhost"))
+                .map(|spec| spec.agent_id("evalhost"))
                 .collect::<Vec<_>>(),
             ["evalhost.local"]
         );
@@ -2315,7 +2459,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         assert_eq!(sup.tasks[1].id.as_deref(), Some("evalhost.mix.sup.ding"));
         assert_eq!(
             sup.tasks[1].command.as_deref(),
-            Some("st2 ding --identity evalhost.mix.sup --root $ST_ROOT")
+            Some("st2 ding --id evalhost.mix.sup --root $ST_ROOT")
         );
 
         let plan = reconcile(&specs, &[], "evalhost").unwrap();
@@ -2461,7 +2605,8 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
                 [
                     exact.display().to_string(),
                     "ding".into(),
-                    "--identity".into(),
+                    // The derived companion addresses its agent by exact ID, never by a route.
+                    "--id".into(),
                     "host.worker".into(),
                     "--root".into(),
                     root.join("bus root").display().to_string(),
@@ -2488,7 +2633,7 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
         assert_eq!(
             std::fs::read_to_string(&exact_receipt).unwrap(),
             format!(
-                "ding\n--identity\nhost.worker\n--root\n{}\n",
+                "ding\n--id\nhost.worker\n--root\n{}\n",
                 root.join("bus root").display()
             )
         );

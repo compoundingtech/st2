@@ -165,19 +165,21 @@ pub fn expand_driver(spec: &AgentSpec, this_host: &str) -> Result<KdlDocument> {
         "agent '{}' has no host and driver expansion received no host fallback",
         spec.identity
     );
-    let bus_id = spec.bus_id(this_host);
+    // Generated wrapper arguments carry the immutable agent ID as an exact-ID selector. They are
+    // never handed to an address parser: a driver expansion is automation, not a human route.
+    let agent_id = spec.agent_id(this_host);
     let mut output = match driver {
-        Driver::Claude(driver) => expand_claude(driver, &bus_id)?,
-        Driver::Codex(driver) => expand_codex(driver, &bus_id),
-        Driver::Pi(driver) => expand_pi(driver, &bus_id),
-        Driver::OpenCode(driver) => expand_opencode(driver, &bus_id),
-        Driver::Omp(driver) => expand_omp(driver, &bus_id),
+        Driver::Claude(driver) => expand_claude(driver, &agent_id)?,
+        Driver::Codex(driver) => expand_codex(driver, &agent_id),
+        Driver::Pi(driver) => expand_pi(driver, &agent_id),
+        Driver::OpenCode(driver) => expand_opencode(driver, &agent_id),
+        Driver::Omp(driver) => expand_omp(driver, &agent_id),
     };
     output.autoformat();
     Ok(output)
 }
 
-fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
+fn expand_codex(driver: &CodexDriver, agent_id: &str) -> KdlDocument {
     let mut provider = vec!["codex".to_string()];
     if let Some(model) = &driver.model {
         provider.extend(["--model".to_string(), model.clone()]);
@@ -194,10 +196,10 @@ fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "codex".to_string(),
-        "--identity".to_string(),
-        bus_id.to_string(),
+        "--id".to_string(),
+        agent_id.to_string(),
         "--runtime-id".to_string(),
-        bus_id.to_string(),
+        agent_id.to_string(),
         "--".to_string(),
     ];
     argv.extend(provider);
@@ -208,7 +210,7 @@ fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
 /// that extension from this binary's verified hook set rather than writing a machine-local path
 /// into the declaration. `-a` accepts the workspace for this run only, which is why no pi analogue
 /// of [`crate::pretrust`] exists — nothing in the operator's ambient pi config is mutated.
-fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
+fn expand_pi(driver: &PiDriver, agent_id: &str) -> KdlDocument {
     let mut provider = vec!["pi".to_string(), "-a".to_string()];
     if let Some(model) = &driver.model {
         provider.extend(["--model".to_string(), model.clone()]);
@@ -225,10 +227,10 @@ fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "pi-session".to_string(),
-        "--identity".to_string(),
-        bus_id.to_string(),
+        "--id".to_string(),
+        agent_id.to_string(),
         "--runtime-id".to_string(),
-        bus_id.to_string(),
+        agent_id.to_string(),
         "--".to_string(),
     ];
     argv.extend(provider);
@@ -238,7 +240,7 @@ fn expand_pi(driver: &PiDriver, bus_id: &str) -> KdlDocument {
 /// omp needs no rendered configuration file either: its channel is a pi-style extension the
 /// wrapper injects from this binary's verified hook set. omp has no pi `-a` equivalent it needs
 /// for a workspace launch — the wrapper already runs with the workspace as cwd.
-fn expand_omp(driver: &OmpDriver, bus_id: &str) -> KdlDocument {
+fn expand_omp(driver: &OmpDriver, agent_id: &str) -> KdlDocument {
     let mut provider = vec!["omp".to_string()];
     if let Some(model) = &driver.model {
         provider.extend(["--model".to_string(), model.clone()]);
@@ -255,10 +257,10 @@ fn expand_omp(driver: &OmpDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "omp-session".to_string(),
-        "--identity".to_string(),
-        bus_id.to_string(),
+        "--id".to_string(),
+        agent_id.to_string(),
         "--runtime-id".to_string(),
-        bus_id.to_string(),
+        agent_id.to_string(),
         "--".to_string(),
     ];
     argv.extend(provider);
@@ -267,7 +269,7 @@ fn expand_omp(driver: &OmpDriver, bus_id: &str) -> KdlDocument {
 
 /// OpenCode's server surface is wrapper-owned runtime state: the wrapper allocates the port and
 /// password at launch, so the expansion stays a pure declaration with no machine-local values.
-fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
+fn expand_opencode(driver: &OpenCodeDriver, agent_id: &str) -> KdlDocument {
     let mut provider = vec!["opencode".to_string()];
     if let Some(model) = &driver.model {
         provider.extend(["--model".to_string(), model.clone()]);
@@ -283,17 +285,17 @@ fn expand_opencode(driver: &OpenCodeDriver, bus_id: &str) -> KdlDocument {
         CATALOG.to_string(),
         "driver".to_string(),
         "opencode-session".to_string(),
-        "--identity".to_string(),
-        bus_id.to_string(),
+        "--id".to_string(),
+        agent_id.to_string(),
         "--runtime-id".to_string(),
-        bus_id.to_string(),
+        agent_id.to_string(),
         "--".to_string(),
     ];
     argv.extend(provider);
     document([node("argv", argv)])
 }
 
-fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
+fn expand_claude(driver: &ClaudeDriver, agent_id: &str) -> Result<KdlDocument> {
     // The same registration a hand-authored seat carries: without it a driver-declared
     // seat has no observed-state producer and no lifecycle hooks at all.
     let settings = serde_json::to_string_pretty(&crate::hooks::claude_settings_registration())?;
@@ -333,10 +335,10 @@ fn expand_claude(driver: &ClaudeDriver, bus_id: &str) -> Result<KdlDocument> {
         CATALOG.to_string(),
         "driver".to_string(),
         "claude-session".to_string(),
-        "--identity".to_string(),
-        bus_id.to_string(),
+        "--id".to_string(),
+        agent_id.to_string(),
         "--runtime-id".to_string(),
-        bus_id.to_string(),
+        agent_id.to_string(),
         "--".to_string(),
     ];
     argv.extend(provider);
@@ -367,6 +369,8 @@ mod tests {
 
     fn spec(driver: Driver) -> AgentSpec {
         AgentSpec {
+            id: None,
+            address: None,
             identity: "worker".into(),
             name: None,
             description: None,
@@ -497,7 +501,7 @@ mod tests {
                 "$CATALOG",
                 "driver",
                 "codex",
-                "--identity",
+                "--id",
                 "host.worker",
                 "--runtime-id",
                 "host.worker",
@@ -511,6 +515,39 @@ mod tests {
                 "override",
                 "Start work."
             ]
+        );
+    }
+
+    /// A driver expansion is automation: it must select the immutable ID, so a later address
+    /// change cannot repoint a generated wrapper at a different subject.
+    #[test]
+    fn driver_expansion_selects_the_immutable_id_and_never_the_mutable_address() {
+        let mut declared = spec(Driver::Codex(CodexDriver {
+            model: None,
+            effort: None,
+            prompt: "Start work.".into(),
+            args: Vec::new(),
+        }));
+        declared.id =
+            Some(agent_spec::AgentId::parse("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1").unwrap());
+        declared.address = Some(agent_spec::AgentAddress::parse("keymap.verifier").unwrap());
+
+        let output = expand_driver(&declared, "unused").unwrap();
+        let argv = strings(output.get("argv").unwrap());
+
+        let id = argv.iter().position(|arg| *arg == "--id").unwrap();
+        assert_eq!(argv[id + 1], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        let runtime = argv.iter().position(|arg| *arg == "--runtime-id").unwrap();
+        assert_eq!(argv[runtime + 1], "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1");
+        assert!(
+            !argv.iter().any(|arg| *arg == "--identity"),
+            "an exact-ID selector must not be spelled as the address-parsing flag"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("keymap.verifier") || arg.contains("host.worker")),
+            "no generated argument may carry a human route: {argv:?}"
         );
     }
 
@@ -535,7 +572,7 @@ mod tests {
                 "$CATALOG",
                 "driver",
                 "opencode-session",
-                "--identity",
+                "--id",
                 "host.worker",
                 "--runtime-id",
                 "host.worker",
@@ -587,7 +624,7 @@ mod tests {
                 "$CATALOG",
                 "driver",
                 "claude-session",
-                "--identity",
+                "--id",
                 "host.worker",
                 "--runtime-id",
                 "host.worker",

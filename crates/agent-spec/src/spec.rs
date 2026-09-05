@@ -21,6 +21,10 @@ use std::time::Duration;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use crate::identity::{
+    AddressBook, AgentAddress, AgentId, Subject, bus_address, legacy_bus_identity,
+};
+
 /// Maximum Unicode scalar count for an agent's human-facing label.
 pub const AGENT_NAME_MAX_CHARS: usize = 160;
 /// Maximum Unicode scalar count for an agent's enduring responsibility description.
@@ -314,8 +318,17 @@ impl AgentDesiredState {
 /// A rendered agent job, lowered to the shared declaration fields st2 and other readers inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpec {
-    /// Unique id; the bus id is `<host>.<identity>`.
+    /// Explicit catalog-global immutable agent ID.
+    ///
+    /// `None` is an unmigrated legacy declaration. Its implicit ID is exactly the value migration
+    /// freezes — `<resolved-host>.<identity>` — so [`AgentSpec::agent_id`] is the single ownership
+    /// selector before and after migration and no declaration-anchored state moves when the field
+    /// appears.
+    pub id: Option<AgentId>,
+    /// Positional declaration key and legacy address fallback. Not immutable subject identity.
     pub identity: String,
+    /// Explicit mutable host-local semantic address. `None` falls back to `identity`.
+    pub address: Option<AgentAddress>,
     /// Optional mutable human-facing label. Never used as an automation selector.
     pub name: Option<String>,
     /// Optional enduring responsibility boundary. Never used for lifecycle decisions.
@@ -585,13 +598,49 @@ impl Default for Restart {
 }
 
 impl AgentSpec {
-    /// The bus id this spec compiles to — `<host>.<identity>` — using `this_host` when `host` is unset.
-    pub fn bus_id(&self, this_host: &str) -> String {
-        format!(
-            "{}.{}",
-            self.host.as_deref().unwrap_or(this_host),
-            self.identity
-        )
+    /// The catalog-global immutable agent ID that owns this subject's runtime, durable state,
+    /// graph edges, and automation.
+    ///
+    /// An explicit `id` is authoritative. An unmigrated legacy declaration yields exactly the
+    /// bytes migration freezes, so this is one selector with one meaning across the transition.
+    /// Never use it as a human route: after an address change the two diverge.
+    pub fn agent_id(&self, this_host: &str) -> String {
+        match &self.id {
+            Some(id) => id.as_str().to_owned(),
+            None => self.legacy_bus_identity(this_host),
+        }
+    }
+
+    /// The positional declaration key `<host>.<identity>` — the legacy address fallback and the
+    /// exact bytes legacy-ID migration freezes.
+    pub fn legacy_bus_identity(&self, this_host: &str) -> String {
+        legacy_bus_identity(self.resolved_host(this_host), &self.identity)
+    }
+
+    /// The effective address: explicit `address` when present, else the positional `identity`.
+    pub fn effective_address(&self) -> &str {
+        match &self.address {
+            Some(address) => address.as_str(),
+            None => &self.identity,
+        }
+    }
+
+    /// The qualified human route `<host>.<effective-address>`.
+    ///
+    /// This routes; it never owns. A retired subject is non-routable — read
+    /// [`AgentSpec::subject`] and consult [`Subject::bus_address`] when routability matters.
+    pub fn bus_address(&self, this_host: &str) -> String {
+        bus_address(self.resolved_host(this_host), self.effective_address())
+    }
+
+    /// This declaration as one address-book subject.
+    pub fn subject(&self, this_host: &str) -> anyhow::Result<Subject> {
+        Ok(Subject {
+            id: AgentId::parse(&self.agent_id(this_host))?,
+            host: self.resolved_host(this_host).to_owned(),
+            effective_address: self.effective_address().to_owned(),
+            routable: !self.desired_state.is_retired(),
+        })
     }
 
     /// The host that should run this spec, defaulting to `this_host` when unset.
@@ -622,6 +671,20 @@ impl AgentSpec {
     pub fn restart_policy(&self) -> Restart {
         self.restart.clone().unwrap_or_default()
     }
+}
+
+/// Project one complete catalog snapshot into the address book ordinary references resolve
+/// through.
+///
+/// Build this from an immutable discovery result so a lookup and the uniqueness proof it depends on
+/// describe the same catalog generation. A declaration whose implicit or explicit ID cannot be
+/// admitted is a catalog error, not a silently skipped subject.
+pub fn address_book(specs: &[AgentSpec], this_host: &str) -> anyhow::Result<AddressBook> {
+    specs
+        .iter()
+        .map(|spec| spec.subject(this_host))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(AddressBook::new)
 }
 
 // ---- Duration parsing ("60s", "5s", "20m", "2h", "3d") ---------------------------------------
@@ -658,7 +721,11 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// render-agnostic.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RawSpec {
+    /// Explicit catalog-global immutable agent ID, as written.
+    pub id: Option<String>,
     pub identity: Option<String>,
+    /// Explicit mutable host-local semantic address, as written.
+    pub address: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub host: Option<String>,
@@ -1209,7 +1276,9 @@ impl RawSpec {
     /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
     /// has none of these and is skipped.
     pub(crate) fn looks_like_spec(&self) -> bool {
-        self.identity.is_some()
+        self.id.is_some()
+            || self.address.is_some()
+            || self.identity.is_some()
             || self.job_type.as_deref() == Some("service")
             || self.retired.is_some()
             || self.desired_state.is_some()
@@ -1241,6 +1310,18 @@ impl RawSpec {
         host: Option<String>,
         path: PathBuf,
     ) -> anyhow::Result<AgentSpec> {
+        let declared_id = self
+            .id
+            .as_deref()
+            .map(AgentId::parse)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("agent '{identity}': {error}"))?;
+        let declared_address = self
+            .address
+            .as_deref()
+            .map(AgentAddress::parse)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("agent '{identity}': {error}"))?;
         validate_presentation("name", self.name.as_deref(), AGENT_NAME_MAX_CHARS)?;
         validate_presentation(
             "description",
@@ -1319,9 +1400,13 @@ impl RawSpec {
                 "agent '{identity}' declares both a compact launch and `pty \"agent\"`; choose one form"
             );
         }
-        let bus_id = format!("{}.{}", host.as_deref().unwrap_or_default(), identity)
-            .trim_start_matches('.')
-            .to_string();
+        // Runtime ownership keys off the immutable agent ID. For an unmigrated legacy declaration
+        // that is exactly the bytes migration freezes, which is why every existing task ID and
+        // socket path survives the transition unchanged.
+        let agent_id = match &declared_id {
+            Some(id) => id.as_str().to_owned(),
+            None => legacy_bus_identity(host.as_deref().unwrap_or_default(), &identity),
+        };
         let mut tasks: Vec<Task> = Vec::new();
         // Authored task names, captured before the maps are consumed: a derived stream companion must
         // not silently shadow an explicit sibling that already owns `stream-<name>`.
@@ -1344,8 +1429,8 @@ impl RawSpec {
                 kind: TaskKind::Pty,
                 derived: false,
                 name: "agent".to_string(),
-                // An agent IS its pty: ding defaults its poke target to this same bus id.
-                id: Some(bus_id.clone()),
+                // An agent IS its pty: the canonical compact task's runtime ID is the agent ID.
+                id: Some(agent_id.clone()),
                 command: self.command,
                 argv: self.argv,
                 cwd: None,
@@ -1360,8 +1445,9 @@ impl RawSpec {
                 kind: TaskKind::Exec,
                 derived: true,
                 name: "ding".to_string(),
-                id: Some(format!("{bus_id}.ding")),
-                command: Some(format!("st2 ding --identity {bus_id} --root $ST_ROOT")),
+                id: Some(format!("{agent_id}.ding")),
+                // DING receives an exact-ID selector, never a mutable address.
+                command: Some(format!("st2 ding --id {agent_id} --root $ST_ROOT")),
                 argv: None,
                 cwd: None,
                 tags: BTreeMap::new(),
@@ -1427,7 +1513,7 @@ impl RawSpec {
                 kind: TaskKind::Exec,
                 derived: true,
                 name: task_name.clone(),
-                id: Some(format!("{bus_id}.{task_name}")),
+                id: Some(format!("{agent_id}.{task_name}")),
                 command,
                 argv,
                 cwd: None,
@@ -1444,7 +1530,9 @@ impl RawSpec {
         let resources = self.resource.lower()?;
 
         Ok(AgentSpec {
+            id: declared_id,
             identity,
+            address: declared_address,
             name: self.name,
             description: self.description,
             host,
