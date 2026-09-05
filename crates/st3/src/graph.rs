@@ -5,9 +5,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    CheckpointActivation, CheckpointSpec, DesiredSubject, GateSpec, LaunchSpec, LinkSpec,
-    MemberKind, MemberLifecycle, MemberSpec, MessageTemplate, NormalizedIntent, ObserverSpec,
-    PlanRunCancellation, RestartIntensity, RestartType, ScheduleSpec, St3Error, SubscriptionSpec,
+    DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec, MessageTemplate,
+    NormalizedIntent, ObserverSpec, PlanRunCancellation, RestartIntensity, RestartType,
+    ScheduleSpec, St3Error, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -15,13 +15,11 @@ const ROOT_NODES: &[&str] = &[
     "exec",
     "pty",
     "host",
+    "doc",
     "resource",
     "observer",
     "subscription",
     "person",
-    "account",
-    "supervisor",
-    "link",
     "plan",
     "plan-run",
     "message",
@@ -32,9 +30,7 @@ const ROOT_NODES: &[&str] = &[
 struct ParseContext {
     default_host: String,
     subjects: BTreeMap<String, DesiredSubject>,
-    checkpoints: Vec<CheckpointSpec>,
     document_refs: BTreeSet<String>,
-    checkpoint: Option<CheckpointActivation>,
     owner_run: Option<String>,
     allow_execution_root: bool,
     plan_run_cancellations: Vec<PlanRunCancellation>,
@@ -119,9 +115,7 @@ fn parse_intent_with_owner(
     let mut context = ParseContext {
         default_host: default_host.to_owned(),
         subjects: BTreeMap::new(),
-        checkpoints: Vec::new(),
         document_refs: BTreeSet::new(),
-        checkpoint: None,
         owner_run: owner_run.map(str::to_owned),
         allow_execution_root,
         plan_run_cancellations: Vec::new(),
@@ -133,8 +127,6 @@ fn parse_intent_with_owner(
     if let Some(run) = owner_run {
         rewrite_owned_references(&mut context.subjects, owner_run_id(run));
     }
-    validate_links(&context.subjects)?;
-
     let normalized_nodes = children
         .nodes()
         .iter()
@@ -146,7 +138,6 @@ fn parse_intent_with_owner(
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
-        checkpoints: context.checkpoints,
         plans,
         plan_run_cancellations: context.plan_run_cancellations,
         document_refs: context.document_refs,
@@ -292,7 +283,6 @@ fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             kind: "host".into(),
             desired: canonical_node(node)?,
             member: None,
-            activation: context.checkpoint.clone(),
             owner_run: context.owner_run.clone(),
             owner_generation: None,
             owner_step: None,
@@ -348,9 +338,6 @@ fn parse_agent(
     let workspace = child_string(children, "workspace")?.unwrap_or_else(|| ".".into());
     let environment = parse_map_child(children, "env")?;
     let display_name = child_string(children, "name")?;
-    let supervisor = child_string(children, "supervisor")?
-        .map(|name| namespaced("supervisor", &name))
-        .unwrap_or_else(|| "supervisor/root".into());
     let lifecycle = parse_lifecycle(child_string(children, "lifecycle")?)?;
     let restart = parse_restart_type(restart_type_value(children)?)?;
     let restart_intensity = parse_restart_intensity(children)?;
@@ -393,7 +380,6 @@ fn parse_agent(
             restart.clone(),
             restart_intensity.clone(),
             shutdown_timeout_ms,
-            &supervisor,
         )?);
     } else if let Some(launch) = compact_launch(command, argv)? {
         primary = Some(MemberSpec {
@@ -412,7 +398,6 @@ fn parse_agent(
             restart_intensity: restart_intensity.clone(),
             shutdown_timeout_ms,
             driver: None,
-            supervisor: supervisor.clone(),
         });
     }
 
@@ -425,7 +410,6 @@ fn parse_agent(
             kind: "agent".into(),
             desired,
             member: primary,
-            activation: context.checkpoint.clone(),
             owner_run: context.owner_run.clone(),
             owner_generation: None,
             owner_step: None,
@@ -466,7 +450,6 @@ fn parse_agent(
             restart_intensity.clone(),
             shutdown_timeout_ms,
             false,
-            &supervisor,
         )?;
         insert_subject(
             context,
@@ -475,7 +458,6 @@ fn parse_agent(
                 kind: child.name().value().into(),
                 desired: canonical_node(child)?,
                 member: Some(member),
-                activation: context.checkpoint.clone(),
                 owner_run: context.owner_run.clone(),
                 owner_generation: None,
                 owner_step: None,
@@ -524,9 +506,6 @@ fn parse_standalone_member(
     let lifecycle = parse_lifecycle(child_string(children, "lifecycle")?)?;
     let restart = parse_restart_type(restart_type_value(children)?)?;
     let restart_intensity = parse_restart_intensity(children)?;
-    let supervisor = child_string(children, "supervisor")?
-        .map(|name| namespaced("supervisor", &name))
-        .unwrap_or_else(|| "supervisor/root".into());
     let shutdown_timeout_ms = child_string(children, "shutdown-timeout")?
         .map(|value| parse_duration(&value, true))
         .transpose()?
@@ -543,7 +522,6 @@ fn parse_standalone_member(
         restart_intensity,
         shutdown_timeout_ms,
         true,
-        &supervisor,
     )?;
     insert_subject(
         context,
@@ -552,7 +530,6 @@ fn parse_standalone_member(
             kind: kind.into(),
             desired: canonical_node(node)?,
             member: Some(member),
-            activation: context.checkpoint.clone(),
             owner_run: context.owner_run.clone(),
             owner_generation: None,
             owner_step: None,
@@ -564,6 +541,7 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     let name = first_string(node)?;
     validate_name(&name, false)?;
     match kind {
+        "doc" => validate_doc(node)?,
         "resource" => validate_resource(node)?,
         "observer" => validate_observer(node)?,
         "subscription" => validate_subscription(node)?,
@@ -571,15 +549,12 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
             ensure_no_properties(node)?;
             one_string(node)?;
         }
-        "account" => validate_account(node)?,
-        "supervisor" => validate_supervisor(node)?,
-        "link" => validate_link(node)?,
         "message" => validate_message(node)?,
         "schedule" => validate_schedule(node)?,
         _ => unreachable!("the desired-state registry controls structure kinds"),
     }
     let subject = match kind {
-        "resource" if name.starts_with("doc/") || name.starts_with("file/") => name,
+        "doc" => format!("doc/{name}"),
         "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
             format!(
                 "{kind}/{}/{}",
@@ -596,12 +571,20 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
             kind: kind.into(),
             desired: canonical_node(node)?,
             member: None,
-            activation: context.checkpoint.clone(),
             owner_run: context.owner_run.clone(),
             owner_generation: None,
             owner_step: None,
         },
-    )
+    )?;
+    if kind == "doc" {
+        let hash = required_child_string(
+            node.children().expect("a validated doc has a body"),
+            "hash",
+            &name,
+        )?;
+        context.document_refs.insert(format!("doc/{name}@{hash}"));
+    }
+    Ok(())
 }
 
 fn parse_stop(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
@@ -633,7 +616,6 @@ fn parse_stop(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
             kind: "stop".into(),
             desired: json!({ "stop": subject }),
             member: None,
-            activation: context.checkpoint.clone(),
             owner_run: context.owner_run.clone(),
             owner_generation: None,
             owner_step: None,
@@ -703,12 +685,13 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
                     && !party.starts_with("person/")
                 {
                     let local = party.strip_prefix("agent/").unwrap_or(&party);
-                    if !local.starts_with(&format!("{run}/")) {
-                        values
+                    if !local.starts_with(&format!("{run}/"))
+                        && let Some(value) = values
                             .get_mut("arguments")
                             .and_then(Value::as_array_mut)
                             .and_then(|arguments| arguments.first_mut())
-                            .map(|value| *value = Value::String(format!("agent/{run}/{local}")));
+                    {
+                        *value = Value::String(format!("agent/{run}/{local}"));
                     }
                 }
                 for value in values.values_mut() {
@@ -722,155 +705,6 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
         rewrite(&mut subject.desired, &aliases);
         rewrite_agent_parties(&mut subject.desired, run);
     }
-}
-
-#[allow(dead_code)]
-fn parse_checkpoints(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
-    if context.checkpoint.is_some() {
-        return Err(St3Error::new(
-            "nested-checkpoints",
-            "a checkpoint subgraph cannot contain checkpoints",
-        ));
-    }
-    ensure_no_properties(node)?;
-    let name = one_string_with_children(node)?;
-    let sequence = namespaced("checkpoint", &name);
-    let sequence_subject = sequence.clone();
-    insert_subject(
-        context,
-        DesiredSubject {
-            subject: sequence_subject,
-            kind: "checkpoints".into(),
-            desired: canonical_node(node)?,
-            member: None,
-            activation: None,
-            owner_run: context.owner_run.clone(),
-            owner_generation: None,
-            owner_step: None,
-        },
-    )?;
-    let children = node.children().ok_or_else(|| {
-        St3Error::new(
-            "empty-checkpoints",
-            format!("checkpoint sequence `{name}` is empty"),
-        )
-    })?;
-    let mut names = HashSet::new();
-    for (ordinal, checkpoint) in children.nodes().iter().enumerate() {
-        if checkpoint.name().value() != "checkpoint" {
-            return Err(St3Error::new(
-                "invalid-checkpoint-child",
-                format!(
-                    "checkpoint sequence `{name}` contains `{}`",
-                    checkpoint.name().value()
-                ),
-            ));
-        }
-        ensure_no_properties(checkpoint)?;
-        let checkpoint_name = one_string_with_children(checkpoint)?;
-        if checkpoint_name.is_empty() || checkpoint_name.len() > 160 {
-            return Err(St3Error::new(
-                "invalid-checkpoint-name",
-                "a checkpoint name must contain 1 through 160 bytes",
-            ));
-        }
-        if !names.insert(checkpoint_name.clone()) {
-            return Err(St3Error::new(
-                "duplicate-checkpoint",
-                format!("checkpoint sequence `{name}` repeats `{checkpoint_name}`"),
-            ));
-        }
-        let body = checkpoint.children().ok_or_else(|| {
-            St3Error::new(
-                "missing-checkpoint-body",
-                format!("checkpoint `{checkpoint_name}` has no body"),
-            )
-        })?;
-        let subgraphs = body
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "subgraph")
-            .collect::<Vec<_>>();
-        let gate_nodes = body
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "gate")
-            .collect::<Vec<_>>();
-        if subgraphs.len() > 1
-            || gate_nodes.is_empty()
-            || body.nodes().len() != subgraphs.len() + gate_nodes.len()
-        {
-            return Err(St3Error::new(
-                "invalid-checkpoint-shape",
-                format!(
-                    "checkpoint `{checkpoint_name}` needs one or more gates and at most one subgraph"
-                ),
-            ));
-        }
-        let mut gates = Vec::new();
-        let mut gate_names = HashSet::new();
-        for gate_node in gate_nodes {
-            let gate = parse_gate(gate_node, &context.default_host)?;
-            if !gate_names.insert(gate_name(&gate).to_owned()) {
-                return Err(St3Error::new(
-                    "duplicate-gate",
-                    format!(
-                        "checkpoint `{checkpoint_name}` repeats gate `{}`",
-                        gate_name(&gate)
-                    ),
-                ));
-            }
-            gates.push(gate);
-        }
-        let activation = CheckpointActivation {
-            sequence: sequence.clone(),
-            ordinal: ordinal as u32,
-        };
-        if let Some(subgraph) = subgraphs.first() {
-            ensure_bare(subgraph)?;
-            let body = subgraph.children().ok_or_else(|| {
-                St3Error::new(
-                    "empty-checkpoint-subgraph",
-                    format!("checkpoint `{checkpoint_name}` has an empty subgraph"),
-                )
-            })?;
-            let prior_activation = context.checkpoint.replace(activation.clone());
-            for child in body.nodes() {
-                if child.name().value() == "checkpoints" {
-                    return Err(St3Error::new(
-                        "nested-checkpoints",
-                        "a checkpoint subgraph cannot contain checkpoints",
-                    ));
-                }
-                parse_desired_node(child, None, context)?;
-            }
-            context.checkpoint = prior_activation;
-        }
-        let checkpoint_spec = CheckpointSpec {
-            subject: format!("checkpoint/{name}/{ordinal}"),
-            sequence: sequence.clone(),
-            name: checkpoint_name,
-            ordinal: ordinal as u32,
-            gates,
-        };
-        insert_subject(
-            context,
-            DesiredSubject {
-                subject: checkpoint_spec.subject.clone(),
-                kind: "checkpoint-stage".into(),
-                desired: serde_json::to_value(&checkpoint_spec).map_err(|error| {
-                    St3Error::new("internal", format!("normalize checkpoint: {error}"))
-                })?,
-                member: None,
-                activation: None,
-                owner_run: context.owner_run.clone(),
-                owner_generation: None,
-                owner_step: None,
-            },
-        )?;
-        context.checkpoints.push(checkpoint_spec);
-    }
-    Ok(())
 }
 
 pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec, St3Error> {
@@ -1186,7 +1020,6 @@ fn driver_member(
     restart: RestartType,
     restart_intensity: RestartIntensity,
     shutdown_timeout_ms: u64,
-    supervisor: &str,
 ) -> Result<MemberSpec, St3Error> {
     let name = one_string_with_children(driver)?;
     let children = driver.children().ok_or_else(|| {
@@ -1258,7 +1091,6 @@ fn driver_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: Some(name),
-        supervisor: supervisor.into(),
     })
 }
 
@@ -1275,7 +1107,6 @@ fn task_member(
     default_intensity: RestartIntensity,
     default_shutdown_timeout_ms: u64,
     standalone: bool,
-    supervisor: &str,
 ) -> Result<MemberSpec, St3Error> {
     let body = node.children().ok_or_else(|| {
         St3Error::new(
@@ -1343,7 +1174,6 @@ fn task_member(
         restart_intensity,
         shutdown_timeout_ms,
         driver: None,
-        supervisor: supervisor.into(),
     })
 }
 
@@ -1462,7 +1292,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "type",
         "host",
         "workspace",
-        "supervisor",
         "under",
         "keep",
         "lifecycle",
@@ -1490,7 +1319,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "type",
         "host",
         "workspace",
-        "supervisor",
         "keep",
         "lifecycle",
         "shutdown-timeout",
@@ -1629,14 +1457,7 @@ fn validate_task_body(
         "unset",
     ];
     if standalone {
-        allowed.extend([
-            "host",
-            "workspace",
-            "supervisor",
-            "restart",
-            "shutdown-timeout",
-            "render",
-        ]);
+        allowed.extend(["host", "workspace", "restart", "shutdown-timeout", "render"]);
     }
     reject_unknown_children(document, &allowed, "member", owner)?;
     for child in [
@@ -1653,13 +1474,7 @@ fn validate_task_body(
         unique_child(document, child)?;
     }
     if standalone {
-        for child in [
-            "host",
-            "workspace",
-            "supervisor",
-            "shutdown-timeout",
-            "render",
-        ] {
+        for child in ["host", "workspace", "shutdown-timeout", "render"] {
             unique_child(document, child)?;
         }
         validate_restart_forms(document)?;
@@ -1885,37 +1700,34 @@ fn validate_render(node: &KdlNode) -> Result<(), St3Error> {
     Ok(())
 }
 
+fn validate_doc(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let name = one_string_with_children(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("missing-doc-body", format!("doc `{name}` needs a hash")))?;
+    reject_unknown_children(body, &["hash"], "doc", &name)?;
+    let hash = required_child_string(body, "hash", &name)?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(St3Error::new(
+            "invalid-document-hash",
+            format!("doc `{name}` needs a 64-character SHA-256 hash"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_resource(node: &KdlNode) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
     one_string_with_children(node)?;
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("missing-resource-body", "a resource needs a kind"))?;
-    reject_unknown_children(body, &["kind", "binding"], "resource", "resource")?;
+    reject_unknown_children(body, &["kind"], "resource", "resource")?;
     let kind = required_child_string(body, "kind", "resource")?;
-    if !matches!(
-        kind.as_str(),
-        "vcs.pull-request"
-            | "ci.run"
-            | "repository"
-            | "file"
-            | "document"
-            | "harness.session-file"
-            | "human.review"
-    ) {
-        return Err(St3Error::new(
-            "unsupported-capability",
-            format!("resource kind `{kind}` is not registered"),
-        ));
-    }
-    if let Some(binding) = child_string(body, "binding")?
-        && binding != "late"
-    {
-        return Err(St3Error::new(
-            "invalid-resource-binding",
-            "a resource binding must be `late`",
-        ));
-    }
+    st3_schema::registry()
+        .validate_resource_kind(&kind)
+        .map_err(|error| St3Error::new(error.code, error.message))?;
     Ok(())
 }
 
@@ -2006,145 +1818,6 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
         return Err(St3Error::new(
             "unsupported-subscription-delivery",
             "a subscription delivery must be `message`",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_no_properties(node)?;
-    one_string_with_children(node)?;
-    let body = node
-        .children()
-        .ok_or_else(|| St3Error::new("missing-account-body", "an account needs a body"))?;
-    reject_unknown_children(
-        body,
-        &["provider", "external-account", "auth-type"],
-        "account",
-        "account",
-    )?;
-    required_child_string(body, "provider", "account")?;
-    required_child_string(body, "external-account", "account")?;
-    let auth = required_child_string(body, "auth-type", "account")?;
-    if !matches!(auth.as_str(), "subscription" | "api-key") {
-        return Err(St3Error::new(
-            "invalid-auth-type",
-            format!("invalid account auth type `{auth}`"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_supervisor(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_no_properties(node)?;
-    one_string_with_children(node)?;
-    let Some(body) = node.children() else {
-        return Ok(());
-    };
-    reject_unknown_children(body, &["terminal-control"], "supervisor", "supervisor")?;
-    let mut names = HashSet::new();
-    for gate in body.nodes() {
-        let name = first_string(gate)?;
-        if !names.insert(name.clone()) {
-            return Err(St3Error::new(
-                "duplicate-terminal-control",
-                format!("terminal control `{name}` repeats"),
-            ));
-        }
-        ensure_only_properties(gate, &["driver"])?;
-        let driver = property_string(gate, "driver")?.ok_or_else(|| {
-            St3Error::new(
-                "missing-terminal-control-driver",
-                format!("terminal control `{name}` needs a driver"),
-            )
-        })?;
-        if !matches!(driver.as_str(), "claude" | "codex" | "pi" | "opencode") {
-            return Err(St3Error::new(
-                "invalid-terminal-control-driver",
-                format!("invalid terminal control driver `{driver}`"),
-            ));
-        }
-        let children = gate.children().ok_or_else(|| {
-            St3Error::new(
-                "empty-terminal-control",
-                format!("terminal control `{name}` is empty"),
-            )
-        })?;
-        reject_unknown_children(
-            children,
-            &["contains", "selected", "key", "max-inputs"],
-            "terminal control",
-            &name,
-        )?;
-        unique_child(children, "selected")?;
-        unique_child(children, "max-inputs")?;
-        let matchers = children
-            .nodes()
-            .iter()
-            .filter(|child| matches!(child.name().value(), "contains" | "selected"))
-            .count();
-        let keys = children
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "key")
-            .collect::<Vec<_>>();
-        if matchers == 0 || keys.is_empty() {
-            return Err(St3Error::new(
-                "invalid-terminal-control",
-                format!("terminal control `{name}` needs a matcher and a key"),
-            ));
-        }
-        for key in &keys {
-            let key = one_string(key)?;
-            if !matches!(
-                key.as_str(),
-                "enter" | "escape" | "tab" | "space" | "up" | "down" | "left" | "right"
-            ) {
-                return Err(St3Error::new(
-                    "invalid-terminal-control-key",
-                    format!("invalid terminal control key `{key}`"),
-                ));
-            }
-        }
-        let max_inputs = child_integer(children, "max-inputs")?.unwrap_or(keys.len() as i128);
-        if max_inputs < keys.len() as i128 || max_inputs > u32::MAX as i128 {
-            return Err(St3Error::new(
-                "invalid-terminal-control-limit",
-                format!("terminal control `{name}` has an invalid max-inputs value"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_link(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_no_properties(node)?;
-    one_string_with_children(node)?;
-    let body = node
-        .children()
-        .ok_or_else(|| St3Error::new("missing-link-body", "a link needs a body"))?;
-    reject_unknown_children(
-        body,
-        &["from", "to", "required", "on-unreachable"],
-        "link",
-        "link",
-    )?;
-    let from = required_child_string(body, "from", "link")?;
-    let to = required_child_string(body, "to", "link")?;
-    validate_full_subject(&from)?;
-    validate_full_subject(&to)?;
-    if from == to {
-        return Err(St3Error::new("link-cycle", "a link cannot target itself"));
-    }
-    let required = unique_child(body, "required")?
-        .map(one_bool)
-        .transpose()?
-        .unwrap_or(true);
-    let policy = child_string(body, "on-unreachable")?.unwrap_or_else(|| "hold".into());
-    if !matches!(policy.as_str(), "hold" | "void") || (!required && policy != "hold") {
-        return Err(St3Error::new(
-            "invalid-link-policy",
-            format!("invalid link policy `{policy}`"),
         ));
     }
     Ok(())
@@ -2437,20 +2110,6 @@ fn parse_utc_time(value: &str) -> Result<i64, St3Error> {
         .map_err(|error| St3Error::new("invalid-utc-time", error.to_string()))
 }
 
-pub fn link_spec(value: &Value) -> Option<LinkSpec> {
-    Some(LinkSpec {
-        from: canonical_child_value(value, "from")?.as_str()?.to_owned(),
-        to: canonical_child_value(value, "to")?.as_str()?.to_owned(),
-        required: canonical_child_value(value, "required")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        on_unreachable: canonical_child_value(value, "on-unreachable")
-            .and_then(Value::as_str)
-            .unwrap_or("hold")
-            .to_owned(),
-    })
-}
-
 pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> {
     let children = value.get("children")?.as_array()?;
     if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
@@ -2561,59 +2220,6 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             .to_owned(),
         stopped: false,
     })
-}
-
-pub fn supervisor_terminal_controls(value: &Value) -> Vec<crate::model::TerminalControlSpec> {
-    let Some(children) = value.get("children").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    children
-        .iter()
-        .filter(|child| child.get("name").and_then(Value::as_str) == Some("terminal-control"))
-        .filter_map(|gate| {
-            let name = gate
-                .get("arguments")?
-                .as_array()?
-                .first()?
-                .as_str()?
-                .to_owned();
-            let driver = gate.pointer("/properties/driver")?.as_str()?.to_owned();
-            let body = gate.get("children")?.as_array()?;
-            let values = |kind: &str| {
-                body.iter()
-                    .filter(|child| child.get("name").and_then(Value::as_str) == Some(kind))
-                    .filter_map(|child| {
-                        child
-                            .get("arguments")?
-                            .as_array()?
-                            .first()?
-                            .as_str()
-                            .map(str::to_owned)
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let contains = values("contains");
-            let selected = values("selected").into_iter().next();
-            let keys = values("key");
-            let max_inputs = body
-                .iter()
-                .find(|child| child.get("name").and_then(Value::as_str) == Some("max-inputs"))
-                .and_then(|child| child.get("arguments"))
-                .and_then(Value::as_array)
-                .and_then(|values| values.first())
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(keys.len() as u32);
-            Some(crate::model::TerminalControlSpec {
-                name,
-                driver,
-                contains,
-                selected,
-                keys,
-                max_inputs,
-            })
-        })
-        .collect()
 }
 
 pub fn agent_under(value: &Value) -> Vec<crate::model::UnderSpec> {
@@ -2799,38 +2405,6 @@ fn validate_document_ref(value: &str) -> Result<(), St3Error> {
             "invalid-document-reference",
             format!("invalid document reference `{value}`"),
         ));
-    }
-    Ok(())
-}
-
-fn validate_links(subjects: &BTreeMap<String, DesiredSubject>) -> Result<(), St3Error> {
-    let mut edges = BTreeMap::<String, String>::new();
-    for desired in subjects.values().filter(|subject| subject.kind == "link") {
-        let Some(spec) = link_spec(&desired.desired) else {
-            continue;
-        };
-        if spec.on_unreachable == "void" {
-            return Err(St3Error::new(
-                "invalid-link-policy",
-                format!("link `{}` uses removed void policy", desired.subject),
-            ));
-        }
-        if spec.required {
-            edges.insert(spec.from, spec.to);
-        }
-    }
-    for start in edges.keys() {
-        let mut seen = BTreeSet::new();
-        let mut cursor = start;
-        while let Some(next) = edges.get(cursor) {
-            if !seen.insert(cursor.clone()) || next == start {
-                return Err(St3Error::new(
-                    "link-cycle",
-                    format!("a required link cycle includes `{start}`"),
-                ));
-            }
-            cursor = next;
-        }
     }
     Ok(())
 }
@@ -3098,7 +2672,7 @@ fn repeated_child_strings(document: &KdlDocument, name: &str) -> Result<Vec<Stri
         .nodes()
         .iter()
         .filter(|node| node.name().value() == name)
-        .map(|node| one_string(node))
+        .map(one_string)
         .collect()
 }
 
@@ -3302,6 +2876,35 @@ fn valid_field_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_st3_eval_uses_the_current_graph_grammar() {
+        let evals = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("evals/st3");
+        let mut parsed = 0;
+        for entry in std::fs::read_dir(&evals).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let eval = entry.path().join("eval.kdl");
+            if !eval.is_file() {
+                continue;
+            }
+            let source = std::fs::read_to_string(&eval).unwrap();
+            let intent = parse_test_intent(&source, "eval-node")
+                .unwrap_or_else(|error| panic!("{}: {error}", eval.display()));
+            let ready = intent
+                .plans
+                .values()
+                .filter(|plan| plan.state == crate::model::PlanState::Ready)
+                .count();
+            assert_eq!(ready, 1, "{} must declare one ready plan", eval.display());
+            parsed += 1;
+        }
+        assert!(parsed >= 24, "the st3 eval corpus unexpectedly shrank");
+    }
 
     #[test]
     fn rejects_old_agent_root() {
@@ -3551,7 +3154,7 @@ subgraph {
             r#"
 version 2
 subgraph {
-  resource "queue" { kind "file" }
+  resource "queue" { kind "custom.example.queue" }
   observer "queue-watch" {
     resource "resource/queue"
     provider "example.queue"
@@ -3587,6 +3190,14 @@ subgraph { exec "work" mystery="value" { command "true" } }"#,
         )
         .expect_err("unknown property");
         assert_eq!(property.code, "unknown-property");
+
+        let obsolete_resource_binding = parse_test_intent(
+            r#"version 2
+subgraph { resource "source" { kind "custom.st3.document-source"; binding "late" } }"#,
+            "node",
+        )
+        .expect_err("resources are unbound until a claim supplies facts");
+        assert_eq!(obsolete_resource_binding.code, "unknown-child");
     }
 
     #[test]

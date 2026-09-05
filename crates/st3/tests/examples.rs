@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use agent_spec::spec::Driver;
+use sha2::{Digest as _, Sha256};
 
 fn assigned_to(step: &st3::model::StepSpec) -> Option<&str> {
     match &step.work_selector {
@@ -479,10 +480,13 @@ fn plan_document_lift_produces_and_uses_one_exact_plan_output() {
             step: "lift-plan-document".into()
         })
     );
-    assert!(
-        intent.document_refs.contains(
-            "doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769"
-        )
+    let document = fs::read(root.join("repo/PLAN.md")).unwrap();
+    let hash = hex::encode(Sha256::digest(&document));
+    let reference = format!("doc/evals/plan-document-lift/plan@{hash}");
+    assert!(intent.document_refs.contains(&reference));
+    assert_eq!(
+        fs::read(root.join(".st3-documents").join(hash)).unwrap(),
+        document
     );
 }
 

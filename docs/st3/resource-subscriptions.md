@@ -34,7 +34,6 @@ The command publishes this graph shape:
 ```kdl
 resource "github/compoundingtech/st2/pull/403" {
   kind "vcs.pull-request"
-  binding "late"
 }
 
 plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
@@ -63,7 +62,9 @@ plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
 }
 ```
 
-The resource stores normalized external facts. The plan run owns the observer and subscription.
+The resource begins unbound. The resource stores normalized external facts after its first observation.
+
+The plan run owns the observer and subscription.
 
 The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
 

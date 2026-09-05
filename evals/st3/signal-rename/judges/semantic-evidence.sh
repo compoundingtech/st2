@@ -22,7 +22,7 @@ for product in \
 do
   printf '\n### product: %s\n' "$product"
   st3 inspect "resource/plan-run/$ST_PLAN_RUN/$product" --json \
-    | jq -c '[.recent_claims[] | select(.kind == "resource.binding")][0] | {store_index, actor, fields: (.body.fields // .body)}'
+    | jq -c '[.recent_claims[] | select(.kind == "resource.observed")][0] | {store_index, actor, fields: (.body.fields // .body)}'
 done
 
 printf '\n### integrated commits and changed files\n'

@@ -44,9 +44,9 @@ subgraph {
         step "read-bug-report" { title "The exact immutable bug report is understood"; goal "Read the referenced task document through st3 doc get. Identify the leak reproduction, root-cause requirement, regression-test requirement, and verification contract." }
         step "send-debug-brief" {
           title "The specialist receives one bounded debugging brief"
-          goal "Send agent/${ST_PLAN_RUN}/gbx.fix exactly one Small Talk message. Require reproduction, root cause, smallest fix, a mutation-valid regression test, green suite, commit, and evidence report. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/debug-brief resource.binding --actor agent/${ST_PLAN_RUN}/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/gbx.fix exactly one Small Talk message. Require reproduction, root cause, smallest fix, a mutation-valid regression test, green suite, commit, and evidence report. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/debug-brief resource.observed --actor agent/${ST_PLAN_RUN}/gbx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "read-bug-report" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/debug-brief" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/debug-brief" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -67,15 +67,15 @@ subgraph {
         step "verify-regression-and-suite" { title "The regression and complete suite are green"; goal "Run node --test and the direct reproduction. Confirm defaultOptions remains byte-equivalent across a custom call. Inspect the final diff."; depends-on { step "implement-smallest-fix" completed } }
         step "publish-fix-revision" {
           title "The root-cause fix revision is published"
-          goal "Commit the source and regression test with the configured identity. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/fix-revision resource.binding --actor agent/${ST_PLAN_RUN}/gbx.fix --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+          goal "Commit the source and regression test with the configured identity. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/fix-revision resource.observed --actor agent/${ST_PLAN_RUN}/gbx.fix --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
           depends-on { step "verify-regression-and-suite" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/fix-revision" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/fix-revision" { kind "vcs.commit"; state "published" } }
         }
         step "report-fix-evidence" {
           title "The supervisor receives the complete debugging evidence"
-          goal "Send agent/${ST_PLAN_RUN}/gbx.sup exactly one Small Talk report. Include the root cause, changed files, commit, red-before proof, green suite, direct reproduction, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.binding --actor agent/${ST_PLAN_RUN}/gbx.fix --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/gbx.sup exactly one Small Talk report. Include the root cause, changed files, commit, red-before proof, green suite, direct reproduction, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.observed --actor agent/${ST_PLAN_RUN}/gbx.fix --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "publish-fix-revision" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/worker-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/worker-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -92,9 +92,9 @@ subgraph {
         step "verify-fix-read-only" { title "The supervisor independently verifies the root-cause fix"; goal "Without edits, inspect ../worker. Run the complete suite and direct reproduction. Verify the regression test, mutation-free defaultOptions, published HEAD, committed diff, and clean tree."; depends-on { step "read-worker-report" completed } }
         step "confirm-requester" {
           title "The requester receives one verified bug-fix confirmation"
-          goal "Send person/eval-requester exactly one Small Talk message. Cite the root cause, real commit, regression test, and read-only verification. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-confirmation resource.binding --actor agent/${ST_PLAN_RUN}/gbx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one Small Talk message. Cite the root cause, real commit, regression test, and read-only verification. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-confirmation resource.observed --actor agent/${ST_PLAN_RUN}/gbx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "verify-fix-read-only" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-confirmation" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-confirmation" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

@@ -1,0 +1,112 @@
+# st3 schema registry
+
+This file is generated from `st3-schema`.
+
+Schema: `st3.v1`
+Digest: `9fa525e024bc982995343041ae4cff813e5bbb8f8be8c1dce2c0a18380e0f22d`
+
+## Subject families
+
+| Family | Pattern | Client writable | Description |
+|---|---|---:|---|
+| `agent` | `agent/RUN/LOCAL_ID` | no | A plan-run agent runtime. |
+| `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
+| `daemon` | `daemon/NODE` | no | An st3 daemon. |
+| `doc` | `doc/NAME` | no | A named immutable document lineage. |
+| `exec` | `exec/RUN/LOCAL_ID` | no | A plan-run exec runtime. |
+| `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
+| `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
+| `host` | `host/NAME` | no | A graph host. |
+| `message` | `message/ID` | yes | A Small Talk message. |
+| `observer` | `observer/RUN/LOCAL_ID` | no | A plan-run resource observer. |
+| `person` | `person/IDENTITY` | no | A human actor. |
+| `plan` | `plan/ID` | no | An immutable plan revision lineage. |
+| `plan-run` | `plan-run/ID` | no | A plan execution. |
+| `planning-session` | `planning-session/ID` | no | A durable planning session. |
+| `pty` | `pty/RUN/LOCAL_ID` | no | A plan-run terminal runtime. |
+| `resource` | `resource/NAME` | yes | An observed external or durable fact bag. |
+| `revision-proposal` | `revision-proposal/ID` | no | A plan revision proposal. |
+| `run-generation` | `run-generation/ID` | no | An immutable plan-run generation. |
+| `schedule` | `schedule/RUN/LOCAL_ID` | no | A plan-run schedule. |
+| `step-run` | `step-run/GENERATION/PATH` | no | One step attempt lineage. |
+| `subscription` | `subscription/RUN/LOCAL_ID` | no | A plan-run observer subscription. |
+
+Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE.NAME`.
+
+## Resource kinds
+
+| Kind | Facts | Description |
+|---|---|---|
+| `ci.run` | `commit:subject-reference`, `completed_at:string`, `conclusion:string`, `external_id:string`, `name:string`, `provider:string`, `pull_request:subject-reference`, `repository:subject-reference`, `started_at:string`, `status:string`, `url:string` | A continuous integration run. |
+| `human.review` | `decision:string`, `reason:string`, `reviewer:subject-reference`, `submitted_at:string`, `target:subject-reference` | A human review of another graph subject. |
+| `vcs.commit` | `author:string`, `committed_at:string`, `committer:string`, `message:string`, `parents:array`, `repository:subject-reference immutable`, `sha:string immutable`, `state:string`, `tree:string immutable`, `url:string` | An immutable version control commit. |
+| `vcs.pull-request` | `author:string`, `base:subject-reference`, `checks:array`, `created_at:string`, `draft:boolean`, `head:subject-reference`, `merged:boolean`, `number:integer`, `repository:subject-reference`, `reviews:array`, `state:string`, `title:string`, `updated_at:string`, `url:string` | A version control pull request. |
+| `vcs.ref` | `name:string immutable`, `ref_type:string`, `repository:subject-reference immutable`, `target:subject-reference`, `url:string` | A named version control reference. |
+| `vcs.repository` | `default_ref:subject-reference`, `head:subject-reference`, `state:string`, `url:string`, `vcs:string` | A version control repository. |
+| `custom.NAMESPACE.NAME` | open fact bag | A namespaced custom resource. |
+
+## Claim kinds
+
+| Kind | Subjects | Write policy | Cardinality | Fields | KDL source |
+|---|---|---|---|---|---|
+| `agent.presence` | `agent` | `same-subject-actor` | `append` | `presence!:string`, `reason:string` |  |
+| `daemon.started` | `daemon` | `system-only` | `append` | `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` |  |
+| `doc.bound` | `doc` | `authorized-requester` | `append` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |
+| `eval.verdict` | `plan-run` | `system-only` | `once` | `reason:string`, `residue:array`, `verdict!:string` |  |
+| `gate.requested` | `gate-operation` | `system-only` | `once` | `attempt:integer`, `baseline:boolean`, `capability_expires_at:string`, `capability_hash:string`, `decisions:array`, `gate:string`, `model:string`, `operation:subject-reference`, `owner:subject-reference`, `plan_revision:string`, `question:string`, `review_targets:array`, `reviewer:subject-reference`, `runner:string`, `status:string`, `step_definition:string`, `token_budget:integer`, `tools:array` | `gate` |
+| `gate.result` | `gate-operation` | `capability-holder` | `append` | `baseline:boolean`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:subject-reference`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
+| `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
+| `harness.context-clear.result` | `agent` | `system-only` | `once` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
+| `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `reason:string`, `severity:string`, `status:string` |  |
+| `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
+| `harness.usage` | `agent` | `same-subject-actor` | `append` | `incarnation_id:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `total_tokens:integer` |  |
+| `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `subgraph` |
+| `message.closed` | `message` | `same-subject-actor` | `once-per-actor` | `status!:string` |  |
+| `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
+| `message.read` | `message` | `same-subject-actor` | `once-per-actor` | `status!:string` |  |
+| `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
+| `observer.observed` | `observer` | `system-only` | `append` | `changed_fields:array`, `cursor:string`, `locator:string`, `next_check_unix_ms:string`, `observation:subject-reference`, `provider:string`, `resource:subject-reference`, `revision:string`, `status:string` | `observer` |
+| `observer.state` | `observer` | `system-only` | `state-transition` | `reason:string`, `state!:string` | `observer` |
+| `plan-run.created` | `plan-run` | `system-only` | `once` | `current_generation:subject-reference`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mode:string`, `parent_step_run:subject-reference`, `plan:subject-reference`, `requester:subject-reference`, `revision:string`, `root_plan_run:subject-reference`, `root_revision:string`, `status:string`, `workspace:string` | `plan` |
+| `plan-run.state` | `plan-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `plan-run`, `completion`, `finally` |
+| `plan.produced` | `plan`, `step-run` | `capability-holder` | `append` | `attempt:integer`, `name:string`, `plan:subject-reference`, `revision:string`, `step_definition:string` | `produces` |
+| `plan.published` | `plan` | `authorized-requester` | `append` | `body:object`, `revision:string`, `state:string` | `plan` |
+| `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `plan_revision:string`, `preview_hash:string`, `requester:subject-reference`, `variant:string` |  |
+| `planning-session.cancelled` | `planning-session` | `authorized-requester` | `once` | `reason:string`, `requester:subject-reference` |  |
+| `planning-session.candidate-submitted` | `planning-session` | `same-subject-actor` | `append` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `plan_revision:string`, `revision:integer`, `variant:string` |  |
+| `planning-session.previewed` | `planning-session` | `system-only` | `append` | `candidate_revision:integer`, `diff:string`, `graph:string`, `plan:object`, `preview_hash:string`, `store_index:integer`, `variant:string` |  |
+| `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` |  |
+| `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `plan:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` |  |
+| `resource.observed` | `resource` | `ordinary-client` | `append` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
+| `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |
+| `revision-proposal.approved` | `revision-proposal` | `authorized-requester` | `once-per-actor` | `all_approved:boolean`, `preview_hash:string`, `reviewer:subject-reference` |  |
+| `revision-proposal.cancelled` | `revision-proposal` | `authorized-requester` | `once` | `reason:string`, `status:string` |  |
+| `revision-proposal.created` | `revision-proposal` | `authorized-requester` | `once` | `candidate_revision:string`, `compatible_steps:array`, `cutover:string`, `preview_hash:string`, `reason:string`, `reviewers:array`, `run:subject-reference`, `source_generation:subject-reference`, `status:string` |  |
+| `run-generation.created` | `run-generation` | `system-only` | `once` | `compatible_steps:array`, `predecessor:subject-reference`, `reason:string`, `revision:string`, `run:subject-reference`, `status:string` | `plan` |
+| `run-generation.state` | `run-generation` | `system-only` | `state-transition` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `plan` |
+| `run-generation.superseded` | `run-generation` | `system-only` | `once` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `plan` |
+| `runtime.action.deadline-reached` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
+| `runtime.action.failed` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
+| `runtime.action.requested` | `agent`, `exec`, `pty`, `gate-operation` | `authorized-requester` | `append` | `action:string`, `deadline_unix_ms:string`, `incarnation_id:string`, `operation:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
+| `runtime.action.succeeded` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
+| `runtime.observed` | `agent`, `exec`, `pty`, `gate-operation` | `same-subject-actor` | `append` | `adopted:boolean`, `driver:string`, `exit_code:integer`, `exit_signal:integer`, `host:string`, `incarnation_id:string`, `reachability:string`, `reason:string`, `runtime_id:string`, `shutdown_timeout_ms:integer`, `status:string`, `terminal:boolean` |  |
+| `runtime.reconcile-decision` | `agent`, `exec`, `pty` | `system-only` | `append` | `decision:string`, `gate:string`, `input_number:integer`, `key:string`, `reachability:string`, `reason:string`, `restart_at_unix_ms:string` |  |
+| `runtime.restart-window-reset` | `agent`, `exec`, `pty` | `system-only` | `append` | `desired_token:string`, `incarnation_id:string` |  |
+| `schedule.occurrence-cancelled` | `schedule` | `system-only` | `append` | `occurrence:integer`, `reason:string`, `revision:string` | `schedule` |
+| `schedule.occurrence-reached` | `schedule` | `system-only` | `append` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled:subject-reference`, `scheduled_at_unix_ms:string` | `schedule` |
+| `schedule.occurrence-scheduled` | `schedule` | `system-only` | `append` | `at_unix_ms:integer`, `occurrence:integer`, `revision:string`, `scheduled_at_unix_ms:string` | `schedule` |
+| `step-run.carried` | `step-run` | `system-only` | `once` | `attempt:integer`, `definition_hash:string`, `source:subject-reference`, `source_generation:subject-reference`, `source_step_run:subject-reference`, `status:string`, `worker_reported:boolean` | `step` |
+| `step-run.retried` | `step-run` | `system-only` | `append` | `attempt:integer`, `not_before_unix_ms:integer`, `reason:string`, `status:string` | `step` |
+| `step-run.state` | `step-run` | `system-only` | `state-transition` | `attempt:integer`, `readiness_epoch:integer`, `reason:string`, `status:string` | `step` |
+| `subscription.state` | `subscription` | `system-only` | `state-transition` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
+| `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `byte_count:integer`, `incarnation_id:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
+| `terminal.input.result` | `agent`, `pty` | `system-only` | `once` | `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string`, `sequence:integer` |  |
+| `transport.observed` | `host` | `system-only` | `append` | `last_success_at:integer`, `protocol:string`, `reason:string`, `remote_heads:object`, `status!:string` |  |
+| `work.claimed` | `step-run` | `same-subject-actor` | `state-transition` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.failed` | `step-run` | `same-subject-actor` | `once` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.progress` | `step-run` | `same-subject-actor` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.released` | `step-run` | `same-subject-actor` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.renewed` | `step-run` | `same-subject-actor` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.submitted` | `step-run` | `same-subject-actor` | `once` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+
+`resource.observed` validates facts against the resource kind. Custom resource facts remain open.

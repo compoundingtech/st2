@@ -119,6 +119,11 @@ enum Command {
     },
     /// Publish one registered typed observation.
     Claim(ClaimArgs),
+    /// Inspect the authoritative subject, resource, and claim schema.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
     /// Record a human review decision.
     Review {
         #[command(subcommand)]
@@ -300,6 +305,9 @@ struct RunArgs {
     inputs: Vec<(String, String)>,
     #[arg(long)]
     detach: bool,
+    /// Treat the run as a disposable eval and remove its runtime state at completion.
+    #[arg(long)]
+    eval: bool,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
 }
@@ -564,13 +572,32 @@ struct ClaimArgs {
     fields: Vec<(String, Value)>,
     #[arg(long)]
     evidence: Vec<String>,
+    /// Return the same logical result when this graph-wide key is retried.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SchemaCommand {
+    /// List registered subject families.
+    Subjects,
+    /// List registered resource kinds.
+    Resources,
+    /// List claim kinds, optionally for one subject.
+    Claims {
+        #[arg(long)]
+        subject: Option<String>,
+    },
+    /// Show one claim kind.
+    Show { kind: String },
+    /// Export the complete registry.
+    Export,
 }
 
 #[derive(Subcommand)]
 enum ReviewCommand {
     Approve(ReviewArgs),
     Reject(ReviewArgs),
-    Revise(ReviewArgs),
 }
 
 #[derive(Subcommand)]
@@ -877,6 +904,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Context { command } => run_context(&client, command, cli.json).await,
         Command::Resource { command } => run_resource(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
+        Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Review { command } => run_review(&client, command, cli.json).await,
         Command::Work { command } => run_work(&client, command, cli.json).await,
         Command::Message { command } => run_message(&client, command, cli.json).await,
@@ -930,9 +958,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
         actor: None,
         fields: BTreeMap::from([
             ("status".into(), Value::String("running".into())),
+            ("pid".into(), Value::from(std::process::id())),
             (
                 "version".into(),
                 Value::String(env!("CARGO_PKG_VERSION").into()),
+            ),
+            (
+                "schema".into(),
+                Value::String(st3_schema::SCHEMA_NAME.into()),
+            ),
+            (
+                "schema_digest".into(),
+                Value::String(st3_schema::registry().digest()),
             ),
         ]),
         evidence: Vec::new(),
@@ -1265,7 +1302,7 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
                 revision: Some(selected.revision.clone()),
                 workspace: workspace.to_string_lossy().into_owned(),
                 requester: args.requester,
-                mode: Some("run".into()),
+                mode: Some(if args.eval { "eval" } else { "run" }.into()),
                 inputs: unique_pairs(args.inputs, "input")?,
                 idempotency_key: format!(
                     "run:{}:{nonce}:{}",
@@ -1663,7 +1700,7 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
             .await?;
         for event in events {
             cursor = cursor.max(event.store_index);
-            if event.kind == "action.failed" {
+            if event.kind == "runtime.action.failed" {
                 anyhow::bail!("{} failed: {}", subject, event.body);
             }
         }
@@ -2287,7 +2324,7 @@ async fn run_status(client: &Client, args: StatusArgs, json_output: bool) -> Res
                 "/v1/claims",
                 &ClaimInput {
                     subject,
-                    kind: "presence.observed".into(),
+                    kind: "agent.presence".into(),
                     actor: Some(normalize_agent_subject(identity)),
                     fields: BTreeMap::from([
                         ("presence".into(), Value::String(presence)),
@@ -2493,6 +2530,10 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
             let hash = hex::encode(Sha256::digest(args.url.as_bytes()));
             let subject = format!("resource/{}", &hash[..20]);
             let fields = BTreeMap::from([
+                (
+                    "kind".into(),
+                    Value::String("custom.st3.external-reference".into()),
+                ),
                 ("status".into(), Value::String("active".into())),
                 ("url".into(), Value::String(args.url)),
                 (
@@ -2517,7 +2558,7 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                     "/v1/claims",
                     &ClaimInput {
                         subject: subject.clone(),
-                        kind: "resource.binding".into(),
+                        kind: "resource.observed".into(),
                         actor: Some(normalize_agent_subject(&owner)),
                         fields,
                         evidence: Vec::new(),
@@ -2596,7 +2637,7 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                     "/v1/claims",
                     &ClaimInput {
                         subject: subject.clone(),
-                        kind: "resource.binding".into(),
+                        kind: "resource.observed".into(),
                         actor: Some(normalize_agent_subject(&identity)),
                         fields: BTreeMap::from([(
                             "status".into(),
@@ -2730,7 +2771,7 @@ async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Resul
                 fields: args.fields.into_iter().collect(),
                 evidence: args.evidence,
                 expected_subject: None,
-                idempotency_key: None,
+                idempotency_key: args.idempotency_key,
             },
         )
         .await?;
@@ -2742,11 +2783,65 @@ async fn run_claim(client: &Client, args: ClaimArgs, json_output: bool) -> Resul
     }
 }
 
+async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) -> Result<()> {
+    let value: Value = client.get("/v1/schema").await?;
+    let selected = match command {
+        SchemaCommand::Export => value,
+        SchemaCommand::Subjects => value
+            .get("subjects")
+            .cloned()
+            .context("the schema response lacks subjects")?,
+        SchemaCommand::Resources => value
+            .get("resources")
+            .cloned()
+            .context("the schema response lacks resources")?,
+        SchemaCommand::Claims { subject } => {
+            let claims = value
+                .get("claims")
+                .and_then(Value::as_object)
+                .context("the schema response lacks claims")?;
+            if let Some(subject) = subject {
+                let family = subject
+                    .split_once('/')
+                    .map(|(family, _)| family)
+                    .context("a schema subject must be a full subject")?;
+                Value::Object(
+                    claims
+                        .iter()
+                        .filter(|(_, spec)| {
+                            spec.get("subjects")
+                                .and_then(Value::as_array)
+                                .is_some_and(|subjects| {
+                                    subjects.iter().any(|candidate| {
+                                        candidate.as_str() == Some("*")
+                                            || candidate.as_str() == Some(family)
+                                    })
+                                })
+                        })
+                        .map(|(kind, spec)| (kind.clone(), spec.clone()))
+                        .collect(),
+                )
+            } else {
+                Value::Object(claims.clone())
+            }
+        }
+        SchemaCommand::Show { kind } => {
+            let escaped = kind.replace('~', "~0").replace('/', "~1");
+            value
+                .pointer(&format!("/claims/{escaped}"))
+                .or_else(|| value.pointer(&format!("/resources/{escaped}")))
+                .or_else(|| value.pointer(&format!("/subjects/{escaped}")))
+                .cloned()
+                .with_context(|| format!("schema item `{kind}` is not registered"))?
+        }
+    };
+    print_value(&selected, json_output)
+}
+
 async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) -> Result<()> {
     let (decision, args) = match command {
         ReviewCommand::Approve(args) => ("approved", args),
         ReviewCommand::Reject(args) => ("rejected", args),
-        ReviewCommand::Revise(args) => ("revise", args),
     };
     let path = format!("/v1/reviews/{}", args.resource);
     let response: ClaimRecord = client
@@ -3237,11 +3332,11 @@ async fn accept_message(client: &Client, message: &MessageView, actor: Option<&s
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
-                lifecycle: "accepted".into(),
+                lifecycle: "read".into(),
                 actor: actor.map(str::to_owned),
                 evidence: Vec::new(),
                 expected_subject: None,
-                idempotency_key: format!("message-accepted:{}", message.subject),
+                idempotency_key: format!("message-read:{}", message.subject),
             },
         )
         .await?;
@@ -3884,14 +3979,15 @@ async fn run_quick(
             let mut ready = false;
             for event in events {
                 cursor = cursor.max(event.store_index);
-                if event.kind == "harness.ready"
-                    || (event.kind == "member.observed"
+                if (event.kind == "harness.observed"
+                    && event.body.pointer("/fields/state").and_then(Value::as_str) == Some("ready"))
+                    || (event.kind == "runtime.observed"
                         && event.body.pointer("/fields/status").and_then(Value::as_str)
                             == Some("ready"))
                 {
                     ready = true;
                 }
-                if event.kind == "harness.error" || event.kind == "action.failed" {
+                if event.kind == "harness.diagnostic" || event.kind == "runtime.action.failed" {
                     anyhow::bail!("{} became unreachable: {}", created.subject, event.body);
                 }
             }
@@ -3949,59 +4045,48 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("start {} provider", args.driver))?;
-    let mut ready = false;
-    loop {
-        tokio::select! {
-            status = child.wait() => {
-                let status = status?;
-                #[cfg(unix)]
-                let signal = {
-                    use std::os::unix::process::ExitStatusExt as _;
-                    status.signal()
-                };
-                let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                    subject: subject.into(),
-                    kind: "member.observed".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("exited".into())),
-                        ("exit_code".into(), status.code().map(Value::from).unwrap_or(Value::Null)),
-                        ("exit_signal".into(), signal.map(Value::from).unwrap_or(Value::Null)),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                }).await?;
-                if args.driver == "exec" {
-                    let code = status
-                        .code()
-                        .unwrap_or_else(|| 128_i32.saturating_add(signal.unwrap_or(1)))
-                        .clamp(0, 255) as u8;
-                    if code != 0 {
-                        return Err(CommandExit(code).into());
-                    }
-                    return Ok(());
-                }
-                anyhow::ensure!(status.success(), "{} exited with {status}", args.driver);
-                return Ok(());
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if !ready && args.driver != "claude" => {
-                let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                    subject: subject.into(),
-                    kind: "harness.ready".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("ready".into())),
-                        ("driver".into(), Value::String(args.driver.clone())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                }).await?;
-                ready = true;
-            }
+    let status = child.wait().await?;
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    };
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("exited".into())),
+                    (
+                        "exit_code".into(),
+                        status.code().map(Value::from).unwrap_or(Value::Null),
+                    ),
+                    (
+                        "exit_signal".into(),
+                        signal.map(Value::from).unwrap_or(Value::Null),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            },
+        )
+        .await?;
+    if args.driver == "exec" {
+        let code = status
+            .code()
+            .unwrap_or_else(|| 128_i32.saturating_add(signal.unwrap_or(1)))
+            .clamp(0, 255) as u8;
+        if code != 0 {
+            return Err(CommandExit(code).into());
         }
+        return Ok(());
     }
+    anyhow::ensure!(status.success(), "{} exited with {status}", args.driver);
+    Ok(())
 }
 
 async fn run_st2_native_driver(
@@ -4041,7 +4126,7 @@ async fn run_st2_native_driver(
                 let outcome = result?;
                 let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                     subject: subject.into(),
-                    kind: "member.observed".into(),
+                    kind: "runtime.observed".into(),
                     actor: Some(subject.into()),
                     fields: BTreeMap::from([
                         ("status".into(), Value::String("exited".into())),
@@ -4069,10 +4154,10 @@ async fn run_st2_native_driver(
                     {
                         let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
-                            kind: "harness.ready".into(),
+                            kind: "harness.observed".into(),
                             actor: Some(subject.into()),
                             fields: BTreeMap::from([
-                                ("status".into(), Value::String("ready".into())),
+                                ("state".into(), Value::String("ready".into())),
                                 ("driver".into(), Value::String(driver.into())),
                                 ("transport".into(), Value::String("native".into())),
                             ]),
@@ -4205,7 +4290,7 @@ async fn publish_harness_activity(
         st2::harness_state::Activity::Unknown => "indeterminate",
     };
     let fields = BTreeMap::from([
-        ("status".into(), Value::String(status.into())),
+        ("state".into(), Value::String(status.into())),
         ("driver".into(), Value::String(driver.into())),
         (
             "blocked_on".into(),
@@ -4242,7 +4327,7 @@ async fn publish_harness_activity(
             "/v1/claims",
             &ClaimInput {
                 subject: subject.into(),
-                kind: "harness.activity".into(),
+                kind: "harness.observed".into(),
                 actor: Some(subject.into()),
                 fields,
                 evidence: Vec::new(),
@@ -4313,10 +4398,10 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                         frame_sequence = frame_sequence.saturating_add(1);
                         let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
-                            kind: "harness.activity".into(),
+                            kind: "harness.observed".into(),
                             actor: Some(subject.into()),
                             fields: BTreeMap::from([
-                                ("status".into(), Value::String(status.into())),
+                                ("state".into(), Value::String(status.into())),
                                 ("driver".into(), Value::String("pi".into())),
                                 ("transport".into(), Value::String("pi-channel".into())),
                             ]),
@@ -4458,10 +4543,10 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                 if !ready && state_dir.join("binding.json").is_file() {
                     let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                         subject: subject.into(),
-                        kind: "harness.ready".into(),
+                        kind: "harness.observed".into(),
                         actor: Some(subject.into()),
                         fields: BTreeMap::from([
-                            ("status".into(), Value::String("ready".into())),
+                            ("state".into(), Value::String("ready".into())),
                             ("driver".into(), Value::String("codex".into())),
                             ("transport".into(), Value::String("app-server".into())),
                         ]),
@@ -4490,7 +4575,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         st2::harness_state::Activity::Unknown => "indeterminate",
                     };
                     let fields = BTreeMap::from([
-                        ("status".into(), Value::String(status.into())),
+                        ("state".into(), Value::String(status.into())),
                         ("driver".into(), Value::String("codex".into())),
                         ("blocked_on".into(), Value::String(observed.blocked_on.as_str().into())),
                         ("ask".into(), Value::String(observed.ask.as_str().into())),
@@ -4504,7 +4589,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                     ))?));
                     let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                         subject: subject.into(),
-                        kind: "harness.activity".into(),
+                        kind: "harness.observed".into(),
                         actor: Some(subject.into()),
                         fields,
                         evidence: Vec::new(),
@@ -4549,7 +4634,7 @@ async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
         .await?;
     for message in messages
         .iter()
-        .filter(|message| matches!(message.status.as_str(), "delivered" | "accepted"))
+        .filter(|message| matches!(message.status.as_str(), "delivered" | "read"))
     {
         let Some((step_subject, attempt, readiness_epoch, message_incarnation)) =
             work_message_target(message)
@@ -4881,10 +4966,10 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                         initialized = true;
                         let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
                             subject: subject.into(),
-                            kind: "harness.ready".into(),
+                            kind: "harness.observed".into(),
                             actor: Some(subject.into()),
                             fields: BTreeMap::from([
-                                ("status".into(), Value::String("ready".into())),
+                                ("state".into(), Value::String("ready".into())),
                                 ("driver".into(), Value::String("claude".into())),
                             ]),
                             evidence: Vec::new(),
@@ -5241,6 +5326,17 @@ mod tests {
         };
         assert_eq!(args.references, ["first", "second", "third"]);
         assert_eq!(args.actor.as_deref(), Some("agent/sup"));
+    }
+
+    #[test]
+    fn run_eval_flag_selects_disposable_run_mode() {
+        let cli = Cli::try_parse_from(["st3", "run", "eval.kdl", "--eval", "--detach"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("the run command did not parse");
+        };
+        assert!(args.eval);
+        assert!(args.detach);
+        assert_eq!(args.file.as_deref(), Some(Path::new("eval.kdl")));
     }
 
     #[tokio::test]

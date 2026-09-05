@@ -132,7 +132,6 @@ pub struct MemberSpec {
     pub restart_intensity: RestartIntensity,
     pub shutdown_timeout_ms: u64,
     pub driver: Option<String>,
-    pub supervisor: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -142,8 +141,6 @@ pub struct DesiredSubject {
     pub desired: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activation: Option<CheckpointActivation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,27 +317,11 @@ pub struct PlanRunInput {
     pub claim_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CheckpointActivation {
-    pub sequence: String,
-    pub ordinal: u32,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CheckpointSpec {
+pub struct GateContext {
     pub subject: String,
-    pub sequence: String,
     pub name: String,
-    pub ordinal: u32,
-    pub gates: Vec<GateSpec>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct LinkSpec {
-    pub from: String,
-    pub to: String,
-    pub required: bool,
-    pub on_unreachable: String,
+    pub started_at_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -367,16 +348,6 @@ pub struct ScheduleSpec {
     pub catch_up: String,
     pub max_catch_up: Option<u32>,
     pub message: Option<MessageTemplate>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TerminalControlSpec {
-    pub name: String,
-    pub driver: String,
-    pub contains: Vec<String>,
-    pub selected: Option<String>,
-    pub keys: Vec<String>,
-    pub max_inputs: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -445,7 +416,6 @@ pub struct NormalizedIntent {
     pub schema: String,
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,
-    pub checkpoints: Vec<CheckpointSpec>,
     #[serde(default)]
     pub plans: BTreeMap<String, PlanSpec>,
     #[serde(default)]
@@ -736,6 +706,10 @@ pub struct ClaimRecord {
     pub kind: String,
     pub origin: String,
     pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
     pub body: Value,
     pub predecessors: Vec<String>,
     pub accepted_at_unix_ms: u128,

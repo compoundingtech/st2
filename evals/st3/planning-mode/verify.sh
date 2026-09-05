@@ -12,5 +12,5 @@ jq -e '
 ' --arg hash "$(cat approved-preview-hash.txt)" approved.json >/dev/null
 jq -e '
   ([.recent_claims[] | select(.kind == "plan.published")] | length) == 1
-  and ([.recent_claims[] | select(.kind == "plan.documents")] | length) == 1
+  and ([.recent_claims[] | select(.kind == "planning-session.approved")] | length) == 1
 ' plan-inspect.json >/dev/null

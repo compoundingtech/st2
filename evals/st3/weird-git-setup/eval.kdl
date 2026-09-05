@@ -71,15 +71,15 @@ subgraph {
         }
         step "publish-feature-revision" {
           title "The feature worktree revision is published"
-          goal "Commit on the current feature branch with the configured identity. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/feature-revision resource.binding --actor agent/${ST_PLAN_RUN}/wg.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+          goal "Commit on the current feature branch with the configured identity. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/feature-revision resource.observed --actor agent/${ST_PLAN_RUN}/wg.dev --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
           depends-on { step "verify-complete-suite" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/feature-revision" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/feature-revision" { kind "vcs.commit"; state "published" } }
         }
         step "report-requester" {
           title "The requester receives the verified worktree result"
-          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, branch, linked-worktree evidence, and green test command. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.binding --actor agent/${ST_PLAN_RUN}/wg.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, branch, linked-worktree evidence, and green test command. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.observed --actor agent/${ST_PLAN_RUN}/wg.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "publish-feature-revision" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

@@ -28,6 +28,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 st-runtime = { path = "../st-runtime" }
+st3-schema = { path = "../st3-schema" }
 st2 = { path = "../.." }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

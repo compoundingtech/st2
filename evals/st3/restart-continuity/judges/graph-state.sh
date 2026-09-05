@@ -41,14 +41,14 @@ while read -r name kind state_name; do
       | (.kind == $kind) and (.state == $state)' \
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
-    | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
+    | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -eq 1
 done <<'PRODUCTS'
-pre-restart vcs.revision published
+pre-restart vcs.commit published
 restart cold-restart injected
-batch vcs.revision published
-worker-report message.receipt published
-verification message.receipt published
+batch vcs.commit published
+worker-report custom.st3.message-receipt published
+verification custom.st3.message-receipt published
 PRODUCTS
 
 echo "PASS: the graph records every work step and one binding for each required product"

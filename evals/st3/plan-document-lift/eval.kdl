@@ -5,7 +5,7 @@ subgraph {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/plan-document-lift."
     baseline "the exact source plan exists before planning starts" {
-      has "doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769" "# Deployment summary plan"
+      has "doc/evals/plan-document-lift/plan@99be916fc8c9bf56e58e5f33cf8f5c91497bd50549bb188c70fafd670e46cbc7" "# Deployment summary plan"
     }
 
     step "start-planner" timeout="10m" {
@@ -27,8 +27,8 @@ subgraph {
 
     step "lift-plan-document" timeout="20m" {
       title "The exact repository plan becomes a complete ready graph plan"
-      goal "Compile doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769 into ready plan eval/plan-document-lift/work before doing any project work. Claim each nested step before doing its work. Publish while publish-ready-graph-plan is claimed."
-      document "doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769"
+      goal "Compile doc/evals/plan-document-lift/plan@99be916fc8c9bf56e58e5f33cf8f5c91497bd50549bb188c70fafd670e46cbc7 into ready plan eval/plan-document-lift/work before doing any project work. Claim each nested step before doing its work. Publish while publish-ready-graph-plan is claimed."
+      document "doc/evals/plan-document-lift/plan@99be916fc8c9bf56e58e5f33cf8f5c91497bd50549bb188c70fafd670e46cbc7"
       assigned-to "agent/${ST_PLAN_RUN}/pdl.agent"
       depends-on { step "start-planner" completed }
       produces-plan "eval/plan-document-lift/work"
@@ -37,7 +37,7 @@ subgraph {
         goal "Complete plan work."
         step "read-exact-plan-document" {
           title "The exact immutable plan document is loaded"
-          goal "Run st3 doc get doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769 --output SOURCE-PLAN.md. Verify its SHA-256 and read it. Do not inspect inventory.json or create RESULT.md."
+          goal "Run st3 doc get doc/evals/plan-document-lift/plan@99be916fc8c9bf56e58e5f33cf8f5c91497bd50549bb188c70fafd670e46cbc7 --output SOURCE-PLAN.md. Verify its SHA-256 and read it. Do not inspect inventory.json or create RESULT.md."
         }
         step "author-complete-graph-plan" {
           title "The complete execution plan is encoded as KDL"
@@ -64,7 +64,7 @@ subgraph {
       title "All plan-document lifting gates pass"
       depends-on { step "execute-lifted-plan" completed }
       gate "the exact pre-published document bytes were used" {
-        exec "set -eu; tmp=$(mktemp); st3 doc get doc/evals/plan-document-lift/plan@939f7dd165d4fcc61f0d389731b37cf4cc9d3c604e08ded0284c5c722be64769 --output \"$tmp\" >/dev/null; cmp repo/PLAN.md \"$tmp\"; rm -f \"$tmp\""
+        exec "set -eu; tmp=$(mktemp); st3 doc get doc/evals/plan-document-lift/plan@99be916fc8c9bf56e58e5f33cf8f5c91497bd50549bb188c70fafd670e46cbc7 --output \"$tmp\" >/dev/null; cmp repo/PLAN.md \"$tmp\"; rm -f \"$tmp\""
         host "local"
         workspace "${ST_WORKSPACE}"
         time-limit "120000ms"

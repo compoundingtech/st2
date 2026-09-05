@@ -54,9 +54,9 @@ subgraph {
         }
         step "send-test-brief" {
           title "The developer receives one complete test brief"
-          goal "Send agent/${ST_PLAN_RUN}/tw.dev exactly one Small Talk message. Require tests for exact values, boundaries, range edges, aggregation, empty input, and error paths. State that src must not change. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-brief resource.binding --actor agent/${ST_PLAN_RUN}/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/tw.dev exactly one Small Talk message. Require tests for exact values, boundaries, range edges, aggregation, empty input, and error paths. State that src must not change. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-brief resource.observed --actor agent/${ST_PLAN_RUN}/tw.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "inspect-module-read-only" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/test-brief" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/test-brief" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -90,15 +90,15 @@ subgraph {
         }
         step "publish-test-revision" {
           title "The test revision is published"
-          goal "Commit the test-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-revision resource.binding --actor agent/${ST_PLAN_RUN}/tw.dev --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+          goal "Commit the test-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/test-revision resource.observed --actor agent/${ST_PLAN_RUN}/tw.dev --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
           depends-on { step "run-complete-suite" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/test-revision" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/test-revision" { kind "vcs.commit"; state "published" } }
         }
         step "report-test-result" {
           title "The supervisor receives the committed test result"
-          goal "Send agent/${ST_PLAN_RUN}/tw.sup exactly one Small Talk message. Include the revision, test count, covered behavior, green command, and unchanged src evidence. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/developer-report resource.binding --actor agent/${ST_PLAN_RUN}/tw.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/tw.sup exactly one Small Talk message. Include the revision, test count, covered behavior, green command, and unchanged src evidence. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/developer-report resource.observed --actor agent/${ST_PLAN_RUN}/tw.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "publish-test-revision" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/developer-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/developer-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -122,9 +122,9 @@ subgraph {
         }
         step "confirm-requester" {
           title "The requester receives one verified assessment"
-          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, test count, coverage summary, green command, unchanged src result, and your assessment. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-assessment resource.binding --actor agent/${ST_PLAN_RUN}/tw.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one Small Talk message. Include the revision, test count, coverage summary, green command, unchanged src result, and your assessment. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-assessment resource.observed --actor agent/${ST_PLAN_RUN}/tw.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "verify-read-only" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-assessment" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-assessment" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

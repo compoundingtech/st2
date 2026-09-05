@@ -35,10 +35,10 @@ while read -r name kind; do
   st3 inspect "resource/plan-run/$ST_PLAN_RUN/$name" --json \
     | jq -e --arg kind "$kind" '.status.subjects[0].actual | (.fields // .) | .kind == $kind and .state == "published"' >/dev/null
 done <<'PRODUCTS'
-debug-brief message.receipt
-fix-revision vcs.revision
-worker-report message.receipt
-final-confirmation message.receipt
+debug-brief custom.st3.message-receipt
+fix-revision vcs.commit
+worker-report custom.st3.message-receipt
+final-confirmation custom.st3.message-receipt
 PRODUCTS
 
 echo "PASS: the graph records the complete Ghost Bug plan and products"

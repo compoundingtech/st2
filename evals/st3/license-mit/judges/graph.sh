@@ -33,10 +33,10 @@ while read -r name kind; do
   st3 inspect "resource/plan-run/$ST_PLAN_RUN/$name" --json \
     | jq -e --arg kind "$kind" '.status.subjects[0].actual | (.fields // .) | .kind == $kind and .state == "published"' >/dev/null
 done <<'PRODUCTS'
-license-brief message.receipt
-license-revision vcs.revision
-worker-report message.receipt
-final-confirmation message.receipt
+license-brief custom.st3.message-receipt
+license-revision vcs.commit
+worker-report custom.st3.message-receipt
+final-confirmation custom.st3.message-receipt
 PRODUCTS
 
 echo "PASS: the graph records the complete License MIT plan and products"

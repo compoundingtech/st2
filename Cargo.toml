@@ -13,6 +13,7 @@ members = [
     "crates/st2-resource-wasip2",
     "crates/st2-wire",
     "crates/st3",
+    "crates/st3-schema",
     "crates/st3-migrate",
 ]
 default-members = [
@@ -22,6 +23,7 @@ default-members = [
     "crates/st2-resource-protocol",
     "crates/st2-wire",
     "crates/st3",
+    "crates/st3-schema",
     "crates/st3-migrate",
 ]
 

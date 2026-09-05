@@ -46,9 +46,9 @@ subgraph {
         step "read-request" { title "The exact immutable license request is understood"; goal "Read the referenced task document through st3 doc get. Confirm that the widget library must become MIT licensed." }
         step "send-worker-brief" {
           title "The worker receives one bounded license brief"
-          goal "Send agent/${ST_PLAN_RUN}/lmc.worker exactly one Small Talk message. Require canonical MIT LICENSE text, package.json license MIT, no proprietary text, a commit, and a clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/license-brief resource.binding --actor agent/${ST_PLAN_RUN}/lmc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/lmc.worker exactly one Small Talk message. Require canonical MIT LICENSE text, package.json license MIT, no proprietary text, a commit, and a clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/license-brief resource.observed --actor agent/${ST_PLAN_RUN}/lmc.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "read-request" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/license-brief" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/license-brief" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -67,15 +67,15 @@ subgraph {
         step "verify-license-change" { title "The complete MIT license surface is verified"; goal "Verify the MIT grant and warranty disclaimer, package.json license, absence of proprietary text, and the intended diff."; depends-on { step "apply-mit-license" completed } }
         step "publish-license-revision" {
           title "The MIT license revision is published"
-          goal "Commit the license-only change. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/license-revision resource.binding --actor agent/${ST_PLAN_RUN}/lmc.worker --field kind=vcs.revision --field state=published --field revision=SHA. Complete this step after the claim."
+          goal "Commit the license-only change. Confirm a clean tree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/license-revision resource.observed --actor agent/${ST_PLAN_RUN}/lmc.worker --field kind=vcs.commit --field state=published --field sha=SHA. Complete this step after the claim."
           depends-on { step "verify-license-change" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/license-revision" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/license-revision" { kind "vcs.commit"; state "published" } }
         }
         step "report-worker-result" {
           title "The supervisor receives the committed license evidence"
-          goal "Send agent/${ST_PLAN_RUN}/lmc.sup exactly one Small Talk report. Include changed files, commit, MIT checks, and clean-tree evidence. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.binding --actor agent/${ST_PLAN_RUN}/lmc.worker --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/lmc.sup exactly one Small Talk report. Include changed files, commit, MIT checks, and clean-tree evidence. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.observed --actor agent/${ST_PLAN_RUN}/lmc.worker --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "publish-license-revision" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/worker-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/worker-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -92,9 +92,9 @@ subgraph {
         step "verify-worker-revision-read-only" { title "The supervisor independently verifies the MIT revision"; goal "Without edits, inspect ../worker. Verify canonical MIT LICENSE text, package.json MIT, no proprietary text, the published HEAD, its commit diff, and a clean tree."; depends-on { step "read-worker-report" completed } }
         step "confirm-requester" {
           title "The requester receives one verified MIT confirmation"
-          goal "Send person/eval-requester exactly one Small Talk message. Cite the real commit and each read-only verification. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-confirmation resource.binding --actor agent/${ST_PLAN_RUN}/lmc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one Small Talk message. Cite the real commit and each read-only verification. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-confirmation resource.observed --actor agent/${ST_PLAN_RUN}/lmc.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "verify-worker-revision-read-only" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-confirmation" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-confirmation" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

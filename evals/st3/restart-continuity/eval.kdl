@@ -76,11 +76,11 @@ subgraph {
         }
         step "publish-pre-restart-revision" {
           title "The pre-restart revision is published"
-          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/pre-restart resource.binding --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
+          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/pre-restart resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
           depends-on { step "process-item-2" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/pre-restart" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -105,7 +105,7 @@ subgraph {
       }
       produces {
         resource "plan-run/${ST_PLAN_RUN}/restart" {
-          kind "cold-restart"
+          kind "custom.st3.cold-restart"
           state "injected"
         }
       }
@@ -144,22 +144,22 @@ subgraph {
         }
         step "publish-batch-revision" {
           title "The complete batch revision is published"
-          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/batch resource.binding --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."#
+          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/batch resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
           depends-on { step "verify-complete-batch" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/batch" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
         }
         step "report-to-supervisor" {
           title "The worker reports one result to the supervisor"
-          goal #"Send agent/${ST_PLAN_RUN}/rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.binding --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+          goal #"Send agent/${ST_PLAN_RUN}/rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
           depends-on { step "publish-batch-revision" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/worker-report" {
-              kind "message.receipt"
+              kind "custom.st3.message-receipt"
               state "published"
             }
           }
@@ -188,11 +188,11 @@ subgraph {
         }
         step "confirm-requester" {
           title "The requester receives one verified confirmation"
-          goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/verification resource.binding --actor agent/${ST_PLAN_RUN}/rc.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+          goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/verification resource.observed --actor agent/${ST_PLAN_RUN}/rc.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
           depends-on { step "verify-ledger-read-only" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/verification" {
-              kind "message.receipt"
+              kind "custom.st3.message-receipt"
               state "published"
             }
           }

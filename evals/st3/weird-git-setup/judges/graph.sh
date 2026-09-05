@@ -32,15 +32,15 @@ while read -r name kind; do
       | (.kind == $kind) and (.state == "published")' \
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
-    | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
+    | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -ge 1
 done <<'PRODUCTS'
-feature-revision vcs.revision
-final-report message.receipt
+feature-revision vcs.commit
+final-report custom.st3.message-receipt
 PRODUCTS
 
 published="$(st3 inspect "resource/plan-run/$ST_PLAN_RUN/feature-revision" --json \
-  | jq -r '.status.subjects[0].actual | (.fields // .) | .revision')"
+  | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
 current="$(git -C "$CATALOG/wt/feature" rev-parse HEAD)"
 test "$published" = "$current"
 

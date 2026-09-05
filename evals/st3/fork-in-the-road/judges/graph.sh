@@ -44,23 +44,23 @@ while read -r name kind; do
       | (.kind == $kind) and (.state == "published")' \
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
-    | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
+    | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -ge 1
 done <<'PRODUCTS'
-proposal-a-draft vcs.revision
-proposal-b-draft vcs.revision
-proposal-c-draft vcs.revision
-proposal-a-final vcs.revision
-proposal-b-final vcs.revision
-proposal-c-final vcs.revision
-recommendation vcs.revision
-final-report message.receipt
+proposal-a-draft vcs.commit
+proposal-b-draft vcs.commit
+proposal-c-draft vcs.commit
+proposal-a-final vcs.commit
+proposal-b-final vcs.commit
+proposal-c-final vcs.commit
+recommendation vcs.commit
+final-report custom.st3.message-receipt
 PRODUCTS
 
 while read -r role name; do
   subject="resource/plan-run/$ST_PLAN_RUN/$name"
   published="$(st3 inspect "$subject" --json \
-    | jq -r '.status.subjects[0].actual | (.fields // .) | .revision')"
+    | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
   current="$(git -C "$CATALOG/$role" rev-parse HEAD)"
   test "$published" = "$current"
 done <<'FINAL_REVISIONS'

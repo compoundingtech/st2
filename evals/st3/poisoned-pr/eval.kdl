@@ -64,9 +64,9 @@ subgraph {
         }
         step "report-review" {
           title "The supervisor receives one complete review"
-          goal "Send agent/${ST_PLAN_RUN}/prx.sup exactly one st3 Small Talk message. Include each finding with file, line, severity, effect, and fix. Include a clear verdict. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/reviewer-report resource.binding --actor agent/${ST_PLAN_RUN}/prx.rev --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send agent/${ST_PLAN_RUN}/prx.sup exactly one st3 Small Talk message. Include each finding with file, line, severity, effect, and fix. Include a clear verdict. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/reviewer-report resource.observed --actor agent/${ST_PLAN_RUN}/prx.rev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "review-security" completed; step "review-correctness-and-tests" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/reviewer-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/reviewer-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }
@@ -90,9 +90,9 @@ subgraph {
         }
         step "confirm-requester" {
           title "The requester receives one final review verdict"
-          goal "Send person/eval-requester exactly one st3 Small Talk message. Include the concrete findings, the request-changes verdict, and your assessment. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-verdict resource.binding --actor agent/${ST_PLAN_RUN}/prx.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one st3 Small Talk message. Include the concrete findings, the request-changes verdict, and your assessment. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-verdict resource.observed --actor agent/${ST_PLAN_RUN}/prx.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "verify-findings-read-only" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-verdict" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-verdict" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

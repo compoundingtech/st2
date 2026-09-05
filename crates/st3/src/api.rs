@@ -119,6 +119,7 @@ impl IntoResponse for ApiError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/schema", get(schema))
         .route("/v1/intent/plan", post(plan))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/planning-sessions", post(start_planning_session))
@@ -219,6 +220,17 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/peer/claims/query", post(query_peer))
         .layer(from_fn_with_state(state.clone(), response_envelope))
         .with_state(state)
+}
+
+async fn schema() -> Json<Value> {
+    let registry = st3_schema::registry();
+    Json(json!({
+        "schema": registry.name,
+        "digest": registry.digest(),
+        "subjects": registry.subjects,
+        "resources": registry.resources,
+        "claims": registry.claims,
+    }))
 }
 
 async fn response_envelope(
@@ -363,6 +375,23 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         }),
         Err(error) => checks.push(DoctorCheck {
             name: "claim-store".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
+    match state.store.operation_projection_drift() {
+        Ok(drift) if drift.is_empty() => checks.push(DoctorCheck {
+            name: "operation-projection".into(),
+            status: "pass".into(),
+            message: "the operation projection matches the claim log".into(),
+        }),
+        Ok(drift) => checks.push(DoctorCheck {
+            name: "operation-projection".into(),
+            status: "fail".into(),
+            message: format!("operation projection drift: {}", drift.join(", ")),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "operation-projection".into(),
             status: "fail".into(),
             message: error.to_string(),
         }),
@@ -689,20 +718,31 @@ async fn start_planning_session(
             .unwrap_or_else(|| request_reference.clone()),
         "Planning request",
     )?;
+    let mut started_fields = BTreeMap::from([
+        (
+            "plan".into(),
+            Value::String(format!("plan/{}", session.plan)),
+        ),
+        ("request".into(), Value::String(request_reference)),
+        ("planner".into(), Value::String(session.planner.clone())),
+        ("workspace".into(), Value::String(session.workspace.clone())),
+        ("requester".into(), Value::String(session.requester.clone())),
+    ]);
+    if let Some(run) = &session.target_plan_run {
+        started_fields.insert("target_run".into(), Value::String(run.clone()));
+    }
+    if let Some(generation) = &session.source_generation {
+        started_fields.insert(
+            "target_generation".into(),
+            Value::String(generation.clone()),
+        );
+    }
     record_planning_event(
         &state,
         &session,
         "planning-session.started",
         Some(&requester),
-        BTreeMap::from([
-            (
-                "plan".into(),
-                Value::String(format!("plan/{}", session.plan)),
-            ),
-            ("request".into(), Value::String(request_reference)),
-            ("planner".into(), Value::String(session.planner.clone())),
-            ("workspace".into(), Value::String(session.workspace.clone())),
-        ]),
+        started_fields,
         &format!("{}:started", request.idempotency_key),
     )?;
     signal_changed(&state);
@@ -765,7 +805,6 @@ async fn submit_planning_variant(
     })?;
     let (intent, _) = plan_source(&state, kdl, None)?;
     if !intent.subjects.is_empty()
-        || !intent.checkpoints.is_empty()
         || intent.plans.len() != 1
         || !intent.plans.contains_key(&session.plan)
     {
@@ -941,6 +980,12 @@ async fn preview_planning_variant(
             ),
             ("preview_hash".into(), Value::String(preview.hash.clone())),
             ("store_index".into(), Value::from(preview.store_index)),
+            ("graph".into(), Value::String(preview.graph.clone())),
+            ("diff".into(), Value::String(preview.diff.clone())),
+            (
+                "plan".into(),
+                serde_json::to_value(&preview.plan).map_err(ApiError::internal)?,
+            ),
         ]),
         &format!("planning-preview:{}:{}", response.id, preview.hash),
     )?;
@@ -1080,21 +1125,6 @@ async fn propose_planning_variant(
                 proposal: Some(proposal),
             }
         };
-    record_planning_event(
-        &state,
-        &session,
-        "planning-session.variant-proposed",
-        Some(&request.actor),
-        BTreeMap::from([
-            ("variant".into(), Value::String(variant.name.clone())),
-            (
-                "source_generation".into(),
-                Value::String(current.generation),
-            ),
-            ("plan_revision".into(), Value::String(plan.revision.clone())),
-        ]),
-        &format!("{}:event", request.idempotency_key),
-    )?;
     signal_changed(&state);
     Ok(Json(result))
 }
@@ -1228,29 +1258,6 @@ async fn approve_planning_session(
             &format!("{approval_key}:publish"),
         )
         .map_err(ApiError::bad)?;
-    state
-        .store
-        .append_claim(&ClaimInput {
-            subject: format!("plan/{}", session.plan),
-            kind: "plan.documents".into(),
-            actor: Some(normalize_message_party(&request.actor)),
-            fields: BTreeMap::from([
-                (
-                    "planning_session".into(),
-                    Value::String(session.subject.clone()),
-                ),
-                ("markdown".into(), Value::String(candidate.markdown.clone())),
-                ("kdl".into(), Value::String(candidate.kdl.clone())),
-                (
-                    "revision".into(),
-                    Value::String(candidate.plan_revision.clone()),
-                ),
-            ]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: Some(format!("{approval_key}:documents")),
-        })
-        .map_err(ApiError::bad)?;
     let response = state
         .store
         .finish_planning_session(
@@ -1266,6 +1273,8 @@ async fn approve_planning_session(
         "planning-session.approved",
         Some(&request.actor),
         BTreeMap::from([
+            ("variant".into(), Value::String(candidate.variant.clone())),
+            ("candidate_revision".into(), Value::from(candidate.revision)),
             (
                 "preview_hash".into(),
                 Value::String(request.preview_hash.clone()),
@@ -1276,6 +1285,10 @@ async fn approve_planning_session(
             ),
             ("markdown".into(), Value::String(candidate.markdown.clone())),
             ("kdl".into(), Value::String(candidate.kdl.clone())),
+            (
+                "requester".into(),
+                Value::String(response.requester.clone()),
+            ),
         ]),
         &format!("{approval_key}:event"),
     )?;
@@ -1303,14 +1316,20 @@ async fn cancel_planning_session(
         &response,
         "planning-session.cancelled",
         Some(&request.actor),
-        BTreeMap::from([(
-            "reason".into(),
-            request
-                .reason
-                .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-        )]),
+        BTreeMap::from([
+            (
+                "reason".into(),
+                request
+                    .reason
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            ),
+            (
+                "requester".into(),
+                Value::String(response.requester.clone()),
+            ),
+        ]),
         &format!("{}:cancelled", request.idempotency_key),
     )?;
     stop_planning_agent(&state, &session.planner, &request.idempotency_key)?;
@@ -1364,6 +1383,10 @@ fn record_planning_event(
             idempotency_key: Some(idempotency_key.into()),
         })
         .map_err(ApiError::bad)?;
+    state
+        .store
+        .rebuild_claim_projections()
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -1672,7 +1695,7 @@ async fn watch_resource(
         .map(|field| format!("        on {}\n", quote(field)))
         .collect::<String>();
     let kdl = format!(
-        "version 2\nsubgraph {{\n  resource {} {{\n    kind {resource_kind:?}\n    binding \"late\"\n  }}\n  plan {} state=\"ready\" {{\n    goal \"Observe one resource and send its selected changes.\"\n    subgraph {{\n      observer \"watch\" {{\n        resource {}\n        provider {}\n        locator {}\n{observer_fields}      }}\n      subscription \"watch\" {{\n        observer \"observer/watch\"\n        to {}\n{subscription_fields}        delivery \"message\"\n      }}\n    }}\n  }}\n}}\n",
+        "version 2\nsubgraph {{\n  resource {} {{\n    kind {resource_kind:?}\n  }}\n  plan {} state=\"ready\" {{\n    goal \"Observe one resource and send its selected changes.\"\n    subgraph {{\n      observer \"watch\" {{\n        resource {}\n        provider {}\n        locator {}\n{observer_fields}      }}\n      subscription \"watch\" {{\n        observer \"observer/watch\"\n        to {}\n{subscription_fields}        delivery \"message\"\n      }}\n    }}\n  }}\n}}\n",
         quote(&resource_name),
         quote(&plan_id),
         quote(&format!("resource/{resource_name}")),
@@ -1822,7 +1845,10 @@ async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    let response = state.store.append_claim(&request).map_err(ApiError::bad)?;
+    let response = state
+        .store
+        .append_client_claim(&request)
+        .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -1894,13 +1920,10 @@ async fn post_review(
     AxumPath(subject): AxumPath<String>,
     Json(request): Json<ReviewRequest>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    if !matches!(
-        request.decision.as_str(),
-        "approved" | "rejected" | "revise"
-    ) {
+    if !matches!(request.decision.as_str(), "approved" | "rejected") {
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
-            "a review decision must be approved, rejected, or revise",
+            "a review decision must be approved or rejected",
         )));
     }
     let subject = if subject.starts_with("resource/") || subject.starts_with("step-run/") {
@@ -1918,7 +1941,7 @@ async fn post_review(
     let review_request = if subject.starts_with("step-run/") {
         let review_request = state
             .store
-            .latest_claim(&subject, Some("review.requested"))
+            .gate_request_for_owner(&subject)
             .map_err(ApiError::internal)?
             .ok_or_else(|| {
                 ApiError::bad(St3Error::new(
@@ -1977,9 +2000,13 @@ async fn post_review(
     } else {
         None
     };
-    let decision = request.decision.clone();
+    let verdict = if request.decision == "approved" {
+        "pass"
+    } else {
+        "fail"
+    };
     let mut fields = BTreeMap::from([
-        ("decision".into(), Value::String(request.decision)),
+        ("verdict".into(), Value::String(verdict.into())),
         (
             "reason".into(),
             request.reason.map(Value::String).unwrap_or(Value::Null),
@@ -1991,8 +2018,11 @@ async fn post_review(
     let response = state
         .store
         .append_claim(&ClaimInput {
-            subject: subject.clone(),
-            kind: "review.decision".into(),
+            subject: review_request
+                .as_ref()
+                .map(|request| request.subject.clone())
+                .unwrap_or_else(|| subject.clone()),
+            kind: "gate.result".into(),
             actor,
             fields,
             evidence: review_request
@@ -2003,16 +2033,6 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
-    if decision == "revise" && subject.starts_with("step-run/") {
-        state
-            .store
-            .set_step_state(
-                &subject,
-                "blocked",
-                Some("the human reviewer requested a plan revision"),
-            )
-            .map_err(ApiError::internal)?;
-    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -2160,7 +2180,7 @@ async fn post_message_claim(
     let subject = message_subject(&message_id);
     let kind = match request.lifecycle.as_str() {
         "delivered" => "message.delivered",
-        "accepted" => "message.accepted",
+        "read" => "message.read",
         "closed" => "message.closed",
         other => {
             return Err(ApiError::bad(St3Error::new(
@@ -2432,9 +2452,11 @@ async fn quick_agent(
     let runtime_id = format!("{}.{}", run.id, bus_id.replace('/', "."));
     let ready = state
         .store
-        .latest_claim(&agent_subject, Some("harness.ready"))
+        .latest_claim(&agent_subject, Some("harness.observed"))
         .map_err(ApiError::internal)?
-        .is_some();
+        .is_some_and(|claim| {
+            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("ready")
+        });
     let response = QuickAgentResponse {
         subject: agent_subject,
         plan: format!("plan/{plan_id}"),
@@ -2545,13 +2567,16 @@ async fn get_eval(
         .plan_run(&run)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("eval plan run `{run}` does not exist")))?;
-    let verdict = match run.status.as_str() {
-        "completed" => Some("pass".into()),
-        "failed" => Some("fail".into()),
-        "cancelled" => Some("void".into()),
-        _ => None,
-    };
-    let cleanup = if run.phase == "terminal" {
+    let verdict_claim = state
+        .store
+        .latest_claim(&run.subject, Some("eval.verdict"))
+        .map_err(ApiError::internal)?;
+    let verdict = verdict_claim
+        .as_ref()
+        .and_then(|claim| claim.body.pointer("/fields/verdict"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let cleanup = if run.phase == "terminal" && verdict.is_some() {
         "complete"
     } else if run.phase == "final"
         || run.phase == "final-cancelled"
@@ -3401,12 +3426,32 @@ async fn input_session(
             })?,
         SessionInputMode::Line | SessionInputMode::Key => request.value.as_bytes().to_vec(),
     };
-    let blob_hash = state.store.put_blob(&bytes).map_err(ApiError::internal)?;
     let mode = match request.mode {
         SessionInputMode::Line => "line",
         SessionInputMode::Raw => "raw",
         SessionInputMode::Key => "key",
     };
+    let request_key = format!(
+        "session-control-request:input:{subject}:{}",
+        request.idempotency_key
+    );
+    if let Some(prior) = state
+        .store
+        .operation_claim(&request_key)
+        .map_err(ApiError::internal)?
+    {
+        return finish_session_control(
+            &state,
+            &subject,
+            "terminal.input.result",
+            &result_key,
+            &prior,
+            &session,
+            Err(anyhow::anyhow!(
+                "the input request committed before an outcome; st3 will not repeat it"
+            )),
+        );
+    }
     let request_claim = state
         .store
         .append_claim(&ClaimInput {
@@ -3415,7 +3460,11 @@ async fn input_session(
             actor: Some("requester".into()),
             fields: BTreeMap::from([
                 ("mode".into(), Value::String(mode.into())),
-                ("blob_hash".into(), Value::String(blob_hash)),
+                (
+                    "sha256".into(),
+                    Value::String(hex::encode(Sha256::digest(&bytes))),
+                ),
+                ("byte_count".into(), Value::from(bytes.len() as u64)),
                 (
                     "runtime_id".into(),
                     Value::String(session.runtime_id.clone()),
@@ -3427,10 +3476,7 @@ async fn input_session(
             ]),
             evidence: Vec::new(),
             expected_subject: None,
-            idempotency_key: Some(format!(
-                "session-control-request:input:{subject}:{}",
-                request.idempotency_key
-            )),
+            idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
     let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone());
@@ -3483,14 +3529,32 @@ async fn clear_context(
             "context clear requires a terminal Claude driver in st3 v1",
         )));
     }
+    let request_key = format!(
+        "session-control-request:context-clear:{subject}:{}",
+        request.idempotency_key
+    );
+    if let Some(prior) = state
+        .store
+        .operation_claim(&request_key)
+        .map_err(ApiError::internal)?
+    {
+        return finish_session_control(
+            &state,
+            &subject,
+            "harness.context-clear.result",
+            &result_key,
+            &prior,
+            &session,
+            Ok(()),
+        );
+    }
     let request_claim = state
         .store
         .append_claim(&ClaimInput {
             subject: subject.clone(),
-            kind: "context.clear.requested".into(),
+            kind: "harness.context-clear.requested".into(),
             actor: Some("requester".into()),
             fields: BTreeMap::from([
-                ("operation_status".into(), Value::String("requested".into())),
                 (
                     "runtime_id".into(),
                     Value::String(session.runtime_id.clone()),
@@ -3502,10 +3566,7 @@ async fn clear_context(
             ]),
             evidence: Vec::new(),
             expected_subject: None,
-            idempotency_key: Some(format!(
-                "session-control-request:context-clear:{subject}:{}",
-                request.idempotency_key
-            )),
+            idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
     let effect = st_runtime::PtyRuntime::new(state.pty_root.clone()).send_line_if(
@@ -3516,7 +3577,7 @@ async fn clear_context(
     finish_session_control(
         &state,
         &subject,
-        "context.clear.result",
+        "harness.context-clear.result",
         &result_key,
         &request_claim,
         &session,
@@ -3553,14 +3614,36 @@ async fn signal_session(
         return Ok(Json(session_control_response(&subject, &result)));
     }
     let session = live_session(&state, &subject, Some(&request.expected_incarnation))?;
+    let request_key = format!(
+        "session-control-request:signal:{subject}:{}",
+        request.idempotency_key
+    );
+    if let Some(prior) = state
+        .store
+        .operation_claim(&request_key)
+        .map_err(ApiError::internal)?
+    {
+        return finish_session_control(
+            &state,
+            &subject,
+            "runtime.action.succeeded",
+            &result_key,
+            &prior,
+            &session,
+            Err(anyhow::anyhow!(
+                "the signal request committed before an outcome; st3 will not repeat it"
+            )),
+        );
+    }
     let request_claim = state
         .store
         .append_claim(&ClaimInput {
             subject: subject.clone(),
-            kind: "session.signal.requested".into(),
+            kind: "runtime.action.requested".into(),
             actor: Some("requester".into()),
             fields: BTreeMap::from([
-                ("operation_status".into(), Value::String("requested".into())),
+                ("action".into(), Value::String("signal".into())),
+                ("operation".into(), Value::String(result_key.clone())),
                 ("signal".into(), Value::String(request.signal)),
                 (
                     "runtime_id".into(),
@@ -3573,10 +3656,7 @@ async fn signal_session(
             ]),
             evidence: Vec::new(),
             expected_subject: None,
-            idempotency_key: Some(format!(
-                "session-control-request:signal:{subject}:{}",
-                request.idempotency_key
-            )),
+            idempotency_key: Some(request_key),
         })
         .map_err(ApiError::bad)?;
     let effect = if session.terminal {
@@ -3592,7 +3672,7 @@ async fn signal_session(
     finish_session_control(
         &state,
         &subject,
-        "session.signal.result",
+        "runtime.action.succeeded",
         &result_key,
         &request_claim,
         &session,
@@ -3609,40 +3689,64 @@ fn finish_session_control(
     session: &LiveSession,
     effect: anyhow::Result<()>,
 ) -> Result<Json<SessionControlResponse>, ApiError> {
-    let status = if effect.is_ok() {
-        "succeeded"
+    let succeeded = effect.is_ok();
+    let mut reason = effect.as_ref().err().map(ToString::to_string);
+    let mut fields = BTreeMap::from([
+        (
+            "runtime_id".into(),
+            Value::String(session.runtime_id.clone()),
+        ),
+        (
+            "incarnation_id".into(),
+            Value::String(session.incarnation_id.clone()),
+        ),
+    ]);
+    match kind {
+        "terminal.input.result" => {
+            fields.insert(
+                "result".into(),
+                Value::String(if succeeded { "written" } else { "failed" }.into()),
+            );
+        }
+        "harness.context-clear.result" => {
+            let result = if succeeded { "indeterminate" } else { "failed" };
+            if succeeded {
+                reason = Some(
+                    "the clear command was sent, but no new context epoch was observed".into(),
+                );
+            }
+            fields.insert("result".into(), Value::String(result.into()));
+        }
+        _ => {
+            fields.insert(
+                "operation_status".into(),
+                Value::String(if succeeded { "succeeded" } else { "failed" }.into()),
+            );
+        }
+    }
+    fields.insert(
+        "reason".into(),
+        reason.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    let claim_kind = if kind == "runtime.action.succeeded" && !succeeded {
+        "runtime.action.failed"
     } else {
-        "failed"
+        kind
     };
-    let reason = effect.as_ref().err().map(ToString::to_string);
     let result = state
         .store
         .append_claim(&ClaimInput {
             subject: subject.into(),
-            kind: kind.into(),
+            kind: claim_kind.into(),
             actor: Some("requester".into()),
-            fields: BTreeMap::from([
-                ("operation_status".into(), Value::String(status.into())),
-                (
-                    "runtime_id".into(),
-                    Value::String(session.runtime_id.clone()),
-                ),
-                (
-                    "incarnation_id".into(),
-                    Value::String(session.incarnation_id.clone()),
-                ),
-                (
-                    "reason".into(),
-                    reason.clone().map(Value::String).unwrap_or(Value::Null),
-                ),
-            ]),
+            fields,
             evidence: vec![request.id.clone()],
             expected_subject: None,
             idempotency_key: Some(result_key.into()),
         })
         .map_err(ApiError::bad)?;
     signal_changed(state);
-    if let Some(reason) = reason {
+    if !succeeded && let Some(reason) = reason {
         let code = if reason.contains("changed incarnation") {
             "stale-incarnation"
         } else {
@@ -3842,27 +3946,32 @@ async fn terminal_proxy(
         let runtime = st_runtime::PtyRuntime::new(pty_root);
         let mut sequence = 0_u64;
         while let Some(Ok(message)) = reader.next().await {
-            let bytes = match message {
-                WsMessage::Binary(bytes) => bytes.to_vec(),
-                WsMessage::Text(text) => text.as_bytes().to_vec(),
+            let (mode, bytes) = match message {
+                WsMessage::Binary(bytes) => ("binary", bytes.to_vec()),
+                WsMessage::Text(text) => ("text", text.as_bytes().to_vec()),
                 WsMessage::Close(_) => break,
                 WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
             };
             sequence = sequence.saturating_add(1);
-            let byte_hash = hex::encode(Sha256::digest(&bytes));
-            let Ok(blob_hash) = store.put_blob(&bytes) else {
-                break;
-            };
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            let mut fields = BTreeMap::from([
+                ("sequence".into(), Value::from(sequence)),
+                ("mode".into(), Value::String(mode.into())),
+                ("sha256".into(), Value::String(sha256)),
+                ("byte_count".into(), Value::from(bytes.len() as u64)),
+                ("runtime_id".into(), Value::String(input_runtime.clone())),
+            ]);
+            if let Some(incarnation_id) = &incarnation_id {
+                fields.insert(
+                    "incarnation_id".into(),
+                    Value::String(incarnation_id.clone()),
+                );
+            }
             let request = store.append_claim(&ClaimInput {
                 subject: input_subject.clone(),
                 kind: "terminal.input.requested".into(),
                 actor: None,
-                fields: BTreeMap::from([
-                    ("sequence".into(), Value::from(sequence)),
-                    ("byte_hash".into(), Value::String(byte_hash)),
-                    ("blob_hash".into(), Value::String(blob_hash)),
-                    ("runtime_id".into(), Value::String(input_runtime.clone())),
-                ]),
+                fields,
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some(format!(
@@ -3878,14 +3987,22 @@ async fn terminal_proxy(
             {
                 break;
             }
+            let mut fields = BTreeMap::from([
+                ("sequence".into(), Value::from(sequence)),
+                ("result".into(), Value::String("written".into())),
+                ("runtime_id".into(), Value::String(input_runtime.clone())),
+            ]);
+            if let Some(incarnation_id) = &incarnation_id {
+                fields.insert(
+                    "incarnation_id".into(),
+                    Value::String(incarnation_id.clone()),
+                );
+            }
             let _ = store.append_claim(&ClaimInput {
                 subject: input_subject.clone(),
                 kind: "terminal.input.result".into(),
                 actor: None,
-                fields: BTreeMap::from([
-                    ("sequence".into(), Value::from(sequence)),
-                    ("operation_status".into(), Value::String("written".into())),
-                ]),
+                fields,
                 evidence: vec![request.id],
                 expected_subject: None,
                 idempotency_key: Some(format!(
@@ -4454,7 +4571,10 @@ subgraph {
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
 
         let documents = store
-            .latest_claim("plan/planned/work", Some("plan.documents"))
+            .latest_claim(
+                &format!("planning-session/{session}"),
+                Some("planning-session.approved"),
+            )
             .unwrap()
             .expect("the published plan does not link its documents");
         for field in ["markdown", "kdl"] {
@@ -4496,7 +4616,10 @@ subgraph {
         );
         assert_eq!(
             store
-                .claims_for("plan/planned/work", Some("plan.documents"))
+                .claims_for(
+                    &format!("planning-session/{session}"),
+                    Some("planning-session.approved"),
+                )
                 .unwrap()
                 .len(),
             1
@@ -4532,6 +4655,10 @@ subgraph {
                 .and_then(Value::as_str),
             Some(request_reference)
         );
+        let before = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
+        store.rebuild_claim_projections().unwrap();
+        let after = serde_json::to_value(store.planning_session(session).unwrap()).unwrap();
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
@@ -5047,7 +5174,7 @@ subgraph {
                 .store
                 .append_claim(&ClaimInput {
                     subject: subject.into(),
-                    kind: "transport.peer".into(),
+                    kind: "transport.observed".into(),
                     actor: None,
                     fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
                     evidence: Vec::new(),
@@ -5077,6 +5204,69 @@ subgraph {
             descending["claims"][0]["subject"].as_str(),
             Some("host/two")
         );
+    }
+
+    #[tokio::test]
+    async fn public_claim_admission_and_idempotency_use_the_exported_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+
+        let (status, schema) = get_request(app.clone(), "/v1/schema").await;
+        assert_eq!(status, StatusCode::OK, "{schema}");
+        assert_eq!(schema["schema"], st3_schema::SCHEMA_NAME);
+        assert_eq!(schema["digest"], st3_schema::registry().digest());
+
+        let forbidden = serde_json::to_value(ClaimInput {
+            subject: "host/node".into(),
+            kind: "transport.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("caller-transport".into()),
+        })
+        .unwrap();
+        let (status, body) = json_request(app.clone(), "/v1/claims", forbidden).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "claim-write-forbidden");
+
+        let resource = ClaimInput {
+            subject: "resource/example".into(),
+            kind: "resource.observed".into(),
+            actor: Some("person/nathan".into()),
+            fields: BTreeMap::from([
+                (
+                    "kind".into(),
+                    Value::String("custom.example.measurement".into()),
+                ),
+                ("value".into(), Value::from(1)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("caller-resource".into()),
+        };
+        let (status, first) = json_request(
+            app.clone(),
+            "/v1/claims",
+            serde_json::to_value(&resource).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let (status, retry) = json_request(
+            app.clone(),
+            "/v1/claims",
+            serde_json::to_value(&resource).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retry}");
+        assert_eq!(retry["id"], first["id"]);
+
+        let mut changed = resource;
+        changed.fields.insert("value".into(), Value::from(2));
+        let (status, mismatch) =
+            json_request(app, "/v1/claims", serde_json::to_value(changed).unwrap()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mismatch}");
+        assert_eq!(mismatch["code"], "idempotency-mismatch");
     }
 
     #[tokio::test]
@@ -5123,10 +5313,11 @@ subgraph {
         let request = state
             .store
             .append_claim(&ClaimInput {
-                subject: step.subject.clone(),
-                kind: "review.requested".into(),
+                subject: "gate-operation/review-api/approval".into(),
+                kind: "gate.requested".into(),
                 actor: None,
                 fields: BTreeMap::from([
+                    ("owner".into(), Value::String(step.subject.clone())),
                     ("reviewer".into(), Value::String("person/nathan".into())),
                     ("plan_revision".into(), Value::String(run.revision.clone())),
                     (
@@ -5167,6 +5358,7 @@ subgraph {
         .await;
         assert_eq!(status, StatusCode::OK, "{accepted}");
         assert_eq!(accepted["body"]["fields"]["request"], request.id);
+        assert_eq!(accepted["body"]["fields"]["verdict"], "pass");
         assert_eq!(accepted["body"]["evidence"][0], request.id);
     }
 
@@ -5298,7 +5490,7 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: agent_subject.clone(),
-                kind: "member.observed".into(),
+                kind: "runtime.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("running".into())),

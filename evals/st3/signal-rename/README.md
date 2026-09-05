@@ -39,7 +39,7 @@ Inherited nested steps use that parent message. An explicit nested reassignment 
 
 The native driver only transports Small Talk graph messages. It does not create a separate message type or source of truth.
 
-Each lane publishes a `vcs.revision` resource claim. The plan does not infer completion from prose or exported messages.
+Each lane publishes a `vcs.commit` resource claim. The plan does not infer completion from prose or exported messages.
 
 The final report remains a message because communication is its product. A resource claim records its publication.
 

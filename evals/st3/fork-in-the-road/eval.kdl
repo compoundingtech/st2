@@ -92,10 +92,10 @@ subgraph {
         }
         step "publish-draft" {
           title "The per-human draft revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-a-draft resource.binding --actor agent/${ST_PLAN_RUN}/fd.a --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-a-draft resource.observed --actor agent/${ST_PLAN_RUN}/fd.a --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "write-proposal" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/proposal-a-draft" { kind "vcs.revision"; state "published" }
+            resource "plan-run/${ST_PLAN_RUN}/proposal-a-draft" { kind "vcs.commit"; state "published" }
           }
         }
       }
@@ -120,10 +120,10 @@ subgraph {
         }
         step "publish-draft" {
           title "The shared draft revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-b-draft resource.binding --actor agent/${ST_PLAN_RUN}/fd.b --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-b-draft resource.observed --actor agent/${ST_PLAN_RUN}/fd.b --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "write-proposal" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/proposal-b-draft" { kind "vcs.revision"; state "published" }
+            resource "plan-run/${ST_PLAN_RUN}/proposal-b-draft" { kind "vcs.commit"; state "published" }
           }
         }
       }
@@ -148,10 +148,10 @@ subgraph {
         }
         step "publish-draft" {
           title "The federated draft revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-c-draft resource.binding --actor agent/${ST_PLAN_RUN}/fd.c --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-c-draft resource.observed --actor agent/${ST_PLAN_RUN}/fd.c --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "write-proposal" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/proposal-c-draft" { kind "vcs.revision"; state "published" }
+            resource "plan-run/${ST_PLAN_RUN}/proposal-c-draft" { kind "vcs.commit"; state "published" }
           }
         }
       }
@@ -219,9 +219,9 @@ subgraph {
         step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.a." }
         step "publish-final" {
           title "The final per-human revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-a-final resource.binding --actor agent/${ST_PLAN_RUN}/fd.a --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-a-final resource.observed --actor agent/${ST_PLAN_RUN}/fd.a --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "respond" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-a-final" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-a-final" { kind "vcs.commit"; state "published" } }
         }
       }
     }
@@ -237,9 +237,9 @@ subgraph {
         step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.b." }
         step "publish-final" {
           title "The final shared revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-b-final resource.binding --actor agent/${ST_PLAN_RUN}/fd.b --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-b-final resource.observed --actor agent/${ST_PLAN_RUN}/fd.b --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "respond" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-b-final" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-b-final" { kind "vcs.commit"; state "published" } }
         }
       }
     }
@@ -255,9 +255,9 @@ subgraph {
         step "respond" { title "The proposal answers both critiques"; goal "Read and archive both panel critique messages. Update PROPOSAL.md with the strongest challenge, any changed view, and the remaining fork. Commit with author fd.c." }
         step "publish-final" {
           title "The final federated revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-c-final resource.binding --actor agent/${ST_PLAN_RUN}/fd.c --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/proposal-c-final resource.observed --actor agent/${ST_PLAN_RUN}/fd.c --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "respond" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-c-final" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/proposal-c-final" { kind "vcs.commit"; state "published" } }
         }
       }
     }
@@ -274,15 +274,15 @@ subgraph {
         step "write-recommendation" { title "The recommendation is committed"; goal "Write RECOMMENDATION.md with the option set, key tradeoffs, a justified recommendation, a prototype sequence, privacy consequences, and explicit human decisions. Commit it with author fd.sup."; depends-on { step "compare-final-proposals" completed } }
         step "publish-recommendation" {
           title "The recommendation revision is published"
-          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/recommendation resource.binding --actor agent/${ST_PLAN_RUN}/fd.sup --field kind=vcs.revision --field state=published --field revision=$SHA. Complete this step after the claim."
+          goal "Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/recommendation resource.observed --actor agent/${ST_PLAN_RUN}/fd.sup --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."
           depends-on { step "write-recommendation" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/recommendation" { kind "vcs.revision"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/recommendation" { kind "vcs.commit"; state "published" } }
         }
         step "confirm-requester" {
           title "The requester receives one final recommendation"
-          goal "Send person/eval-requester exactly one st3 Small Talk message. Include the option set, main tradeoffs, recommendation, reason, and human decisions. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.binding --actor agent/${ST_PLAN_RUN}/fd.sup --field kind=message.receipt --field state=published --field message=message/$MID. Complete this step after the claim."
+          goal "Send person/eval-requester exactly one st3 Small Talk message. Include the option set, main tradeoffs, recommendation, reason, and human decisions. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.observed --actor agent/${ST_PLAN_RUN}/fd.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."
           depends-on { step "publish-recommendation" completed }
-          produces { resource "plan-run/${ST_PLAN_RUN}/final-report" { kind "message.receipt"; state "published" } }
+          produces { resource "plan-run/${ST_PLAN_RUN}/final-report" { kind "custom.st3.message-receipt"; state "published" } }
         }
       }
     }

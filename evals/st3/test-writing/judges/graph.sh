@@ -38,17 +38,17 @@ while read -r name kind; do
       | (.kind == $kind) and (.state == "published")' \
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
-    | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
+    | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -ge 1
 done <<'PRODUCTS'
-test-brief message.receipt
-test-revision vcs.revision
-developer-report message.receipt
-final-assessment message.receipt
+test-brief custom.st3.message-receipt
+test-revision vcs.commit
+developer-report custom.st3.message-receipt
+final-assessment custom.st3.message-receipt
 PRODUCTS
 
 published="$(st3 inspect "resource/plan-run/$ST_PLAN_RUN/test-revision" --json \
-  | jq -r '.status.subjects[0].actual | (.fields // .) | .revision')"
+  | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
 current="$(git -C "$CATALOG/worker" rev-parse HEAD)"
 test "$published" = "$current"
 

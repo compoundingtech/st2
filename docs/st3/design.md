@@ -8,6 +8,8 @@ st3 is a resident, event-driven reconciler for one claims graph. It stores immut
 
 This document defines the system design. [plan-graph-runtime.md](./plan-graph-runtime.md) defines the complete plan language and planning workflow.
 
+[schema.md](./schema.md) lists the generated public vocabulary. [data-authority.md](./data-authority.md) classifies durable authority and projections.
+
 ## Product outcome
 
 st3 gives a person or an agent one durable graph for these objects:
@@ -114,11 +116,9 @@ The reconciler does not scan a catalog and does not use a periodic discovery swe
 
 `gate` means a condition that can pass or fail. It covers graph predicates, mechanical commands, bounded LLM evaluation, and human review.
 
-Plans, steps, and checkpoint stages use repeated `gate` nodes. Sibling gates form an AND relation.
+Plans and steps use repeated `gate` nodes. Sibling gates form an AND relation.
 
 The old `judges` block, `judge` node, `judgement` CLI, and judgement API are not part of st3.
-
-A supervisor's bounded screen-input feature uses `terminal-control`. It is not a gate.
 
 The public running-gate surfaces are:
 
@@ -201,7 +201,7 @@ st3 and st2 do not share a live control loop. They can share an existing PTY reg
 
 Every st3 intent starts with `version 2` and contains exactly one untyped `subgraph` root.
 
-The root can contain plan definitions, durable resources, people, accounts, supervisors, links, messages, and plan-run cancellation.
+The root can contain plan definitions, durable resources, people, documents, messages, and plan-run cancellation.
 
 An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` must occur in a plan or step subgraph.
 
@@ -211,7 +211,7 @@ The parser is strict. Unknown fields, duplicate single fields, invalid identifie
 
 A plan occurs at the root. A nested plan occurs inside one step.
 
-The graph also supports ordered checkpoint stages for direct desired-state convergence. Checkpoint stages now use repeated named `gate` nodes. The durable plan runtime is the work execution model and does not use a second plan-specific checkpoint language.
+The plan runtime is the only execution model. st3 has no checkpoint, supervisor, or link node.
 
 ## Identity and authority
 
@@ -233,7 +233,7 @@ A work selector does not grant revision authority. The candidate revision cannot
 
 `revisions="human-only"` adds a human approval boundary. `revision-reviewer` selects a reviewer, or the run requester reviews by default.
 
-`under` does not participate in authority. `supervisor` remains the lifecycle and policy relation for controlled members.
+`under` is visible grouping metadata. It does not participate in authority or runtime ownership.
 
 ## Runtime reconciliation
 
@@ -338,7 +338,7 @@ A planning session can target a current plan run. The session stores the exact s
 The requester can revise, approve, or cancel:
 
 - Revision stores feedback as an immutable document, sends it through Small Talk, and invalidates the old preview.
-- Approval requires the current preview hash and current subject tokens. It publishes one ready plan and links the Markdown and KDL document references. It never starts a run.
+- Approval requires the current preview hash and current subject tokens. Its approval claim links the Markdown and KDL documents. It never starts a run.
 - Cancellation publishes no plan.
 
 The requester can compare named variants. The requester can then propose one previewed variant as a revision of the target run.
@@ -355,6 +355,7 @@ Main endpoint groups are:
 - planning: `/v1/planning-sessions` and its session actions;
 - plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
 - graph data: `/v1/claims`, `/v1/claims/by-id/{id}`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
+- schema: `/v1/schema`;
 - documents: `/v1/documents` and `/v1/documents/content`;
 - Small Talk: `/v1/messages` and message lifecycle actions;
 - sessions: `/v1/sessions/...` for logs, screens, input, signals, and attach;
@@ -365,20 +366,21 @@ The Unix socket mode is `0600`. A configured TCP peer listener assumes a trusted
 
 ## Claim vocabulary
 
-The claim registry defines accepted kinds and whether they wake reconciliation.
+The `st3-schema` crate defines accepted subjects, resource kinds, claims, fields, write policies, cardinality, projections, and reconciliation effects.
+
+The daemon exports the same registry through `/v1/schema`. The CLI exposes it through `st3 schema`.
 
 Important plan and gate kinds include:
 
-- `plan.published`, `plan.documents`, and `plan.produced`;
+- `plan.published` and `plan.produced`;
 - `plan-run.created` and `plan-run.state`;
 - `run-generation.created`, `run-generation.superseded`, and `run-generation.state`;
 - `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied`;
-- `step-run.carried`, `step-run.state`, and `step-run.retry`;
+- `step-run.carried`, `step-run.state`, and `step-run.retried`;
 - `gate.requested` and `gate.result`;
-- `review.requested` and `review.decision`;
-- `planning-session.started`, `planning-session.candidate-submitted`, `planning-session.previewed`, and `planning-session.variant-proposed`;
+- `planning-session.started`, `planning-session.candidate-submitted`, and `planning-session.previewed`;
 - `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`;
-- `observer.observed`, `observer.health`, `resource.observed`, and `subscription.health`.
+- `observer.observed`, `observer.state`, `resource.observed`, and `subscription.state`.
 
 An unknown replicated claim remains in history and makes its subject indeterminate. A node does not silently interpret an unknown kind.
 

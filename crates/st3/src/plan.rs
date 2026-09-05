@@ -46,12 +46,11 @@ pub fn parse_plans(
     };
     let outer_owners = direct_agent_owners(children, default_host)?;
     for node in children.nodes() {
-        match node.name().value() {
-            "plan" => insert_plan(
+        if node.name().value() == "plan" {
+            insert_plan(
                 &mut plans,
                 parse_plan(node, outer_owners.clone(), default_host, true)?,
-            )?,
-            _ => {}
+            )?;
         }
     }
     Ok(plans)
@@ -981,11 +980,31 @@ fn parse_products(node: &KdlNode) -> Result<Vec<ProductSpec>, St3Error> {
                         ),
                     ));
                 }
-                fields.insert(
-                    field.name().value().to_owned(),
-                    json_value(field.entries()[0].value())?,
-                );
+                let name = field.name().value().to_owned();
+                let value = json_value(field.entries()[0].value())?;
+                if fields.insert(name.clone(), value).is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-product-field",
+                        format!("product `{subject}` repeats field `{name}`"),
+                    ));
+                }
             }
+        }
+        if kind == "resource" {
+            let resource_kind = fields.get("kind").and_then(Value::as_str).ok_or_else(|| {
+                St3Error::new(
+                    "missing-resource-kind",
+                    format!("resource product `{subject}` needs a registered kind"),
+                )
+            })?;
+            let facts = fields
+                .iter()
+                .filter(|(name, _)| name.as_str() != "kind")
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            st3_schema::registry()
+                .validate_resource_facts(resource_kind, &facts)
+                .map_err(|error| St3Error::new(error.code, error.message))?;
         }
         output.push(ProductSpec { subject, fields });
     }
@@ -1558,7 +1577,7 @@ subgraph {
       depends-on { step "start" completed }
       plan "work" { goal "Complete plan work."; step "inspect" { } }
       produces {
-        resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.revision"; state "published" }
+        resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.commit"; state "published" }
       }
     }
     step "two" { agentless; depends-on { step "start" completed } }
@@ -1737,13 +1756,13 @@ subgraph {
     goal "Publish the release."
     goal "Keep the workspace clean."
     baseline "release is open" { field "state" "resource/release" is "open" }
-    produces { resource "release" { state "published" } }
+    produces { resource "release" { kind "custom.test.release"; state "published" } }
     gate "release is approved" { field "approval" "resource/release" is "yes" }
     step "build" {
       goal "Build the artifact."
       goal "Record the checksum."
       baseline "source exists" { exists "resource/source" }
-      produces { resource "artifact" { state "published" } }
+      produces { resource "artifact" { kind "custom.test.artifact"; state "published" } }
       gate "artifact is valid" { field "valid" "resource/artifact" is #true }
     }
 
@@ -1764,6 +1783,38 @@ subgraph {
         assert_eq!(plan.steps["build"].products.len(), 1);
         assert_eq!(plan.steps["build"].gates.len(), 1);
         assert!(plan.steps["publish"].goals.is_empty());
+
+        let unknown_product = crate::graph::parse_intent(
+            r#"version 2
+subgraph {
+  plan "bad-product" state="ready" {
+    goal "Publish one invalid resource."
+    produces { resource "result" { kind "document.result"; state "published" } }
+  }
+}"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(unknown_product.code, "unknown-resource-kind");
+
+        let duplicate_field = crate::graph::parse_intent(
+            r#"version 2
+subgraph {
+  plan "duplicate-product-field" state="ready" {
+    goal "Reject an ambiguous product."
+    produces {
+      resource "result" {
+        kind "custom.test.result"
+        state "ready"
+        state "published"
+      }
+    }
+  }
+}"#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(duplicate_field.code, "duplicate-product-field");
     }
 
     #[test]

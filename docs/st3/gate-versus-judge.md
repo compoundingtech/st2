@@ -2,9 +2,9 @@
 
 Status: resolved.
 
-st3 uses `gate` for plan, step, and checkpoint acceptance conditions.
+st3 uses `gate` for plan-level and step-level acceptance conditions.
 
-The supervisor screen-input feature is named `terminal-control`. This removes the former language collision.
+Terminal input uses dedicated incarnation-bound control claims. It is not a gate.
 
 The complete public vocabulary is:
 

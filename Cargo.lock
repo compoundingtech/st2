@@ -2554,6 +2554,7 @@ dependencies = [
  "sha2",
  "st-runtime",
  "st2",
+ "st3-schema",
  "tar",
  "tempfile",
  "tokio",
@@ -2580,6 +2581,16 @@ dependencies = [
  "st3",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "st3-schema"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

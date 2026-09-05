@@ -42,9 +42,9 @@ duplicate_id="$(st3 message send "$subject" \
   --tags "plan-run:$ST_PLAN_RUN,duplicate-work:process-before-restart" \
   -m "DUPLICATE-BATCH-RC-7B9D: This repeats work assigned before the cold restart. Read the durable st3 plan, PROGRESS.md, and git history. Do not redo items 1 or 2. Continue only ready assigned work.")"
 
-st3 claim "resource/plan-run/$ST_PLAN_RUN/restart" resource.binding \
+st3 claim "resource/plan-run/$ST_PLAN_RUN/restart" resource.observed \
   --actor "$ST_AGENT" \
-  --field kind=cold-restart \
+  --field kind=custom.st3.cold-restart \
   --field state=injected \
   --field old_incarnation="$old_incarnation" \
   --field new_incarnation="$new_incarnation" \

@@ -28,8 +28,8 @@ output_index="$(jq -r '.store_index' <<<"$output")"
 test "$plan" = "plan/eval/plan-document-lift/work"
 test "${#revision}" -eq 64
 
-publisher_claim="$(st3 trace "$publisher" --json --limit 100 | jq -s '[.[] | select(.kind == "work.claim")] | last | .store_index')"
-publisher_complete="$(st3 trace "$publisher" --json --limit 100 | jq -s '[.[] | select(.kind == "work.complete")] | last | .store_index')"
+publisher_claim="$(st3 trace "$publisher" --json --limit 100 | jq -s '[.[] | select(.kind == "work.claimed")] | last | .store_index')"
+publisher_complete="$(st3 trace "$publisher" --json --limit 100 | jq -s '[.[] | select(.kind == "work.submitted")] | last | .store_index')"
 test "$output_index" -gt "$publisher_claim"
 test "$output_index" -lt "$publisher_complete"
 
@@ -59,6 +59,6 @@ jq -e '
 ' <<<"$published" >/dev/null
 
 st3 inspect "resource/$root/plan-result" --json \
-  | jq -e '.status.subjects[0].actual | (.fields // .) | .kind == "document.result" and .state == "published"' >/dev/null
+  | jq -e '.status.subjects[0].actual | (.fields // .) | .kind == "custom.st3.document-result" and .state == "published"' >/dev/null
 
 echo "PASS: st3 used the exact attempt-bound plan output after publication"

@@ -117,11 +117,11 @@ subgraph {
         }
         step "publish-base-compatibility" {
           title "The base compatibility revision is published"
-          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-compatibility resource.binding --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-compatibility resource.observed --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-base-compatibility" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/base-compatibility" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -160,11 +160,11 @@ subgraph {
         }
         step "publish-relay-revision" {
           title "The relay revision is published"
-          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/relay-revision resource.binding --actor agent/${ST_PLAN_RUN}/sig.relay --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/relay-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-relay" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/relay-revision" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -203,11 +203,11 @@ subgraph {
         }
         step "publish-hub-revision" {
           title "The hub revision is published"
-          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/hub-revision resource.binding --actor agent/${ST_PLAN_RUN}/sig.hub --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/hub-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-hub" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/hub-revision" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -239,11 +239,11 @@ subgraph {
         }
         step "publish-config-revision" {
           title "The root and config revision is published"
-          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/config-revision resource.binding --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/config-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "rename-root-and-config" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/config-revision" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -277,11 +277,11 @@ subgraph {
         }
         step "publish-final-base-revision" {
           title "The alias-free base revision is published"
-          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-final-revision resource.binding --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-final-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-final-base" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/base-final-revision" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -315,11 +315,11 @@ subgraph {
         }
         step "publish-integrated-revision" {
           title "The integrated revision is published"
-          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/integrated-revision resource.binding --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.revision --field state=published --field revision=SHA. Then complete the step without --evidence."
+          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/integrated-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "verify-clean-product-cutover" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/integrated-revision" {
-              kind "vcs.revision"
+              kind "vcs.commit"
               state "published"
             }
           }
@@ -393,11 +393,11 @@ subgraph {
         }
         step "publish-report-receipt" {
           title "The final report receipt is published"
-          goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.binding --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=coordination.report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
+          goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
           depends-on { step "send-final-report" completed }
           produces {
             resource "plan-run/${ST_PLAN_RUN}/final-report" {
-              kind "coordination.report"
+              kind "custom.st3.coordination-report"
               state "published"
               recipient "agent/local.morgan"
             }

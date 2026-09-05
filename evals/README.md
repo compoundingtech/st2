@@ -124,7 +124,9 @@ st2 eval ./evals/st2/license-mit
 st3 eval ./evals/st3/license-mit
 st2 eval ./evals/st2/network-smoke
 st3 eval ./evals/st3/network-smoke
-st3 claim resource/plan-inputs/source resource.observed --field state=ready
+st3 claim resource/plan-inputs/source resource.observed \
+  --field kind=custom.st3.document-source \
+  --field state=ready
 st3 eval ./evals/st3/plan-inputs \
   --input message="Input proof." \
   --input source=resource/plan-inputs/source

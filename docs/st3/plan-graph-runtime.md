@@ -285,7 +285,8 @@ A start request must provide exactly the declared names. Missing and extra names
 
 Use `${input.message}` and `${input.source}` in execution content. st3 preserves quoted and multiline text when it writes interpolated KDL.
 
-A resource input accepts `resource/NAME` or `resource/NAME@CLAIM_ID`. st3 resolves a bare subject to its latest accepted claim atomically.
+A resource input accepts `resource/NAME` or `resource/NAME@CLAIM_ID`.
+st3 resolves a bare subject to its latest `resource.observed` claim atomically.
 
 The run stores the exact resource subject and claim ID. Later claims do not change gates, inspection, or execution for that input.
 
@@ -298,7 +299,9 @@ st3 run plan.kdl \
   --input message="Review this release." \
   --input source=resource/release-source
 
-st3 claim resource/plan-inputs/source resource.observed --field state=ready
+st3 claim resource/plan-inputs/source resource.observed \
+  --field kind=custom.st3.document-source \
+  --field state=ready
 st3 eval ./evals/st3/plan-inputs \
   --input message="Input proof." \
   --input source=resource/plan-inputs/source
@@ -340,7 +343,7 @@ produces {
     state "published"
   }
   message "plan-run/${ST_PLAN_RUN}/handoff" {
-    status "accepted"
+    status "read"
   }
 }
 ```
@@ -387,7 +390,7 @@ gate "text omits value" { lacks "message/report" "UNVERIFIED" }
 
 `has` and `lacks` accept file, document, or message subjects.
 
-A plan gate or checkpoint gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
+A plan gate can also use `deadline "10m"`. A step uses its `timeout` property instead.
 
 ### Mechanical gates
 
@@ -438,7 +441,7 @@ gate "the release is approved" type="human" {
 
 A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
 
-st3 creates one `review.requested` claim for the exact plan or step revision and attempt. A review decision must match that request.
+st3 creates one `gate.requested` claim for the exact plan or step revision and attempt. A review decision must match that request.
 
 ## Dependencies
 
@@ -828,7 +831,7 @@ Preview returns these review values:
 
 Revision invalidates the prior preview. Approval requires the current preview hash and current subject tokens.
 
-Approval publishes the ready plan and one `plan.documents` claim. It does not start a run. Approval and cancellation stop the planner.
+Approval publishes the ready plan and one `planning-session.approved` claim. It does not start a run. Approval and cancellation stop the planner.
 
 Controllers should wait on `planning-session.*` events. They must not spend an agent turn to poll session status.
 
@@ -850,14 +853,14 @@ The API endpoint is `POST /v1/gate-results`. The durable kinds are `gate.request
 Plan execution uses these important claim kinds:
 
 - `plan.published` records an immutable plan revision.
-- `plan.documents` links an approved planning session to Markdown and KDL.
+- `planning-session.approved` links an approved planning session to Markdown and KDL.
 - `plan-run.created` and `plan-run.state` record stable run history.
 - `run-generation.created`, `run-generation.superseded`, and `run-generation.state` record revision lineage.
 - `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied` record revision review.
-- `step-run.carried`, `step-run.state`, and `step-run.retry` record generation-specific step history.
+- `step-run.carried`, `step-run.state`, and `step-run.retried` record generation-specific step history.
 - `plan.produced` binds a generated plan to one producing attempt.
 - `gate.requested` and `gate.result` record gate operations and evidence.
-- `review.requested` and `review.decision` record exact human gates.
+- `gate.requested` and `gate.result` record exact human gates.
 
 Evidence is a list of claim IDs or immutable graph references that support a result. The evidence does not replace the gate. The gate definition says what must be decided; evidence records why the result is trustworthy.
 

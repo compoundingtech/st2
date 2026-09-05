@@ -30,10 +30,10 @@ for name in reviewer-report final-verdict; do
   status="$(st3 inspect "$subject" --json)"
   jq -e '
     .status.subjects[0].actual | (.fields // .)
-      | (.kind == "message.receipt") and (.state == "published")' \
+      | (.kind == "custom.st3.message-receipt") and (.state == "published")' \
     <<<"$status" >/dev/null
   bindings="$(st3 trace "$subject" --json --limit 20 \
-    | jq -s '[.[] | select(.kind == "resource.binding")] | length')"
+    | jq -s '[.[] | select(.kind == "resource.observed")] | length')"
   test "$bindings" -ge 1
 done
 

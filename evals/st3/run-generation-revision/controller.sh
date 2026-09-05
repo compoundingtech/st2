@@ -7,6 +7,7 @@ readonly REQUESTER=person/eval-requester
 st3 --json run "$EVAL_ROOT/initial.kdl" \
   --workspace "$EVAL_ROOT" \
   --requester "$REQUESTER" \
+  --eval \
   --detach > "$EVAL_ROOT/initial-run.json"
 
 run_subject=$(jq -er '.subject' "$EVAL_ROOT/initial-run.json")
@@ -14,8 +15,9 @@ run_id=$(jq -er '.id' "$EVAL_ROOT/initial-run.json")
 old_generation=$(jq -er '.generation' "$EVAL_ROOT/initial-run.json")
 stable_subject=$(jq -er '.steps[] | select(.step == "stable") | .subject' "$EVAL_ROOT/initial-run.json")
 
-st3 claim "resource/generation-proof/$run_id/stable" resource.binding \
+st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --actor "$REQUESTER" \
+  --field kind=custom.st3.eval-signal \
   --field state=done >/dev/null
 st3 wait "$stable_subject" --for completed --timeout 2m >/dev/null
 
@@ -74,8 +76,9 @@ jq -e '
 
 test "$(cat "$EVAL_ROOT/observed-generation.txt")" = "${new_generation#run-generation/}"
 
-st3 claim "resource/generation-proof/$run_id/changed" resource.binding \
+st3 claim "resource/generation-proof/$run_id/changed" resource.observed \
   --actor "$REQUESTER" \
+  --field kind=custom.st3.eval-signal \
   --field state=done >/dev/null
 st3 wait "$run_subject" --for completed --timeout 2m >/dev/null
 

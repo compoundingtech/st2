@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_operation_index
+ON claims(json_extract(body, '$._operation.id'))
+WHERE json_extract(body, '$._operation.id') IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS operations (
+    id TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    canonical_claim_id TEXT NOT NULL REFERENCES claims(id),
+    state TEXT NOT NULL CHECK(state IN ('active','conflict'))
+);
 
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
@@ -78,19 +88,18 @@ CREATE TABLE IF NOT EXISTS desired (
     claim_id TEXT NOT NULL REFERENCES claims(id),
     body TEXT NOT NULL,
     member TEXT,
-    activation TEXT,
     owner_run TEXT,
     owner_generation TEXT,
     owner_step TEXT
 );
 
 CREATE TABLE IF NOT EXISTS idempotency (
-    key TEXT PRIMARY KEY,
+    operation_id TEXT PRIMARY KEY,
     response TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plan_run_requests (
-    key TEXT PRIMARY KEY,
+    operation_id TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL
 );
 
@@ -254,7 +263,7 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 "#;
 
 pub struct Store {
@@ -277,11 +286,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 7,
+        table_count == 0 || version == 8,
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 7,
+        version == 0 || version == 8,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -292,10 +301,16 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .with_context(|| format!("open st3 database {}", path.display()))?;
         reject_old_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        {
+            let transaction = connection.transaction()?;
+            rebuild_operations_tx(&transaction)?;
+            rebuild_planning_tx(&transaction)?;
+            transaction.commit()?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             origin: origin.into(),
@@ -303,9 +318,15 @@ impl Store {
     }
 
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
-        let connection = Connection::open_in_memory()?;
+        let mut connection = Connection::open_in_memory()?;
         reject_old_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        {
+            let transaction = connection.transaction()?;
+            rebuild_operations_tx(&transaction)?;
+            rebuild_planning_tx(&transaction)?;
+            transaction.commit()?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             origin: origin.into(),
@@ -321,6 +342,46 @@ impl Store {
         current_index(&connection)
     }
 
+    pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let expected = expected_operations(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT id, request_digest, canonical_claim_id, state FROM operations ORDER BY id",
+        )?;
+        let actual = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut drift = Vec::new();
+        for id in expected
+            .keys()
+            .chain(actual.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            if expected.get(id) != actual.get(id) {
+                drift.push((*id).clone());
+            }
+        }
+        Ok(drift)
+    }
+
+    pub fn rebuild_claim_projections(&self) -> Result<()> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        rebuild_operations_tx(&transaction)?;
+        rebuild_planning_tx(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn cached_idempotency_response<T: DeserializeOwned>(
         &self,
         key: &str,
@@ -328,8 +389,8 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
@@ -345,8 +406,8 @@ impl Store {
     ) -> Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection.execute(
-            "INSERT OR IGNORE INTO idempotency(key, response) VALUES (?1, ?2)",
-            params![key, serde_json::to_string(response)?],
+            "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+            params![opaque_cache_key(key), serde_json::to_string(response)?],
         )?;
         Ok(())
     }
@@ -729,8 +790,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((response, stored_hash)) = connection
             .query_row(
-                "SELECT i.response, r.request_hash FROM idempotency i JOIN plan_run_requests r ON r.key=i.key WHERE i.key=?1",
-                [&request.idempotency_key],
+                "SELECT i.response, r.request_hash FROM idempotency i JOIN plan_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
+                [opaque_cache_key(&request.idempotency_key)],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
@@ -890,17 +951,17 @@ impl Store {
         let view = plan_run_view_tx(&transaction, &run_id).map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    request.idempotency_key,
+                    opaque_cache_key(&request.idempotency_key),
                     serde_json::to_string(&view).map_err(internal)?
                 ],
             )
             .map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO plan_run_requests(key, request_hash) VALUES (?1, ?2)",
-                params![request.idempotency_key, request_hash],
+                "INSERT INTO plan_run_requests(operation_id, request_hash) VALUES (?1, ?2)",
+                params![opaque_cache_key(&request.idempotency_key), request_hash],
             )
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
@@ -922,8 +983,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1013,9 +1074,9 @@ impl Store {
         };
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&output).map_err(internal)?
                 ],
             )
@@ -1240,8 +1301,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1318,9 +1379,9 @@ impl Store {
         let view = revision_proposal_view_tx(&transaction, &proposal_id).map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&view).map_err(internal)?
                 ],
             )
@@ -1343,8 +1404,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1374,9 +1435,9 @@ impl Store {
             };
             transaction
                 .execute(
-                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                    "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                     params![
-                        idempotency_key,
+                        opaque_cache_key(idempotency_key),
                         serde_json::to_string(&response).map_err(internal)?
                     ],
                 )
@@ -1463,9 +1524,9 @@ impl Store {
             let connection = self.connection.lock().expect("store mutex poisoned");
             connection
                 .execute(
-                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                    "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                     params![
-                        idempotency_key,
+                        opaque_cache_key(idempotency_key),
                         serde_json::to_string(&response).map_err(internal)?
                     ],
                 )
@@ -1489,9 +1550,9 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&response).map_err(internal)?
                 ],
             )
@@ -1520,8 +1581,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -1581,9 +1642,9 @@ impl Store {
         let view = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&view).map_err(internal)?
                 ],
             )
@@ -1873,8 +1934,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2042,9 +2103,9 @@ impl Store {
         let view = plan_run_view_tx(&transaction, run_id).map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&view).map_err(internal)?
                 ],
             )
@@ -2169,8 +2230,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [&request.idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(&request.idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2334,11 +2395,20 @@ impl Store {
             "claim_expires_at_unix_ms": claim_expiry,
             "readiness_epoch": readiness_epoch
         }, "evidence": request.evidence});
+        let claim_kind = match action {
+            "claim" => "work.claimed",
+            "renew" => "work.renewed",
+            "progress" => "work.progress",
+            "complete" => "work.submitted",
+            "fail" => "work.failed",
+            "release" => "work.released",
+            _ => unreachable!("the work action was validated above"),
+        };
         append_claim_tx(
             &transaction,
             &self.origin,
             &subject,
-            &format!("work.{action}"),
+            claim_kind,
             Some(&actor),
             &body,
             &request.evidence,
@@ -2351,9 +2421,9 @@ impl Store {
              FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    request.idempotency_key,
+                    opaque_cache_key(&request.idempotency_key),
                     serde_json::to_string(&view).map_err(internal)?
                 ],
             )
@@ -2446,7 +2516,7 @@ impl Store {
             &transaction,
             &self.origin,
             &subject,
-            "step-run.retry",
+            "step-run.retried",
             None,
             &body,
             &[],
@@ -2638,18 +2708,6 @@ impl Store {
                     }
                 }
             }
-            if desired.kind == "link"
-                && let Some(link) = crate::graph::link_spec(&desired.desired)
-            {
-                for endpoint in [link.from, link.to] {
-                    if !known(&endpoint)? {
-                        blockers.push(format!(
-                            "link `{}` references undeclared subject `{endpoint}`",
-                            desired.subject
-                        ));
-                    }
-                }
-            }
             if desired.kind == "message"
                 && let Some(to) = canonical_child_string(&desired.desired, "to")
             {
@@ -2762,28 +2820,6 @@ impl Store {
                 }
             }
         }
-        for checkpoint in &intent.checkpoints {
-            for gate in &checkpoint.gates {
-                let subject = match gate {
-                    crate::model::GateSpec::Exists { subject, .. }
-                    | crate::model::GateSpec::Empty { subject, .. }
-                    | crate::model::GateSpec::Field { subject, .. }
-                    | crate::model::GateSpec::Has { subject, .. }
-                    | crate::model::GateSpec::Lacks { subject, .. } => Some(subject.as_str()),
-                    _ => None,
-                };
-                if let Some(subject) = subject
-                    && !subject.starts_with("file/")
-                    && !subject.starts_with("doc/")
-                    && !known(subject)?
-                {
-                    blockers.push(format!(
-                        "checkpoint `{}` references undeclared subject `{subject}`",
-                        checkpoint.name
-                    ));
-                }
-            }
-        }
         blockers.sort();
         blockers.dedup();
         warnings.sort();
@@ -2816,7 +2852,7 @@ impl Store {
                     action: "stop".into(),
                     reason: "the desired state explicitly stops this member".into(),
                 });
-            } else if desired.member.is_some() && desired.activation.is_none() {
+            } else if desired.member.is_some() {
                 actions.push(PlannedAction {
                     subject: subject.clone(),
                     action: "observe-or-start".into(),
@@ -2921,8 +2957,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key = ?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id = ?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -3068,9 +3104,9 @@ impl Store {
             };
             transaction
                 .execute(
-                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                    "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                     params![
-                        idempotency_key,
+                        opaque_cache_key(idempotency_key),
                         serde_json::to_string(&response).map_err(internal)?
                     ],
                 )
@@ -3131,8 +3167,8 @@ impl Store {
             .map_err(internal)?;
             transaction
                 .execute(
-                    "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
+                    "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
                     params![
                         subject,
                         desired.kind,
@@ -3140,7 +3176,6 @@ impl Store {
                         claim_id,
                         serde_json::to_string(&desired.desired).map_err(internal)?,
                         desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
-                        desired.activation.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
                         desired.owner_run,
                         desired.owner_generation,
                         desired.owner_step,
@@ -3250,9 +3285,9 @@ impl Store {
         };
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&response).map_err(internal)?
                 ],
             )
@@ -3282,8 +3317,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -3323,7 +3358,7 @@ impl Store {
             &transaction,
             &self.origin,
             name,
-            "document.bound",
+            "doc.bound",
             None,
             &body,
             &[],
@@ -3346,9 +3381,9 @@ impl Store {
         };
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(idempotency_key),
                     serde_json::to_string(&version).map_err(internal)?
                 ],
             )
@@ -3396,19 +3431,32 @@ impl Store {
         if let Some(actor) = &input.actor {
             validate_actor(actor)?;
         }
-        validate_claim_fields(input)?;
+        let claim_spec = validate_claim_fields(input)?;
+        let operation = claim_operation(input).map_err(internal)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
-        if let Some(key) = &input.idempotency_key
-            && let Some(response) = connection
-                .query_row(
-                    "SELECT response FROM idempotency WHERE key=?1",
-                    [key],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(internal)?
+        if let Some((operation_id, request_digest)) = &operation
+            && let Some((stored_digest, canonical_claim, state)) =
+                operation_tx(&connection, operation_id).map_err(internal)?
         {
-            return serde_json::from_str(&response).map_err(internal);
+            if state == "conflict" {
+                return Err(St3Error::new(
+                    "idempotency-conflict",
+                    "the replicated operation has conflicting requests",
+                )
+                .with_detail("operation_id", operation_id.clone()));
+            }
+            if stored_digest != *request_digest {
+                return Err(St3Error::new(
+                    "idempotency-mismatch",
+                    "the idempotency key already identifies a different request",
+                )
+                .with_detail("operation_id", operation_id.clone())
+                .with_detail("stored_digest", stored_digest)
+                .with_detail("request_digest", request_digest.clone()));
+            }
+            return claim_by_id_tx(&connection, &canonical_claim)
+                .map_err(internal)?
+                .ok_or_else(|| St3Error::new("internal", "the operation claim is missing"));
         }
         let transaction = connection.transaction().map_err(internal)?;
         for evidence in &input.evidence {
@@ -3436,13 +3484,23 @@ impl Store {
                 .with_detail("current_head", json!(actual)));
             }
         }
+        let stored_fields = normalize_resource_observation(&transaction, input)?;
+        validate_claim_cardinality(&transaction, input, &claim_spec.cardinality)?;
         validate_message_transition(&transaction, input)?;
         let predecessor = latest_claim_id_tx(&transaction, &input.subject).map_err(internal)?;
         let predecessors = predecessor.into_iter().collect::<Vec<_>>();
-        let body = json!({
-            "fields": input.fields,
+        let mut body = json!({
+            "fields": stored_fields.as_ref().unwrap_or(&input.fields),
             "evidence": input.evidence,
         });
+        if let Some((operation_id, request_digest)) = &operation {
+            body.as_object_mut()
+                .expect("the claim body is an object")
+                .insert(
+                    "_operation".into(),
+                    json!({ "id": operation_id, "request_digest": request_digest }),
+                );
+        }
         let record = append_claim_tx(
             &transaction,
             &self.origin,
@@ -3454,29 +3512,52 @@ impl Store {
             None,
         )
         .map_err(internal)?;
-        if let Some(key) = &input.idempotency_key {
-            transaction
-                .execute(
-                    "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
-                    params![key, serde_json::to_string(&record).map_err(internal)?],
-                )
-                .map_err(internal)?;
+        if operation.is_some() {
+            register_operation_tx(&transaction, &record).map_err(internal)?;
         }
         transaction.commit().map_err(internal)?;
         Ok(record)
+    }
+
+    pub fn append_client_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        self.append_claim(input)
     }
 
     pub fn idempotent_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
             .map(|response| serde_json::from_str(&response).map_err(anyhow::Error::from))
             .transpose()
+    }
+
+    pub fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let operation_id = operation_id_for_key(key);
+        connection
+            .query_row(
+                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                        claims.origin, claims.actor, claims.body, claims.predecessors, claims.accepted_at_unix_ms
+                 FROM operations JOIN claims ON claims.id=operations.canonical_claim_id
+                 WHERE operations.id=?1 AND operations.state='active'",
+                [operation_id],
+                claim_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn status(&self, selected: Option<&str>) -> Result<StatusResponse> {
@@ -3651,26 +3732,127 @@ impl Store {
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT subject, kind, body, member, activation, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
         let rows = statement.query_map([], |row| {
             let subject = row.get::<_, String>(0)?;
             let kind = row.get::<_, String>(1)?;
             let desired = row.get::<_, String>(2)?;
             let member = row.get::<_, Option<String>>(3)?;
-            let activation = row.get::<_, Option<String>>(4)?;
             Ok(DesiredSubject {
                 subject,
                 kind,
                 desired: serde_json::from_str(&desired).unwrap_or(Value::Null),
                 member: member.and_then(|value| serde_json::from_str(&value).ok()),
-                activation: activation.and_then(|value| serde_json::from_str(&value).ok()),
-                owner_run: row.get(5)?,
-                owner_generation: row.get(6)?,
-                owner_step: row.get(7)?,
+                owner_run: row.get(4)?,
+                owner_generation: row.get(5)?,
+                owner_step: row.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn retire_eval_owned_desired(&self, run: &str) -> Result<Vec<String>> {
+        let run = if run.starts_with("plan-run/") {
+            run.to_owned()
+        } else {
+            format!("plan-run/{run}")
+        };
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let mode: Option<String> = transaction
+            .query_row(
+                "SELECT mode FROM plan_runs WHERE id=?1",
+                [run.strip_prefix("plan-run/").unwrap_or(&run)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(
+            mode.as_deref() == Some("eval"),
+            "only eval runs can retire their desired graph"
+        );
+        transaction.execute("DELETE FROM desired WHERE owner_run=?1", [&run])?;
+        let residue = {
+            let mut statement = transaction
+                .prepare("SELECT subject FROM desired WHERE owner_run=?1 ORDER BY subject")?;
+            statement
+                .query_map([&run], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(residue)
+    }
+
+    pub fn eval_runtime_records(&self, run: &str) -> Result<Vec<(String, bool)>> {
+        let run = if run.starts_with("plan-run/") {
+            run.to_owned()
+        } else {
+            format!("plan-run/{run}")
+        };
+        let run_id = run.strip_prefix("plan-run/").unwrap_or(&run);
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mode: Option<String> = connection
+            .query_row("SELECT mode FROM plan_runs WHERE id=?1", [run_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        anyhow::ensure!(
+            mode.as_deref() == Some("eval"),
+            "only eval runs have disposable runtime records"
+        );
+
+        let mut records = BTreeMap::new();
+        {
+            let mut statement = connection.prepare(
+                "SELECT body FROM claims WHERE kind='intent.desired' ORDER BY store_index",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let desired: DesiredSubject = serde_json::from_str(&row?)?;
+                if desired.owner_run.as_deref() != Some(run.as_str()) {
+                    continue;
+                }
+                if let Some(member) = desired.member {
+                    records.insert(member.runtime_id, member.terminal);
+                }
+            }
+        }
+
+        let mut gate_prefixes = vec![format!("gate-operation/plan-run.{run_id}/")];
+        {
+            let mut statement = connection.prepare(
+                "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
+            )?;
+            let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                gate_prefixes.push(format!("gate-operation/step-run.{}.", row?));
+            }
+        }
+        {
+            let mut statement = connection.prepare(
+                "SELECT subject, body FROM claims WHERE kind='gate.requested' ORDER BY store_index",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (subject, body) = row?;
+                if !gate_prefixes
+                    .iter()
+                    .any(|prefix| subject.starts_with(prefix))
+                {
+                    continue;
+                }
+                let body: Value = serde_json::from_str(&body)?;
+                let fields = body.get("fields").unwrap_or(&body);
+                let has_exec_runner = fields.get("runner").and_then(Value::as_str) == Some("exec")
+                    || fields.get("model").and_then(Value::as_str).is_some();
+                if has_exec_runner {
+                    records.insert(subject.replace('/', "."), false);
+                }
+            }
+        }
+        Ok(records.into_iter().collect())
     }
 
     pub fn messages(
@@ -3779,6 +3961,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn gate_request_for_owner(&self, owner: &str) -> Result<Option<ClaimRecord>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+                 FROM claims WHERE kind='gate.requested'
+                 AND json_extract(body, '$.fields.owner')=?1
+                 ORDER BY store_index DESC LIMIT 1",
+                [owner],
+                claim_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
@@ -3844,8 +4041,8 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
             .query_row(
-                "SELECT response FROM idempotency WHERE key=?1",
-                [&idempotency_key],
+                "SELECT response FROM idempotency WHERE operation_id=?1",
+                [opaque_cache_key(&idempotency_key)],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -3881,6 +4078,23 @@ impl Store {
                 active_subscriptions.push((subject.clone(), expected.clone()));
             }
         }
+        let normalized_observation = normalize_resource_observation(
+            &transaction,
+            &ClaimInput {
+                subject: resource.into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("facts".into(), facts.clone())]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            },
+        )?
+        .expect("a resource observation is normalized");
+        let resource_kind = normalized_observation
+            .get("kind")
+            .cloned()
+            .expect("a normalized resource observation has a kind");
         let previous = latest_actual(&transaction, resource)
             .map_err(internal)?
             .and_then(|actual| actual.get("facts").cloned());
@@ -3955,6 +4169,7 @@ impl Store {
                     "resource.observed",
                     None,
                     &json!({"fields": {
+                        "kind": resource_kind,
                         "facts": facts,
                         "observer": observer,
                         "baseline": baseline,
@@ -3984,7 +4199,7 @@ impl Store {
                 .map_err(internal)?
                 .and_then(|actual| {
                     actual
-                        .get("status")
+                        .get("state")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                 });
@@ -3997,10 +4212,10 @@ impl Store {
                     &transaction,
                     &self.origin,
                     subscription_subject,
-                    "subscription.health",
+                    "subscription.state",
                     None,
                     &json!({"fields": {
-                        "status": status,
+                        "state": status,
                         "reason": (!target_exists).then_some("the delivery target is absent"),
                     }}),
                     &predecessors,
@@ -4072,9 +4287,9 @@ impl Store {
         };
         transaction
             .execute(
-                "INSERT INTO idempotency(key, response) VALUES (?1, ?2)",
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
                 params![
-                    idempotency_key,
+                    opaque_cache_key(&idempotency_key),
                     serde_json::to_string(&outcome).map_err(internal)?
                 ],
             )
@@ -4136,17 +4351,6 @@ impl Store {
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         latest_actual(&connection, subject)
-    }
-
-    pub fn checkpoint_reached_ordinal(&self, sequence: &str) -> Result<Option<u32>> {
-        let Some(claim) = self.latest_claim(sequence, Some("checkpoint.reached"))? else {
-            return Ok(None);
-        };
-        Ok(claim
-            .body
-            .pointer("/fields/ordinal")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()))
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
@@ -4509,23 +4713,26 @@ impl Store {
                     .map_err(internal)?;
                 if inserted != 0 {
                     let index = transaction.last_insert_rowid() as u64;
-                    insert_event(
-                        &transaction,
-                        index,
-                        &claim.kind,
-                        &claim.subject,
-                        &claim.body,
-                    )
-                    .map_err(internal)?;
-                    if claim.kind == "intent.desired" {
+                    let effective = register_operation_tx(&transaction, claim).map_err(internal)?;
+                    if effective {
+                        insert_event(
+                            &transaction,
+                            index,
+                            &claim.kind,
+                            &claim.subject,
+                            &claim.body,
+                        )
+                        .map_err(internal)?;
+                    }
+                    if effective && claim.kind == "intent.desired" {
                         if let Ok(desired) =
                             serde_json::from_value::<DesiredSubject>(claim.body.clone())
                         {
                             select_replicated_desired(&transaction, claim, &desired)?;
                         }
-                    } else if claim.kind == "document.bound" {
+                    } else if effective && claim.kind == "doc.bound" {
                         select_replicated_document(&transaction, claim, index)?;
-                    } else if claim.kind == "plan.published" {
+                    } else if effective && claim.kind == "plan.published" {
                         select_replicated_plan(&transaction, claim, index)?;
                     }
                 }
@@ -4538,7 +4745,9 @@ impl Store {
                 )
                 .map_err(internal)?;
         }
+        rebuild_operations_tx(&transaction).map_err(internal)?;
         project_replicated_plan_runs(&transaction)?;
+        rebuild_planning_tx(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);
         let missing_sequences = missing_ranges
@@ -4617,7 +4826,7 @@ fn resolve_plan_run_inputs(
                 let claim_id = if let Some(claim_id) = requested_claim {
                     let exists = transaction
                         .query_row(
-                            "SELECT 1 FROM claims WHERE id=?1 AND subject=?2",
+                            "SELECT 1 FROM claims WHERE id=?1 AND subject=?2 AND kind='resource.observed'",
                             params![claim_id, subject],
                             |_| Ok(()),
                         )
@@ -4632,12 +4841,20 @@ fn resolve_plan_run_inputs(
                     }
                     claim_id.to_owned()
                 } else {
-                    latest_claim_id_tx(transaction, subject)
+                    transaction
+                        .query_row(
+                            "SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY store_index DESC LIMIT 1",
+                            [subject],
+                            |row| row.get(0),
+                        )
+                        .optional()
                         .map_err(internal)?
                         .ok_or_else(|| {
                             St3Error::new(
                                 "missing-resource-input",
-                                format!("plan input `{name}` references an unavailable resource"),
+                                format!(
+                                    "plan input `{name}` references a resource without an observation"
+                                ),
                             )
                         })?
                 };
@@ -4913,7 +5130,7 @@ fn find_document(
 }
 
 fn validate_claim_kind(kind: &str) -> Result<(), St3Error> {
-    if registered_client_claim_kind(kind) {
+    if st3_schema::is_known_claim(kind) {
         Ok(())
     } else {
         Err(St3Error::new(
@@ -4924,18 +5141,10 @@ fn validate_claim_kind(kind: &str) -> Result<(), St3Error> {
 }
 
 fn validate_claim_subject(subject: &str) -> Result<(), St3Error> {
-    if subject.is_empty()
-        || subject.len() > 512
-        || !subject.contains('/')
-        || subject.chars().any(char::is_whitespace)
-        || subject.chars().any(char::is_control)
-    {
-        return Err(St3Error::new(
-            "invalid-claim-subject",
-            "a claim subject must be a bounded full subject without whitespace",
-        ));
-    }
-    Ok(())
+    st3_schema::registry()
+        .validate_subject(subject)
+        .map(|_| ())
+        .map_err(|error| St3Error::new(error.code, error.message))
 }
 
 fn validate_actor(actor: &str) -> Result<(), St3Error> {
@@ -4950,147 +5159,474 @@ fn validate_actor(actor: &str) -> Result<(), St3Error> {
     })
 }
 
-fn validate_claim_fields(input: &ClaimInput) -> Result<(), St3Error> {
-    let enum_field = |name: &str, allowed: &[&str]| -> Result<(), St3Error> {
-        let Some(value) = input.fields.get(name) else {
-            return Err(St3Error::new(
-                "missing-claim-field",
-                format!("claim kind `{}` needs field `{name}`", input.kind),
-            ));
-        };
-        let Some(value) = value.as_str() else {
-            return Err(St3Error::new(
-                "invalid-claim-field",
-                format!("claim field `{name}` must be a string"),
-            ));
-        };
-        if !allowed.contains(&value) {
-            return Err(St3Error::new(
-                "invalid-claim-field",
-                format!("claim field `{name}` has invalid value `{value}`"),
-            ));
-        }
-        Ok(())
+fn validate_claim_fields(input: &ClaimInput) -> Result<&'static st3_schema::ClaimSpec, St3Error> {
+    st3_schema::registry()
+        .validate_claim(&input.subject, &input.kind, &input.fields)
+        .map_err(|error| St3Error::new(error.code, error.message))
+}
+
+fn validate_claim_cardinality(
+    transaction: &Transaction<'_>,
+    input: &ClaimInput,
+    cardinality: &st3_schema::Cardinality,
+) -> Result<(), St3Error> {
+    let duplicate = match cardinality {
+        st3_schema::Cardinality::Append | st3_schema::Cardinality::StateTransition => false,
+        st3_schema::Cardinality::Once => transaction
+            .query_row(
+                "SELECT 1 FROM claims WHERE subject=?1 AND kind=?2 LIMIT 1",
+                params![input.subject, input.kind],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some(),
+        st3_schema::Cardinality::OncePerActor => transaction
+            .query_row(
+                "SELECT 1 FROM claims WHERE subject=?1 AND kind=?2 AND actor IS ?3 LIMIT 1",
+                params![input.subject, input.kind, input.actor],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some(),
     };
-    match input.kind.as_str() {
-        "context.clear.requested" | "session.signal.requested" => {
-            enum_field("operation_status", &["requested"])?
-        }
-        "context.clear.result" | "session.signal.result" => {
-            enum_field("operation_status", &["succeeded", "failed"])?
-        }
-        "terminal.input.result" => {
-            enum_field("operation_status", &["succeeded", "failed", "written"])?
-        }
-        "account.quota" => enum_field("quota", &["available", "limited", "exhausted", "unknown"])?,
-        "eval.verdict" => enum_field("verdict", &["pass", "fail", "void"])?,
-        "gate.result" => enum_field("verdict", &["pass", "fail"])?,
-        "presence.observed" => enum_field("presence", &["available", "busy", "dnd", "offline"])?,
-        "reachability.changed" => enum_field(
-            "reachability",
-            &["reachable", "unreachable", "indeterminate"],
-        )?,
-        "review.decision" => enum_field("decision", &["approved", "rejected", "revise"])?,
-        "transport.peer" => enum_field("status", &["up", "down", "unknown"])?,
-        _ => {}
+    if duplicate {
+        return Err(St3Error::new(
+            "claim-cardinality",
+            format!(
+                "claim kind `{}` already exists at its allowed cardinality for `{}`",
+                input.kind, input.subject
+            ),
+        ));
     }
     Ok(())
 }
 
-fn registered_client_claim_kind(kind: &str) -> bool {
-    const REGISTERED: &[&str] = &[
-        "account.quota",
-        "action.completed",
-        "action.failed",
-        "action.requested",
-        "action.result",
-        "actor.action-observed",
-        "agent.account",
-        "checkpoint.active",
-        "checkpoint.failed",
-        "checkpoint.reached",
-        "clock.adjusted",
-        "cutover.ready",
-        "clock.reached",
-        "clock.wake.requested",
-        "clock.wake.cancel.requested",
-        "context.clear.requested",
-        "context.clear.result",
-        "daemon.started",
-        "deadline.reached",
-        "eval.verdict",
-        "terminal-control.observed",
-        "harness.activity",
-        "harness.cleared",
-        "harness.compacted",
-        "harness.error",
-        "harness.idle",
-        "harness.ready",
-        "harness.turn-usage",
-        "harness.work-started",
-        "gate.result",
-        "gate.requested",
-        "member.observed",
-        "member.launch",
-        "member.restart-reset",
-        "message.accepted",
-        "message.closed",
-        "message.delivered",
-        "message.sent",
-        "plan-run.created",
-        "plan-run.state",
-        "plan.documents",
-        "plan.published",
-        "planning-session.approved",
-        "planning-session.cancelled",
-        "planning-session.candidate-submitted",
-        "planning-session.previewed",
-        "planning-session.revision-requested",
-        "planning-session.started",
-        "planning-session.variant-proposed",
-        "presence.observed",
-        "pid.observed",
-        "reachability.changed",
-        "replication.accepted",
-        "observer.observed",
-        "observer.health",
-        "resource.binding",
-        "resource.file-observed",
-        "resource.observed",
-        "resource.session-bound",
-        "review.decision",
-        "review.requested",
-        "revision-proposal.applied",
-        "revision-proposal.approved",
-        "revision-proposal.cancelled",
-        "revision-proposal.created",
-        "run-generation.created",
-        "run-generation.state",
-        "run-generation.superseded",
-        "session.signal.requested",
-        "session.signal.result",
-        "step-run.carried",
-        "step-run.state",
-        "step-run.retry",
-        "supervision.decision",
-        "subscription.health",
-        "terminal.input.requested",
-        "terminal.input.result",
-        "transport.peer",
-        "work.claim",
-        "work.renew",
-        "work.progress",
-        "work.complete",
-        "work.fail",
-        "work.release",
+fn normalize_resource_observation(
+    transaction: &Transaction<'_>,
+    input: &ClaimInput,
+) -> Result<Option<BTreeMap<String, Value>>, St3Error> {
+    if input.kind != "resource.observed" {
+        return Ok(None);
+    }
+    let prior_kind = latest_resource_kind(transaction, &input.subject)?;
+    let desired_kind = current_desired_row_tx(transaction, &input.subject)
+        .map_err(internal)?
+        .filter(|desired| desired.kind == "resource")
+        .and_then(|desired| serde_json::from_str::<Value>(&desired.body).ok())
+        .and_then(|desired| canonical_child_string(&desired, "kind"));
+    let requested_kind = input.fields.get("kind").and_then(Value::as_str);
+    let kind = requested_kind
+        .map(str::to_owned)
+        .or_else(|| prior_kind.clone())
+        .or(desired_kind)
+        .ok_or_else(|| {
+            St3Error::new(
+                "missing-resource-kind",
+                "the first resource observation needs a registered resource kind",
+            )
+        })?;
+    if prior_kind.as_deref().is_some_and(|prior| prior != kind) {
+        return Err(St3Error::new(
+            "immutable-resource-kind",
+            format!(
+                "resource `{}` already has kind `{}`",
+                input.subject,
+                prior_kind.unwrap()
+            ),
+        ));
+    }
+    let facts = resource_facts(&input.fields)?;
+    let spec = st3_schema::registry()
+        .validate_resource_facts(&kind, &facts)
+        .map_err(|error| St3Error::new(error.code, error.message))?;
+    if let Some(previous) = latest_actual(transaction, &input.subject).map_err(internal)? {
+        let previous = previous
+            .get("facts")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| previous.as_object().cloned().unwrap_or_default());
+        for (name, field) in &spec.fields {
+            if field.immutable
+                && let Some(value) = facts.get(name)
+                && previous.get(name).is_some_and(|prior| prior != value)
+            {
+                return Err(St3Error::new(
+                    "immutable-resource-field",
+                    format!(
+                        "resource field `{name}` cannot change for `{}`",
+                        input.subject
+                    ),
+                ));
+            }
+        }
+    }
+    let mut fields = input.fields.clone();
+    fields.insert("kind".into(), Value::String(kind));
+    Ok(Some(fields))
+}
+
+fn resource_facts(fields: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>, St3Error> {
+    if let Some(value) = fields.get("facts") {
+        return value
+            .as_object()
+            .map(|facts| {
+                facts
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .ok_or_else(|| {
+                St3Error::new(
+                    "invalid-resource-observation",
+                    "resource observation facts must be an object",
+                )
+            });
+    }
+    const ENVELOPE: &[&str] = &[
+        "kind",
+        "observed_at",
+        "observer",
+        "baseline",
+        "changed_fields",
     ];
-    REGISTERED.contains(&kind)
+    Ok(fields
+        .iter()
+        .filter(|(name, _)| !ENVELOPE.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect())
+}
+
+fn latest_resource_kind(
+    transaction: &Transaction<'_>,
+    subject: &str,
+) -> Result<Option<String>, St3Error> {
+    let bodies = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT body FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY store_index DESC",
+            )
+            .map_err(internal)?;
+        statement
+            .query_map([subject], |row| row.get::<_, String>(0))
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?
+    };
+    Ok(bodies.into_iter().find_map(|body| {
+        serde_json::from_str::<Value>(&body)
+            .ok()?
+            .pointer("/fields/kind")?
+            .as_str()
+            .map(str::to_owned)
+    }))
+}
+
+fn registered_client_claim_kind(kind: &str) -> bool {
+    st3_schema::is_known_claim(kind)
+}
+
+fn opaque_cache_key(key: &str) -> String {
+    format!(
+        "cache/{}",
+        hex::encode(Sha256::digest(
+            [b"st3.idempotency-cache.v1\0".as_slice(), key.as_bytes()].concat()
+        ))
+    )
+}
+
+fn operation_id_for_key(key: &str) -> String {
+    format!(
+        "op/{}",
+        hex::encode(Sha256::digest(
+            [b"st3.idempotency.v1\0".as_slice(), key.as_bytes()].concat()
+        ))
+    )
+}
+
+fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>> {
+    let Some(key) = input.idempotency_key.as_deref() else {
+        return Ok(None);
+    };
+    if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+        return Err(anyhow::anyhow!(
+            "an idempotency key must contain 1 through 512 non-control characters"
+        ));
+    }
+    let operation_id = operation_id_for_key(key);
+    let mut evidence = input.evidence.clone();
+    evidence.sort();
+    evidence.dedup();
+    let request_digest = canonical_hash(&(
+        "st3.claim-request.v1",
+        &input.subject,
+        &input.kind,
+        &input.actor,
+        &input.fields,
+        evidence,
+        &input.expected_subject,
+    ))?;
+    Ok(Some((operation_id, request_digest)))
+}
+
+fn operation_parts(body: &Value) -> Option<(&str, &str)> {
+    Some((
+        body.pointer("/_operation/id")?.as_str()?,
+        body.pointer("/_operation/request_digest")?.as_str()?,
+    ))
+}
+
+fn operation_tx(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    connection
+        .query_row(
+            "SELECT request_digest, canonical_claim_id, state FROM operations WHERE id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecord>> {
+    connection
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE id=?1",
+            [id],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn expected_operations(
+    connection: &Connection,
+) -> Result<BTreeMap<String, (String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+         FROM claims
+         WHERE json_extract(body, '$._operation.id') IS NOT NULL
+         ORDER BY id",
+    )?;
+    let claims = statement
+        .query_map([], claim_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
+    for claim in claims {
+        if let Some((operation_id, request_digest)) = operation_parts(&claim.body) {
+            grouped
+                .entry(operation_id.to_owned())
+                .or_default()
+                .push((request_digest.to_owned(), claim.id));
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(operation_id, mut claims)| {
+            claims.sort();
+            let request_digest = claims[0].0.clone();
+            let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
+                "active"
+            } else {
+                "conflict"
+            };
+            let canonical_claim_id = claims
+                .iter()
+                .filter(|(digest, _)| digest == &request_digest)
+                .map(|(_, claim)| claim)
+                .min()
+                .expect("an operation has at least one claim")
+                .clone();
+            (
+                operation_id,
+                (request_digest, canonical_claim_id, state.into()),
+            )
+        })
+        .collect())
+}
+
+fn rebuild_operations_tx(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute("DELETE FROM operations", [])?;
+    for (id, (request_digest, canonical_claim_id, state)) in expected_operations(transaction)? {
+        transaction.execute(
+            "INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES (?1, ?2, ?3, ?4)",
+            params![id, request_digest, canonical_claim_id, state],
+        )?;
+    }
+    Ok(())
+}
+
+fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute("DELETE FROM planning_previews", [])?;
+    transaction.execute("DELETE FROM planning_candidates", [])?;
+    transaction.execute("DELETE FROM planning_sessions", [])?;
+    let mut statement = transaction.prepare(
+        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+         FROM claims WHERE kind LIKE 'planning-session.%' ORDER BY store_index",
+    )?;
+    let claims = statement
+        .query_map([], claim_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for claim in claims {
+        let id = claim
+            .subject
+            .strip_prefix("planning-session/")
+            .context("a planning claim has an invalid subject")?;
+        let fields = claim
+            .body
+            .get("fields")
+            .and_then(Value::as_object)
+            .context("a planning claim has no fields")?;
+        let text = |name: &str| fields.get(name).and_then(Value::as_str);
+        let accepted = claim.accepted_at_unix_ms.to_string();
+        match claim.kind.as_str() {
+            "planning-session.started" => {
+                let plan = text("plan")
+                    .context("planning-session.started has no plan")?
+                    .strip_prefix("plan/")
+                    .unwrap_or_else(|| text("plan").expect("the plan was checked"));
+                let target_run = text("target_run")
+                    .map(|value| value.strip_prefix("plan-run/").unwrap_or(value));
+                let target_generation = text("target_generation")
+                    .map(|value| value.strip_prefix("run-generation/").unwrap_or(value));
+                transaction.execute(
+                    "INSERT INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
+                    params![
+                        id,
+                        plan,
+                        text("request").context("planning-session.started has no request")?,
+                        text("workspace").context("planning-session.started has no workspace")?,
+                        text("requester").or(claim.actor.as_deref()).context("planning-session.started has no requester")?,
+                        text("planner").context("planning-session.started has no planner")?,
+                        target_run,
+                        target_generation,
+                        accepted,
+                    ],
+                )?;
+            }
+            "planning-session.candidate-submitted" => {
+                let variant = text("variant").unwrap_or("default");
+                let revision = fields
+                    .get("candidate_revision")
+                    .or_else(|| fields.get("revision"))
+                    .and_then(Value::as_u64)
+                    .context("a planning candidate has no revision")?;
+                transaction.execute(
+                    "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        id,
+                        variant,
+                        revision,
+                        text("markdown").context("a planning candidate has no Markdown")?,
+                        text("kdl").context("a planning candidate has no KDL")?,
+                        text("plan_revision").context("a planning candidate has no plan revision")?,
+                        accepted,
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM planning_previews WHERE session_id=?1 AND variant=?2",
+                    params![id, variant],
+                )?;
+                transaction.execute(
+                    "UPDATE planning_sessions SET status='review', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![id, accepted],
+                )?;
+            }
+            "planning-session.previewed" => {
+                let variant = text("variant").unwrap_or("default");
+                let revision = fields
+                    .get("candidate_revision")
+                    .and_then(Value::as_u64)
+                    .context("a planning preview has no candidate revision")?;
+                let plan = fields
+                    .get("plan")
+                    .context("a planning preview has no plan response")?;
+                transaction.execute(
+                    "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
+                       store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
+                       plan_response=excluded.plan_response, created_at_unix_ms=excluded.created_at_unix_ms",
+                    params![
+                        id,
+                        variant,
+                        revision,
+                        text("preview_hash").context("a planning preview has no hash")?,
+                        fields.get("store_index").and_then(Value::as_u64).context("a planning preview has no store index")?,
+                        text("graph").context("a planning preview has no graph")?,
+                        text("diff").context("a planning preview has no diff")?,
+                        serde_json::to_string(plan)?,
+                        accepted,
+                    ],
+                )?;
+            }
+            "planning-session.revision-requested" => {
+                transaction.execute(
+                    "UPDATE planning_sessions SET status='revision-requested', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![id, accepted],
+                )?;
+                transaction.execute("DELETE FROM planning_previews WHERE session_id=?1", [id])?;
+            }
+            "planning-session.approved" => {
+                transaction.execute(
+                    "UPDATE planning_sessions SET status='approved', published_revision=?2, updated_at_unix_ms=?3 WHERE id=?1",
+                    params![id, text("plan_revision"), accepted],
+                )?;
+            }
+            "planning-session.cancelled" => {
+                transaction.execute(
+                    "UPDATE planning_sessions SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![id, accepted],
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn register_operation_tx(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<bool> {
+    let Some((operation_id, request_digest)) = operation_parts(&claim.body) else {
+        return Ok(true);
+    };
+    let current = operation_tx(transaction, operation_id)?;
+    match current {
+        None => {
+            transaction.execute(
+                "INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES (?1, ?2, ?3, 'active')",
+                params![operation_id, request_digest, claim.id],
+            )?;
+            Ok(true)
+        }
+        Some((stored_digest, canonical, state)) if stored_digest == request_digest => {
+            if claim.id < canonical {
+                transaction.execute(
+                    "UPDATE operations SET canonical_claim_id=?2 WHERE id=?1",
+                    params![operation_id, claim.id],
+                )?;
+            }
+            Ok(state == "active" && canonical == claim.id)
+        }
+        Some(_) => {
+            transaction.execute(
+                "UPDATE operations SET state='conflict' WHERE id=?1",
+                [operation_id],
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 fn known_replicated_claim_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "intent.desired" | "document.bound" | "plan.published" | "plan.produced"
+        "intent.desired" | "doc.bound" | "plan.published" | "plan.produced"
     ) || registered_client_claim_kind(kind)
 }
 
@@ -5100,6 +5636,19 @@ fn has_unknown_claim_at(
     at_index: Option<u64>,
 ) -> Result<Option<String>> {
     let through = at_index.unwrap_or(i64::MAX as u64);
+    let conflict = connection
+        .query_row(
+            "SELECT operations.id FROM claims JOIN operations
+             ON operations.id=json_extract(claims.body, '$._operation.id')
+             WHERE claims.subject=?1 AND claims.store_index<=?2 AND operations.state='conflict'
+             ORDER BY operations.id LIMIT 1",
+            params![subject, through],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(operation) = conflict {
+        return Ok(Some(format!("idempotency-conflict:{operation}")));
+    }
     let mut statement = connection.prepare(
         "SELECT DISTINCT kind FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY kind",
     )?;
@@ -5118,7 +5667,7 @@ fn validate_message_transition(
     let requested = match input.kind.as_str() {
         "message.sent" => "sent",
         "message.delivered" => "delivered",
-        "message.accepted" => "accepted",
+        "message.read" => "read",
         "message.closed" => "closed",
         _ => return Ok(()),
     };
@@ -5134,7 +5683,7 @@ fn validate_message_transition(
             format!("`{}` needs status `{requested}`", input.kind),
         ));
     }
-    if matches!(requested, "accepted" | "closed") && input.actor.is_none() {
+    if matches!(requested, "read" | "closed") && input.actor.is_none() {
         return Err(St3Error::new(
             "missing-message-actor",
             format!("`{}` needs an actor", input.kind),
@@ -5143,7 +5692,7 @@ fn validate_message_transition(
 
     let current: Option<String> = transaction
         .query_row(
-            "SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.delivered','message.accepted','message.closed') ORDER BY store_index DESC LIMIT 1",
+            "SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.delivered','message.read','message.closed') ORDER BY store_index DESC LIMIT 1",
             [&input.subject],
             |row| row.get(0),
         )
@@ -5152,7 +5701,7 @@ fn validate_message_transition(
     let current = current.as_deref().map(|kind| match kind {
         "message.sent" => "sent",
         "message.delivered" => "delivered",
-        "message.accepted" => "accepted",
+        "message.read" => "read",
         "message.closed" => "closed",
         _ => unreachable!("the SQL query selects message lifecycle kinds"),
     });
@@ -5176,8 +5725,8 @@ fn validate_message_transition(
         (current, requested),
         (None, "sent")
             | (Some("sent"), "delivered")
-            | (Some("delivered"), "accepted")
-            | (Some("accepted"), "closed")
+            | (Some("delivered"), "read")
+            | (Some("read"), "closed")
     );
     if !valid {
         return Err(St3Error::new(
@@ -5203,6 +5752,10 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    let fields = schema_fields_for_body(kind, body)?;
+    st3_schema::registry()
+        .validate_claim(subject, kind, &fields)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
     let now = now_ms();
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
@@ -5239,10 +5792,43 @@ fn append_claim_tx(
         kind: kind.into(),
         origin: origin.into(),
         actor: actor.map(str::to_owned),
+        operation_id: operation_parts(body).map(|(id, _)| id.to_owned()),
+        request_digest: operation_parts(body).map(|(_, digest)| digest.to_owned()),
         body: body.clone(),
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+fn schema_fields_for_body(kind: &str, body: &Value) -> Result<BTreeMap<String, Value>> {
+    if let Some(fields) = body.get("fields").and_then(Value::as_object) {
+        return Ok(fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect());
+    }
+    if kind == "intent.desired" {
+        let desired: DesiredSubject = serde_json::from_value(body.clone())?;
+        return Ok(BTreeMap::from([
+            ("kind".into(), Value::String(desired.kind.clone())),
+            ("revision".into(), Value::String(desired_revision(&desired))),
+            ("desired".into(), desired.desired),
+        ]));
+    }
+    if kind == "plan.published" {
+        let plan: PlanSpec = serde_json::from_value(body.clone())?;
+        return Ok(BTreeMap::from([
+            ("revision".into(), Value::String(plan.revision.clone())),
+            ("state".into(), serde_json::to_value(&plan.state)?),
+            ("body".into(), body.clone()),
+        ]));
+    }
+    Ok(body
+        .as_object()
+        .context("a claim body must be an object")?
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5503,6 +6089,7 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
     let accepted = row.get::<_, String>(9)?;
+    let body = serde_json::from_str(&body).unwrap_or(Value::Null);
     Ok(ClaimRecord {
         id: row.get(0)?,
         store_index: row.get(1)?,
@@ -5511,7 +6098,9 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
         kind: row.get(4)?,
         origin: row.get(5)?,
         actor: row.get(6)?,
-        body: serde_json::from_str(&body).unwrap_or(Value::Null),
+        operation_id: operation_parts(&body).map(|(id, _)| id.to_owned()),
+        request_digest: operation_parts(&body).map(|(_, digest)| digest.to_owned()),
+        body,
         predecessors: serde_json::from_str(&predecessors).unwrap_or_default(),
         accepted_at_unix_ms: accepted.parse().unwrap_or_default(),
     })
@@ -5682,6 +6271,28 @@ fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
                 format!("replicated claim `{}` failed verification", claim.id),
             ));
         }
+        if known_replicated_claim_kind(&claim.kind) {
+            let fields = schema_fields_for_body(&claim.kind, &claim.body).map_err(|error| {
+                St3Error::new(
+                    "invalid-replicated-claim",
+                    format!(
+                        "replicated claim `{}` has an invalid body: {error}",
+                        claim.id
+                    ),
+                )
+            })?;
+            st3_schema::registry()
+                .validate_claim(&claim.subject, &claim.kind, &fields)
+                .map_err(|error| {
+                    St3Error::new(
+                        "invalid-replicated-claim",
+                        format!(
+                            "replicated claim `{}` violates {}: {}",
+                            claim.id, error.code, error.message
+                        ),
+                    )
+                })?;
+        }
     }
     Ok(())
 }
@@ -5709,8 +6320,8 @@ fn select_replicated_desired(
     }
     transaction
         .execute(
-            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, activation, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, activation=excluded.activation, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
+            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
             params![
                 claim.subject,
                 desired.kind,
@@ -5718,7 +6329,6 @@ fn select_replicated_desired(
                 claim.id,
                 serde_json::to_string(&desired.desired).map_err(internal)?,
                 desired.member.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
-                desired.activation.as_ref().map(serde_json::to_string).transpose().map_err(internal)?,
                 desired.owner_run,
                 desired.owner_generation,
                 desired.owner_step,
@@ -5735,8 +6345,8 @@ fn project_replicated_plan_runs(transaction: &Transaction<'_>) -> Result<(), St3
              FROM claims
              WHERE kind IN ('plan-run.created','plan-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                             'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
-                            'step-run.carried','step-run.state','step-run.retry',
-                            'work.claim','work.renew','work.progress','work.complete','work.fail','work.release')
+                            'step-run.carried','step-run.state','step-run.retried',
+                            'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')
              ORDER BY store_index",
         )
         .map_err(internal)?;
@@ -5947,7 +6557,7 @@ fn project_plan_run_update(
     if !claim.subject.starts_with("step-run/") {
         return Ok(());
     }
-    if claim.kind == "step-run.retry" {
+    if claim.kind == "step-run.retried" {
         let Some(attempt) = fields.get("attempt").and_then(Value::as_u64) else {
             return Ok(());
         };
@@ -7589,7 +8199,7 @@ mod tests {
             r#"
 version 2
 subgraph {
-  resource "source" { kind "document"; binding "late" }
+  resource "source" { kind "custom.st3.document-source" }
   plan "inputs" state="ready" {
     input "message" kind="text"
     input "source" kind="resource"
@@ -7855,7 +8465,7 @@ subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all run
         store
             .append_claim(&ClaimInput {
                 subject: subject.into(),
-                kind: "member.observed".into(),
+                kind: "runtime.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
                 evidence: Vec::new(),
@@ -7868,10 +8478,7 @@ subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all run
                 subject: subject.into(),
                 kind: "terminal.input.result".into(),
                 actor: None,
-                fields: BTreeMap::from([(
-                    "operation_status".into(),
-                    Value::String("written".into()),
-                )]),
+                fields: BTreeMap::from([("result".into(), Value::String("written".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: None,
@@ -7883,7 +8490,7 @@ subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all run
             .expect("actual state")
             .expect("subject state");
         assert_eq!(actual["status"], "running");
-        assert_eq!(actual["operation_status"], "written");
+        assert_eq!(actual["result"], "written");
     }
 
     #[test]
@@ -8314,7 +8921,7 @@ subgraph {{
         source
             .append_claim(&ClaimInput {
                 subject: "host/source".into(),
-                kind: "transport.peer".into(),
+                kind: "transport.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
                 evidence: Vec::new(),
@@ -8332,14 +8939,53 @@ subgraph {{
     }
 
     #[test]
+    fn replication_rejects_a_registered_claim_that_violates_the_schema() {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut batch = source.export_replication(0).unwrap();
+        let claim = &mut batch.batches[0].claims[0];
+        claim.body["fields"]["unexpected"] = Value::Bool(true);
+        claim.id = claim_hash(
+            &claim.batch_id,
+            &claim.subject,
+            &claim.kind,
+            &claim.origin,
+            claim.actor.as_deref(),
+            &claim.body,
+            &claim.predecessors,
+        )
+        .unwrap();
+
+        let target = Store::open_memory("target").unwrap();
+        let error = target
+            .import_replication("source", &batch)
+            .expect_err("a registered claim must satisfy the shared schema");
+        assert_eq!(error.code, "invalid-replicated-claim");
+        assert_eq!(target.index().unwrap(), 0);
+    }
+
+    #[test]
     fn an_unknown_replicated_claim_marks_its_subject_indeterminate() {
         let source = Store::open_memory("source").unwrap();
         source
             .append_claim(&ClaimInput {
                 subject: "resource/future".into(),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: None,
-                fields: BTreeMap::from([("status".into(), Value::String("active".into()))]),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("custom.st3.future".into())),
+                    ("status".into(), Value::String("active".into())),
+                ]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some("future".into()),
@@ -8378,7 +9024,7 @@ subgraph {{
         source
             .append_claim(&ClaimInput {
                 subject: "host/source".into(),
-                kind: "transport.peer".into(),
+                kind: "transport.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
                 evidence: Vec::new(),
@@ -8401,7 +9047,7 @@ subgraph {{
         target.import_replication("middle", &relayed).unwrap();
         assert!(
             target
-                .latest_claim("host/source", Some("transport.peer"))
+                .latest_claim("host/source", Some("transport.observed"))
                 .unwrap()
                 .is_some()
         );
@@ -8539,7 +9185,7 @@ subgraph {{
     }
 
     #[test]
-    fn message_lifecycle_cannot_skip_delivery_or_acceptance() {
+    fn message_lifecycle_cannot_skip_delivery_or_read() {
         let store = Store::open_memory("node").unwrap();
         let subject = "message/demo";
         let append = |kind: &str, status: &str, actor: Option<&str>, key: &str| {
@@ -8567,13 +9213,7 @@ subgraph {{
             "delivered",
         )
         .unwrap();
-        append(
-            "message.accepted",
-            "accepted",
-            Some("agent/worker"),
-            "accepted",
-        )
-        .unwrap();
+        append("message.read", "read", Some("agent/worker"), "read").unwrap();
         append("message.closed", "closed", Some("agent/worker"), "closed").unwrap();
         assert_eq!(store.messages(None, true).unwrap()[0].status, "closed");
     }
@@ -8641,6 +9281,60 @@ subgraph {
         let path = directory.path().join("state.sqlite3");
         drop(Store::open(&path, "node").unwrap());
         Store::open(&path, "node").unwrap();
+    }
+
+    #[test]
+    fn response_idempotency_caches_never_store_caller_keys() {
+        let store = Store::open_memory("node").unwrap();
+        let caller_key = "caller-visible-secret-key";
+        store
+            .cache_idempotency_response(caller_key, &json!({"ok": true}))
+            .unwrap();
+        assert_eq!(
+            store
+                .cached_idempotency_response::<Value>(caller_key)
+                .unwrap(),
+            Some(json!({"ok": true}))
+        );
+        let connection = store.connection.lock().unwrap();
+        let operation_id: String = connection
+            .query_row("SELECT operation_id FROM idempotency", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(operation_id, caller_key);
+        assert_eq!(operation_id, opaque_cache_key(caller_key));
+    }
+
+    #[test]
+    fn operation_projection_drift_is_detected_and_rebuilt_on_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        store
+            .append_client_claim(&ClaimInput {
+                subject: "resource/projection".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.projection".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("projection-operation".into()),
+            })
+            .unwrap();
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute("UPDATE operations SET state='conflict'", [])
+            .unwrap();
+        assert_eq!(store.operation_projection_drift().unwrap().len(), 1);
+        drop(store);
+
+        let reopened = Store::open(&path, "node").unwrap();
+        assert!(reopened.operation_projection_drift().unwrap().is_empty());
     }
 
     #[test]
@@ -9790,7 +10484,7 @@ version 2
 subgraph {
   agent "one" { workspace "."; command "true" }
   agent "two" { workspace "."; command "true" }
-  resource "github/acme/demo/pull/1" { kind "vcs.pull-request"; binding "late" }
+  resource "github/acme/demo/pull/1" { kind "vcs.pull-request" }
   observer "github/acme/demo/pull/1" {
     resource "resource/github/acme/demo/pull/1"
     provider "github.pull-request"
@@ -9874,7 +10568,7 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
-                &json!({"head": "a", "state": "open", "checks": "pending"}),
+                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
                 100,
                 &subscriptions,
             )
@@ -9895,7 +10589,7 @@ subgraph {
             store
                 .latest_actual_value("subscription/missing")
                 .unwrap()
-                .unwrap()["status"],
+                .unwrap()["state"],
             "pending"
         );
         let unchanged = store
@@ -9904,7 +10598,7 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
-                &json!({"head": "a", "state": "open", "checks": "pending"}),
+                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
                 200,
                 &subscriptions,
             )
@@ -9917,7 +10611,7 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
-                &json!({"head": "a", "state": "closed", "checks": "pending"}),
+                &json!({"head": "a", "state": "closed", "checks": ["pending"]}),
                 300,
                 &subscriptions,
             )
@@ -9930,7 +10624,7 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
-                &json!({"head": "a", "state": "closed", "checks": "pending"}),
+                &json!({"head": "a", "state": "closed", "checks": ["pending"]}),
                 300,
                 &subscriptions,
             )
@@ -9961,7 +10655,7 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-after-stop"),
-                &json!({"head": "a", "state": "open", "checks": "pending"}),
+                &json!({"head": "a", "state": "open", "checks": ["pending"]}),
                 350,
                 &subscriptions,
             )
@@ -9974,12 +10668,179 @@ subgraph {
                 &observer_revision,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-three"),
-                &json!({"head": "a", "state": "open", "checks": "passing"}),
+                &json!({"head": "a", "state": "open", "checks": ["passing"]}),
                 400,
                 &subscriptions,
             )
             .unwrap();
         assert_eq!(unselected.changed_fields, ["checks"]);
         assert!(unselected.message_subjects.is_empty());
+    }
+
+    #[test]
+    fn a_graph_wide_idempotency_key_returns_the_original_claim() {
+        let store = Store::open_memory("node").unwrap();
+        let request = ClaimInput {
+            subject: "custom/test/fact".into(),
+            kind: "custom.test.observed".into(),
+            actor: Some("person/tester".into()),
+            fields: BTreeMap::from([("value".into(), json!(1))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("one-operation".into()),
+        };
+        let first = store.append_claim(&request).unwrap();
+        let retry = store.append_claim(&request).unwrap();
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.operation_id, first.operation_id);
+        assert_eq!(store.claims_for(&request.subject, None).unwrap().len(), 1);
+
+        let mut changed = request.clone();
+        changed.fields.insert("value".into(), json!(2));
+        let error = store.append_claim(&changed).unwrap_err();
+        assert_eq!(error.code, "idempotency-mismatch");
+    }
+
+    #[test]
+    fn matching_replica_operations_converge_without_a_second_event() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let request = ClaimInput {
+            subject: "custom/test/fact".into(),
+            kind: "custom.test.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("value".into(), json!(1))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("replicated-operation".into()),
+        };
+        let left_claim = left.append_claim(&request).unwrap();
+        let right_claim = right.append_claim(&request).unwrap();
+        assert_ne!(left_claim.id, right_claim.id);
+        assert_eq!(left_claim.operation_id, right_claim.operation_id);
+
+        left.import_replication("right", &right.export_replication(0).unwrap())
+            .unwrap();
+        let retry = left.append_claim(&request).unwrap();
+        assert_eq!(
+            retry.id,
+            std::cmp::min(left_claim.id.clone(), right_claim.id.clone())
+        );
+        assert_eq!(left.events_after(0, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conflicting_replica_operations_make_the_subject_indeterminate() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let request = |value| ClaimInput {
+            subject: "custom/test/fact".into(),
+            kind: "custom.test.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("value".into(), json!(value))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("conflicting-operation".into()),
+        };
+        left.append_claim(&request(1)).unwrap();
+        right.append_claim(&request(2)).unwrap();
+        left.import_replication("right", &right.export_replication(0).unwrap())
+            .unwrap();
+        assert!(left.operation_projection_drift().unwrap().is_empty());
+
+        let error = left.append_claim(&request(1)).unwrap_err();
+        assert_eq!(error.code, "idempotency-conflict");
+        let status = left.status(Some("custom/test/fact")).unwrap();
+        assert_eq!(status.subjects[0].reachability, "indeterminate");
+        assert!(
+            status.subjects[0]
+                .reason
+                .as_deref()
+                .is_some_and(|value| value.contains("idempotency-conflict"))
+        );
+    }
+
+    #[test]
+    fn public_claims_cannot_impersonate_system_producers() {
+        let store = Store::open_memory("node").unwrap();
+        let error = store
+            .append_client_claim(&ClaimInput {
+                subject: "host/peer".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "claim-write-forbidden");
+    }
+
+    #[test]
+    fn once_cardinality_rejects_a_second_local_claim() {
+        let store = Store::open_memory("node").unwrap();
+        let request = ClaimInput {
+            subject: "plan-run/one".into(),
+            kind: "plan-run.created".into(),
+            actor: None,
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store.append_claim(&request).unwrap();
+        assert_eq!(
+            store.append_claim(&request).unwrap_err().code,
+            "claim-cardinality"
+        );
+    }
+
+    #[test]
+    fn resource_kind_and_immutable_facts_are_enforced() {
+        let store = Store::open_memory("node").unwrap();
+        let observed = |fields| ClaimInput {
+            subject: "resource/commit".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store
+            .append_client_claim(&observed(BTreeMap::from([
+                ("kind".into(), Value::String("vcs.commit".into())),
+                ("sha".into(), Value::String("abc".into())),
+                ("state".into(), Value::String("published".into())),
+            ])))
+            .unwrap();
+        let second = store
+            .append_client_claim(&observed(BTreeMap::from([(
+                "state".into(),
+                Value::String("verified".into()),
+            )])))
+            .unwrap();
+        assert_eq!(second.body["fields"]["kind"], "vcs.commit");
+        assert_eq!(
+            store
+                .append_client_claim(&observed(BTreeMap::from([(
+                    "sha".into(),
+                    Value::String("def".into()),
+                )])))
+                .unwrap_err()
+                .code,
+            "immutable-resource-field"
+        );
+        assert_eq!(
+            store
+                .append_client_claim(&observed(BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("ci.run".into()),
+                )])))
+                .unwrap_err()
+                .code,
+            "immutable-resource-kind"
+        );
     }
 }

@@ -2,8 +2,7 @@ version 2
 
 subgraph {
   resource "plan-inputs/source" {
-    kind "document"
-    binding "late"
+    kind "custom.st3.document-source"
   }
 
   plan "eval/plan-inputs" state="ready" {

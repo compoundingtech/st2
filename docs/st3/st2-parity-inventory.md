@@ -113,7 +113,7 @@ Nested command rows follow it.
 | `message ls` | `message ls` | Unfinished | Count and sender filtering exist. `--archive` currently includes open messages. Add exact archive selection, time filters, bodies, orphan recovery, and coverage rules. | M |
 | `message sent` | None | Unfinished | Add a sender history query with complete or partial coverage metadata. Peer replication must preserve the sender index. | M |
 | `message read` | `message read` | Unfinished | `--archive` closes an open message instead of selecting archived input. Restore selection semantics and the raw Markdown envelope. | S |
-| `message archive` | `message archive` | Parity | st3 records accepted and closed lifecycle claims instead of moving a file. The normal user result is equivalent. | None |
+| `message archive` | `message archive` | Parity | st3 records read and closed lifecycle claims instead of moving a file. The normal user result is equivalent. | None |
 | `message thread` | `message thread` | Unfinished | st3 finds the transitive thread. The `--tree` flag is accepted but the CLI still prints the flat JSON list. | S |
 | Filesystem message import | `message export` only | Unfinished | Export creates a compatibility mailbox. No importer preserves existing IDs, threads, archives, receipts, and sent history. | L |
 
@@ -192,10 +192,10 @@ They do not have direct st2 command contracts.
 | `import` | Combines and applies one version-2 KDL tree and its staged documents. |
 | `exec` and `logs` | Runs one graph exec member and reads its current or prior log. |
 | `inspect` and `trace` | Reads one subject and its immutable claim history. |
-| `wait` | Waits for a subject condition, checkpoint, or eval verdict. |
+| `wait` | Waits for a subject condition or eval verdict. |
 | `doc put`, `doc get`, and `doc list` | Manages immutable document versions and selected name bindings. |
 | `claim` | Publishes one registered typed observation. |
-| `review approve`, `reject`, and `revise` | Records a human review decision on a resource. |
+| `review approve` and `reject` | Records a human gate result. A revision uses the plan revision workflow. |
 | `work ls`, `show`, `claim`, `renew`, `progress`, `complete`, `fail`, and `release` | Operates durable plan-step claims and results. |
 | `work publish-plan` and `work revise` | Publishes a produced plan or a reviewed plan revision. |
 | `gate-result` | Posts a capability-bound running gate result. |
@@ -207,7 +207,7 @@ It does not make every accepted field operational.
 
 | st2 declaration surface | st3 state now | Class | Gap and required work | Effort |
 |---|---|---|---|---:|
-| KDL version 1 and top-level `agent` | Version 2 with one `subgraph` | Deliberate | `st3-migrate file` and `catalog` wrap declarations and rewrite lifecycle intent. Keep this as a migration boundary. | None |
+| KDL version 1 and top-level `agent` | Version 2 with one open plan for each agent | Deliberate | `st3-migrate file` and `catalog` put each runtime under a plan. The operator starts each ready plan after import. Keep this as a migration boundary. | None |
 | TOML and JSON Agent Specs | KDL only | Deliberate | The catalog migrator discovers these specs but emits only KDL declarations. Add an explicit conversion or refusal report. | M |
 | `identity` | Implemented | Parity | st3 resolves the canonical `agent/<host>.<identity>` subject. | None |
 | `name` | Preserved in intent and member display | Unfinished | Expose it in the roster. Match st2 Unicode character limits instead of the current UTF-8 byte limit. | S |
@@ -216,9 +216,9 @@ It does not make every accepted field operational.
 | `type "service"` | Implemented | Parity | Both reject the retired batch type. | None |
 | `host` | Implemented | Parity | `local` resolves to the receiving API node. | None |
 | `workspace` | Implemented | Parity | st3 uses it for rendering, launch, and default task working directories. | None |
-| `supervisor` agent identity | Supervisor policy subject | Deliberate | The same word has a different meaning. Rename one surface or migrate the old crash recipient into an explicit alert link. | M |
-| `desired-state` with running, suspended, or retired | Running intent or generic stop | Deliberate | Migration loses the suspended or retired distinction and its reason. Add typed stopped states if operators still need that distinction. | M |
-| Legacy `retired` and `suspended` | Explicit `stop` | Deliberate | The migrator performs the rewrite. It must report the lost state and reason. | S |
+| `supervisor` agent identity | No special subject | Deliberate | Use explicit messages and `under` grouping metadata. | None |
+| `desired-state` with running, suspended, or retired | Ready or retired plan | Deliberate | Migration loses the suspended or retired distinction and its reason. Add more plan states if operators still need that distinction. | M |
+| Legacy `retired` and `suspended` | Retired plan | Deliberate | The migrator does not emit a runtime outside a plan. It must report the lost state and reason. | S |
 | Agent `keep` | Accepted but ignored | Unfinished | Carry the pin into member specs. Prevent normal garbage collection until an explicit pin change. | M |
 | Compact agent `lifecycle` | Inherited by every st3 member | Unfinished | st2 applies this field only to its compact primary task. Preserve that scope during migration. | M |
 | Restart intensity block | Implemented | Parity | Attempts, interval, delay, and fail or delay mode run in st3. | None |
@@ -262,12 +262,10 @@ These surfaces are additions, not st2 parity gaps.
 |---|---|
 | Plan-run ownership | Gives every runtime one execution owner and one cleanup boundary. |
 | Plan-owned `exec` and `pty` | Runs a member without an aggregate agent declaration. |
-| Root `resource`, `person`, and `account` | Declares observed graph subjects and actor identities. |
-| `supervisor` and `terminal-control` | Applies declared bounded screen input and durable supervision decisions. |
-| `link` | Holds or voids work when a required subject is unreachable. |
+| Root `resource`, `person`, and `doc` | Declares graph subjects, actor identities, and immutable document bindings. |
 | `plan` and plan steps | Runs durable work graphs with claims, reviews, and nested plans. |
 | `message` and `schedule` | Declares graph messages and clock-triggered messages. |
-| Checkpoints and gates | Controls ordered readiness, completion, and eval verdicts. |
+| Repeated gates | Controls plan and step acceptance without a second execution model. |
 
 ## Render and materialization gaps
 
@@ -351,9 +349,8 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 | Suspended state | Generic stop | Deliberate | Add a distinct reversible state if operators need intent separate from retirement. | M |
 | Retired state | Generic stop | Deliberate | Add a distinct terminal declaration state if roster and audit readers need it. | M |
 | Explicit teardown | Plan-run cancellation and owner-local stop | Parity | st3 does not kill members when the daemon exits. This matches the durable runtime direction. | None |
-| st2 supervisor crash recipient | No direct equivalent | Unfinished | Publish a typed crash alert message to an explicit agent or supervision policy. | M |
-| st3 terminal controls | Implemented | New | Terminal controls can send bounded input and record decisions. | None |
-| Required links | Implemented | New | A link can hold work or void an eval when a dependency is unreachable. | None |
+| st2 supervisor crash recipient | No direct equivalent | Unfinished | Publish a typed crash alert message to an explicit agent. | M |
+| Session controls | Implemented | New | Dedicated endpoints fence terminal input, signals, and context clearing with claims. | None |
 | Health repair | Claim-driven observation | Unfinished | Add periodic or external observation for provider sockets, stale presence, and leaked child processes. | M |
 | Cross-host reachability | Peer claims | Unfinished | Prove duplicate, delayed, missing, and conflicting peer batches. Define indeterminate status during a partition. | L |
 
@@ -386,7 +383,6 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 | Gap | Class | Required work | Effort |
 |---|---|---|---:|
 | The design still shows old typed driver node names in parts of the KDL section. | Unfinished | Make `harness "PROVIDER"` normative everywhere, or change the parser and migrator back. | S |
-| The design root-node list names `checkpoints`, while the parser accepts root `plan`. | Unfinished | Align the complete KDL grammar and examples with the current plan runtime. | S |
 | The design names some accepted fields as operational when the reducer ignores them. | Unfinished | Mark `keep`, nested resources, streams, `deliver`, `ding`, and `meta` with exact implementation state. | S |
 | Pi and OpenCode lack live provider proofs. | Unfinished | Add bounded lifecycle, delivery, restart, and cleanup tests for each provider. | M each |
 | Generic DING has no complete transport proof. | Unfinished | Port the model-free st2 delivery fixtures before claiming command-agent parity. | L |
@@ -398,11 +394,10 @@ This evidence makes the cleanup row a cutover blocker, not optional hardening.
 
 1. Decide whether “drop-in” means current-fleet migration or complete st2 product parity.
 2. Decide whether st3 keeps suspended, retired, away, request transport, and generic DING.
-3. Decide whether the `supervisor` name can keep its different st3 meaning.
-4. Close Codex cleanup and protocol upgrade handling before another fleet cutover.
-5. Close render safety and message archive migration before st3 owns persistent agents.
-6. Add task inventory, unpark, snapshot, rollback, and full driver diagnostics.
-7. Prove Pi, OpenCode, partitions, and non-Linux containment after the common path is safe.
+3. Close Codex cleanup and protocol upgrade handling before another fleet cutover.
+4. Close render safety and message archive migration before st3 owns persistent agents.
+5. Add task inventory, unpark, snapshot, rollback, and full driver diagnostics.
+6. Prove Pi, OpenCode, partitions, and non-Linux containment after the common path is safe.
 
 The first decision controls the schedule.
 The current-fleet path can omit unused st2 features after an explicit catalog audit.

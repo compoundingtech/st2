@@ -10,7 +10,7 @@ use sha2::Digest as _;
 use tokio::sync::Notify;
 
 use crate::model::{
-    CheckpointSpec, ClaimInput, DependencySpec, DesiredSubject, GateSpec, LaunchSpec, MemberKind,
+    ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec, MemberKind,
     MemberLifecycle, MemberSpec, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
     RestartIntensity, RestartType, StepSpec, UsedPlanSpec, WorkSelector,
 };
@@ -42,6 +42,7 @@ pub trait RuntimeControl: Send + Sync + 'static {
         terminal: bool,
         expected_incarnation: Option<&str>,
     ) -> Result<()>;
+    fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()>;
     fn attach(&self, runtime_id: &str) -> Result<()>;
     fn send(&self, runtime_id: &str, text: &str) -> Result<()>;
     fn screen(&self, runtime_id: &str) -> Result<String>;
@@ -162,6 +163,23 @@ impl RuntimeControl for NativeRuntime {
         }
     }
 
+    fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()> {
+        if terminal {
+            if self
+                .pty
+                .snapshot()?
+                .iter()
+                .any(|item| item.name == runtime_id)
+            {
+                self.pty.remove(runtime_id)
+            } else {
+                Ok(())
+            }
+        } else {
+            self.exec.remove(runtime_id)
+        }
+    }
+
     fn attach(&self, runtime_id: &str) -> Result<()> {
         self.pty.attach(runtime_id)
     }
@@ -265,7 +283,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if let Err(error) = self.reconcile_once() {
                 let _ = self.record_once(
                     "host/reconciler",
-                    "harness.error",
+                    "harness.diagnostic",
                     BTreeMap::from([
                         ("status".into(), Value::String("unreachable".into())),
                         ("reason".into(), Value::String(error.to_string())),
@@ -290,7 +308,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             Err(error) => {
                 self.record_once(
                     "host/runtime",
-                    "harness.error",
+                    "harness.diagnostic",
                     BTreeMap::from([
                         ("status".into(), Value::String("indeterminate".into())),
                         ("reason".into(), Value::String(error.to_string())),
@@ -300,7 +318,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         };
 
-        let active = self.active_subjects(&desired)?;
+        let active = desired.iter().collect::<Vec<_>>();
         for subject in &active {
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
@@ -312,9 +330,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             if member.host != self.host {
                 continue;
             }
-            if self.link_blocks(subject, &desired)? {
-                continue;
-            }
             let observed = if member.terminal {
                 ptys.get(&member.runtime_id).cloned()
             } else {
@@ -323,7 +338,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             match observed {
                 Some(observation) if observation.status == "running" => {
                     self.record_member(subject, &observation, true)?;
-                    self.reconcile_gates(subject, member, &desired)?;
                 }
                 Some(observation)
                     if matches!(observation.status.as_str(), "exited" | "vanished") =>
@@ -348,7 +362,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 None if member.lifecycle == MemberLifecycle::AdoptOnly => {
                     self.record_once(
                         &subject.subject,
-                        "member.observed",
+                        "runtime.observed",
                         member_fields(member, "absent", None, false),
                     )?;
                 }
@@ -407,7 +421,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.reconcile_schedules(&desired)?;
         self.deliver_messages(&desired)?;
         self.evaluate_plan_runs()?;
-        self.evaluate_checkpoints(&desired)?;
         Ok(())
     }
 
@@ -417,7 +430,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
         Ok(self
             .store
-            .claims_for(subject, Some("member.launch"))?
+            .claims_for(subject, Some("runtime.action.succeeded"))?
             .into_iter()
             .rev()
             .any(|claim| {
@@ -431,65 +444,6 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub fn attach(&self, runtime_id: &str) -> Result<()> {
         self.runtime.attach(runtime_id)
-    }
-
-    fn active_subjects<'a>(
-        &self,
-        desired: &'a [DesiredSubject],
-    ) -> Result<Vec<&'a DesiredSubject>> {
-        let mut reached = HashMap::new();
-        let mut final_ordinals = HashMap::<String, u32>::new();
-        for stage in desired
-            .iter()
-            .filter(|subject| subject.kind == "checkpoint-stage")
-        {
-            if let Ok(stage) = serde_json::from_value::<CheckpointSpec>(stage.desired.clone()) {
-                final_ordinals
-                    .entry(stage.sequence)
-                    .and_modify(|ordinal| *ordinal = (*ordinal).max(stage.ordinal))
-                    .or_insert(stage.ordinal);
-            }
-        }
-        for activation in desired
-            .iter()
-            .filter_map(|subject| subject.activation.as_ref())
-        {
-            if !reached.contains_key(&activation.sequence) {
-                let terminal = self
-                    .store
-                    .latest_claim(&activation.sequence, Some("checkpoint.failed"))?
-                    .is_some();
-                reached.insert(
-                    activation.sequence.clone(),
-                    (
-                        self.current_checkpoint_reached(&activation.sequence, desired)?,
-                        terminal,
-                    ),
-                );
-            }
-        }
-        Ok(desired
-            .iter()
-            .filter(|subject| match &subject.activation {
-                None => true,
-                Some(activation) => {
-                    let next =
-                        reached
-                            .get(&activation.sequence)
-                            .map_or(0, |(reached, terminal)| {
-                                if *terminal {
-                                    final_ordinals
-                                        .get(&activation.sequence)
-                                        .copied()
-                                        .unwrap_or(0)
-                                } else {
-                                    reached.map_or(0, |ordinal| ordinal.saturating_add(1))
-                                }
-                            });
-                    activation.ordinal <= next
-                }
-            })
-            .collect())
     }
 
     fn reconcile_stop(
@@ -549,7 +503,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if observation.is_none_or(|observation| observation.status != "running") {
             self.record_once(
                 subject,
-                "member.observed",
+                "runtime.observed",
                 BTreeMap::from([
                     ("status".into(), Value::String("stopped".into())),
                     ("runtime_id".into(), Value::String(runtime_id.into())),
@@ -561,7 +515,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(true);
         }
         let incarnation = incarnation.unwrap_or("unknown");
-        let requests = self.store.claims_for(subject, Some("action.requested"))?;
+        let requests = self
+            .store
+            .claims_for(subject, Some("runtime.action.requested"))?;
         let request = requests.into_iter().rev().find(|claim| {
             claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("terminate")
                 && claim
@@ -574,7 +530,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let deadline = now_ms().saturating_add(timeout_ms as u128);
             let request = self.store.append_claim(&ClaimInput {
                 subject: subject.into(),
-                kind: "action.requested".into(),
+                kind: "runtime.action.requested".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("action".into(), Value::String("terminate".into())),
@@ -593,7 +549,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if let Err(error) = self.runtime.stop(runtime_id, terminal, Some(incarnation)) {
                 self.store.append_claim(&ClaimInput {
                     subject: subject.into(),
-                    kind: "action.failed".into(),
+                    kind: "runtime.action.failed".into(),
                     actor: None,
                     fields: BTreeMap::from([
                         ("action".into(), Value::String("terminate".into())),
@@ -625,7 +581,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let deadline_key = format!("stop-deadline:{subject}:{incarnation}");
         let deadline_record = self.store.append_claim(&ClaimInput {
             subject: subject.into(),
-            kind: "deadline.reached".into(),
+            kind: "runtime.action.deadline-reached".into(),
             actor: None,
             fields: BTreeMap::from([
                 ("action".into(), Value::String("terminate".into())),
@@ -637,7 +593,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         if self
             .store
-            .claims_for(subject, Some("action.completed"))?
+            .claims_for(subject, Some("runtime.action.succeeded"))?
             .iter()
             .any(|claim| {
                 claim
@@ -649,7 +605,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             self.record_once(
                 subject,
-                "supervision.decision",
+                "runtime.reconcile-decision",
                 BTreeMap::from([
                     ("decision".into(), Value::String("raise".into())),
                     ("reachability".into(), Value::String("unreachable".into())),
@@ -664,7 +620,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.runtime.kill(runtime_id, terminal, Some(incarnation))?;
         self.store.append_claim(&ClaimInput {
             subject: subject.into(),
-            kind: "action.completed".into(),
+            kind: "runtime.action.succeeded".into(),
             actor: None,
             fields: BTreeMap::from([
                 ("action".into(), Value::String("kill".into())),
@@ -690,7 +646,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             self.record_once(
                 &subject.subject,
-                "harness.error",
+                "harness.diagnostic",
                 BTreeMap::from([
                     ("status".into(), Value::String("warning".into())),
                     ("reason".into(), Value::String(warning)),
@@ -742,7 +698,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let operation = format!("{}:start", subject.subject);
         self.record_once(
             &subject.subject,
-            "action.requested",
+            "runtime.action.requested",
             BTreeMap::from([
                 ("action".into(), Value::String("start".into())),
                 ("operation".into(), Value::String(operation.clone())),
@@ -751,7 +707,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Err(error) = self.runtime.start(&launch_member) {
             self.record_once(
                 &subject.subject,
-                "action.failed",
+                "runtime.action.failed",
                 BTreeMap::from([
                     ("action".into(), Value::String("start".into())),
                     ("operation".into(), Value::String(operation)),
@@ -766,7 +722,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_default();
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
-            kind: "member.launch".into(),
+            kind: "runtime.action.succeeded".into(),
             actor: None,
             fields: BTreeMap::from([
                 ("desired_token".into(), Value::String(desired_token)),
@@ -782,12 +738,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         })?;
         self.record_once(
             &subject.subject,
-            "member.observed",
+            "runtime.observed",
             member_fields(member, "starting", None, false),
         )?;
         self.record_once(
             &subject.subject,
-            "action.completed",
+            "runtime.action.succeeded",
             BTreeMap::from([
                 ("reason".into(), Value::String(reason.into())),
                 (
@@ -817,7 +773,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             RestartDecision::Wait { until, reason } => {
                 self.record_once(
                     &subject.subject,
-                    "supervision.decision",
+                    "runtime.reconcile-decision",
                     BTreeMap::from([
                         ("decision".into(), Value::String("wait".into())),
                         ("reachability".into(), Value::String("reachable".into())),
@@ -833,7 +789,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             RestartDecision::Fail { reason } => self.record_once(
                 &subject.subject,
-                "supervision.decision",
+                "runtime.reconcile-decision",
                 BTreeMap::from([
                     ("decision".into(), Value::String("raise".into())),
                     ("reachability".into(), Value::String("unreachable".into())),
@@ -856,7 +812,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .unwrap_or_default();
         let mut launches = self
             .store
-            .claims_for(&subject.subject, Some("member.launch"))?
+            .claims_for(&subject.subject, Some("runtime.action.succeeded"))?
             .into_iter()
             .filter(|claim| {
                 claim
@@ -868,7 +824,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect::<Vec<_>>();
         let resets = self
             .store
-            .claims_for(&subject.subject, Some("member.restart-reset"))?;
+            .claims_for(&subject.subject, Some("runtime.restart-window-reset"))?;
         let reset_index = resets
             .iter()
             .filter(|claim| {
@@ -891,7 +847,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let incarnation = observation.incarnation_id.as_deref().unwrap_or("unknown");
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
-                    kind: "member.restart-reset".into(),
+                    kind: "runtime.restart-window-reset".into(),
                     actor: None,
                     fields: BTreeMap::from([
                         ("desired_token".into(), Value::String(desired_token.clone())),
@@ -921,7 +877,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if member.restart_intensity.delay_ms > 0 {
             let observed_at = self
                 .store
-                .claims_for(&subject.subject, Some("member.observed"))?
+                .claims_for(&subject.subject, Some("runtime.observed"))?
                 .into_iter()
                 .rev()
                 .find(|claim| {
@@ -1005,38 +961,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
     }
 
-    fn perform_action(
-        &self,
-        subject: &str,
-        action: &str,
-        effect: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        let operation = format!("{subject}:{action}");
-        self.record_once(
-            subject,
-            "action.requested",
-            BTreeMap::from([
-                ("action".into(), Value::String(action.into())),
-                ("operation".into(), Value::String(operation.clone())),
-            ]),
-        )?;
-        match effect() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.record_once(
-                    subject,
-                    "action.failed",
-                    BTreeMap::from([
-                        ("action".into(), Value::String(action.into())),
-                        ("operation".into(), Value::String(operation)),
-                        ("reason".into(), Value::String(error.to_string())),
-                    ]),
-                )?;
-                Err(error)
-            }
-        }
-    }
-
     fn record_member(
         &self,
         subject: &DesiredSubject,
@@ -1056,7 +980,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if let Some(exit_code) = observation.exit_code {
             fields.insert("exit_code".into(), Value::from(exit_code));
         }
-        self.record_once(&subject.subject, "member.observed", fields)
+        self.record_once(&subject.subject, "runtime.observed", fields)
     }
 
     fn record_once(
@@ -1565,9 +1489,84 @@ impl<R: RuntimeControl> Reconciler<R> {
         if !live.is_empty() {
             return Ok(false);
         }
-        let status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
-        self.store
-            .set_plan_run_state(&run.id, status, "terminal", None)
+        let mut status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
+        let mut changed = false;
+        if run.mode == "eval" {
+            let mut runtime_cleanup_errors = Vec::new();
+            match self.store.eval_runtime_records(&run.subject) {
+                Ok(records) => {
+                    for (runtime_id, terminal) in records {
+                        if let Err(error) = self.runtime.remove(&runtime_id, terminal) {
+                            runtime_cleanup_errors.push(format!("{runtime_id}: {error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    runtime_cleanup_errors.push(error.to_string());
+                }
+            }
+            let (verdict, reason, residue) = match (
+                runtime_cleanup_errors.is_empty(),
+                self.store.retire_eval_owned_desired(&run.subject),
+            ) {
+                (false, retired) => {
+                    status = "cancelled";
+                    let mut reasons = runtime_cleanup_errors;
+                    if let Err(error) = retired {
+                        reasons.push(error.to_string());
+                    }
+                    (
+                        "void",
+                        Some(format!(
+                            "eval cleanup infrastructure failed: {}",
+                            reasons.join("; ")
+                        )),
+                        Vec::new(),
+                    )
+                }
+                (true, Ok(residue)) if residue.is_empty() => (
+                    match status {
+                        "completed" => "pass",
+                        "failed" => "fail",
+                        _ => "void",
+                    },
+                    None,
+                    residue,
+                ),
+                (true, Ok(residue)) => {
+                    status = "failed";
+                    (
+                        "fail",
+                        Some("the eval left subjects in its owned graph".to_owned()),
+                        residue,
+                    )
+                }
+                (true, Err(error)) => {
+                    status = "cancelled";
+                    (
+                        "void",
+                        Some(format!("eval cleanup infrastructure failed: {error}")),
+                        Vec::new(),
+                    )
+                }
+            };
+            let mut fields = BTreeMap::from([("verdict".into(), Value::String(verdict.into()))]);
+            if let Some(reason) = reason {
+                fields.insert("reason".into(), Value::String(reason));
+            }
+            if !residue.is_empty() {
+                fields.insert(
+                    "residue".into(),
+                    Value::Array(residue.into_iter().map(Value::String).collect()),
+                );
+            }
+            self.record_once(&run.subject, "eval.verdict", fields)?;
+            changed = true;
+        }
+        changed |= self
+            .store
+            .set_plan_run_state(&run.id, status, "terminal", None)?;
+        Ok(changed)
     }
 
     fn plan_completion_selected(
@@ -2012,14 +2011,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .and_then(|actual| actual_field(actual, "status"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let harness_state = self
+                .store
+                .latest_actual_value(&subject.subject)?
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "state"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let holds = match subject.kind.as_str() {
                 "stop" => {
                     matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
                 }
-                "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
+                "message" => matches!(status.as_deref(), Some("delivered" | "read" | "closed")),
                 _ => match subject.member.as_ref() {
                     Some(member) if member.driver.is_some() => {
-                        matches!(status.as_deref(), Some("ready" | "working" | "idle"))
+                        matches!(harness_state.as_deref(), Some("ready" | "working" | "idle"))
                     }
                     Some(_) => matches!(
                         status.as_deref(),
@@ -2114,12 +2120,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 review_targets,
             );
         }
-        let stage = CheckpointSpec {
+        let stage = GateContext {
             subject: subject.to_owned(),
-            sequence: run.subject.clone(),
             name: title.to_owned(),
-            ordinal: 0,
-            gates: vec![gate.clone()],
+            started_at_unix_ms: run
+                .steps
+                .iter()
+                .find(|step| step.subject == subject)
+                .map_or(run.created_at_unix_ms, |step| step.created_at_unix_ms),
         };
         self.evaluate_gate(&stage, &gate)
     }
@@ -2139,7 +2147,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         let question = question
             .map(str::to_owned)
             .unwrap_or_else(|| format!("Approve {title}?"));
-        let fields = BTreeMap::from([
+        let mut fields = BTreeMap::from([
+            ("owner".into(), Value::String(subject.to_owned())),
             ("reviewer".into(), Value::String(reviewer.into())),
             ("question".into(), Value::String(question)),
             (
@@ -2149,7 +2158,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             (
                 "decisions".into(),
                 Value::Array(
-                    ["approved", "rejected", "revise"]
+                    ["approved", "rejected"]
                         .into_iter()
                         .map(|value| Value::String(value.into()))
                         .collect(),
@@ -2163,9 +2172,15 @@ impl<R: RuntimeControl> Reconciler<R> {
             ("attempt".into(), Value::from(attempt)),
         ]);
         let request_hash = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&fields)?));
+        let operation = format!(
+            "gate-operation/{}/{}",
+            subject.replace('/', "."),
+            &request_hash[..24]
+        );
+        fields.insert("operation".into(), Value::String(operation.clone()));
         let request = self.store.append_claim(&ClaimInput {
-            subject: subject.to_owned(),
-            kind: "review.requested".into(),
+            subject: operation.clone(),
+            kind: "gate.requested".into(),
             actor: None,
             fields,
             evidence: Vec::new(),
@@ -2176,7 +2191,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &request_hash[..24]
             )),
         })?;
-        let decision = self.store.latest_claim(subject, Some("review.decision"))?;
+        let decision = self.store.latest_claim(&operation, Some("gate.result"))?;
         match decision.as_ref().and_then(|claim| {
             (claim.actor.as_deref() == Some(reviewer)
                 && claim
@@ -2187,13 +2202,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             .then(|| {
                 claim
                     .body
-                    .pointer("/fields/decision")
+                    .pointer("/fields/verdict")
                     .and_then(Value::as_str)
             })
             .flatten()
         }) {
-            Some("approved") => Ok(GateOutcome::Pass),
-            Some("rejected") => Ok(GateOutcome::Fail(
+            Some("pass") => Ok(GateOutcome::Pass),
+            Some("fail") => Ok(GateOutcome::Fail(
                 "the human reviewer rejected the work".into(),
             )),
             _ => Ok(GateOutcome::Pending),
@@ -2227,258 +2242,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             });
         }
         Ok(false)
-    }
-
-    fn evaluate_checkpoints(&self, desired: &[DesiredSubject]) -> Result<()> {
-        let mut stages = desired
-            .iter()
-            .filter(|subject| subject.kind == "checkpoint-stage")
-            .filter_map(|subject| {
-                serde_json::from_value::<CheckpointSpec>(subject.desired.clone())
-                    .ok()
-                    .map(|stage| (stage, subject.owner_run.clone()))
-            })
-            .collect::<Vec<_>>();
-        stages.sort_by_key(|(stage, _)| (stage.sequence.clone(), stage.ordinal));
-        let final_ordinals =
-            stages
-                .iter()
-                .fold(HashMap::<String, u32>::new(), |mut map, (stage, _)| {
-                    map.entry(stage.sequence.clone())
-                        .and_modify(|ordinal| *ordinal = (*ordinal).max(stage.ordinal))
-                        .or_insert(stage.ordinal);
-                    map
-                });
-        for (stage, owner_run) in stages {
-            let reached = self.current_checkpoint_reached(&stage.sequence, desired)?;
-            let terminal = self
-                .store
-                .latest_claim(&stage.sequence, Some("checkpoint.failed"))?
-                .is_some();
-            let next = if terminal {
-                final_ordinals.get(&stage.sequence).copied().unwrap_or(0)
-            } else {
-                reached.map_or(0, |ordinal| ordinal.saturating_add(1))
-            };
-            if stage.ordinal != next {
-                continue;
-            }
-            self.record_once(
-                &stage.subject,
-                "checkpoint.active",
-                BTreeMap::from([
-                    ("sequence".into(), Value::String(stage.sequence.clone())),
-                    ("ordinal".into(), Value::from(stage.ordinal)),
-                ]),
-            )?;
-            let mut all_pass = true;
-            let deadline_failure = stage
-                .gates
-                .iter()
-                .filter(|gate| matches!(gate, GateSpec::Deadline { .. }))
-                .map(|gate| self.evaluate_gate(&stage, gate))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .find_map(|outcome| match outcome {
-                    GateOutcome::Fail(reason) => Some(reason),
-                    _ => None,
-                });
-            if let Some(reason) = deadline_failure {
-                self.fail_checkpoint(&stage, owner_run.as_deref(), &reason)?;
-                continue;
-            }
-            if !self.checkpoint_subgraph_holds(&stage, desired)? {
-                continue;
-            }
-            for gate in stage
-                .gates
-                .iter()
-                .filter(|gate| !matches!(gate, GateSpec::Deadline { .. }))
-            {
-                match self.evaluate_gate(&stage, gate)? {
-                    GateOutcome::Pass => {}
-                    GateOutcome::Pending => {
-                        all_pass = false;
-                        break;
-                    }
-                    GateOutcome::Fail(reason) => {
-                        self.fail_checkpoint(&stage, owner_run.as_deref(), &reason)?;
-                        all_pass = false;
-                        break;
-                    }
-                }
-            }
-            if all_pass {
-                let definition_revision = self
-                    .store
-                    .selected_desired_revision(&stage.subject)?
-                    .context("a checkpoint stage has no selected definition revision")?;
-                self.record_once(
-                    &stage.sequence,
-                    "checkpoint.reached",
-                    BTreeMap::from([
-                        ("ordinal".into(), Value::from(stage.ordinal)),
-                        ("name".into(), Value::String(stage.name)),
-                        (
-                            "definition_revision".into(),
-                            Value::String(definition_revision),
-                        ),
-                    ]),
-                )?;
-                let final_ordinal = final_ordinals.get(&stage.sequence).copied();
-                let establishes_verdict = final_ordinal == Some(stage.ordinal)
-                    || final_ordinal == Some(stage.ordinal.saturating_add(1));
-                if establishes_verdict
-                    && let Some(owner_run) = owner_run.as_deref()
-                    && self
-                        .store
-                        .latest_claim(owner_run, Some("eval.verdict"))?
-                        .is_none()
-                {
-                    self.record_once(
-                        owner_run,
-                        "eval.verdict",
-                        BTreeMap::from([
-                            ("verdict".into(), Value::String("pass".into())),
-                            ("sequence".into(), Value::String(stage.sequence.clone())),
-                        ]),
-                    )?;
-                }
-                self.signal_changed();
-            }
-        }
-        Ok(())
-    }
-
-    fn checkpoint_subgraph_holds(
-        &self,
-        stage: &CheckpointSpec,
-        desired: &[DesiredSubject],
-    ) -> Result<bool> {
-        for subject in desired.iter().filter(|subject| {
-            subject.activation.as_ref().is_some_and(|activation| {
-                activation.sequence == stage.sequence && activation.ordinal == stage.ordinal
-            })
-        }) {
-            let status = self
-                .store
-                .latest_actual_value(&subject.subject)?
-                .as_ref()
-                .and_then(|actual| actual_field(actual, "status"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let holds = match subject.kind.as_str() {
-                "stop" => {
-                    matches!(status.as_deref(), Some("stopped" | "absent" | "exited"))
-                }
-                "message" => matches!(status.as_deref(), Some("delivered" | "accepted" | "closed")),
-                _ => match subject.member.as_ref() {
-                    Some(member) if member.lifecycle == MemberLifecycle::AdoptOnly => matches!(
-                        status.as_deref(),
-                        Some("absent" | "running" | "ready" | "working" | "idle" | "exited")
-                    ),
-                    Some(member) if member.driver.is_some() => {
-                        matches!(status.as_deref(), Some("ready" | "working" | "idle"))
-                    }
-                    Some(_) => matches!(
-                        status.as_deref(),
-                        Some("running" | "ready" | "working" | "idle" | "exited")
-                    ),
-                    None => true,
-                },
-            };
-            if !holds {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn current_checkpoint_reached(
-        &self,
-        sequence: &str,
-        desired: &[DesiredSubject],
-    ) -> Result<Option<u32>> {
-        let claims = self
-            .store
-            .claims_for(sequence, Some("checkpoint.reached"))?;
-        let mut stages = desired
-            .iter()
-            .filter(|subject| subject.kind == "checkpoint-stage")
-            .filter_map(|subject| {
-                serde_json::from_value::<CheckpointSpec>(subject.desired.clone()).ok()
-            })
-            .filter(|stage| stage.sequence == sequence)
-            .collect::<Vec<_>>();
-        stages.sort_by_key(|stage| stage.ordinal);
-        let mut reached = None;
-        for stage in stages {
-            let Some(revision) = self.store.selected_desired_revision(&stage.subject)? else {
-                break;
-            };
-            let has_current_pass = claims.iter().any(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/ordinal")
-                    .and_then(Value::as_u64)
-                    == Some(stage.ordinal as u64)
-                    && claim
-                        .body
-                        .pointer("/fields/definition_revision")
-                        .and_then(Value::as_str)
-                        == Some(revision.as_str())
-            });
-            if !has_current_pass {
-                break;
-            }
-            let still_passes = stage
-                .gates
-                .iter()
-                .filter(|gate| !matches!(gate, GateSpec::Deadline { .. }))
-                .map(|gate| self.evaluate_gate(&stage, gate))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .all(|outcome| matches!(outcome, GateOutcome::Pass));
-            if !still_passes {
-                break;
-            }
-            reached = Some(stage.ordinal);
-        }
-        Ok(reached)
-    }
-
-    fn fail_checkpoint(
-        &self,
-        stage: &CheckpointSpec,
-        owner_run: Option<&str>,
-        reason: &str,
-    ) -> Result<()> {
-        self.record_once(
-            &stage.sequence,
-            "checkpoint.failed",
-            BTreeMap::from([
-                ("ordinal".into(), Value::from(stage.ordinal)),
-                ("reason".into(), Value::String(reason.into())),
-            ]),
-        )?;
-        if let Some(owner_run) = owner_run
-            && self
-                .store
-                .latest_claim(owner_run, Some("eval.verdict"))?
-                .is_none()
-        {
-            self.record_once(
-                owner_run,
-                "eval.verdict",
-                BTreeMap::from([
-                    ("verdict".into(), Value::String("fail".into())),
-                    ("reason".into(), Value::String(reason.into())),
-                    ("sequence".into(), Value::String(stage.sequence.clone())),
-                ]),
-            )?;
-        }
-        self.signal_changed();
-        Ok(())
     }
 
     fn deliver_messages(&self, desired: &[DesiredSubject]) -> Result<()> {
@@ -2519,9 +2282,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 message.title.as_deref().unwrap_or("message"),
                 message.from
             );
-            self.perform_action(&message.subject, "deliver", || {
-                self.runtime.send(runtime_id, &wake)
-            })?;
+            self.runtime.send(runtime_id, &wake)?;
             self.record_once(
                 &message.subject,
                 "message.delivered",
@@ -2545,136 +2306,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn link_blocks(&self, subject: &DesiredSubject, desired: &[DesiredSubject]) -> Result<bool> {
-        for link in desired.iter().filter(|item| item.kind == "link") {
-            let Some(spec) = crate::graph::link_spec(&link.desired) else {
-                continue;
-            };
-            if !spec.required || spec.from != subject.subject {
-                continue;
-            }
-            let target = self.store.latest_actual_value(&spec.to)?;
-            let reachable = target.as_ref().is_some_and(|value| {
-                let status = actual_field(value, "status").and_then(Value::as_str);
-                let reachability = actual_field(value, "reachability").and_then(Value::as_str);
-                !matches!(
-                    status,
-                    Some("absent" | "stopped" | "exited" | "unreachable" | "indeterminate")
-                ) && !matches!(reachability, Some("unreachable" | "indeterminate"))
-            });
-            if reachable {
-                continue;
-            }
-            self.record_once(
-                &subject.subject,
-                "supervision.decision",
-                BTreeMap::from([
-                    ("decision".into(), Value::String("hold".into())),
-                    (
-                        "reason".into(),
-                        Value::String(format!(
-                            "required link `{}` cannot reach `{}`",
-                            link.subject, spec.to
-                        )),
-                    ),
-                    ("reachability".into(), Value::String("unreachable".into())),
-                ]),
-            )?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn reconcile_gates(
-        &self,
-        subject: &DesiredSubject,
-        member: &MemberSpec,
-        desired: &[DesiredSubject],
-    ) -> Result<()> {
-        let Some(driver) = member.driver.as_deref() else {
-            return Ok(());
-        };
-        let Some(supervisor) = desired
-            .iter()
-            .find(|item| item.subject == member.supervisor && item.kind == "supervisor")
-        else {
-            return Ok(());
-        };
-        let screen = match self.runtime.screen(&member.runtime_id) {
-            Ok(screen) => screen,
-            Err(_) => return Ok(()),
-        };
-        let normalized = screen.lines().map(str::trim).collect::<Vec<_>>().join("\n");
-        for gate in crate::graph::supervisor_terminal_controls(&supervisor.desired)
-            .into_iter()
-            .filter(|gate| gate.driver == driver)
-        {
-            let matches = gate
-                .contains
-                .iter()
-                .all(|needle| normalized.contains(needle))
-                && gate
-                    .selected
-                    .as_ref()
-                    .is_none_or(|line| normalized.lines().any(|candidate| candidate == line));
-            if !matches {
-                continue;
-            }
-            let prior = self
-                .store
-                .claims_for(&subject.subject, Some("supervision.decision"))?
-                .into_iter()
-                .filter(|claim| {
-                    claim.body.pointer("/fields/gate").and_then(Value::as_str) == Some(&gate.name)
-                })
-                .count() as u32;
-            if prior >= gate.max_inputs {
-                self.record_once(
-                    &subject.subject,
-                    "supervision.decision",
-                    BTreeMap::from([
-                        ("decision".into(), Value::String("raise".into())),
-                        ("gate".into(), Value::String(gate.name)),
-                        ("reachability".into(), Value::String("unreachable".into())),
-                        (
-                            "reason".into(),
-                            Value::String("the gate stayed visible after its input limit".into()),
-                        ),
-                    ]),
-                )?;
-                return Ok(());
-            }
-            let key = gate
-                .keys
-                .get(prior as usize)
-                .or_else(|| gate.keys.last())
-                .context("a validated gate has no key")?;
-            self.perform_action(&subject.subject, "gate-input", || {
-                self.runtime.send_key(&member.runtime_id, key)
-            })?;
-            self.store.append_claim(&ClaimInput {
-                subject: subject.subject.clone(),
-                kind: "supervision.decision".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("decision".into(), Value::String("input".into())),
-                    ("gate".into(), Value::String(gate.name)),
-                    ("key".into(), Value::String(key.clone())),
-                    ("input_number".into(), Value::from(prior.saturating_add(1))),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some(format!(
-                    "gate:{}:{}:{}",
-                    subject.subject, supervisor.subject, prior
-                )),
-            })?;
-            self.signal_changed();
-            return Ok(());
-        }
-        Ok(())
-    }
-
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
             let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
@@ -2688,7 +2319,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             };
             let reached = self
                 .store
-                .claims_for(&schedule.subject, Some("clock.reached"))?;
+                .claims_for(&schedule.subject, Some("schedule.occurrence-reached"))?;
             let last = reached
                 .iter()
                 .filter(|claim| {
@@ -2733,7 +2364,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             if remaining > spec.max_catch_up.unwrap_or(0) as u64 {
                                 self.record_once(
                                     &schedule.subject,
-                                    "supervision.decision",
+                                    "runtime.reconcile-decision",
                                     BTreeMap::from([
                                         ("decision".into(), Value::String("raise".into())),
                                         (
@@ -2773,7 +2404,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let request = self.store.append_claim(&ClaimInput {
                 subject: schedule.subject.clone(),
-                kind: "clock.wake.requested".into(),
+                kind: "schedule.occurrence-scheduled".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("revision".into(), Value::String(revision.clone())),
@@ -2807,7 +2438,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     {
                         let _ = store.append_claim(&ClaimInput {
                             subject: schedule_subject.clone(),
-                            kind: "clock.wake.cancel.requested".into(),
+                            kind: "schedule.occurrence-cancelled".into(),
                             actor: None,
                             fields: BTreeMap::from([
                                 ("revision".into(), Value::String(revision.clone())),
@@ -2830,7 +2461,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                     let reached = store.append_claim(&ClaimInput {
                         subject: schedule_subject.clone(),
-                        kind: "clock.reached".into(),
+                        kind: "schedule.occurrence-reached".into(),
                         actor: None,
                         fields: BTreeMap::from([
                             ("revision".into(), Value::String(revision.clone())),
@@ -2912,7 +2543,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if !is_stopped {
                     self.store.append_claim(&ClaimInput {
                         subject: observer.subject.clone(),
-                        kind: "observer.health".into(),
+                        kind: "observer.state".into(),
                         actor: None,
                         fields: BTreeMap::from([(
                             "status".into(),
@@ -3016,7 +2647,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             ));
                             let _ = store.append_claim(&ClaimInput {
                                 subject: observer_subject.clone(),
-                                kind: "observer.health".into(),
+                                kind: "observer.state".into(),
                                 actor: None,
                                 fields: BTreeMap::from([
                                     ("status".into(), Value::String("unreachable".into())),
@@ -3052,7 +2683,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn evaluate_gate(&self, stage: &CheckpointSpec, gate: &GateSpec) -> Result<GateOutcome> {
+    fn evaluate_gate(&self, stage: &GateContext, gate: &GateSpec) -> Result<GateOutcome> {
         let outcome = match gate {
             GateSpec::Exists { subject, .. } => {
                 self.ensure_file_observation(subject)?;
@@ -3136,13 +2767,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             GateSpec::Deadline { duration_ms, .. } => {
-                let Some(active) = self
-                    .store
-                    .latest_claim(&stage.subject, Some("checkpoint.active"))?
-                else {
-                    return Ok(GateOutcome::Pending);
-                };
-                let elapsed = now_ms().saturating_sub(active.accepted_at_unix_ms);
+                let elapsed = now_ms().saturating_sub(stage.started_at_unix_ms);
                 if elapsed >= *duration_ms as u128 {
                     GateOutcome::Fail(format!("deadline expired after {duration_ms}ms"))
                 } else {
@@ -3197,21 +2822,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 prompt,
             )?,
             GateSpec::Human { reviewer, .. } => {
-                let decision = self
-                    .store
-                    .latest_claim(&stage.subject, Some("review.decision"))?;
+                let operation = gate_operation_subject(
+                    stage,
+                    crate::graph::gate_name(gate),
+                    &serde_json::to_value(gate)?,
+                )?;
+                let decision = self.store.latest_claim(&operation, Some("gate.result"))?;
                 match decision.as_ref().and_then(|claim| {
                     (claim.actor.as_deref() == Some(reviewer.as_str()))
                         .then(|| {
                             claim
                                 .body
-                                .pointer("/fields/decision")
+                                .pointer("/fields/verdict")
                                 .and_then(Value::as_str)
                         })
                         .flatten()
                 }) {
-                    Some("approved") => GateOutcome::Pass,
-                    Some("rejected") => {
+                    Some("pass") => GateOutcome::Pass,
+                    Some("fail") => {
                         GateOutcome::Fail("the human reviewer rejected the work".into())
                     }
                     _ => GateOutcome::Pending,
@@ -3236,11 +2864,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             if let Some(reason) = reason {
                 fields.insert("reason".into(), Value::String(reason));
             }
-            self.record_once(
-                &format!("gate-result/{}", &digest[..32]),
-                "gate.result",
-                fields,
-            )?;
+            let subject = format!("gate-operation/predicate/{}", &digest[..32]);
+            fields.insert("operation".into(), Value::String(subject.clone()));
+            self.record_once(&subject, "gate.result", fields)?;
         }
         Ok(outcome)
     }
@@ -3248,7 +2874,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[allow(clippy::too_many_arguments)]
     fn run_mechanical(
         &self,
-        stage: &CheckpointSpec,
+        stage: &GateContext,
         name: &str,
         command: &str,
         host: &str,
@@ -3367,14 +2993,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("mechanical-gate".into()),
-            supervisor: "supervisor/root".into(),
         };
         let desired = DesiredSubject {
             subject: result_subject,
             kind: "gate".into(),
             desired: Value::Null,
             member: Some(member.clone()),
-            activation: None,
             owner_run: None,
             owner_generation: None,
             owner_step: None,
@@ -3397,7 +3021,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[allow(clippy::too_many_arguments)]
     fn run_llm_gate(
         &self,
-        stage: &CheckpointSpec,
+        stage: &GateContext,
         name: &str,
         model: &str,
         host: &str,
@@ -3603,14 +3227,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             restart_intensity: RestartIntensity::default(),
             shutdown_timeout_ms: 5_000,
             driver: Some("llm-gate".into()),
-            supervisor: "supervisor/root".into(),
         };
         let desired = DesiredSubject {
             subject: result_subject,
             kind: "gate".into(),
             desired: Value::Null,
             member: Some(member.clone()),
-            activation: None,
             owner_run: None,
             owner_generation: None,
             owner_step: None,
@@ -3631,7 +3253,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let action = if hard { "kill-gate" } else { "stop-gate" };
         if self
             .store
-            .claims_for(subject, Some("action.completed"))?
+            .claims_for(subject, Some("runtime.action.succeeded"))?
             .iter()
             .any(|claim| {
                 claim.body.pointer("/fields/action").and_then(Value::as_str) == Some(action)
@@ -3646,7 +3268,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let request = self.store.append_claim(&ClaimInput {
             subject: subject.into(),
-            kind: "action.requested".into(),
+            kind: "runtime.action.requested".into(),
             actor: None,
             fields: BTreeMap::from([
                 ("action".into(), Value::String(action.into())),
@@ -3670,7 +3292,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.store.append_claim(&ClaimInput {
             subject: subject.into(),
-            kind: "action.completed".into(),
+            kind: "runtime.action.succeeded".into(),
             actor: None,
             fields: BTreeMap::from([
                 ("action".into(), Value::String(action.into())),
@@ -3767,12 +3389,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if let Some(mode) = mode {
                     fields.insert("mode".into(), Value::from(mode));
                 }
-                self.record_once(subject, "resource.file-observed", fields)?;
+                self.record_once(subject, "resource.observed", fields)?;
             }
             Err(error) => {
                 self.record_once(
                     subject,
-                    "resource.file-observed",
+                    "resource.observed",
                     BTreeMap::from([
                         ("status".into(), Value::String("unreadable".into())),
                         ("path".into(), Value::String(path.into())),
@@ -4143,14 +3765,14 @@ fn compare_value(found: &Value, operator: &str, expected: &Value) -> bool {
     }
 }
 
-fn gate_operation_subject(
-    stage: &CheckpointSpec,
-    name: &str,
-    definition: &Value,
-) -> Result<String> {
+fn gate_operation_subject(stage: &GateContext, name: &str, definition: &Value) -> Result<String> {
     let bytes = serde_json::to_vec(&(stage.subject.as_str(), name, definition))?;
     let hash = hex::encode(sha2::Sha256::digest(bytes));
-    Ok(format!("{}/gate/{}", stage.subject, &hash[..24]))
+    Ok(format!(
+        "gate-operation/{}/{}",
+        stage.subject.replace('/', "."),
+        &hash[..24]
+    ))
 }
 
 fn now_ms() -> u128 {
@@ -4200,6 +3822,7 @@ mod tests {
         started_members: Mutex<Vec<MemberSpec>>,
         stops: Mutex<Vec<String>>,
         kills: Mutex<Vec<String>>,
+        removes: Mutex<Vec<String>>,
         screen: Mutex<String>,
         keys: Mutex<Vec<String>>,
         sent_lines: Mutex<Vec<(String, String)>>,
@@ -4241,6 +3864,18 @@ mod tests {
             _expected_incarnation: Option<&str>,
         ) -> Result<()> {
             self.kills.lock().unwrap().push(runtime_id.into());
+            Ok(())
+        }
+        fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()> {
+            self.removes.lock().unwrap().push(runtime_id.into());
+            if terminal {
+                self.ptys
+                    .lock()
+                    .unwrap()
+                    .retain(|runtime| runtime.runtime_id != runtime_id);
+            } else {
+                self.execs.lock().unwrap().remove(runtime_id);
+            }
             Ok(())
         }
         fn attach(&self, _runtime_id: &str) -> Result<()> {
@@ -4404,9 +4039,12 @@ subgraph {
             store
                 .append_claim(&ClaimInput {
                     subject: subject.into(),
-                    kind: "resource.binding".into(),
+                    kind: "resource.observed".into(),
                     actor: None,
-                    fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("custom.st3.state".into())),
+                        ("state".into(), Value::String(state.into())),
+                    ]),
                     evidence: Vec::new(),
                     expected_subject: None,
                     idempotency_key: Some(key.into()),
@@ -4428,7 +4066,7 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: "resource/release".into(),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([("state".into(), Value::String("closed".into()))]),
                 evidence: Vec::new(),
@@ -4442,7 +4080,7 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: "resource/source".into(),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([("state".into(), Value::String("dirty".into()))]),
                 evidence: Vec::new(),
@@ -4476,7 +4114,7 @@ subgraph {
                 goal "Publish an approved result."
                 completion { when "all-steps-exhausted" }
                 produces {
-                  resource "result" { state "published" }
+                  resource "result" { kind "custom.st3.release-result"; state "published" }
                 }
                 gate "the result is approved" {
                   field "approval" "resource/result" is "yes"
@@ -4513,9 +4151,15 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: "resource/result".into(),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: None,
-                fields: BTreeMap::from([("state".into(), Value::String("published".into()))]),
+                fields: BTreeMap::from([
+                    (
+                        "kind".into(),
+                        Value::String("custom.st3.release-result".into()),
+                    ),
+                    ("state".into(), Value::String("published".into())),
+                ]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some("result-published".into()),
@@ -4527,7 +4171,7 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: "resource/result".into(),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([
                     ("state".into(), Value::String("published".into())),
@@ -4761,7 +4405,7 @@ subgraph {
         assert!(starts.contains(&good_runtime));
         assert!(
             store
-                .latest_claim(&bad_subject, Some("action.failed"))
+                .latest_claim(&bad_subject, Some("runtime.action.failed"))
                 .unwrap()
                 .is_some()
         );
@@ -4950,7 +4594,7 @@ subgraph {
       assigned-to "agent/worker"
       produces {
         resource "plan-run/${ST_PLAN_RUN}/change" {
-          kind "vcs.revision"
+          kind "vcs.commit"
           state "published"
         }
       }
@@ -5003,10 +4647,10 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: format!("resource/plan-run/{}/change", run.id),
-                kind: "resource.binding".into(),
+                kind: "resource.observed".into(),
                 actor: Some("agent/worker".into()),
                 fields: BTreeMap::from([
-                    ("kind".into(), Value::String("vcs.revision".into())),
+                    ("kind".into(), Value::String("vcs.commit".into())),
                     ("state".into(), Value::String("published".into())),
                 ]),
                 evidence: Vec::new(),
@@ -5375,7 +5019,7 @@ subgraph {
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         let request = store
-            .latest_claim(&step, Some("review.requested"))
+            .gate_request_for_owner(&step)
             .unwrap()
             .expect("the human review was not requested");
         assert_eq!(
@@ -5394,11 +5038,11 @@ subgraph {
         );
         store
             .append_claim(&ClaimInput {
-                subject: step.clone(),
-                kind: "review.decision".into(),
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
                 actor: Some("person/someone-else".into()),
                 fields: BTreeMap::from([
-                    ("decision".into(), Value::String("approved".into())),
+                    ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
                 ]),
                 evidence: vec![request.id.clone()],
@@ -5413,10 +5057,10 @@ subgraph {
         );
         store
             .append_claim(&ClaimInput {
-                subject: step.clone(),
-                kind: "review.decision".into(),
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
                 actor: Some("person/nathan".into()),
-                fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
+                fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some("unbound-review".into()),
@@ -5429,11 +5073,11 @@ subgraph {
         );
         store
             .append_claim(&ClaimInput {
-                subject: step,
-                kind: "review.decision".into(),
+                subject: request.subject.clone(),
+                kind: "gate.result".into(),
                 actor: Some("person/nathan".into()),
                 fields: BTreeMap::from([
-                    ("decision".into(), Value::String("approved".into())),
+                    ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
                 ]),
                 evidence: vec![request.id],
@@ -5577,7 +5221,10 @@ subgraph {
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        assert_eq!(&*runtime.starts.lock().unwrap(), &[runtime_id.clone()]);
+        assert_eq!(
+            &*runtime.starts.lock().unwrap(),
+            std::slice::from_ref(&runtime_id)
+        );
 
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id: runtime_id.clone(),
@@ -5587,15 +5234,18 @@ subgraph {
             incarnation_id: Some("worker-one".into()),
         });
         reconciler.reconcile_once().unwrap();
-        assert_eq!(&*runtime.starts.lock().unwrap(), &[runtime_id.clone()]);
+        assert_eq!(
+            &*runtime.starts.lock().unwrap(),
+            std::slice::from_ref(&runtime_id)
+        );
 
         store
             .append_claim(&ClaimInput {
                 subject: agent_subject.clone(),
-                kind: "harness.ready".into(),
+                kind: "harness.observed".into(),
                 actor: Some(agent_subject.clone()),
                 fields: BTreeMap::from([
-                    ("status".into(), Value::String("ready".into())),
+                    ("state".into(), Value::String("ready".into())),
                     ("transport".into(), Value::String("app-server".into())),
                 ]),
                 evidence: Vec::new(),
@@ -5621,7 +5271,7 @@ subgraph {
 
         let starts = runtime.starts.lock().unwrap();
         assert_eq!(starts.len(), 2);
-        assert!(starts[1].contains(".gate."));
+        assert!(starts[1].starts_with("gate-operation."));
     }
 
     #[test]
@@ -5763,10 +5413,10 @@ subgraph {
             store
                 .append_claim(&ClaimInput {
                     subject: subject.clone(),
-                    kind: "harness.ready".into(),
+                    kind: "harness.observed".into(),
                     actor: Some(subject.clone()),
                     fields: BTreeMap::from([
-                        ("status".into(), Value::String("ready".into())),
+                        ("state".into(), Value::String("ready".into())),
                         ("transport".into(), Value::String("app-server".into())),
                     ]),
                     evidence: Vec::new(),
@@ -5865,10 +5515,33 @@ subgraph {
 
         let completed = store.plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed", "{completed:?}");
-        assert!(store.desired_subjects().unwrap().iter().any(|desired| {
-            desired.owner_run.as_deref() == Some(plan_run.subject.as_str())
-                && desired.kind == "stop"
-        }));
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|desired| { desired.owner_run.as_deref() != Some(plan_run.subject.as_str()) })
+        );
+        assert_eq!(
+            store
+                .latest_claim(&plan_run.subject, Some("eval.verdict"))
+                .unwrap()
+                .unwrap()
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        let started = runtime.starts.lock().unwrap().clone();
+        let removed = runtime.removes.lock().unwrap().clone();
+        assert!(
+            started
+                .iter()
+                .all(|runtime_id| removed.contains(runtime_id)),
+            "eval cleanup must remove each runtime record; started={:?}; removed={:?}",
+            started,
+            removed,
+        );
     }
 
     #[test]
@@ -6198,7 +5871,7 @@ subgraph {
     }
 
     #[test]
-    fn a_reconcile_does_not_redeliver_an_accepted_message() {
+    fn a_reconcile_does_not_redeliver_a_read_message() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
@@ -6338,7 +6011,7 @@ subgraph {
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 1);
         let decision = store
-            .latest_claim("agent/node.worker", Some("supervision.decision"))
+            .latest_claim("agent/node.worker", Some("runtime.reconcile-decision"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6543,7 +6216,7 @@ subgraph { stop "agent/node.worker" }"#,
 
         assert_eq!(
             store
-                .claims_for("schedule/reminder", Some("clock.reached"))
+                .claims_for("schedule/reminder", Some("schedule.occurrence-reached"))
                 .unwrap()
                 .len(),
             1
@@ -6589,13 +6262,13 @@ subgraph { schedule "reminder" { stop } }"#,
 
         assert!(
             store
-                .claims_for("schedule/reminder", Some("clock.reached"))
+                .claims_for("schedule/reminder", Some("schedule.occurrence-reached"))
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
             store
-                .claims_for("schedule/reminder", Some("clock.wake.cancel.requested"))
+                .claims_for("schedule/reminder", Some("schedule.occurrence-cancelled"))
                 .unwrap()
                 .len(),
             1
@@ -6604,8 +6277,7 @@ subgraph { schedule "reminder" { stop } }"#,
     }
 
     #[test]
-    fn a_required_link_holds_only_its_source() {
-        let store = Arc::new(Store::open_memory("node").unwrap());
+    fn removed_link_nodes_are_rejected() {
         let source = r#"
             version 2
             subgraph {
@@ -6617,34 +6289,12 @@ subgraph { schedule "reminder" { stop } }"#,
               }
             }
         "#;
-        apply_source(&store, source, "link-hold");
-        let runtime = Arc::new(FakeRuntime::default());
-        let reconciler = Reconciler::new(
-            store.clone(),
-            runtime.clone(),
-            "node".into(),
-            Arc::new(Notify::new()),
-        );
-
-        reconciler.reconcile_once().unwrap();
-
-        assert_eq!(&*runtime.starts.lock().unwrap(), &["node.target"]);
-        let decision = store
-            .latest_claim("agent/node.source", Some("supervision.decision"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decision
-                .body
-                .pointer("/fields/decision")
-                .and_then(Value::as_str),
-            Some("hold")
-        );
+        let error = parse_intent(source, "node").unwrap_err();
+        assert_eq!(error.code, "unknown-node");
     }
 
     #[test]
-    fn a_terminal_control_stops_after_its_declared_input_limit() {
-        let store = Arc::new(Store::open_memory("node").unwrap());
+    fn removed_supervisor_nodes_are_rejected() {
         let source = r#"
             version 2
             subgraph {
@@ -6661,39 +6311,8 @@ subgraph { schedule "reminder" { stop } }"#,
               }
             }
         "#;
-        apply_source(&store, source, "bounded-gate");
-        let runtime = Arc::new(FakeRuntime::default());
-        runtime.ptys.lock().unwrap().push(RuntimeObservation {
-            runtime_id: "node.worker".into(),
-            terminal: true,
-            status: "running".into(),
-            exit_code: None,
-            incarnation_id: Some("one".into()),
-        });
-        *runtime.screen.lock().unwrap() = "Press Enter to continue".into();
-        let reconciler = Reconciler::new(
-            store.clone(),
-            runtime.clone(),
-            "node".into(),
-            Arc::new(Notify::new()),
-        );
-
-        reconciler.reconcile_once().unwrap();
-        reconciler.reconcile_once().unwrap();
-        reconciler.reconcile_once().unwrap();
-
-        assert_eq!(&*runtime.keys.lock().unwrap(), &["enter"]);
-        let decision = store
-            .latest_claim("agent/node.worker", Some("supervision.decision"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decision
-                .body
-                .pointer("/fields/decision")
-                .and_then(Value::as_str),
-            Some("raise")
-        );
+        let error = parse_intent(source, "node").unwrap_err();
+        assert_eq!(error.code, "unknown-node");
     }
 
     #[tokio::test]
@@ -6758,6 +6377,23 @@ subgraph { schedule "reminder" { stop } }"#,
                 .status,
             "completed"
         );
+        assert_eq!(
+            store
+                .latest_claim(&run.subject, Some("eval.verdict"))
+                .unwrap()
+                .unwrap()
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("fail")
+        );
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
     }
 
     #[test]
@@ -6773,7 +6409,7 @@ subgraph { schedule "reminder" { stop } }"#,
                 step "publish" {
                   assigned-to "agent/worker"
                   depends-on {
-                    field "decision" "resource/approval" "is" "approved"
+                    field "decision" "resource/approval" "is" "approve"
                   }
                 }
               }
@@ -6794,9 +6430,12 @@ subgraph { schedule "reminder" { stop } }"#,
         store
             .append_claim(&ClaimInput {
                 subject: "resource/approval".into(),
-                kind: "review.decision".into(),
+                kind: "resource.observed".into(),
                 actor: Some("person/reviewer".into()),
-                fields: BTreeMap::from([("decision".into(), Value::String("approved".into()))]),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("human.review".into())),
+                    ("decision".into(), Value::String("approve".into())),
+                ]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some("approve".into()),
@@ -6817,9 +6456,12 @@ subgraph { schedule "reminder" { stop } }"#,
         store
             .append_claim(&ClaimInput {
                 subject: "resource/approval".into(),
-                kind: "review.decision".into(),
+                kind: "resource.observed".into(),
                 actor: Some("person/reviewer".into()),
-                fields: BTreeMap::from([("decision".into(), Value::String("rejected".into()))]),
+                fields: BTreeMap::from([(
+                    "decision".into(),
+                    Value::String("request-changes".into()),
+                )]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: Some("reject".into()),
@@ -7008,10 +6650,10 @@ subgraph {
         store
             .append_claim(&ClaimInput {
                 subject: "agent/node.one".into(),
-                kind: "harness.ready".into(),
+                kind: "harness.observed".into(),
                 actor: None,
                 fields: BTreeMap::from([
-                    ("status".into(), Value::String("ready".into())),
+                    ("state".into(), Value::String("ready".into())),
                     (
                         "incarnation_id".into(),
                         Value::String("incarnation-one".into()),
@@ -7099,7 +6741,7 @@ subgraph {
         let source = r#"
 version 2
 subgraph {
-  resource "source" { kind "document"; binding "late" }
+  resource "source" { kind "custom.st3.document-source" }
   plan "resource-input" state="ready" {
     input "source" kind="resource"
     goal "Check the start snapshot."
@@ -7223,7 +6865,7 @@ subgraph {
 version 2
 subgraph {
   agent "target" { workspace "/tmp"; command "true"; restart "never" }
-  resource "github/acme/demo/pull/1" { kind "vcs.pull-request"; binding "late" }
+  resource "github/acme/demo/pull/1" { kind "vcs.pull-request" }
   observer "github/acme/demo/pull/1" {
     resource "resource/github/acme/demo/pull/1"
     provider "github.pull-request"

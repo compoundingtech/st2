@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use agent_spec::spec::Driver;
 use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand};
-use kdl::{KdlDocument, KdlEntry, KdlNode};
+use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use st2::eval_spec::{Check, JsonScalar, JudgeKind, Spec as EvalSpec};
@@ -259,31 +259,24 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
             .get(0)
             .and_then(|value| value.as_string())
             .context("old agent has no name")?;
-        if running == Some(false) {
-            let host = node
-                .children()
-                .and_then(|body| body.get("host"))
-                .and_then(|host| host.get(0))
-                .and_then(|value| value.as_string());
-            let identity = node
-                .children()
-                .and_then(|body| body.get("identity"))
-                .and_then(|identity| identity.get(0))
-                .and_then(|value| value.as_string())
-                .unwrap_or(name);
-            let bus = if identity.contains('.') {
-                identity.to_owned()
-            } else if let Some(host) = host {
-                format!("{host}.{identity}")
-            } else {
-                identity.to_owned()
-            };
-            let mut stop = KdlNode::new("stop");
-            stop.entries_mut()
-                .push(KdlEntry::new(format!("agent/{bus}")));
-            children.nodes_mut().push(stop);
-            continue;
-        }
+        let host = node
+            .children()
+            .and_then(|body| body.get("host"))
+            .and_then(|host| host.get(0))
+            .and_then(|value| value.as_string());
+        let identity = node
+            .children()
+            .and_then(|body| body.get("identity"))
+            .and_then(|identity| identity.get(0))
+            .and_then(|value| value.as_string())
+            .unwrap_or(name);
+        let bus = if identity.contains('.') {
+            identity.to_owned()
+        } else if let Some(host) = host {
+            format!("{host}.{identity}")
+        } else {
+            identity.to_owned()
+        };
         let mut agent = node.clone();
         let body = agent.children_mut().get_or_insert_with(KdlDocument::new);
         body.nodes_mut().retain(|child| {
@@ -306,7 +299,31 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
             restart.entries_mut().push(KdlEntry::new("always"));
             body.nodes_mut().push(restart);
         }
-        children.nodes_mut().push(agent);
+        let mut plan = KdlNode::new("plan");
+        plan.entries_mut()
+            .push(KdlEntry::new(format!("catalog/{bus}")));
+        plan.entries_mut().push(KdlEntry::new_prop(
+            "state",
+            if running == Some(false) {
+                "retired"
+            } else {
+                "ready"
+            },
+        ));
+        let mut plan_body = KdlDocument::new();
+        let mut goal = KdlNode::new("goal");
+        goal.entries_mut()
+            .push(KdlEntry::new(format!("Keep agent {bus} available.")));
+        plan_body.nodes_mut().push(goal);
+        if running != Some(false) {
+            let mut plan_subgraph = KdlNode::new("subgraph");
+            let mut plan_subgraph_body = KdlDocument::new();
+            plan_subgraph_body.nodes_mut().push(agent);
+            plan_subgraph.set_children(plan_subgraph_body);
+            plan_body.nodes_mut().push(plan_subgraph);
+        }
+        plan.set_children(plan_body);
+        children.nodes_mut().push(plan);
     }
     let mut root = KdlNode::new("subgraph");
     root.set_children(children);
@@ -513,22 +530,40 @@ fn transform_eval(
         .collect::<Vec<_>>();
     identities.sort_by_key(|identity| std::cmp::Reverse(identity.len()));
     identities.dedup();
-    for identity in identities {
-        let run_identity = format!("{identity}.${{ST_PLAN_RUN}}");
-        legacy = legacy.replace(&identity, &run_identity);
-        for field in ["agent", "identity", "from", "to"] {
-            legacy = legacy.replace(
-                &format!("{field} {run_identity}"),
-                &format!("{field} {run_identity:?}"),
-            );
-        }
-    }
+    let mut document: KdlDocument = legacy
+        .parse()
+        .context("parse translated eval before agent reference rewrite")?;
+    rewrite_eval_agent_references(&mut document, &identities);
+    document.autoformat();
+    legacy = document.to_string();
     legacy = legacy.replace("${EVAL_ROOT}", "${ST_WORKSPACE}");
     let name = cell
         .file_name()
         .and_then(|value| value.to_str())
         .context("eval name is not UTF-8")?;
     Ok((checkpoint_intent_to_plan(&legacy, name)?, documents))
+}
+
+fn rewrite_eval_agent_references(document: &mut KdlDocument, identities: &[String]) {
+    for node in document.nodes_mut() {
+        let agent_node = node.name().value() == "agent";
+        for (index, entry) in node.entries_mut().iter_mut().enumerate() {
+            if agent_node && index == 0 && entry.name().is_none() {
+                continue;
+            }
+            let KdlValue::String(value) = entry.value_mut() else {
+                continue;
+            };
+            for identity in identities {
+                let actor = format!("agent/${{ST_PLAN_RUN}}/{identity}");
+                *value = value.replace(identity, &actor);
+                *value = value.replace(&format!("agent/{actor}"), &actor);
+            }
+        }
+        if let Some(children) = node.children_mut() {
+            rewrite_eval_agent_references(children, identities);
+        }
+    }
 }
 
 fn transform_eval_checkpoint(
@@ -542,41 +577,16 @@ fn transform_eval_checkpoint(
         .file_name()
         .and_then(|value| value.to_str())
         .context("eval name is not UTF-8")?;
-    let scope = format!("scope/eval/{name}");
     let sequence = format!("eval/{name}");
     let restart = if eval.supervise { "always" } else { "never" };
     let mut documents = Vec::new();
     let mut output = String::new();
     output.push_str("version 2\nsubgraph {\n");
-    output.push_str(&format!("  checkpoints {sequence:?} scope={scope:?} {{\n"));
+    output.push_str(&format!("  checkpoints {sequence:?} {{\n"));
     let mut team_checkpoint = String::new();
     team_checkpoint.push_str("    checkpoint \"The eval team is running\" {\n      subgraph {\n");
-    let all_agents = spec
-        .agents
-        .iter()
-        .chain(eval.agents.iter())
-        .collect::<Vec<_>>();
-    let has_claude = all_agents
-        .iter()
-        .any(|agent| matches!(agent.driver.as_ref(), Some(Driver::Claude(_))));
-    let has_development_channel = all_agents.iter().any(|agent| {
-        matches!(
-            agent.driver.as_ref(),
-            Some(Driver::Claude(driver)) if driver.dev_channels
-        )
-    });
-    let eval_supervisor = has_claude.then(|| format!("eval-{name}"));
-    if let Some(supervisor) = &eval_supervisor {
-        write_eval_supervisor(&mut team_checkpoint, supervisor, has_development_channel);
-    }
     for agent in spec.agents.iter().chain(eval.agents.iter()) {
-        write_eval_agent(
-            &mut team_checkpoint,
-            agent,
-            restart,
-            host,
-            eval_supervisor.as_deref(),
-        );
+        write_eval_agent(&mut team_checkpoint, agent, restart, host);
     }
     if let Some(kick) = &eval.message {
         let content = if cell.join(&kick.content).is_file() {
@@ -608,11 +618,8 @@ fn transform_eval_checkpoint(
         .iter()
         .chain(eval.agents.iter())
         .collect::<Vec<_>>();
-    if agents.is_empty() {
-        team_checkpoint.push_str(&format!(
-            "      gate \"eval scope exists\" {{ exists {scope:?} }}\n"
-        ));
-    } else {
+    let has_team_checkpoint = !agents.is_empty() || eval.message.is_some();
+    if !agents.is_empty() {
         for (ordinal, agent) in agents.into_iter().enumerate() {
             let subject = format!("agent/{}", eval_agent_identity(&agent.id, host));
             if agent.driver.is_some() {
@@ -693,7 +700,9 @@ fn transform_eval_checkpoint(
         output.push_str("    }\n");
     }
 
-    output.push_str(&team_checkpoint);
+    if has_team_checkpoint {
+        output.push_str(&team_checkpoint);
+    }
     if let Some(kick) = &eval.message {
         let generated = output_cell.join(".st3-migration/wait-team-done.sh");
         write_file(&generated, WAIT_TEAM_DONE)?;
@@ -793,14 +802,6 @@ fn transform_eval_checkpoint(
         format!("{}ms", eval.max_timeout.as_millis())
     ));
     output.push_str("    }\n");
-    output.push_str("    checkpoint \"The temporary eval scope is empty\" {\n      subgraph {\n");
-    output.push_str(&format!(
-        "        scope {:?} {{ stop }}\n",
-        format!("eval/{name}")
-    ));
-    output.push_str(&format!(
-        "      }}\n      gate \"temporary eval scope is empty\" {{ empty {scope:?} }}\n    }}\n"
-    ));
     output.push_str("  }\n}\n");
     let mut formatted: KdlDocument = output
         .parse()
@@ -831,8 +832,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "version 2\nsubgraph {{\n  scope {:?} retention=\"temporary\" {{\n    plan {:?} state=\"ready\" {{\n      goal {:?}\n",
-        format!("eval/{name}/${{ST_PLAN_RUN}}"),
+        "version 2\nsubgraph {{\n  plan {:?} state=\"ready\" {{\n    completion {{ when \"all-steps-exhausted\" }}\n    goal {:?}\n",
         format!("eval/{name}"),
         format!("Complete the migrated {name} eval.")
     );
@@ -844,12 +844,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
             .find(|entry| entry.name().is_none())
             .and_then(|entry| entry.value().as_string())
             .context("translated checkpoint has no title")?;
-        let cleanup = title == "The temporary eval scope is empty";
-        let id = if cleanup {
-            "cleanup".into()
-        } else {
-            format!("{:02}-{}", ordinal, slug(title))
-        };
+        let id = format!("{:02}-{}", ordinal, slug(title));
         let mut timeout = None::<String>;
         let mut body_nodes = Vec::new();
         if let Some(body) = checkpoint.children() {
@@ -875,15 +870,12 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         if let Some(timeout) = timeout {
             output.push_str(&format!(" timeout={timeout:?}"));
         }
-        if cleanup {
-            output.push_str(" finally=#true");
-        }
         output.push_str(" {\n");
         output.push_str(&format!("        title {title:?}\n"));
         if let Some(prior) = &prior {
             output.push_str(&format!(
                 "        depends-on {{ step {prior:?} {} }}\n",
-                if cleanup { "terminal" } else { "completed" }
+                "completed"
             ));
         }
         for child in body_nodes {
@@ -891,11 +883,9 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
             output.push('\n');
         }
         output.push_str("      }\n");
-        if !cleanup {
-            prior = Some(id);
-        }
+        prior = Some(id);
     }
-    output.push_str("    }\n  }\n}\n");
+    output.push_str("  }\n}\n");
     let mut formatted: KdlDocument = output
         .parse()
         .with_context(|| format!("parse checkpoint conversion KDL:\n{output}"))?;
@@ -925,15 +915,11 @@ fn write_eval_agent(
     agent: &st2::eval_spec::SpecAgent,
     restart: &str,
     host: &str,
-    supervisor: Option<&str>,
 ) {
-    output.push_str(&format!("    agent {:?} {{\n", agent.id));
-    if !agent.id.contains('.') {
-        output.push_str(&format!(
-            "      identity {:?}\n",
-            eval_agent_identity(&agent.id, host)
-        ));
-    }
+    output.push_str(&format!(
+        "    agent {:?} {{\n",
+        eval_agent_identity(&agent.id, host)
+    ));
     if let Some(workspace) = &agent.workspace {
         output.push_str(&format!(
             "      workspace {:?}\n",
@@ -941,9 +927,6 @@ fn write_eval_agent(
         ));
     } else {
         output.push_str("      workspace \"${ST_WORKSPACE}\"\n");
-    }
-    if let Some(supervisor) = supervisor {
-        output.push_str(&format!("      supervisor {supervisor:?}\n"));
     }
     if let Some(command) = &agent.command {
         output.push_str(&format!(
@@ -980,28 +963,6 @@ fn write_eval_agent(
         ));
     }
     output.push_str("    }\n");
-}
-
-fn write_eval_supervisor(output: &mut String, supervisor: &str, development_channel: bool) {
-    output.push_str(&format!("        supervisor {supervisor:?} {{\n"));
-    output.push_str(
-        "          terminal-control \"claude-workspace-trust\" driver=\"claude\" {\n\
-                   contains \"Quick safety check: Is this a project you created or one you trust?\"\n\
-                   key \"enter\"\n\
-                   max-inputs 1\n\
-                   }\n",
-    );
-    if development_channel {
-        output.push_str(
-            "          terminal-control \"claude-development-channel\" driver=\"claude\" {\n\
-                       contains \"WARNING: Loading development channels\"\n\
-                       contains \"Channels: server:st3\"\n\
-                       key \"enter\"\n\
-                       max-inputs 1\n\
-                       }\n",
-        );
-    }
-    output.push_str("        }\n");
 }
 
 fn write_eval_driver(output: &mut String, driver: &Driver) {
@@ -1456,21 +1417,12 @@ agent "worker" {
         .unwrap();
         assert!(translated.starts_with("version 2\n"));
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        let worker = &intent.subjects["agent/host-a.worker"];
-        assert_eq!(
-            worker.member.as_ref().unwrap().restart,
-            st3::model::RestartType::Always
-        );
-        assert_eq!(
-            worker
-                .member
-                .as_ref()
-                .unwrap()
-                .environment
-                .get("PATH")
-                .map(String::as_str),
-            Some("/bin")
-        );
+        let plan = &intent.plans["catalog/host-a.worker"];
+        assert_eq!(plan.state, st3::model::PlanState::Ready);
+        let graph = plan.subgraph_kdl.as_deref().unwrap();
+        assert!(graph.contains("agent worker"));
+        assert!(graph.contains("restart always"));
+        assert!(graph.contains("PATH \"/bin\""));
         assert!(!translated.contains("ST_AGENT"));
         assert!(!translated.contains("lifetime"));
     }
@@ -1493,24 +1445,25 @@ agent "worker" {
         )
         .unwrap();
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        let member = intent.subjects["agent/host-a.worker"]
-            .member
-            .as_ref()
-            .unwrap();
-        assert_eq!(member.driver.as_deref(), Some("codex"));
+        assert_eq!(
+            intent.plans["catalog/host-a.worker"].state,
+            st3::model::PlanState::Ready
+        );
         assert!(translated.contains("harness codex"));
         assert!(!translated.contains("harness claude"));
     }
 
     #[test]
-    fn retired_catalog_agents_become_explicit_stops() {
+    fn retired_catalog_agents_become_retired_plans() {
         let translated = transform_declaration(
             r#"agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
             Some(false),
         )
         .unwrap();
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        assert_eq!(intent.subjects["agent/host-a.worker"].kind, "stop");
+        let plan = &intent.plans["catalog/host-a.worker"];
+        assert_eq!(plan.state, st3::model::PlanState::Retired);
+        assert!(plan.subgraph_kdl.is_none());
     }
 
     #[test]
@@ -1612,24 +1565,27 @@ agent "worker" {
         let plan = intent.plans.values().next().unwrap();
         let team = &plan.steps["00-the-eval-team-is-running"];
         let team_graph = team.subgraph_kdl.as_deref().unwrap();
-        assert!(team_graph.contains("agent \"mix.sup.${ST_PLAN_RUN}\""));
-        assert!(team_graph.contains("identity \"local.judge.${ST_PLAN_RUN}\""));
+        assert!(team_graph.contains("agent mix.sup"));
+        assert!(team_graph.contains("agent local.judge"));
         assert!(team_graph.contains("message \"kickoff/${ST_PLAN_RUN}\""));
+        assert!(team_graph.contains("to \"agent/${ST_PLAN_RUN}/mix.sup\""));
         assert!(translated.contains("model gpt-5.6-sol"));
         assert!(translated.contains("${ST_WORKSPACE}"));
         assert!(!translated.contains("${EVAL_ROOT}"));
+        assert!(!translated.contains("scope "));
         assert!(team.gates.iter().any(|gate| {
             matches!(
                 gate,
                 st3::model::GateSpec::Exists { subject, .. }
-                    if subject == "agent/mix.sup.${ST_PLAN_RUN}"
+                    if subject == "agent/${ST_PLAN_RUN}/mix.sup"
             )
         }));
         assert!(translated.contains("title \"The team reported completion\""));
         assert!(translated.contains(".st3-migration/wait-team-done.sh"));
         assert!(translated.contains("kickoff/${ST_PLAN_RUN}"));
-        assert!(translated.contains("supervisor eval-"));
-        assert!(translated.contains("terminal-control claude-workspace-trust"));
+        assert!(!translated.contains("supervisor eval-"));
+        assert!(!translated.contains("terminal-control"));
+        assert!(plan.completion.is_some());
         assert!(
             !translated.contains("wait-team-done.sh 'requester' 'mix.sup' kickoff 'local.judge'")
         );
@@ -1672,6 +1628,27 @@ agent "worker" {
             .find("title \"All held-out gates pass\"")
             .unwrap();
         assert!(run < team && team < completion && completion < gates);
+    }
+
+    #[test]
+    fn teamless_eval_omits_the_empty_team_step() {
+        let source = r#"
+            eval {
+              run "setup" { command "true" }
+              max-timeout "60s"
+              judges { judge "result" { exec "true" } }
+            }
+        "#;
+        let spec = st2::eval_spec::parse_spec(source).unwrap();
+        let cell = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let (translated, _) = transform_eval(&spec, cell.path(), output.path(), "local").unwrap();
+        st3::parse_intent(&translated, "local").unwrap();
+
+        assert!(!translated.contains("The eval team is running"));
+        assert!(translated.contains("Run step setup finishes"));
+        assert!(translated.contains("All held-out gates pass"));
     }
 
     #[test]
