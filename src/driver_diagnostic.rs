@@ -24,6 +24,7 @@ pub enum Stage {
     ApiGate,
     Sse,
     Seed,
+    ProviderAuth,
     Delivery,
     ReadBack,
     #[serde(other)]
@@ -31,11 +32,12 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::VersionGate,
         Self::ApiGate,
         Self::Sse,
         Self::Seed,
+        Self::ProviderAuth,
         Self::Delivery,
         Self::ReadBack,
     ];
@@ -46,20 +48,27 @@ impl Stage {
             Self::ApiGate => "apiGate",
             Self::Sse => "sse",
             Self::Seed => "seed",
+            Self::ProviderAuth => "providerAuth",
             Self::Delivery => "delivery",
             Self::ReadBack => "readBack",
             Self::Unknown => "unknown",
         }
     }
 
+    /// Projection order, earliest boundary first. `ProviderAuth` sits between the four gates st2
+    /// owns and the two it can only observe through them: the gates are st2↔producer contract
+    /// facts that must hold before any provider-side reading means anything, while a rejected
+    /// credential is the CAUSE whose symptoms are delivery and read-back failures — so it must
+    /// outrank both rather than hide behind them.
     const fn index(self) -> Option<usize> {
         match self {
             Self::VersionGate => Some(0),
             Self::ApiGate => Some(1),
             Self::Sse => Some(2),
             Self::Seed => Some(3),
-            Self::Delivery => Some(4),
-            Self::ReadBack => Some(5),
+            Self::ProviderAuth => Some(4),
+            Self::Delivery => Some(5),
+            Self::ReadBack => Some(6),
             Self::Unknown => None,
         }
     }
@@ -70,16 +79,22 @@ impl Stage {
 pub enum Driver {
     #[serde(rename = "opencode")]
     OpenCode,
+    Claude,
+    Codex,
+    Omp,
     #[serde(other)]
     Unknown,
 }
 
 impl Driver {
-    pub const ALL: [Self; 1] = [Self::OpenCode];
+    pub const ALL: [Self; 4] = [Self::OpenCode, Self::Claude, Self::Codex, Self::Omp];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Omp => "omp",
             Self::Unknown => "unknown",
         }
     }
@@ -107,12 +122,13 @@ pub enum Reason {
     DeliveryRejected,
     ReadBackUnavailable,
     NotDurable,
+    ProviderAuthRejected,
     #[serde(other)]
     Unknown,
 }
 
 impl Reason {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -132,6 +148,7 @@ impl Reason {
         Self::DeliveryRejected,
         Self::ReadBackUnavailable,
         Self::NotDurable,
+        Self::ProviderAuthRejected,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -155,6 +172,7 @@ impl Reason {
             Self::DeliveryRejected => "deliveryRejected",
             Self::ReadBackUnavailable => "readBackUnavailable",
             Self::NotDurable => "notDurable",
+            Self::ProviderAuthRejected => "providerAuthRejected",
             Self::Unknown => "unknown",
         }
     }
@@ -172,6 +190,7 @@ impl Reason {
             | Self::QuestionUnavailable
             | Self::MalformedQuestions
             | Self::MissingAskId => Stage::Seed,
+            Self::ProviderAuthRejected => Stage::ProviderAuth,
             Self::DeliveryUnavailable | Self::DeliveryRejected => Stage::Delivery,
             Self::ReadBackUnavailable | Self::NotDurable => Stage::ReadBack,
             Self::Unknown => Stage::Unknown,
@@ -201,6 +220,7 @@ impl Reason {
             Self::MissingAskId => {
                 matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
             }
+            Self::ProviderAuthRejected => matches!(source, Source::TurnResult),
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
                 matches!(source, Source::PromptTransport)
             }
@@ -223,12 +243,13 @@ pub enum Source {
     QuestionSnapshot,
     PromptTransport,
     MessageReadBack,
+    TurnResult,
     #[serde(other)]
     Unknown,
 }
 
 impl Source {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::VersionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
@@ -237,6 +258,7 @@ impl Source {
         Self::QuestionSnapshot,
         Self::PromptTransport,
         Self::MessageReadBack,
+        Self::TurnResult,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -249,6 +271,7 @@ impl Source {
             Self::QuestionSnapshot => "questionSnapshot",
             Self::PromptTransport => "promptTransport",
             Self::MessageReadBack => "messageReadBack",
+            Self::TurnResult => "turnResult",
             Self::Unknown => "unknown",
         }
     }
@@ -362,6 +385,11 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             Stage::ApiGate => "restore the producer API contract, then restart the seat",
             Stage::Sse => "restore the producer event stream; recovery clears this advisory",
             Stage::Seed => "restore readable producer state snapshots; recovery clears this advisory",
+            // The one boundary whose repair is neither an st2-side nor a producer-side restore:
+            // nothing in the seat is broken, the account's credential was refused. The text stays
+            // generic on purpose — which client owns which credential home is declared outside
+            // st2, and no credential knowledge enters this crate (Q12).
+            Stage::ProviderAuth => "the seat's provider credential was rejected; re-login with the account's own client and unpark",
             Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
             Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
@@ -373,13 +401,30 @@ pub fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("driver-diagnostic")
 }
 
-/// Whether this declaration has a native driver that currently publishes this record.
+/// Whether this declaration has a native driver that publishes this record at all.
 pub fn expected_for(spec: &crate::AgentSpec) -> bool {
     matches!(
         spec.driver.as_ref(),
-        Some(crate::Driver::OpenCode(_))
+        Some(
+            crate::Driver::OpenCode(_)
+                | crate::Driver::Claude(_)
+                | crate::Driver::Codex(_)
+                | crate::Driver::Omp(_)
+        )
     )
 }
+
+/// Whether a missing record is itself a fault for this declaration.
+///
+/// Only a driver that publishes a boundary result on EVERY launch can be missing one: OpenCode's
+/// version gate publishes or clears before the provider spawns, so absence there means the native
+/// driver never ran. Claude, Codex, and omp publish this record only when the provider's own typed
+/// turn result names a rejected credential, so absence is their healthy steady state and advising
+/// on it would put a warning under every seat in the fleet.
+pub fn absence_is_a_fault(spec: &crate::AgentSpec) -> bool {
+    matches!(spec.driver.as_ref(), Some(crate::Driver::OpenCode(_)))
+}
+
 pub fn read(path: &Path) -> Observed {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
@@ -429,7 +474,7 @@ pub struct Publisher {
     driver: Driver,
     producer_version: Option<String>,
     support: Support,
-    failures: [Option<Record>; 6],
+    failures: [Option<Record>; 7],
 }
 
 impl Publisher {
@@ -485,8 +530,8 @@ impl Publisher {
             recovery: RECOVERY.to_string(),
         };
         self.failures[index] = Some(record);
-        crate::metrics::record_driver_diagnostic(stage, reason, source, self.support, false);
-        emit(stage, reason, source, self.support, "failure", self.producer_version.as_deref());
+        crate::metrics::record_driver_diagnostic(self.driver, stage, reason, source, self.support, false);
+        emit(self.driver, stage, reason, source, self.support, "failure", self.producer_version.as_deref());
         self.persist();
     }
 
@@ -507,6 +552,7 @@ impl Publisher {
             return;
         };
         crate::metrics::record_driver_diagnostic(
+            self.driver,
             stage,
             cleared.reason,
             cleared.source,
@@ -514,6 +560,7 @@ impl Publisher {
             true,
         );
         emit(
+            self.driver,
             stage,
             cleared.reason,
             cleared.source,
@@ -543,6 +590,7 @@ impl Publisher {
 }
 
 fn emit(
+    driver: Driver,
     stage: Stage,
     reason: Reason,
     source: Source,
@@ -554,6 +602,7 @@ fn emit(
         tracing::info_span!(
             "st2.driver.diagnostic",
             "span.label" = stage.as_str(),
+            "st2.driver.name" = driver.as_str(),
             "st2.driver.stage" = stage.as_str(),
             "st2.driver.reason" = reason.as_str(),
             "st2.driver.source" = source.as_str(),
@@ -564,6 +613,7 @@ fn emit(
     });
     let _guard = span.as_ref().map(tracing::Span::enter);
     tracing::info!(
+        driver = driver.as_str(),
         stage = stage.as_str(),
         reason = reason.as_str(),
         source = source.as_str(),
@@ -672,6 +722,93 @@ mod tests {
                 0,
             ),
             Observed::Indeterminate(InvalidReason::FutureSkew)
+        );
+    }
+
+    /// The credential boundary is the one record a Claude hook, a Codex control pump, or an omp
+    /// channel writes, so its wire pairing is pinned on its own: a rejection is evidence only when
+    /// it came from the harness's typed turn result, and only on the stage whose repair text says
+    /// "re-login".
+    #[test]
+    fn a_credential_rejection_is_evidence_only_from_a_typed_turn_result() {
+        let valid = br#"{
+          "schema":"st2.driver-diagnostic.v1","driver":"claude","stage":"providerAuth",
+          "reason":"providerAuthRejected","source":"turnResult","support":"unknown",
+          "observedAt":100,"recovery":"clearsOnStageRecovery"
+        }"#;
+        let observed = read_at(valid, 100);
+        let Observed::Failure(failure) = &observed else {
+            panic!("a credential rejection must read as a failure")
+        };
+        assert_eq!(failure.driver, Driver::Claude);
+        assert_eq!(failure.support, Support::Unknown);
+        assert!(failure.producer_version.is_none());
+        assert!(
+            repair_text(&observed).contains("re-login"),
+            "{}",
+            repair_text(&observed)
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"turnResult", b"eventStream"), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "a rejection attributed to a channel that cannot carry a turn result is not evidence"
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"\"providerAuth\"", b"\"delivery\""), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "the credential reason belongs to exactly one stage"
+        );
+        for (word, driver) in [
+            (&b"\"codex\""[..], Driver::Codex),
+            (b"\"omp\"", Driver::Omp),
+        ] {
+            let Observed::Failure(other) = read_at(&valid.replace(b"\"claude\"", word), 100) else {
+                panic!("{driver:?} is an admitted driver word")
+            };
+            assert_eq!(other.driver, driver);
+        }
+    }
+
+    /// Projection order is load-bearing: a rejected credential is the CAUSE of the delivery and
+    /// read-back failures it produces, so it must outrank them — while the gates that prove st2
+    /// can read the producer at all still outrank it.
+    #[test]
+    fn a_rejected_credential_outranks_its_symptoms_but_not_the_producer_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut publisher = Publisher::new(
+            tmp.path(),
+            Driver::Codex,
+            Some("codex-cli 0.153.0".to_string()),
+            Support::Supported,
+        );
+        publisher.publish(Stage::ReadBack, Reason::ReadBackUnavailable, Source::MessageReadBack);
+        publisher.publish(Stage::Delivery, Reason::DeliveryUnavailable, Source::PromptTransport);
+        publisher.publish(Stage::ProviderAuth, Reason::ProviderAuthRejected, Source::TurnResult);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else {
+            panic!("the credential boundary must be the projected failure")
+        };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+        assert_eq!(failure.driver, Driver::Codex);
+        assert_eq!(failure.producer_version.as_deref(), Some("codex-cli 0.153.0"));
+
+        publisher.publish(Stage::Sse, Reason::SseDisconnected, Source::EventStream);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(
+            failure.stage,
+            Stage::Sse,
+            "an unreadable producer stream makes any credential reading untrustworthy"
+        );
+
+        publisher.clear(Stage::Sse);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+
+        publisher.clear(Stage::ProviderAuth);
+        let Observed::Failure(failure) = read(&path(tmp.path())) else { panic!() };
+        assert_eq!(
+            failure.stage,
+            Stage::Delivery,
+            "clearing the cause reveals the symptom it was hiding"
         );
     }
 
