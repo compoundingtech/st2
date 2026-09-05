@@ -1,0 +1,15 @@
+{
+  "schema": "st2.harness-state.v1",
+  "agent": "hetz.worker",
+  "harness": "codex",
+  "state": "active",
+  "ptySession": "worker",
+  "incarnation": "session-1",
+  "seq": 7,
+  "sinceMs": 1787999000000,
+  "writtenAtMs": 1787999999000,
+  "transitions": 41,
+  "blockedOn": "none",
+  "inputBuffer": "empty",
+  "ask": "none"
+}

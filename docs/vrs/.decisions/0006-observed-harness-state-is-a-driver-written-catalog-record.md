@@ -137,3 +137,72 @@ declared native driver is expected to publish it. Telemetry repeats only the
 closed axes on
 metrics and `span.label`; raw versions and identities remain trace/log-only,
 and prompt/message/path content never enters the record or labels.
+
+## Amendment 2: the fault axis is a third record version with one shared disposition
+
+Accepted by Johannes on 2026-09-05 for the harness-state v3 foundation.
+
+The original decision put activity, `blockedOn`, and `inputBuffer` in one
+record and left everything else to prose in `reason`. That is what broke: an
+authentication rejection, an exhausted quota, a throttle, and a human
+permission prompt all arrive as some combination of `active`, `blockedOn`, and
+a `reason` word, so every consumer that wants to know "does this seat need a
+person, and to do what" ends up parsing prose or inventing its own rules. The
+amendment separates the axes and moves the fold into st2.
+
+**Condition becomes its own axis, in a new record version.** Because a version
+suffix is this record family's read contract, changing what the record says
+reserves the next version rather than widening the current one:
+`st2.harness-state.v3` carries a tagged `condition ∈ clear | fault`, where a
+fault names a closed category, an open provider-namespaced code, a recovery
+class, and its own semantic observation time. The overloaded `blockedOn` is
+replaced by a tagged ask axis that speaks only about actual human prompts. A
+fault is not an ask — a throttled provider asks nobody anything — and where
+both hold, remediation is primary while the ask stays visible. Versions 1 and 2
+project their condition as EXPLICITLY absent: their legacy words never infer a
+fault, and absence is never `clear`.
+
+**st2 owns normalization and publishes one derived disposition.** Three closed
+axes — a state, how soon a human is needed, and what that human would do first
+— from one pure function, exposed on the roster, the catalog graph, and Doctor.
+Consumers read it; none re-derives it. The raw axes ride beside it, so nothing
+is hidden by the fold and a consumer that disagrees can see its inputs. A
+native-driver diagnostic failure contributes through the same function — it is
+a fault the harness could not report itself — and, as Amendment 1 established,
+still never changes delivery. Ended and record-level indeterminate never page.
+
+**Two clocks, deliberately.** The heartbeat proves only that a writer still
+holds evidence; it never moves a fault's observation time or its recovery
+deadline. Attention is derived at read time, so an `automatic` recovery past
+its own deadline becomes an untyped, unknown-recovery fault that pages until an
+explicit paired clear, a terminal record, a new claim, or a new incarnation
+replaces it. Without that separation a seat could heartbeat its way out of an
+overdue recovery forever.
+
+**Options considered and rejected.** Widening version 1/2 in place: rejected,
+because the version suffix is the read contract and a pinned reader would
+decode new words with old meanings. A separate fault record beside
+`harness-state`: rejected for the same reason Amendment 1 chose one diagnostic
+snapshot — two files make every consumer choose precedence independently, and
+condition and activity are observations of one thing by one owner. Free-form
+provider strings promoted to a routable field: rejected, since the whole point
+is that consumers stop branching on prose; provider vocabulary is kept in the
+open `code` under a closed category. Each consumer deriving its own urgency:
+rejected, because two derivations are how one consumer starts paging for what
+another ignores.
+
+**Consequences.** Reader-first, again: this version reads, strictly validates,
+and projects version 3 while the single writer-selection point stays on version
+2, and version 3 activation replaces that point rather than adding a second
+selector. The ownership envelope is version-independent, so a version 2 claim
+refuses a version 3 record instead of overwriting a meaning it cannot read, and
+an undecodable record's ownership sequence still carries forward. Every
+projected row carries the exact version its record declared, which makes the
+migration's drain gate positive. The roster wire grows the appended version 3
+axes plus a row-level `disposition`; the pinned literals and the stable-roster
+invariant wording change deliberately in the same change. Per-provider
+mappings, the writer cutover, and what a recovery deadline should be are open
+(`DQ-H7`, `DQ-H8`). A conversation reference — identity and capability only,
+with a finite verification bound and no conversation content — ships in the
+same version, because a consumer that can see a fault will ask which
+conversation it belongs to.

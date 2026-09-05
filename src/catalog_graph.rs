@@ -73,6 +73,10 @@ pub struct GraphAgent {
     pub desired_state_reason: Option<String>,
     pub source: GraphSource,
     pub resources: Vec<GraphResource>,
+    /// The runtime observation projected by [`crate::agents::graph_runtime_value`]: presence,
+    /// activity, inbox, the observed-state axes, the driver diagnostic, harness context, and the
+    /// SHARED derived `disposition`. The graph carries that disposition rather than deriving one,
+    /// so it can never become a second opinion about whether a seat needs a human.
     pub runtime: serde_json::Value,
     /// The effective host-local address: explicit `address`, else the positional `identity`.
     pub address: String,

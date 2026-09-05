@@ -77,3 +77,28 @@ hypotheses.
   (`src/opencode_session.rs::captured_permission_grant_pair_enters_and_exits_blocked`,
   `::captured_question_reply_pair_enters_and_exits_blocked`); the raw frames
   and commands are in `.experiments/2026-08-23-opencode-surface.md`.
+- **DQ-H7 Version 3 producers and the writer cutover.** The fault axis is
+  specified, read, strictly validated, and projected, and the shared
+  disposition is derived from it; no producer emits it yet and the
+  writer-selection point stays on version 2. Two things remain open. First,
+  the per-provider mapping: which typed signal each driver projects into
+  which closed category, code, and recovery — the same evidence rule the
+  activity projection follows (a driver publishes what it positively
+  observes, never prose), and the same measurement burden, since a category
+  is only worth routing on if the provider's signal really means it.
+  Second, the cutover order: the version 3 writer may activate only where
+  every reader of that catalog already accepts version 3, and the one-way
+  claim fence plus the version-independent ownership envelope are what make
+  a mixed fleet safe in the meantime — a version 2 writer refuses a version
+  3 record instead of overwriting a meaning it cannot read. Resolves by:
+  per-driver capture evidence for the mappings, then flipping the single
+  writer-selection point.
+- **DQ-H8 What a `nextObservationDueMs` should be.** The overdue rule is
+  specified and proved, but nothing yet establishes what deadline a producer
+  should publish for a given automatic recovery — a provider's stated retry
+  window, a measured one, or a conservative multiple of it. Too short pages
+  for faults that were going to clear; too long delays a page indefinitely,
+  which is the failure the rule exists to prevent. The field is optional
+  precisely so a producer that cannot justify a number withholds it, and a
+  fault with no deadline never becomes overdue. Resolves by: measured retry
+  behavior per provider, or an explicit decision to page on a fixed bound.

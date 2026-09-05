@@ -153,7 +153,9 @@ pub fn probe_pty_root(catalog_root: &Path) -> PathBuf {
 }
 
 /// The `observedState` object inside a roster row. Vocabulary words are the record's own
-/// (`as_str`), never Rust identifier spellings.
+/// (`as_str`), never Rust identifier spellings. The shipped fields keep their names, order, and
+/// meaning; the version 3 axes are APPENDED, so a consumer pinned to the old shape reads exactly
+/// what it read before.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObservedJson<'a> {
@@ -165,6 +167,21 @@ struct ObservedJson<'a> {
     since: Option<u64>,
     reason: Option<&'a str>,
     exit: Option<&'a str>,
+    /// The exact version the record declared, or `null` when the bytes declared none. This is
+    /// what makes a migration's drain gate POSITIVE: "every row reads `st2.harness-state.v3`" is
+    /// checkable, while "no row is still v1" is not checkable from any absence.
+    schema: Option<&'a str>,
+    /// Typed indeterminacy, non-null exactly when the observation is indeterminate. The
+    /// authoritative field; the scalar `reason` above remains its compatibility projection.
+    indeterminacy: Option<IndeterminacyJson<'a>>,
+    /// The condition axis, always emitted. `absent` for versions 1 and 2, which carry no such
+    /// axis — never `clear`, and no fault inferred.
+    condition: ConditionJson<'a>,
+    /// The tagged human-ask axis: an actual human prompt, always emitted.
+    human_ask: HumanAskJson,
+    /// The conversation bridge, `null` when the record states nothing about one — which is not
+    /// the same as `unsupported`.
+    conversation_ref: Option<ConversationRefJson<'a>>,
 }
 
 impl<'a> ObservedJson<'a> {
@@ -178,7 +195,152 @@ impl<'a> ObservedJson<'a> {
             since: observed.since_ms,
             reason: observed.reason.as_deref(),
             exit: observed.exit.as_deref(),
+            schema: observed.schema.as_deref(),
+            indeterminacy: observed
+                .indeterminacy
+                .as_ref()
+                .map(|why| IndeterminacyJson {
+                    reason: why.reason.as_str(),
+                    evidence_age_ms: why.evidence_age_ms,
+                }),
+            condition: ConditionJson::from_view(&observed.condition),
+            human_ask: HumanAskJson::from_axis(observed.human_ask),
+            conversation_ref: observed
+                .conversation
+                .as_ref()
+                .map(ConversationRefJson::from_ref),
         })
+    }
+}
+
+/// Why an observation is indeterminate, typed for consumers that must distinguish a producer bug
+/// from a stale seat.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndeterminacyJson<'a> {
+    reason: &'a str,
+    /// `null` when the bytes carried no usable stamp, so "no age" and "age zero" stay distinct.
+    evidence_age_ms: Option<u64>,
+}
+
+/// The condition axis. One field set for every arm, so a fault never disappears as a missing key
+/// and an absent axis is never mistaken for a healthy one.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConditionJson<'a> {
+    kind: &'static str,
+    /// `null` for a fault whose category word is outside the closed set — untyped, still routed
+    /// by `recovery` — and for the non-fault arms.
+    category: Option<&'static str>,
+    /// Provider-namespaced and open. Diagnostic: no consumer branches on it.
+    code: Option<&'a str>,
+    recovery: Option<&'static str>,
+    observed_at_ms: Option<u64>,
+    next_observation_due_ms: Option<u64>,
+    detail: Option<&'a str>,
+    /// An automatic recovery past its own deadline, decided at read time on the semantic clock.
+    overdue: bool,
+}
+
+impl<'a> ConditionJson<'a> {
+    fn from_view(condition: &'a harness_state::ConditionView) -> Self {
+        let fault = condition.fault();
+        Self {
+            kind: condition.kind(),
+            category: fault.and_then(|fault| {
+                fault
+                    .category
+                    .map(harness_state::FaultCategory::as_str)
+            }),
+            code: fault.and_then(|fault| fault.code.as_deref()),
+            recovery: fault.map(|fault| fault.recovery.as_str()),
+            observed_at_ms: fault.map(|fault| fault.observed_at_ms),
+            next_observation_due_ms: fault.and_then(|fault| fault.next_observation_due_ms),
+            detail: fault.and_then(|fault| fault.detail.as_deref()),
+            overdue: fault.is_some_and(|fault| fault.overdue),
+        }
+    }
+}
+
+/// The tagged ask axis: `none`, `pending` with its kind, or `unknown`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HumanAskJson {
+    kind: &'static str,
+    ask: Option<&'static str>,
+}
+
+impl HumanAskJson {
+    fn from_axis(human_ask: harness_state::HumanAsk) -> Self {
+        Self {
+            kind: human_ask.kind(),
+            ask: human_ask.pending().map(harness_state::AskKind::as_str),
+        }
+    }
+}
+
+/// The conversation bridge: identity and capability only. No conversation content rides this
+/// projection, because none rides the record it reads.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationRefJson<'a> {
+    kind: &'static str,
+    driver: Option<&'a str>,
+    /// The provider's own conversation identity, carried opaquely.
+    conversation: Option<&'a str>,
+    incarnation: Option<&'a str>,
+    history_mutability: Option<&'static str>,
+    capability_evidence: Option<&'static str>,
+    /// The finite bound through which the link was verified.
+    verified_through_ms: Option<u64>,
+    /// The `unavailable` arm's diagnostic reason.
+    reason: Option<&'a str>,
+}
+
+impl<'a> ConversationRefJson<'a> {
+    fn from_ref(conversation: &'a harness_state::ConversationRef) -> Self {
+        let link = conversation.link();
+        Self {
+            kind: conversation.kind(),
+            driver: link.map(|link| link.driver.as_str()),
+            conversation: link.map(|link| link.conversation.as_str()),
+            incarnation: link.map(|link| link.incarnation.as_str()),
+            history_mutability: link
+                .map(|link| link.history_mutability.as_str()),
+            capability_evidence: link
+                .map(|link| link.capability_evidence.as_str()),
+            verified_through_ms: link.map(|link| link.verified_through_ms),
+            reason: match conversation {
+                harness_state::ConversationRef::Unavailable(reason) => reason.as_deref(),
+                harness_state::ConversationRef::Unsupported
+                | harness_state::ConversationRef::Linked(_) => None,
+            },
+        }
+    }
+}
+
+/// The shared derived disposition: exactly three closed axes, computed by
+/// [`harness_state::disposition`] and by nothing else. It is a ROW-level sibling of
+/// `observedState` rather than a member of it, because it folds two row-level axes — the observed
+/// record and the native-driver diagnostic — and nesting it would assert it derives from the
+/// record alone. Downstream consumers read this instead of re-deriving urgency; the raw axes ride
+/// beside it so a consumer that disagrees can see exactly what was folded.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DispositionJson {
+    state: &'static str,
+    attention: &'static str,
+    primary_action: &'static str,
+}
+
+impl DispositionJson {
+    fn from_row(row: &AgentRow) -> Self {
+        let disposition = harness_state::disposition(row.observed.as_ref(), &row.driver_diagnostic);
+        Self {
+            state: disposition.state.as_str(),
+            attention: disposition.attention.as_str(),
+            primary_action: disposition.primary_action.as_str(),
+        }
     }
 }
 
@@ -348,6 +510,9 @@ struct SummaryJson<'a> {
     /// different from having one nobody answered.
     #[serde(rename = "busAddress")]
     bus_address: Option<&'a str>,
+    /// The shared derived disposition, appended after every shipped field. A row-level sibling of
+    /// `observedState`, because it folds `observedState` AND `driverDiagnostic`.
+    disposition: DispositionJson,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -375,6 +540,7 @@ struct EnrichedJson<'a> {
     address: &'a str,
     #[serde(rename = "busAddress")]
     bus_address: Option<&'a str>,
+    disposition: DispositionJson,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -399,6 +565,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 id: &r.id,
                 address: &r.address,
                 bus_address: r.bus_address.as_deref(),
+                disposition: DispositionJson::from_row(r),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -420,6 +587,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 id: &r.id,
                 address: &r.address,
                 bus_address: r.bus_address.as_deref(),
+                disposition: DispositionJson::from_row(r),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -434,7 +602,12 @@ pub(crate) fn graph_runtime_value(row: &AgentRow) -> serde_json::Value {
         "inbox": row.inbox,
         "observedState": ObservedJson::from_row(row.observed.as_ref()),
         "driverDiagnostic": DriverDiagnosticJson::from_row(&row.driver_diagnostic),
+        // The fourth axis, unchanged and independent: a filling window survives every
+        // `observedState: unknown` derivation, which is the wedge case it exists for.
         "context": ContextJson::from_row(row.context.as_ref()),
+        // The same shared derivation the roster projects, from the same function: the graph must
+        // not be a second opinion about urgency.
+        "disposition": DispositionJson::from_row(row),
     })
 }
 
@@ -529,11 +702,11 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude","disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null,"disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude","disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null,"disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -556,7 +729,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}}]"#
         );
     }
 
@@ -585,15 +758,22 @@ mod tests {
             since_ms: Some(1784653000000),
             exit: None,
             reason: None,
+            schema: Some(harness_state::SCHEMA_V1.to_string()),
+            indeterminacy: None,
+            // Versions 1 and 2 carry no condition axis: explicitly absent, never
+            // `clear`, and no fault inferred from their legacy words.
+            condition: harness_state::ConditionView::Absent,
+            human_ask: harness_state::HumanAsk::None,
+            conversation: None,
         });
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null,"schema":"st2.harness-state.v1","indeterminacy":null,"condition":{"kind":"absent","category":null,"code":null,"recovery":null,"observedAtMs":null,"nextObservationDueMs":null,"detail":null,"overdue":false},"humanAsk":{"kind":"none","ask":null},"conversationRef":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","disposition":{"state":"idle","attention":"none","primaryAction":"none"}}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null,"schema":"st2.harness-state.v1","indeterminacy":null,"condition":{"kind":"absent","category":null,"code":null,"recovery":null,"observedAtMs":null,"nextObservationDueMs":null,"detail":null,"overdue":false},"humanAsk":{"kind":"none","ask":null},"conversationRef":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","disposition":{"state":"idle","attention":"none","primaryAction":"none"}}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -607,10 +787,20 @@ mod tests {
             since_ms: None,
             exit: None,
             reason: Some("session-dead".to_string()),
+            schema: Some(harness_state::SCHEMA_V1.to_string()),
+            indeterminacy: Some(harness_state::Indeterminacy {
+                reason: "session-dead".to_string(),
+                evidence_age_ms: Some(4_210),
+            }),
+            // Versions 1 and 2 carry no condition axis: explicitly absent, never
+            // `clear`, and no fault inferred from their legacy words.
+            condition: harness_state::ConditionView::Absent,
+            human_ask: harness_state::HumanAsk::Unknown,
+            conversation: None,
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null,"schema":"st2.harness-state.v1","indeterminacy":{"reason":"session-dead","evidenceAgeMs":4210},"condition":{"kind":"absent","category":null,"code":null,"recovery":null,"observedAtMs":null,"nextObservationDueMs":null,"detail":null,"overdue":false},"humanAsk":{"kind":"unknown","ask":null},"conversationRef":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","disposition":{"state":"unknown","attention":"none","primaryAction":"observe"}}]"#
         );
     }
 
@@ -631,6 +821,16 @@ mod tests {
             since_ms: None,
             exit: None,
             reason: Some("session-dead".to_string()),
+            schema: Some(harness_state::SCHEMA_V1.to_string()),
+            indeterminacy: Some(harness_state::Indeterminacy {
+                reason: "session-dead".to_string(),
+                evidence_age_ms: Some(4_210),
+            }),
+            // Versions 1 and 2 carry no condition axis: explicitly absent, never
+            // `clear`, and no fault inferred from their legacy words.
+            condition: harness_state::ConditionView::Absent,
+            human_ask: harness_state::HumanAsk::Unknown,
+            conversation: None,
         });
         wedged.context = Some(harness_context::Observed {
             subject: harness_state::RecordSubject::BusIdentity("hetz.worker".into()),
@@ -733,6 +933,13 @@ mod tests {
             since_ms: Some(1788000100000),
             exit: None,
             reason: None,
+            schema: Some(harness_state::SCHEMA_V1.to_string()),
+            indeterminacy: None,
+            // Versions 1 and 2 carry no condition axis: explicitly absent, never
+            // `clear`, and no fault inferred from their legacy words.
+            condition: harness_state::ConditionView::Absent,
+            human_ask: harness_state::HumanAsk::None,
+            conversation: None,
         });
         limited.context = Some(harness_context::Observed {
             subject: harness_state::RecordSubject::BusIdentity("hetz.worker".into()),
@@ -800,5 +1007,140 @@ mod tests {
         for forbidden in ["prompt", "body", "filename", "sessionId", "messageId"] {
             assert!(!rendered.contains(forbidden), "{rendered}");
         }
+    }
+
+    /// The version 3 axes ride the roster wire beside the shipped fields, and the shared
+    /// disposition is a ROW-level sibling computed by `harness_state::disposition` — never a
+    /// second opinion assembled here. The pinned case is the hard one: a fault and a human ask at
+    /// the same time, where remediation is primary and the ask must stay visible.
+    #[test]
+    fn the_fault_axis_and_the_shared_disposition_ride_the_roster_wire() {
+        let mut faulted = row("hetz.worker", State::Busy, None, false, None, 0);
+        faulted.observed = Some(harness_state::Observed {
+            state: harness_state::Activity::Active,
+            // The legacy pair is the projection of the tagged axis, not an independent claim.
+            blocked_on: harness_state::BlockedOn::Human,
+            input_buffer: harness_state::InputBuffer::Empty,
+            ask: harness_state::Ask::Permission,
+            harness: Some("codex".to_string()),
+            since_ms: Some(1_788_000_000_000),
+            exit: None,
+            reason: None,
+            subject: Some(harness_state::RecordSubject::AgentId(
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".into(),
+            )),
+            schema: Some(harness_state::SCHEMA_V3.to_string()),
+            indeterminacy: None,
+            condition: harness_state::ConditionView::Fault(harness_state::Fault {
+                category: Some(harness_state::FaultCategory::Quota),
+                code: Some("codex/usage_limit_reached".to_string()),
+                recovery: harness_state::Recovery::Human,
+                observed_at_ms: 1_788_000_050_000,
+                next_observation_due_ms: None,
+                detail: Some("the five-hour window is exhausted".to_string()),
+                overdue: false,
+            }),
+            human_ask: harness_state::HumanAsk::Pending(harness_state::AskKind::Permission),
+            conversation: Some(harness_state::ConversationRef::Linked(
+                harness_state::ConversationLink {
+                    driver: "codex".to_string(),
+                    conversation: "thread_01JXPLACEHOLDER".to_string(),
+                    incarnation: "session-1".to_string(),
+                    history_mutability: harness_state::HistoryMutability::Rewritable,
+                    capability_evidence: harness_state::CapabilityEvidence::Probed,
+                    verified_through_ms: 1_788_000_050_000,
+                },
+            )),
+        });
+
+        let wire: serde_json::Value =
+            serde_json::from_str(&to_json(&[faulted.clone()], false)).unwrap();
+        assert_eq!(
+            wire[0]["observedState"]["condition"],
+            serde_json::json!({
+                "kind": "fault",
+                "category": "quota",
+                "code": "codex/usage_limit_reached",
+                "recovery": "human",
+                "observedAtMs": 1_788_000_050_000u64,
+                "nextObservationDueMs": null,
+                "detail": "the five-hour window is exhausted",
+                "overdue": false
+            })
+        );
+        assert_eq!(
+            wire[0]["observedState"]["humanAsk"],
+            serde_json::json!({"kind": "pending", "ask": "permission"})
+        );
+        assert_eq!(
+            wire[0]["observedState"]["conversationRef"],
+            serde_json::json!({
+                "kind": "linked",
+                "driver": "codex",
+                "conversation": "thread_01JXPLACEHOLDER",
+                "incarnation": "session-1",
+                "historyMutability": "rewritable",
+                "capabilityEvidence": "probed",
+                "verifiedThroughMs": 1_788_000_050_000u64,
+                "reason": null
+            })
+        );
+        assert_eq!(
+            wire[0]["observedState"]["schema"], "st2.harness-state.v3",
+            "the exact version rides the wire so a drain gate can be positive"
+        );
+        // The shipped fields are untouched, and the ask stays visible beside the fault.
+        assert_eq!(wire[0]["observedState"]["state"], "active");
+        assert_eq!(wire[0]["observedState"]["blockedOn"], "human");
+        assert_eq!(wire[0]["observedState"]["ask"], "permission");
+        assert_eq!(wire[0]["observedState"]["indeterminacy"], serde_json::Value::Null);
+        // Remediation is primary while the fault stands; declared presence is untouched by it.
+        assert_eq!(
+            wire[0]["disposition"],
+            serde_json::json!({"state": "failed", "attention": "now", "primaryAction": "remediate"})
+        );
+        assert_eq!(wire[0]["status"], "busy");
+
+        // The graph projects the same derivation from the same function, and `--enrich` too. The
+        // appended axis must not displace one: the graph runtime keeps every key it carried, so
+        // `context` — the axis that survives an indeterminate observation — is pinned here beside
+        // the new one.
+        faulted.context = Some(harness_context::Observed {
+            subject: harness_state::RecordSubject::AgentId(
+                "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1".into(),
+            ),
+            harness: harness_context::Harness::Codex,
+            used_tokens: Some(92_283),
+            window_tokens: Some(258_400),
+            used_percent: Some(36.0),
+            model: None,
+            cost_usd: None,
+            session_total_tokens: None,
+            rate_limits: harness_context::RateLimits::default(),
+            compactions: 0,
+            last_compaction_ms: None,
+            last_compaction_trigger: None,
+            observed_at_ms: 1_788_000_050_000,
+            age_ms: 4_210,
+            stale: false,
+        });
+        let runtime = graph_runtime_value(&faulted);
+        assert_eq!(runtime["disposition"], wire[0]["disposition"]);
+        assert_eq!(runtime["context"]["usedPercent"], 36.0);
+        assert_eq!(runtime["observedState"]["condition"]["kind"], "fault");
+        assert_eq!(runtime["driverDiagnostic"]["status"], "absent");
+        assert_eq!(runtime["presence"], "busy");
+        assert_eq!(runtime["inbox"], 0);
+        let enriched: serde_json::Value =
+            serde_json::from_str(&to_json(&[faulted], true)).unwrap();
+        assert_eq!(enriched[0]["disposition"], wire[0]["disposition"]);
+
+        // A row nobody has ever observed is not a state: unknown, non-paging, worth observing.
+        let quiet = row("hetz.quiet", State::Available, None, false, None, 0);
+        let wire: serde_json::Value = serde_json::from_str(&to_json(&[quiet], false)).unwrap();
+        assert_eq!(
+            wire[0]["disposition"],
+            serde_json::json!({"state": "unknown", "attention": "none", "primaryAction": "observe"})
+        );
     }
 }

@@ -1,0 +1,33 @@
+{
+  "schema": "st2.harness-state.v3",
+  "agent": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
+  "harness": "codex",
+  "state": "active",
+  "ptySession": "worker",
+  "incarnation": "session-1",
+  "seq": 7,
+  "sinceMs": 1787999000000,
+  "writtenAtMs": 1787999999000,
+  "transitions": 41,
+  "inputBuffer": "empty",
+  "condition": {
+    "kind": "fault",
+    "category": "provider",
+    "code": "codex/upstream_5xx",
+    "recovery": "human",
+    "observedAtMs": 1787999999000
+  },
+  "ask": {
+    "kind": "pending",
+    "ask": "permission"
+  },
+  "conversationRef": {
+    "kind": "linked",
+    "driver": "codex",
+    "conversation": "thread_01JXPLACEHOLDER",
+    "incarnation": "session-1",
+    "historyMutability": "rewritable",
+    "capabilityEvidence": "probed",
+    "verifiedThroughMs": 1787999999000
+  }
+}
