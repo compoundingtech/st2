@@ -43,6 +43,10 @@ transport runs. Open questions are tracked in
 [open-questions.md](./open-questions.md); the direction this design deliberately
 does not take yet is in [roadmap.md](./roadmap.md).
 
+The `agent` field's immutable-ID meaning is the accepted target. Existing
+records and producers retain bus identity until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Scope
 
 This specification defines the harness-context record, its freshness and
@@ -107,7 +111,7 @@ replicated subtree (see
 ```json
 {
   "schema": "st2.harness-context.v1",
-  "agent": "<identity>",
+  "agent": "<agent-id>",
   "harness": "claude | codex | pi | omp | opencode",
   "usedTokens": 92283,
   "windowTokens": 258400,

@@ -29,10 +29,16 @@ catalog transactions.
 
 Each logical agent subject has one explicit catalog-global immutable **agent
 ID**. New subjects use UUIDv7. Before ID-aware routing activates, migration adds
-an `id` field to every legacy declaration. Its value is that subject's existing
-host-qualified bus identity, which preserves current runtime and durable-state
-keys and distinguishes identical local identities on different hosts. The
-legacy ID becomes opaque and remains unchanged after a host move.
+an `id` field to every live and structurally archived legacy declaration. A live
+subject receives its existing host-qualified bus identity, preserving current
+runtime identifiers. An archived subject receives those bytes when unused
+across the combined live-and-archived subject set; an archived collision
+receives UUIDv7 in its declaration and tombstone. Migration resolves supervisor
+references against the combined pre-migration live-and-archived subject index
+and rewrites every reference to the parent's migrated ID in the same
+transaction. A missing or ambiguous reference refuses before writes and
+requires pre-activation unarchive and repair before retry. A frozen legacy ID
+becomes opaque and remains unchanged after a host move.
 
 An ID survives routing, presentation, graph, host, desired-state, and
 runtime-incarnation changes. Retirement makes a subject non-routable and
@@ -50,9 +56,10 @@ no alias, redirect, history, or expiry period and may be reused.
 
 Ordinary references resolve addresses. Exact ID lookup uses explicit syntax or
 a typed API and never falls through to address lookup. Durable graph edges,
-ownership, authorization, message provenance/replies, runtime task identity,
-and state continuity use the immutable ID. `ST_AGENT` carries that ID as an
-exact actor selector rather than a mutable address.
+ownership, authorization, message provenance/replies, and default runtime task
+identity use the immutable ID. Existing declaration-parent state and Resource
+paths do not move. `ST_AGENT` carries the ID as an exact actor selector rather
+than a mutable address.
 
 `name` and `description` remain mutable, non-unique presentation. They never
 route or identify a subject.
@@ -74,13 +81,17 @@ host-qualified bus identity are the sole stable routing keys.
 
 - `new-agent` can create a subject immediately with an opaque durable ID, omit
   or use a provisional address, then refine its route after the first prompts.
-- Existing declarations need one additive `id` migration but no runtime or
-  durable-state re-key. An absent `address` preserves their current route until
-  first assignment.
+- Existing live and archived declarations need one additive `id` migration, and
+  supervisor references become ID-keyed in the same transaction. A live subject
+  keeps its former bus identity; only an archived collision receives UUIDv7 to
+  preserve global uniqueness. Runtime and declaration-parent durable state
+  require no re-key. An absent `address` preserves the current route until first
+  assignment.
 - A legacy ID may retain an obsolete host-looking prefix after a host move. Its
   type, not its string shape, distinguishes it from a current bus address.
-- A host move does not change logical subject identity, although host-qualified
-  runtime keys and process incarnation may change.
+- A host move does not change logical subject identity or default task identity,
+  although the process incarnation can still change under the host lifecycle
+  contract.
 - Stale human routes fail loudly. The system does not accumulate compatibility
   aliases or make correctness depend on time.
 - The implementation must change every identity-bearing boundary coherently;
@@ -117,13 +128,17 @@ Evidence gathered on 2026-09-04 and 2026-09-05:
   selected frozen existing bus identities for colliding legacy IDs in q13.
 
 Implementation acceptance requires model-free tests that prove: UUIDv7 creation,
-explicit-ID migration from every existing bus identity, catalog-global ID
-uniqueness, optional-address parsing and legacy fallback, host-local
-effective-address collisions, explicit ID versus ordinary address selection,
-dotted-reference disambiguation, immediate old-address failure and reuse,
-retirement release, atomic cutover under concurrent readers/writers,
-constrained self/supervisor authoring and Nix refusal; unchanged task/PTY PID,
-creation identity, generation, provider session, inbox, archive, context, and
-Resource state after address changes; retained subject ID with existing
-lifecycle behavior for host/graph/launch controls; and stable machine-readable
-roster, graph, task, message, and diagnostic shapes.
+explicit-ID migration for live and archived declarations, deterministic archived
+collision handling, atomic supervisor reference migration, catalog-global ID
+uniqueness across the live catalog and archive, optional-address parsing and
+legacy fallback, host-local effective-address collisions, explicit ID versus
+ordinary address selection, dotted-reference disambiguation including
+host-pinned qualified input, immediate old-address failure and reuse, retirement
+release, ID-safe unarchive, and safe reactivation; atomic cutover under
+concurrent readers/writers, constrained self/supervisor authoring, and Nix
+refusal; unchanged task/PTY PID, creation identity, generation, provider
+session, inbox, archive, context, Resource state, declaration-parent state paths,
+and existing long-form task IDs after address changes; retained subject ID with
+existing lifecycle behavior for host/graph/launch controls; message-version
+reader-first compatibility and typed non-Agent endpoints; and stable
+machine-readable roster, graph, task, message, and diagnostic shapes.

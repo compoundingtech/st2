@@ -68,16 +68,25 @@ in the same field-rules specification.
   only for exact IDs.** Agent-declaration addition and removal are keyed by
   immutable agent ID. Adding a newly generated ID creates a subject;
   reintroducing an earlier ID denotes the same subject. A declaration-source
-  edit cannot change an ID in place. Add only a missing task ID. Remove only an
-  exactly attributed old task ID. Retirement stops the declared set, prevents
-  relaunch, releases address routing, and preserves the subject ID. Suspension
-  retains address routing. An address change is metadata and routing projection,
-  not remove-old/add-new; a task name or task ID change remains remove-old then
-  add-new. Each host acts only on its local runtime projection. A host change
-  preserves the logical agent ID but is independent removal on the old host and
-  addition on the new host, never process migration. The hosts require no
-  shared order, receipt, or proof. Catalog skew can cause temporary overlap or
-  absence; each host retains its local last-known-good ownership.
+  edit cannot change an ID in place. Legacy migration covers live and
+  structurally archived declarations, resolves archived ID collisions without
+  duplicating a subject ID, and atomically rewrites supervisor references to the
+  referenced subject's migrated ID. Add only a missing task ID.
+  Compact agent lowering assigns its canonical task the explicit ID
+  `<agent-id>`. Any long-form named task without an explicit ID defaults to
+  `<agent-id>.<task-name>`, including a task named `agent`; an explicit authored
+  task ID remains authoritative. Remove only an exactly attributed old task ID.
+  Retirement stops the declared set, prevents relaunch, releases address
+  routing, and preserves the subject ID. Suspension retains address routing.
+  Reactivation from retirement proves effective-address uniqueness against the
+  complete prospective catalog.
+  An address change is metadata and routing projection, not remove-old/add-new; a
+  task name or task ID change remains remove-old then add-new. Each host acts
+  only on its local runtime projection. A host change preserves the logical
+  agent ID but is independent removal on the old host and addition on the new
+  host, never process migration. The hosts require no shared order, receipt, or
+  proof. Catalog skew can cause temporary overlap or absence; each host retains
+  its local last-known-good ownership.
 
   Suspension is reversible desired absence, not a second runtime state
   machine. It tears down the same exact owned task set as retirement, including

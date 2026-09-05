@@ -8,6 +8,10 @@ This document specifies sender-owned native message history. It builds on
 
 Active.
 
+The immutable-ID and mutable-address paragraphs are the accepted target. The
+current implementation remains on version 1 and bus-identity routing until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Scope
 
 This specification defines ordinary Agent `message send`, `message reply`, and `message sent`
@@ -58,11 +62,11 @@ A version-1 commit node is:
 }
 ```
 
-The version-1 record is:
+The version-2 Agent record is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "filename": "1786550000123-abc123.md",
   "ts": 1786550000123,
   "from": "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
@@ -75,9 +79,20 @@ The version-1 record is:
   "body": "message body\n",
   "renderedMessage": "---\nfrom: dev3.dotfiles.fractal.keymap.verifier\nfrom-id: 0199b8f4-8d3a-7c21-9a44-6f85b7320ea1\n---\nmessage body\n",
   "fromAddress": "dev3.dotfiles.fractal.keymap.verifier",
-  "toAddress": "dev4.fractal.chat"
+  "toAddress": "dev4.fractal.chat",
+  "fromKind": "agent",
+  "toKind": "agent"
 }
 ```
+
+Version 1 keeps `from` and `to` as legacy bus identities. Migration freezes
+those same bytes as legacy agent IDs, so a version-2 reader can interpret old
+rows without rewriting immutable history. Version-2 readers accept both
+versions; strict version-1 readers reject version 2. The rollout therefore
+deploys tolerant readers fleet-wide before any version-2 writer activates.
+Principal or external endpoint records use the corresponding `fromKind` or
+`toKind` and keep that endpoint's canonical address in `from` or `to`; agent
+fields always contain agent IDs.
 
 Committed record filenames append `.json` to the canonical message filename. Pending and commit
 filenames are the SHA-256 digest of their canonical JSON content plus `.json`. A pending filename
@@ -109,11 +124,12 @@ steps (`MESSAGE-R05`, `MESSAGE-R06`, `MESSAGE-R08`):
 1. Atomically create `index.json` if absent. Its `since` precedes every indexed send attempt.
 2. Recover the single pending/active publication, if present.
 3. Resolve each ordinary Agent address to one immutable agent ID and capture
-   its current bus address. Persist the IDs as canonical endpoints and the
-   addresses as display-only publication snapshots. An explicit exact-ID
-   endpoint bypasses address lookup but joins its current address when one
-   exists. A message using the eval external-requester capability at either
-   endpoint bypasses ordinary Sent indexing.
+   its current bus address. Persist the IDs as canonical endpoints, the
+   addresses as display-only publication snapshots, and endpoint kind as
+   `agent`. An explicit exact-ID endpoint bypasses address lookup but joins its
+   current address when one exists. A separately admitted principal or external
+   endpoint retains its canonical address with an explicit endpoint kind. An
+   eval external requester at either endpoint bypasses ordinary Sent indexing.
 4. Atomically create one pending record with a fresh canonical message filename.
 5. Atomically create `active.json` containing its filename and record digest.
 6. Materialize the exact recipient bytes under that filename. An identical inbox file or archive
@@ -161,22 +177,25 @@ st2 message sent [address]
   [--json]
 ```
 
-The subject resolves an ordinary `--as <address>` when supplied, otherwise it
-uses the exact immutable ID in `ST_AGENT`. An ordinary positional reference
-resolves an address; `--id` performs exact subject lookup and the two forms are
-mutually exclusive. Rows sort by
-`(ts, filename)`. `--since` is strict; `--to` compares the canonical persisted
-recipient ID. `--include-body` adds `body`; otherwise the key is absent.
-`--count` prints a number only for `since` coverage and refuses unavailable or
-partial coverage (`MESSAGE-R03`, `MESSAGE-R09`).
+Selection follows one total order. A positional address selects the subject
+first; otherwise ordinary `--as <address>` selects it; otherwise the command
+uses the exact immutable ID in `ST_AGENT`. `--id` replaces the positional form
+and is mutually exclusive with both a positional address and `--as`. Every
+address form uses ordinary address resolution; neither an address nor
+`ST_AGENT` is heuristically retyped. Rows sort by `(ts, filename)`. `--since`
+is strict; `--to` compares the canonical persisted recipient endpoint.
+`--include-body` adds `body`; otherwise the key is absent. `--count` prints a
+number only for `since` coverage and refuses unavailable or partial coverage
+(`MESSAGE-R03`, `MESSAGE-R09`).
 
 Catalog filesystem read access permits observation of any declared Agent
 selected by current address or explicit immutable ID. Selecting a subject does
 not grant publication authority or change the acting ID. Human output may join
-the current bus address for display. Persisted `from` and `to` fields and JSON
-authority remain immutable endpoint IDs so address changes do not rewrite
-history or break replies. Appended nullable `fromAddress` and `toAddress` fields
-preserve publication-time display snapshots without becoming selectors.
+the current bus address for display. Persisted Agent `from` and `to` fields and
+JSON authority remain immutable endpoint IDs so address changes do not rewrite
+history or break replies. Version-2 nullable `fromAddress` and `toAddress`
+fields preserve publication-time display snapshots without becoming selectors.
+Endpoint-kind fields distinguish non-Agent canonical addresses.
 
 The shared JSON envelope is a tagged coverage union:
 
@@ -192,7 +211,8 @@ The shared JSON envelope is a tagged coverage union:
       "inReplyTo": null,
       "tags": [],
       "priority": null,
-      "toAddress": "dev3.dotfiles.fractal.keymap.verifier"
+      "toAddress": "dev3.dotfiles.fractal.keymap.verifier",
+      "toKind": "agent"
     }
   ]
 }
@@ -206,10 +226,12 @@ Coverage variants are exact:
 | `since` | `since` | All successful indexed sends at or after the boundary are represented. |
 | `partial` | `since`, `pending` | The boundary exists, but one or more intents are incomplete. |
 
-`SentMessages`, `SentCoverage`, and `SentMessageRow` live in `st2-wire`. A sent
-row has canonical `to`, never `from`; nullable display-only `toAddress` is
-appended after the existing fields. Optional fields remain nullable and an
-unrequested body remains absent (`MESSAGE-R02`, `MESSAGE-R04`).
+`SentMessages`, `SentCoverage`, and `SentMessageRow` live in `st2-wire`. An
+Agent sent row has canonical `to`, never `from`. Nullable `toAddress` is a
+display-only publication snapshot. Authoritative `toKind` determines whether
+`to` contains an agent ID or a canonical principal/external address; its
+absence on a version-1 row means `agent`. An unrequested body remains absent
+(`MESSAGE-R02`, `MESSAGE-R04`).
 
 ### Fractal consumer semantics (non-normative)
 

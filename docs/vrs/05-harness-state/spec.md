@@ -16,6 +16,10 @@ unmet residuals: root `DQ3`'s supervisor-following gate (`DQ-H5`) and
 Claude's eventless deny path (the remaining `DQ-H1` window). Open questions
 are tracked in [open-questions.md](./open-questions.md).
 
+The `agent` field's immutable-ID meaning is the accepted target. Existing
+records and producers retain bus identity until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Scope
 
 This specification defines the observed-state record, its freshness and
@@ -54,7 +58,7 @@ One JSON object, atomically written (tmp sibling + rename), newline-terminated:
 ```json
 {
   "schema": "st2.harness-state.v1",
-  "agent": "<identity>",
+  "agent": "<agent-id>",
   "harness": "codex | claude | pi | opencode",
   "state": "idle | active | child | ended",
   "blockedOn": "none | human",

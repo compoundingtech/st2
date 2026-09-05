@@ -199,12 +199,21 @@ Authoring: [pinned discovery, identity, and host][evals-discovery]. st2 source:
 
 <h3 id="f02">F02 Agent <code>id</code> and legacy <code>identity</code></h3>
 
-The target `id` field is the immutable catalog-global agent ID. The complete
-catalog admits each ID at most once across hosts and desired states.
+The target `id` field is the immutable catalog-global agent ID. IDs are unique
+across live and structurally archived subjects, across hosts and desired states.
 Subject-creation tools generate UUIDv7. Before ID-aware routing activates,
-migration assigns every legacy declaration its existing
+migration assigns every live legacy declaration its existing
 `<resolved-host>.<identity>` bus identity as an explicit ID without moving
-runtime or durable state. That ID remains unchanged after later host moves.
+runtime or declaration-anchored state. An archived declaration receives those
+same bytes when unused in the combined subject set; a collision receives UUIDv7
+in its declaration and tombstone. Supervisor resolution uses the combined
+pre-migration live-and-archived subject index. In the same catalog transition,
+every reference is rewritten to the parent's migrated ID. A missing or ambiguous
+reference refuses before writes with `legacy-supervisor-unresolved`; the
+operator must unarchive and repair that declaration through the pre-activation
+legacy authoring path, then retry. Unarchive preserves and validates the
+migrated ID and refuses an unmigrated archive after activation. A frozen legacy
+ID remains unchanged after host moves.
 
 Agent-declaration membership is keyed by ID. Adding a generated ID creates a
 new subject. Reintroducing an earlier ID denotes the same subject and may adopt
@@ -218,6 +227,8 @@ Authoring: future canonical `id` plus the pinned legacy
 [discovery and identity contract][evals-discovery]. Current st2 source:
 [`AgentSpec::identity`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [reconciliation](../../../src/reconcile.rs).
+This target remains fenced by
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md).
 
 <h3 id="f03">F03 <code>host</code></h3>
 
@@ -461,7 +472,8 @@ task is live and every retained dead record is explicitly keep-pinned. A
 retired declaration is complete only when every declared task record is
 absent. Resume does not override `keep`, `adopt-only`, ownership proof, or
 drift/replacement policy. Inbox, archive, context, resources, and presence files
-are outside task teardown and remain addressable.
+remain addressable through exact agent ID; retirement removes only ordinary
+address routing.
 
 The canonical KDL authoring form is:
 
@@ -470,11 +482,16 @@ desired-state "suspended" reason="Waiting for capacity"
 ```
 
 The safe authoring surface is
-`st2 agent desired-state <identity> <state> [--reason ...]`. It serializes with
-other catalog writers, preserves unrelated
-source bytes, refuses Nix-owned declarations, and returns an authored-intent
-receipt. It does not imply that reconciliation or Doctor has observed
-convergence.
+`st2 agent desired-state --id <agent-id> <state> [--reason ...]`. It serializes
+with other catalog writers, preserves unrelated source bytes, refuses Nix-owned
+declarations, and returns an authored-intent receipt. A transition from retired
+to running or suspended validates effective-address uniqueness against the
+complete prospective catalog before publication. The receipt does not imply
+that reconciliation or Doctor has observed convergence.
+
+The exact-ID selector and reactivation validation are target behavior fenced by
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md); the linked
+current evidence still exercises the positional legacy selector.
 
 st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [KDL lowering](../../../crates/agent-spec/src/kdl_format.rs),
@@ -523,14 +540,13 @@ opaque shell command, `argv` is a non-empty structured argument vector, and an
 empty body means external ingress. Unknown children, including the reserved
 `every`, fail admission.
 
-A launched stream adds exactly one derived exec task named `stream-<name>` and
-with runtime ID `<host>.<agent>.stream-<name>`. Its authored `command` or
-`argv` lowers directly to that task; no stream runner or stdout line protocol
-is inserted. An external-ingress stream adds no task. Adding or removing a
-launched stream therefore adds or removes that exact derived companion under
-the owning agent's lifecycle; changing its launch is spawn-input drift under
-F11. It does not change the canonical agent task or select a delivery
-transport.
+A launched stream adds exactly one derived exec task named `stream-<name>` with
+default runtime ID `<agent-id>.stream-<name>`. Its authored `command` or `argv`
+lowers directly to that task; no stream runner or stdout line protocol is
+inserted. An external-ingress stream adds no task. Adding or removing a launched
+stream therefore adds or removes that exact derived companion under the owning
+agent's lifecycle; changing its launch is spawn-input drift under F11. It does
+not change the canonical agent task or select a delivery transport.
 
 Authoring: canonical Agent Spec stream field after the matching evals change
 lands. st2 source: [`Stream`](../../../crates/agent-spec/src/spec.rs),
@@ -557,14 +573,15 @@ Address and ID are separate typed namespaces; equal bytes do not collide.
 
 An ordinary unpinned reference tries the complete input as a bare address and
 every dotted split whose prefix is an admitted host and suffix is an effective
-address in that host. A host-pinned reference treats the complete input as an
-address in that host. Candidates are deduplicated by agent ID; exactly one
-distinct subject must remain. An explicit typed ID bypasses this algorithm.
+address in that host. A host-pinned reference tries the complete input as an
+address in that host plus the qualified split whose prefix equals the pinned
+host. Candidates are deduplicated by agent ID; exactly one distinct subject
+must remain. An explicit typed ID bypasses this algorithm.
 
 An address-only change updates the catalog address book and runtime metadata
-without changing immutable ownership, supervisor edges, task IDs, launch
-fingerprints, workspaces, state paths, inbox/archive/context/Resource data, or
-a healthy runtime incarnation.
+without changing immutable ownership, ID-keyed supervisor edges, task IDs,
+launch fingerprints, workspaces, declaration-parent state paths,
+inbox/archive/context/Resource data, or a healthy runtime incarnation.
 
 The safe authoring surface is
 `st2 agent address --id <agent-id> (--clear | <address>)`. It uses the same

@@ -163,7 +163,9 @@ accepted.
   delivery attempts, or writes.
 
 - **R16 Supervisor declaration:** Every non-root agent declares exactly one
-  supervisor; root is the only agent without a supervisor.
+  supervisor by immutable agent ID; root is the only agent without a
+  supervisor. Legacy supervisor references migrate to the resolved parent's
+  migrated ID in the same catalog transition that adds explicit IDs.
 - **R17 Durable error propagation:** Lifecycle, harness/eval, provider-turn,
   task/exec/PTY, hook, and delivery errors are durably reported to the
   responsible supervisor with agent ID, task identity, and actionable context.
@@ -175,10 +177,13 @@ accepted.
   to the selected owner/task; unrelated diagnostics remain visible while
   unrelated workspaces, tasks, and live PTY PID/generation stay unchanged.
   Automation, ownership, authorization, and durable graph edges use the agent
-  ID through an explicit ID selector or typed API. An ordinary human reference
-  may be a bare agent address or a host-qualified bus address and resolves only
-  when the complete catalog proves one subject. Presentation values never
-  resolve a message, Resource, status, lifecycle, or authoring target.
+  ID through an explicit ID selector or typed API. Every agent-selecting command
+  keeps address and ID inputs disjoint. When a command defaults from
+  `ST_AGENT`, it consumes that value as a typed exact ID and never reparses it
+  as an address. An ordinary human reference may be a bare agent address or a
+  host-qualified bus address and resolves only when the complete catalog proves
+  one subject. Presentation values never resolve a message, Resource, status,
+  lifecycle, or authoring target.
 - **R20 Portable Resource bindings:** An agent may directly carry zero or more
   order-independent Resource bindings. Each binding has a non-empty, agent-local
   unique name and preserves an RFC 3986 absolute URI byte-for-byte without
@@ -195,12 +200,14 @@ accepted.
   Resource-only declaration changes do not alter a task's effective launch
   definition and do not stop, replace, or relaunch healthy work.
 - **R27 Transactional catalog authoring:** One st2 publication operation admits
-  exactly one canonical KDL Agent Spec, with explicit host and identity, against
-  the complete prospective catalog. Publication is compare-and-swap, durable,
-  and atomic: readers observe either the previous declaration set or the next
-  complete set. Reconciliation holds one coherent declaration snapshot through
-  materialization, runtime observation, planning, and execution, so a retirement
-  cannot commit and then be followed by a launch from stale catalog input.
+  exactly one canonical KDL Agent Spec, with explicit ID, host, and identity,
+  against the complete prospective catalog and structural archive ID index.
+  Publication is compare-and-swap, durable, and atomic: readers observe either
+  the previous declaration set or the next complete set. Reconciliation holds
+  one coherent declaration snapshot
+  through materialization, runtime observation, planning, and execution, so a
+  retirement cannot commit and then be followed by a launch from stale catalog
+  input.
   A durable incomplete-apply marker fences every declaration-plane snapshot and
   action after a crashed whole-catalog apply; a resident supervisor stays alive
   but performs zero lifecycle actions until the transaction is completed.
@@ -258,13 +265,14 @@ accepted.
   bytes, or the prepared source, and carries no migration policy or publication
   authority.
 - **R23 Fail-closed task inventory:** One read-only machine command exposes
-  every desired local PTY and exec task by immutable agent ID, current bus
-  address, task name, runtime id, kind, lifecycle, retirement, desired state,
-  runtime state, PID, creation time, and opaque runtime-generation id.
-  Unknown, duplicate, malformed, unreadable, timed-out, PID-reused, or
-  otherwise unprovable evidence is indeterminate and makes the versioned
-  envelope incomplete and the command unsuccessful; it is never reported as
-  absence. The command projects a
+  every desired local PTY and exec task by immutable agent ID, nullable current
+  bus address, task name, runtime id, kind, lifecycle, retirement, desired
+  state, runtime state, PID, creation time, and opaque runtime-generation id.
+  A proved non-routable retired subject has a null bus address without making
+  coverage incomplete. Unknown, duplicate, malformed, unreadable, timed-out,
+  PID-reused, or otherwise unprovable evidence is indeterminate and makes the
+  versioned envelope incomplete and the command unsuccessful; it is never
+  reported as absence. The command projects a
   supervisor's known park fault and per-task recovery action alongside the
   unmodified runtime observation. The action is structured executable argv
   carrying the exact canonical catalog folder and selected host, so invoking it
@@ -283,18 +291,27 @@ accepted.
   discovery and runtime observation; any marker, malformed fence, or generation
   change makes the envelope incomplete.
 - **R24 Immutable agent ID and mutable agent address:** Each logical agent
-  subject has one explicit, catalog-global, immutable agent ID. The complete
-  catalog requires IDs to be unique across hosts and all desired states. The ID
-  survives address, presentation, supervisor, graph-placement, host-placement,
-  desired-state, and runtime-incarnation changes. New subjects use UUIDv7.
-  During migration, each legacy subject receives its existing host-qualified
-  bus identity as its explicit ID, so current cross-host duplicates remain
-  distinct without moving durable state. That legacy ID becomes opaque and
-  keeps its original host-looking bytes after a later host move.
-  Retirement makes the subject non-routable but preserves its ID. Reintroducing
-  the same ID denotes the same subject; a replacement subject receives a newly
-  generated ID. Suspended subjects retain their route and occupy the address
-  namespace. Retired subjects release their address.
+  subject has one explicit, catalog-global, immutable agent ID. IDs are unique
+  across the live catalog and structural archive, across hosts and desired
+  states. The ID survives address, presentation, supervisor, graph-placement,
+  host-placement, desired-state, archival, and runtime-incarnation changes. New
+  subjects use UUIDv7. During migration, every live legacy subject receives its
+  existing host-qualified bus identity as its explicit ID. A structurally
+  archived legacy subject receives those same bytes when they remain unique
+  across the combined live-and-archived subject set; an archived collision
+  receives UUIDv7 and records it in its declaration and tombstone. This
+  preserves current runtime and archived continuity without admitting duplicate
+  IDs. Supervisor resolution uses the combined pre-migration live-and-archived
+  subject index. The same transition rewrites every reference to the parent's
+  migrated ID. A missing or ambiguous reference refuses before writes with
+  `legacy-supervisor-unresolved`; the operator must unarchive and repair that
+  declaration through the pre-activation legacy authoring path, then retry.
+  A frozen legacy ID becomes opaque and keeps its original host-looking bytes
+  after a later host move. Retirement makes the subject non-routable but
+  preserves its ID. Reintroducing the same ID denotes the same subject; a
+  replacement subject receives a newly generated ID. Suspended subjects retain
+  their route and occupy the address namespace. Retired subjects release their
+  address.
   An Agent Spec may declare an optional mutable `address`. Its effective
   address is the explicit value when present and otherwise the positional
   legacy `identity` value. An explicit address is at most 255 ASCII characters
@@ -308,9 +325,9 @@ accepted.
   history, or timed compatibility route. Exact ID lookup uses only explicit ID
   syntax or a typed API.
   Address-only changes preserve the logical subject, declaration-state anchor,
-  supervisor edges, inbox, archive, context, Resource state, task IDs, live
-  PTY PID/creation identity/generation, and provider session. A host, graph, or
-  launch change retains the subject ID but follows its own runtime lifecycle
+  ID-keyed supervisor edges, inbox, archive, context, Resource state, task IDs,
+  live PTY PID/creation identity/generation, and provider session. A host, graph,
+  or launch change retains the subject ID but follows its own runtime lifecycle
   rule.
 - **R25 Bounded presentation and constrained identity authoring:** Agent Specs
   may declare optional, non-empty `name` and `description` strings in canonical
@@ -338,20 +355,25 @@ accepted.
   a descendant reached through ID-keyed supervisor edges, while its absence
   selects the operator path.
 - **R26 Nondisruptive identity and presentation projection:** Runtime
-  ownership, task IDs, state paths, provider bindings, and `ST_AGENT` derive
-  from immutable agent ID rather than mutable address or presentation. For
-  every healthy managed PTY, st2 reconciles a versioned owned metadata snapshot
-  containing immutable actor ID, current bus address, and optional description
-  through one exact task-ID metadata patch. The primary `agent` task
-  additionally maps optional name to native PTY display metadata; secondary
-  PTYs preserve their task-specific display convention. Projection preserves
-  unrelated tags, removes absent owned values, reports and retries failure, and
-  is idempotent. Address and presentation projection never use human-address
-  resolution or enter launch, teardown, garbage collection, replacement, or
-  flapping accounting. The current lowered Agent Spec remains the only source
-  of address, name, and description; an explicit ID roster query returns the
-  subject's current address and presentation without publishing a duplicate
-  Agent Spec state file.
+  ownership, default task IDs, provider bindings, and `ST_AGENT` derive from
+  immutable agent ID rather than mutable address or presentation. Compact agent
+  lowering assigns its canonical task the explicit ID `<agent-id>`. Any
+  long-form named task without an explicit task ID defaults to
+  `<agent-id>.<task-name>`, including a task named `agent`; an explicitly
+  authored task ID remains authoritative. State and Resource paths remain
+  anchored at the declaration parent under R02. For every healthy managed PTY,
+  st2 reconciles a versioned owned metadata snapshot containing immutable actor
+  ID, current bus address, and optional description through one exact task-ID
+  metadata patch. Only the canonical compact agent task whose task ID equals
+  the agent ID maps optional name to native PTY display metadata; other PTYs
+  preserve their task-specific display convention. Projection
+  preserves unrelated tags, removes absent owned values, reports and retries
+  failure, and is idempotent. Address and presentation projection never uses
+  human-address resolution or enters launch, teardown, garbage collection,
+  replacement, or flapping accounting. The current lowered Agent Spec remains
+  the only source of address, name, and description; an explicit ID roster
+  query returns the subject's current address and presentation without
+  publishing a duplicate Agent Spec state file.
 - **R27 Typed agent desired state:** Every admitted Agent Spec has exactly one
   whole-agent desired state: `running`, `suspended`, or `retired`. Omission and
   legacy `retired #false` mean running; legacy `retired #true` means retired
@@ -368,11 +390,14 @@ accepted.
   changes lifecycle intent only in one canonical KDL declaration selected by
   explicit immutable agent ID. It uses the same source-preserving, durable,
   exact-target, trusted-fleet authority boundary as presentation authoring and
-  refuses Nix-owned, malformed, ambiguous, or unsupported declarations.
-  Running is canonically omitted; suspended and retired states persist their
-  rationale. Its receipt proves the declaration edit, never runtime
-  convergence. Human listing, roster JSON, task inventory, and Doctor expose
-  desired state without conflating it with presence or observed liveness.
+  refuses Nix-owned, malformed, ambiguous, or unsupported declarations. A
+  transition from retired to running or suspended validates effective-address
+  uniqueness against the complete prospective catalog before publication,
+  including the positional identity fallback. Running is canonically omitted;
+  suspended and retired states persist their rationale. Its receipt proves the
+  declaration edit, never runtime convergence. Human listing, roster JSON, task
+  inventory, and Doctor expose desired state without conflating it with
+  presence or observed liveness.
 - **R29 Visible, nondisruptive launch drift:** st2 derives a versioned desired
   launch fingerprint from the minimal effective fields it already passes to a
   task. Only an st2 launch records an observed fingerprint, bound to that

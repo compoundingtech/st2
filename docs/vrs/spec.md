@@ -62,6 +62,10 @@ legacy control in `tests/eval_run_e2e.rs`.
 
 ## Immutable agent ID, mutable address, and presentation (R02, R08, R11, R13, R19, R24-R26)
 
+This section is the accepted target contract. The current implementation remains
+on the pre-decision identity model until
+[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 An Agent Spec separates four values that the current implementation overloads:
 
 | Concept | Declaration/runtime form | Mutability | Scope | Use |
@@ -72,18 +76,28 @@ An Agent Spec separates four values that the current implementation overloads:
 | agent name | optional `name "<name>"` | mutable | non-unique | presentation only |
 
 Before ID-aware routing activates, catalog migration adds an explicit `id` to
-every declaration. Each legacy subject receives its existing host-qualified bus
-identity as that ID, preserving current runtime and durable-state keys. New
-subjects receive UUIDv7 IDs. The complete catalog admits each ID at most once
-across all hosts and desired states. A legacy ID's original host-looking prefix
-becomes opaque: a later host move changes current placement and bus address, not
-the ID.
+every live and structurally archived declaration. It first assigns each live
+legacy subject its existing host-qualified bus identity, preserving current
+runtime IDs and declaration-anchored state. An archived subject receives those
+same bytes when unused across the combined live-and-archived set; a collision
+receives UUIDv7, recorded in both its declaration and tombstone. Supervisor
+resolution uses the combined pre-migration live-and-archived subject index. In
+the same atomic catalog transition, every reference is rewritten to its
+parent's migrated ID. A missing or ambiguous reference refuses before writes
+with `legacy-supervisor-unresolved`; before activation, the operator must
+unarchive and repair that declaration through the ordinary legacy authoring
+path, then retry migration.
+Unarchive preserves the migrated ID, validates its uniqueness against the
+prospective live-and-archived set, and refuses an unmigrated archive after
+activation. New subjects receive UUIDv7 IDs. A legacy frozen ID's original
+host-looking prefix becomes opaque: a later host move changes current placement
+and bus address, not the ID.
 
 A subject's ID survives address, name, description, supervisor, graph
-placement, host placement, desired state, and runtime-incarnation changes.
-Retirement makes the subject non-routable and releases its address but preserves
-the ID. Reintroducing the same ID denotes the same subject; a replacement
-subject receives a newly generated ID.
+placement, host placement, desired state, archival, and runtime-incarnation
+changes. Retirement makes the subject non-routable and releases its address but
+preserves the ID. Reintroducing the same ID denotes the same subject; a
+replacement subject receives a newly generated ID.
 
 `address` is an optional semantic alias. When omitted, positional `identity` is
 the effective legacy address. When present, it is the effective address and the
@@ -121,8 +135,8 @@ Address and ID are separate typed namespaces; equal string bytes do not collide.
 An explicit ID selector performs only catalog-global ID lookup. An ordinary
 reference uses this fail-closed candidate set:
 
-1. when the caller pins a host, treat the complete input as an agent address in
-   that host;
+1. when the caller pins a host, treat the complete input as an address in that
+   host and also try the qualified split whose prefix equals the pinned host;
 2. otherwise, treat the complete input as a bare address across the selected
    catalog and also try every dotted split whose prefix is an admitted logical
    host and whose suffix is an effective address in that host;
@@ -134,10 +148,13 @@ decidable without guessing which dot is a separator. Absence and multiple
 distinct subjects fail with address-specific diagnostics.
 
 Ordinary CLI references and message recipients use that address algorithm.
-Exact subject selection uses an explicit `--id` form or an API parameter typed
-as agent ID; it never falls through to address lookup. Internal ownership,
-supervisor edges, replies, message provenance, authoring authority, and
-lifecycle plans carry agent IDs, not reparsed free-form references.
+Every agent-selecting command exposes mutually exclusive address and exact-ID
+forms. A command that defaults from `ST_AGENT` consumes it through the typed ID
+path; generated hooks and channels use the exact-ID form rather than passing it
+to an address parser. Exact subject selection never falls through to address
+lookup. Internal ownership, supervisor edges, replies, message provenance,
+authoring authority, and lifecycle plans carry agent IDs, not reparsed
+free-form references.
 
 Assigning or changing `address` is one atomic address-book cutover. The old
 address stops resolving as soon as the new catalog generation is visible and
@@ -146,13 +163,13 @@ implicit alias, or time-bounded compatibility route. A stale caller fails
 loudly and refreshes the roster. Catalog-generation and incomplete-transaction
 fences keep each lookup on one coherent before-or-after address book.
 
-Address changes do not alter the subject's state anchor, ID-keyed supervisor
-edges, task IDs, launch fingerprints, workspace, inbox, archive, context,
-Resource state, provider-session binding, or runtime ownership. A healthy task
-keeps its PID, creation identity, and generation. Host, graph, task, and launch
-changes retain the logical subject ID but still follow their own field-specific
-runtime rules; logical-subject continuity does not imply process-incarnation
-continuity.
+Address changes do not alter the subject's declaration-parent state anchor,
+ID-keyed supervisor edges, task IDs, launch fingerprints, workspace, inbox,
+archive, context, Resource state, provider-session binding, or runtime
+ownership. A healthy task keeps its PID, creation identity, and generation.
+Host, graph, task, and launch changes retain the logical subject ID but still
+follow their own field-specific runtime rules; logical-subject continuity does
+not imply process-incarnation continuity.
 
 `name` remains a non-unique human label and `description` remains the enduring
 responsibility boundary. Omission is the only cleared representation. Name is
@@ -178,7 +195,8 @@ edit canonical KDL only. Each operation:
    unsupported formats, malformed catalogs, ambiguous targets, and direct ID
    mutation;
 4. applies one span-bounded edit, reparses and validates the complete candidate
-   catalog, including effective-address uniqueness;
+   catalog, including effective-address uniqueness and ID uniqueness against the
+   structural archive;
 5. fsyncs a temporary under the reserved `.st2` control plane, rechecks the
    original inode/version and bytes, atomically renames it through retained
    no-follow directory capabilities, then fsyncs the declaration directory.
@@ -198,26 +216,32 @@ in one local POSIX filesystem/kernel lock domain. Direct same-UID writes and
 independently synchronized hosts do not participate; the source recheck detects
 observed interference but is not a distributed lock service.
 
-Roster and graph JSON append `id`, `address`, and `busAddress` while preserving
-the existing field order and meanings required by their compatibility
-invariants. The existing `identity` field remains the positional declaration
-key and legacy address fallback; consumers do not treat it as the agent ID.
-`name` and `description` remain separate presentation fields. An exact ID roster
-query returns one subject plus its current host and effective address. An
-ordinary address query fails on absence or ambiguity.
+Roster and graph JSON append `id`, `address`, and nullable `busAddress` while
+preserving the existing field order and meanings required by their compatibility
+invariants. A retired non-routable subject has null `busAddress` without making
+the envelope incomplete. The existing `identity` field remains the positional
+declaration key and legacy address fallback; consumers do not treat it as the
+agent ID. `name` and `description` remain separate presentation fields. An
+exact ID roster query returns one subject plus its current host and nullable
+effective address. An ordinary address query fails on absence or ambiguity.
 
 For each healthy managed PTY, reconciliation uses one atomic exact-task-ID
-`pty metadata patch --id <task-id>` request. Runtime task IDs continue to derive
-from immutable agent ID and task name; host placement may remain in the runtime
-key without becoming logical subject identity. Every PTY receives the exact
-owned tag snapshot `agent.presentation.schema=2`,
-`agent.actor.id=<agent-id>`, `agent.actor.address=<bus-address>`, and optional
+`pty metadata patch --id <task-id>` request. Compact agent lowering assigns its
+canonical task the explicit runtime ID `<agent-id>`. Every long-form named task
+without an explicit task ID defaults to `<agent-id>.<task-name>`, including a
+task named `agent`; explicitly authored task IDs remain authoritative. This
+preserves every legacy task ID and socket path because each frozen ID equals its
+former bus identity and the lowering rule itself does not change. Host placement
+is not separately concatenated into a default ID; host-looking bytes inside a
+legacy ID are opaque. Every PTY receives the exact owned tag snapshot
+`agent.presentation.schema=2`, `agent.actor.id=<agent-id>`,
+`agent.actor.address=<bus-address>`, and optional
 `agent.presentation.description=<description>`. Clearing a value removes only
-its owned tag. Unrelated tags remain unchanged. Only the canonical PTY whose
-task name is `agent` carries the compatibility tag `role=agent` and maps `name`
-to native `displayName`; secondary PTYs clear that role tag and retain their
-task-specific display convention. Name is not duplicated in tags. Exec tasks
-receive no PTY metadata.
+its owned tag. Unrelated tags remain unchanged. Only the canonical compact agent
+task whose task ID equals the agent ID carries the compatibility tag
+`role=agent` and maps `name` to native `displayName`; other PTYs clear that role
+tag and retain their task-specific display convention. Name is not duplicated
+in tags. Exec tasks receive no PTY metadata.
 
 One effective metadata delta emits one coherent `metadata_change` event, while
 an unchanged patch emits none. Projection failure reports and retries but never
@@ -301,10 +325,10 @@ Agent Spec envelope in
 retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
 --input-sha256 HEX (--expect-absent | --expect-sha256 HEX) --json` binds
-publication to that exact capture. It accepts exactly one canonical KDL `agent` node with an
-explicit, path-safe host and identity. st2 no longer exposes an intent compiler:
-external renderers own the transformation from human intent to exact Agent Spec
-bytes or a create-only publication bundle.
+publication to that exact capture. It accepts exactly one canonical KDL `agent`
+node with an explicit ID plus path-safe host and identity. st2 no longer
+exposes an intent compiler: external renderers own the transformation from
+human intent to exact Agent Spec bytes or a create-only publication bundle.
 
 The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
 read/write transaction domain:
@@ -714,14 +738,16 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   commands that intentionally use the ambient Claude and Codex configs.
 
   st2 owns `ST_AGENT` for every PTY and exec task, setting it to the
-  catalog-global immutable agent ID on every reconciliation. The resolved host
-  remains a separate declaration and launcher input and may remain part of the
-  runtime task ID; it is not encoded into `ST_AGENT`. An omitted value is
-  injected, an authored exact match is accepted, and a conflicting authored
-  value refuses the declaration before workspace materialization or runner
-  access. The derived value is part of the persisted launch environment, so
-  initial launch, supervised replay, and manual PTY restart preserve the same
-  actor ID.
+  catalog-global immutable agent ID on every reconciliation. Compact agent
+  lowering assigns that ID explicitly to its canonical task. Other named tasks
+  without explicit IDs append `.<task-name>`, including a task named `agent`.
+  The resolved host remains a separate declaration and launcher input; it is
+  not separately concatenated into either derivation, and any host-looking bytes
+  inside a legacy ID are opaque. An omitted `ST_AGENT` is injected, an authored
+  exact match is accepted, and a conflicting authored value refuses the
+  declaration before workspace materialization or runner access. The value is
+  part of the persisted launch environment, so initial launch, supervised
+  replay, and manual PTY restart preserve the same actor ID.
 
   The canonical `agent` task treats a reconciler's ambient `NO_COLOR` as a
   launcher preference rather than agent policy. Unless the Agent Spec declares
@@ -766,10 +792,13 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
   `st2.task-inventory.v1` envelope for the selected host. Rows are sorted by
-  agent, task, and runtime id and cover both PTY and terminal-free exec tasks.
-  `complete=false` plus a non-zero exit is a closed result: a consumer must not
-  turn a missing row into absence. A running row always carries a PID, creation
-  time, and opaque generation id derived from stable backend evidence.
+  immutable agent ID, task name, and runtime ID and cover both PTY and
+  terminal-free exec tasks. Each row includes immutable agent ID and nullable
+  current bus address; a proved non-routable retired subject has a null address
+  without weakening completeness. `complete=false` plus a non-zero exit is a
+  closed result: a consumer must not turn a missing row into absence. A running
+  row always carries a PID, creation time, and opaque generation ID derived from
+  stable backend evidence.
 
   Discovery runs before and after runtime observation. A semantic declaration
   change across those passes makes the result incomplete. The reader also
@@ -939,8 +968,12 @@ archiveRoot}` and is published as one additive `archived` row in the
 tombstone is unexplained control-plane state and makes the envelope incomplete.
 Eligibility is fail-closed and local-host only, because another host's runtime
 records are not observable: canonical path, retired in either spelling, no live
-or dead record for any declared task, and no remaining declaration naming the
-identity as `supervisor`. `st2 catalog unarchive` is the exact reverse move.
+or dead record for any declared task, and no remaining declaration referencing
+the subject's immutable ID as `supervisor`. `st2 catalog unarchive` is the exact
+reverse move; it preserves the archived ID, refuses an unmigrated archive after
+ID-aware activation, and validates ID uniqueness against the prospective
+live-and-archived subject set. A later transition to a routable desired state
+validates prospective effective-address uniqueness.
 
 The supervisor closes the same edge without an operator. Each `st2 up` reconcile
 pass ends by archiving every local seat whose retirement outlived the catalog's

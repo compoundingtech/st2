@@ -10,6 +10,10 @@ specified in [`01-claude/spec.md`](./01-claude/spec.md) and
 Active. A map to the implementation and its evidence, not a replacement for the
 tests.
 
+The sender-projection section is the accepted immutable-ID target. The current
+implementation remains on bus-identity projection until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Composer states
 
 One inspection of a rendered screen, evaluated against one exact expected
@@ -28,12 +32,15 @@ notice, yields exactly one state:
 
 ## Sender projection
 
-The durable message carries canonical sender ID plus a publication-time bus
-address snapshot. Immediately before constructing the notice, DING resolves the
-ID against one coherent current address book. The displayed sender is the
-current bus address when routable, otherwise the stored snapshot when present,
-otherwise the ID. Replies retain the canonical ID from the message; rendered
-text is never reparsed as authority.
+For an Agent endpoint, the durable message carries canonical sender ID plus a
+publication-time bus address snapshot. Immediately before constructing the
+notice, DING resolves the ID against one coherent current address book. The
+displayed sender is the current bus address only when that lookup succeeds.
+An absent, unreadable, incomplete, ambiguous, or nonroutable address book
+degrades to the stored snapshot and then the ID; cosmetic lookup never blocks
+delivery. A principal or external endpoint displays its canonical typed address
+without Agent lookup. Replies retain the canonical endpoint from the message;
+rendered text is never reparsed as authority.
 
 ## Delivery
 

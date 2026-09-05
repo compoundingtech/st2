@@ -5,6 +5,10 @@ inherits [stream](../04-stream/spec.md) (`event`, `event-id`, `key`,
 supersession) and [Agent Spec](../02-agent-spec/spec.md) (`resource binding`,
 `carrier`).
 
+The ID-keyed owner and event-emission terms are the accepted target. The current
+implementation retains bus-identity subscription keys until
+[DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md) closes.
+
 ## Data flow
 
 ```text
@@ -20,7 +24,7 @@ resync watcher thread
    '- equal → nothing; changed → queue per class window
    |
    v  window boundary
-st2::event::emit_builtin_resync(bus_id,
+st2::event::emit_builtin_resync(agent_id,
                  event-id=<sha256(canonical binding/path/old/new/occurrence body)>,
                  key=<binding label>, supersede=true,
                  subject="resource <binding> changed")
