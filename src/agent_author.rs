@@ -623,14 +623,7 @@ pub fn set_desired_state(
         validate_desired_state_reason(reason)
             .map_err(|error| AuthorError::new("invalid-desired-state", error.to_string()))?;
     }
-    if let Some(marker) = managed_by
-        && (marker.is_empty() || marker.trim() != marker)
-    {
-        return Err(AuthorError::new(
-            "invalid-managed-by",
-            format!("asserted ownership marker {marker:?} is empty or padded"),
-        ));
-    }
+    validate_marker_assertion(managed_by)?;
     let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
         AuthorError::new(
             "catalog-lock-failed",
@@ -2056,31 +2049,74 @@ fn is_nix_managed(node: &KdlNode) -> bool {
     declared_markers(node).contains(&"nix")
 }
 
-/// Decide whether `asserted` authorizes authoring on a possibly generator-owned declaration.
+/// Reject an ownership assertion no declaration could carry, before any lock or read.
+///
+/// A marker is compared byte-exactly against the declaration's own `meta { managed-by "..." }`
+/// value, so an empty or padded assertion can only ever be a caller mistake.
+pub(crate) fn validate_marker_assertion(asserted: Option<&str>) -> Result<(), AuthorError> {
+    if let Some(marker) = asserted
+        && (marker.is_empty() || marker.trim() != marker)
+    {
+        return Err(AuthorError::new(
+            "invalid-managed-by",
+            format!("asserted ownership marker {marker:?} is empty or padded"),
+        ));
+    }
+    Ok(())
+}
+
+/// Every ownership marker the declaration source `bytes` carries, in source order.
+///
+/// `agent publish` replaces a whole declaration file rather than one node, so every marker any
+/// `agent` node in the incumbent file declares is at stake in that publication and the union is
+/// what an assertion has to resolve against (#486). Bytes that are not UTF-8 or do not parse as
+/// KDL carry no discoverable claim and read as unmarked: a writer able to leave such bytes in a
+/// declaration leaf already holds direct filesystem write authority over the file, which is
+/// strictly stronger than any st2 write path this marker governs.
+pub(crate) fn declaration_markers(bytes: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let Ok(document) = text.parse::<KdlDocument>() else {
+        return Vec::new();
+    };
+    document
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "agent")
+        .flat_map(|node| {
+            declared_markers(node)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Decide whether `asserted` authorizes rewriting bytes carrying the `declared` markers.
 ///
 /// `meta { managed-by "nix" }` says the Nix projection, not st2, is the writer of these bytes: an
-/// edit made behind it is silently reverted on the next activation, which is why unasserted
-/// authoring refuses (R25, decision 0003). Only that marker refuses; the others are labels on
-/// declarations st2's own verbs are expected to edit.
+/// edit made behind it is silently reverted on the next activation, which is why an unasserted
+/// rewrite refuses (R25, decision 0003). Only that marker refuses; the others are labels on
+/// declarations st2's own verbs and publishers are expected to rewrite.
 ///
 /// The generator itself is the one writer that legitimately authors the declaration, and
 /// `--managed-by` is how it says so. An assertion is admitted only when it names exactly the one
 /// marker the declaration carries — a caller wrong about who owns the bytes is wrong about the
 /// edit, so a mismatched marker, an unmarked declaration, and an unresolvable multi-marker
 /// declaration all fail closed. Returns whether an assertion was matched.
-fn authorize_marker(
-    target: &KdlNode,
-    expected_identity: &str,
+pub(crate) fn authorize_asserted_marker(
+    declared: &[&str],
+    subject: &str,
     path: &Path,
     asserted: Option<&str>,
 ) -> Result<bool, AuthorError> {
-    let declared = declared_markers(target);
-    match (asserted, declared.as_slice()) {
+    match (asserted, declared) {
         (None, _) if !declared.contains(&"nix") => Ok(false),
         (None, _) => Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}, or pass --managed-by \"nix\" if you are that projection",
+                "agent {subject:?} is Nix-owned; edit its Nix source instead of {}, or pass --managed-by \"nix\" if you are that projection",
                 path.display()
             ),
         )),
@@ -2088,14 +2124,14 @@ fn authorize_marker(
         (Some(asserted), []) => Err(AuthorError::new(
             "managed-by-unmarked",
             format!(
-                "--managed-by {asserted:?} claims agent {expected_identity:?}, whose declaration {} carries no `meta {{ managed-by }}` marker",
+                "--managed-by {asserted:?} claims agent {subject:?}, whose declaration {} carries no `meta {{ managed-by }}` marker",
                 path.display()
             ),
         )),
         (Some(asserted), markers) => Err(AuthorError::new(
             "managed-by-mismatch",
             format!(
-                "--managed-by {asserted:?} does not own agent {expected_identity:?}: {} declares owner {}",
+                "--managed-by {asserted:?} does not own agent {subject:?}: {} declares owner {}",
                 path.display(),
                 markers
                     .iter()
@@ -2105,6 +2141,16 @@ fn authorize_marker(
             ),
         )),
     }
+}
+
+/// The lifecycle verb's marker authority, read from the exact declaration node it edits.
+fn authorize_marker(
+    target: &KdlNode,
+    expected_identity: &str,
+    path: &Path,
+    asserted: Option<&str>,
+) -> Result<bool, AuthorError> {
+    authorize_asserted_marker(&declared_markers(target), expected_identity, path, asserted)
 }
 
 fn presentation_edit(

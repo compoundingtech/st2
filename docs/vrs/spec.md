@@ -340,7 +340,8 @@ Agent Spec envelope in
 `st2 agent digest (--spec FILE | --bundle DIR)` captures a source through
 retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
---input-sha256 HEX (--expect-absent | --expect-sha256 HEX) --json` binds
+--input-sha256 HEX (--expect-absent | --expect-sha256 HEX)
+[--managed-by MARKER] --json` binds
 publication to that exact capture. It accepts exactly one canonical KDL `agent`
 node with an explicit ID plus path-safe host and identity. st2 no longer
 exposes an intent compiler: external renderers own the transformation from
@@ -396,6 +397,22 @@ matches. `--expect-absent` is idempotent for identical input.
 stale declaration writer. Full-catalog admission rejects any
 structural validation error before publication. The typed result is
 `published` or `unchanged`.
+
+A hash-authorized update also passes the ownership boundary the lifecycle verb
+applies, because it rewrites the same declaration wholesale. `--managed-by
+MARKER` asserts the ownership marker the caller believes owns the incumbent,
+and the replacement is admitted only when the incumbent's own
+`meta { managed-by "..." }` names exactly that one marker; a mismatched marker,
+an unmarked incumbent, an unresolvable multi-marker incumbent, and an empty or
+padded assertion each refuse before any write, under the same refusal codes the
+authoring verbs use. Without an assertion, only the Nix marker refuses, which
+is what lets each publisher of another marker adopt the assertion on its own
+schedule. Create-only publication has no incumbent to protect and a
+byte-identical republication authors nothing, so neither requires an assertion;
+a candidate that merely claims a marker asserts no authority, and the receipt
+reports `managedBy` only for a marker the incumbent confirmed. Incumbent bytes
+that are not readable as a declaration carry no ownership claim, so repairing
+them stays possible for a writer who could already replace the file directly.
 
 Host-scoped validation rejects a pty task whose session socket path would exceed the
 portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a

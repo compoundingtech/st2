@@ -157,7 +157,12 @@ The st2 transaction performs these steps in order:
    external lock service, or shared receipt is involved.
 3. Re-read the current target under the lock and require the caller's exact
    absent-or-SHA-256 precondition. Require the staged digest to equal the
-   caller's input digest.
+   caller's input digest. When that incumbent carries an ownership marker and
+   the candidate would replace its bytes, require the caller to assert exactly
+   that marker with `--managed-by`: an unasserted replacement refuses for the
+   Nix marker, and a mismatched, unmarked, unresolvable, or malformed assertion
+   always refuses — here, before any write. Creation and a byte-identical
+   republication replace no owned bytes and need no assertion.
 4. Overlay the staged candidate on the locked catalog snapshot and run shared
    parsing, core admission, and st2 catalog policy over that exact projection.
 5. Publish by an atomic, durable file or bundle transition. Preserve exact

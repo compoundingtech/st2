@@ -40,6 +40,13 @@ pub struct PublishRequest {
     pub source: PublishSource,
     pub expectation: PublishExpectation,
     pub input_sha256: String,
+    /// The ownership marker the caller asserts owns the declaration it is replacing.
+    ///
+    /// `None` is the ordinary path: it refuses a replacement whose incumbent carries
+    /// `meta { managed-by "nix" }`, exactly as unasserted authoring refuses. `Some(marker)` is a
+    /// generator saying "I am the writer of these bytes" and is admitted only when the incumbent
+    /// names exactly that one marker (#486).
+    pub managed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -62,6 +69,12 @@ pub struct PublishResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_sha256: Option<String>,
     pub after_sha256: String,
+    /// The incumbent's ownership marker, when one authorized this replacement.
+    ///
+    /// Absent on the ordinary unmarked path and on a create-only publication, which has no
+    /// incumbent to protect and therefore nothing to confirm an assertion against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +287,8 @@ pub fn validate_candidate_for_host(
 /// Publish one spec under the catalog's exclusive authoring lock.
 pub fn publish(request: PublishRequest) -> Result<PublishResult> {
     validate_sha256(&request.input_sha256)?;
+    let asserted_marker = request.managed_by.as_deref();
+    crate::agent_author::validate_marker_assertion(asserted_marker).map_err(marker_refusal)?;
     let catalog = request
         .catalog
         .canonicalize()
@@ -297,6 +312,29 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
     let same_spec = before.as_deref() == Some(candidate.bytes.as_slice());
     let before_hash = before.as_deref().map(sha256);
     let after_hash = sha256(&candidate.bytes);
+
+    // #486: publication rewrites a whole declaration, which makes it the widest st2 write path
+    // onto the bytes `agent desired-state --managed-by` guards (#473). The incumbent's ownership
+    // marker therefore governs a replacement here too: an unasserted publication over a Nix-owned
+    // declaration refuses exactly as unasserted authoring refuses, and an assertion is admitted
+    // only when it names exactly the marker the incumbent carries. Create-only publication has no
+    // incumbent to protect, and a publication whose bytes equal the incumbent's authors nothing,
+    // so both stay admissible unasserted — which is what keeps an idempotent replay and the
+    // receipt-recovery re-publication of a marked declaration working.
+    let confirmed_marker = match &before {
+        Some(current) if !same_spec => {
+            let declared = crate::agent_author::declaration_markers(current);
+            let matched = crate::agent_author::authorize_asserted_marker(
+                &declared.iter().map(String::as_str).collect::<Vec<_>>(),
+                &candidate.bus_id(),
+                &target_spec,
+                asserted_marker,
+            )
+            .map_err(marker_refusal)?;
+            asserted_marker.filter(|_| matched).map(str::to_owned)
+        }
+        _ => None,
+    };
 
     match &request.expectation {
         PublishExpectation::Absent => {
@@ -372,6 +410,7 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
             target_spec,
             before_hash,
             verified_after,
+            confirmed_marker,
         ));
     }
 
@@ -405,7 +444,18 @@ pub fn publish(request: PublishRequest) -> Result<PublishResult> {
         target_spec,
         before_hash,
         verified_after,
+        confirmed_marker,
     ))
+}
+
+/// Surface an ownership refusal through the shared authoring code vocabulary.
+///
+/// `publish` speaks `anyhow` rather than the classified `AuthorError` the authoring verbs return,
+/// so the code travels in the message: the two write paths refuse the same candidate under the
+/// same name (`nix-managed-declaration`, `managed-by-mismatch`, `managed-by-unmarked`,
+/// `invalid-managed-by`).
+fn marker_refusal(error: crate::agent_author::AuthorError) -> anyhow::Error {
+    anyhow::anyhow!("publication refused [{}]: {error}", error.code())
 }
 
 fn result(
@@ -415,6 +465,7 @@ fn result(
     path: PathBuf,
     before_sha256: Option<String>,
     after_sha256: String,
+    managed_by: Option<String>,
 ) -> PublishResult {
     PublishResult {
         schema: SCHEMA,
@@ -426,6 +477,7 @@ fn result(
         input_sha256,
         before_sha256,
         after_sha256,
+        managed_by,
     }
 }
 
