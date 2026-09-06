@@ -1631,13 +1631,17 @@ pub fn validate_presentation(
 
 /// Validate an explicit immutable agent ID at the shared parse/authoring boundary (R24).
 ///
-/// The ID is opaque: only its two admitted producers constrain it. A new subject carries a UUIDv7
-/// and a migrated legacy subject carries the frozen bytes of its former `<host>.<identity>` bus
-/// identity, which R26 also reuses verbatim as the canonical task ID and therefore as a session
-/// socket path component. So this refuses exactly what would stop being a usable task ID: an
-/// empty value, non-ASCII or non-printable bytes, whitespace, path or host separators, and a
-/// leading or trailing dot. It deliberately does not impose the address grammar — equal bytes in
-/// the two namespaces do not collide, and a frozen legacy ID keeps host-looking bytes.
+/// The ID is opaque, but not arbitrary: R26 reuses it verbatim as the canonical task ID and
+/// therefore as a session socket path component, and IDs travel through shell-adjacent text (bus
+/// messages, notices, journal lines), where a backtick has already executed a command on a live
+/// host (schickling/dotfiles#1614). So the grammar is the closed safe set `[A-Za-z0-9._-]`, which
+/// admits both admitted producers — a new subject's UUIDv7 and a migrated subject's frozen
+/// `<host>.<identity>` bus identity — and refuses every shell metacharacter, path and host
+/// separator, whitespace byte, and non-ASCII byte outright.
+///
+/// It stays wider than the address grammar on purpose: a frozen legacy ID keeps host-looking bytes
+/// and whatever case and underscores its identity carried, so freezing an admissible identity can
+/// never be refused here. Equal bytes in the two namespaces do not collide.
 pub fn validate_agent_id(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!value.is_empty(), "agent `id` cannot be empty");
     anyhow::ensure!(
@@ -1647,8 +1651,8 @@ pub fn validate_agent_id(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         value
             .bytes()
-            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\' | b':')),
-        "agent `id` '{value}' must be printable ASCII without whitespace, `/`, `\\`, or `:`"
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "agent `id` '{value}' must match [A-Za-z0-9._-]+"
     );
     anyhow::ensure!(
         !value.starts_with('.') && !value.ends_with('.'),

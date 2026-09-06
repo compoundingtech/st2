@@ -2774,8 +2774,11 @@ fn the_address_grammar_is_bounded_lowercase_dotted_segments() {
     }
 }
 
-/// The ID is opaque, but it is also the canonical task ID under R26, so it must stay a usable task
-/// identifier: no empty value, no whitespace, no path or host separators, no leading/trailing dot.
+/// The ID is opaque, but it is also the canonical task ID under R26 and it travels through
+/// shell-adjacent text, so the grammar is the closed safe set `[A-Za-z0-9._-]`: every shell
+/// metacharacter, separator, whitespace and non-ASCII byte is refused, while both admitted
+/// producers — UUIDv7 and a frozen `<host>.<identity>` bus identity, case and underscores
+/// included — stay admissible.
 #[test]
 fn the_id_grammar_admits_uuidv7_and_frozen_bus_identities_only() {
     for accepted in [
@@ -2798,10 +2801,19 @@ fn the_id_grammar_admits_uuidv7_and_frozen_bus_identities_only() {
     let too_long = "a".repeat(256);
     for (rejected, expected) in [
         ("", "cannot be empty"),
-        ("has space", "without whitespace"),
-        ("a/b", "without whitespace"),
-        ("a\\b", "without whitespace"),
-        ("host:1", "without whitespace"),
+        ("has space", "must match [A-Za-z0-9._-]+"),
+        ("a/b", "must match [A-Za-z0-9._-]+"),
+        ("a\\\\b", "must match [A-Za-z0-9._-]+"),
+        ("host:1", "must match [A-Za-z0-9._-]+"),
+        ("a`id`b", "must match [A-Za-z0-9._-]+"),
+        ("a$(id)b", "must match [A-Za-z0-9._-]+"),
+        ("a;id", "must match [A-Za-z0-9._-]+"),
+        ("a&b", "must match [A-Za-z0-9._-]+"),
+        ("a|b", "must match [A-Za-z0-9._-]+"),
+        ("a*b", "must match [A-Za-z0-9._-]+"),
+        ("a?b", "must match [A-Za-z0-9._-]+"),
+        ("a'b", "must match [A-Za-z0-9._-]+"),
+        ("wörker", "must match [A-Za-z0-9._-]+"),
         (".leading", "cannot begin or end with `.`"),
         ("trailing.", "cannot begin or end with `.`"),
         (too_long.as_str(), "exceeds the 255-byte limit"),
