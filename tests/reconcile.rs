@@ -418,6 +418,8 @@ fn spec(
     tasks: Vec<Task>,
 ) -> AgentSpec {
     AgentSpec {
+        id: None,
+        address: None,
         identity: identity.to_string(),
         name: None,
         description: None,
