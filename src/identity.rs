@@ -28,7 +28,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum AgentSelector {
     /// Exact subject lookup on the two immutable keys. Never falls through to address lookup.
     Id(String),
-    /// An ordinary human reference, resolved by [`resolve_address`].
+    /// An ordinary human reference, resolved by [`resolve_address`] on every plane that routes:
+    /// messages, events, inboxes, status, context. Authoring commands must select exactly one
+    /// declaration to edit, so they carry these bytes through to their own declaration-key
+    /// resolver (`agent_author::resolve_target`: an exact bus identity, or a bare stable identity
+    /// unique in the catalog) and never consult the address book.
     Address(String),
 }
 

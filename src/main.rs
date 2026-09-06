@@ -428,8 +428,8 @@ enum DriverCmd {
 enum AgentCmd {
     /// Author reversible whole-agent lifecycle intent in one canonical KDL declaration.
     DesiredState {
-        /// Ordinary agent reference — an exact bus address, or a bare address unique in the
-        /// catalog — or the desired state when `--id` names the subject.
+        /// Exact bus identity, or a bare stable identity only when unique — or the desired state
+        /// when `--id` names the subject. Authoring selects the declaration, never the address.
         #[arg(value_name = "IDENTITY_OR_STATE")]
         first: Option<String>,
         /// The desired state, when the first positional is the agent reference.
@@ -677,8 +677,9 @@ struct MsgCtx {
 /// use, and the reason clap's exclusion is expressed against the second positional.
 #[derive(Args)]
 struct PresentationArgs {
-    /// Ordinary agent reference — an exact bus address, or a bare address unique in the catalog —
-    /// or the new value when `--id` names the subject.
+    /// Exact bus identity, or a bare stable identity only when unique in the selected catalog —
+    /// or the new value when `--id` names the subject. Authoring selects the declaration, never
+    /// the address.
     #[arg(value_name = "IDENTITY_OR_TEXT")]
     first: Option<String>,
     /// The new value, when the first positional is the agent reference.

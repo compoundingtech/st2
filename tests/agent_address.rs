@@ -536,3 +536,63 @@ fn a_parents_address_cutover_keeps_the_org_chart_and_its_notifications() {
         "the address book must not answer a supervisor edge: {impostor:?}"
     );
 }
+
+/// Authoring selects the declaration, never the address — which is what the positional's help
+/// text says. After a cutover the subject's own new address does not name it; its declaration key
+/// and the exact `--id` form still do.
+#[test]
+fn authoring_selects_the_declaration_key_and_not_the_current_address() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/alpha/agent.kdl",
+        &declaration("alpha", "h", "catalog", ""),
+    );
+
+    let cutover = receipt(&address(
+        root,
+        &["h.alpha", "ops.alpha", "--host", "h", "--json"],
+        None,
+    ));
+    assert_eq!(cutover["address"], "ops.alpha");
+
+    for selector in ["ops.alpha", "h.ops.alpha"] {
+        let refused = address(
+            root,
+            &[selector, "back.alpha", "--host", "h", "--json"],
+            None,
+        );
+        assert!(
+            !refused.status.success(),
+            "{selector} selected a declaration: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        assert_eq!(
+            receipt(&refused)["code"],
+            "target-not-found",
+            "for {selector}"
+        );
+
+        let renamed = run(
+            root,
+            &["rename", selector, "Renamed", "--host", "h", "--json"],
+            None,
+        );
+        assert_eq!(
+            receipt(&renamed)["code"],
+            "target-not-found",
+            "for {selector}"
+        );
+    }
+
+    // Both declaration-key spellings still select, before and after the cutover.
+    for selector in ["alpha", "h.alpha"] {
+        let admitted = receipt(&address(
+            root,
+            &[selector, "back.alpha", "--host", "h", "--json"],
+            None,
+        ));
+        assert_eq!(admitted["address"], "back.alpha", "for {selector}");
+    }
+}
