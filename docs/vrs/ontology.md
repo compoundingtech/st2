@@ -76,7 +76,7 @@ the launch argv. This is not a shell command line. Use *provider argv* only
 when referring specifically to the canonical agent provider; *launch argv*
 applies to every PTY and exec task.
 
-Authority: [R06 restartable launch definitions and R40 launch argv
+Authority: [R06 restartable launch definitions and R42 launch argv
 transparency](requirements.md);
 [host-local scheduling and supervision](spec.md#host-local-scheduling-and-supervision)
 
@@ -463,7 +463,7 @@ Authority: [R31 reachable restart bounds](requirements.md);
 The declaration-owned whole-agent lifecycle intent: `running`, `suspended`, or
 `retired`. It is distinct from presence and session state.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [`AgentDesiredState`](../../crates/agent-spec/src/spec.rs)
 
 ### suspension
@@ -472,7 +472,7 @@ Reversible desired absence of an agent's live tasks while its declaration and
 catalog-backed durable state remain available. Suspension is not process pause
 or checkpointing.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [Agent Spec field rules](02-agent-spec/spec.md)
 
 ### retirement
@@ -480,7 +480,7 @@ Authority: [R27 typed agent desired state](requirements.md);
 Terminal desired absence whose completion additionally requires every declared
 task record to be collected. Legacy `retired #true` is a readable spelling.
 
-Authority: [R27 typed agent desired state](requirements.md);
+Authority: [R41 typed agent desired state](requirements.md);
 [Doctor retired absence](02-doctor/requirements.md)
 
 ### desired-state rationale
@@ -488,7 +488,7 @@ Authority: [R27 typed agent desired state](requirements.md);
 The bounded human explanation required by a new suspended or retired desired
 state. It explains intent and grants no lifecycle authority of its own.
 
-Authority: [R27 typed agent desired state](requirements.md)
+Authority: [R41 typed agent desired state](requirements.md)
 
 ### reconciliation
 

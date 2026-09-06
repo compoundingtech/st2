@@ -42,12 +42,12 @@ Systemd's default command-line expansion is not transparent to caller-owned
 argv. Passing `--expand-environment=no` before the command separator is the
 narrow correction: it preserves the complete dollar-bearing literal while all
 measured scope lifecycle, descriptor, PTY, exit-status, collection, and reuse
-semantics remain unchanged. This supports [R40 launch argv transparency](../requirements.md)
+semantics remain unchanged. This supports [R42 launch argv transparency](../requirements.md)
 and [decision 0016](../.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 
 ## VRS Impact
 
-- `requirements.md` adds R40 launch argv transparency.
+- `requirements.md` adds R42 launch argv transparency.
 - `ontology.md` defines **launch argv** as the canonical task-wide term.
 - `spec.md` fixes the exact systemd scope wrapper order and its deterministic
   scope/pass-through tests.
