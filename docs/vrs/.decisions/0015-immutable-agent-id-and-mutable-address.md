@@ -116,7 +116,11 @@ and host-local `dup-address` admission, `effective_id`/`effective_address`/
 fail-closed bare-or-qualified reference resolution — which every reference plane
 now shares, including stream ingress. Positional `identity` remains the durable
 key, so `ST_AGENT`, task IDs, session socket paths, declaration-parent state,
-harness records, PTY tags, and supervisor edges are untouched by a cutover.
+harness records, PTY tags, and supervisor edges are untouched by a cutover. A
+`supervisor` value is a declaration key on both of its planes — the org-chart
+walk and the notices that walk carries (crash-loop, protocol rejection) — so an
+address is a routing alias for human and message references only, never a
+supervisor reference.
 
 Deferred: UUIDv7 creation, the `st2 catalog migrate-ids` freeze transaction,
 ID-keyed durable records (message version 2, harness-state and harness-context

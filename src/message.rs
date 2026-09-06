@@ -1009,16 +1009,21 @@ pub fn resolve_agent_dir(
     Ok(optional_agent_handle(catalog_root, selector, this_host)?.map(|agent| agent.path))
 }
 
-/// The admitted readings of a runtime's own agent reference, in order.
+/// The admitted readings of a *declaration-key* reference, in order.
 ///
-/// `st2 driver … --identity` has always accepted the positional identity as well as the
-/// `<host>.<identity>` bus identity, and an identity may itself contain dots — so rather than
-/// guessing which dot is a separator, both readings are tried in the order today's resolution used:
-/// the reference as a whole key first, then the same reference qualified by this host.
+/// Two kinds of reference are declaration keys rather than routes: a runtime's own
+/// `st2 driver … --identity`, and the `supervisor` value a declaration carries. Both have always
+/// accepted the positional identity as well as the `<host>.<identity>` bus identity, and an
+/// identity may itself contain dots — so rather than guessing which dot is a separator, both
+/// readings are tried in the order today's resolution used: the reference as a whole key first,
+/// then the same reference qualified by this host. That is exactly the pair
+/// [`crate::supervisor_chain::resolve_spec`] matches, so the org chart and the notifications it
+/// carries read one namespace.
 ///
-/// Both readings are exact keys. A runtime never selects itself through the mutable address, so an
-/// address cutover cannot disconnect a seat from its own directories, workspace, or message boxes.
-fn actor_readings(reference: &str, this_host: &str) -> Vec<AgentSelector> {
+/// Both readings are exact keys. Neither a runtime nor a supervisor edge selects through the
+/// mutable address, so an address cutover cannot disconnect a seat from its own directories,
+/// workspace, or message boxes, and cannot break a parent's notification path.
+fn declaration_readings(reference: &str, this_host: &str) -> Vec<AgentSelector> {
     let qualified = format!("{this_host}.{reference}");
     if qualified == reference {
         return vec![AgentSelector::Id(reference.to_owned())];
@@ -1029,13 +1034,13 @@ fn actor_readings(reference: &str, this_host: &str) -> Vec<AgentSelector> {
     ]
 }
 
-/// [`resolve_agent_dir`] for a runtime resolving its own agent from a driver argument.
-pub fn resolve_actor_dir(
+/// [`resolve_agent_dir`] for a declaration key: a runtime's own agent, or a declared `supervisor`.
+pub fn resolve_declared_dir(
     catalog_root: &Path,
     reference: &str,
     this_host: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    for selector in actor_readings(reference, this_host) {
+    for selector in declaration_readings(reference, this_host) {
         if let Some(agent) = optional_agent_handle(catalog_root, &selector, this_host)? {
             return Ok(Some(agent.path));
         }
@@ -1043,16 +1048,17 @@ pub fn resolve_actor_dir(
     Ok(None)
 }
 
-/// The exact selector a runtime uses to name itself as a message endpoint.
+/// The exact selector for a declaration key used as a message endpoint — a runtime naming itself
+/// as the sender, or a declared `supervisor` as the recipient.
 ///
 /// An unresolvable reference keeps its own bytes, so a caller that is not a declared subject — a
 /// flat compat box, an external requester — still fails with today's diagnostic.
-pub fn actor_selector(
+pub fn declared_selector(
     catalog_root: &Path,
     reference: &str,
     this_host: &str,
 ) -> anyhow::Result<AgentSelector> {
-    for selector in actor_readings(reference, this_host) {
+    for selector in declaration_readings(reference, this_host) {
         if optional_agent_handle(catalog_root, &selector, this_host)?.is_some() {
             return Ok(selector);
         }

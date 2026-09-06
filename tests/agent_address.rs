@@ -413,3 +413,126 @@ fn the_exact_id_form_serves_declaration_and_route_resolution_alike() {
         String::from_utf8_lossy(&status.stderr)
     );
 }
+
+/// A **parent's** address cutover must leave the org chart and everything the org chart carries
+/// intact: `supervisor` is the positional declaration key, so no child declaration changes, and
+/// crash-loop notices still reach the renamed parent — even when another subject has since taken
+/// the address bytes the parent's children spell.
+#[test]
+fn a_parents_address_cutover_keeps_the_org_chart_and_its_notifications() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        &declaration("root", "h", "catalog", ""),
+    );
+    write(
+        root,
+        "h/child/agent.kdl",
+        &declaration("child", "h", "catalog", "  supervisor \"h.root\"\n"),
+    );
+    // The bare reading of the same edge, and a stranger that claims the bytes it spells.
+    write(
+        root,
+        "h/bare/agent.kdl",
+        &declaration("bare", "h", "catalog", "  supervisor \"root\"\n"),
+    );
+    write(
+        root,
+        "h/impostor/agent.kdl",
+        &declaration(
+            "impostor",
+            "h",
+            "catalog",
+            "  address \"root\"\n  supervisor \"h.root\"\n",
+        ),
+    );
+
+    let cutover = receipt(&address(
+        root,
+        &["h.root", "ops.root", "--host", "h", "--json"],
+        None,
+    ));
+    assert_eq!(cutover["address"], "ops.root");
+    assert_eq!(cutover["busAddress"], "h.ops.root");
+
+    // 1. The org chart still validates with both children's `supervisor` values unedited.
+    let validated = run(root, &["validate", "--host", "h"], None);
+    assert!(
+        validated.status.success(),
+        "stdout:\n{}stderr:\n{}",
+        String::from_utf8_lossy(&validated.stdout),
+        String::from_utf8_lossy(&validated.stderr)
+    );
+    let report = String::from_utf8_lossy(&validated.stdout);
+    assert!(report.contains("0 errors"), "{report}");
+    for child in ["h/child/agent.kdl", "h/bare/agent.kdl"] {
+        let declaration = fs::read_to_string(root.join(child)).unwrap();
+        assert!(
+            declaration.contains("supervisor"),
+            "{child} lost its supervisor edge"
+        );
+    }
+
+    // 2. Messages route on the new address.
+    let sent = run(
+        root,
+        &[
+            "message",
+            "send",
+            "ops.root",
+            "--host",
+            "h",
+            "--as",
+            "h.child",
+            "-m",
+            "the parent is still reachable",
+        ],
+        None,
+    );
+    assert!(
+        sent.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+
+    // 3. Crash-loop notices reach the renamed parent through the positional edge — both the
+    //    qualified and the bare spelling — and never the subject holding the released bytes.
+    for (task, identity, supervisor) in [
+        ("h.child-agent", "child", "h.root"),
+        ("h.bare-agent", "bare", "root"),
+    ] {
+        st2::run::surface_crash_loop(
+            root,
+            "h",
+            &st2::run::CrashLoop {
+                pty_id: task.to_owned(),
+                identity: identity.to_owned(),
+                host: Some("h".to_owned()),
+                supervisor: Some(supervisor.to_owned()),
+            },
+        );
+    }
+
+    let parent = st2::message::list_dir(&st2::message::inbox_dir(&root.join("h/root"))).unwrap();
+    assert_eq!(
+        parent.len(),
+        3,
+        "one message plus two crash-loop notices: {parent:?}"
+    );
+    assert_eq!(
+        parent
+            .iter()
+            .filter(|message| message.tags.contains(&"crash-loop".to_owned()))
+            .count(),
+        2,
+        "both supervisor spellings notified the renamed parent: {parent:?}"
+    );
+    let impostor =
+        st2::message::list_dir(&st2::message::inbox_dir(&root.join("h/impostor"))).unwrap();
+    assert!(
+        impostor.is_empty(),
+        "the address book must not answer a supervisor edge: {impostor:?}"
+    );
+}
