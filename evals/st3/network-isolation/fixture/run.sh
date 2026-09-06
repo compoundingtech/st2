@@ -27,8 +27,8 @@ cleanup() {
     socket="$root/$name/st3.sock"
     if [ -S "$socket" ] && [ -s "$name/run-id" ]; then
       run_id=$(cat "$name/run-id")
-      printf 'version 2\nsubgraph { plan-run "plan-run/%s" { cancel reason="the fixture completed" } }\n' "$run_id" >"$name/stop.kdl"
-      if st3 --endpoint "$socket" run "$name/stop.kdl" >/dev/null 2>&1; then
+      printf 'version 2\nplan-run "%s" { cancellation "fixture-complete" { reason "the fixture completed" } }\n' "$run_id" >"$name/stop.kdl"
+      if st3 --endpoint "$socket" publish "$name/stop.kdl" --as person/fixture >/dev/null 2>&1; then
         wait_for_terminal_cleanup "$socket" "$run_id" || failed=1
       else
         failed=1
@@ -51,17 +51,14 @@ for name in a b; do
   for _ in $(seq 1 100); do st3 --endpoint "$socket" doctor >/dev/null 2>&1 && break; sleep 0.05; done
   cat >"$name/network.kdl" <<KDL
 version 2
-subgraph {
-  plan "fixture/network-$name" state="ready" {
-    goal "Keep one isolated message target and PTY available."
-    subgraph {
-      agent "net.$name" { workspace "$PWD"; command "sleep 300"; restart "never"; env { ST3_MESSAGE_ROOT "$state/messages" } }
-      pty "session-$name" { workspace "$PWD"; command "bash -c 'echo ${name^^}-READY; sleep 300'"; restart "never" }
-    }
-  }
+plan "fixture/network-$name" state="ready" {
+  goal "Keep one isolated message target and PTY available."
+  agent "net.$name" { workspace "$PWD"; command "sleep 300"; restart "never"; env { ST3_MESSAGE_ROOT "$state/messages" } }
+  pty "session-$name" { workspace "$PWD"; command "bash -c 'echo ${name^^}-READY; sleep 300'"; restart "never" }
 }
 KDL
-  st3 --endpoint "$socket" --json run "$name/network.kdl" --detach | jq -er .id >"$name/run-id"
+  st3 --endpoint "$socket" publish "$name/network.kdl" --as person/fixture >/dev/null
+  st3 --endpoint "$socket" --json plan start "fixture/network-$name" --workspace "$PWD" --as person/fixture | jq -er .plan_run.id >"$name/run-id"
 done
 sleep 1
 run_a=$(cat a/run-id)

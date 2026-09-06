@@ -9,16 +9,18 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
     DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent, PlanInputKind,
-    PlanOutputView, PlanResponse, PlanRunInput, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
-    PlannedAction, PlanningCandidateView, PlanningPreviewView, PlanningSessionView,
-    PlanningVariantView, ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse,
-    ResourceObservationOutcome, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
-    SubscriptionSpec, WorkRequest, WorkSelector,
+    PlanOutputView, PlanResponse, PlanRevisionOperation, PlanRunDeclaration, PlanRunInput,
+    PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction, PlanningCandidateView,
+    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
+    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, ResourceObservationOutcome,
+    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
+    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
 };
 
 const SCHEMA: &str = r#"
@@ -2716,7 +2718,10 @@ impl Store {
                 } else {
                     format!("agent/{to}")
                 };
-                if recipient != "requester" && !known(&recipient)? {
+                if recipient != "requester"
+                    && !recipient.starts_with("person/")
+                    && !known(&recipient)?
+                {
                     blockers.push(format!(
                         "message `{}` references undeclared recipient `{recipient}`",
                         desired.subject
@@ -2900,40 +2905,70 @@ impl Store {
                 reason: "the immutable plan revision is not published".into(),
             });
         }
-        for cancellation in &intent.plan_run_cancellations {
-            let run_id = cancellation
-                .run
-                .strip_prefix("plan-run/")
-                .unwrap_or(&cancellation.run);
-            let status = connection
+        for declaration in intent.plan_runs.values() {
+            plan_plan_run_declaration(
+                &connection,
+                declaration,
+                store_index,
+                &mut tokens,
+                &mut actions,
+                &mut blockers,
+                &mut warnings,
+            )?;
+        }
+        for declaration in intent.planning_sessions.values() {
+            plan_planning_session_declaration(
+                &connection,
+                declaration,
+                store_index,
+                &mut tokens,
+                &mut actions,
+                &mut blockers,
+            )?;
+        }
+        for refresh in &intent.resource_refreshes {
+            tokens.entry(refresh.resource.clone()).or_insert(
+                claim_ids_at(&connection, &refresh.resource, Some(store_index))
+                    .map_err(internal)?
+                    .into_iter()
+                    .last()
+                    .into_iter()
+                    .collect(),
+            );
+            let exists = connection
                 .query_row(
-                    "SELECT status FROM plan_runs WHERE id=?1",
-                    [run_id],
-                    |row| row.get::<_, String>(0),
+                    "SELECT 1 FROM desired WHERE subject=?1 AND kind='resource'",
+                    [&refresh.resource],
+                    |_| Ok(()),
                 )
                 .optional()
-                .map_err(internal)?;
-            let token = claim_ids_at(&connection, &cancellation.run, Some(store_index))
                 .map_err(internal)?
-                .into_iter()
-                .last()
-                .into_iter()
-                .collect();
-            tokens.insert(cancellation.run.clone(), token);
-            match status.as_deref() {
-                None => blockers.push(format!("plan run `{}` does not exist", cancellation.run)),
-                Some("completed" | "failed" | "cancelled") => warnings.push(format!(
-                    "plan run `{}` is already {}",
-                    cancellation.run,
-                    status.as_deref().unwrap_or_default()
-                )),
-                Some(_) => actions.push(PlannedAction {
-                    subject: cancellation.run.clone(),
-                    action: "cancel".into(),
-                    reason: cancellation.reason.clone(),
-                }),
+                .is_some();
+            if exists {
+                match publication_operation_is_new(
+                    &connection,
+                    &refresh.resource,
+                    "refresh",
+                    &refresh.id,
+                    refresh,
+                ) {
+                    Ok(true) => actions.push(PlannedAction {
+                        subject: refresh.resource.clone(),
+                        action: format!("refresh:{}", refresh.id),
+                        reason: "the publication requests a fresh observation".into(),
+                    }),
+                    Ok(false) => {}
+                    Err(error) => blockers.push(error.message),
+                }
+            } else {
+                blockers.push(format!("resource `{}` does not exist", refresh.resource));
             }
         }
+
+        blockers.sort();
+        blockers.dedup();
+        warnings.sort();
+        warnings.dedup();
 
         Ok(PlanResponse {
             store_index,
@@ -2958,6 +2993,16 @@ impl Store {
         intent: &NormalizedIntent,
         expected: &BTreeMap<String, Vec<String>>,
         idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        self.apply_as(intent, expected, idempotency_key, None)
+    }
+
+    pub fn apply_as(
+        &self,
+        intent: &NormalizedIntent,
+        expected: &BTreeMap<String, Vec<String>>,
+        idempotency_key: &str,
+        actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -3016,21 +3061,48 @@ impl Store {
                 .with_detail("current_heads", json!(actual)));
             }
         }
-        for cancellation in &intent.plan_run_cancellations {
-            let actual = latest_claim_id_tx(&transaction, &cancellation.run)
+        for declaration in intent.plan_runs.values() {
+            let actual = latest_claim_id_tx(&transaction, &declaration.subject)
                 .map_err(internal)?
                 .into_iter()
                 .collect::<Vec<_>>();
-            let expected = expected.get(&cancellation.run).ok_or_else(|| {
+            let expected = expected.get(&declaration.subject).ok_or_else(|| {
                 St3Error::new(
                     "missing-subject-token",
-                    format!("apply omitted the subject token for `{}`", cancellation.run),
+                    format!(
+                        "apply omitted the subject token for `{}`",
+                        declaration.subject
+                    ),
                 )
             })?;
             if actual != *expected {
                 return Err(St3Error::new(
                     "stale-subject",
-                    format!("plan run `{}` changed after planning", cancellation.run),
+                    format!("plan run `{}` changed after planning", declaration.subject),
+                ));
+            }
+        }
+        for declaration in intent.planning_sessions.values() {
+            let actual = latest_claim_id_tx(&transaction, &declaration.subject)
+                .map_err(internal)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let expected = expected.get(&declaration.subject).ok_or_else(|| {
+                St3Error::new(
+                    "missing-subject-token",
+                    format!(
+                        "apply omitted the subject token for `{}`",
+                        declaration.subject
+                    ),
+                )
+            })?;
+            if actual != *expected {
+                return Err(St3Error::new(
+                    "stale-subject",
+                    format!(
+                        "planning session `{}` changed after planning",
+                        declaration.subject
+                    ),
                 ));
             }
         }
@@ -3054,25 +3126,94 @@ impl Store {
                 .map(|current| current.as_deref() != Some(plan.revision.as_str()))
                 .unwrap_or(true)
         });
-        let cancellations_changed = intent.plan_run_cancellations.iter().any(|cancellation| {
-            transaction
-                .query_row(
-                    "SELECT status FROM plan_runs WHERE id=?1",
-                    [cancellation
-                        .run
-                        .strip_prefix("plan-run/")
-                        .unwrap_or(&cancellation.run)],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map(|status| {
-                    status.is_some_and(|status| {
-                        !matches!(status.as_str(), "completed" | "failed" | "cancelled")
+        let mut operations_changed = false;
+        for declaration in intent.plan_runs.values() {
+            let run_id = declaration
+                .subject
+                .strip_prefix("plan-run/")
+                .unwrap_or(&declaration.subject);
+            if declaration.creation.is_some()
+                && transaction
+                    .query_row("SELECT 1 FROM plan_runs WHERE id=?1", [run_id], |_| Ok(()))
+                    .optional()
+                    .map_err(internal)?
+                    .is_none()
+            {
+                operations_changed = true;
+            }
+            for revision in declaration.revisions.values() {
+                operations_changed |= publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "revision",
+                    &revision.id,
+                    revision,
+                )?;
+            }
+            for reset in declaration.resets.values() {
+                operations_changed |= publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "reset",
+                    &reset.id,
+                    reset,
+                )?;
+            }
+            for cancellation in declaration.cancellations.values() {
+                operations_changed |= publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "cancellation",
+                    &cancellation.id,
+                    cancellation,
+                )?;
+            }
+        }
+        for declaration in intent.planning_sessions.values() {
+            let id = declaration
+                .subject
+                .strip_prefix("planning-session/")
+                .unwrap_or(&declaration.subject);
+            if declaration.creation.is_some()
+                && transaction
+                    .query_row("SELECT 1 FROM planning_sessions WHERE id=?1", [id], |_| {
+                        Ok(())
                     })
-                })
-                .unwrap_or(false)
-        });
-        let changed = desired_changed || plans_changed || cancellations_changed;
+                    .optional()
+                    .map_err(internal)?
+                    .is_none()
+            {
+                operations_changed = true;
+            }
+            for feedback in declaration.feedback.values() {
+                operations_changed |= publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "feedback",
+                    &feedback.id,
+                    feedback,
+                )?;
+            }
+            for cancellation in declaration.cancellations.values() {
+                operations_changed |= publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "cancellation",
+                    &cancellation.id,
+                    cancellation,
+                )?;
+            }
+        }
+        for refresh in &intent.resource_refreshes {
+            operations_changed |= publication_operation_is_new(
+                &transaction,
+                &refresh.resource,
+                "refresh",
+                &refresh.id,
+                refresh,
+            )?;
+        }
+        let changed = desired_changed || plans_changed || operations_changed;
         if !changed {
             let store_index = current_index_tx(&transaction).map_err(internal)?;
             let mut subject_tokens = intent
@@ -3090,10 +3231,19 @@ impl Store {
                     plan_definition_token_tx(&transaction, &plan.id).map_err(internal)?,
                 );
             }
-            for cancellation in &intent.plan_run_cancellations {
+            for declaration in intent.plan_runs.values() {
                 subject_tokens.insert(
-                    cancellation.run.clone(),
-                    latest_claim_id_tx(&transaction, &cancellation.run)
+                    declaration.subject.clone(),
+                    latest_claim_id_tx(&transaction, &declaration.subject)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            for declaration in intent.planning_sessions.values() {
+                subject_tokens.insert(
+                    declaration.subject.clone(),
+                    latest_claim_id_tx(&transaction, &declaration.subject)
                         .map_err(internal)?
                         .into_iter()
                         .collect(),
@@ -3106,6 +3256,8 @@ impl Store {
                 claim_ids: Vec::new(),
                 subject_tokens,
                 reconcile_subjects: Vec::new(),
+                resolved_kdl: String::new(),
+                operations: Vec::new(),
             };
             transaction
                 .execute(
@@ -3135,6 +3287,7 @@ impl Store {
         let mut claim_ids = Vec::new();
         let mut tokens = BTreeMap::new();
         let mut reconcile_subjects = Vec::new();
+        let mut operation_receipts = Vec::new();
         for (subject, desired) in &intent.subjects {
             let revision = desired_revision(desired);
             let current = current_desired_row_tx(&transaction, subject).map_err(internal)?;
@@ -3259,25 +3412,217 @@ impl Store {
             claim_ids.push(claim_id.clone());
             tokens.insert(plan.subject.clone(), vec![claim_id]);
         }
-        for cancellation in &intent.plan_run_cancellations {
-            let ids = cancel_plan_run_tx(
-                &transaction,
-                &self.origin,
-                &cancellation.run,
-                &cancellation.reason,
-                &batch_id,
-                now,
-            )
-            .map_err(internal)?;
-            claim_ids.extend(ids);
+        for declaration in intent.plan_runs.values() {
+            let created =
+                create_declared_plan_run_tx(&transaction, &self.origin, declaration, &batch_id)?;
+            if !created.is_empty() {
+                operation_receipts.push(PlannedAction {
+                    subject: declaration.subject.clone(),
+                    action: "start-plan-run".into(),
+                    reason: "the named plan run was created".into(),
+                });
+            }
+            claim_ids.extend(created);
+            for revision in declaration.revisions.values() {
+                if !publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "revision",
+                    &revision.id,
+                    revision,
+                )? {
+                    continue;
+                }
+                let (ids, proposed) = adopt_declared_plan_revision_tx(
+                    &transaction,
+                    &self.origin,
+                    declaration,
+                    revision,
+                    &batch_id,
+                    actor,
+                )?;
+                claim_ids.extend(ids);
+                let receipt = append_publication_operation_tx(
+                    &transaction,
+                    &self.origin,
+                    &declaration.subject,
+                    "revision",
+                    &revision.id,
+                    revision,
+                    actor,
+                    &batch_id,
+                )?;
+                claim_ids.push(receipt.id);
+                operation_receipts.push(PlannedAction {
+                    subject: declaration.subject.clone(),
+                    action: format!(
+                        "{}:{}",
+                        if proposed {
+                            "propose-revision"
+                        } else {
+                            "revise"
+                        },
+                        revision.id
+                    ),
+                    reason: revision.reason.clone(),
+                });
+                if !proposed && let Some(cancellation) = &revision.cancellation {
+                    let ids = cancel_plan_run_tx(
+                        &transaction,
+                        &self.origin,
+                        &declaration.subject,
+                        &cancellation.reason,
+                        &batch_id,
+                        now,
+                    )
+                    .map_err(internal)?;
+                    claim_ids.extend(ids);
+                }
+            }
+            for reset in declaration.resets.values() {
+                if !publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "reset",
+                    &reset.id,
+                    reset,
+                )? {
+                    continue;
+                }
+                let runtime = runtime_subject_for_run(
+                    declaration
+                        .subject
+                        .strip_prefix("plan-run/")
+                        .unwrap_or(&declaration.subject),
+                    &reset.runtime,
+                );
+                let reset_claim = reset_declared_runtime_tx(
+                    &transaction,
+                    &self.origin,
+                    declaration,
+                    reset,
+                    &runtime,
+                    &batch_id,
+                )?;
+                claim_ids.push(reset_claim.id);
+                let receipt = append_publication_operation_tx(
+                    &transaction,
+                    &self.origin,
+                    &declaration.subject,
+                    "reset",
+                    &reset.id,
+                    reset,
+                    actor,
+                    &batch_id,
+                )?;
+                claim_ids.push(receipt.id);
+                reconcile_subjects.push(runtime.clone());
+                operation_receipts.push(PlannedAction {
+                    subject: runtime,
+                    action: format!("reset:{}", reset.id),
+                    reason: reset.reason.clone(),
+                });
+            }
+            for cancellation in declaration.cancellations.values() {
+                if !publication_operation_is_new(
+                    &transaction,
+                    &declaration.subject,
+                    "cancellation",
+                    &cancellation.id,
+                    cancellation,
+                )? {
+                    continue;
+                }
+                let ids = cancel_plan_run_tx(
+                    &transaction,
+                    &self.origin,
+                    &declaration.subject,
+                    &cancellation.reason,
+                    &batch_id,
+                    now,
+                )
+                .map_err(internal)?;
+                if !ids.is_empty() {
+                    operation_receipts.push(PlannedAction {
+                        subject: declaration.subject.clone(),
+                        action: format!("cancel:{}", cancellation.id),
+                        reason: cancellation.reason.clone(),
+                    });
+                }
+                claim_ids.extend(ids);
+                let receipt = append_publication_operation_tx(
+                    &transaction,
+                    &self.origin,
+                    &declaration.subject,
+                    "cancellation",
+                    &cancellation.id,
+                    cancellation,
+                    actor,
+                    &batch_id,
+                )?;
+                claim_ids.push(receipt.id);
+            }
             tokens.insert(
-                cancellation.run.clone(),
-                latest_claim_id_tx(&transaction, &cancellation.run)
+                declaration.subject.clone(),
+                latest_claim_id_tx(&transaction, &declaration.subject)
                     .map_err(internal)?
                     .into_iter()
                     .collect(),
             );
-            reconcile_subjects.push(cancellation.run.clone());
+            reconcile_subjects.push(declaration.subject.clone());
+        }
+        for declaration in intent.planning_sessions.values() {
+            let ids = apply_planning_session_declaration_tx(
+                &transaction,
+                &self.origin,
+                declaration,
+                &batch_id,
+                actor,
+                &mut operation_receipts,
+            )?;
+            claim_ids.extend(ids);
+            tokens.insert(
+                declaration.subject.clone(),
+                latest_claim_id_tx(&transaction, &declaration.subject)
+                    .map_err(internal)?
+                    .into_iter()
+                    .collect(),
+            );
+            reconcile_subjects.push(declaration.subject.clone());
+        }
+        for refresh in &intent.resource_refreshes {
+            if !publication_operation_is_new(
+                &transaction,
+                &refresh.resource,
+                "refresh",
+                &refresh.id,
+                refresh,
+            )? {
+                continue;
+            }
+            let ids = request_declared_resource_refresh_tx(
+                &transaction,
+                &self.origin,
+                refresh,
+                &batch_id,
+            )?;
+            claim_ids.extend(ids);
+            let receipt = append_publication_operation_tx(
+                &transaction,
+                &self.origin,
+                &refresh.resource,
+                "refresh",
+                &refresh.id,
+                refresh,
+                actor,
+                &batch_id,
+            )?;
+            claim_ids.push(receipt.id);
+            operation_receipts.push(PlannedAction {
+                subject: refresh.resource.clone(),
+                action: format!("refresh:{}", refresh.id),
+                reason: "the refresh request was accepted".into(),
+            });
         }
         let store_index = current_index_tx(&transaction).map_err(internal)?;
         let response = ApplyResponse {
@@ -3287,6 +3632,8 @@ impl Store {
             claim_ids,
             subject_tokens: tokens,
             reconcile_subjects,
+            resolved_kdl: String::new(),
+            operations: operation_receipts,
         };
         transaction
             .execute(
@@ -3932,11 +4279,21 @@ impl Store {
                 title: actual
                     .get("title")
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        desired
+                            .as_ref()
+                            .and_then(|value| canonical_child_string(value, "title"))
+                    }),
                 in_reply_to: actual
                     .get("in_reply_to")
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        desired
+                            .as_ref()
+                            .and_then(|value| canonical_child_string(value, "in-reply-to"))
+                    }),
                 tags: actual
                     .get("tags")
                     .and_then(Value::as_array)
@@ -3947,7 +4304,12 @@ impl Store {
                             .map(str::to_owned)
                             .collect()
                     })
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        desired
+                            .as_ref()
+                            .map(|value| canonical_child_strings(value, "tag"))
+                            .unwrap_or_default()
+                    }),
                 created_index,
             });
         }
@@ -4786,6 +5148,1276 @@ impl Store {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_plan_run_declaration(
+    connection: &Connection,
+    declaration: &PlanRunDeclaration,
+    store_index: u64,
+    tokens: &mut BTreeMap<String, Vec<String>>,
+    actions: &mut Vec<PlannedAction>,
+    blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), St3Error> {
+    let run_id = declaration
+        .subject
+        .strip_prefix("plan-run/")
+        .unwrap_or(&declaration.subject);
+    tokens.insert(
+        declaration.subject.clone(),
+        claim_ids_at(connection, &declaration.subject, Some(store_index))
+            .map_err(internal)?
+            .into_iter()
+            .last()
+            .into_iter()
+            .collect(),
+    );
+    let current = connection
+        .query_row(
+            "SELECT plan_id, initial_revision, workspace, requester, status, current_generation_id,
+                    inputs, mode
+             FROM plan_runs WHERE id=?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(creation) = &declaration.creation {
+        if let Some((plan, revision, workspace, requester, _, _, inputs, mode)) = &current {
+            let stored_inputs =
+                serde_json::from_str::<BTreeMap<String, PlanRunInput>>(inputs).map_err(internal)?;
+            let stored_values = stored_inputs
+                .into_iter()
+                .map(|(name, input)| (name, input.value))
+                .collect::<BTreeMap<_, _>>();
+            if plan != &creation.plan
+                || revision != &creation.revision
+                || workspace != &creation.workspace
+                || requester != &creation.requester
+                || stored_values != creation.inputs
+                || mode != &creation.mode
+            {
+                blockers.push(format!(
+                    "plan run `{}` already exists with different creation fields",
+                    declaration.subject
+                ));
+            }
+        } else {
+            let plan = connection
+                .query_row(
+                    "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+                    params![creation.plan, creation.revision],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .map(|body| serde_json::from_str::<PlanSpec>(&body))
+                .transpose()
+                .map_err(internal)?;
+            match plan {
+                None => blockers.push(format!(
+                    "plan `plan/{}@{}` does not exist",
+                    creation.plan, creation.revision
+                )),
+                Some(plan) if plan.state != PlanState::Ready => blockers.push(format!(
+                    "plan `plan/{}` revision `{}` is not ready",
+                    creation.plan, creation.revision
+                )),
+                Some(plan) => {
+                    if let Err(error) = resolve_plan_run_inputs(connection, &plan, &creation.inputs)
+                    {
+                        blockers.push(error.message);
+                    }
+                    if let Err(error) = enforce_plan_run_capacity(connection, &plan) {
+                        blockers.push(error.message);
+                    }
+                    actions.push(PlannedAction {
+                        subject: declaration.subject.clone(),
+                        action: "start-plan-run".into(),
+                        reason: "the named plan run does not exist".into(),
+                    });
+                }
+            }
+        }
+    }
+    if current.is_none() && declaration.creation.is_none() {
+        blockers.push(format!("plan run `{}` does not exist", declaration.subject));
+        return Ok(());
+    }
+    let status = current.as_ref().map(|value| value.4.as_str());
+    let current_generation = current.as_ref().map(|value| value.5.as_str());
+    for revision in declaration.revisions.values() {
+        if current_generation.is_some_and(|current| {
+            revision
+                .from_generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&revision.from_generation)
+                != current
+        }) {
+            blockers.push(format!(
+                "revision `{}` names a stale run generation",
+                revision.id
+            ));
+        }
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+                params![revision.plan, revision.revision],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some();
+        if !exists {
+            blockers.push(format!(
+                "revision `{}` names missing plan `plan/{}@{}`",
+                revision.id, revision.plan, revision.revision
+            ));
+        }
+        match publication_operation_is_new(
+            connection,
+            &declaration.subject,
+            "revision",
+            &revision.id,
+            revision,
+        ) {
+            Ok(true) => actions.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: format!("revise:{}", revision.id),
+                reason: revision.reason.clone(),
+            }),
+            Ok(false) => {}
+            Err(error) => blockers.push(error.message),
+        }
+    }
+    for reset in declaration.resets.values() {
+        if current_generation.is_some_and(|current| {
+            reset
+                .from_generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&reset.from_generation)
+                != current
+        }) {
+            blockers.push(format!("reset `{}` names a stale run generation", reset.id));
+        }
+        match publication_operation_is_new(
+            connection,
+            &declaration.subject,
+            "reset",
+            &reset.id,
+            reset,
+        ) {
+            Ok(true) => actions.push(PlannedAction {
+                subject: runtime_subject_for_run(run_id, &reset.runtime),
+                action: format!("reset:{}", reset.id),
+                reason: reset.reason.clone(),
+            }),
+            Ok(false) => {}
+            Err(error) => blockers.push(error.message),
+        }
+    }
+    for cancellation in declaration.cancellations.values() {
+        let is_new = match publication_operation_is_new(
+            connection,
+            &declaration.subject,
+            "cancellation",
+            &cancellation.id,
+            cancellation,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                blockers.push(error.message);
+                continue;
+            }
+        };
+        if !is_new {
+            continue;
+        } else if matches!(status, Some("completed" | "failed" | "cancelled")) {
+            warnings.push(format!(
+                "plan run `{}` is already {}",
+                declaration.subject,
+                status.unwrap_or_default()
+            ));
+        } else {
+            actions.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: format!("cancel:{}", cancellation.id),
+                reason: cancellation.reason.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_planning_session_declaration(
+    connection: &Connection,
+    declaration: &PlanningSessionDeclaration,
+    store_index: u64,
+    tokens: &mut BTreeMap<String, Vec<String>>,
+    actions: &mut Vec<PlannedAction>,
+    blockers: &mut Vec<String>,
+) -> Result<(), St3Error> {
+    let id = declaration
+        .subject
+        .strip_prefix("planning-session/")
+        .unwrap_or(&declaration.subject);
+    tokens.insert(
+        declaration.subject.clone(),
+        claim_ids_at(connection, &declaration.subject, Some(store_index))
+            .map_err(internal)?
+            .into_iter()
+            .last()
+            .into_iter()
+            .collect(),
+    );
+    let current = connection
+        .query_row(
+            "SELECT plan_id, request_ref, workspace, requester, planner, status,
+                    target_run_id, source_generation_id
+             FROM planning_sessions WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(creation) = &declaration.creation {
+        if let Some((plan, request, workspace, requester, planner, _, target, generation)) =
+            &current
+        {
+            if plan != &creation.plan
+                || request != &creation.request
+                || workspace != &creation.workspace
+                || requester != &creation.requester
+                || planner != &crate::graph::planning_planner_subject(&declaration.subject)
+                || target.as_deref()
+                    != creation
+                        .target_run
+                        .as_deref()
+                        .map(|value| value.strip_prefix("plan-run/").unwrap_or(value))
+                || generation.as_deref()
+                    != creation
+                        .target_generation
+                        .as_deref()
+                        .map(|value| value.strip_prefix("run-generation/").unwrap_or(value))
+            {
+                blockers.push(format!(
+                    "planning session `{}` already exists with different creation fields",
+                    declaration.subject
+                ));
+            }
+        } else {
+            if let (Some(run), Some(generation)) =
+                (&creation.target_run, &creation.target_generation)
+            {
+                let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+                let expected_generation = generation
+                    .strip_prefix("run-generation/")
+                    .unwrap_or(generation);
+                let actual = connection
+                    .query_row(
+                        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                        [run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if actual.as_deref() != Some(expected_generation) {
+                    blockers.push(format!(
+                        "planning session `{}` names a stale target generation",
+                        declaration.subject
+                    ));
+                }
+            }
+            actions.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: "start-planning".into(),
+                reason: "the named planning session does not exist".into(),
+            });
+        }
+    }
+    if current.is_none() && declaration.creation.is_none() {
+        blockers.push(format!(
+            "planning session `{}` does not exist",
+            declaration.subject
+        ));
+    }
+    for feedback in declaration.feedback.values() {
+        match publication_operation_is_new(
+            connection,
+            &declaration.subject,
+            "feedback",
+            &feedback.id,
+            feedback,
+        ) {
+            Ok(true) => actions.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: format!("feedback:{}", feedback.id),
+                reason: "the publication supplies planning feedback".into(),
+            }),
+            Ok(false) => {}
+            Err(error) => blockers.push(error.message),
+        }
+    }
+    for cancellation in declaration.cancellations.values() {
+        match publication_operation_is_new(
+            connection,
+            &declaration.subject,
+            "cancellation",
+            &cancellation.id,
+            cancellation,
+        ) {
+            Ok(true) => actions.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: format!("cancel:{}", cancellation.id),
+                reason: cancellation.reason.clone(),
+            }),
+            Ok(false) => {}
+            Err(error) => blockers.push(error.message),
+        }
+    }
+    Ok(())
+}
+
+fn runtime_subject_for_run(run_id: &str, runtime: &str) -> String {
+    let Some((kind, local)) = runtime.split_once('/') else {
+        return runtime.to_owned();
+    };
+    if !matches!(kind, "agent" | "exec" | "pty") || local.starts_with(&format!("{run_id}/")) {
+        runtime.to_owned()
+    } else {
+        format!("{kind}/{run_id}/{local}")
+    }
+}
+
+fn create_declared_plan_run_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    declaration: &PlanRunDeclaration,
+    batch_id: &str,
+) -> Result<Vec<String>, St3Error> {
+    let Some(creation) = &declaration.creation else {
+        return Ok(Vec::new());
+    };
+    let run_id = declaration
+        .subject
+        .strip_prefix("plan-run/")
+        .unwrap_or(&declaration.subject);
+    let exists = transaction
+        .query_row("SELECT 1 FROM plan_runs WHERE id=?1", [run_id], |_| Ok(()))
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if exists {
+        return Ok(Vec::new());
+    }
+    let plan: PlanSpec = transaction
+        .query_row(
+            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+            params![creation.plan, creation.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str(&body))
+        .transpose()
+        .map_err(internal)?
+        .ok_or_else(|| {
+            St3Error::new(
+                "missing-plan",
+                format!(
+                    "plan `plan/{}@{}` does not exist",
+                    creation.plan, creation.revision
+                ),
+            )
+        })?;
+    if plan.state != PlanState::Ready {
+        return Err(St3Error::new(
+            "plan-not-ready",
+            format!("plan `plan/{}` is not ready", creation.plan),
+        ));
+    }
+    let inputs = resolve_plan_run_inputs(transaction, &plan, &creation.inputs)?;
+    enforce_plan_run_capacity(transaction, &plan)?;
+    let generation_id = Uuid::now_v7().simple().to_string();
+    let generation_subject = format!("run-generation/{generation_id}");
+    let root_plan_run = declaration.subject.clone();
+    let mut variables = BTreeMap::from([
+        ("ST_PLAN".into(), plan.id.clone()),
+        ("ST_PLAN_REVISION".into(), plan.revision.clone()),
+        ("ST_PLAN_RUN".into(), run_id.to_owned()),
+        ("ST_RUN_GENERATION".into(), generation_id.clone()),
+        ("ST_REQUESTER".into(), creation.requester.clone()),
+        ("ST_ROOT_PLAN_RUN".into(), root_plan_run.clone()),
+        ("ST_WORKSPACE".into(), creation.workspace.clone()),
+        ("ST_PARENT_STEP_RUN".into(), String::new()),
+    ]);
+    for (name, input) in &inputs {
+        variables.insert(format!("input.{name}"), input.value.clone());
+    }
+    let now = now_ms();
+    transaction
+        .execute(
+            "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?3, ?1, NULL, ?5, ?6, ?7, ?8, 'running', 'normal', ?9, ?9)",
+            params![
+                run_id,
+                plan.id,
+                plan.revision,
+                generation_id,
+                creation.workspace,
+                creation.requester,
+                serde_json::to_string(&inputs).map_err(internal)?,
+                creation.mode,
+                now.to_string(),
+            ],
+        )
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
+            params![
+                generation_id,
+                run_id,
+                plan.revision,
+                creation.requester,
+                now.to_string()
+            ],
+        )
+        .map_err(internal)?;
+    let mut flat = Vec::new();
+    flatten_steps(&plan, None, &mut flat);
+    for (step, selector) in flat {
+        let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
+        let step_subject = format!("step-run/{generation_id}/{}", step.path);
+        let mut step_variables = variables.clone();
+        step_variables.insert("ST_STEP".into(), step.path.clone());
+        step_variables.insert("ST_STEP_RUN".into(), step_subject.clone());
+        step_variables.insert("ST_ATTEMPT".into(), "1".into());
+        step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+        step_variables.insert(
+            "ST_PARENT_STEP_RUN".into(),
+            crate::plan::parent_step_path(&plan, &step.path)
+                .map(|path| format!("step-run/{generation_id}/{path}"))
+                .unwrap_or_default(),
+        );
+        let title = step
+            .title
+            .as_deref()
+            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .transpose()?;
+        let goals = interpolate_goals(&step.goals, &step_variables)?;
+        transaction
+            .execute(
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params![
+                    step_subject,
+                    run_id,
+                    generation_id,
+                    step.path,
+                    step.definition_hash,
+                    assignee,
+                    serde_json::to_string(&available_to).map_err(internal)?,
+                    agentless,
+                    title,
+                    goals,
+                    now.to_string()
+                ],
+            )
+            .map_err(internal)?;
+    }
+    let body = json!({
+        "fields": {
+            "status": "running",
+            "plan": plan.subject,
+            "revision": plan.revision,
+            "initial_revision": plan.revision,
+            "current_generation": generation_subject,
+            "root_revision": plan.revision,
+            "root_plan_run": root_plan_run,
+            "parent_step_run": Value::Null,
+            "default_selector": Value::Null,
+            "workspace": creation.workspace,
+            "requester": creation.requester,
+            "inputs": inputs,
+            "mode": creation.mode,
+        }
+    });
+    let run_claim = append_claim_tx(
+        transaction,
+        origin,
+        &declaration.subject,
+        "plan-run.created",
+        Some(&creation.requester),
+        &body,
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)?;
+    let generation_claim = append_claim_tx(
+        transaction,
+        origin,
+        &generation_subject,
+        "run-generation.created",
+        Some(&creation.requester),
+        &json!({"fields": {
+            "run": declaration.subject,
+            "revision": plan.revision,
+            "status": "running",
+            "reason": "initial plan run"
+        }}),
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)?;
+    Ok(vec![run_claim.id, generation_claim.id])
+}
+
+fn adopt_declared_plan_revision_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    declaration: &PlanRunDeclaration,
+    operation: &PlanRevisionOperation,
+    batch_id: &str,
+    actor: Option<&str>,
+) -> Result<(Vec<String>, bool), St3Error> {
+    let actor = actor.ok_or_else(|| {
+        St3Error::new(
+            "missing-publication-actor",
+            "a plan-run revision needs `--as` or ST_AGENT",
+        )
+    })?;
+    let actor = normalize_actor_for_publication(actor);
+    let run_id = declaration
+        .subject
+        .strip_prefix("plan-run/")
+        .unwrap_or(&declaration.subject);
+    let current = plan_run_view_tx(transaction, run_id).map_err(internal)?;
+    if generation_id_from_subject(&current.generation)
+        != generation_id_from_subject(&operation.from_generation)
+    {
+        return Err(St3Error::new(
+            "stale-run-generation",
+            format!("revision `{}` names a stale run generation", operation.id),
+        ));
+    }
+    if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
+        || current.phase != "normal"
+    {
+        return Err(St3Error::new(
+            "plan-run-not-revisable",
+            format!(
+                "plan run `{}` is {} in its {} phase",
+                declaration.subject, current.status, current.phase
+            ),
+        ));
+    }
+    let current_plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+    if operation.plan != current_plan_id {
+        return Err(St3Error::new(
+            "wrong-plan-revision",
+            format!(
+                "revision `{}` targets plan `{}` instead of `{current_plan_id}`",
+                operation.id, operation.plan
+            ),
+        ));
+    }
+    let old: PlanSpec = transaction
+        .query_row(
+            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+            params![current_plan_id, current.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(internal)
+        .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
+    let next: PlanSpec = transaction
+        .query_row(
+            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+            params![operation.plan, operation.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(internal)
+        .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
+    if next.state != PlanState::Ready {
+        return Err(St3Error::new(
+            "plan-revision-not-ready",
+            "a running plan can adopt only a ready revision",
+        ));
+    }
+    if old.inputs != next.inputs {
+        return Err(St3Error::new(
+            "run-input-mutation",
+            "a run revision cannot change its input declarations",
+        ));
+    }
+    let variables = plan_run_variables(&current, &next.revision);
+    let (compatible, reviewers) =
+        analyze_plan_revision(&old, &next, &actor, &current.requester, &variables)?;
+    if !reviewers.is_empty() || matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
+        if operation.cancellation.is_some() {
+            return Err(St3Error::new(
+                "revision-cancellation-needs-immediate-cutover",
+                "a revision with a deferred or reviewed cutover cannot contain cancellation",
+            ));
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM revision_proposals WHERE run_id=?1 AND status IN ('pending-approval','draining')",
+                [run_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(St3Error::new(
+                "revision-proposal-already-pending",
+                "the plan run already has one pending revision proposal",
+            ));
+        }
+        let proposal_id = hex::encode(Sha256::digest(format!(
+            "st3.declared-revision-proposal.v1\0{}\0{}",
+            declaration.subject, operation.id
+        )))[..32]
+            .to_owned();
+        let cutover = old.revision_cutover.clone();
+        let status = if reviewers.is_empty() {
+            "draining"
+        } else {
+            "pending-approval"
+        };
+        let preview_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "source_generation": current.generation,
+                "candidate_revision": next.revision,
+                "compatible_steps": compatible,
+                "reviewers": reviewers,
+                "cutover": cutover,
+            }))
+            .map_err(internal)?,
+        ));
+        let now = now_ms();
+        transaction
+            .execute(
+                "INSERT INTO revision_proposals(id, run_id, source_generation_id, candidate_revision, actor, reason, status, cutover, compatible_steps, reviewers, approvals, preview_hash, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
+                params![
+                    proposal_id,
+                    run_id,
+                    generation_id_from_subject(&current.generation),
+                    next.revision,
+                    actor,
+                    operation.reason,
+                    status,
+                    revision_cutover_name(&cutover),
+                    serde_json::to_string(&compatible).map_err(internal)?,
+                    serde_json::to_string(&reviewers).map_err(internal)?,
+                    preview_hash,
+                    now.to_string(),
+                ],
+            )
+            .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, now.to_string()],
+                )
+                .map_err(internal)?;
+        }
+        let subject = format!("revision-proposal/{proposal_id}");
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &subject,
+            "revision-proposal.created",
+            Some(&actor),
+            &json!({"fields": {
+                "run": current.subject,
+                "source_generation": current.generation,
+                "candidate_revision": next.revision,
+                "reason": operation.reason,
+                "status": status,
+                "cutover": revision_cutover_name(&cutover),
+                "compatible_steps": compatible,
+                "reviewers": reviewers,
+                "preview_hash": preview_hash,
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        return Ok((vec![claim.id], true));
+    }
+
+    let predecessor_id = generation_id_from_subject(&current.generation).to_owned();
+    let predecessor_subject = current.generation.clone();
+    let generation_id = Uuid::now_v7().simple().to_string();
+    let generation_subject = format!("run-generation/{generation_id}");
+    let now = now_ms();
+    transaction
+        .execute(
+            "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?7)",
+            params![generation_id, run_id, next.revision, predecessor_id, actor, operation.reason, now.to_string()],
+        )
+        .map_err(internal)?;
+    let mut variables = variables;
+    variables.insert("ST_RUN_GENERATION".into(), generation_id.clone());
+    let mut flat = Vec::new();
+    flatten_steps(&next, None, &mut flat);
+    let mut claim_ids = Vec::new();
+    for (step, selector) in flat {
+        let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
+        let subject = format!("step-run/{generation_id}/{}", step.path);
+        let carried = compatible
+            .contains(&step.path)
+            .then(|| current.steps.iter().find(|old| old.step == step.path))
+            .flatten();
+        let attempt = carried.map(|old| old.attempt).unwrap_or(1);
+        let mut step_variables = variables.clone();
+        step_variables.insert("ST_STEP".into(), step.path.clone());
+        step_variables.insert("ST_STEP_RUN".into(), subject.clone());
+        step_variables.insert("ST_ATTEMPT".into(), attempt.to_string());
+        step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
+        step_variables.insert(
+            "ST_PARENT_STEP_RUN".into(),
+            crate::plan::parent_step_path(&next, &step.path)
+                .map(|path| format!("step-run/{generation_id}/{path}"))
+                .or_else(|| current.parent_step_run.clone())
+                .unwrap_or_default(),
+        );
+        let title = step
+            .title
+            .as_deref()
+            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .transpose()?;
+        let goals = interpolate_goals(&step.goals, &step_variables)?;
+        let status = carried
+            .map(|old| match old.status.as_str() {
+                "claimed" | "working" | "verifying" => "ready",
+                value => value,
+            })
+            .unwrap_or("pending");
+        let worker_reported = carried.is_some_and(|old| old.worker_reported && status != "ready");
+        let blocked_reason = carried.and_then(|old| old.blocked_reason.as_deref());
+        let not_before = carried
+            .and_then(|old| old.not_before_unix_ms)
+            .map(|value| value.to_string());
+        transaction
+            .execute(
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string()],
+            )
+            .map_err(internal)?;
+        if let Some(old) = carried {
+            let claim = append_claim_tx(
+                transaction,
+                origin,
+                &subject,
+                "step-run.carried",
+                Some(&actor),
+                &json!({"fields": {
+                    "source_step_run": old.subject,
+                    "source_generation": predecessor_subject,
+                    "status": status,
+                    "attempt": attempt,
+                    "worker_reported": worker_reported
+                }}),
+                &[],
+                Some(batch_id),
+            )
+            .map_err(internal)?;
+            claim_ids.push(claim.id);
+        }
+    }
+    cancel_descendant_plan_runs_tx(transaction, origin, &predecessor_id, &actor, now)?;
+    transaction
+        .execute(
+            "UPDATE run_generations SET status='superseded', updated_at_unix_ms=?2 WHERE id=?1",
+            params![predecessor_id, now.to_string()],
+        )
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+            params![run_id, generation_id, now.to_string()],
+        )
+        .map_err(internal)?;
+    let superseded = append_claim_tx(
+        transaction,
+        origin,
+        &predecessor_subject,
+        "run-generation.superseded",
+        Some(&actor),
+        &json!({"fields": {
+            "status": "superseded",
+            "successor": generation_subject,
+            "reason": operation.reason,
+        }}),
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)?;
+    claim_ids.push(superseded.id);
+    let created = append_claim_tx(
+        transaction,
+        origin,
+        &generation_subject,
+        "run-generation.created",
+        Some(&actor),
+        &json!({"fields": {
+            "run": current.subject,
+            "revision": next.revision,
+            "predecessor": predecessor_subject,
+            "status": "running",
+            "reason": operation.reason,
+            "compatible_steps": compatible,
+        }}),
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)?;
+    claim_ids.push(created.id);
+    Ok((claim_ids, false))
+}
+
+fn reset_declared_runtime_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    declaration: &PlanRunDeclaration,
+    operation: &RuntimeResetOperation,
+    runtime: &str,
+    batch_id: &str,
+) -> Result<ClaimRecord, St3Error> {
+    let current_generation = transaction
+        .query_row(
+            "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+            [declaration
+                .subject
+                .strip_prefix("plan-run/")
+                .unwrap_or(&declaration.subject)],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(internal)?;
+    if generation_id_from_subject(&operation.from_generation) != current_generation {
+        return Err(St3Error::new(
+            "stale-run-generation",
+            format!("reset `{}` names a stale run generation", operation.id),
+        ));
+    }
+    let desired = current_desired_row_tx(transaction, runtime)
+        .map_err(internal)?
+        .ok_or_else(|| {
+            St3Error::new(
+                "runtime-not-desired",
+                format!("runtime `{runtime}` has no selected desired state"),
+            )
+        })?;
+    if !matches!(desired.kind.as_str(), "agent" | "exec" | "pty") {
+        return Err(St3Error::new(
+            "not-a-runtime",
+            format!("subject `{runtime}` is not an agent, exec, or PTY runtime"),
+        ));
+    }
+    let actual = latest_actual(transaction, runtime)
+        .map_err(internal)?
+        .ok_or_else(|| {
+            St3Error::new(
+                "runtime-not-incarnated",
+                format!("runtime `{runtime}` has no current incarnation"),
+            )
+        })?;
+    let incarnation = actual
+        .get("fields")
+        .unwrap_or(&actual)
+        .get("incarnation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            St3Error::new(
+                "runtime-not-incarnated",
+                format!("runtime `{runtime}` has no current incarnation"),
+            )
+        })?;
+    append_claim_tx(
+        transaction,
+        origin,
+        runtime,
+        "runtime.restart-window-reset",
+        None,
+        &json!({"fields": {
+            "desired_token": desired.claim_id,
+            "incarnation_id": incarnation,
+            "reason": operation.reason,
+        }}),
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)
+}
+
+fn request_declared_resource_refresh_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    operation: &ResourceRefreshOperation,
+    batch_id: &str,
+) -> Result<Vec<String>, St3Error> {
+    let desired = {
+        let mut statement = transaction
+            .prepare("SELECT subject, body, revision FROM desired WHERE kind='observer'")
+            .map_err(internal)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?
+    };
+    let observers = desired
+        .into_iter()
+        .filter_map(|(subject, body, revision)| {
+            serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|desired| crate::graph::observer_spec(&desired))
+                .filter(|spec| !spec.stopped && spec.resource == operation.resource)
+                .map(|_| (subject, revision))
+        })
+        .collect::<Vec<_>>();
+    if observers.is_empty() {
+        return Err(St3Error::new(
+            "resource-not-observed",
+            format!("resource `{}` has no active observer", operation.resource),
+        ));
+    }
+    let now = now_ms();
+    let mut claims = Vec::new();
+    for (observer, revision) in observers {
+        let attempt = hex::encode(Sha256::digest(format!(
+            "st3.resource-refresh.v1\0{}\0{}\0{}",
+            operation.resource, operation.id, observer
+        )));
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &observer,
+            "observer.state",
+            None,
+            &json!({"fields": {
+                "state": "healthy",
+                "reason": "published refresh",
+                "revision": revision,
+                "attempt": attempt,
+                "next_check_unix_ms": now,
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claims.push(claim.id);
+    }
+    Ok(claims)
+}
+
+fn apply_planning_session_declaration_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    declaration: &PlanningSessionDeclaration,
+    batch_id: &str,
+    actor: Option<&str>,
+    receipts: &mut Vec<PlannedAction>,
+) -> Result<Vec<String>, St3Error> {
+    let id = declaration
+        .subject
+        .strip_prefix("planning-session/")
+        .unwrap_or(&declaration.subject);
+    let mut claim_ids = Vec::new();
+    let mut exists = transaction
+        .query_row(
+            "SELECT requester, status FROM planning_sessions WHERE id=?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    if exists.is_none()
+        && let Some(creation) = &declaration.creation
+    {
+        let planner = crate::graph::planning_planner_subject(&declaration.subject);
+        transaction
+            .execute(
+                "INSERT INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
+                params![
+                    id,
+                    creation.plan,
+                    creation.request,
+                    creation.workspace,
+                    creation.requester,
+                    planner,
+                    creation.target_run.as_deref().map(|value| value.strip_prefix("plan-run/").unwrap_or(value)),
+                    creation.target_generation.as_deref().map(|value| value.strip_prefix("run-generation/").unwrap_or(value)),
+                    now_ms().to_string(),
+                ],
+            )
+            .map_err(internal)?;
+        let mut fields = serde_json::Map::from_iter([
+            (
+                "plan".into(),
+                Value::String(format!("plan/{}", creation.plan)),
+            ),
+            ("request".into(), Value::String(creation.request.clone())),
+            ("planner".into(), Value::String(planner.clone())),
+            (
+                "workspace".into(),
+                Value::String(creation.workspace.clone()),
+            ),
+            (
+                "requester".into(),
+                Value::String(creation.requester.clone()),
+            ),
+        ]);
+        if let Some(run) = &creation.target_run {
+            fields.insert("target_run".into(), Value::String(run.clone()));
+        }
+        if let Some(generation) = &creation.target_generation {
+            fields.insert(
+                "target_generation".into(),
+                Value::String(generation.clone()),
+            );
+        }
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &declaration.subject,
+            "planning-session.started",
+            Some(&creation.requester),
+            &json!({"fields": fields}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claim_ids.push(claim.id);
+        receipts.push(PlannedAction {
+            subject: declaration.subject.clone(),
+            action: "start-planning".into(),
+            reason: "the named planning session was created".into(),
+        });
+        exists = Some((creation.requester.clone(), "planning".into()));
+    }
+    let Some((requester, mut status)) = exists else {
+        return Err(St3Error::new(
+            "missing-planning-session",
+            format!("planning session `{}` does not exist", declaration.subject),
+        ));
+    };
+    let actor = actor.map(normalize_actor_for_publication);
+    if (!declaration.feedback.is_empty() || !declaration.cancellations.is_empty())
+        && actor.as_deref() != Some(requester.as_str())
+    {
+        return Err(St3Error::new(
+            "planning-review-not-authorized",
+            format!(
+                "the publication actor cannot change planning session `{}`",
+                declaration.subject
+            ),
+        ));
+    }
+    for feedback in declaration.feedback.values() {
+        if !publication_operation_is_new(
+            transaction,
+            &declaration.subject,
+            "feedback",
+            &feedback.id,
+            feedback,
+        )? {
+            continue;
+        }
+        if !matches!(status.as_str(), "review" | "revision-requested") {
+            return Err(St3Error::new(
+                "invalid-planning-transition",
+                format!(
+                    "planning session `{}` cannot accept feedback while {status}",
+                    declaration.subject
+                ),
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE planning_sessions SET status='revision-requested', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, now_ms().to_string()],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute("DELETE FROM planning_previews WHERE session_id=?1", [id])
+            .map_err(internal)?;
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &declaration.subject,
+            "planning-session.revision-requested",
+            actor.as_deref(),
+            &json!({"fields": {
+                "feedback": feedback.document,
+                "variant": feedback.variant,
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claim_ids.push(claim.id);
+        let message_subject = format!(
+            "message/{}",
+            &hex::encode(Sha256::digest(
+                format!("{}:feedback:{}", declaration.subject, feedback.id).as_bytes()
+            ))[..16]
+        );
+        let planner = crate::graph::planning_planner_subject(&declaration.subject);
+        let message = append_claim_tx(
+            transaction,
+            origin,
+            &message_subject,
+            "message.sent",
+            actor.as_deref(),
+            &json!({"fields": {
+                "from": actor,
+                "to": planner,
+                "content": feedback.document,
+                "status": "sent",
+                "title": "Planning feedback",
+                "in_reply_to": Value::Null,
+                "tags": ["planning"],
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claim_ids.push(message.id);
+        receipts.push(PlannedAction {
+            subject: declaration.subject.clone(),
+            action: format!("feedback:{}", feedback.id),
+            reason: "the planning feedback was published".into(),
+        });
+        let receipt = append_publication_operation_tx(
+            transaction,
+            origin,
+            &declaration.subject,
+            "feedback",
+            &feedback.id,
+            feedback,
+            actor.as_deref(),
+            batch_id,
+        )?;
+        claim_ids.push(receipt.id);
+        status = "revision-requested".into();
+    }
+    for cancellation in declaration.cancellations.values() {
+        if !publication_operation_is_new(
+            transaction,
+            &declaration.subject,
+            "cancellation",
+            &cancellation.id,
+            cancellation,
+        )? {
+            continue;
+        }
+        if status == "cancelled" {
+            let receipt = append_publication_operation_tx(
+                transaction,
+                origin,
+                &declaration.subject,
+                "cancellation",
+                &cancellation.id,
+                cancellation,
+                actor.as_deref(),
+                batch_id,
+            )?;
+            claim_ids.push(receipt.id);
+            receipts.push(PlannedAction {
+                subject: declaration.subject.clone(),
+                action: format!("cancel:{}", cancellation.id),
+                reason: "the planning session was already cancelled".into(),
+            });
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE planning_sessions SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, now_ms().to_string()],
+            )
+            .map_err(internal)?;
+        let claim = append_claim_tx(
+            transaction,
+            origin,
+            &declaration.subject,
+            "planning-session.cancelled",
+            actor.as_deref(),
+            &json!({"fields": {
+                "reason": cancellation.reason,
+                "requester": requester,
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claim_ids.push(claim.id);
+        receipts.push(PlannedAction {
+            subject: declaration.subject.clone(),
+            action: format!("cancel:{}", cancellation.id),
+            reason: cancellation.reason.clone(),
+        });
+        let receipt = append_publication_operation_tx(
+            transaction,
+            origin,
+            &declaration.subject,
+            "cancellation",
+            &cancellation.id,
+            cancellation,
+            actor.as_deref(),
+            batch_id,
+        )?;
+        claim_ids.push(receipt.id);
+        status = "cancelled".into();
+    }
+    Ok(claim_ids)
+}
+
+fn normalize_actor_for_publication(actor: &str) -> String {
+    if actor.contains('/') {
+        actor.to_owned()
+    } else {
+        format!("person/{actor}")
+    }
+}
+
 #[derive(Clone)]
 struct DesiredRow {
     kind: String,
@@ -4797,7 +6429,7 @@ struct DesiredRow {
 }
 
 fn resolve_plan_run_inputs(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     plan: &PlanSpec,
     supplied: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, PlanRunInput>, St3Error> {
@@ -4886,7 +6518,7 @@ fn resolve_plan_run_inputs(
 }
 
 fn enforce_plan_run_capacity(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     requested: &PlanSpec,
 ) -> Result<(), St3Error> {
     let mut statement = transaction
@@ -5359,6 +6991,79 @@ fn operation_id_for_key(key: &str) -> String {
             [b"st3.idempotency.v1\0".as_slice(), key.as_bytes()].concat()
         ))
     )
+}
+
+fn publication_operation_key(subject: &str, action: &str, id: &str) -> String {
+    operation_id_for_key(&format!("st3.publish.v1\0{subject}\0{action}\0{id}"))
+}
+
+fn publication_operation_digest<T: Serialize>(
+    subject: &str,
+    action: &str,
+    value: &T,
+) -> Result<String, St3Error> {
+    canonical_hash(&("st3.publish-operation.v1", subject, action, value)).map_err(internal)
+}
+
+fn publication_operation_is_new<T: Serialize>(
+    connection: &Connection,
+    subject: &str,
+    action: &str,
+    id: &str,
+    value: &T,
+) -> Result<bool, St3Error> {
+    let operation_id = publication_operation_key(subject, action, id);
+    let digest = publication_operation_digest(subject, action, value)?;
+    match operation_tx(connection, &operation_id).map_err(internal)? {
+        None => Ok(true),
+        Some((stored, _, state)) if state == "active" && stored == digest => Ok(false),
+        Some((_, _, state)) if state == "conflict" => Err(St3Error::new(
+            "idempotency-conflict",
+            format!("operation `{id}` has conflicting replicated claims"),
+        )),
+        Some(_) => Err(St3Error::new(
+            "immutable-operation-id",
+            format!("operation `{id}` repeats with different content"),
+        )),
+    }
+}
+
+fn append_publication_operation_tx<T: Serialize>(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    action: &str,
+    id: &str,
+    value: &T,
+    actor: Option<&str>,
+    batch_id: &str,
+) -> Result<ClaimRecord, St3Error> {
+    let operation_id = publication_operation_key(subject, action, id);
+    let request_digest = publication_operation_digest(subject, action, value)?;
+    let body = json!({
+        "fields": {
+            "operation": id,
+            "action": action,
+            "status": "accepted",
+        },
+        "_operation": {
+            "id": operation_id,
+            "request_digest": request_digest,
+        },
+    });
+    let claim = append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "publication.operation",
+        actor,
+        &body,
+        &[],
+        Some(batch_id),
+    )
+    .map_err(internal)?;
+    register_operation_tx(transaction, &claim).map_err(internal)?;
+    Ok(claim)
 }
 
 fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>> {
@@ -6229,6 +7934,24 @@ fn canonical_child_string(value: &Value, name: &str) -> Option<String> {
         .first()?
         .as_str()
         .map(str::to_owned)
+}
+
+fn canonical_child_strings(value: &Value, name: &str) -> Vec<String> {
+    value
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some(name))
+        .filter_map(|child| {
+            child
+                .get("arguments")
+                .and_then(Value::as_array)
+                .and_then(|arguments| arguments.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<(), St3Error> {
@@ -7368,7 +9091,7 @@ fn plan_header_hash(plan: &PlanSpec) -> Result<String, St3Error> {
         "human_only": plan.revisions_human_only,
         "reviewer": plan.revision_reviewer,
         "cutover": plan.revision_cutover,
-        "subgraph": plan.subgraph_kdl,
+        "declarations": plan.declarations_kdl,
         "work_selector": plan.work_selector,
         "completion": plan.completion,
         "goals": plan.goals,
@@ -8143,7 +9866,7 @@ mod tests {
 
     fn simple(command: &str) -> NormalizedIntent {
         parse_intent(
-            &format!("version 2\nsubgraph {{ exec \"work\" {{ command {command:?}; restart \"never\" }} }}"),
+            &format!("version 2\n exec \"work\" {{ command {command:?}; restart \"never\" }} "),
             "node",
         )
         .expect("intent")
@@ -8218,15 +9941,356 @@ mod tests {
     }
 
     #[test]
+    fn direct_publication_is_additive_atomic_and_operation_ids_are_immutable() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plan = publish_plan(
+            &store,
+            "version 2\nplan \"lifecycle\" state=\"ready\" { goal \"Remain open.\" }",
+            "publish-lifecycle",
+        );
+        let creation = format!(
+            "version 2\nplan-run \"lifecycle/demo\" {{\n  plan {:?}\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
+            format!("plan/lifecycle@{}", plan.revision),
+            workspace.path().display().to_string(),
+        );
+        let intent = crate::graph::parse_intent(&creation, "node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: creation.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let created = store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "create-lifecycle-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(created.changed);
+        assert!(
+            created
+                .operations
+                .iter()
+                .any(|operation| operation.action == "start-plan-run")
+        );
+
+        let replay_preview = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: creation,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let replay = store
+            .apply_as(
+                &intent,
+                &replay_preview.subject_tokens,
+                "replay-lifecycle-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(!replay.changed);
+
+        let omitted_source =
+            "version 2\nplan \"unrelated\" state=\"ready\" { goal \"Do other work.\" }\n";
+        let omitted = crate::graph::parse_intent(omitted_source, "node").unwrap();
+        let omitted_preview = store
+            .plan(
+                &omitted,
+                IntentInput {
+                    kdl: omitted_source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let omission = store
+            .apply_as(
+                &omitted,
+                &omitted_preview.subject_tokens,
+                "omit-existing-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(omission.changed);
+        assert!(store.plan_run("lifecycle/demo").unwrap().is_some());
+
+        let atomic_failure = r#"version 2
+plan-run "lifecycle/demo" {
+  cancellation "stop" { reason "stop the run" }
+}
+resource "missing" {
+  refresh "now" { timeout "1s" }
+}
+"#;
+        let atomic_intent = crate::graph::parse_intent(atomic_failure, "node").unwrap();
+        let atomic_preview = store
+            .plan(
+                &atomic_intent,
+                IntentInput {
+                    kdl: atomic_failure.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(!atomic_preview.blockers.is_empty());
+        let error = store
+            .apply_as(
+                &atomic_intent,
+                &atomic_preview.subject_tokens,
+                "atomic-failure",
+                Some("person/operator"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "resource-not-observed");
+        assert_eq!(
+            store.plan_run("lifecycle/demo").unwrap().unwrap().phase,
+            "normal"
+        );
+
+        let cancellation = r#"version 2
+plan-run "lifecycle/demo" {
+  cancellation "stop" { reason "stop the run" }
+}
+"#;
+        let cancel_intent = crate::graph::parse_intent(cancellation, "node").unwrap();
+        let cancel_preview = store
+            .plan(
+                &cancel_intent,
+                IntentInput {
+                    kdl: cancellation.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let cancelled = store
+            .apply_as(
+                &cancel_intent,
+                &cancel_preview.subject_tokens,
+                "cancel-lifecycle-run",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(cancelled.changed);
+        let replay_preview = store
+            .plan(
+                &cancel_intent,
+                IntentInput {
+                    kdl: cancellation.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let replay = store
+            .apply_as(
+                &cancel_intent,
+                &replay_preview.subject_tokens,
+                "replay-cancellation",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(!replay.changed);
+
+        let changed_id = r#"version 2
+plan-run "lifecycle/demo" {
+  cancellation "stop" { reason "a different reason" }
+}
+"#;
+        let changed_intent = crate::graph::parse_intent(changed_id, "node").unwrap();
+        let changed_preview = store
+            .plan(
+                &changed_intent,
+                IntentInput {
+                    kdl: changed_id.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            changed_preview
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("different content"))
+        );
+    }
+
+    #[test]
+    fn a_declared_planning_session_creates_its_session_and_planner_atomically() {
+        let store = Store::open_memory("node").unwrap();
+        let request = store
+            .put_document(
+                "doc/planning/release/request",
+                b"Plan the release.",
+                &None,
+                "planning-request",
+            )
+            .unwrap();
+        let source = format!(
+            r#"version 2
+planning-session "planning/release/one" {{
+  plan "release"
+  request "{}@{}"
+  workspace "/work/release"
+  requester "person/operator"
+  planner "codex" {{ model "gpt-5.6-sol"; effort "medium" }}
+}}
+"#,
+            request.name, request.hash
+        );
+        let intent = crate::graph::parse_intent(&source, "node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: source.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+        let applied = store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "planning-session-publication",
+                Some("person/operator"),
+            )
+            .unwrap();
+        let session = store
+            .planning_session("planning/release/one")
+            .unwrap()
+            .unwrap();
+        let planner =
+            crate::graph::planning_planner_subject("planning-session/planning/release/one");
+        assert_eq!(session.status, "planning");
+        assert_eq!(session.planner, planner);
+        assert!(
+            applied
+                .operations
+                .iter()
+                .any(|operation| operation.action == "start-planning")
+        );
+        assert!(store.selected_desired_token(&planner).unwrap().is_some());
+
+        let replay_preview = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let replay = store
+            .apply_as(
+                &intent,
+                &replay_preview.subject_tokens,
+                "planning-session-replay",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(!replay.changed);
+    }
+
+    #[test]
+    fn a_declared_human_revision_creates_and_approves_one_proposal() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let initial = publish_plan(
+            &store,
+            r#"version 2
+plan "reviewed" state="ready" revisions="human-only" {
+  goal "Use the initial definition."
+  step "work" { agentless }
+}
+"#,
+            "publish-reviewed-initial",
+        );
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: initial.id.clone(),
+                revision: Some(initial.revision.clone()),
+                workspace: workspace.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-reviewed".into(),
+            })
+            .unwrap();
+        let candidate = publish_plan(
+            &store,
+            r#"version 2
+plan "reviewed" state="ready" revisions="human-only" {
+  goal "Use the reviewed definition."
+  step "work" { agentless }
+}
+"#,
+            "publish-reviewed-candidate",
+        );
+        let revision = format!(
+            "version 2\nplan-run {:?} {{\n  revision \"review-one\" {{\n    plan {:?}\n    from {:?}\n    reason \"the definition needs review\"\n  }}\n}}\n",
+            run.subject,
+            format!("plan/{}@{}", candidate.id, candidate.revision),
+            run.generation,
+        );
+        let intent = crate::graph::parse_intent(&revision, "node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                IntentInput {
+                    kdl: revision,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let applied = store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "declare-reviewed-revision",
+                Some("person/operator"),
+            )
+            .unwrap();
+        assert!(
+            applied
+                .operations
+                .iter()
+                .any(|operation| { operation.action == "propose-revision:review-one" })
+        );
+        let proposal = store.revision_proposal_for_run(&run.id).unwrap().unwrap();
+        assert_eq!(proposal.status, "pending-approval");
+        assert_eq!(proposal.reviewers, ["person/operator"]);
+
+        let approved = store
+            .approve_revision_proposal(
+                &proposal.id,
+                "person/operator",
+                proposal.preview_hash.as_deref().unwrap(),
+                "approve-reviewed-revision",
+            )
+            .unwrap();
+        assert_eq!(approved.status, "applied");
+        assert_eq!(approved.plan_run.revision, candidate.revision);
+        assert_ne!(approved.plan_run.generation, run.generation);
+    }
+
+    #[test]
     fn a_plan_response_reports_the_server_normalized_revision() {
         let source = r#"
 version 2
-subgraph {
+
   plan "portable" state="ready" {
     goal "Keep one worker available."
-    subgraph { agent "worker" { workspace "."; command "true" } }
+     agent "worker" { workspace "."; command "true" }
   }
-}
+
 "#;
         let server_intent = crate::graph::parse_intent(source, "server-node").unwrap();
         let client_intent = crate::graph::parse_intent(source, "local").unwrap();
@@ -8257,7 +10321,7 @@ subgraph {
             &store,
             r#"
 version 2
-subgraph {
+
   resource "source" { kind "custom.st3.document-source" }
   plan "inputs" state="ready" {
     input "message" kind="text"
@@ -8265,7 +10329,7 @@ subgraph {
     goal "Use the supplied values."
     step "work" { agentless; goal "Write ${input.message}."; gate "source state" { field "state" "${input.source}" is "ready" } }
   }
-}
+
 "#,
             "publish-input-plan",
         );
@@ -8353,13 +10417,13 @@ subgraph {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
-subgraph {
+
   plan "parent" state="ready" { goal "Keep the parent run open." }
   plan "child" state="ready" {
     input "message" kind="text"
     goal "Use the supplied message."
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
@@ -8407,12 +10471,12 @@ subgraph {
             &store,
             r#"
 version 2
-subgraph {
+
   plan "revision-input" state="ready" {
     input "message" kind="text"
     goal "Use the supplied message."
   }
-}
+
 "#,
             "publish-revision-input",
         );
@@ -8431,12 +10495,12 @@ subgraph {
             &store,
             r#"
 version 2
-subgraph {
+
   plan "revision-input" state="ready" {
     input "source" kind="resource"
     goal "Use the supplied resource."
   }
-}
+
 "#,
             "publish-changed-revision-input",
         );
@@ -8458,7 +10522,7 @@ subgraph {
         let first = publish_plan(
             &store,
             r#"version 2
-subgraph { plan "bounded" state="ready" { concurrent-runs max=3; goal "Keep this run open." } }"#,
+ plan "bounded" state="ready" { concurrent-runs max=3; goal "Keep this run open." } "#,
             "bounded-three",
         );
         for index in 1..=2 {
@@ -8477,7 +10541,7 @@ subgraph { plan "bounded" state="ready" { concurrent-runs max=3; goal "Keep this
         let second = publish_plan(
             &store,
             r#"version 2
-subgraph { plan "bounded" state="ready" { concurrent-runs max=1; goal "Keep one run open." } }"#,
+ plan "bounded" state="ready" { concurrent-runs max=1; goal "Keep one run open." } "#,
             "bounded-one",
         );
         assert_eq!(store.active_plan_runs_for_plan("bounded").unwrap().len(), 2);
@@ -8499,7 +10563,7 @@ subgraph { plan "bounded" state="ready" { concurrent-runs max=1; goal "Keep one 
         let plan = publish_plan(
             &unlimited,
             r#"version 2
-subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all runs." } }"#,
+ plan "unlimited" state="ready" { concurrent-runs; goal "Allow all runs." } "#,
             "unlimited-plan",
         );
         for index in 1..=3 {
@@ -8569,7 +10633,7 @@ subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all run
         assert_ne!(old.hash, new.hash);
         let intent = parse_intent(
             &format!(
-                "version 2\nsubgraph {{ person \"worker\"; message \"task\" {{ to \"person/worker\"; content \"doc/task@{}\"; }} }}",
+                "version 2\n person \"worker\"; message \"task\" {{ to \"person/worker\"; content \"doc/task@{}\"; }} ",
                 old.hash
             ),
             "node",
@@ -8667,7 +10731,7 @@ subgraph { plan "unlimited" state="ready" { concurrent-runs; goal "Allow all run
     fn replication_carries_runnable_plan_definitions() {
         let source = Store::open_memory("source").unwrap();
         let kdl = r#"version 2
-subgraph { plan "remote" state="ready" { goal "Run remote work."; step "work" { } } }"#;
+ plan "remote" state="ready" { goal "Run remote work."; step "work" { } } "#;
         let intent = parse_intent(kdl, "source").unwrap();
         let planned = source
             .plan(
@@ -8707,12 +10771,12 @@ subgraph { plan "remote" state="ready" { goal "Run remote work."; step "work" { 
         let controller = Store::open_memory("controller").unwrap();
         let kdl = r#"
 version 2
-subgraph {
+
   plan "remote-work" state="ready" {
     goal "Complete plan remote-work."
     step "work" { assigned-to "agent/worker.one" }
   }
-}
+
 "#;
         let intent = parse_intent(kdl, "controller").unwrap();
         let planned = controller
@@ -8785,7 +10849,7 @@ subgraph {
             let kdl = format!(
                 r#"
 version 2
-subgraph {{
+
   agent "owner" {{ workspace "."; command "true" }}
   plan "lineage" state="ready" {{
     goal "Replicate generation lineage."
@@ -8795,7 +10859,7 @@ subgraph {{
     }}
     step "stable" {{ goal "Carry stable work." }}
   }}
-}}
+
 "#
             );
             let intent = parse_intent(&kdl, "source").unwrap();
@@ -8892,13 +10956,13 @@ subgraph {{
             let kdl = format!(
                 r#"
 version 2
-subgraph {{
+
   agent "owner" {{ workspace "."; command "true" }}
   plan "proposal" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
     goal "Replicate a revision proposal."
     step "work" {{ goal {goal:?} }}
   }}
-}}
+
 "#
             );
             let intent = parse_intent(&kdl, "source").unwrap();
@@ -9283,7 +11347,7 @@ subgraph {{
         let intent = crate::graph::parse_test_intent(
             r#"
 version 2
-subgraph {
+
   agent "mix.sup" {
     workspace "/work"
     command "sleep 60"
@@ -9294,7 +11358,7 @@ subgraph {
     to "mix.sup"
     content "work"
   }
-}
+
 "#,
             "local",
         )
@@ -9402,12 +11466,12 @@ subgraph {
         let intent = crate::graph::parse_test_intent(
             r#"
 version 2
-subgraph {
+
   plan "lease" state="ready" {
     goal "Complete plan lease."
     step "work" { assigned-to "agent/worker" }
   }
-}
+
 "#,
             "node",
         )
@@ -9505,7 +11569,7 @@ subgraph {
         };
         publish(
             r#"version 2
-subgraph {
+
   plan "bootstrap" state="ready" {
     goal "Complete plan bootstrap."
     step "compile" {
@@ -9514,12 +11578,12 @@ subgraph {
       plan "work" { goal "Complete plan work."; step "publish" { } }
     }
   }
-}"#,
+"#,
             "nested-output-bootstrap",
         );
         publish(
             r#"version 2
-subgraph { plan "project/work" state="ready" { goal "Run project work."; step "work" { } } }"#,
+ plan "project/work" state="ready" { goal "Run project work."; step "work" { } } "#,
             "nested-output-plan",
         );
         let plan = store.plan_spec("project/work", None).unwrap().unwrap();
@@ -9607,7 +11671,7 @@ subgraph { plan "project/work" state="ready" { goal "Run project work."; step "w
         };
         publish(
             r#"version 2
-subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } } }"#,
+ plan "retry" state="ready" { goal "Run retry work."; step "work" { } } "#,
             "retry-plan",
         );
         let run = store
@@ -9652,7 +11716,7 @@ subgraph { plan "retry" state="ready" { goal "Run retry work."; step "work" { } 
         let first = publish(
             r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "revision" state="ready" {
     goal "Complete plan revision."
@@ -9660,7 +11724,7 @@ subgraph {
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
   }
-}
+
 "#,
             "revision-one",
         );
@@ -9683,7 +11747,7 @@ subgraph {
         let second = publish(
             r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "revision" state="ready" {
     goal "Complete plan revision."
@@ -9691,7 +11755,7 @@ subgraph {
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
   }
-}
+
 "#,
             "revision-two",
         );
@@ -9736,7 +11800,7 @@ subgraph {
         let first = publish(
             r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "generation" state="ready" {
     goal "Test immutable generations."
@@ -9748,7 +11812,7 @@ subgraph {
       goal "Depend on the changed step."
     }
   }
-}
+
 "#,
             "generation-one",
         );
@@ -9797,7 +11861,7 @@ subgraph {
         let second = publish(
             r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "generation" state="ready" {
     goal "Test immutable generations."
@@ -9809,7 +11873,7 @@ subgraph {
       goal "Depend on the changed step."
     }
   }
-}
+
 "#,
             "generation-two",
         );
@@ -9895,12 +11959,12 @@ subgraph {
         let first = publish(
             r#"
 version 2
-subgraph {
+
   plan "authority" state="ready" {
     goal "Keep revision authority structural."
     step "work" { assigned-to "agent/node.worker"; goal "Use the first goal." }
   }
-}
+
 "#,
             "authority-one",
         );
@@ -9918,16 +11982,16 @@ subgraph {
         let escalated = publish(
             r#"
 version 2
-subgraph {
+
   plan "authority" state="ready" {
     goal "Keep revision authority structural."
     step "work" {
       assigned-to "agent/node.worker"
       goal "Use the second goal."
-      subgraph { agent "worker" { workspace "."; command "true" } }
+       agent "worker" { workspace "."; command "true" }
     }
   }
-}
+
 "#,
             "authority-two",
         );
@@ -9949,14 +12013,14 @@ subgraph {
             let source = format!(
                 r#"
 version 2
-subgraph {{
+
   plan "contract" state="ready" {{
     goal "Use the current plan contract."
     {selector}
     {completion}
     step "work" {{ }}
   }}
-}}
+
 "#
             );
             parse_intent(&source, "node").unwrap().plans["contract"].clone()
@@ -9995,16 +12059,16 @@ subgraph {{
             let source = format!(
                 r#"
 version 2
-subgraph {{
+
   plan "protected" state="ready" revisions="human-only" revision-reviewer="person/plan-reviewer" {{
     goal "Test protected revision."
-    subgraph {{ agent "worker" {{ workspace "."; command "true" }} }}
+     agent "worker" {{ workspace "."; command "true" }}
     step "work" revisions="human-only" revision-reviewer="person/step-reviewer" {{
       assigned-to "agent/worker"
       goal {goal:?}
     }}
   }}
-}}
+
 "#
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
@@ -10103,12 +12167,12 @@ subgraph {{
             let source = format!(
                 r#"
 version 2
-subgraph {{
+
   plan "protected" state="ready" revisions="human-only" {{
     goal "Test revision cancellation."
     step "work" {{ goal {goal:?} }}
   }}
-}}
+
 "#
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
@@ -10202,14 +12266,14 @@ subgraph {{
             let source = format!(
                 r#"
 version 2
-subgraph {{
+
   agent "worker" {{ workspace "."; command "true" }}
   plan "drain" state="ready"{cutover} {{
     goal "Test a drained cutover."
     step "active" {{ assigned-to "agent/worker"; goal "Keep active work." }}
     step "waiting" {{ assigned-to "agent/worker"; goal {goal:?} }}
   }}
-}}
+
 "#
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
@@ -10259,13 +12323,13 @@ subgraph {{
         };
         let child_source = r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "drain-child" state="ready" {
     goal "Keep descendant work in the idle boundary."
     step "active" { assigned-to "agent/worker" }
   }
-}
+
 "#;
         let child_intent = crate::graph::parse_test_intent(child_source, "node").unwrap();
         let child_planned = store
@@ -10384,7 +12448,7 @@ subgraph {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "."; command "true" }
   plan "cancel" state="ready" {
     goal "Cancel this plan through the graph."
@@ -10392,7 +12456,7 @@ subgraph {
     step "work" { assigned-to "agent/node.worker" }
     finally { step "cleanup" { agentless } }
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
@@ -10466,12 +12530,12 @@ subgraph {
             .unwrap();
         let child_source = r#"
 version 2
-subgraph {
+
   plan "cancel-child" state="ready" {
     goal "Cancel with the parent run."
     step "child-work" { agentless }
   }
-}
+
 "#;
         let child_intent = parse_intent(child_source, "node").unwrap();
         let child_planned = store
@@ -10507,7 +12571,7 @@ subgraph {
             )
             .unwrap();
         let cancellation = format!(
-            "version 2\nsubgraph {{ plan-run {:?} {{ cancel reason=\"the test cancelled the run\" }} }}\n",
+            "version 2\n plan-run {:?} {{ cancellation \"operator\" {{ reason \"the test cancelled the run\" }} }} \n",
             run.subject
         );
         let intent = parse_intent(&cancellation, "node").unwrap();
@@ -10595,7 +12659,7 @@ subgraph {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
-subgraph {
+
   agent "one" { workspace "."; command "true" }
   agent "two" { workspace "."; command "true" }
   resource "github/acme/demo/pull/1" { kind "vcs.pull-request" }
@@ -10625,7 +12689,7 @@ subgraph {
     on "state"
     delivery "message"
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
@@ -10766,7 +12830,7 @@ subgraph {
             .unwrap();
         assert_eq!(retry.message_subjects, changed.message_subjects);
         assert_eq!(store.messages(None, true).unwrap().len(), 2);
-        let stop_source = "version 2\nsubgraph { subscription \"one\" { stop } }\n";
+        let stop_source = "version 2\n subscription \"one\" { stop } \n";
         let stop_intent = parse_intent(stop_source, "node").unwrap();
         let stop_plan = store
             .plan(

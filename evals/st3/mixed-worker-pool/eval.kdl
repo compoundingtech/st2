@@ -1,6 +1,5 @@
 version 2
 
-subgraph {
   plan "eval/mixed-worker-pool" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "A Codex agent and a Claude agent each claim one step from the same explicit worker pool."
@@ -8,7 +7,6 @@ subgraph {
     step "start-pool" timeout="10m" {
       agentless
       title "Both pool agents are ready"
-      subgraph {
         agent "pool.codex" {
           workspace "${ST_WORKSPACE}"
           harness "codex" {
@@ -26,7 +24,6 @@ subgraph {
             args "--permission-mode" "bypassPermissions"
           }
         }
-      }
       gate "Codex is reachable" { field "reachability" "agent/${ST_PLAN_RUN}/pool.codex" "is" "reachable" }
       gate "Claude is reachable" { field "reachability" "agent/${ST_PLAN_RUN}/pool.claude" "is" "reachable" }
     }
@@ -60,4 +57,3 @@ subgraph {
       }
     }
   }
-}

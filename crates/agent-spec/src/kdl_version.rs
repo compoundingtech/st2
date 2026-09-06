@@ -71,7 +71,10 @@ mod tests {
             assert_eq!(ensure_st2_version(&document).unwrap(), version);
             assert!(ensure_st3_version(&document).is_err());
         }
-        let document: KdlDocument = "version 2\nsubgraph { agent \"worker\" }".parse().unwrap();
+        let document: KdlDocument =
+            "version 2\nplan \"work\" state=\"ready\" { goal \"Do the work.\" }"
+                .parse()
+                .unwrap();
         assert_eq!(ensure_st3_version(&document).unwrap(), 2);
         assert!(ensure_st2_version(&document).is_err());
     }

@@ -1,6 +1,5 @@
 version 2
 
-subgraph {
   plan "generation-proof" state="ready" revisions="human-only" {
     completion { when "all-steps-exhausted" }
     goal "Prove a live plan revision."
@@ -16,4 +15,3 @@ subgraph {
       gate "the changed result exists" { field "state" "resource/generation-proof/${ST_PLAN_RUN}/changed" "is" "done" }
     }
   }
-}

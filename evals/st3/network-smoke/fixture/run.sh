@@ -28,8 +28,8 @@ remove_test_ptys() {
 cleanup() {
   local failed=0
   if [ -S "$socket" ] && [ -n "$run_id" ]; then
-    printf 'version 2\nsubgraph { plan-run "plan-run/%s" { cancel reason="the fixture completed" } }\n' "$run_id" >stop.kdl
-    if st3 --endpoint "$socket" run stop.kdl >/dev/null 2>&1; then
+    printf 'version 2\nplan-run "%s" { cancellation "fixture-complete" { reason "the fixture completed" } }\n' "$run_id" >stop.kdl
+    if st3 --endpoint "$socket" publish stop.kdl --as person/fixture >/dev/null 2>&1; then
       wait_for_terminal_cleanup || failed=1
     else
       failed=1
@@ -57,23 +57,20 @@ st3 --endpoint "$socket" doctor >/dev/null
 printf 'NETWORK-SMOKE-HEALTH-GREEN\n' >result.txt
 cat >network.kdl <<KDL
 version 2
-subgraph {
-  plan "fixture/network-smoke" state="ready" {
-    goal "Keep one message target available."
-    subgraph {
-      agent "net.dev" {
-        workspace "$PWD"
-        command "sleep 300"
-        restart "on-failure"
-        exec "ding" {
-          argv "st3" "driver" "ding"
-        }
-      }
+plan "fixture/network-smoke" state="ready" {
+  goal "Keep one message target available."
+  agent "net.dev" {
+    workspace "$PWD"
+    command "sleep 300"
+    restart "on-failure"
+    exec "ding" {
+      argv "st3" "driver" "ding"
     }
   }
 }
 KDL
-run_id="$(st3 --endpoint "$socket" --json run network.kdl --detach | jq -er .id)"
+st3 --endpoint "$socket" publish network.kdl --as person/fixture >/dev/null
+run_id="$(st3 --endpoint "$socket" --json plan start fixture/network-smoke --workspace "$PWD" --as person/fixture | jq -er .plan_run.id)"
 agent="agent/$run_id/net.dev"
 for _ in $(seq 1 100); do st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null 2>&1 && break; sleep 0.05; done
 st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null

@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/restart-continuity" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/restart-continuity."
     step "start-team" timeout="10m" {
       title "The native Claude team is ready"
-      subgraph {
         agent "rc.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "claude" {
@@ -45,7 +43,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/rc.sup" }
       gate "condition-2" { exists "agent/${ST_PLAN_RUN}/rc.dev" }
     }
@@ -91,7 +88,6 @@ subgraph {
     step "inject-cold-restart" timeout="10m" {
       title "The worker cold-restarts and receives repeated work"
       depends-on { step "process-before-restart" completed }
-      subgraph {
         exec "eval/restart-continuity/inject" {
           host "local"
           workspace "${ST_WORKSPACE}/inj"
@@ -102,7 +98,6 @@ subgraph {
             CATALOG "${ST_WORKSPACE}"
           }
         }
-      }
       produces {
         resource "plan-run/${ST_PLAN_RUN}/restart" {
           kind "custom.st3.cold-restart"
@@ -255,4 +250,3 @@ subgraph {
     }
 
   }
-}

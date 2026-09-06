@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/resource-cold-start" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/resource-cold-start."
     step "contract" timeout="1m" {
       title "The cold resource becomes ready before delivery"
-      subgraph {
         exec "eval/resource-cold-start/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
@@ -15,7 +13,6 @@ subgraph {
           restart "never"
 
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/resource-cold-start/contract" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/resource-cold-start/contract" "is" 0 }
     }
@@ -33,4 +30,3 @@ subgraph {
     }
 
   }
-}

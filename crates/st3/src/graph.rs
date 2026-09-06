@@ -6,8 +6,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec, MessageTemplate,
-    NormalizedIntent, ObserverSpec, PlanRunCancellation, RestartIntensity, RestartType,
-    ScheduleSpec, St3Error, SubscriptionSpec,
+    NamedCancellation, NormalizedIntent, ObserverSpec, PlanRevisionOperation, PlanRunCreation,
+    PlanRunDeclaration, PlannerSpec, PlanningFeedbackOperation, PlanningSessionCreation,
+    PlanningSessionDeclaration, ResourceRefreshOperation, RestartIntensity, RestartType,
+    RuntimeResetOperation, ScheduleSpec, St3Error, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -23,10 +25,29 @@ const ROOT_NODES: &[&str] = &[
     "person",
     "plan",
     "plan-run",
+    "planning-session",
     "message",
     "schedule",
     "stop",
 ];
+
+pub(crate) fn is_plan_declaration(name: &str) -> bool {
+    matches!(
+        name,
+        "agent"
+            | "exec"
+            | "pty"
+            | "host"
+            | "doc"
+            | "resource"
+            | "observer"
+            | "subscription"
+            | "person"
+            | "message"
+            | "schedule"
+            | "stop"
+    )
+}
 
 struct ParseContext {
     default_host: String,
@@ -34,11 +55,20 @@ struct ParseContext {
     document_refs: BTreeSet<String>,
     owner_run: Option<String>,
     allow_execution_root: bool,
-    plan_run_cancellations: Vec<PlanRunCancellation>,
+    plan_runs: BTreeMap<String, PlanRunDeclaration>,
+    planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
+    resource_refreshes: Vec<ResourceRefreshOperation>,
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
     parse_intent_with_owner(source, default_host, None, false)
+}
+
+pub(crate) fn parse_internal_intent(
+    source: &str,
+    default_host: &str,
+) -> Result<NormalizedIntent, St3Error> {
+    parse_intent_with_owner(source, default_host, None, true)
 }
 
 #[cfg(test)]
@@ -46,7 +76,7 @@ pub(crate) fn parse_test_intent(
     source: &str,
     default_host: &str,
 ) -> Result<NormalizedIntent, St3Error> {
-    parse_intent_with_owner(source, default_host, None, true)
+    parse_internal_intent(source, default_host)
 }
 
 pub(crate) fn parse_execution_intent(
@@ -107,11 +137,11 @@ pub fn validate_plan_runtimes(
                 .keys()
                 .map(|name| (format!("input.{name}"), format!("migration-{name}"))),
         );
-        if let Some(source) = &plan.subgraph_kdl {
+        if let Some(source) = &plan.declarations_kdl {
             validate_source(source, &variables, default_host, subjects)?;
         }
         for step in plan.steps.values() {
-            if let Some(source) = &step.subgraph_kdl {
+            if let Some(source) = &step.declarations_kdl {
                 validate_source(source, &variables, default_host, subjects)?;
             }
             if let Some(nested) = &step.nested_plan {
@@ -149,65 +179,60 @@ fn parse_intent_with_owner(
         .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
     st2::kdl_version::ensure_st3_version(&document)
         .map_err(|error| St3Error::new("unsupported-kdl-version", error.to_string()))?;
-    let roots = document
+    let declarations = document
         .nodes()
         .iter()
         .filter(|node| node.name().value() != "version")
         .collect::<Vec<_>>();
-    let [root] = roots.as_slice() else {
+    if declarations.is_empty() {
         return Err(St3Error::new(
             "invalid-root",
-            "an st3 intent must contain one version declaration and exactly one root node",
-        ));
-    };
-    if root.name().value() != "subgraph" || root.ty().is_some() || !root.entries().is_empty() {
-        return Err(St3Error::new(
-            "invalid-root",
-            "an st3 intent must use one untyped `subgraph` root with no values",
+            "an st3 publication must contain at least one declaration after `version 2`",
         ));
     }
-    let children = root.children().ok_or_else(|| {
-        St3Error::new(
-            "empty-subgraph",
-            "the root subgraph must contain desired state",
-        )
-    })?;
-    if children.nodes().is_empty() {
+    if declarations
+        .iter()
+        .any(|node| node.name().value() == "subgraph")
+    {
         return Err(St3Error::new(
-            "empty-subgraph",
-            "the root subgraph must contain desired state",
+            "removed-subgraph",
+            "`subgraph` is not part of st3 KDL; publish declarations directly after `version 2`",
         ));
     }
-
-    let plans = crate::plan::parse_plans(root, default_host)?;
+    let plans = crate::plan::parse_plans(&document, default_host)?;
     let mut context = ParseContext {
         default_host: default_host.to_owned(),
         subjects: BTreeMap::new(),
         document_refs: BTreeSet::new(),
         owner_run: owner_run.map(str::to_owned),
         allow_execution_root,
-        plan_run_cancellations: Vec::new(),
+        plan_runs: BTreeMap::new(),
+        planning_sessions: BTreeMap::new(),
+        resource_refreshes: Vec::new(),
     };
-    for node in children.nodes() {
+    for node in &declarations {
         parse_desired_node(node, None, &mut context)?;
     }
-    collect_document_refs(root, &mut context.document_refs)?;
+    for node in document.nodes() {
+        collect_document_refs(node, &mut context.document_refs)?;
+    }
     if let Some(run) = owner_run {
         rewrite_owned_references(&mut context.subjects, owner_run_id(run));
     }
-    let normalized_nodes = children
-        .nodes()
-        .iter()
+    let normalized_nodes = declarations
+        .into_iter()
         .map(canonical_node)
         .collect::<Result<Vec<_>, _>>()?;
-    let normalized = json!({ "version": 2, "subgraph": normalized_nodes });
+    let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
     Ok(NormalizedIntent {
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
         plans,
-        plan_run_cancellations: context.plan_run_cancellations,
+        plan_runs: context.plan_runs,
+        planning_sessions: context.planning_sessions,
+        resource_refreshes: context.resource_refreshes,
         document_refs: context.document_refs,
         normalized,
     })
@@ -267,7 +292,7 @@ fn parse_desired_node(
     {
         return Err(St3Error::new(
             "runtime-outside-plan",
-            format!("`{kind}` must be inside a plan or step subgraph"),
+            format!("`{kind}` must be inside a plan or step"),
         ));
     }
     if kind == "account" && context.owner_run.is_some() {
@@ -281,68 +306,638 @@ fn parse_desired_node(
         "agent" => parse_agent(node, enclosing_host, context),
         "exec" | "pty" => parse_standalone_member(node, kind, enclosing_host, context),
         "plan" => Ok(()),
-        "plan-run" => parse_plan_run_action(node, context),
+        "plan-run" => parse_plan_run_declaration(node, context),
+        "planning-session" => parse_planning_session_declaration(node, context),
+        "resource" => parse_resource_declaration(node, context),
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
 }
 
-fn parse_plan_run_action(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
+fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
-    let run = one_string_with_children(node)?;
-    let run = if run.starts_with("plan-run/") {
-        run
+    let id = one_string_with_children(node)?;
+    let subject = namespaced("plan-run", &id);
+    validate_full_subject(&subject)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-plan-run", "a plan-run declaration needs a body"))?;
+    reject_unknown_children(
+        body,
+        &[
+            "plan",
+            "workspace",
+            "requester",
+            "mode",
+            "input",
+            "revision",
+            "reset",
+            "cancellation",
+        ],
+        "plan-run",
+        &subject,
+    )?;
+    let has_creation = body.nodes().iter().any(|child| {
+        matches!(
+            child.name().value(),
+            "plan" | "workspace" | "requester" | "mode" | "input"
+        )
+    });
+    let creation = if has_creation {
+        let plan_ref = required_child_string(body, "plan", &subject)?;
+        let (plan, revision) = exact_plan_revision(&plan_ref)?;
+        let workspace = required_child_string(body, "workspace", &subject)?;
+        if !workspace.starts_with('/') {
+            return Err(St3Error::new(
+                "relative-plan-run-workspace",
+                "a published plan-run workspace must be absolute",
+            ));
+        }
+        let requester = required_child_string(body, "requester", &subject)?;
+        validate_full_subject(&requester)?;
+        if !matches!(requester.split('/').next(), Some("person" | "agent")) {
+            return Err(St3Error::new(
+                "invalid-plan-run-requester",
+                "a plan-run requester must be a person or agent subject",
+            ));
+        }
+        let mode = child_string(body, "mode")?.unwrap_or_else(|| "run".into());
+        if !matches!(mode.as_str(), "run" | "eval") {
+            return Err(St3Error::new(
+                "invalid-run-mode",
+                format!("run mode `{mode}` is not registered"),
+            ));
+        }
+        let mut inputs = BTreeMap::new();
+        for input in body
+            .nodes()
+            .iter()
+            .filter(|child| child.name().value() == "input")
+        {
+            ensure_no_properties(input)?;
+            ensure_no_children(input)?;
+            let values = positional_values(input);
+            if values.len() != 2 {
+                return Err(St3Error::new(
+                    "invalid-plan-run-input",
+                    "a plan-run input needs a name and a value",
+                ));
+            }
+            let name = value_string(values[0])?;
+            let value = value_string(values[1])?;
+            if inputs.insert(name.clone(), value).is_some() {
+                return Err(St3Error::new(
+                    "duplicate-plan-run-input",
+                    format!("plan run `{subject}` repeats input `{name}`"),
+                ));
+            }
+        }
+        Some(PlanRunCreation {
+            plan,
+            revision,
+            workspace,
+            requester,
+            inputs,
+            mode,
+        })
     } else {
-        format!("plan-run/{run}")
+        None
     };
-    let body = node.children().ok_or_else(|| {
-        St3Error::new("empty-plan-run-action", "a plan-run action needs `cancel`")
-    })?;
-    let [cancel] = body.nodes() else {
-        return Err(St3Error::new(
-            "invalid-plan-run-action",
-            "a plan-run action must contain exactly one `cancel`",
-        ));
+    let mut incoming = PlanRunDeclaration {
+        subject: subject.clone(),
+        creation,
+        ..PlanRunDeclaration::default()
     };
-    if cancel.name().value() != "cancel" || cancel.ty().is_some() || cancel.children().is_some() {
-        return Err(St3Error::new(
-            "invalid-plan-run-action",
-            "a plan-run action must contain one bare `cancel` node",
-        ));
+    for child in body.nodes() {
+        match child.name().value() {
+            "revision" => {
+                let operation = parse_plan_revision(child)?;
+                insert_named_operation(&mut incoming.revisions, operation.id.clone(), operation)?;
+            }
+            "reset" => {
+                let operation = parse_runtime_reset(child)?;
+                insert_named_operation(&mut incoming.resets, operation.id.clone(), operation)?;
+            }
+            "cancellation" => {
+                let operation = parse_named_cancellation(child)?;
+                insert_named_operation(
+                    &mut incoming.cancellations,
+                    operation.id.clone(),
+                    operation,
+                )?;
+            }
+            _ => {}
+        }
     }
-    ensure_only_properties(cancel, &["reason"])?;
-    if !cancel.entries().iter().all(|entry| entry.name().is_some()) {
-        return Err(St3Error::new(
-            "invalid-plan-run-action",
-            "`cancel` cannot contain positional values",
-        ));
-    }
-    let reason = property_string(cancel, "reason")?.ok_or_else(|| {
+    merge_plan_run_declaration(context, incoming)
+}
+
+fn exact_plan_revision(value: &str) -> Result<(String, String), St3Error> {
+    let (plan, revision) = value.rsplit_once('@').ok_or_else(|| {
         St3Error::new(
-            "missing-cancel-reason",
-            "a plan-run cancellation needs a reason",
+            "unpinned-plan-run",
+            "a plan-run must name an exact plan revision as `plan/ID@REVISION`",
         )
     })?;
-    if reason.trim().is_empty() {
+    let plan = plan.strip_prefix("plan/").unwrap_or(plan);
+    validate_name(plan, false)?;
+    if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(St3Error::new(
-            "missing-cancel-reason",
-            "a plan-run cancellation needs a non-empty reason",
+            "invalid-plan-revision",
+            "a plan revision must be a 64-character SHA-256 hash",
         ));
     }
-    if context
-        .plan_run_cancellations
+    Ok((plan.into(), revision.to_ascii_lowercase()))
+}
+
+fn parse_plan_revision(node: &KdlNode) -> Result<PlanRevisionOperation, St3Error> {
+    ensure_no_properties(node)?;
+    let id = one_string_with_children(node)?;
+    validate_name(&id, false)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-revision", format!("revision `{id}` needs a body")))?;
+    reject_unknown_children(
+        body,
+        &["plan", "from", "reason", "cancellation"],
+        "revision",
+        &id,
+    )?;
+    let (plan, revision) = exact_plan_revision(&required_child_string(body, "plan", &id)?)?;
+    let from_generation = namespaced("run-generation", &required_child_string(body, "from", &id)?);
+    validate_full_subject(&from_generation)?;
+    let cancellation = unique_child(body, "cancellation")?
+        .map(parse_named_cancellation)
+        .transpose()?;
+    Ok(PlanRevisionOperation {
+        id: id.clone(),
+        plan,
+        revision,
+        from_generation,
+        reason: required_nonempty_child(body, "reason", &id)?,
+        cancellation,
+    })
+}
+
+fn parse_runtime_reset(node: &KdlNode) -> Result<RuntimeResetOperation, St3Error> {
+    ensure_no_properties(node)?;
+    let id = one_string_with_children(node)?;
+    validate_name(&id, false)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-reset", format!("reset `{id}` needs a body")))?;
+    reject_unknown_children(body, &["runtime", "from", "reason"], "reset", &id)?;
+    let from_generation = namespaced("run-generation", &required_child_string(body, "from", &id)?);
+    validate_full_subject(&from_generation)?;
+    Ok(RuntimeResetOperation {
+        id: id.clone(),
+        runtime: required_child_string(body, "runtime", &id)?,
+        from_generation,
+        reason: required_nonempty_child(body, "reason", &id)?,
+    })
+}
+
+fn parse_named_cancellation(node: &KdlNode) -> Result<NamedCancellation, St3Error> {
+    ensure_no_properties(node)?;
+    let id = one_string_with_children(node)?;
+    validate_name(&id, false)?;
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "empty-cancellation",
+            format!("cancellation `{id}` needs a body"),
+        )
+    })?;
+    reject_unknown_children(body, &["reason"], "cancellation", &id)?;
+    Ok(NamedCancellation {
+        id: id.clone(),
+        reason: required_nonempty_child(body, "reason", &id)?,
+    })
+}
+
+fn required_nonempty_child(
+    body: &KdlDocument,
+    name: &str,
+    owner: &str,
+) -> Result<String, St3Error> {
+    let value = required_child_string(body, name, owner)?;
+    if value.trim().is_empty() {
+        return Err(St3Error::new(
+            "empty-operation-value",
+            format!("`{owner}` needs a non-empty `{name}`"),
+        ));
+    }
+    Ok(value)
+}
+
+fn insert_named_operation<T: Eq>(
+    target: &mut BTreeMap<String, T>,
+    id: String,
+    operation: T,
+) -> Result<(), St3Error> {
+    if let Some(current) = target.get(&id) {
+        if current == &operation {
+            return Ok(());
+        }
+        return Err(St3Error::new(
+            "immutable-operation-id",
+            format!("operation `{id}` repeats with different content"),
+        ));
+    }
+    target.insert(id, operation);
+    Ok(())
+}
+
+fn merge_plan_run_declaration(
+    context: &mut ParseContext,
+    incoming: PlanRunDeclaration,
+) -> Result<(), St3Error> {
+    let subject = incoming.subject.clone();
+    let current = context
+        .plan_runs
+        .entry(subject.clone())
+        .or_insert_with(|| PlanRunDeclaration {
+            subject,
+            ..PlanRunDeclaration::default()
+        });
+    if let Some(creation) = incoming.creation {
+        if current
+            .creation
+            .as_ref()
+            .is_some_and(|value| value != &creation)
+        {
+            return Err(St3Error::new(
+                "immutable-plan-run",
+                format!(
+                    "plan run `{}` repeats with different creation fields",
+                    current.subject
+                ),
+            ));
+        }
+        current.creation.get_or_insert(creation);
+    }
+    for (id, operation) in incoming.revisions {
+        insert_named_operation(&mut current.revisions, id, operation)?;
+    }
+    for (id, operation) in incoming.resets {
+        insert_named_operation(&mut current.resets, id, operation)?;
+    }
+    for (id, operation) in incoming.cancellations {
+        insert_named_operation(&mut current.cancellations, id, operation)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn planning_planner_subject(session: &str) -> String {
+    let digest = hex::encode(Sha256::digest(session.as_bytes()));
+    format!("agent/planner.{}", &digest[..20])
+}
+
+fn parse_resource_declaration(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let name = one_string_with_children(node)?;
+    validate_name(&name, false)?;
+    let resource = namespaced("resource", &name);
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "missing-resource-body",
+            "a resource needs a kind or a refresh operation",
+        )
+    })?;
+    let mut refresh_count = 0;
+    for refresh in body
+        .nodes()
         .iter()
-        .any(|cancellation| cancellation.run == run)
+        .filter(|child| child.name().value() == "refresh")
+    {
+        refresh_count += 1;
+        let operation = parse_resource_refresh(&resource, refresh)?;
+        if let Some(current) = context
+            .resource_refreshes
+            .iter()
+            .find(|current| current.resource == resource && current.id == operation.id)
+        {
+            if current != &operation {
+                return Err(St3Error::new(
+                    "immutable-operation-id",
+                    format!(
+                        "refresh `{}` for `{resource}` repeats with different content",
+                        operation.id
+                    ),
+                ));
+            }
+        } else {
+            context.resource_refreshes.push(operation);
+        }
+    }
+    let has_kind = body
+        .nodes()
+        .iter()
+        .any(|child| child.name().value() == "kind");
+    if has_kind {
+        let mut desired = node.clone();
+        desired
+            .children_mut()
+            .as_mut()
+            .expect("the resource body exists")
+            .nodes_mut()
+            .retain(|child| child.name().value() != "refresh");
+        parse_structure(&desired, "resource", context)?;
+    } else if body
+        .nodes()
+        .iter()
+        .any(|child| child.name().value() != "refresh")
     {
         return Err(St3Error::new(
-            "duplicate-plan-run-action",
-            format!("plan run `{run}` repeats"),
+            "invalid-resource-operation",
+            format!("resource `{resource}` has a field but no kind"),
         ));
     }
-    context
-        .plan_run_cancellations
-        .push(PlanRunCancellation { run, reason });
+    if !has_kind && refresh_count == 0 {
+        return Err(St3Error::new(
+            "empty-resource-operation",
+            format!("resource `{resource}` has no declaration or operation"),
+        ));
+    }
     Ok(())
+}
+
+fn parse_resource_refresh(
+    resource: &str,
+    node: &KdlNode,
+) -> Result<ResourceRefreshOperation, St3Error> {
+    ensure_no_properties(node)?;
+    let id = one_string_with_children(node)?;
+    validate_name(&id, false)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-refresh", format!("refresh `{id}` needs a body")))?;
+    reject_unknown_children(body, &["timeout"], "refresh", &id)?;
+    let timeout_ms = child_string(body, "timeout")?
+        .map(|value| parse_duration(&value, true))
+        .transpose()?
+        .unwrap_or(30_000);
+    Ok(ResourceRefreshOperation {
+        resource: resource.into(),
+        id,
+        timeout_ms,
+    })
+}
+
+fn parse_planning_session_declaration(
+    node: &KdlNode,
+    context: &mut ParseContext,
+) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let id = one_string_with_children(node)?;
+    let subject = namespaced("planning-session", &id);
+    validate_full_subject(&subject)?;
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "empty-planning-session",
+            "a planning-session declaration needs a body",
+        )
+    })?;
+    reject_unknown_children(
+        body,
+        &[
+            "plan",
+            "request",
+            "workspace",
+            "requester",
+            "planner",
+            "target-run",
+            "target-generation",
+            "feedback",
+            "cancellation",
+        ],
+        "planning-session",
+        &subject,
+    )?;
+    let has_creation = body.nodes().iter().any(|child| {
+        matches!(
+            child.name().value(),
+            "plan"
+                | "request"
+                | "workspace"
+                | "requester"
+                | "planner"
+                | "target-run"
+                | "target-generation"
+        )
+    });
+    let creation = if has_creation {
+        let plan = required_child_string(body, "plan", &subject)?;
+        let plan = plan.strip_prefix("plan/").unwrap_or(&plan).to_owned();
+        validate_name(&plan, false)?;
+        let request = required_child_string(body, "request", &subject)?;
+        validate_document_ref(&request)?;
+        if !request.starts_with("doc/") || !request.contains('@') {
+            return Err(St3Error::new(
+                "unpinned-planning-request",
+                "a planning request must name an exact document version",
+            ));
+        }
+        let workspace = required_child_string(body, "workspace", &subject)?;
+        if !workspace.starts_with('/') {
+            return Err(St3Error::new(
+                "relative-planning-workspace",
+                "a published planning-session workspace must be absolute",
+            ));
+        }
+        let requester = required_child_string(body, "requester", &subject)?;
+        if !requester.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-planning-requester",
+                "a planning requester must be a person subject",
+            ));
+        }
+        validate_full_subject(&requester)?;
+        let planner_node = unique_child(body, "planner")?.ok_or_else(|| {
+            St3Error::new("missing-planner", "a planning-session needs a planner")
+        })?;
+        ensure_no_properties(planner_node)?;
+        let provider = one_string_with_children(planner_node)?;
+        if provider != "codex" {
+            return Err(St3Error::new(
+                "unsupported-planner",
+                "the planning MVP supports only the Codex planner",
+            ));
+        }
+        let planner_body = planner_node
+            .children()
+            .ok_or_else(|| St3Error::new("empty-planner", "a planner needs a body"))?;
+        reject_unknown_children(planner_body, &["model", "effort"], "planner", &provider)?;
+        let target_run =
+            child_string(body, "target-run")?.map(|value| namespaced("plan-run", &value));
+        let target_generation = child_string(body, "target-generation")?
+            .map(|value| namespaced("run-generation", &value));
+        if target_run.is_some() != target_generation.is_some() {
+            return Err(St3Error::new(
+                "incomplete-planning-target",
+                "a targeted planning session needs both target-run and target-generation",
+            ));
+        }
+        if let Some(target) = &target_run {
+            validate_full_subject(target)?;
+        }
+        if let Some(target) = &target_generation {
+            validate_full_subject(target)?;
+        }
+        Some(PlanningSessionCreation {
+            plan,
+            request,
+            workspace,
+            requester,
+            planner: PlannerSpec {
+                provider,
+                model: child_string(planner_body, "model")?,
+                effort: child_string(planner_body, "effort")?,
+            },
+            target_run,
+            target_generation,
+        })
+    } else {
+        None
+    };
+    let mut incoming = PlanningSessionDeclaration {
+        subject: subject.clone(),
+        creation,
+        ..PlanningSessionDeclaration::default()
+    };
+    for child in body.nodes() {
+        match child.name().value() {
+            "feedback" => {
+                ensure_no_properties(child)?;
+                let operation_id = one_string_with_children(child)?;
+                validate_name(&operation_id, false)?;
+                let feedback_body = child.children().ok_or_else(|| {
+                    St3Error::new(
+                        "empty-planning-feedback",
+                        format!("feedback `{operation_id}` needs a body"),
+                    )
+                })?;
+                reject_unknown_children(
+                    feedback_body,
+                    &["document", "variant"],
+                    "feedback",
+                    &operation_id,
+                )?;
+                let document = required_child_string(feedback_body, "document", &operation_id)?;
+                validate_document_ref(&document)?;
+                if !document.starts_with("doc/") || !document.contains('@') {
+                    return Err(St3Error::new(
+                        "unpinned-planning-feedback",
+                        "planning feedback must name an exact document version",
+                    ));
+                }
+                let operation = PlanningFeedbackOperation {
+                    id: operation_id.clone(),
+                    document,
+                    variant: child_string(feedback_body, "variant")?
+                        .unwrap_or_else(|| "default".into()),
+                };
+                insert_named_operation(&mut incoming.feedback, operation_id, operation)?;
+            }
+            "cancellation" => {
+                let operation = parse_named_cancellation(child)?;
+                insert_named_operation(
+                    &mut incoming.cancellations,
+                    operation.id.clone(),
+                    operation,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    let planner_creation = incoming.creation.clone();
+    let has_cancellation = !incoming.cancellations.is_empty();
+    let current = context
+        .planning_sessions
+        .entry(subject.clone())
+        .or_insert_with(|| PlanningSessionDeclaration {
+            subject: subject.clone(),
+            ..PlanningSessionDeclaration::default()
+        });
+    if let Some(creation) = incoming.creation {
+        if current
+            .creation
+            .as_ref()
+            .is_some_and(|value| value != &creation)
+        {
+            return Err(St3Error::new(
+                "immutable-planning-session",
+                format!(
+                    "planning session `{}` repeats with different creation fields",
+                    current.subject
+                ),
+            ));
+        }
+        current.creation.get_or_insert(creation);
+    }
+    for (id, operation) in incoming.feedback {
+        insert_named_operation(&mut current.feedback, id, operation)?;
+    }
+    for (id, operation) in incoming.cancellations {
+        insert_named_operation(&mut current.cancellations, id, operation)?;
+    }
+    if let Some(creation) = planner_creation {
+        let planner = planning_planner_subject(&subject);
+        if !context.subjects.contains_key(&planner) {
+            let name = planner.strip_prefix("agent/").unwrap_or(&planner);
+            let mut agent = KdlNode::new("agent");
+            agent.entries_mut().push(kdl::KdlEntry::new(name));
+            let mut agent_body = KdlDocument::new();
+            agent_body
+                .nodes_mut()
+                .push(string_node("workspace", &creation.workspace));
+            let mut harness = KdlNode::new("harness");
+            harness.entries_mut().push(kdl::KdlEntry::new("codex"));
+            let mut harness_body = KdlDocument::new();
+            if let Some(model) = &creation.planner.model {
+                harness_body.nodes_mut().push(string_node("model", model));
+            }
+            if let Some(effort) = &creation.planner.effort {
+                harness_body.nodes_mut().push(string_node("effort", effort));
+            }
+            let target_context = creation.target_run.as_ref().map_or_else(String::new, |run| {
+                format!(
+                    " Inspect the current target with `st3 --json plan show {run}` before you revise it. The target generation is `{}`.",
+                    creation.target_generation.as_deref().unwrap_or_default()
+                )
+            });
+            harness_body.nodes_mut().push(string_node(
+                "prompt",
+                &format!(
+                    "You are the durable Codex planner for planning session `{id}`. Read `{}` with `st3 doc get`.{target_context} Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{}` and its state must be ready. Submit it with `st3 planning submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay ready for feedback until approval or cancellation.",
+                    creation.request, creation.plan
+                ),
+            ));
+            let mut args = KdlNode::new("args");
+            args.entries_mut().push(kdl::KdlEntry::new(
+                "--dangerously-bypass-approvals-and-sandbox",
+            ));
+            args.entries_mut()
+                .push(kdl::KdlEntry::new("--dangerously-bypass-hook-trust"));
+            harness_body.nodes_mut().push(args);
+            harness.set_children(harness_body);
+            agent_body.nodes_mut().push(harness);
+            agent.set_children(agent_body);
+            parse_agent(&agent, None, context)?;
+        }
+    }
+    if has_cancellation {
+        let mut stop = KdlNode::new("stop");
+        stop.entries_mut()
+            .push(kdl::KdlEntry::new(planning_planner_subject(&subject)));
+        parse_stop(&stop, context)?;
+    }
+    Ok(())
+}
+
+fn string_node(name: &str, value: &str) -> KdlNode {
+    let mut node = KdlNode::new(name);
+    node.entries_mut().push(kdl::KdlEntry::new(value));
+    node
 }
 
 fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
@@ -1810,9 +2405,30 @@ fn validate_message(node: &KdlNode) -> Result<(), St3Error> {
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("missing-message-body", "a message needs a body"))?;
-    reject_unknown_children(body, &["from", "to", "content"], "message", "message")?;
+    reject_unknown_children(
+        body,
+        &["from", "to", "content", "title", "in-reply-to", "tag"],
+        "message",
+        "message",
+    )?;
     child_string(body, "from")?;
     required_child_string(body, "to", "message")?;
+    child_string(body, "title")?;
+    if let Some(parent) = child_string(body, "in-reply-to")?
+        && !parent.starts_with("message/")
+    {
+        return Err(St3Error::new(
+            "invalid-message-reference",
+            "a message reply must use a full `message/ID` subject",
+        ));
+    }
+    let tags = repeated_child_strings(body, "tag")?;
+    if tags.iter().collect::<BTreeSet<_>>().len() != tags.len() {
+        return Err(St3Error::new(
+            "duplicate-message-tag",
+            "a message tag repeats",
+        ));
+    }
     let content = required_child_string(body, "content", "message")?;
     if content.trim().is_empty() {
         return Err(St3Error::new(
@@ -1997,7 +2613,7 @@ fn validate_string_map(node: &KdlNode, environment: bool) -> Result<(), St3Error
     Ok(())
 }
 
-pub(crate) fn validate_deferred_subgraph(node: &KdlNode) -> Result<(), St3Error> {
+pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Error> {
     if node.name().value() == "account" {
         return Err(St3Error::new(
             "account-inside-plan",
@@ -2009,7 +2625,7 @@ pub(crate) fn validate_deferred_subgraph(node: &KdlNode) -> Result<(), St3Error>
     }
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            validate_deferred_subgraph(child)?;
+            validate_deferred_declaration(child)?;
         }
     }
     Ok(())
@@ -2874,23 +3490,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_old_agent_root() {
+    fn rejects_a_runtime_outside_a_plan() {
         let error = parse_intent("version 2\nagent \"worker\" { command \"true\" }", "host")
-            .expect_err("old KDL must fail");
-        assert_eq!(error.code, "invalid-root");
+            .expect_err("an unowned runtime must fail");
+        assert_eq!(error.code, "runtime-outside-plan");
+    }
+
+    #[test]
+    fn rejects_the_removed_wrapper_and_accepts_direct_roots() {
+        let removed = parse_intent(
+            "version 2\nsubgraph { plan \"work\" state=\"ready\" { goal \"Do the work.\" } }",
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(removed.code, "removed-subgraph");
+
+        let direct = parse_intent(
+            "version 2\nplan \"work\" state=\"ready\" { goal \"Do the work.\" }",
+            "node",
+        )
+        .unwrap();
+        assert!(direct.plans.contains_key("work"));
     }
 
     #[test]
     fn account_declarations_are_root_only_and_strict() {
         let source = r#"
 version 2
-subgraph {
+
   account "claude/team-a" {
     provider "anthropic"
     external-account "team-a"
     auth-type "subscription"
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         assert!(intent.subjects.contains_key("account/claude/team-a"));
@@ -2901,20 +3534,20 @@ subgraph {
 
         let deferred = r#"
 version 2
-subgraph {
+
   plan "bad" state="ready" {
     goal "Reject nested accounts."
     step "work" {
-      subgraph {
+
         account "claude/team-a" {
           provider "anthropic"
           external-account "team-a"
           auth-type "subscription"
         }
-      }
+
     }
   }
-}
+
 "#;
         assert_eq!(
             parse_intent(deferred, "node").unwrap_err().code,
@@ -2940,9 +3573,9 @@ subgraph {
     #[test]
     fn rejects_st2_document_versions() {
         for source in [
-            "subgraph { agent \"worker\" { command \"true\" } }",
-            "version 0\nsubgraph { agent \"worker\" { command \"true\" } }",
-            "version 1\nsubgraph { agent \"worker\" { command \"true\" } }",
+            " agent \"worker\" { command \"true\" } ",
+            "version 0\n agent \"worker\" { command \"true\" } ",
+            "version 1\n agent \"worker\" { command \"true\" } ",
         ] {
             let error = parse_intent(source, "host").expect_err("st2 KDL must fail");
             assert_eq!(error.code, "unsupported-kdl-version");
@@ -2954,7 +3587,7 @@ subgraph {
         let intent = parse_test_intent(
             r#"
 version 2
-subgraph {
+
   message "task" {
     to "worker"
     content "doc/tasks/work@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2966,7 +3599,7 @@ subgraph {
       prompt "Work on the task."
     }
   }
-}
+
 "#,
             "node",
         )
@@ -2981,7 +3614,7 @@ subgraph {
         let intent = parse_test_intent(
             r#"
 version 2
-subgraph {
+
   agent "worker" {
     workspace "/work"
     harness "claude" {
@@ -2989,7 +3622,7 @@ subgraph {
       prompt "Work on the task."
     }
   }
-}
+
 "#,
             "node",
         )
@@ -3030,7 +3663,7 @@ subgraph {
         ] {
             let source = format!(
                 r#"version 2
-subgraph {{
+
   agent "worker" {{
     workspace "/work"
     harness {provider:?} {{
@@ -3038,7 +3671,7 @@ subgraph {{
       prompt "Do the work."
     }}
   }}
-}}"#,
+"#,
             );
             let intent = parse_test_intent(&source, "node").unwrap();
             let member = intent.subjects["agent/node.worker"]
@@ -3061,12 +3694,12 @@ subgraph {{
         let intent = parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "build" state="ready" {
     goal "Complete plan build."
     step "build" {
       title "The first step passes"
-      subgraph { exec "one" { command "true"; restart "never" } }
+       exec "one" { command "true"; restart "never" }
       gate "condition-1" { field "status" "exec/one" is "exited" }
     }
 
@@ -3076,7 +3709,7 @@ subgraph {
       gate "condition-2" { field "decision" "resource/review" is "approved" }
     }
   }
-}
+
 "#,
             "node",
         )
@@ -3094,7 +3727,7 @@ subgraph {
     fn local_placement_resolves_to_the_receiving_node() {
         let source = r#"
             version 2
-            subgraph {
+
               exec "setup" {
                 host "local"
                 command "true"
@@ -3110,7 +3743,7 @@ subgraph {
                   }
                 }
               }
-            }
+
         "#;
 
         let intent = parse_test_intent(source, "node-a").unwrap();
@@ -3131,7 +3764,7 @@ subgraph {
         let intent = parse_test_intent(
             r#"
 version 2
-subgraph {
+
   agent "worker" {
     workspace "/work"
     restart "never"
@@ -3144,7 +3777,7 @@ subgraph {
     }
     exec "build" { command "true" }
   }
-}
+
 "#,
             "node",
         )
@@ -3167,14 +3800,14 @@ subgraph {
         let intent = parse_test_intent(
             r#"
 version 2
-subgraph {
+
   pty "standalone" { command "sleep 1" }
   agent "worker" {
     workspace "/work"
     command "sleep 1"
     pty "helper" { command "sleep 1" }
   }
-}
+
 "#,
             "node",
         )
@@ -3197,7 +3830,7 @@ subgraph {
     fn under_is_repeatable_non_owning_agent_metadata() {
         let source = r#"
 version 2
-subgraph {
+
   agent "lead" {
     workspace "/work"
     under "worker" reason="the worker supplies a specialist view"
@@ -3209,7 +3842,7 @@ subgraph {
     under "missing"
     harness "codex" { prompt "Do the assigned work." }
   }
-}
+
 "#;
         let intent = parse_test_intent(source, "node").unwrap();
         let worker = agent_under(&intent.subjects["agent/node.worker"].desired);
@@ -3250,7 +3883,7 @@ subgraph {
         let intent = parse_test_intent(
             r#"
 version 2
-subgraph {
+
   resource "queue" { kind "custom.example.queue" }
   observer "queue-watch" {
     resource "resource/queue"
@@ -3258,7 +3891,7 @@ subgraph {
     locator "jobs/ready"
     field "priority"
   }
-}
+
 "#,
             "node",
         )
@@ -3274,7 +3907,7 @@ subgraph {
     fn strict_grammar_rejects_unknown_children_and_properties() {
         let child = parse_test_intent(
             r#"version 2
-subgraph { agent "worker" { command "true"; retired #true } }"#,
+ agent "worker" { command "true"; retired #true } "#,
             "node",
         )
         .expect_err("retired is old syntax");
@@ -3282,7 +3915,7 @@ subgraph { agent "worker" { command "true"; retired #true } }"#,
 
         let property = parse_test_intent(
             r#"version 2
-subgraph { exec "work" mystery="value" { command "true" } }"#,
+ exec "work" mystery="value" { command "true" } "#,
             "node",
         )
         .expect_err("unknown property");
@@ -3290,7 +3923,7 @@ subgraph { exec "work" mystery="value" { command "true" } }"#,
 
         let obsolete_resource_binding = parse_test_intent(
             r#"version 2
-subgraph { resource "source" { kind "custom.st3.document-source"; binding "late" } }"#,
+ resource "source" { kind "custom.st3.document-source"; binding "late" } "#,
             "node",
         )
         .expect_err("resources are unbound until a claim supplies facts");
@@ -3300,7 +3933,7 @@ subgraph { resource "source" { kind "custom.st3.document-source"; binding "late"
     #[test]
     fn authored_messages_reject_empty_content() {
         let error = parse_intent(
-            "version 2\nsubgraph { message \"empty\" { to \"worker\"; content \"  \" } }",
+            "version 2\n message \"empty\" { to \"worker\"; content \"  \" } ",
             "node",
         )
         .expect_err("an empty message must not enter the delivery FIFO");
@@ -3311,12 +3944,12 @@ subgraph { resource "source" { kind "custom.st3.document-source"; binding "late"
     fn a_plan_can_pin_bare_document_references() {
         let source = r#"
 version 2
-subgraph {
+
   message "task" {
     to "worker"
     content "doc/tasks/work"
   }
-}
+
 "#;
         let resolved = resolve_document_references(
             source,
@@ -3327,6 +3960,55 @@ subgraph {
         assert_eq!(
             intent.document_refs.into_iter().next().unwrap(),
             format!("doc/tasks/work@{}", "a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn planning_sessions_get_stable_bounded_planner_subjects() {
+        let long =
+            "planning-session/planning/release-with-a-long-name/01994d32d8ef7f8ca18a0170ef58db30";
+        let subject = planning_planner_subject(long);
+        assert_eq!(subject, planning_planner_subject(long));
+        assert!(subject.starts_with("agent/planner."));
+        assert!(subject.strip_prefix("agent/").unwrap().len() <= 32);
+        assert_ne!(
+            subject,
+            planning_planner_subject("planning-session/planning/release/another")
+        );
+    }
+
+    #[test]
+    fn a_targeted_planner_receives_its_exact_session_and_run_context() {
+        let source = format!(
+            r#"
+version 2
+planning-session "planning/release/revise" {{
+  plan "release"
+  request "doc/planning/request@{}"
+  workspace "/work/release"
+  requester "person/operator"
+  planner "codex" {{ model "gpt-5.6-sol"; effort "medium" }}
+  target-run "plan-run/release/live"
+  target-generation "run-generation/release/live/2"
+}}
+"#,
+            "a".repeat(64)
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let planner_subject = planning_planner_subject("planning-session/planning/release/revise");
+        let planner = &intent.subjects[&planner_subject];
+        let desired = serde_json::to_string(&planner.desired).unwrap();
+        assert!(
+            desired.contains("st3 planning submit planning/release/revise"),
+            "{desired}"
+        );
+        assert!(
+            desired.contains("st3 --json plan show plan-run/release/live"),
+            "{desired}"
+        );
+        assert!(
+            desired.contains("run-generation/release/live/2"),
+            "{desired}"
         );
     }
 }

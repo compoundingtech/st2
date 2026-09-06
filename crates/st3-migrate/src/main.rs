@@ -272,8 +272,7 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
         .iter()
         .filter(|node| node.name().value() != "version")
         .collect::<Vec<_>>();
-    if version == 2 && roots.len() == 1 && roots[0].name().value() == "subgraph" {
-        st3::parse_intent(source, "local")?;
+    if version == 2 && st3::parse_intent(source, "local").is_ok() {
         return Ok(source.to_owned());
     }
     anyhow::ensure!(
@@ -369,22 +368,16 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
             .push(KdlEntry::new(format!("Keep agent {bus} available.")));
         plan_body.nodes_mut().push(goal);
         if running != Some(false) {
-            let mut plan_subgraph = KdlNode::new("subgraph");
-            let mut plan_subgraph_body = KdlDocument::new();
-            plan_subgraph_body.nodes_mut().push(agent);
-            plan_subgraph.set_children(plan_subgraph_body);
-            plan_body.nodes_mut().push(plan_subgraph);
+            plan_body.nodes_mut().push(agent);
         }
         plan.set_children(plan_body);
         children.nodes_mut().push(plan);
     }
-    let mut root = KdlNode::new("subgraph");
-    root.set_children(children);
     let mut output = KdlDocument::new();
     let mut version = KdlNode::new("version");
     version.entries_mut().push(KdlEntry::new(2));
     output.nodes_mut().push(version);
-    output.nodes_mut().push(root);
+    output.nodes_mut().extend(children.nodes().iter().cloned());
     output.autoformat();
     Ok(rewrite_catalog_text(&output.to_string()))
 }
@@ -735,10 +728,10 @@ fn transform_eval_checkpoint(
     let restart = if eval.supervise { "always" } else { "never" };
     let mut documents = Vec::new();
     let mut output = String::new();
-    output.push_str("version 2\nsubgraph {\n");
-    output.push_str(&format!("  checkpoints {sequence:?} {{\n"));
+    output.push_str("version 2\n");
+    output.push_str(&format!("checkpoints {sequence:?} {{\n"));
     let mut team_checkpoint = String::new();
-    team_checkpoint.push_str("    checkpoint \"The eval team is running\" {\n      subgraph {\n");
+    team_checkpoint.push_str("  checkpoint \"The eval team is running\" {\n");
     for agent in spec.agents.iter().chain(eval.agents.iter()) {
         write_eval_agent(&mut team_checkpoint, agent, restart, host);
     }
@@ -766,7 +759,6 @@ fn transform_eval_checkpoint(
             content
         ));
     }
-    team_checkpoint.push_str("      }\n");
     let agents = spec
         .agents
         .iter()
@@ -800,10 +792,9 @@ fn transform_eval_checkpoint(
     for (ordinal, step) in eval.run_steps.iter().enumerate() {
         let subject = format!("eval/{name}/run/{ordinal}-{}", step.id);
         output.push_str(&format!(
-            "    checkpoint {:?} {{\n",
+            "  checkpoint {:?} {{\n",
             format!("Run step {} finishes", step.id)
         ));
-        output.push_str("      subgraph {\n");
         output.push_str(&format!("        exec {subject:?} {{\n"));
         output.push_str(&format!("          host {host:?}\n"));
         output.push_str(&format!(
@@ -833,7 +824,7 @@ fn transform_eval_checkpoint(
             }
             output.push('\n');
         }
-        output.push_str("        }\n      }\n");
+        output.push_str("        }\n");
         output.push_str(&format!(
             "      gate {:?} {{ field \"status\" {:?} \"is\" \"exited\" }}\n",
             format!("run step {} exited", step.id),
@@ -877,7 +868,7 @@ fn transform_eval_checkpoint(
         );
     }
 
-    output.push_str("    checkpoint \"All held-out gates pass\" {\n");
+    output.push_str("  checkpoint \"All held-out gates pass\" {\n");
     let signal_gates = eval
         .judges
         .iter()
@@ -885,7 +876,6 @@ fn transform_eval_checkpoint(
         .filter(|(_, judge)| judge.signal)
         .collect::<Vec<_>>();
     if !signal_gates.is_empty() {
-        output.push_str("      subgraph {\n");
         for (ordinal, judge) in signal_gates {
             let command = match &judge.kind {
                 JudgeKind::Bash(command) => rewrite_bus_command(command),
@@ -902,7 +892,6 @@ fn transform_eval_checkpoint(
                 format!("eval/{name}/signal/{ordinal}")
             ));
         }
-        output.push_str("      }\n");
     }
     let mut gating_gates = 0usize;
     for judge in eval.judges.iter().filter(|judge| !judge.signal) {
@@ -956,7 +945,7 @@ fn transform_eval_checkpoint(
         format!("{}ms", eval.max_timeout.as_millis())
     ));
     output.push_str("    }\n");
-    output.push_str("  }\n}\n");
+    output.push_str("}\n");
     let mut formatted: KdlDocument = output
         .parse()
         .with_context(|| format!("parse migrated plan KDL:\n{output}"))?;
@@ -968,25 +957,16 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
     let document: KdlDocument = source
         .parse()
         .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
-    let root = document
+    let checkpoints = document
         .nodes()
         .iter()
-        .find(|node| node.name().value() == "subgraph")
-        .context("translated eval has no subgraph root")?;
-    let checkpoints = root
-        .children()
-        .and_then(|children| {
-            children
-                .nodes()
-                .iter()
-                .find(|node| node.name().value() == "checkpoints")
-        })
+        .find(|node| node.name().value() == "checkpoints")
         .context("translated eval has no checkpoint sequence")?;
     let stages = checkpoints
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "version 2\nsubgraph {{\n  plan {:?} state=\"ready\" {{\n    completion {{ when \"all-steps-exhausted\" }}\n    goal {:?}\n",
+        "version 2\nplan {:?} state=\"ready\" {{\n  completion {{ when \"all-steps-exhausted\" }}\n  goal {:?}\n",
         format!("eval/{name}"),
         format!("Complete the migrated {name} eval.")
     );
@@ -1039,7 +1019,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         output.push_str("      }\n");
         prior = Some(id);
     }
-    output.push_str("  }\n}\n");
+    output.push_str("}\n");
     let mut formatted: KdlDocument = output
         .parse()
         .with_context(|| format!("parse checkpoint conversion KDL:\n{output}"))?;
@@ -1575,7 +1555,7 @@ agent "worker" {
         let intent = st3::parse_intent(&translated, "local").unwrap();
         let plan = &intent.plans["catalog/host-a.worker"];
         assert_eq!(plan.state, st3::model::PlanState::Ready);
-        let graph = plan.subgraph_kdl.as_deref().unwrap();
+        let graph = plan.declarations_kdl.as_deref().unwrap();
         assert!(graph.contains("agent worker"));
         assert!(graph.contains("restart always"));
         assert!(graph.contains("PATH \"/bin\""));
@@ -1715,7 +1695,7 @@ agent "worker" {
         let intent = st3::parse_intent(&translated, "local").unwrap();
         let plan = &intent.plans["catalog/host-a.worker"];
         assert_eq!(plan.state, st3::model::PlanState::Retired);
-        assert!(plan.subgraph_kdl.is_none());
+        assert!(plan.declarations_kdl.is_none());
     }
 
     #[test]
@@ -1816,7 +1796,7 @@ agent "worker" {
         assert!(!translated.contains("command \"exec claude"));
         let plan = intent.plans.values().next().unwrap();
         let team = &plan.steps["00-the-eval-team-is-running"];
-        let team_graph = team.subgraph_kdl.as_deref().unwrap();
+        let team_graph = team.declarations_kdl.as_deref().unwrap();
         assert!(team_graph.contains("agent mix.sup"));
         assert!(team_graph.contains("agent local.judge"));
         assert!(team_graph.contains("message \"kickoff/${ST_PLAN_RUN}\""));

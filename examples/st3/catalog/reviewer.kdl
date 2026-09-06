@@ -1,11 +1,9 @@
 version 2
 
-subgraph {
   plan "catalog/reviewer" state="ready" {
     goal "Keep the catalog review agent ready for work."
     step "start-reviewer" {
       agentless
-      subgraph {
         agent "catalog.reviewer" {
           workspace "."
           restart "always"
@@ -14,8 +12,6 @@ subgraph {
             prompt "Review work from the graph and report evidence."
           }
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/catalog.reviewer" }
     }
   }
-}

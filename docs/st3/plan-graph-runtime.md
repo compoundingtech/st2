@@ -2,7 +2,9 @@
 
 Status: current language and runtime specification.
 
-Every st3 KDL document starts with `version 2`. It contains one untyped `subgraph` root.
+See [kdl-lifecycle.md](./kdl-lifecycle.md) for complete day-to-day publication workflows.
+
+Every st3 KDL document starts with `version 2`. Declarations follow the version directly.
 
 A plan is an immutable definition in the claims graph. Publishing a plan does not start it.
 
@@ -35,23 +37,21 @@ A plan run has one stable subject. Each immutable run generation binds that run 
 ```kdl
 version 2
 
-subgraph {
-  plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
+plan "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
     input "source" kind="resource"
     goal "Produce a verified release decision."
     goal "Keep the source and test evidence visible in the graph."
     completion { when "all-steps-exhausted" }
 
-    subgraph {
-      agent "release.lead" {
+    agent "release.lead" {
         workspace "${ST_WORKSPACE}/lead"
         harness "codex" {
           model "gpt-5.6-sol"
           effort "medium"
           prompt "Claim assigned st3 work and publish the release decision."
         }
-      }
-      agent "release.test" {
+    }
+    agent "release.test" {
         under "release.lead" reason="the lead combines the test evidence"
         workspace "${ST_WORKSPACE}/test"
         harness "codex" {
@@ -59,7 +59,6 @@ subgraph {
           effort "medium"
           prompt "Claim assigned st3 work and publish the test evidence."
         }
-      }
     }
 
     baseline "the release request is ready" {
@@ -115,11 +114,10 @@ subgraph {
         time-limit "5m"
       }
     }
-  }
 }
 ```
 
-The plan subgraph owns the complete plan revision. Its agents use stable subjects inside one plan run.
+The plan body owns the complete plan revision. Its agents use stable subjects inside one plan run.
 
 The plan baseline protects the run admission boundary. The inspection product is intermediate step output.
 
@@ -153,7 +151,7 @@ plan "PLAN_ID"
   produces { PRODUCT... }
   gate "NAME" { GATE_BODY }
 
-  subgraph { PLAN_AGENTS... }
+  PLAN_AGENTS...
 
   step "STEP_ID" { ... }
   finally { step "CLEANUP_ID" { ... } }
@@ -182,7 +180,7 @@ An exact idempotent retry returns its existing run before the capacity check. A 
 
 The reviewer defaults to the plan run requester. `revision-cutover` is `restart-active` by default or `when-idle` when declared. The value in the current generation controls how its successor starts; a candidate cannot select its own cutover.
 
-A plan can contain one direct subgraph. Direct agents in that subgraph can revise the complete plan.
+A plan can contain direct declarations. Direct agents in the plan can revise the complete plan.
 
 A plan can contain zero steps. A zero-step plan without `completion` becomes standing after reconciliation.
 
@@ -209,11 +207,11 @@ An authored runtime ID is local to the run. st3 expands it to these subjects:
 - `subscription/RUN/LOCAL_ID`;
 - `schedule/RUN/LOCAL_ID`.
 
-Two concurrent runs can use the same local IDs. Two subgraphs in one generation cannot declare the same runtime subject.
+Two concurrent runs can use the same local IDs. Two declaration sites in one generation cannot declare the same runtime subject.
 
 An open plan keeps its runtimes present. This rule supports long-lived chat agents without a second plan type.
 
-A runtime `stop` can occur only inside the owner plan. Root control uses `plan-run { cancel }` instead.
+A runtime `stop` can occur only inside the owner plan. Root control uses a named plan-run `cancellation` instead.
 
 The default plan permits one nonterminal run. This default also lets `st3 plan show PLAN` identify the current run.
 
@@ -221,7 +219,7 @@ Bare `concurrent-runs` permits unlimited nonterminal runs. `concurrent-runs max=
 
 The capacity check runs after the idempotency check. A child start waits when capacity is full, but a direct start returns `plan-run-capacity`.
 
-Plans and agents do not support in-place ownership changes. Publish a replacement subgraph and cancel the old run when ownership must change.
+Plans and agents do not support in-place ownership changes. Publish a replacement plan and cancel the old run when ownership must change.
 
 ## Step syntax
 
@@ -240,7 +238,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   }
 
   baseline "NAME" { GRAPH_PREDICATE }
-  subgraph { DESIRED_STATE... }
+  DESIRED_STATE...
   plan "nested-work" { ... }
   retry { attempts 3; backoff "30s" }
   produces { PRODUCT... }
@@ -250,7 +248,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `subgraph`, `plan`, `retry`, `produces`, `produces-plan`, and `uses-plan` are single fields.
+`title`, `assigned-to`, `agentless`, `plan`, `retry`, `produces`, `produces-plan`, and `uses-plan` are single fields.
 
 `available-to`, `goal`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
 
@@ -262,7 +260,7 @@ A plan can have one `finally` block. Final steps can depend on other final steps
 
 Dependencies cannot cross the normal and final phases. A final step does not make normal work optional.
 
-Step revision protection adds to inherited plan protection. Direct agents in the step subgraph can revise that step subtree.
+Step revision protection adds to inherited plan protection. Direct agents in the step can revise that step subtree.
 
 ## Goals
 
@@ -295,9 +293,11 @@ Inputs do not support defaults, lists, secrets, schemas, or automatic environmen
 Nested child plans cannot declare inputs in this version.
 
 ```sh
-st3 run plan.kdl \
+st3 publish plan.kdl --as person/operator
+st3 plan start PLAN_ID \
   --input message="Review this release." \
-  --input source=resource/release-source
+  --input source=resource/release-source \
+  --as person/operator
 
 st3 claim resource/plan-inputs/source resource.observed \
   --field kind=custom.st3.document-source \
@@ -371,7 +371,7 @@ gate "the report is green" { field "status" "resource/report" "is" "green" }
 
 Sibling gates form an AND relation. There is no `gates` wrapper.
 
-Step gates run after the subgraph, worker report, nested work, used plan, and products hold. Plan gates run after every normal step and all plan products hold.
+Step gates run after direct declarations, worker report, nested work, used plan, and products hold. Plan gates run after every normal step and all plan products hold.
 
 Each running gate records `gate.requested` and `gate.result`. The result cites operation evidence. A pass releases the boundary. A failure fails the step or plan. A pending graph or human gate keeps the boundary pending.
 
@@ -474,8 +474,8 @@ For a normal step, st3 performs this sequence:
 5. Resolve the nearest work selector.
 6. Verify that at least one eligible agent is present, when the selector names agents.
 7. Mark the attempt ready and increment its readiness epoch.
-8. Materialize its subgraph.
-9. Wait for subgraph convergence.
+8. Materialize its direct declarations.
+9. Wait for declaration convergence.
 10. Wait for a worker report when an agent claimed the step.
 11. Wait for nested plan steps or an exact used plan.
 12. Verify products.
@@ -695,7 +695,7 @@ All plan runs use the same state machine. There is no separate standing plan typ
 
 An open plan becomes `standing` when it has no next step and has no explicit completion result.
 
-An open plan still asserts its plan subgraph. This rule lets a standing conversation plan keep its agent present.
+An open plan still asserts its direct declarations. This rule lets a standing conversation plan keep its agent present.
 
 `st3 codex` and `st3 claude` publish a deterministic zero-step standing plan. The first command for an agent starts one run.
 
@@ -707,9 +707,9 @@ A plan run does not stop because a controller deletes its runtime. The graph mus
 
 ```kdl
 version 2
-subgraph {
-  plan-run "RUN_ID" {
-    cancel reason="The request was withdrawn."
+plan-run "RUN_ID" {
+  cancellation "request-withdrawn" {
+    reason "The request was withdrawn."
   }
 }
 ```
@@ -732,8 +732,8 @@ st3 sends a cancellation message to each active claimant. The message tells the 
 
 Revision authority comes from agent placement in the current generation.
 
-- A direct agent in a step subgraph can revise that step subtree.
-- A direct agent in a plan subgraph can revise the complete plan.
+- A direct agent in a step can revise that step subtree.
+- A direct agent in a plan can revise the complete plan.
 - A direct agent adjacent to plans can revise those plans.
 
 The run requester can propose any revision. A work selector does not grant revision authority.
@@ -817,13 +817,13 @@ st3 doc list doc/project/request
 
 Bare document names can appear in an intent before preview. The preview resolves them to the current exact hash. Apply validates the bytes and binds that exact version.
 
-## Preview, publish, and run
+## Preview, publish, and start
 
 `st3 preview FILE` validates KDL, resolves documents, displays changes, returns subject tokens, and performs no write.
 
-`st3 run FILE` repeats preview, applies the exact tokens, selects one ready plan, starts one run, and follows it unless `--detach` is present.
+`st3 publish FILE --as ACTOR` repeats preview and applies the exact tokens. It never starts a plan run.
 
-If a file contains multiple ready plans, select one with `--plan`.
+`st3 plan start PLAN --as ACTOR` publishes one plan-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
 
 `st3 plan show PLAN_RUN` reads one exact run. `st3 plan show PLAN` works only when that plan has exactly one nonterminal run.
 

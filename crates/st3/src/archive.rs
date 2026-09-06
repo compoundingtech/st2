@@ -129,7 +129,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         fs::create_dir(source.path().join("_git")).unwrap();
         fs::write(source.path().join("_git/config"), "test").unwrap();
-        fs::write(source.path().join("eval.kdl"), "subgraph {}").unwrap();
+        fs::write(source.path().join("eval.kdl"), "version 2\n").unwrap();
         let one = archive_eval(source.path()).unwrap();
         let two = archive_eval(source.path()).unwrap();
         assert_eq!(one, two);

@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/ghost-bug-codex" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/ghost-bug-codex."
     step "start-team" timeout="10m" {
       title "The native Codex debugging team is ready"
-      subgraph {
         agent "gbx.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "codex" {
@@ -29,7 +27,6 @@ subgraph {
           restart "never"
           env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
         }
-      }
     }
 
     step "delegate-debug-brief" timeout="15m" {
@@ -121,4 +118,3 @@ subgraph {
     }
 
   }
-}

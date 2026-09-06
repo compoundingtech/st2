@@ -7,5 +7,6 @@ jq -e '.status == "superseded"' old-generation.json >/dev/null
 jq -e '.predecessor == $old' \
   --arg old "$(jq -er '.subject' old-generation.json)" \
   new-generation.json >/dev/null
-jq -e '.status == "applied"' applied.json >/dev/null
+jq -e '.status == "approved"' approved.json >/dev/null
+jq -e '.initial_revision != .revision' applied.json >/dev/null
 test -s observed-generation.txt

@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/signal-rename-codex" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/signal-rename-codex."
     step "materialize" timeout="30m" {
       title "The isolated workspace exists"
-      subgraph {
         exec "eval/signal-rename-codex/materialize" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -19,7 +17,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/signal-rename-codex/materialize" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/signal-rename-codex/materialize" "is" 0 }
     }
@@ -27,7 +24,6 @@ subgraph {
     step "start-team" timeout="10m" {
       title "The four native Codex agents are ready"
       depends-on { step "materialize" completed }
-      subgraph {
         agent "sig.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "codex" {
@@ -88,7 +84,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "open-base-compatibility" timeout="30m" {
@@ -415,4 +410,3 @@ subgraph {
     }
 
   }
-}

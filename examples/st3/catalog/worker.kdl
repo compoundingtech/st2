@@ -1,11 +1,9 @@
 version 2
 
-subgraph {
   plan "catalog/worker" state="ready" {
     goal "Keep the catalog worker ready for work."
     step "start-worker" {
       agentless
-      subgraph {
         agent "catalog.worker" {
           workspace "."
           restart "always"
@@ -13,8 +11,6 @@ subgraph {
             prompt "Own the assigned repository and wait for graph messages."
           }
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/catalog.worker" }
     }
   }
-}

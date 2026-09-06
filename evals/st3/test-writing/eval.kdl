@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/test-writing" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/test-writing."
     step "start-team" timeout="10m" {
       title "The native Codex test team is ready"
-      subgraph {
         agent "tw.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "codex" {
@@ -37,7 +35,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "prepare-test-brief" timeout="15m" {
@@ -139,4 +136,3 @@ subgraph {
     }
 
   }
-}

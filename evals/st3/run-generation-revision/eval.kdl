@@ -1,14 +1,12 @@
 version 2
 
-subgraph {
   plan "eval/run-generation-revision" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Prove an approved plan revision creates one immutable successor generation."
+    goal "Prove an approved targeted planning revision creates one immutable successor generation."
     goal "Prove compatible state and automatic run environment move to the successor."
 
-    step "exercise-revision" timeout="5m" {
-      title "The controller revises one live plan run"
-      subgraph {
+    step "exercise-revision" timeout="25m" {
+      title "A Codex planner revises one live plan run"
         exec "eval/run-generation-revision/controller" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -16,7 +14,6 @@ subgraph {
           command "bash ./controller.sh"
           restart "never"
         }
-      }
       gate "the revision controller exits successfully" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/run-generation-revision/controller" "is" 0 }
     }
 
@@ -32,4 +29,3 @@ subgraph {
     }
 
   }
-}

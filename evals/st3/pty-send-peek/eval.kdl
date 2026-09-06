@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/pty-send-peek" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/pty-send-peek."
     step "contract" timeout="1m" {
       title "PTY send and peek make a real byte round trip"
-      subgraph {
         pty "psp" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -21,7 +19,6 @@ subgraph {
           restart "never"
 
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/pty-send-peek/probe" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/pty-send-peek/probe" "is" 0 }
     }
@@ -34,4 +31,3 @@ subgraph {
       }
     }
   }
-}

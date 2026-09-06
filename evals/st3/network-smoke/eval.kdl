@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/network-smoke" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/network-smoke."
     step "contract" timeout="2m" {
       title "An isolated st3 daemon hosts a subject and delivers Small Talk"
-      subgraph {
         exec "eval/network-smoke/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
@@ -14,7 +12,6 @@ subgraph {
           command "bash ./run.sh"
           restart "never"
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/network-smoke/contract" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/network-smoke/contract" "is" 0 }
     }
@@ -27,4 +24,3 @@ subgraph {
       }
     }
   }
-}

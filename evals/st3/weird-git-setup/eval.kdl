@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/weird-git-setup" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/weird-git-setup."
     step "materialize-megarepo" timeout="5m" {
       title "The linked worktree fixture exists"
-      subgraph {
         exec "eval/weird-git-setup/materialize" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -15,7 +13,6 @@ subgraph {
           restart "never"
           env { CATALOG "${ST_WORKSPACE}" }
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/weird-git-setup/materialize" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/weird-git-setup/materialize" "is" 0 }
     }
@@ -23,7 +20,6 @@ subgraph {
     step "start-worker" timeout="10m" {
       title "The native Codex worker is ready in the linked worktree"
       depends-on { step "materialize-megarepo" completed }
-      subgraph {
         agent "wg.dev" {
           workspace "${ST_WORKSPACE}/wt/feature"
           harness "codex" {
@@ -39,7 +35,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "repair-feature-worktree" timeout="20m" {
@@ -96,4 +91,3 @@ subgraph {
     }
 
   }
-}

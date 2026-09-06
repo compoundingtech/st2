@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/license-mit" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/license-mit."
     step "start-team" timeout="10m" {
       title "The native Claude Sonnet license team is ready"
-      subgraph {
         agent "lmc.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "claude" {
@@ -31,7 +29,6 @@ subgraph {
           restart "never"
           env { CATALOG "${ST_WORKSPACE}"; ST_ROOT "${ST_WORKSPACE}/.st3-messages"; ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages" }
         }
-      }
     }
 
     step "delegate-license-change" timeout="15m" {
@@ -121,4 +118,3 @@ subgraph {
     }
 
   }
-}

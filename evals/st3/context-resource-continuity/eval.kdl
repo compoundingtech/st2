@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/context-resource-continuity" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/context-resource-continuity."
     step "contract" timeout="2m" {
       title "Context and resources survive two daemon restarts"
-      subgraph {
         exec "eval/context-resource-continuity/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
@@ -14,7 +12,6 @@ subgraph {
           command "bash ./run.sh"
           restart "never"
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/context-resource-continuity/contract" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/context-resource-continuity/contract" "is" 0 }
     }
@@ -28,4 +25,3 @@ subgraph {
       }
     }
   }
-}

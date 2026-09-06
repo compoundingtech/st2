@@ -1,11 +1,9 @@
 version 2
 
-subgraph {
   plan "native-drivers" state="ready" {
     goal "Keep four native harnesses ready for work."
     step "start-harnesses" {
       agentless
-      subgraph {
         agent "native.claude" {
           workspace "."
           harness "claude" {
@@ -34,11 +32,9 @@ subgraph {
             prompt "Wait for a native graph message."
           }
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/native.claude" }
       gate "condition-2" { exists "agent/${ST_PLAN_RUN}/native.codex" }
       gate "condition-3" { exists "agent/${ST_PLAN_RUN}/native.pi" }
       gate "condition-4" { exists "agent/${ST_PLAN_RUN}/native.opencode" }
     }
   }
-}

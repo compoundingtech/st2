@@ -1,11 +1,9 @@
 version 2
 
-subgraph {
   plan "review-chat" state="ready" {
     goal "Keep one review agent ready for a conversation."
     step "start-reviewer" {
       agentless
-      subgraph {
         agent "reviewer" {
           name "Review agent"
           workspace "."
@@ -16,8 +14,6 @@ subgraph {
             prompt "Review the current work and wait for graph messages."
           }
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/reviewer" }
     }
   }
-}

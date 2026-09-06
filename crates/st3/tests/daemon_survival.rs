@@ -9,6 +9,12 @@ use std::time::Duration;
 
 struct Daemon(Child);
 
+fn st3_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env("ST_AGENT", "person/test");
+    command
+}
+
 impl Daemon {
     fn stop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
@@ -26,7 +32,7 @@ impl Drop for Daemon {
 
 fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
     Daemon(
-        Command::new(binary)
+        st3_command(binary)
             .arg("up")
             .args(["--node", "survival-node"])
             .arg("--state-dir")
@@ -60,36 +66,36 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
     fs::write(
         &intent,
         r#"version 2
-subgraph {
+
   plan "pty-helpers" state="ready" {
     goal "Keep the operator PTY available."
     step "operator" {
-      subgraph {
+
         pty "operator" {
           argv "sh" "-c" "printf ready; read line; printf ' got:%s' \"$line\"; sleep 1"
           restart "never"
         }
-      }
+
     }
   }
-}
+
 "#,
     )
     .unwrap();
     let mut daemon = start_daemon(binary, &state, &socket);
     wait_for(
         || {
-            Command::new(binary)
+            st3_command(binary)
                 .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
                 .output()
                 .is_ok_and(|output| output.status.success())
         },
         "the daemon did not become ready",
     );
-    let published = Command::new(binary)
-        .args(["--endpoint", socket.to_str().unwrap(), "--json", "run"])
+    let published = st3_command(binary)
+        .args(["--endpoint", socket.to_str().unwrap(), "publish"])
         .arg(&intent)
-        .arg("--detach")
+        .args(["--as", "person/test"])
         .output()
         .unwrap();
     assert!(
@@ -97,9 +103,29 @@ subgraph {
         "{}",
         String::from_utf8_lossy(&published.stderr)
     );
-    let run: serde_json::Value = serde_json::from_slice(&published.stdout).unwrap();
-    let subject = format!("pty/{}/operator", run["id"].as_str().unwrap());
-    let waited = Command::new(binary)
+    let started = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "plan",
+            "start",
+            "pty-helpers",
+            "--id",
+            "pty-helpers/test",
+            "--workspace",
+            temporary.path().to_str().unwrap(),
+            "--as",
+            "person/test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let subject = "pty/pty-helpers/test/operator".to_owned();
+    let waited = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -117,13 +143,13 @@ subgraph {
         "{}",
         String::from_utf8_lossy(&waited.stderr)
     );
-    let listed = Command::new(binary)
+    let listed = st3_command(binary)
         .args(["--endpoint", socket.to_str().unwrap(), "pty", "ls"])
         .output()
         .unwrap();
     assert!(listed.status.success());
     assert!(String::from_utf8_lossy(&listed.stdout).contains(&subject));
-    let sent = Command::new(binary)
+    let sent = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -141,7 +167,7 @@ subgraph {
     );
     wait_for(
         || {
-            Command::new(binary)
+            st3_command(binary)
                 .args([
                     "--endpoint",
                     socket.to_str().unwrap(),
@@ -157,7 +183,7 @@ subgraph {
         },
         "the PTY did not receive the line",
     );
-    let signalled = Command::new(binary)
+    let signalled = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -211,7 +237,7 @@ fn exec_record(state: &Path, name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn interruptible_command(binary: &Path) -> Command {
-    let mut command = Command::new(binary);
+    let mut command = st3_command(binary);
     command.process_group(0);
     unsafe {
         command.pre_exec(|| {
@@ -236,14 +262,14 @@ fn exec_returns_the_remote_status_and_retains_the_log() {
     let mut daemon = start_daemon(binary, &state, &socket);
     wait_for(
         || {
-            Command::new(binary)
+            st3_command(binary)
                 .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
                 .output()
                 .is_ok_and(|output| output.status.success())
         },
         "the daemon did not become ready",
     );
-    let exec = Command::new(binary)
+    let exec = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -260,7 +286,7 @@ fn exec_returns_the_remote_status_and_retains_the_log() {
     assert_eq!(exec.status.code(), Some(7));
     assert_eq!(exec.stdout, b"exact-log");
     let subject = exec_subject(&exec.stderr);
-    let logs = Command::new(binary)
+    let logs = st3_command(binary)
         .args(["--endpoint", socket.to_str().unwrap(), "logs", "--all"])
         .arg(&subject)
         .output()
@@ -271,7 +297,7 @@ fn exec_returns_the_remote_status_and_retains_the_log() {
         String::from_utf8_lossy(&logs.stderr)
     );
     assert_eq!(logs.stdout, b"exact-log");
-    let signalled = Command::new(binary)
+    let signalled = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -287,7 +313,7 @@ fn exec_returns_the_remote_status_and_retains_the_log() {
         .expect("run a signalled exec member");
     assert_eq!(signalled.status.code(), Some(128 + libc::SIGTERM));
 
-    let detached = Command::new(binary)
+    let detached = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -304,7 +330,7 @@ fn exec_returns_the_remote_status_and_retains_the_log() {
         .expect("run a detached exec member");
     assert!(detached.status.success());
     let detached_subject = String::from_utf8_lossy(&detached.stdout).trim().to_owned();
-    let waited = Command::new(binary)
+    let waited = st3_command(binary)
         .args(["--endpoint", socket.to_str().unwrap(), "wait"])
         .arg(&detached_subject)
         .args(["--for", "exited", "--timeout", "2s"])
@@ -327,7 +353,7 @@ fn interrupt_stops_follow_and_optional_cancel_stops_the_member() {
     let mut daemon = start_daemon(binary, &state, &socket);
     wait_for(
         || {
-            Command::new(binary)
+            st3_command(binary)
                 .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
                 .output()
                 .is_ok_and(|output| output.status.success())
@@ -460,7 +486,7 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
     let mut daemon = start_daemon(binary, &state, &socket);
     wait_for(
         || {
-            Command::new(binary)
+            st3_command(binary)
                 .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
                 .output()
                 .is_ok_and(|output| output.status.success())
@@ -468,7 +494,7 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
         "the first daemon did not become ready",
     );
 
-    let detached = Command::new(binary)
+    let detached = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
@@ -504,7 +530,7 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
     let mut replacement = start_daemon(binary, &state, &socket);
     wait_for(
         || {
-            let output = Command::new(binary)
+            let output = st3_command(binary)
                 .args(["--endpoint", socket.to_str().unwrap(), "inspect", &subject])
                 .output();
             output.is_ok_and(|output| {
@@ -515,7 +541,7 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
         "the replacement daemon did not adopt the exec",
     );
     wait_for(|| !alive(generation.pid), "the exec did not finish");
-    let logs = Command::new(binary)
+    let logs = st3_command(binary)
         .args([
             "--endpoint",
             socket.to_str().unwrap(),

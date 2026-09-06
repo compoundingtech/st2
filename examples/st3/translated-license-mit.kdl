@@ -1,13 +1,11 @@
 version 2
 
-subgraph {
   plan "eval/license-mit" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/license-mit."
     step "team" timeout="20m" {
       agentless
       title "The eval team is running"
-      subgraph {
         agent "mix.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "claude" {
@@ -25,7 +23,6 @@ subgraph {
           }
           restart "never"
         }
-      }
       gate "condition-1" { exists "agent/${ST_PLAN_RUN}/mix.sup" }
       gate "condition-2" { exists "agent/${ST_PLAN_RUN}/mix.worker" }
     }
@@ -58,4 +55,3 @@ subgraph {
       }
     }
   }
-}

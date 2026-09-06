@@ -198,7 +198,7 @@ account "claude/team-a" {
 
 The declaration creates `account/claude/team-a`. The supported authentication types are `subscription` and `api-key`.
 
-An account is not plan-owned. A plan or step subgraph cannot declare one.
+An account is not plan-owned. A plan or step cannot declare one.
 
 An agent records its selected account with an `agent.account` state transition. The agent must write its own association.
 
@@ -233,11 +233,13 @@ st3 and st2 do not share a live control loop. They can share an existing PTY reg
 
 ## KDL intent boundary
 
-Every st3 intent starts with `version 2` and contains exactly one untyped `subgraph` root.
+[kdl-lifecycle.md](./kdl-lifecycle.md) is the operational guide for publish, start, revise, approve, refresh, cancel, and print-only workflows.
+
+Every st3 intent starts with `version 2`. Declarations follow the version directly.
 
 The root can contain accounts, plan definitions, durable resources, people, documents, messages, and plan-run cancellation.
 
-An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` must occur in a plan or step subgraph.
+An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` that performs execution must occur in a plan or step.
 
 A runtime `stop` must occur in the same owning plan. It cannot target a runtime from another plan run.
 
@@ -288,8 +290,8 @@ Per-subject writers and causal predecessor heads control graph updates. A claime
 
 Plan revision authority comes only from graph placement in the current generation.
 
-- An agent in a step subgraph can revise that step subtree.
-- An agent in a plan subgraph can revise that plan.
+- An agent declared directly in a step can revise that step subtree.
+- An agent declared directly in a plan can revise that plan.
 - An agent adjacent to direct plans can revise those plans.
 
 A work selector does not grant revision authority. The candidate revision cannot grant authority to its own author.
@@ -334,7 +336,7 @@ Service reset retains the binary, service definition, configuration, workspaces,
 
 ## Plan execution
 
-A ready plan starts only through `POST /v1/plan-runs` or `st3 run`.
+A ready plan starts only through a published `plan-run` declaration. `st3 plan start` generates and publishes that declaration.
 
 A plan run records its initial revision, current generation, root revision, root run, workspace, requester, status, and phase.
 
@@ -355,7 +357,7 @@ Normal execution has these boundaries:
 3. Step baselines must hold before each attempt becomes ready.
 4. At least one eligible desired agent exists when the step needs an agent.
 5. The step becomes ready with a new readiness epoch.
-6. The step subgraph converges.
+6. The step declarations converge.
 7. A claimant reports completion when the step needs an agent.
 8. Declared step products must exist.
 9. All step gates must pass.

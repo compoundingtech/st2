@@ -543,10 +543,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
             r#"version 2
-subgraph {{
+
   agent "one" {{ workspace {:?}; command "true"; render {{ file "shared" "one" }} }}
   agent "two" {{ workspace {:?}; command "true"; render {{ file "shared" "two" }} }}
-}}"#,
+"#,
             workspace.path().display().to_string(),
             workspace.path().display().to_string(),
         );

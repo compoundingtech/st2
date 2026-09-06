@@ -1,6 +1,5 @@
 version 2
 
-subgraph {
   plan "eval/planning-mode" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Prove one Codex planning session from request through direct approval."
@@ -8,7 +7,6 @@ subgraph {
 
     step "planning-session" timeout="25m" {
       title "A Codex planner submits one reviewable plan candidate"
-      subgraph {
         exec "eval/planning-mode/controller" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -19,7 +17,6 @@ subgraph {
             PLANNED_PLAN "planning-mode-${ST_PLAN_RUN}"
           }
         }
-      }
       gate "the controller exits successfully" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/planning-mode/controller" "is" 0 }
     }
 
@@ -35,4 +32,3 @@ subgraph {
     }
 
   }
-}

@@ -1,6 +1,5 @@
 version 2
 
-subgraph {
   resource "local-file-refresh/file" {
     kind "filesystem.file"
   }
@@ -9,7 +8,6 @@ subgraph {
     completion { when "all-steps-exhausted" }
     goal "Refresh one local file observation without exposing its content."
 
-    subgraph {
       observer "file" {
         resource "resource/local-file-refresh/file"
         provider "local.file"
@@ -18,19 +16,16 @@ subgraph {
         field "content_hash"
         field "size"
       }
-    }
 
     step "change-and-refresh" timeout="1m" {
       agentless
       title "A manual refresh observes one file change"
-      subgraph {
         exec "local-file-refresh/change" {
           host "local"
           workspace "${ST_WORKSPACE}"
           command "bash ./refresh.sh"
           restart "never"
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/local-file-refresh/change" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/local-file-refresh/change" "is" 0 }
     }
@@ -46,4 +41,3 @@ subgraph {
       }
     }
   }
-}

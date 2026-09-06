@@ -119,12 +119,12 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/schema", get(schema))
         .route("/v1/intent/plan", post(plan))
         .route("/v1/intent/apply", post(apply))
-        .route("/v1/planning-sessions", post(start_planning_session))
+        .route("/v1/plans/{id}", get(get_plan))
         .route("/v1/planning-sessions/{id}", get(get_planning_session))
         .route(
             "/v1/planning-sessions/{id}/submit",
@@ -151,42 +151,24 @@ pub fn router(state: AppState) -> Router {
             post(propose_planning_variant),
         )
         .route(
-            "/v1/planning-sessions/{id}/revise",
-            post(revise_planning_session),
-        )
-        .route(
             "/v1/planning-sessions/{id}/approve",
             post(approve_planning_session),
         )
-        .route(
-            "/v1/planning-sessions/{id}/cancel",
-            post(cancel_planning_session),
-        )
         .route("/v1/documents", get(list_documents).post(put_document))
-        .route("/v1/resource-watches", post(watch_resource))
-        .route(
-            "/v1/resource-watches/{*subscription}",
-            post(unwatch_resource),
-        )
-        .route("/v1/resources/refresh/{*resource}", post(refresh_resource))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews/{*subject}", post(post_review))
-        .route("/v1/messages", get(list_messages).post(send_message))
+        .route("/v1/messages", get(list_messages))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/close/{*subject}", post(close_message))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/status", get(status))
-        .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
-        .route("/v1/claude", post(quick_claude))
-        .route("/v1/codex", post(quick_codex))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
-        .route("/v1/plan-runs", get(list_plan_runs).post(start_plan_run))
-        .route("/v1/plan-runs/{run}/revision", post(revise_plan_run))
+        .route("/v1/plan-runs", get(list_plan_runs))
         .route("/v1/plan-runs/{run}/generations", get(list_run_generations))
         .route(
             "/v1/plan-runs/{run}/revision-proposal",
@@ -221,8 +203,31 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/peer/export", get(export_peer))
         .route("/v1/peer/cursor", get(peer_cursor))
         .route("/v1/peer/claims", post(import_peer))
-        .route("/v1/peer/claims/query", post(query_peer))
-        .layer(from_fn_with_state(state.clone(), response_envelope))
+        .route("/v1/peer/claims/query", post(query_peer));
+    #[cfg(test)]
+    let app = app
+        .route("/v1/planning-sessions", post(start_planning_session))
+        .route(
+            "/v1/planning-sessions/{id}/revise",
+            post(revise_planning_session),
+        )
+        .route(
+            "/v1/planning-sessions/{id}/cancel",
+            post(cancel_planning_session),
+        )
+        .route("/v1/resource-watches", post(watch_resource))
+        .route(
+            "/v1/resource-watches/{*subscription}",
+            post(unwatch_resource),
+        )
+        .route("/v1/resources/refresh/{*resource}", post(refresh_resource))
+        .route("/v1/messages", post(send_message))
+        .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
+        .route("/v1/claude", post(quick_claude))
+        .route("/v1/codex", post(quick_codex))
+        .route("/v1/plan-runs", post(start_plan_run))
+        .route("/v1/plan-runs/{run}/revision", post(revise_plan_run));
+    app.layer(from_fn_with_state(state.clone(), response_envelope))
         .with_state(state)
 }
 
@@ -900,7 +905,7 @@ async fn submit_planning_variant(
         ),
     )?;
     signal_changed(&state);
-    Ok(Json(response))
+    preview_planning_variant(state, id, variant).await
 }
 
 async fn preview_planning_candidate(
@@ -1243,6 +1248,9 @@ async fn approve_planning_session(
     }
     if session.status == "approved" {
         if session.published_revision.as_deref() == Some(candidate.plan_revision.as_str()) {
+            let approval_key = format!("planning-approval:{}:{}", session.id, preview.hash);
+            stop_planning_agent(&state, &session.planner, &approval_key)?;
+            signal_changed(&state);
             return Ok(Json(session));
         }
         return Err(ApiError::internal(format!(
@@ -1256,6 +1264,22 @@ async fn approve_planning_session(
             preview.plan.blockers.join("; "),
         )));
     }
+    let target = if let Some(run_subject) = session.target_plan_run.as_deref() {
+        let current = state
+            .store
+            .plan_run(run_subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("the target plan run does not exist"))?;
+        if session.source_generation.as_deref() != Some(current.generation.as_str()) {
+            return Err(ApiError::bad(St3Error::new(
+                "stale-planning-generation",
+                "the planning approval targets a superseded generation",
+            )));
+        }
+        Some((run_subject.to_owned(), current))
+    } else {
+        None
+    };
     let intent =
         parse_intent(&preview.plan.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
     let approval_key = format!("planning-approval:{}:{}", session.id, preview.hash);
@@ -1267,6 +1291,60 @@ async fn approve_planning_session(
             &format!("{approval_key}:publish"),
         )
         .map_err(ApiError::bad)?;
+    if let Some((run_subject, current)) = target {
+        let plan = &intent.plans[&session.plan];
+        let old = state
+            .store
+            .plan_spec(&session.plan, Some(&current.revision))
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal("the current plan revision is unavailable"))?;
+        let (_, reviewers) = crate::store::analyze_plan_revision(
+            &old,
+            plan,
+            &request.actor,
+            &current.requester,
+            &crate::store::plan_run_variables(&current, &plan.revision),
+        )
+        .map_err(ApiError::bad)?;
+        if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
+            state
+                .store
+                .adopt_plan_revision(
+                    &run_subject,
+                    plan,
+                    &request.actor,
+                    "the requester approved the planning revision",
+                    &format!("{approval_key}:cutover"),
+                )
+                .map_err(ApiError::bad)?;
+        } else {
+            let proposal = state
+                .store
+                .create_revision_proposal(
+                    &run_subject,
+                    plan,
+                    &request.actor,
+                    "the requester approved the planning revision",
+                    &format!("{approval_key}:proposal"),
+                )
+                .map_err(ApiError::bad)?;
+            if proposal.reviewers.contains(&request.actor) {
+                let revision_preview = proposal
+                    .preview_hash
+                    .as_deref()
+                    .ok_or_else(|| ApiError::internal("the revision proposal has no preview"))?;
+                state
+                    .store
+                    .approve_revision_proposal(
+                        &proposal.subject,
+                        &request.actor,
+                        revision_preview,
+                        &format!("{approval_key}:revision-approval"),
+                    )
+                    .map_err(ApiError::bad)?;
+            }
+        }
+    }
     let response = state
         .store
         .finish_planning_session(
@@ -1314,6 +1392,8 @@ async fn cancel_planning_session(
     let session = required_planning_session(&state, &id)?;
     authorize_planning_reviewer(&session, &request.actor)?;
     if session.status == "cancelled" {
+        stop_planning_agent(&state, &session.planner, &request.idempotency_key)?;
+        signal_changed(&state);
         return Ok(Json(session));
     }
     let response = state
@@ -1546,16 +1626,17 @@ fn stop_planning_agent(state: &AppState, planner: &str, key: &str) -> Result<(),
         .map(|run| run.subject)
         .map(|run| {
             format!(
-                "  plan-run {:?} {{ cancel reason=\"the planning session ended\" }}\n",
+                "plan-run {:?} {{ cancellation \"planning-session-ended\" {{ reason \"the planning session ended\" }} }}\n",
                 run
             )
         })
         .unwrap_or_default();
-    if cancellation.is_empty() {
-        return Ok(());
-    }
-    let kdl = format!("version 2\nsubgraph {{\n{cancellation}}}\n");
-    let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
+    let kdl = if cancellation.is_empty() {
+        format!("version 2\nstop {planner:?}\n")
+    } else {
+        format!("version 2\n{cancellation}")
+    };
+    let intent = crate::graph::parse_internal_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     state
         .store
         .apply_internal(&intent, &format!("{key}:stop-planner"))
@@ -1590,17 +1671,38 @@ async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
 ) -> Result<Json<ApplyResponse>, ApiError> {
+    let actor = request.actor.as_deref().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-publication-actor",
+            "publication needs `--as` or ST_AGENT",
+        ))
+    })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
-    let response = state
+    let mut response = state
         .store
-        .apply(
+        .apply_as(
             &intent,
             &request.expected_subjects,
             &request.idempotency_key,
+            Some(actor),
         )
         .map_err(ApiError::bad)?;
+    response.resolved_kdl = request.intent.kdl;
     signal_changed(&state);
     Ok(Json(response))
+}
+
+async fn get_plan(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<crate::model::PlanSpec>, ApiError> {
+    let id = id.strip_prefix("plan/").unwrap_or(&id);
+    state
+        .store
+        .plan_spec(id, None)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("plan `plan/{id}` does not exist")))
 }
 
 async fn put_document(
@@ -1729,7 +1831,7 @@ async fn watch_resource(
         .map(|field| format!("        on {}\n", quote(field)))
         .collect::<String>();
     let kdl = format!(
-        "version 2\nsubgraph {{\n  resource {} {{\n    kind {resource_kind:?}\n  }}\n  plan {} state=\"ready\" {{\n    goal \"Observe one resource and send its selected changes.\"\n    subgraph {{\n      observer \"watch\" {{\n        resource {}\n        provider {}\n        locator {}\n{observer_fields}      }}\n      subscription \"watch\" {{\n        observer \"observer/watch\"\n        to {}\n{subscription_fields}        delivery \"message\"\n      }}\n    }}\n  }}\n}}\n",
+        "version 2\nresource {} {{\n  kind {resource_kind:?}\n}}\nplan {} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {}\n    provider {}\n    locator {}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
         quote(&resource_name),
         quote(&plan_id),
         quote(&format!("resource/{resource_name}")),
@@ -1800,7 +1902,7 @@ async fn unwatch_resource(
             ApiError::not_found(format!("subscription `{subscription}` does not exist"))
         })?;
     let kdl = format!(
-        "version 2\nsubgraph {{\n  plan-run {run:?} {{ cancel reason=\"the resource watch stopped\" }}\n}}\n"
+        "version 2\nplan-run {run:?} {{ cancellation \"resource-watch-stopped\" {{ reason \"the resource watch stopped\" }} }}\n"
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     let planned = state
@@ -2642,7 +2744,7 @@ async fn quick_agent(
     driver_body.push_str(&format!("prompt {prompt:?}\n"));
     let plan_id = format!("standing/{bus_id}");
     let kdl = format!(
-        "version 2\nsubgraph {{\n  plan {plan_id:?} state=\"ready\" {{\n    goal \"Keep the agent ready for work and conversation.\"\n    subgraph {{\n      agent {bus_id:?} {{\n        identity {bus_id:?}\n        workspace {:?}\n        harness {driver:?} {{\n{driver_body}        }}\n      }}\n    }}\n  }}\n}}\n",
+        "version 2\nplan {plan_id:?} state=\"ready\" {{\n  goal \"Keep the agent ready for work and conversation.\"\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
         request.worktree
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
@@ -4517,13 +4619,13 @@ mod tests {
         let source = format!(
             r#"
 version 2
-subgraph {{
+
   agent "resettable" {{
     workspace {workspace:?}
     command "true"
     restart "on-failure"
   }}
-}}
+
 "#,
             workspace = root.path().display().to_string()
         );
@@ -4597,7 +4699,7 @@ subgraph {{
         let source = format!(
             r#"
 version 2
-subgraph {{
+
   resource "refresh/file" {{ kind "filesystem.file" }}
   observer "refresh/file" {{
     resource "resource/refresh/file"
@@ -4606,7 +4708,7 @@ subgraph {{
     field "status"
     field "content_hash"
   }}
-}}
+
 "#,
             locator = root.path().join("watched.txt").display().to_string()
         );
@@ -4823,7 +4925,7 @@ subgraph {{
             serde_json::to_value(PlanRequest {
                 intent: crate::model::IntentInput {
                     kdl: r#"version 2
-subgraph { message "task" { to "worker"; content "doc/task" } }"#
+ message "task" { to "worker"; content "doc/task" } "#
                         .into(),
                     source_name: None,
                 },
@@ -4897,7 +4999,7 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
             .unwrap()
             .unwrap();
         let standing_intent = crate::graph::parse_execution_intent(
-            standing_plan.subgraph_kdl.as_ref().unwrap(),
+            standing_plan.declarations_kdl.as_ref().unwrap(),
             "node",
             &standing.id,
         )
@@ -4922,7 +5024,7 @@ subgraph { message "task" { to "worker"; content "doc/task" } }"#
 
         let first = br#"
 version 2
-subgraph {
+
   plan "planned/work" state="ready" {
     goal "Publish the planned result."
     step "inspect" { goal "Inspect the source." }
@@ -4931,18 +5033,17 @@ subgraph {
       depends-on { step "inspect" completed }
     }
   }
-}
+
 "#;
         let mut side_effect = br#"
 version 2
-subgraph {
   agent "side-effect" {
     workspace "/tmp"
     harness "codex" { prompt "This must never be published." }
   }
 "#
         .to_vec();
-        side_effect.extend_from_slice(&first[b"version 2\nsubgraph {\n".len()..]);
+        side_effect.extend_from_slice(&first[b"version 2\n".len()..]);
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/planning-sessions/{session}/submit"),
@@ -5041,7 +5142,7 @@ subgraph {
 
         let second = br#"
 version 2
-subgraph {
+
   plan "planned/work" state="ready" {
     goal "Publish the planned and verified result."
     step "inspect" { goal "Inspect the source." }
@@ -5054,7 +5155,7 @@ subgraph {
       depends-on { step "change" completed }
     }
   }
-}
+
 "#;
         let (status, resubmitted) = json_request(
             app.clone(),
@@ -5227,6 +5328,214 @@ subgraph {
     }
 
     #[tokio::test]
+    async fn declarative_planning_approval_stops_its_session_planner() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let request = store
+            .put_document(
+                "doc/planning/direct/request",
+                b"Plan one inspection.",
+                &None,
+                "direct-planning-request",
+            )
+            .unwrap();
+        let session = "planning/direct/one";
+        let source = format!(
+            r#"version 2
+planning-session {session:?} {{
+  plan "planned/direct"
+  request {:?}
+  workspace {:?}
+  requester "person/operator"
+  planner "codex" {{ model "gpt-5.6-sol"; effort "medium" }}
+}}
+"#,
+            format!("{}@{}", request.name, request.hash),
+            workspace.display().to_string(),
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "direct-planning-session",
+                Some("person/operator"),
+            )
+            .unwrap();
+        let planner =
+            crate::graph::planning_planner_subject(&format!("planning-session/{session}"));
+        assert_eq!(
+            store.selected_desired_kind(&planner).unwrap().as_deref(),
+            Some("agent")
+        );
+
+        let app = router(state);
+        let encoded_session = urlencoding::encode(session);
+        let candidate = br#"version 2
+plan "planned/direct" state="ready" {
+  goal "Inspect the release."
+  step "inspect" { goal "Inspect the release input." }
+}
+"#;
+        let (status, submitted) = json_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{encoded_session}/submit"),
+            serde_json::to_value(PlanningCandidateSubmitRequest {
+                actor: planner.clone(),
+                markdown: b"# Plan\n\nInspect the release input.\n".to_vec(),
+                kdl: candidate.to_vec(),
+                idempotency_key: "direct-planning-candidate".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{submitted}");
+        let (status, previewed) = json_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{encoded_session}/preview"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{previewed}");
+        let preview_hash = previewed["preview"]["hash"].as_str().unwrap();
+        let (status, approved) = json_request(
+            app,
+            &format!("/v1/planning-sessions/{encoded_session}/approve"),
+            serde_json::to_value(PlanningApprovalRequest {
+                actor: "person/operator".into(),
+                preview_hash: preview_hash.into(),
+                idempotency_key: "direct-planning-approval".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["status"], "approved");
+        assert_eq!(
+            store.selected_desired_kind(&planner).unwrap().as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn one_targeted_planning_approval_also_approves_the_run_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let initial = r#"version 2
+plan "targeted" state="ready" revisions="human-only" {
+  goal "Use the initial plan."
+  step "work" { agentless }
+}
+"#;
+        let intent = parse_intent(initial, "node").unwrap();
+        let preview = store
+            .plan(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: initial.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "targeted-plan")
+            .unwrap();
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "targeted".into(),
+                revision: None,
+                workspace: workspace.display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "targeted-run".into(),
+            })
+            .unwrap();
+        let app = router(state);
+        let (status, session) = json_request(
+            app.clone(),
+            "/v1/planning-sessions",
+            serde_json::to_value(PlanningSessionStartRequest {
+                plan: "ignored".into(),
+                run: Some(run.subject.clone()),
+                request: b"Add the final verification.".to_vec(),
+                workspace: workspace.display().to_string(),
+                requester: Some("person/operator".into()),
+                model: None,
+                effort: None,
+                idempotency_key: "targeted-session".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let session_id = session["id"].as_str().unwrap();
+        let planner = session["planner"].as_str().unwrap();
+        let candidate = br#"version 2
+plan "targeted" state="ready" revisions="human-only" {
+  goal "Use the reviewed plan."
+  step "work" { agentless }
+  step "verify" {
+    agentless
+    depends-on { step "work" completed }
+  }
+}
+"#;
+        let (status, submitted) = json_request(
+            app.clone(),
+            &format!("/v1/planning-sessions/{session_id}/submit"),
+            serde_json::to_value(PlanningCandidateSubmitRequest {
+                actor: planner.into(),
+                markdown: b"# Targeted plan\n".to_vec(),
+                kdl: candidate.to_vec(),
+                idempotency_key: "targeted-candidate".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{submitted}");
+        let preview_hash = submitted["preview"]["hash"].as_str().unwrap();
+        let (status, approved) = json_request(
+            app,
+            &format!("/v1/planning-sessions/{session_id}/approve"),
+            serde_json::to_value(PlanningApprovalRequest {
+                actor: "person/operator".into(),
+                preview_hash: preview_hash.into(),
+                idempotency_key: "targeted-approval".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["status"], "approved");
+        let revised = store.plan_run(&run.id).unwrap().unwrap();
+        assert_ne!(revised.generation, run.generation);
+
+        let approvals = store
+            .events_after(0, None)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "revision-proposal.approved")
+            .count();
+        assert_eq!(approvals, 1);
+    }
+
+    #[tokio::test]
     async fn planning_compares_named_variants_and_proposes_from_one_generation() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -5235,12 +5544,12 @@ subgraph {
         let store = state.store.clone();
         let source = r#"
 version 2
-subgraph {
+
   plan "variants" state="ready" {
     goal "Use the initial plan."
     step "work" { goal "Use the initial goal." }
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
@@ -5290,16 +5599,16 @@ subgraph {
         let planner = started["planner"].as_str().unwrap();
         let compact = br#"
 version 2
-subgraph {
+
   plan "variants" state="ready" {
     goal "Use the compact plan."
     step "work" { goal "Use the compact goal." }
   }
-}
+
 "#;
         let extended = br#"
 version 2
-subgraph {
+
   plan "variants" state="ready" {
     goal "Use the extended plan."
     step "work" { goal "Use the extended goal." }
@@ -5308,7 +5617,7 @@ subgraph {
       goal "Verify the extended result."
     }
   }
-}
+
 "#;
         for (index, (name, kdl)) in [
             ("compact", compact.as_slice()),
@@ -5488,20 +5797,20 @@ subgraph {
             format!(
                 r#"
 version 2
-subgraph {{
+
   plan "eval/demo" state="ready" {{
     goal "Complete plan eval/demo."
     baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
     step "document" {{
       agentless
       title "The document exists"
-      subgraph {{
+
         message "task" {{ to "person/worker"; content "doc/evals/demo/task@{hash}" }}
-      }}
+
     }}
     completion {{ when "all-steps-exhausted" }}
   }}
-}}
+
 "#
             ),
         )
@@ -5559,13 +5868,13 @@ subgraph {{
         let state = state(root.path());
         let source = r#"
 version 2
-subgraph {
+
   plan "revision" state="ready" {
     goal "Complete plan revision."
-    subgraph { agent "sup" { workspace "."; command "true" } }
+     agent "sup" { workspace "."; command "true" }
     step "work" { goal "First goal." }
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
@@ -5597,13 +5906,13 @@ subgraph {
         let app = router(state.clone());
         let replacement = r#"
 version 2
-subgraph {
+
   plan "revision" state="ready" {
     goal "Complete plan revision."
-    subgraph { agent "sup" { workspace "."; command "true" } }
+     agent "sup" { workspace "."; command "true" }
     step "work" { goal "Corrected goal." }
   }
-}
+
 "#;
         let (status, revised) = json_request(
             app,
@@ -5634,7 +5943,7 @@ subgraph {
         let state = state(root.path());
         let source = r#"
 version 2
-subgraph {
+
   plan "bootstrap" state="ready" {
     goal "Complete plan bootstrap."
     step "compile" {
@@ -5642,7 +5951,7 @@ subgraph {
       produces-plan "project/work"
     }
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
@@ -5678,13 +5987,13 @@ subgraph {
             .unwrap();
         let produced = r#"
 version 2
-subgraph {
+
   plan "project/work" state="ready" {
     goal "Complete plan project/work."
     step "inspect" { title "Inspect the project" }
     step "implement" { depends-on { step "inspect" completed } }
   }
-}
+
 "#;
         let app = router(state.clone());
         let (status, output) = json_request(
@@ -5721,9 +6030,9 @@ subgraph {
             .unwrap();
         let wrong = r#"
 version 2
-subgraph {
+
   plan "project/other" state="ready" { goal "Complete plan project/other."; goal "Complete plan project/other."; step "inspect" { } }
-}
+
 "#;
         let (status, output) = json_request(
             app.clone(),
@@ -5887,12 +6196,12 @@ subgraph {
         let state = state(root.path());
         let source = r#"
 version 2
-subgraph {
+
   plan "review-api" state="ready" {
     goal "Complete plan review-api."
     step "approval" { gate "human-review" type="human" { reviewer "person/nathan" } }
   }
-}
+
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
@@ -6032,7 +6341,7 @@ subgraph {
             .unwrap()
             .unwrap();
         let intent = crate::graph::parse_execution_intent(
-            plan.subgraph_kdl.as_ref().unwrap(),
+            plan.declarations_kdl.as_ref().unwrap(),
             "node",
             &standing.id,
         )

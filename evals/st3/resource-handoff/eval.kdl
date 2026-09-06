@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/resource-handoff" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/resource-handoff."
     step "contract" timeout="1m" {
       title "The resource moves from A to B without overlap"
-      subgraph {
         exec "eval/resource-handoff/contract" {
           host "local"
           workspace "${ST_WORKSPACE}/fixture"
@@ -14,7 +12,6 @@ subgraph {
           command "bash ./run.sh"
           restart "never"
         }
-      }
       gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/resource-handoff/contract" "is" "exited" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/resource-handoff/contract" "is" 0 }
     }
@@ -28,4 +25,3 @@ subgraph {
       }
     }
   }
-}

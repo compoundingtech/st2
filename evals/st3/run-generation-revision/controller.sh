@@ -3,17 +3,58 @@ set -Eeuo pipefail
 
 readonly EVAL_ROOT=$PWD
 readonly REQUESTER=person/eval-requester
+readonly REQUEST="$EVAL_ROOT/request.md"
 
-st3 --json run "$EVAL_ROOT/initial.kdl" \
+trace_pid=""
+
+stop_trace() {
+  if [[ -n "$trace_pid" ]] && kill -0 "$trace_pid" 2>/dev/null; then
+    kill -TERM "$trace_pid" 2>/dev/null || true
+    wait "$trace_pid" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  stop_trace
+}
+
+trap cleanup EXIT HUP INT TERM
+
+wait_for_event() {
+  local subject=$1
+  local kind=$2
+  local output=$3
+  local deadline=$((SECONDS + 1200))
+
+  : > "$output"
+  st3 --json trace "$subject" --after-index 0 --follow > "$output" &
+  trace_pid=$!
+  while (( SECONDS < deadline )); do
+    if jq -e --arg kind "$kind" 'select(.kind == $kind)' "$output" >/dev/null 2>&1; then
+      stop_trace
+      trace_pid=""
+      return 0
+    fi
+    if ! kill -0 "$trace_pid" 2>/dev/null; then
+      wait "$trace_pid"
+      return 1
+    fi
+    sleep 0.2
+  done
+  printf 'Timed out waiting for %s on %s.\n' "$kind" "$subject" >&2
+  return 1
+}
+
+st3 publish "$EVAL_ROOT/initial.kdl" --as "$REQUESTER" >/dev/null
+st3 --json plan start generation-proof \
+  --id "generation-proof/${ST_PLAN_RUN}" \
   --workspace "$EVAL_ROOT" \
-  --requester "$REQUESTER" \
-  --eval \
-  --detach > "$EVAL_ROOT/initial-run.json"
+  --as "$REQUESTER" > "$EVAL_ROOT/initial-run.json"
 
-run_subject=$(jq -er '.subject' "$EVAL_ROOT/initial-run.json")
-run_id=$(jq -er '.id' "$EVAL_ROOT/initial-run.json")
-old_generation=$(jq -er '.generation' "$EVAL_ROOT/initial-run.json")
-stable_subject=$(jq -er '.steps[] | select(.step == "stable") | .subject' "$EVAL_ROOT/initial-run.json")
+run_subject=$(jq -er '.plan_run.subject' "$EVAL_ROOT/initial-run.json")
+run_id=$(jq -er '.plan_run.id' "$EVAL_ROOT/initial-run.json")
+old_generation=$(jq -er '.plan_run.generation' "$EVAL_ROOT/initial-run.json")
+stable_subject=$(jq -er '.plan_run.steps[] | select(.step == "stable") | .subject' "$EVAL_ROOT/initial-run.json")
 
 st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --actor "$REQUESTER" \
@@ -21,28 +62,58 @@ st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --field state=done >/dev/null
 st3 wait "$stable_subject" --for completed --timeout 2m >/dev/null
 
-st3 --json work revise \
-  "$run_subject" \
-  "$EVAL_ROOT/revised.kdl" \
+st3 --json planning start \
+  --run "$run_subject" \
+  "$REQUEST" \
+  --workspace "$EVAL_ROOT" \
   --as "$REQUESTER" \
-  --reason "the first work definition needs a generation-aware check" \
-  > "$EVAL_ROOT/proposed.json"
+  --model gpt-5.6-sol \
+  --effort medium \
+  > "$EVAL_ROOT/planning-started.json"
 
-proposal=$(jq -er '.proposal.subject' "$EVAL_ROOT/proposed.json")
-preview_hash=$(jq -er '.proposal.preview_hash' "$EVAL_ROOT/proposed.json")
+session_id=$(jq -er '.id' "$EVAL_ROOT/planning-started.json")
+session_subject=$(jq -er '.subject' "$EVAL_ROOT/planning-started.json")
+planner=$(jq -er '.planner' "$EVAL_ROOT/planning-started.json")
+wait_for_event \
+  "$session_subject" \
+  "planning-session.candidate-submitted" \
+  "$EVAL_ROOT/planning-events.jsonl"
+
+st3 --json work revision generation "$old_generation" > "$EVAL_ROOT/before-approval.json"
+jq -e --arg revision "$(jq -er '.plan_run.revision' "$EVAL_ROOT/initial-run.json")" '
+  .status == "running"
+  and .revision == $revision
+' "$EVAL_ROOT/before-approval.json" >/dev/null
+
+variant=$(st3 --json planning show "$session_id" | jq -er '.candidate.variant')
+st3 --json planning preview "$session_id" --variant "$variant" > "$EVAL_ROOT/preview.json"
+preview_hash=$(jq -er '.preview.hash' "$EVAL_ROOT/preview.json")
 jq -e '
-  .status == "pending-approval"
-  and .proposal.reviewers == ["person/eval-requester"]
-' "$EVAL_ROOT/proposed.json" >/dev/null
+  .status == "review"
+  and (.preview.graph | contains("stable [root]"))
+  and (.preview.graph | contains("changed [after stable]"))
+  and (.preview.graph | contains("generation-environment [root]"))
+  and (.preview.diff | contains("update plan/generation-proof"))
+  and (.preview.plan.blockers | length == 0)
+' "$EVAL_ROOT/preview.json" >/dev/null
 
-st3 --json work revision approve \
-  "$proposal" \
+st3 --json planning approve \
+  "$session_id" \
   "$preview_hash" \
   --as "$REQUESTER" \
-  > "$EVAL_ROOT/applied.json"
+  > "$EVAL_ROOT/approved.json"
 
-new_generation=$(jq -er '.plan_run.generation' "$EVAL_ROOT/applied.json")
-environment_subject=$(jq -er '.plan_run.steps[] | select(.step == "generation-environment") | .subject' "$EVAL_ROOT/applied.json")
+jq -e --arg hash "$preview_hash" '
+  .status == "approved"
+  and .preview.hash == $hash
+  and .published_revision == .candidate.plan_revision
+  and .target_plan_run != null
+  and .source_generation != null
+' "$EVAL_ROOT/approved.json" >/dev/null
+
+st3 --json plan show "$run_subject" > "$EVAL_ROOT/applied.json"
+new_generation=$(jq -er '.generation' "$EVAL_ROOT/applied.json")
+environment_subject=$(jq -er '.steps[] | select(.step == "generation-environment") | .subject' "$EVAL_ROOT/applied.json")
 st3 wait "$environment_subject" --for completed --timeout 2m >/dev/null
 
 st3 --json work revision generations "$run_subject" > "$EVAL_ROOT/generations.json"
@@ -50,10 +121,9 @@ st3 --json work revision generation "$old_generation" > "$EVAL_ROOT/old-generati
 st3 --json work revision generation "$new_generation" > "$EVAL_ROOT/new-generation.json"
 
 jq -e --arg old "$old_generation" --arg new "$new_generation" '
-  .status == "applied"
-  and .proposal.source_generation == $old
-  and .proposal.successor_generation == $new
-  and .plan_run.initial_revision != .plan_run.revision
+  .generation == $new
+  and .generation != $old
+  and .initial_revision != .revision
 ' "$EVAL_ROOT/applied.json" >/dev/null
 
 jq -e --arg old "$old_generation" --arg new "$new_generation" '
@@ -81,5 +151,6 @@ st3 claim "resource/generation-proof/$run_id/changed" resource.observed \
   --field kind=custom.st3.eval-signal \
   --field state=done >/dev/null
 st3 wait "$run_subject" --for completed --timeout 2m >/dev/null
+st3 wait "$planner" --for stopped --timeout 2m >/dev/null
 
 printf '%s\n' RUN-GENERATION-REVISION-GREEN > "$EVAL_ROOT/result.txt"

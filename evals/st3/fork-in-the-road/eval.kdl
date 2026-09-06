@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/fork-in-the-road" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/fork-in-the-road."
     step "start-team" timeout="10m" {
       title "The native Codex design panel is ready"
-      subgraph {
         agent "fd.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "codex" {
@@ -70,7 +68,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "draft-per-human" timeout="20m" {
@@ -300,4 +297,3 @@ subgraph {
     }
 
   }
-}

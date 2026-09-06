@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/crash-escalation" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/crash-escalation."
     step "faults" timeout="1m" {
       title "The runtime classifies abnormal and clean exits"
-      subgraph {
         exec "eval/crash-escalation/crash" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -20,7 +18,6 @@ subgraph {
           command "exit 0"
           restart "never"
         }
-      }
       gate "condition-1" { field "reachability" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" "unreachable" }
       gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" 17 }
       gate "condition-3" { field "status" "exec/${ST_PLAN_RUN}/eval/crash-escalation/clean" "is" "exited" }
@@ -37,4 +34,3 @@ subgraph {
       }
     }
   }
-}

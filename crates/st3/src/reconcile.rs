@@ -1169,7 +1169,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .set_plan_run_state(&run.id, "running", "normal", None)?;
             }
         }
-        changed |= self.materialize_plan_subgraph(run, plan)?;
+        changed |= self.materialize_plan_declarations(run, plan)?;
         changed |= self.retire_predecessor_generation(run)?;
         let mut normal_failed = flat.iter().any(|step| {
             !step.spec.finally
@@ -1400,7 +1400,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ) {
                 continue;
             }
-            changed |= self.materialize_step_subgraph(run, &step, view)?;
+            changed |= self.materialize_step_declarations(run, &step, view)?;
             if self.step_timed_out(view, &step)? {
                 changed |= self.store.set_step_state(
                     &view.subject,
@@ -1409,7 +1409,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 )?;
                 continue;
             }
-            if !self.step_subgraph_holds(&view.subject)? {
+            if !self.step_declarations_hold(&view.subject)? {
                 continue;
             }
             if !view.agentless && !view.worker_reported {
@@ -1530,7 +1530,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .map(|subject| format!("  stop {:?}", subject.subject))
             .collect::<Vec<_>>();
         if !running.is_empty() {
-            let source = format!("version 2\nsubgraph {{\n{}\n}}", running.join("\n"));
+            let source = format!("version 2\n\n{}\n", running.join("\n"));
             let intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
             let response = self
                 .store
@@ -1889,13 +1889,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(true)
     }
 
-    fn materialize_step_subgraph(
+    fn materialize_step_declarations(
         &self,
         run: &PlanRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
-        let Some(source) = &step.spec.subgraph_kdl else {
+        let Some(source) = &step.spec.declarations_kdl else {
             return Ok(false);
         };
         let variables = run_variables(run, step, view);
@@ -1951,7 +1951,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if stops.is_empty() {
             return Ok(false);
         }
-        let source = format!("version 2\nsubgraph {{\n{stops}\n}}");
+        let source = format!("version 2\n\n{stops}\n");
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         for subject in intent.subjects.values_mut() {
             subject.owner_generation = Some(run.generation.clone());
@@ -1962,8 +1962,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(response.changed)
     }
 
-    fn materialize_plan_subgraph(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
-        let Some(source) = &plan.subgraph_kdl else {
+    fn materialize_plan_declarations(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
+        let Some(source) = &plan.declarations_kdl else {
             return Ok(false);
         };
         let variables = crate::store::plan_run_variables(run, &plan.revision);
@@ -2032,7 +2032,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return Err(crate::model::St3Error::new(
                     "duplicate-runtime-subject",
                     format!(
-                        "plan run `{}` declares runtime `{}` in more than one subgraph",
+                        "plan run `{}` declares runtime `{}` in more than one plan or step",
                         run.subject, subject.subject
                     ),
                 )
@@ -2042,7 +2042,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn step_subgraph_holds(&self, step_subject: &str) -> Result<bool> {
+    fn step_declarations_hold(&self, step_subject: &str) -> Result<bool> {
         for subject in self
             .store
             .desired_subjects()?
@@ -3952,7 +3952,7 @@ mod tests {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "dag" state="ready" {
     goal "Complete plan dag."
     completion { when "all-steps-exhausted" }
@@ -3965,7 +3965,7 @@ subgraph {
       }
     }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-dag");
         let run = store
@@ -3998,13 +3998,13 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "baseline" state="ready" {
                 goal "Run only from an admitted baseline."
                 completion { when "all-steps-exhausted" }
-                subgraph {
+
                   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
-                }
+
                 baseline "the release is open" {
                   field "state" "resource/release" is "open"
                 }
@@ -4015,7 +4015,7 @@ subgraph {
                   retry { attempts 2 }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "baseline-plan");
         let run = store
@@ -4125,7 +4125,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "release" state="ready" {
                 goal "Publish an approved result."
                 completion { when "all-steps-exhausted" }
@@ -4137,7 +4137,7 @@ subgraph {
                 }
                 step "work" { }
               }
-            }
+
         "#;
         apply_source(&store, source, "release-plan");
         let run = store
@@ -4229,22 +4229,22 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "context" state="ready" {
                 goal "Expose the run context."
-                subgraph {
+
                   exec "plan-task" {
                     command "true"
                     env { CUSTOM_PATH "/opt/st3-shims:${PATH}" }
                   }
-                }
+
                 step "work" {
-                  subgraph {
+
                     exec "task" {
                       command "true"
                       env { CUSTOM_RUN "${ST_PLAN_RUN}" }
                     }
-                  }
+
                   gate "verify context" {
                     exec "true"
                     host "node"
@@ -4253,7 +4253,7 @@ subgraph {
                   }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "context-plan");
         let run = store
@@ -4344,20 +4344,20 @@ subgraph {
     }
 
     #[tokio::test]
-    async fn a_materialized_step_subgraph_wakes_member_reconciliation() {
+    async fn materialized_step_declarations_wake_member_reconciliation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "wake" state="ready" {
     goal "Complete plan wake."
     step "team" {
-      subgraph {
+
         agent "worker" { workspace "/tmp"; command "true"; restart "never" }
-      }
+
     }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-wake");
         store
@@ -4383,7 +4383,7 @@ subgraph {
         reconciler.reconcile_once().unwrap();
         tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
             .await
-            .expect("the materialized subgraph did not request another reconcile pass");
+            .expect("the materialized declarations did not request another reconcile pass");
     }
 
     #[test]
@@ -4391,17 +4391,17 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "start-failure" state="ready" {
     goal "Start all independent plan members."
     step "team" {
-      subgraph {
+
         agent "bad" { workspace "/tmp"; command "true"; restart "never" }
         agent "good" { workspace "/tmp"; command "true"; restart "never" }
-      }
+
     }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-start-failure");
         let run = store
@@ -4471,17 +4471,17 @@ subgraph {
         let first = publish(
             r#"
 version 2
-subgraph {
+
   plan "retire" state="ready" {
     goal "Retire superseded generation members."
     step "team" {
       goal "Use the first team."
-      subgraph {
+
         agent "worker" { workspace "/tmp"; command "true"; restart "never" }
-      }
+
     }
   }
-}
+
 "#,
             "retire-first",
         );
@@ -4520,12 +4520,12 @@ subgraph {
         let child_plan = publish(
             r#"
 version 2
-subgraph {
+
   plan "child" state="ready" {
     goal "Keep one child run active."
     step "work" { goal "Wait for child work." }
   }
-}
+
 "#,
             "retire-child",
         );
@@ -4548,12 +4548,12 @@ subgraph {
         let grandchild_plan = publish(
             r#"
 version 2
-subgraph {
+
   plan "grandchild" state="ready" {
     goal "Keep one grandchild run active."
     step "work" { goal "Wait for grandchild work." }
   }
-}
+
 "#,
             "retire-grandchild",
         );
@@ -4577,12 +4577,12 @@ subgraph {
         let second = publish(
             r#"
 version 2
-subgraph {
+
   plan "retire" state="ready" {
     goal "Retire superseded generation members."
     step "team" { goal "Use the replacement team." }
   }
-}
+
 "#,
             "retire-second",
         );
@@ -4620,7 +4620,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
   plan "product" state="ready" {
     goal "Complete plan product."
@@ -4635,7 +4635,7 @@ subgraph {
       }
     }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-product");
         let run = store
@@ -4707,7 +4707,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let bootstrap = r#"
 version 2
-subgraph {
+
   agent "planner" { workspace "/tmp"; command "true"; restart "never" }
   plan "bootstrap" state="ready" {
     goal "Complete plan bootstrap."
@@ -4722,18 +4722,18 @@ subgraph {
       uses-plan output-of="compile"
     }
   }
-}
+
 "#;
         let first_work = r#"
 version 2
-subgraph {
+
   plan "project/work" state="ready" {
     goal "Complete plan project/work."
     completion { when "all-steps-exhausted" }
     step "inspect" { title "Inspect the fixture" }
     step "finish" { depends-on { step "inspect" completed } }
   }
-}
+
 "#;
         apply_source(&store, bootstrap, "publish-bootstrap");
         apply_source(&store, first_work, "publish-first-work");
@@ -4808,12 +4808,12 @@ subgraph {
 
         let second_work = r#"
 version 2
-subgraph {
+
   plan "project/work" state="ready" {
     goal "Complete plan project/work."
     step "replacement" { title "A later plan revision" }
   }
-}
+
 "#;
         apply_source(&store, second_work, "publish-second-work");
         for _ in 0..4 {
@@ -4949,12 +4949,12 @@ subgraph {
             &store,
             r#"
 version 2
-subgraph {
+
   plan "assignment" state="ready" {
     goal "Complete plan assignment."
     step "work" { assigned-to "agent/worker" }
   }
-}
+
 "#,
             "assignment-plan",
         );
@@ -4988,7 +4988,7 @@ subgraph {
         apply_source(
             &store,
             r#"version 2
-subgraph { stop "agent/node.worker" }"#,
+ stop "agent/node.worker" "#,
             "assignment-stopped-agent",
         );
         reconciler.reconcile_once().unwrap();
@@ -5000,7 +5000,7 @@ subgraph { stop "agent/node.worker" }"#,
         apply_source(
             &store,
             r#"version 2
-subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } }"#,
+ agent "worker" { workspace "/tmp"; command "true"; restart "never" } "#,
             "assignment-agent",
         );
         reconciler.reconcile_once().unwrap();
@@ -5017,7 +5017,7 @@ subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } 
             &store,
             r#"
 version 2
-subgraph {
+
   plan "review" state="ready" {
     goal "Complete plan review."
     step "approval" {
@@ -5029,7 +5029,7 @@ subgraph {
       }
     }
   }
-}
+
 "#,
             "review-plan",
         );
@@ -5137,11 +5137,11 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "true"
               }
-            }
+
         "#;
         apply_source(&store, source, "member-identity");
         let runtime = Arc::new(FakeRuntime::default());
@@ -5173,11 +5173,11 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 harness "codex" { prompt "Wait for work." }
               }
-            }
+
         "#;
         apply_source(&store, source, "native-driver-executable");
         let runtime = Arc::new(FakeRuntime::default());
@@ -5205,13 +5205,13 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "proof" state="ready" {
                 goal "Complete plan proof."
                 completion { when "all-steps-exhausted" }
                 step "native-ready" {
                   title "The native agent is ready"
-                  subgraph {
+
                     agent "worker" {
                       harness "codex" { prompt "Do the work." }
                     }
@@ -5220,7 +5220,7 @@ subgraph {
                       to "worker"
                       content "Start."
                     }
-                  }
+
                   gate "verify" {
                     exec "true"
                     host "node"
@@ -5229,7 +5229,7 @@ subgraph {
                   }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "plan-native-ready");
         let run = store
@@ -5314,12 +5314,12 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "eval/simulated-codex" state="ready" {
                 goal "Complete plan eval/simulated-codex."
                 step "team" {
                   title "The Codex team is ready"
-                  subgraph {
+
                     agent "sup" {
                       harness "codex" { prompt "Coordinate the work." }
                       restart "never"
@@ -5333,31 +5333,31 @@ subgraph {
                       to "sup"
                       content "Start."
                     }
-                  }
+
                   gate "condition-1" { exists "agent/${ST_PLAN_RUN}/sup" }
                   gate "condition-2" { exists "agent/${ST_PLAN_RUN}/worker" }
                 }
                 step "worker-report" {
                   title "The worker report is delivered"
                   depends-on { step "team" completed }
-                  subgraph {
+
                     message "worker-report" {
                       from "worker"
                       to "sup"
                       content "The work is complete."
                     }
-                  }
+
                 }
                 step "confirmation" {
                   title "The supervisor confirmation is delivered"
                   depends-on { step "worker-report" completed }
-                  subgraph {
+
                     message "confirmation" {
                       from "sup"
                       to "requester"
                       content "The result is verified."
                     }
-                  }
+
                 }
                 step "mechanical" {
                   title "The mechanical gate passes"
@@ -5384,7 +5384,7 @@ subgraph {
                 }
                 completion { when "all-steps-exhausted" }
               }
-            }
+
         "#;
         apply_source(&store, source, "simulated-codex-graph");
         let plan_run = store
@@ -5584,7 +5584,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "proof" state="ready" {
                 goal "Complete plan proof."
                 completion { when "all-steps-exhausted" }
@@ -5598,7 +5598,7 @@ subgraph {
                   }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "plan-async-gate");
         let run = store
@@ -5653,7 +5653,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "proof" state="ready" {
                 goal "Complete plan proof."
                 step "review" {
@@ -5669,7 +5669,7 @@ subgraph {
                   }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "plan-llm-budget");
         store
@@ -5760,11 +5760,8 @@ subgraph {
     #[test]
     fn adopts_a_matching_pty_without_a_start() {
         let store = Arc::new(Store::open_memory("node").unwrap());
-        let intent = parse_intent(
-            "version 2\nsubgraph { agent \"worker\" { command \"true\" } }",
-            "node",
-        )
-        .unwrap();
+        let intent =
+            parse_intent("version 2\n agent \"worker\" { command \"true\" } ", "node").unwrap();
         let plan = store
             .plan(
                 &intent,
@@ -5810,12 +5807,12 @@ subgraph {
             let source = format!(
                 r#"
                     version 2
-                    subgraph {{
+
                       agent "worker" {{
                         command "true"
                         restart "{restart}"
                       }}
-                    }}
+
                 "#
             );
             apply_source(&store, &source, name);
@@ -5852,14 +5849,14 @@ subgraph {
             &store,
             r#"
                 version 2
-                subgraph {
+
                   agent "worker" {
                     workspace "/tmp"
                     command "true"
                     env { REVISION "one" }
                     restart "never"
                   }
-                }
+
             "#,
             "member-one",
         );
@@ -5886,14 +5883,14 @@ subgraph {
             &store,
             r#"
                 version 2
-                subgraph {
+
                   agent "worker" {
                     workspace "/tmp"
                     command "true"
                     env { REVISION "two" }
                     restart "never"
                   }
-                }
+
             "#,
             "member-two",
         );
@@ -5912,7 +5909,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "sleep 60"
                 exec "ding" { command "true" }
@@ -5922,7 +5919,7 @@ subgraph {
                 to "node.worker"
                 content "Do the work."
               }
-            }
+
         "#;
         apply_source(&store, source, "one-message");
         let runtime = Arc::new(FakeRuntime::default());
@@ -5958,7 +5955,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "true"
                 restart "always"
@@ -5968,7 +5965,7 @@ subgraph {
                   mode "fail"
                 }
               }
-            }
+
         "#;
         let intent = parse_intent(source, "node").unwrap();
         let plan = store
@@ -6055,7 +6052,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "true"
                 restart "always"
@@ -6065,7 +6062,7 @@ subgraph {
                   mode "delay"
                 }
               }
-            }
+
         "#;
         let intent = parse_intent(source, "node").unwrap();
         let plan = store
@@ -6113,7 +6110,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "true"
                 restart "always"
@@ -6124,7 +6121,7 @@ subgraph {
                   mode "delay"
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "restart-delay-from-exit");
         let runtime = Arc::new(FakeRuntime::default());
@@ -6157,12 +6154,12 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let running_source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "sleep 60"
                 shutdown-timeout "1ms"
               }
-            }
+
         "#;
         let running = parse_intent(running_source, "node").unwrap();
         let plan = store
@@ -6192,7 +6189,7 @@ subgraph {
         reconciler.reconcile_once().unwrap();
 
         let stop_source = r#"version 2
-subgraph { stop "agent/node.worker" }"#;
+ stop "agent/node.worker" "#;
         let stop = parse_intent(stop_source, "node").unwrap();
         let plan = store
             .plan(
@@ -6228,12 +6225,12 @@ subgraph { stop "agent/node.worker" }"#;
         let store = Arc::new(Store::open_memory("node").unwrap());
         let running_source = r#"
             version 2
-            subgraph {
+
               agent "worker" {
                 command "sleep 60"
                 shutdown-timeout "1ms"
               }
-            }
+
         "#;
         apply_source(&store, running_source, "replacement-run");
         let runtime = Arc::new(FakeRuntime::default());
@@ -6254,7 +6251,7 @@ subgraph { stop "agent/node.worker" }"#;
         apply_source(
             &store,
             r#"version 2
-subgraph { stop "agent/node.worker" }"#,
+ stop "agent/node.worker" "#,
             "replacement-stop",
         );
         reconciler.reconcile_once().unwrap();
@@ -6275,7 +6272,7 @@ subgraph { stop "agent/node.worker" }"#,
         let source = format!(
             r#"
                 version 2
-                subgraph {{
+
                   schedule "reminder" {{
                     at "{at}"
                     message {{
@@ -6283,7 +6280,7 @@ subgraph { stop "agent/node.worker" }"#,
                       content "Run the check."
                     }}
                   }}
-                }}
+
             "#
         );
         apply_source(&store, &source, "schedule-one");
@@ -6319,7 +6316,7 @@ subgraph { stop "agent/node.worker" }"#,
         let source = format!(
             r#"
                 version 2
-                subgraph {{
+
                   schedule "reminder" {{
                     at "{at}"
                     message {{
@@ -6327,7 +6324,7 @@ subgraph { stop "agent/node.worker" }"#,
                       content "Run the check."
                     }}
                   }}
-                }}
+
             "#
         );
         apply_source(&store, &source, "schedule-arm");
@@ -6342,7 +6339,7 @@ subgraph { stop "agent/node.worker" }"#,
         apply_source(
             &store,
             r#"version 2
-subgraph { schedule "reminder" { stop } }"#,
+ schedule "reminder" { stop } "#,
             "schedule-stop",
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -6367,14 +6364,14 @@ subgraph { schedule "reminder" { stop } }"#,
     fn removed_link_nodes_are_rejected() {
         let source = r#"
             version 2
-            subgraph {
+
               agent "source" { command "true" }
               agent "target" { command "true" }
               link "dependency" {
                 from "agent/node.source"
                 to "agent/node.target"
               }
-            }
+
         "#;
         let error = parse_intent(source, "node").unwrap_err();
         assert_eq!(error.code, "unknown-node");
@@ -6384,7 +6381,7 @@ subgraph { schedule "reminder" { stop } }"#,
     fn removed_supervisor_nodes_are_rejected() {
         let source = r#"
             version 2
-            subgraph {
+
               supervisor "watch" {
                 terminal-control "confirmation" driver="codex" {
                   contains "Press Enter"
@@ -6396,7 +6393,7 @@ subgraph { schedule "reminder" { stop } }"#,
                 supervisor "watch"
                 harness "codex" { prompt "Do the work." }
               }
-            }
+
         "#;
         let error = parse_intent(source, "node").unwrap_err();
         assert_eq!(error.code, "unknown-node");
@@ -6407,7 +6404,7 @@ subgraph { schedule "reminder" { stop } }"#,
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               plan "eval/demo" state="ready" {
                 goal "Complete plan eval/demo."
                 step "result" timeout="1ms" {
@@ -6424,7 +6421,7 @@ subgraph { schedule "reminder" { stop } }"#,
                 }
               }
               resource "result" { kind "human.review" }
-            }
+
         "#;
         apply_source(&store, source, "plan-cleanup");
         let run = store
@@ -6488,7 +6485,7 @@ subgraph { schedule "reminder" { stop } }"#,
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
-            subgraph {
+
               resource "approval" { kind "human.review" }
               agent "worker" { workspace "/tmp"; command "true"; restart "never" }
               plan "release" state="ready" {
@@ -6500,7 +6497,7 @@ subgraph { schedule "reminder" { stop } }"#,
                   }
                 }
               }
-            }
+
         "#;
         apply_source(&store, source, "latched-dependency");
         let run = store
@@ -6567,12 +6564,12 @@ subgraph { schedule "reminder" { stop } }"#,
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "standing" state="ready" {
     goal "Remain open without implicit completion."
     step "prepare" { agentless }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-standing");
         let run = store
@@ -6601,7 +6598,7 @@ subgraph {
 
         let zero_source = r#"
 version 2
-subgraph { plan "zero" state="ready" { goal "Remain open with no steps." } }
+ plan "zero" state="ready" { goal "Remain open with no steps." }
 "#;
         apply_source(&store, zero_source, "publish-zero");
         let zero = store
@@ -6627,18 +6624,18 @@ subgraph { plan "zero" state="ready" { goal "Remain open with no steps." } }
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "standing-agent" state="ready" {
     goal "Keep one agent available."
-    subgraph {
+
       agent "worker" {
         command "sleep 60"
         restart "on-failure"
         exec "ding" { argv "st3" "driver" "ding" }
       }
-    }
+
   }
-}
+
 "#;
         apply_source(&store, source, "publish-standing-agent");
         let run = store
@@ -6688,14 +6685,14 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "finite" state="ready" {
     goal "Complete and stop the generation assertions."
     completion { when "all-steps-exhausted" }
-    subgraph { agent "worker" { workspace "/tmp"; command "true"; restart "never" } }
+     agent "worker" { workspace "/tmp"; command "true"; restart "never" }
     step "finish" { agentless }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-finite");
         let run = store
@@ -6734,14 +6731,14 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "blocked" state="ready" {
     goal "Expose an unreachable explicit completion frontier."
     completion { when "all-steps-exhausted" }
     step "failed" { agentless }
     step "dependent" { agentless; depends-on { step "failed" completed } }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-blocked");
         let run = store
@@ -6783,7 +6780,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   agent "one" { workspace "/tmp"; command "true"; restart "never" }
   plan "pool" state="ready" {
     goal "Expose two steps to one explicit pool."
@@ -6792,7 +6789,7 @@ subgraph {
     step "a" { }
     step "b" { }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-pool");
         store
@@ -6888,7 +6885,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   resource "source" { kind "custom.st3.document-source" }
   plan "resource-input" state="ready" {
     input "source" kind="resource"
@@ -6899,7 +6896,7 @@ subgraph {
       gate "the start snapshot is ready" { field "state" "${input.source}" is "ready" }
     }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-resource-input");
         let first = store
@@ -6950,17 +6947,17 @@ subgraph {
     }
 
     #[test]
-    fn one_plan_run_rejects_a_runtime_id_in_two_step_subgraphs() {
+    fn one_plan_run_rejects_a_runtime_id_in_two_steps() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   plan "collision" state="ready" {
     goal "Reject two owners for one runtime."
-    step "one" { agentless; subgraph { exec "same" { command "true"; restart "never" } } }
-    step "two" { agentless; subgraph { exec "same" { command "true"; restart "never" } } }
+    step "one" { agentless;  exec "same" { command "true"; restart "never" }  }
+    step "two" { agentless;  exec "same" { command "true"; restart "never" }  }
   }
-}
+
 "#;
         apply_source(&store, source, "publish-collision");
         store
@@ -6982,7 +6979,7 @@ subgraph {
         );
         reconciler.reconcile_once().unwrap();
         let error = reconciler.reconcile_once().unwrap_err();
-        assert!(error.to_string().contains("more than one subgraph"));
+        assert!(error.to_string().contains("more than one plan or step"));
     }
 
     impl ResourceProvider for FakeResourceProvider {
@@ -7011,7 +7008,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   resource "standalone" { kind "custom.example.state" }
   observer "standalone" {
     resource "resource/standalone"
@@ -7019,7 +7016,7 @@ subgraph {
     locator "standalone"
     field "state"
   }
-}
+
 "#;
         apply_source(&store, source, "publish-standalone-observer");
         let (event_notify, mut event_changed) = watch::channel(0_u64);
@@ -7089,7 +7086,7 @@ subgraph {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
-subgraph {
+
   agent "target" { workspace "/tmp"; command "true"; restart "never" }
   resource "github/acme/demo/pull/1" { kind "vcs.pull-request" }
   observer "github/acme/demo/pull/1" {
@@ -7104,7 +7101,7 @@ subgraph {
     on "state"
     delivery "message"
   }
-}
+
 "#;
         apply_source(&store, source, "publish-fake-observer");
         let reconciler = Reconciler::new(

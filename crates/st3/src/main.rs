@@ -21,15 +21,12 @@ use st3::model::{
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, IntentInput, MessageLifecycleRequest,
     MessageSendRequest, MessageView, PlanOutputView, PlanProductionRequest, PlanRequest,
-    PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState,
-    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ResourceRefreshRequest,
-    ResourceRefreshView, ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetRequest, RuntimeResetView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    PlanResponse, PlanRunView, PlanState, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningSessionView, QuickAgentResponse, ResourceRefreshView,
+    ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
+    StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -69,8 +66,8 @@ enum Command {
         #[command(subcommand)]
         command: PlanViewCommand,
     },
-    /// Apply a new-format KDL intent.
-    Run(RunArgs),
+    /// Publish one KDL file as an atomic graph upsert.
+    Publish(PublishArgs),
     /// Apply all new-format KDL files in one directory tree.
     Import(ImportArgs),
     /// Publish one exec member and follow its log.
@@ -187,6 +184,11 @@ struct QuickArgs {
     model: Option<String>,
     #[arg(long)]
     effort: Option<String>,
+    /// Print the generated plan KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -212,11 +214,31 @@ enum PlanningCommand {
 #[derive(Subcommand)]
 enum PlanViewCommand {
     Show(PlanShowArgs),
+    /// Start one run from the current ready plan revision.
+    Start(PlanRunStartArgs),
 }
 
 #[derive(Args)]
 struct PlanShowArgs {
     plan_or_run: String,
+}
+
+#[derive(Args)]
+struct PlanRunStartArgs {
+    plan: String,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    #[arg(long = "input", value_parser = parse_input)]
+    inputs: Vec<(String, String)>,
+    #[arg(long)]
+    follow: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    /// Print the exact plan-run KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -234,6 +256,9 @@ struct PlanStartArgs {
     model: Option<String>,
     #[arg(long)]
     effort: Option<String>,
+    /// Print the planning-session KDL without storing the request or publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -284,6 +309,9 @@ struct PlanReviseArgs {
     feedback: PathBuf,
     #[arg(long = "as")]
     actor: Option<String>,
+    /// Print the feedback KDL without storing the feedback or publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -301,26 +329,18 @@ struct PlanCancelArgs {
     actor: Option<String>,
     #[arg(long)]
     reason: Option<String>,
+    /// Print the cancellation KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
-struct RunArgs {
+struct PublishArgs {
     file: Option<PathBuf>,
-    #[arg(long)]
-    plan: Option<String>,
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-    #[arg(long, env = "ST_AGENT")]
-    requester: Option<String>,
-    #[arg(long = "input", value_parser = parse_input)]
-    inputs: Vec<(String, String)>,
-    #[arg(long)]
-    detach: bool,
-    /// Treat the run as a disposable eval and remove its runtime state at completion.
-    #[arg(long)]
-    eval: bool,
     #[arg(long, visible_alias = "at")]
     at_index: Option<u64>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
 }
 
 #[derive(Args)]
@@ -342,6 +362,11 @@ struct ExecArgs {
     detach: bool,
     #[arg(long)]
     cancel_on_interrupt: bool,
+    /// Print the generated plan KDL without publishing or running it.
+    #[arg(long)]
+    print_kdl: bool,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
     #[arg(last = true, required = true)]
     argv: Vec<String>,
 }
@@ -486,6 +511,9 @@ struct EvalArgs {
     /// Show one live graph screen with semantic state transitions.
     #[arg(long)]
     graph: bool,
+    /// Print the resolved eval plan KDL without publishing or running it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -522,6 +550,11 @@ enum RuntimeCommand {
         subject: String,
         #[arg(long)]
         reason: String,
+        /// Print the reset KDL without publishing it.
+        #[arg(long)]
+        print_kdl: bool,
+        #[arg(long = "as", env = "ST_AGENT")]
+        actor: Option<String>,
     },
 }
 
@@ -568,11 +601,16 @@ enum ResourceCommand {
     Watch(ResourceWatchArgs),
     /// Stop one resource subscription.
     Unwatch(ResourceUnwatchArgs),
-    /// Observe one resource now and wait for the exact attempt.
+    /// Publish one named resource refresh request.
     Refresh {
         resource: String,
         #[arg(long, default_value = "30s")]
         timeout: String,
+        /// Print the refresh KDL without publishing it.
+        #[arg(long)]
+        print_kdl: bool,
+        #[arg(long = "as", env = "ST_AGENT")]
+        actor: Option<String>,
     },
 }
 
@@ -611,6 +649,9 @@ struct ResourceWatchArgs {
     fields: Vec<String>,
     #[arg(long = "to", alias = "as", env = "ST_AGENT")]
     target: Option<String>,
+    /// Print the generated watch plan KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -618,6 +659,9 @@ struct ResourceUnwatchArgs {
     subscription: String,
     #[arg(long = "as", env = "ST_AGENT")]
     actor: Option<String>,
+    /// Print the cancellation KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -733,6 +777,9 @@ struct WorkReviseArgs {
     actor: Option<String>,
     #[arg(long)]
     reason: String,
+    /// Print the revision KDL without publishing the candidate plan or revision.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -777,6 +824,9 @@ struct MessageSendArgs {
         default_value = "person/requester"
     )]
     from: String,
+    /// Print the generated message plan KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -817,6 +867,9 @@ struct MessageReplyArgs {
         default_value = "person/requester"
     )]
     from: String,
+    /// Print the generated reply plan KDL without publishing it.
+    #[arg(long)]
+    print_kdl: bool,
 }
 
 #[derive(Args)]
@@ -944,7 +997,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Preview(args) => run_preview(&client, args, cli.json).await,
         Command::Planning { command } => run_planning(&client, command, cli.json).await,
         Command::Plan { command } => run_plan_view(&client, command, cli.json).await,
-        Command::Run(args) => run_file(&client, args, cli.json).await,
+        Command::Publish(args) => publish_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
         Command::Exec(args) => run_exec(&client, args, cli.json).await,
         Command::Logs(args) => run_logs(&client, args, cli.json).await,
@@ -1108,22 +1161,68 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
     let response = match command {
         PlanningCommand::Start(args) => {
             let (request, _) = read_intent(args.request.as_deref())?;
+            anyhow::ensure!(
+                !request.trim().is_empty(),
+                "a planning request cannot be empty"
+            );
             let workspace = fs::canonicalize(&args.workspace)
                 .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
+            let target = args.run.as_deref().map(|run| async {
+                client
+                    .get::<PlanRunView>(&format!("/v1/plan-runs/{}", urlencoding::encode(run)))
+                    .await
+            });
+            let target = match target {
+                Some(target) => Some(target.await?),
+                None => None,
+            };
+            let plan_id = target
+                .as_ref()
+                .map(|run| run.plan.trim_start_matches("plan/").to_owned())
+                .or(args.id)
+                .context("planning start needs --id or --run")?;
+            let session_id = format!("planning/{plan_id}/{}", uuid::Uuid::now_v7().simple());
+            let request_hash = hex::encode(Sha256::digest(request.as_bytes()));
+            let request_name = format!("doc/planning/{session_id}/request");
+            let request_reference = format!("{request_name}@{request_hash}");
+            let requester = normalize_planning_requester(
+                args.requester.as_deref().unwrap_or("person/requester"),
+            )?;
+            let kdl = planning_session_intent(
+                &session_id,
+                &plan_id,
+                &request_reference,
+                &workspace,
+                &requester,
+                args.model.as_deref(),
+                args.effort.as_deref(),
+                target.as_ref(),
+            );
+            if args.print_kdl {
+                eprintln!(
+                    "Store the request first: st3 doc put {} --as {}",
+                    args.request
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "REQUEST_FILE".into()),
+                    request_name
+                );
+                print!("{kdl}");
+                return Ok(());
+            }
+            put_document_bytes(client, request_name, request.into_bytes()).await?;
+            publish_text(
+                client,
+                kdl,
+                format!("st3 planning start {session_id}"),
+                requester.clone(),
+            )
+            .await?;
             client
-                .post::<_, PlanningSessionView>(
-                    "/v1/planning-sessions",
-                    &PlanningSessionStartRequest {
-                        plan: args.id.unwrap_or_default(),
-                        run: args.run,
-                        request: request.into_bytes(),
-                        workspace: workspace.to_string_lossy().into_owned(),
-                        requester: args.requester,
-                        model: args.model,
-                        effort: args.effort,
-                        idempotency_key: format!("planning-start:{nonce}"),
-                    },
-                )
+                .get::<PlanningSessionView>(&format!(
+                    "/v1/planning-sessions/{}",
+                    urlencoding::encode(&session_id)
+                ))
                 .await?
         }
         PlanningCommand::Show(args) => {
@@ -1175,20 +1274,36 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .await?
         }
         PlanningCommand::Revise(args) => {
+            let actor =
+                normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
+            let feedback = fs::read(&args.feedback)
+                .with_context(|| format!("read feedback {}", args.feedback.display()))?;
+            std::str::from_utf8(&feedback).context("planning feedback must be UTF-8 text")?;
+            let hash = hex::encode(Sha256::digest(&feedback));
+            let session = args
+                .session
+                .strip_prefix("planning-session/")
+                .unwrap_or(&args.session);
+            let document_name = format!("doc/planning/{session}/feedback/{hash}");
+            let reference = format!("{document_name}@{hash}");
+            let operation = format!("feedback-{}", uuid::Uuid::now_v7().simple());
+            let kdl = planning_feedback_intent(session, &operation, &reference, "default");
+            if args.print_kdl {
+                eprintln!(
+                    "Store the feedback first: st3 doc put {} --as {}",
+                    args.feedback.display(),
+                    document_name
+                );
+                print!("{kdl}");
+                return Ok(());
+            }
+            put_document_bytes(client, document_name, feedback).await?;
+            publish_text(client, kdl, format!("st3 planning revise {session}"), actor).await?;
             client
-                .post::<_, PlanningSessionView>(
-                    &format!(
-                        "/v1/planning-sessions/{}/revise",
-                        urlencoding::encode(&args.session)
-                    ),
-                    &PlanningRevisionRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
-                        feedback: fs::read(&args.feedback).with_context(|| {
-                            format!("read feedback {}", args.feedback.display())
-                        })?,
-                        idempotency_key: format!("planning-revise:{nonce}"),
-                    },
-                )
+                .get::<PlanningSessionView>(&format!(
+                    "/v1/planning-sessions/{}",
+                    urlencoding::encode(session)
+                ))
                 .await?
         }
         PlanningCommand::Approve(args) => {
@@ -1207,18 +1322,30 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .await?
         }
         PlanningCommand::Cancel(args) => {
+            let actor =
+                normalize_planning_requester(args.actor.as_deref().unwrap_or("person/requester"))?;
+            let session = args
+                .session
+                .strip_prefix("planning-session/")
+                .unwrap_or(&args.session);
+            let operation = format!("cancel-{}", uuid::Uuid::now_v7().simple());
+            let kdl = planning_cancellation_intent(
+                session,
+                &operation,
+                args.reason
+                    .as_deref()
+                    .unwrap_or("the planning session was cancelled"),
+            );
+            if args.print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            publish_text(client, kdl, format!("st3 planning cancel {session}"), actor).await?;
             client
-                .post::<_, PlanningSessionView>(
-                    &format!(
-                        "/v1/planning-sessions/{}/cancel",
-                        urlencoding::encode(&args.session)
-                    ),
-                    &PlanningCancelRequest {
-                        actor: args.actor.unwrap_or_else(|| "person/requester".into()),
-                        reason: args.reason,
-                        idempotency_key: format!("planning-cancel:{nonce}"),
-                    },
-                )
+                .get::<PlanningSessionView>(&format!(
+                    "/v1/planning-sessions/{}",
+                    urlencoding::encode(session)
+                ))
                 .await?
         }
         PlanningCommand::Compare(args) => {
@@ -1280,32 +1407,38 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
 }
 
 async fn run_plan_view(client: &Client, command: PlanViewCommand, json_output: bool) -> Result<()> {
-    let PlanViewCommand::Show(args) = command;
-    let selected = args.plan_or_run;
-    let run = if selected.starts_with("plan-run/") {
-        client
-            .get::<PlanRunView>(&format!("/v1/plan-runs/{}", urlencoding::encode(&selected)))
-            .await?
-    } else {
-        let runs: Vec<PlanRunView> = client
-            .get(&format!(
-                "/v1/plan-runs?plan={}",
-                urlencoding::encode(&selected)
-            ))
-            .await?;
-        anyhow::ensure!(
-            runs.len() == 1,
-            "plan `{selected}` has {} active runs; use an exact plan run subject",
-            runs.len()
-        );
-        runs.into_iter().next().expect("one active run was checked")
-    };
-    print_value(&run, json_output)
+    match command {
+        PlanViewCommand::Show(args) => {
+            let selected = args.plan_or_run;
+            let run = if selected.starts_with("plan-run/") {
+                client
+                    .get::<PlanRunView>(&format!(
+                        "/v1/plan-runs/{}",
+                        urlencoding::encode(&selected)
+                    ))
+                    .await?
+            } else {
+                let runs: Vec<PlanRunView> = client
+                    .get(&format!(
+                        "/v1/plan-runs?plan={}",
+                        urlencoding::encode(&selected)
+                    ))
+                    .await?;
+                anyhow::ensure!(
+                    runs.len() == 1,
+                    "plan `{selected}` has {} active runs; use an exact plan run subject",
+                    runs.len()
+                );
+                runs.into_iter().next().expect("one active run was checked")
+            };
+            print_value(&run, json_output)
+        }
+        PlanViewCommand::Start(args) => start_plan_run(client, args, json_output).await,
+    }
 }
 
-async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<()> {
-    let file = args.file.clone();
-    let (kdl, source_name) = read_intent(file.as_deref())?;
+async fn publish_file(client: &Client, args: PublishArgs, json_output: bool) -> Result<()> {
+    let (kdl, source_name) = read_intent(args.file.as_deref())?;
     let intent = IntentInput { kdl, source_name };
     let plan: PlanResponse = client
         .post(
@@ -1318,7 +1451,6 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
         .await?;
     anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
     let resolved_intent = plan.resolved_intent.clone();
-    let plan_revisions = plan.plan_revisions.clone();
     let idempotency_key = idempotency(&resolved_intent.kdl, &plan.subject_tokens);
     let response: ApplyResponse = client
         .post(
@@ -1327,80 +1459,68 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
                 intent: resolved_intent.clone(),
                 expected_subjects: plan.subject_tokens,
                 idempotency_key,
+                actor: Some(args.actor),
             },
         )
         .await?;
-    let parsed = st3::parse_intent(&resolved_intent.kdl, "local")?;
-    let ready = parsed
-        .plans
-        .values()
-        .filter(|plan| plan.state == PlanState::Ready)
-        .collect::<Vec<_>>();
-    if ready.is_empty() {
-        return print_value(&response, json_output);
-    }
-    let selected = if let Some(selected) = args.plan.as_deref() {
-        let selected = selected.strip_prefix("plan/").unwrap_or(selected);
-        ready
-            .iter()
-            .find(|plan| plan.id == selected)
-            .copied()
-            .with_context(|| format!("ready plan `{selected}` is not in the file"))?
-    } else {
-        anyhow::ensure!(
-            ready.len() == 1,
-            "the file contains multiple ready plans; select one with --plan"
-        );
-        ready[0]
-    };
-    let workspace = resolve_plan_run_workspace(args.workspace, file.as_deref())?;
-    let revision = plan_revisions
-        .get(&selected.subject)
-        .with_context(|| {
-            format!(
-                "the server did not return a revision for `{}`",
-                selected.subject
-            )
-        })?
-        .clone();
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let started: PlanRunView = client
-        .post(
-            "/v1/plan-runs",
-            &PlanRunRequest {
-                plan: selected.id.clone(),
-                revision: Some(revision),
-                workspace: workspace.to_string_lossy().into_owned(),
-                requester: args.requester,
-                mode: Some(if args.eval { "eval" } else { "run" }.into()),
-                inputs: unique_pairs(args.inputs, "input")?,
-                idempotency_key: format!(
-                    "run:{}:{nonce}:{}",
-                    selected.revision,
-                    std::process::id()
-                ),
-            },
-        )
-        .await?;
-    if args.detach {
-        return print_value(&started, json_output);
-    }
-    follow_plan_run(client, started, json_output).await
+    print_value(&response, json_output)
 }
 
-fn resolve_plan_run_workspace(workspace: Option<PathBuf>, file: Option<&Path>) -> Result<PathBuf> {
-    workspace
-        .or_else(|| {
-            file.and_then(Path::parent)
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .map(Path::to_path_buf)
-        })
-        .unwrap_or(std::env::current_dir()?)
+async fn start_plan_run(client: &Client, args: PlanRunStartArgs, json_output: bool) -> Result<()> {
+    let plan_id = args.plan.strip_prefix("plan/").unwrap_or(&args.plan);
+    let plan: st3::model::PlanSpec = client
+        .get(&format!("/v1/plans/{}", urlencoding::encode(plan_id)))
+        .await?;
+    anyhow::ensure!(
+        plan.state == PlanState::Ready,
+        "plan `plan/{plan_id}` is not ready"
+    );
+    let run_id = args
+        .id
+        .unwrap_or_else(|| format!("{plan_id}/{}", uuid::Uuid::now_v7().simple()));
+    let run_id = run_id.strip_prefix("plan-run/").unwrap_or(&run_id);
+    let workspace = args
+        .workspace
         .canonicalize()
-        .context("resolve the plan run workspace")
+        .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
+    let inputs = unique_pairs(args.inputs, "input")?;
+    let actor = args.actor.unwrap_or_else(|| "person/requester".into());
+    let requester = normalize_requester_subject(&actor);
+    let kdl = plan_run_intent(
+        run_id,
+        plan_id,
+        &plan.revision,
+        &workspace,
+        &requester,
+        &inputs,
+        "run",
+    );
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(());
+    }
+    let response = publish_text(client, kdl, format!("st3 plan start {plan_id}"), actor).await?;
+    let subject = format!("plan-run/{run_id}");
+    let started: PlanRunView = client
+        .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
+        .await?;
+    if !args.follow {
+        return if json_output {
+            print_value(&json!({"publication": response, "plan_run": started}), true)
+        } else {
+            println!("{}", started.subject);
+            Ok(())
+        };
+    }
+    follow_plan_run(client, started, response.store_index, json_output).await
 }
 
-async fn follow_plan_run(client: &Client, mut run: PlanRunView, json_output: bool) -> Result<()> {
+async fn follow_plan_run(
+    client: &Client,
+    mut run: PlanRunView,
+    mut cursor: u64,
+    json_output: bool,
+) -> Result<()> {
     let mut prior = String::new();
     loop {
         let summary = plan_run_signature(&run)?;
@@ -1419,7 +1539,15 @@ async fn follow_plan_run(client: &Client, mut run: PlanRunView, json_output: boo
             "failed" | "cancelled" => anyhow::bail!("plan run {} is {}", run.subject, run.status),
             _ => {}
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&owner_run={}&wait=true&timeout_ms=30000",
+                urlencoding::encode(&run.subject)
+            ))
+            .await?;
+        if let Some(last) = events.last() {
+            cursor = last.store_index;
+        }
         run = client
             .get(&format!(
                 "/v1/plan-runs/{}",
@@ -1492,36 +1620,45 @@ async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Res
 }
 
 async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<()> {
-    let name = args.name.unwrap_or_else(|| {
-        format!(
-            "cli-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        )
-    });
+    let name = args
+        .name
+        .unwrap_or_else(|| uuid::Uuid::now_v7().simple().to_string());
     let cwd = args.cwd.unwrap_or(std::env::current_dir()?);
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("resolve working directory {}", cwd.display()))?;
     let kdl = exec_intent(&name, &args.host, &cwd, &args.environment, &args.argv);
-    let applied = apply_generated(client, kdl, format!("st3 exec {name}")).await?;
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(());
+    }
+    let actor = args.actor.context("st3 exec needs --as or ST_AGENT")?;
+    let parsed = st3::parse_intent(&kdl, &args.host)?;
+    let plan_id = format!("exec/{name}");
+    let revision = parsed.plans[&plan_id].revision.clone();
+    publish_text(client, kdl, format!("st3 exec {name} plan"), actor.clone()).await?;
+    let run_id = format!("{plan_id}/{}", uuid::Uuid::now_v7().simple());
+    let run_kdl = plan_run_intent(
+        &run_id,
+        &plan_id,
+        &revision,
+        &cwd,
+        &normalize_requester_subject(&actor),
+        &BTreeMap::new(),
+        "run",
+    );
+    let applied = publish_text(
+        client,
+        run_kdl,
+        format!("st3 exec {name} run"),
+        actor.clone(),
+    )
+    .await?;
     let run: PlanRunView = client
-        .post(
-            "/v1/plan-runs",
-            &PlanRunRequest {
-                plan: format!("exec/{name}"),
-                revision: None,
-                workspace: cwd.to_string_lossy().into_owned(),
-                requester: std::env::var("ST_AGENT").ok(),
-                mode: Some("run".into()),
-                inputs: BTreeMap::new(),
-                idempotency_key: format!("st3-exec:{name}:{nonce}"),
-            },
-        )
+        .get(&format!(
+            "/v1/plan-runs/{}",
+            urlencoding::encode(&format!("plan-run/{run_id}"))
+        ))
         .await?;
     let subject = format!("exec/{}/{name}", run.id);
     if args.detach {
@@ -1559,7 +1696,7 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
         signal = &mut interrupt => {
             signal?;
             if args.cancel_on_interrupt {
-                apply_generated(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}")).await?;
+                publish_text(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}"), actor.clone()).await?;
             }
             return Err(CommandExit(130).into());
         }
@@ -1570,7 +1707,7 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
         signal = &mut interrupt => {
             signal?;
             if args.cancel_on_interrupt {
-                apply_generated(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}")).await?;
+                publish_text(client, cancel_run_intent(&run.subject), format!("st3 exec cancel {name}"), actor).await?;
             }
             return Err(CommandExit(130).into());
         }
@@ -1643,15 +1780,11 @@ fn exec_intent(
     body.nodes_mut().push(kdl_node("restart", ["never"]));
     task.set_children(body);
 
-    let mut execution = KdlNode::new("subgraph");
-    let mut execution_body = KdlDocument::new();
-    execution_body.nodes_mut().push(task);
-    execution.set_children(execution_body);
     let mut step = KdlNode::new("step");
     step.entries_mut().push(KdlEntry::new("execute"));
     let mut step_body = KdlDocument::new();
     step_body.nodes_mut().push(KdlNode::new("agentless"));
-    step_body.nodes_mut().push(execution);
+    step_body.nodes_mut().push(task);
     let mut gate = KdlNode::new("gate");
     gate.entries_mut().push(KdlEntry::new("the command exits"));
     let mut gate_body = KdlDocument::new();
@@ -1681,13 +1814,52 @@ fn exec_intent(
     plan_body.nodes_mut().push(step);
     plan_body.nodes_mut().push(completion);
     plan.set_children(plan_body);
-    subgraph_document(plan)
+    publication_document(plan)
 }
 
 fn cancel_run_intent(subject: &str) -> String {
     format!(
-        "version 2\nsubgraph {{\n  plan-run {subject:?} {{ cancel reason=\"the command was interrupted\" }}\n}}\n"
+        "version 2\nplan-run {subject:?} {{ cancellation \"command-interrupted\" {{ reason \"the command was interrupted\" }} }}\n"
     )
+}
+
+fn plan_run_intent(
+    run_id: &str,
+    plan_id: &str,
+    revision: &str,
+    workspace: &Path,
+    requester: &str,
+    inputs: &BTreeMap<String, String>,
+    mode: &str,
+) -> String {
+    let mut run = KdlNode::new("plan-run");
+    run.entries_mut().push(KdlEntry::new(run_id));
+    let mut body = KdlDocument::new();
+    let exact_plan = format!("plan/{plan_id}@{revision}");
+    body.nodes_mut()
+        .push(kdl_node("plan", [exact_plan.as_str()]));
+    body.nodes_mut().push(kdl_node(
+        "workspace",
+        [workspace.to_string_lossy().as_ref()],
+    ));
+    body.nodes_mut().push(kdl_node("requester", [requester]));
+    if mode != "run" {
+        body.nodes_mut().push(kdl_node("mode", [mode]));
+    }
+    for (name, value) in inputs {
+        body.nodes_mut()
+            .push(kdl_node("input", [name.as_str(), value.as_str()]));
+    }
+    run.set_children(body);
+    publication_document(run)
+}
+
+fn normalize_requester_subject(actor: &str) -> String {
+    if actor.starts_with("person/") || actor.starts_with("agent/") {
+        actor.to_owned()
+    } else {
+        format!("person/{actor}")
+    }
 }
 
 fn kdl_node<'a>(name: &str, values: impl IntoIterator<Item = &'a str>) -> KdlNode {
@@ -1697,24 +1869,25 @@ fn kdl_node<'a>(name: &str, values: impl IntoIterator<Item = &'a str>) -> KdlNod
     node
 }
 
-fn subgraph_document(node: KdlNode) -> String {
-    let mut children = KdlDocument::new();
-    children.nodes_mut().push(node);
-    let mut root = KdlNode::new("subgraph");
-    root.set_children(children);
+fn publication_document(node: KdlNode) -> String {
     let mut document = KdlDocument::new();
     let mut version = KdlNode::new("version");
     version.entries_mut().push(KdlEntry::new(2));
     document.nodes_mut().push(version);
-    document.nodes_mut().push(root);
+    document.nodes_mut().push(node);
     document.autoformat();
     document.to_string()
 }
 
-async fn apply_generated(
+fn publication_actor() -> Result<String> {
+    std::env::var("ST_AGENT").context("publication needs --as or ST_AGENT")
+}
+
+async fn publish_text(
     client: &Client,
     kdl: String,
     source_name: String,
+    actor: String,
 ) -> Result<ApplyResponse> {
     let intent = IntentInput {
         kdl,
@@ -1738,6 +1911,7 @@ async fn apply_generated(
                 idempotency_key: idempotency(&resolved.kdl, &plan.subject_tokens),
                 intent: resolved,
                 expected_subjects: plan.subject_tokens,
+                actor: Some(actor),
             },
         )
         .await
@@ -2320,31 +2494,7 @@ async fn run_file_from_text(
     source_name: String,
     json_output: bool,
 ) -> Result<()> {
-    let intent = IntentInput {
-        kdl,
-        source_name: Some(source_name),
-    };
-    let plan: PlanResponse = client
-        .post(
-            "/v1/intent/plan",
-            &PlanRequest {
-                intent: intent.clone(),
-                at_index: None,
-            },
-        )
-        .await?;
-    anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
-    let resolved_intent = plan.resolved_intent.clone();
-    let response: ApplyResponse = client
-        .post(
-            "/v1/intent/apply",
-            &ApplyRequest {
-                idempotency_key: idempotency(&resolved_intent.kdl, &plan.subject_tokens),
-                intent: resolved_intent,
-                expected_subjects: plan.subject_tokens,
-            },
-        )
-        .await?;
+    let response = publish_text(client, kdl, source_name, publication_actor()?).await?;
     print_value(&response, json_output)
 }
 
@@ -2606,26 +2756,68 @@ async fn run_runtime(client: &Client, command: RuntimeCommand, json_output: bool
             }
             Ok(())
         }
-        RuntimeCommand::Reset { subject, reason } => {
+        RuntimeCommand::Reset {
+            subject,
+            reason,
+            print_kdl,
+            actor,
+        } => {
             anyhow::ensure!(
                 subject.starts_with("agent/")
                     || subject.starts_with("exec/")
                     || subject.starts_with("pty/"),
                 "runtime reset needs a full agent, exec, or PTY subject"
             );
-            let key = format!("runtime-reset:{}:{}", subject, now_ms());
-            let response: RuntimeResetView = client
-                .post(
-                    &format!("/v1/runtimes/reset/{}", urlencoding::encode(&subject)),
-                    &RuntimeResetRequest {
-                        reason,
-                        idempotency_key: key,
-                    },
-                )
+            let status: StatusResponse = client
+                .get(&format!(
+                    "/v1/status?subject={}",
+                    urlencoding::encode(&subject)
+                ))
                 .await?;
+            let runtime = status
+                .subjects
+                .into_iter()
+                .find(|candidate| candidate.subject == subject)
+                .with_context(|| format!("runtime `{subject}` does not exist"))?;
+            let run_subject = runtime
+                .owner_run
+                .context("the runtime has no owning plan run")?;
+            let run: PlanRunView = client
+                .get(&format!(
+                    "/v1/plan-runs/{}",
+                    urlencoding::encode(&run_subject)
+                ))
+                .await?;
+            let operation = format!("reset-{}", uuid::Uuid::now_v7().simple());
+            let response_kdl =
+                runtime_reset_intent(&run.subject, &operation, &subject, &run.generation, &reason);
+            if print_kdl {
+                print!("{response_kdl}");
+                return Ok(());
+            }
+            let actor = actor.context("runtime reset needs --as or ST_AGENT")?;
+            let response = publish_text(
+                client,
+                response_kdl,
+                format!("st3 runtime reset {subject}"),
+                actor,
+            )
+            .await?;
             print_value(&response, json_output)
         }
     }
+}
+
+fn runtime_reset_intent(
+    run: &str,
+    operation: &str,
+    runtime: &str,
+    generation: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "version 2\nplan-run {run:?} {{\n  reset {operation:?} {{\n    runtime {runtime:?}\n    from {generation:?}\n    reason {reason:?}\n  }}\n}}\n"
+    )
 }
 
 async fn run_context(client: &Client, command: ContextCommand, json_output: bool) -> Result<()> {
@@ -2864,25 +3056,69 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
             let target = args
                 .target
                 .context("a resource watch needs --to or ST_AGENT")?;
-            let stable = serde_json::to_vec(&json!({
-                "provider": args.provider,
-                "locator": args.locator,
-                "fields": args.fields,
-                "target": target,
-            }))?;
-            let key = hex::encode(Sha256::digest(stable));
-            let response: ResourceWatchView = client
-                .post(
-                    "/v1/resource-watches",
-                    &ResourceWatchRequest {
-                        provider: args.provider,
-                        locator: args.locator,
-                        fields: args.fields,
-                        to: Some(target),
-                        idempotency_key: format!("resource-watch:{key}"),
-                    },
+            let target = normalize_message_subject(&target);
+            let (kdl, plan_id, resource) =
+                resource_watch_intent(&args.provider, &args.locator, &args.fields, &target)?;
+            if args.print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            let parsed = st3::parse_intent(&kdl, "local")?;
+            let revision = parsed.plans[&plan_id].revision.clone();
+            let published = publish_text(
+                client,
+                kdl,
+                format!("st3 resource watch {resource}"),
+                target.clone(),
+            )
+            .await?;
+            let mut active: Vec<PlanRunView> = client
+                .get(&format!(
+                    "/v1/plan-runs?plan={}",
+                    urlencoding::encode(&plan_id)
+                ))
+                .await?;
+            anyhow::ensure!(
+                active.len() <= 1,
+                "resource watch plan `plan/{plan_id}` has more than one active run"
+            );
+            let run = if let Some(run) = active.pop() {
+                anyhow::ensure!(
+                    run.revision == revision,
+                    "the resource watch plan has an unexpected active revision"
+                );
+                run
+            } else {
+                let workspace = std::env::current_dir()?.canonicalize()?;
+                let run_kdl = plan_run_intent(
+                    &plan_id,
+                    &plan_id,
+                    &revision,
+                    &workspace,
+                    &target,
+                    &BTreeMap::new(),
+                    "run",
+                );
+                let applied = publish_text(
+                    client,
+                    run_kdl,
+                    format!("st3 resource watch {resource} run"),
+                    target.clone(),
                 )
                 .await?;
+                let _ = published.store_index.max(applied.store_index);
+                client
+                    .get::<PlanRunView>(&format!(
+                        "/v1/plan-runs/{}",
+                        urlencoding::encode(&format!("plan-run/{plan_id}"))
+                    ))
+                    .await?
+            };
+            let response = ResourceWatchView {
+                resource,
+                observer: format!("observer/{}/watch", run.id),
+                subscription: format!("subscription/{}/watch", run.id),
+            };
             if json_output {
                 print_value(&response, true)
             } else {
@@ -2901,38 +3137,158 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 .subscription
                 .strip_prefix("subscription/")
                 .unwrap_or(&args.subscription);
-            let response: Value = client
-                .post(
-                    &format!("/v1/resource-watches/{}", urlencoding::encode(subscription)),
-                    &ResourceUnwatchRequest {
-                        actor: Some(normalize_agent_subject(&actor)),
-                        idempotency_key: format!(
-                            "resource-unwatch:{}:{}",
-                            subscription,
-                            normalize_agent_subject(&actor)
-                        ),
-                    },
-                )
+            let subject = format!("subscription/{subscription}");
+            let status: StatusResponse = client
+                .get(&format!(
+                    "/v1/status?subject={}",
+                    urlencoding::encode(&subject)
+                ))
                 .await?;
+            let run = status
+                .subjects
+                .into_iter()
+                .find(|item| item.subject == subject)
+                .and_then(|item| item.owner_run)
+                .context("the subscription has no owning plan run")?;
+            let operation = format!("unwatch-{}", uuid::Uuid::now_v7().simple());
+            let kdl = cancellation_intent(&run, &operation, "the resource watch stopped");
+            if args.print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            let response = publish_text(
+                client,
+                kdl,
+                format!("st3 resource unwatch {subscription}"),
+                actor,
+            )
+            .await?;
             print_value(&response, json_output)
         }
-        ResourceCommand::Refresh { resource, timeout } => {
+        ResourceCommand::Refresh {
+            resource,
+            timeout,
+            print_kdl,
+            actor,
+        } => {
             let timeout = parse_timeout(&timeout)?;
             let timeout_ms =
                 u64::try_from(timeout.as_millis()).context("the refresh timeout is too large")?;
             let resource = normalize_resource_subject(&resource);
-            let response: ResourceRefreshView = client
-                .post(
-                    &format!("/v1/resources/refresh/{}", urlencoding::encode(&resource)),
-                    &ResourceRefreshRequest {
-                        timeout_ms,
-                        idempotency_key: format!("resource-refresh:{resource}:{}", now_ms()),
-                    },
-                )
-                .await?;
-            print_value(&response, json_output)
+            anyhow::ensure!(
+                timeout_ms > 0 && timeout_ms <= 3_600_000,
+                "a resource refresh timeout must be between 1 ms and 1 hour"
+            );
+            let operation = format!("refresh-{}", uuid::Uuid::now_v7().simple());
+            let kdl = resource_refresh_intent(&resource, &operation, timeout_ms);
+            if print_kdl {
+                print!("{kdl}");
+                return Ok(());
+            }
+            let actor = actor.context("a resource refresh needs --as or ST_AGENT")?;
+            let response = publish_text(
+                client,
+                kdl,
+                format!("st3 resource refresh {resource}"),
+                actor,
+            )
+            .await?;
+            let completed = follow_resource_refresh(client, &resource, &response, timeout).await?;
+            print_value(&completed, json_output)
         }
     }
+}
+
+async fn follow_resource_refresh(
+    client: &Client,
+    resource: &str,
+    publication: &ApplyResponse,
+    timeout: Duration,
+) -> Result<ResourceRefreshView> {
+    let mut attempts = BTreeMap::new();
+    for claim_id in &publication.claim_ids {
+        let claim: ClaimRecord = client
+            .get(&format!(
+                "/v1/claims/by-id/{}",
+                urlencoding::encode(claim_id)
+            ))
+            .await?;
+        if claim.kind != "observer.state"
+            || claim.body.pointer("/fields/reason").and_then(Value::as_str)
+                != Some("published refresh")
+        {
+            continue;
+        }
+        if let Some(attempt) = claim
+            .body
+            .pointer("/fields/attempt")
+            .and_then(Value::as_str)
+        {
+            attempts.insert(claim.subject, attempt.to_owned());
+        }
+    }
+    anyhow::ensure!(
+        !attempts.is_empty(),
+        "the refresh publication did not identify an observer attempt"
+    );
+    let wait = async {
+        let mut cursor = publication.store_index;
+        let mut completed = BTreeSet::new();
+        let mut changed = false;
+        let mut completed_at_index = cursor;
+        while completed.len() != attempts.len() {
+            let events: Vec<EventRecord> = client
+                .get(&format!(
+                    "/v1/events?after={cursor}&wait=true&timeout_ms=30000"
+                ))
+                .await?;
+            for event in events {
+                cursor = cursor.max(event.store_index);
+                let Some(expected) = attempts.get(&event.subject) else {
+                    continue;
+                };
+                if event
+                    .body
+                    .pointer("/fields/attempt")
+                    .and_then(Value::as_str)
+                    != Some(expected.as_str())
+                {
+                    continue;
+                }
+                if event.kind == "observer.observed" {
+                    changed |= event
+                        .body
+                        .pointer("/fields/changed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    completed_at_index = completed_at_index.max(event.store_index);
+                    completed.insert(event.subject);
+                } else if event.kind == "observer.state"
+                    && event.body.pointer("/fields/state").and_then(Value::as_str)
+                        == Some("unreachable")
+                {
+                    let reason = event
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the observer failed");
+                    anyhow::bail!(
+                        "observer `{}` could not refresh `{resource}`: {reason}",
+                        event.subject
+                    );
+                }
+            }
+        }
+        Ok(ResourceRefreshView {
+            resource: resource.to_owned(),
+            observers: attempts.keys().cloned().collect(),
+            changed,
+            completed_at_index,
+        })
+    };
+    tokio::time::timeout(timeout, wait)
+        .await
+        .with_context(|| format!("resource `{resource}` did not finish its refresh in time"))?
 }
 
 fn normalize_resource_subject(reference: &str) -> String {
@@ -2940,6 +3296,109 @@ fn normalize_resource_subject(reference: &str) -> String {
         reference.to_owned()
     } else {
         format!("resource/{reference}")
+    }
+}
+
+fn resource_watch_intent(
+    provider: &str,
+    locator: &str,
+    fields: &[String],
+    target: &str,
+) -> Result<(String, String, String)> {
+    anyhow::ensure!(
+        !fields.is_empty(),
+        "a resource watch needs at least one field"
+    );
+    let (resource_name, resource_kind) = match provider {
+        "github.pull-request" => {
+            for field in fields {
+                anyhow::ensure!(
+                    matches!(field.as_str(), "head" | "state" | "review" | "checks"),
+                    "GitHub pull request provider does not support field `{field}`"
+                );
+            }
+            let (repository, number) = locator
+                .rsplit_once('#')
+                .context("a GitHub pull request locator needs OWNER/REPO#NUMBER")?;
+            let (owner, repository) = repository
+                .split_once('/')
+                .context("a GitHub pull request locator needs OWNER/REPO#NUMBER")?;
+            number
+                .parse::<u64>()
+                .context("a GitHub pull request number must be an integer")?;
+            (
+                format!("github/{owner}/{repository}/pull/{number}"),
+                "vcs.pull-request",
+            )
+        }
+        "local.file" => {
+            anyhow::ensure!(
+                Path::new(locator).is_absolute(),
+                "a local file locator must be an absolute path"
+            );
+            for field in fields {
+                anyhow::ensure!(
+                    matches!(
+                        field.as_str(),
+                        "status" | "path" | "content_hash" | "size" | "mode" | "reason"
+                    ),
+                    "local file provider does not support field `{field}`"
+                );
+            }
+            let hash = hex::encode(Sha256::digest(locator.as_bytes()));
+            (
+                format!("local-file/local/{}", &hash[..24]),
+                "filesystem.file",
+            )
+        }
+        _ => anyhow::bail!("resource provider `{provider}` is not registered"),
+    };
+    let fields = fields.iter().cloned().collect::<BTreeSet<_>>();
+    let stable = serde_json::to_vec(&json!({
+        "provider": provider,
+        "locator": locator,
+        "fields": fields,
+        "target": target,
+        "delivery": "message",
+    }))?;
+    let hash = hex::encode(Sha256::digest(stable));
+    let plan_id = format!("resource-watch/{resource_name}/{}", &hash[..16]);
+    let observer_fields = fields
+        .iter()
+        .map(|field| format!("      field {field:?}\n"))
+        .collect::<String>();
+    let subscription_fields = fields
+        .iter()
+        .map(|field| format!("      on {field:?}\n"))
+        .collect::<String>();
+    let kdl = format!(
+        "version 2\nresource {resource_name:?} {{\n  kind {resource_kind:?}\n}}\nplan {plan_id:?} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {:?}\n    provider {provider:?}\n    locator {locator:?}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {target:?}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
+        format!("resource/{resource_name}")
+    );
+    Ok((kdl, plan_id, format!("resource/{resource_name}")))
+}
+
+fn resource_refresh_intent(resource: &str, operation: &str, timeout_ms: u64) -> String {
+    let resource = resource.strip_prefix("resource/").unwrap_or(resource);
+    format!(
+        "version 2\nresource {resource:?} {{\n  refresh {operation:?} {{\n    timeout {:?}\n  }}\n}}\n",
+        format!("{timeout_ms}ms")
+    )
+}
+
+fn cancellation_intent(run: &str, operation: &str, reason: &str) -> String {
+    format!(
+        "version 2\nplan-run {run:?} {{\n  cancellation {operation:?} {{\n    reason {reason:?}\n  }}\n}}\n"
+    )
+}
+
+fn normalize_message_subject(value: &str) -> String {
+    if value == "requester" {
+        "person/requester".into()
+    } else if value.contains('/') {
+        value.into()
+    } else {
+        format!("agent/{value}")
     }
 }
 
@@ -3157,22 +3616,78 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 .context("a plan revision needs --as or ST_AGENT")?;
             let kdl = fs::read_to_string(&args.file)
                 .with_context(|| format!("read KDL {}", args.file.display()))?;
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            let response: RevisionSubmissionView = client
-                .post(
-                    &format!("/v1/plan-runs/{}/revision", urlencoding::encode(&args.run)),
-                    &PlanRevisionRequest {
-                        intent: IntentInput {
-                            kdl,
-                            source_name: Some(args.file.display().to_string()),
-                        },
-                        actor,
-                        reason: args.reason,
-                        idempotency_key: format!("plan-revision:{}:{nonce}", args.run),
-                    },
-                )
+            let run: PlanRunView = client
+                .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&args.run)))
                 .await?;
-            print_value(&response, json_output)
+            let parsed = st3::parse_intent(&kdl, "local")?;
+            let plan_id = run.plan.strip_prefix("plan/").unwrap_or(&run.plan);
+            let candidate = parsed.plans.get(plan_id).with_context(|| {
+                format!(
+                    "{} must contain the current plan `{plan_id}`",
+                    args.file.display()
+                )
+            })?;
+            anyhow::ensure!(
+                parsed.plans.len() == 1,
+                "a plan revision file must contain exactly one plan"
+            );
+            let operation = format!("revision-{}", uuid::Uuid::now_v7().simple());
+            let revision_kdl = plan_revision_intent(
+                &run.subject,
+                &operation,
+                plan_id,
+                &candidate.revision,
+                &run.generation,
+                &args.reason,
+            );
+            if args.print_kdl {
+                eprintln!(
+                    "Publish the candidate plan first: st3 publish {} --as {}",
+                    args.file.display(),
+                    actor
+                );
+                print!("{revision_kdl}");
+                return Ok(());
+            }
+            publish_text(
+                client,
+                kdl,
+                format!("st3 work revise {} candidate", run.subject),
+                actor.clone(),
+            )
+            .await?;
+            let publication = publish_text(
+                client,
+                revision_kdl,
+                format!("st3 work revise {} operation", run.subject),
+                actor,
+            )
+            .await?;
+            let current: PlanRunView = client
+                .get(&format!(
+                    "/v1/plan-runs/{}",
+                    urlencoding::encode(&run.subject)
+                ))
+                .await?;
+            let proposal = client
+                .get::<RevisionProposalView>(&format!(
+                    "/v1/plan-runs/{}/revision-proposal",
+                    urlencoding::encode(&run.subject)
+                ))
+                .await
+                .ok();
+            if let Some(proposal) = proposal {
+                print_value(
+                    &RevisionSubmissionView {
+                        status: proposal.status.clone(),
+                        plan_run: current,
+                        proposal: Some(proposal),
+                    },
+                    json_output,
+                )
+            } else {
+                print_value(&publication, json_output)
+            }
         }
         WorkCommand::Revision { command } => run_work_revision(client, command, json_output).await,
     }
@@ -3361,7 +3876,9 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
     sync_message_projection(client).await?;
     match command {
         MessageCommand::Send(args) => {
-            let message = send_message(client, args).await?;
+            let Some(message) = send_message(client, args).await? else {
+                return Ok(());
+            };
             sync_message_projection(client).await?;
             if json_output {
                 print_value(&message, true)
@@ -3447,9 +3964,13 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
                     in_reply_to: Some(original.subject),
                     tags: Vec::new(),
                     from: args.from,
+                    print_kdl: args.print_kdl,
                 },
             )
             .await?;
+            let Some(message) = message else {
+                return Ok(());
+            };
             if json_output {
                 print_value(&message, true)
             } else {
@@ -3508,34 +4029,110 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
     }
 }
 
-async fn send_message(client: &Client, args: MessageSendArgs) -> Result<MessageView> {
-    let idempotency_key = format!(
-        "message:{}",
-        hex::encode(Sha256::digest(serde_json::to_vec(&(
-            &args.from,
-            &args.to,
-            &args.body,
-            &args.subject,
-            &args.in_reply_to,
-            &args.tags,
-            now_ms(),
-            std::process::id(),
-        ))?))
+async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
+    let id = uuid::Uuid::now_v7().simple().to_string();
+    let plan_id = format!("message/{id}");
+    let kdl = message_plan_intent(
+        &plan_id,
+        &id,
+        &args.from,
+        &args.to,
+        &args.body,
+        args.subject.as_deref(),
+        args.in_reply_to.as_deref(),
+        &args.tags,
     );
-    client
-        .post(
-            "/v1/messages",
-            &MessageSendRequest {
-                idempotency_key,
-                from: args.from,
-                to: args.to,
-                content: args.body,
-                title: args.subject,
-                in_reply_to: args.in_reply_to,
-                tags: args.tags,
-            },
-        )
-        .await
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(None);
+    }
+    let actor = normalize_message_subject(&args.from);
+    let parsed = st3::parse_intent(&kdl, "local")?;
+    let revision = parsed.plans[&plan_id].revision.clone();
+    publish_text(
+        client,
+        kdl,
+        format!("st3 message send {id} plan"),
+        actor.clone(),
+    )
+    .await?;
+    let workspace = std::env::current_dir()?.canonicalize()?;
+    let run_kdl = plan_run_intent(
+        &plan_id,
+        &plan_id,
+        &revision,
+        &workspace,
+        &normalize_requester_subject(&actor),
+        &BTreeMap::new(),
+        "run",
+    );
+    let applied =
+        publish_text(client, run_kdl, format!("st3 message send {id} run"), actor).await?;
+    let subject = format!("message/{id}");
+    wait_for_actual(client, &subject, applied.store_index).await?;
+    read_message(client, &subject).await.map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_plan_intent(
+    plan_id: &str,
+    message_id: &str,
+    from: &str,
+    to: &str,
+    content: &str,
+    title: Option<&str>,
+    in_reply_to: Option<&str>,
+    tags: &[String],
+) -> String {
+    let mut message = KdlNode::new("message");
+    message.entries_mut().push(KdlEntry::new(message_id));
+    let mut message_body = KdlDocument::new();
+    message_body.nodes_mut().push(kdl_node("from", [from]));
+    message_body.nodes_mut().push(kdl_node("to", [to]));
+    message_body
+        .nodes_mut()
+        .push(kdl_node("content", [content]));
+    if let Some(title) = title {
+        message_body.nodes_mut().push(kdl_node("title", [title]));
+    }
+    if let Some(parent) = in_reply_to {
+        message_body
+            .nodes_mut()
+            .push(kdl_node("in-reply-to", [parent]));
+    }
+    for tag in tags {
+        message_body
+            .nodes_mut()
+            .push(kdl_node("tag", [tag.as_str()]));
+    }
+    message.set_children(message_body);
+
+    let mut step = KdlNode::new("step");
+    step.entries_mut().push(KdlEntry::new("send"));
+    let mut step_body = KdlDocument::new();
+    step_body.nodes_mut().push(KdlNode::new("agentless"));
+    step_body.nodes_mut().push(message);
+    step.set_children(step_body);
+
+    let mut completion = KdlNode::new("completion");
+    let mut completion_body = KdlDocument::new();
+    completion_body
+        .nodes_mut()
+        .push(kdl_node("when", ["all-steps-exhausted"]));
+    completion.set_children(completion_body);
+
+    let mut plan = KdlNode::new("plan");
+    plan.entries_mut().push(KdlEntry::new(plan_id));
+    plan.entries_mut()
+        .push(KdlEntry::new_prop("state", "ready"));
+    let mut plan_body = KdlDocument::new();
+    plan_body
+        .nodes_mut()
+        .push(kdl_node("goal", ["Deliver one message."]));
+    plan_body.nodes_mut().push(step);
+    plan_body.nodes_mut().push(completion);
+    plan.set_children(plan_body);
+    publication_document(plan)
 }
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
@@ -3686,6 +4283,21 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
         !args.graph || std::io::stdout().is_terminal(),
         "--graph needs an interactive terminal"
     );
+    if args.print_kdl {
+        anyhow::ensure!(
+            !args.graph,
+            "--print-kdl and --graph cannot be used together"
+        );
+        let root = args
+            .eval
+            .canonicalize()
+            .with_context(|| format!("resolve eval directory {}", args.eval.display()))?;
+        let source = fs::read_to_string(root.join("eval.kdl"))?;
+        let source = source.replace("${EVAL_ROOT}", &root.to_string_lossy());
+        st3::parse_intent(&source, "local")?;
+        print!("{source}");
+        return Ok(());
+    }
     let bundle = archive_eval(&args.eval)?;
     let bundle_hash = hex::encode(Sha256::digest(&bundle));
     let name = args
@@ -3710,6 +4322,7 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
     } else {
         println!("started {}", started.plan_run);
     }
+    let cursor = started.event_cursor;
     let subject = started.plan_run;
     let run: PlanRunView = client
         .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
@@ -3717,7 +4330,7 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
     if args.graph {
         follow_eval_graph(client, &run.subject).await
     } else {
-        follow_plan_run(client, run, json_output).await
+        follow_plan_run(client, run, cursor, json_output).await
     }
 }
 
@@ -4163,52 +4776,122 @@ async fn run_quick(
     } else {
         format!("{node}.{name}")
     };
-    let subject = format!("agent/{bus_id}");
+    let worktree = fs::canonicalize(&args.worktree)
+        .with_context(|| format!("resolve worktree {}", args.worktree.display()))?;
+    let plan_id = format!("standing/{bus_id}");
+    let kdl = quick_agent_intent(
+        &plan_id,
+        &bus_id,
+        &worktree,
+        driver,
+        args.model.as_deref(),
+        args.effort.as_deref(),
+    );
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(());
+    }
+    let actor = args.actor.context("a quick agent needs --as or ST_AGENT")?;
+    let parsed = st3::parse_intent(&kdl, node)?;
+    let plan = parsed.plans[&plan_id].clone();
+    let plan_publication = publish_text(
+        client,
+        kdl,
+        format!("st3 {driver} {bus_id} plan"),
+        actor.clone(),
+    )
+    .await?;
+    let mut active: Vec<PlanRunView> = client
+        .get(&format!(
+            "/v1/plan-runs?plan={}",
+            urlencoding::encode(&plan_id)
+        ))
+        .await?;
+    anyhow::ensure!(
+        active.len() <= 1,
+        "standing plan `plan/{plan_id}` has more than one active run"
+    );
+    let mut cursor = plan_publication.store_index;
+    let run = if let Some(current) = active.pop() {
+        if current.revision != plan.revision {
+            let revision_id = format!("quick-{}", uuid::Uuid::now_v7().simple());
+            let revision_kdl = plan_revision_intent(
+                &current.subject,
+                &revision_id,
+                &plan_id,
+                &plan.revision,
+                &current.generation,
+                "the quick agent declaration changed",
+            );
+            let applied = publish_text(
+                client,
+                revision_kdl,
+                format!("st3 {driver} {bus_id} revision"),
+                actor.clone(),
+            )
+            .await?;
+            cursor = cursor.max(applied.store_index);
+            client
+                .get::<PlanRunView>(&format!(
+                    "/v1/plan-runs/{}",
+                    urlencoding::encode(&current.subject)
+                ))
+                .await?
+        } else {
+            current
+        }
+    } else {
+        let run_id = plan_id.clone();
+        let run_kdl = plan_run_intent(
+            &run_id,
+            &plan_id,
+            &plan.revision,
+            &worktree,
+            &normalize_requester_subject(&actor),
+            &BTreeMap::new(),
+            "run",
+        );
+        let applied = publish_text(
+            client,
+            run_kdl,
+            format!("st3 {driver} {bus_id} run"),
+            actor.clone(),
+        )
+        .await?;
+        cursor = cursor.max(applied.store_index);
+        client
+            .get::<PlanRunView>(&format!(
+                "/v1/plan-runs/{}",
+                urlencoding::encode(&format!("plan-run/{run_id}"))
+            ))
+            .await?
+    };
+    let subject = format!("agent/{}/{bus_id}", run.id);
     let status: StatusResponse = client
         .get(&format!(
             "/v1/status?subject={}",
             urlencoding::encode(&subject)
         ))
         .await?;
-    let mut expected_subject = status
-        .subjects
-        .first()
-        .map(|subject| {
-            subject
-                .desired_token
-                .iter()
-                .cloned()
-                .chain(subject.conflicts.iter().cloned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    expected_subject.sort();
-    let worktree = fs::canonicalize(&args.worktree)
-        .with_context(|| format!("resolve worktree {}", args.worktree.display()))?;
-    let mut request = QuickAgentRequest {
-        subject: subject.clone(),
-        worktree: worktree.to_string_lossy().into_owned(),
-        model: args.model,
-        effort: args.effort,
-        prompt: None,
-        arguments: Vec::new(),
-        expected_subject,
-        idempotency_key: String::new(),
+    let ready = status.subjects.first().is_some_and(|subject| {
+        subject
+            .actual
+            .as_ref()
+            .map(|actual| actual.get("fields").unwrap_or(actual))
+            .and_then(|actual| actual.get("state"))
+            .and_then(Value::as_str)
+            == Some("ready")
+    });
+    let created = QuickAgentResponse {
+        subject,
+        plan: format!("plan/{plan_id}"),
+        plan_run: run.subject,
+        generation: run.generation,
+        runtime_id: format!("{}.{}", run.id, bus_id.replace('/', ".")),
+        event_cursor: cursor,
+        incarnation_id: None,
+        ready,
     };
-    request.idempotency_key = format!(
-        "quick:{}",
-        hex::encode(Sha256::digest(serde_json::to_vec(&(
-            driver,
-            &request.subject,
-            &request.worktree,
-            &request.model,
-            &request.effort,
-            &request.prompt,
-            &request.arguments,
-            &request.expected_subject,
-        ))?))
-    );
-    let created: QuickAgentResponse = client.post(&format!("/v1/{driver}"), &request).await?;
     if json_output {
         print_value(&created, true)?;
     } else {
@@ -4255,6 +4938,147 @@ async fn run_quick(
     let _ = endpoint;
     let _ = config;
     client.proxy_terminal(&attachment.websocket_path).await
+}
+
+fn quick_agent_intent(
+    plan_id: &str,
+    agent_id: &str,
+    worktree: &Path,
+    driver: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    let mut harness_body = KdlDocument::new();
+    if let Some(model) = model {
+        harness_body.nodes_mut().push(kdl_node("model", [model]));
+    }
+    if let Some(effort) = effort {
+        harness_body.nodes_mut().push(kdl_node("effort", [effort]));
+    }
+    if driver == "claude" {
+        let mut development = KdlNode::new("dev-channels");
+        development.entries_mut().push(KdlEntry::new(true));
+        harness_body.nodes_mut().push(development);
+    }
+    harness_body.nodes_mut().push(kdl_node(
+        "prompt",
+        ["Assist the user in this worktree. Use st3 message ls, read, reply, and archive for Small Talk messages."],
+    ));
+    let mut harness = KdlNode::new("harness");
+    harness.entries_mut().push(KdlEntry::new(driver));
+    harness.set_children(harness_body);
+
+    let mut agent = KdlNode::new("agent");
+    agent.entries_mut().push(KdlEntry::new(agent_id));
+    let mut agent_body = KdlDocument::new();
+    agent_body
+        .nodes_mut()
+        .push(kdl_node("identity", [agent_id]));
+    agent_body
+        .nodes_mut()
+        .push(kdl_node("workspace", [worktree.to_string_lossy().as_ref()]));
+    agent_body.nodes_mut().push(harness);
+    agent.set_children(agent_body);
+
+    let mut plan = KdlNode::new("plan");
+    plan.entries_mut().push(KdlEntry::new(plan_id));
+    plan.entries_mut()
+        .push(KdlEntry::new_prop("state", "ready"));
+    let mut plan_body = KdlDocument::new();
+    plan_body.nodes_mut().push(kdl_node(
+        "goal",
+        ["Keep the agent ready for work and conversation."],
+    ));
+    plan_body.nodes_mut().push(agent);
+    plan.set_children(plan_body);
+    publication_document(plan)
+}
+
+fn plan_revision_intent(
+    run: &str,
+    operation_id: &str,
+    plan_id: &str,
+    revision: &str,
+    from_generation: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "version 2\nplan-run {run:?} {{\n  revision {operation_id:?} {{\n    plan {:?}\n    from {from_generation:?}\n    reason {reason:?}\n  }}\n}}\n",
+        format!("plan/{plan_id}@{revision}")
+    )
+}
+
+fn planning_session_intent(
+    session_id: &str,
+    plan_id: &str,
+    request: &str,
+    workspace: &Path,
+    requester: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    target: Option<&PlanRunView>,
+) -> String {
+    let mut session = KdlNode::new("planning-session");
+    session.entries_mut().push(KdlEntry::new(session_id));
+    let mut body = KdlDocument::new();
+    body.nodes_mut().push(kdl_node("plan", [plan_id]));
+    body.nodes_mut().push(kdl_node("request", [request]));
+    body.nodes_mut().push(kdl_node(
+        "workspace",
+        [workspace.to_string_lossy().as_ref()],
+    ));
+    body.nodes_mut().push(kdl_node("requester", [requester]));
+    let mut planner = KdlNode::new("planner");
+    planner.entries_mut().push(KdlEntry::new("codex"));
+    let mut planner_body = KdlDocument::new();
+    if let Some(model) = model {
+        planner_body.nodes_mut().push(kdl_node("model", [model]));
+    }
+    if let Some(effort) = effort {
+        planner_body.nodes_mut().push(kdl_node("effort", [effort]));
+    }
+    planner.set_children(planner_body);
+    body.nodes_mut().push(planner);
+    if let Some(target) = target {
+        body.nodes_mut()
+            .push(kdl_node("target-run", [target.subject.as_str()]));
+        body.nodes_mut()
+            .push(kdl_node("target-generation", [target.generation.as_str()]));
+    }
+    session.set_children(body);
+    publication_document(session)
+}
+
+fn planning_feedback_intent(
+    session_id: &str,
+    operation_id: &str,
+    document: &str,
+    variant: &str,
+) -> String {
+    format!(
+        "version 2\nplanning-session {session_id:?} {{\n  feedback {operation_id:?} {{\n    document {document:?}\n    variant {variant:?}\n  }}\n}}\n"
+    )
+}
+
+fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &str) -> String {
+    format!(
+        "version 2\nplanning-session {session_id:?} {{\n  cancellation {operation_id:?} {{\n    reason {reason:?}\n  }}\n}}\n"
+    )
+}
+
+fn normalize_planning_requester(actor: &str) -> Result<String> {
+    let actor = if actor.starts_with("person/") {
+        actor.to_owned()
+    } else if actor.contains('/') {
+        actor.to_owned()
+    } else {
+        format!("person/{actor}")
+    };
+    anyhow::ensure!(
+        actor.starts_with("person/"),
+        "a planning requester must be a person subject"
+    );
+    Ok(actor)
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
@@ -5390,29 +6214,34 @@ fn combine_kdl_tree(root: &Path) -> Result<String> {
             .with_context(|| format!("parse {}", file.display()))?;
         st2::kdl_version::ensure_st3_version(&document)
             .with_context(|| format!("check KDL version in {}", file.display()))?;
-        let roots = document
+        let declarations = document
             .nodes()
             .iter()
             .filter(|node| node.name().value() != "version")
             .collect::<Vec<_>>();
-        let [root] = roots.as_slice() else {
-            anyhow::bail!("{} does not contain exactly one root", file.display());
-        };
         anyhow::ensure!(
-            root.name().value() == "subgraph",
-            "{} uses old or invalid KDL",
+            !declarations.is_empty(),
+            "{} contains no declarations",
             file.display()
         );
-        let body = root.children().context("an imported subgraph is empty")?;
-        children.nodes_mut().extend(body.nodes().iter().cloned());
+        anyhow::ensure!(
+            declarations
+                .iter()
+                .all(|node| node.name().value() != "subgraph"),
+            "{} uses the removed subgraph wrapper",
+            file.display()
+        );
+        children
+            .nodes_mut()
+            .extend(declarations.into_iter().cloned());
     }
-    let mut root = KdlNode::new("subgraph");
-    root.set_children(children);
     let mut document = KdlDocument::new();
     let mut version = KdlNode::new("version");
     version.entries_mut().push(KdlEntry::new(2));
     document.nodes_mut().push(version);
-    document.nodes_mut().push(root);
+    document
+        .nodes_mut()
+        .extend(children.nodes().iter().cloned());
     document.autoformat();
     Ok(document.to_string())
 }
@@ -5536,11 +6365,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_run_workspace_accepts_a_file_basename() {
-        assert_eq!(
-            resolve_plan_run_workspace(None, Some(Path::new("plan.kdl"))).unwrap(),
-            std::env::current_dir().unwrap().canonicalize().unwrap()
-        );
+    fn plan_start_accepts_an_explicit_run_id() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "plan",
+            "start",
+            "release/demo",
+            "--id",
+            "release/demo/test",
+            "--as",
+            "agent/operator",
+        ])
+        .unwrap();
+        let Command::Plan {
+            command: PlanViewCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("the plan start command did not parse");
+        };
+        assert_eq!(args.plan, "release/demo");
+        assert_eq!(args.id.as_deref(), Some("release/demo/test"));
+        assert_eq!(args.actor.as_deref(), Some("agent/operator"));
     }
 
     #[test]
@@ -5559,7 +6404,7 @@ mod tests {
             plan.completion,
             Some(st3::model::CompletionSpec::AllStepsExhausted)
         ));
-        let execution = plan.steps["execute"].subgraph_kdl.as_deref().unwrap();
+        let execution = plan.steps["execute"].declarations_kdl.as_deref().unwrap();
         assert!(execution.contains("exec cli-test"), "{execution}");
         assert!(execution.contains("host local"));
         assert!(execution.contains("workspace \"/work/tree\""));
@@ -5657,14 +6502,103 @@ mod tests {
     }
 
     #[test]
-    fn run_eval_flag_selects_disposable_run_mode() {
-        let cli = Cli::try_parse_from(["st3", "run", "eval.kdl", "--eval", "--detach"]).unwrap();
-        let Command::Run(args) = cli.command else {
-            panic!("the run command did not parse");
+    fn publish_accepts_a_file_and_actor() {
+        let cli =
+            Cli::try_parse_from(["st3", "publish", "plan.kdl", "--as", "agent/operator"]).unwrap();
+        let Command::Publish(args) = cli.command else {
+            panic!("the publish command did not parse");
         };
-        assert!(args.eval);
-        assert!(args.detach);
-        assert_eq!(args.file.as_deref(), Some(Path::new("eval.kdl")));
+        assert_eq!(args.file.as_deref(), Some(Path::new("plan.kdl")));
+        assert_eq!(args.actor, "agent/operator");
+    }
+
+    #[test]
+    fn intent_helpers_print_current_direct_kdl() {
+        let quick = quick_agent_intent(
+            "standing/example.worker",
+            "example.worker",
+            Path::new("/work/example"),
+            "codex",
+            None,
+            None,
+        );
+        let quick = st3::parse_intent(&quick, "node").unwrap();
+        assert!(quick.plans.contains_key("standing/example.worker"));
+
+        let message = message_plan_intent(
+            "message/test",
+            "test",
+            "person/sender",
+            "person/recipient",
+            "Hello.",
+            Some("Greeting"),
+            None,
+            &["example".into()],
+        );
+        let message = st3::parse_intent(&message, "node").unwrap();
+        assert!(message.plans.contains_key("message/test"));
+
+        let (watch, plan, resource) = resource_watch_intent(
+            "github.pull-request",
+            "example/project#1",
+            &["state".into()],
+            "person/operator",
+        )
+        .unwrap();
+        let watch = st3::parse_intent(&watch, "node").unwrap();
+        assert!(watch.plans.contains_key(&plan));
+        assert!(watch.subjects.contains_key(&resource));
+
+        let refresh = resource_refresh_intent("resource/example", "after-change", 30_000);
+        let refresh = st3::parse_intent(&refresh, "node").unwrap();
+        assert_eq!(refresh.resource_refreshes.len(), 1);
+
+        let reset = runtime_reset_intent(
+            "plan-run/example",
+            "retry",
+            "agent/worker",
+            "run-generation/01990000000070008000000000000000",
+            "retry the worker",
+        );
+        let reset = st3::parse_intent(&reset, "node").unwrap();
+        assert_eq!(reset.plan_runs["plan-run/example"].resets.len(), 1);
+
+        let planning = planning_session_intent(
+            "planning/example/01990000000070008000000000000000",
+            "example",
+            &format!("doc/planning/example/request@{}", "a".repeat(64)),
+            Path::new("/work/example"),
+            "person/operator",
+            None,
+            None,
+            None,
+        );
+        let planning = st3::parse_intent(&planning, "node").unwrap();
+        assert_eq!(planning.planning_sessions.len(), 1);
+    }
+
+    #[test]
+    fn work_revise_accepts_print_only_mode() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "work",
+            "revise",
+            "plan-run/release",
+            "release.kdl",
+            "--reason",
+            "add a gate",
+            "--as",
+            "person/operator",
+            "--print-kdl",
+        ])
+        .unwrap();
+        let Command::Work {
+            command: WorkCommand::Revise(args),
+        } = cli.command
+        else {
+            panic!("the work revise command did not parse");
+        };
+        assert!(args.print_kdl);
     }
 
     #[tokio::test]

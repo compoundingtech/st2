@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/claude-skill-inheritance" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/claude-skill-inheritance."
     step "start-worker" timeout="10m" {
       title "The native Claude Sonnet worker is ready"
-      subgraph {
         agent "si.agent" {
           workspace "${ST_WORKSPACE}/repo"
           harness "claude" {
@@ -23,7 +21,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "exercise-skill-union" timeout="10m" {
@@ -72,4 +69,3 @@ subgraph {
     }
 
   }
-}

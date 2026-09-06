@@ -755,15 +755,12 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
     let intent = st3::parse_intent(&source, "local").expect("parse Fork in the road eval");
     let plan = &intent.plans["eval/fork-in-the-road"];
     let team = plan.steps["start-team"]
-        .subgraph_kdl
+        .declarations_kdl
         .as_deref()
-        .expect("team subgraph")
+        .expect("team declarations")
         .parse::<kdl::KdlDocument>()
         .expect("parse Fork in the road team");
-    let agents = team
-        .get("subgraph")
-        .and_then(kdl::KdlNode::children)
-        .expect("team body");
+    let agents = &team;
     for member in ["fd.a", "fd.b", "fd.c"] {
         let agent = agents
             .nodes()

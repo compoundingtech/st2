@@ -40,26 +40,24 @@ resource "github/compoundingtech/st2/pull/403" {
 
 plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
   goal "Observe one resource and send its selected changes."
-  subgraph {
-    observer "watch" {
-      resource "resource/github/compoundingtech/st2/pull/403"
-      provider "github.pull-request"
-      locator "compoundingtech/st2#403"
-      field "head"
-      field "state"
-      field "review"
-      field "checks"
-    }
+  observer "watch" {
+    resource "resource/github/compoundingtech/st2/pull/403"
+    provider "github.pull-request"
+    locator "compoundingtech/st2#403"
+    field "head"
+    field "state"
+    field "review"
+    field "checks"
+  }
 
-    subscription "watch" {
-      observer "observer/watch"
-      to "agent/hetz.st2"
-      on "head"
-      on "state"
-      on "review"
-      on "checks"
-      delivery "message"
-    }
+  subscription "watch" {
+    observer "observer/watch"
+    to "agent/example.worker"
+    on "head"
+    on "state"
+    on "review"
+    on "checks"
+    delivery "message"
   }
 }
 ```
@@ -87,16 +85,14 @@ resource "workspace/config" {
 
 plan "observe-config" state="ready" {
   goal "Keep the configuration metadata current."
-  subgraph {
-    observer "config" {
-      resource "resource/workspace/config"
-      provider "local.file"
-      locator "/work/project/config.toml"
-      field "status"
-      field "content_hash"
-      field "size"
-      field "mode"
-    }
+  observer "config" {
+    resource "resource/workspace/config"
+    provider "local.file"
+    locator "/work/project/config.toml"
+    field "status"
+    field "content_hash"
+    field "size"
+    field "mode"
   }
 }
 ```

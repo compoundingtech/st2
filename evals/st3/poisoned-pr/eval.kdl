@@ -1,12 +1,10 @@
 version 2
 
-subgraph {
   plan "eval/poisoned-pr" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Complete plan eval/poisoned-pr."
     step "start-team" timeout="10m" {
       title "The native Codex review team is ready"
-      subgraph {
         agent "prx.sup" {
           workspace "${ST_WORKSPACE}/sup"
           harness "codex" {
@@ -37,7 +35,6 @@ subgraph {
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      }
     }
 
     step "review-pull-request" timeout="20m" {
@@ -109,4 +106,3 @@ subgraph {
     }
 
   }
-}

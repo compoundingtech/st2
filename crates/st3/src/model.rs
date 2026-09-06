@@ -246,7 +246,7 @@ pub struct StepSpec {
     pub baselines: Vec<BaselineSpec>,
     #[serde(default)]
     pub documents: Vec<String>,
-    pub subgraph_kdl: Option<String>,
+    pub declarations_kdl: Option<String>,
     pub products: Vec<ProductSpec>,
     #[serde(default)]
     pub produces_plan: Option<String>,
@@ -276,7 +276,7 @@ pub struct PlanSpec {
     #[serde(default)]
     pub revision_cutover: RevisionCutover,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subgraph_kdl: Option<String>,
+    pub declarations_kdl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_selector: Option<WorkSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,15 +421,109 @@ pub struct NormalizedIntent {
     #[serde(default)]
     pub plans: BTreeMap<String, PlanSpec>,
     #[serde(default)]
-    pub plan_run_cancellations: Vec<PlanRunCancellation>,
+    pub plan_runs: BTreeMap<String, PlanRunDeclaration>,
+    #[serde(default)]
+    pub planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
+    #[serde(default)]
+    pub resource_refreshes: Vec<ResourceRefreshOperation>,
     pub document_refs: BTreeSet<String>,
     pub normalized: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanRunCancellation {
-    pub run: String,
+pub struct NamedCancellation {
+    pub id: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanRunCreation {
+    pub plan: String,
+    pub revision: String,
+    pub workspace: String,
+    pub requester: String,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanRevisionOperation {
+    pub id: String,
+    pub plan: String,
+    pub revision: String,
+    pub from_generation: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<NamedCancellation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeResetOperation {
+    pub id: String,
+    pub runtime: String,
+    pub from_generation: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanRunDeclaration {
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<PlanRunCreation>,
+    #[serde(default)]
+    pub revisions: BTreeMap<String, PlanRevisionOperation>,
+    #[serde(default)]
+    pub resets: BTreeMap<String, RuntimeResetOperation>,
+    #[serde(default)]
+    pub cancellations: BTreeMap<String, NamedCancellation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlannerSpec {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanningSessionCreation {
+    pub plan: String,
+    pub request: String,
+    pub workspace: String,
+    pub requester: String,
+    pub planner: PlannerSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_generation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanningFeedbackOperation {
+    pub id: String,
+    pub document: String,
+    pub variant: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanningSessionDeclaration {
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<PlanningSessionCreation>,
+    #[serde(default)]
+    pub feedback: BTreeMap<String, PlanningFeedbackOperation>,
+    #[serde(default)]
+    pub cancellations: BTreeMap<String, NamedCancellation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResourceRefreshOperation {
+    pub resource: String,
+    pub id: String,
+    pub timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -643,6 +737,8 @@ pub struct ApplyRequest {
     pub intent: IntentInput,
     pub expected_subjects: BTreeMap<String, Vec<String>>,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -653,6 +749,10 @@ pub struct ApplyResponse {
     pub claim_ids: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
     pub reconcile_subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolved_kdl: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<PlannedAction>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

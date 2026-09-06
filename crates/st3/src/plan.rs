@@ -38,15 +38,12 @@ pub(crate) fn validate_plan_id(value: &str) -> Result<(), St3Error> {
 }
 
 pub fn parse_plans(
-    root: &KdlNode,
+    document: &KdlDocument,
     default_host: &str,
 ) -> Result<BTreeMap<String, PlanSpec>, St3Error> {
     let mut plans = BTreeMap::new();
-    let Some(children) = root.children() else {
-        return Ok(plans);
-    };
-    let outer_owners = direct_agent_owners(children, default_host)?;
-    for node in children.nodes() {
+    let outer_owners = direct_agent_owners(document, default_host)?;
+    for node in document.nodes() {
         if node.name().value() == "plan" {
             insert_plan(
                 &mut plans,
@@ -174,7 +171,7 @@ fn parse_plan(
     let mut produces_seen = false;
     let mut baseline_names = BTreeSet::new();
     let mut gate_names = BTreeSet::new();
-    let mut subgraph_kdl = None;
+    let mut declarations = Vec::new();
     let mut revision_owners = outer_owners;
     for child in children.nodes() {
         match child.name().value() {
@@ -302,31 +299,20 @@ fn parse_plan(
                 }
                 finally_seen = true;
             }
-            "subgraph" => {
-                if subgraph_kdl.is_some() {
-                    return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `subgraph`"),
-                    ));
-                }
-                ensure_bare(child)?;
-                let body = child.children().ok_or_else(|| {
-                    St3Error::new(
-                        "empty-plan-subgraph",
-                        format!("plan `{id}` has an empty subgraph"),
-                    )
-                })?;
-                if body.nodes().is_empty() {
-                    return Err(St3Error::new(
-                        "empty-plan-subgraph",
-                        format!("plan `{id}` has an empty subgraph"),
-                    ));
-                }
-                crate::graph::validate_deferred_subgraph(child)?;
-                revision_owners.extend(direct_agent_owners(body, default_host)?);
+            "account" => {
+                return Err(St3Error::new(
+                    "account-inside-plan",
+                    format!("plan `{id}` cannot own an account"),
+                ));
+            }
+            name if crate::graph::is_plan_declaration(name) => {
+                crate::graph::validate_deferred_declaration(child)?;
+                let mut declaration = KdlDocument::new();
+                declaration.nodes_mut().push(child.clone());
+                revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
                 revision_owners.sort();
                 revision_owners.dedup();
-                subgraph_kdl = Some(format!("version 2\n{child}\n"));
+                declarations.push(child.clone());
             }
             other => {
                 return Err(St3Error::new(
@@ -353,6 +339,7 @@ fn parse_plan(
             }
         }
     }
+    let declarations_kdl = declarations_document(declarations);
     let mut plan = PlanSpec {
         subject: format!("plan/{id}"),
         id,
@@ -364,7 +351,7 @@ fn parse_plan(
         revisions_human_only,
         revision_reviewer,
         revision_cutover,
-        subgraph_kdl,
+        declarations_kdl,
         work_selector,
         completion,
         goals,
@@ -411,7 +398,7 @@ fn parse_step(
     let mut dependencies = Vec::new();
     let mut baselines = Vec::new();
     let mut documents = Vec::new();
-    let mut subgraph_kdl = None;
+    let mut declarations = Vec::new();
     let mut products = Vec::new();
     let mut produces_plan = None;
     let mut uses_plan = None;
@@ -428,7 +415,8 @@ fn parse_step(
             if !matches!(
                 name,
                 "goal" | "baseline" | "gate" | "depends-on" | "document" | "available-to"
-            ) && !names.insert(name.to_owned())
+            ) && !crate::graph::is_plan_declaration(name)
+                && !names.insert(name.to_owned())
             {
                 return Err(St3Error::new(
                     "duplicate-step-field",
@@ -467,21 +455,20 @@ fn parse_step(
                 }
                 "depends-on" => dependencies.extend(parse_dependencies(child, default_host)?),
                 "document" => documents.push(parse_step_document(child)?),
-                "subgraph" => {
-                    ensure_bare(child)?;
-                    if child.children().is_none_or(|body| body.nodes().is_empty()) {
-                        return Err(St3Error::new(
-                            "empty-step-subgraph",
-                            format!("step `{path}` has an empty subgraph"),
-                        ));
-                    }
-                    let source = format!("version 2\n{child}\n");
-                    crate::graph::validate_deferred_subgraph(child)?;
-                    revision_owners = direct_agent_owners(
-                        child.children().expect("the subgraph body was checked"),
-                        default_host,
-                    )?;
-                    subgraph_kdl = Some(source);
+                "account" => {
+                    return Err(St3Error::new(
+                        "account-inside-plan",
+                        format!("step `{path}` cannot own an account"),
+                    ));
+                }
+                name if crate::graph::is_plan_declaration(name) => {
+                    crate::graph::validate_deferred_declaration(child)?;
+                    let mut declaration = KdlDocument::new();
+                    declaration.nodes_mut().push(child.clone());
+                    revision_owners.extend(direct_agent_owners(&declaration, default_host)?);
+                    revision_owners.sort();
+                    revision_owners.dedup();
+                    declarations.push(child.clone());
                 }
                 "produces" => products = parse_products(child)?,
                 "produces-plan" => produces_plan = Some(parse_produced_plan(child)?),
@@ -527,6 +514,7 @@ fn parse_step(
         available_to,
         agentless,
     )?;
+    let declarations_kdl = declarations_document(declarations);
     let mut step = StepSpec {
         id,
         path,
@@ -542,7 +530,7 @@ fn parse_step(
         dependencies,
         baselines,
         documents,
-        subgraph_kdl,
+        declarations_kdl,
         products,
         produces_plan,
         uses_plan,
@@ -739,6 +727,19 @@ fn direct_agent_owners(
     owners.sort();
     owners.dedup();
     Ok(owners)
+}
+
+fn declarations_document(nodes: Vec<KdlNode>) -> Option<String> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut document = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(kdl::KdlEntry::new(2));
+    document.nodes_mut().push(version);
+    document.nodes_mut().extend(nodes);
+    document.autoformat();
+    Some(document.to_string())
 }
 
 fn agent_owner(node: &KdlNode, default_host: &str) -> Result<String, St3Error> {
@@ -1561,17 +1562,17 @@ mod tests {
     fn parses_parallel_steps_nested_work_and_products() {
         let source = r#"
 version 2
-subgraph {
+
   plan "demo" state="ready" {
     goal "Complete plan demo."
     step "start" {
       agentless
-      subgraph {
+
         agent "worker" {
           workspace "."
           harness "codex" { prompt "Run durable work." }
         }
-      }
+
     }
     step "one" {
       assigned-to "agent/${ST_PLAN_RUN}/worker"
@@ -1587,11 +1588,11 @@ subgraph {
     finally {
       step "cleanup" {
         agentless
-        subgraph { stop "agent/${ST_PLAN_RUN}/worker" }
+         stop "agent/${ST_PLAN_RUN}/worker"
       }
     }
   }
-}
+
 "#;
         let intent = crate::graph::parse_intent(source, "node").unwrap();
         let plan = &intent.plans["demo"];
@@ -1607,11 +1608,10 @@ subgraph {
     #[test]
     fn rejects_checkpoint_and_dependency_cycles() {
         let old =
-            crate::graph::parse_intent("version 2\nsubgraph { checkpoints \"old\" { } }", "node")
-                .unwrap_err();
+            crate::graph::parse_intent("version 2\n checkpoints \"old\" { } ", "node").unwrap_err();
         assert_eq!(old.code, "unknown-node");
         let cycle = crate::graph::parse_intent(
-            "version 2\nsubgraph {\n  plan \"cycle\" state=\"ready\" {\n    goal \"The cycle is rejected.\"\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n}\n",
+            "version 2\n\n  plan \"cycle\" state=\"ready\" {\n    goal \"The cycle is rejected.\"\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n\n",
             "node",
         )
         .unwrap_err();
@@ -1623,7 +1623,7 @@ subgraph {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "review" state="ready" {
     goal "Complete plan review."
     step "approval" {
@@ -1635,7 +1635,7 @@ subgraph {
       }
     }
   }
-}
+
 "#,
             "node",
         )
@@ -1667,7 +1667,7 @@ subgraph {
             &format!(
                 r#"
 version 2
-subgraph {{
+
   plan "bootstrap" state="ready" {{
     goal "Complete plan bootstrap."
     step "compile" {{
@@ -1682,7 +1682,7 @@ subgraph {{
       uses-plan "project/work@{}"
     }}
   }}
-}}
+
 "#,
                 "b".repeat(64),
                 "a".repeat(64)
@@ -1718,7 +1718,7 @@ subgraph {{
     fn rejects_unpinned_or_unordered_plan_use() {
         let unpinned = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Use a plan."; step "use" { uses-plan "work" } } }"#,
+ plan "bad" state="ready" { goal "Use a plan."; step "use" { uses-plan "work" } } "#,
             "node",
         )
         .unwrap_err();
@@ -1726,7 +1726,7 @@ subgraph { plan "bad" state="ready" { goal "Use a plan."; step "use" { uses-plan
 
         let unpinned_document = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Use a document."; step "use" { document "doc/project/plan" } } }"#,
+ plan "bad" state="ready" { goal "Use a document."; step "use" { document "doc/project/plan" } } "#,
             "node",
         )
         .unwrap_err();
@@ -1734,13 +1734,13 @@ subgraph { plan "bad" state="ready" { goal "Use a document."; step "use" { docum
 
         let unordered = crate::graph::parse_intent(
             r#"version 2
-subgraph {
+
   plan "bad" state="ready" {
     goal "Complete plan bad."
     step "compile" { produces-plan "work" }
     step "use" { uses-plan output-of="compile" }
   }
-}"#,
+"#,
             "node",
         )
         .unwrap_err();
@@ -1752,7 +1752,7 @@ subgraph {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "release" state="ready" {
     goal "Publish the release."
     goal "Keep the workspace clean."
@@ -1769,7 +1769,7 @@ subgraph {
 
     step "publish" { depends-on { step "build" completed } }
   }
-}
+
 "#,
             "node",
         )
@@ -1787,12 +1787,12 @@ subgraph {
 
         let unknown_product = crate::graph::parse_intent(
             r#"version 2
-subgraph {
+
   plan "bad-product" state="ready" {
     goal "Publish one invalid resource."
     produces { resource "result" { kind "document.result"; state "published" } }
   }
-}"#,
+"#,
             "node",
         )
         .unwrap_err();
@@ -1800,7 +1800,7 @@ subgraph {
 
         let duplicate_field = crate::graph::parse_intent(
             r#"version 2
-subgraph {
+
   plan "duplicate-product-field" state="ready" {
     goal "Reject an ambiguous product."
     produces {
@@ -1811,7 +1811,7 @@ subgraph {
       }
     }
   }
-}"#,
+"#,
             "node",
         )
         .unwrap_err();
@@ -1823,7 +1823,7 @@ subgraph {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "pool" state="ready" {
     goal "Complete the pool work."
     available-to "agent/node.one"
@@ -1836,7 +1836,7 @@ subgraph {
     }
     finally { step "cleanup" { agentless } }
   }
-}
+
 "#,
             "node",
         )
@@ -1867,15 +1867,15 @@ subgraph {
 
         for source in [
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Reject selectors."; assigned-to "agent/node.one"; agentless; step "work" { } } }"#,
+ plan "bad" state="ready" { goal "Reject selectors."; assigned-to "agent/node.one"; agentless; step "work" { } } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Reject selectors."; available-to "agent/node.one"; available-to "agent/node.one"; step "work" { } } }"#,
+ plan "bad" state="ready" { goal "Reject selectors."; available-to "agent/node.one"; available-to "agent/node.one"; step "work" { } } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Reject completion."; completion { when "all-steps-exhausted"; depends-on { step "work" completed } }; step "work" { } } }"#,
+ plan "bad" state="ready" { goal "Reject completion."; completion { when "all-steps-exhausted"; depends-on { step "work" completed } }; step "work" { } } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Reject a final completion dependency."; completion { depends-on { step "cleanup" completed } }; finally { step "cleanup" { } } } }"#,
+ plan "bad" state="ready" { goal "Reject a final completion dependency."; completion { depends-on { step "cleanup" completed } }; finally { step "cleanup" { } } } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } }"#,
+ plan "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } "#,
         ] {
             assert!(crate::graph::parse_intent(source, "node").is_err());
         }
@@ -1885,7 +1885,7 @@ subgraph { plan "bad" state="ready" { goal "Reject a cross-phase dependency."; s
     fn a_zero_step_plan_is_valid_and_has_no_implicit_completion() {
         let intent = crate::graph::parse_intent(
             r#"version 2
-subgraph { plan "standing" state="ready" { goal "Keep the agent available." } }"#,
+ plan "standing" state="ready" { goal "Keep the agent available." } "#,
             "node",
         )
         .unwrap();
@@ -1898,11 +1898,11 @@ subgraph { plan "standing" state="ready" { goal "Keep the agent available." } }"
     fn goal_limits_and_removed_plan_language_are_strict() {
         for source in [
             r#"version 2
-subgraph { plan "none" state="ready" { step "work" { } } }"#,
+ plan "none" state="ready" { step "work" { } } "#,
             r#"version 2
-subgraph { plan "four" state="ready" { goal "1"; goal "2"; goal "3"; goal "4"; step "work" { } } }"#,
+ plan "four" state="ready" { goal "1"; goal "2"; goal "3"; goal "4"; step "work" { } } "#,
             r#"version 2
-subgraph { plan "step-four" state="ready" { goal "Run."; step "work" { goal "1"; goal "2"; goal "3"; goal "4" } } }"#,
+ plan "step-four" state="ready" { goal "Run."; step "work" { goal "1"; goal "2"; goal "3"; goal "4" } } "#,
         ] {
             assert_eq!(
                 crate::graph::parse_intent(source, "node").unwrap_err().code,
@@ -1911,15 +1911,15 @@ subgraph { plan "step-four" state="ready" { goal "Run."; step "work" { goal "1";
         }
         for removed in [
             r#"version 2
-subgraph { plan "old" state="ready" { goal "Run."; outcome { } ; step "work" { } } }"#,
+ plan "old" state="ready" { goal "Run."; outcome { } ; step "work" { } } "#,
             r#"version 2
-subgraph { plan "old" state="ready" { goal "Run."; judges { } ; step "work" { } } }"#,
+ plan "old" state="ready" { goal "Run."; judges { } ; step "work" { } } "#,
             r#"version 2
-subgraph { plan "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } }"#,
+ plan "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } "#,
             r#"version 2
-subgraph { plan "old" state="ready" change-policy="agent" { goal "Run."; step "work" { } } }"#,
+ plan "old" state="ready" change-policy="agent" { goal "Run."; step "work" { } } "#,
             r#"version 2
-subgraph { plan "old" state="ready" change-authority="agent/worker" { goal "Run."; step "work" { } } }"#,
+ plan "old" state="ready" change-authority="agent/worker" { goal "Run."; step "work" { } } "#,
         ] {
             assert!(crate::graph::parse_intent(removed, "node").is_err());
         }
@@ -1930,16 +1930,16 @@ subgraph { plan "old" state="ready" change-authority="agent/worker" { goal "Run.
         let intent = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "placed" state="ready" revisions="human-only" revision-reviewer="person/plan" revision-cutover="when-idle" {
     goal "Test revision placement."
-    subgraph { agent "plan-owner" { workspace "."; command "true" } }
+     agent "plan-owner" { workspace "."; command "true" }
     step "work" revisions="human-only" revision-reviewer="person/step" {
       assigned-to "agent/assignee"
-      subgraph { agent "step-owner" { workspace "."; command "true" } }
+       agent "step-owner" { workspace "."; command "true" }
     }
   }
-}
+
 "#,
             "node",
         )
@@ -1964,14 +1964,14 @@ subgraph {
         let reserved = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "reserved" state="ready" {
     goal "Reject a context override."
     step "work" {
-      subgraph { exec "task" { command "true"; env { ST_PLAN_RUN "forged" } } }
+       exec "task" { command "true"; env { ST_PLAN_RUN "forged" } }
     }
   }
-}
+
 "#,
             "node",
         )
@@ -1981,14 +1981,14 @@ subgraph {
         crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "allowed" state="ready" {
     goal "Allow an application variable."
     step "work" {
-      subgraph { exec "task" { command "true"; env { ST_ROOT "allowed" } } }
+       exec "task" { command "true"; env { ST_ROOT "allowed" } }
     }
   }
-}
+
 "#,
             "node",
         )
@@ -2000,7 +2000,7 @@ subgraph {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
-subgraph {
+
   plan "parameterized" state="ready" {
     input "message" kind="text"
     input "source" kind="resource"
@@ -2008,7 +2008,7 @@ subgraph {
     goal "Process ${input.message}."
     step "work" {
       agentless
-      subgraph { exec "task" { command "printf '%s' '${input.message}'"; restart "never" } }
+       exec "task" { command "printf '%s' '${input.message}'"; restart "never" }
       gate "the source is ready" { field "state" "${input.source}" is "ready" }
     }
   }
@@ -2016,7 +2016,7 @@ subgraph {
     concurrent-runs
     goal "Allow concurrent runs."
   }
-}
+
 "#,
             "node",
         )
@@ -2036,15 +2036,15 @@ subgraph {
 
         for source in [
             r#"version 2
-subgraph { plan "bad" state="ready" { input "x" kind="text"; input "x" kind="text"; goal "Reject duplicate input." } }"#,
+ plan "bad" state="ready" { input "x" kind="text"; input "x" kind="text"; goal "Reject duplicate input." } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { input "x" kind="secret"; goal "Reject the input kind." } }"#,
+ plan "bad" state="ready" { input "x" kind="secret"; goal "Reject the input kind." } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { concurrent-runs max=0; goal "Reject the run limit." } }"#,
+ plan "bad" state="ready" { concurrent-runs max=0; goal "Reject the run limit." } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { goal "Use ${input.missing}." } }"#,
+ plan "bad" state="ready" { goal "Use ${input.missing}." } "#,
             r#"version 2
-subgraph { plan "bad" state="ready" { agentless; goal "Reject a plan selector." } }"#,
+ plan "bad" state="ready" { agentless; goal "Reject a plan selector." } "#,
         ] {
             assert!(crate::graph::parse_intent(source, "node").is_err());
         }
@@ -2053,9 +2053,9 @@ subgraph { plan "bad" state="ready" { agentless; goal "Reject a plan selector." 
     #[test]
     fn kdl_interpolation_preserves_arbitrary_text_input() {
         let source = r#"version 2
-subgraph {
+
   exec "task" { command "printf '%s' '${input.message}'" }
-}
+
 "#;
         let message = "a \"quoted\" line\nand another line";
         let variables =
@@ -2063,9 +2063,7 @@ subgraph {
         let interpolated = super::interpolate_kdl(source, &variables).unwrap();
         let document = interpolated.parse::<kdl::KdlDocument>().unwrap();
         let command = document
-            .get("subgraph")
-            .and_then(kdl::KdlNode::children)
-            .and_then(|subgraph| subgraph.get("exec"))
+            .get("exec")
             .and_then(kdl::KdlNode::children)
             .and_then(|exec| exec.get("command"))
             .and_then(|command| command.entries().first())

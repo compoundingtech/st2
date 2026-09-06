@@ -37,6 +37,7 @@ toml = "0.9"
 tower = { version = "0.5", features = ["util"] }
 tar = "0.4"
 urlencoding = "2"
+uuid = { version = "1", features = ["v7"] }
 walkdir = "2"
 
 [dev-dependencies]
