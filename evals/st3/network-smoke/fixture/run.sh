@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(mktemp -d "${TMPDIR:-/tmp}/st3-network-smoke.XXXXXX")"
 state="$root/state"
 socket="$root/st3.sock"
+pty_root="$root/p"
 daemon=""
 run_id=""
 wait_for_terminal_cleanup() {
@@ -20,9 +21,9 @@ wait_for_terminal_cleanup() {
 remove_test_ptys() {
   local session=""
   while IFS= read -r session; do
-    PTY_ROOT="$state/pty" pty kill "$session" >/dev/null 2>&1 || true
-    PTY_ROOT="$state/pty" pty rm "$session" >/dev/null 2>&1 || true
-  done < <(PTY_ROOT="$state/pty" pty list --json 2>/dev/null | jq -r '.[].name')
+    PTY_ROOT="$pty_root" pty kill "$session" >/dev/null 2>&1 || true
+    PTY_ROOT="$pty_root" pty rm "$session" >/dev/null 2>&1 || true
+  done < <(PTY_ROOT="$pty_root" pty list --json 2>/dev/null | jq -r '.[].name')
 }
 cleanup() {
   local failed=0
@@ -40,8 +41,16 @@ cleanup() {
   rm -rf "$root"
   return "$failed"
 }
-trap cleanup EXIT
-st3 up --node smoke --state-dir "$state" --socket "$socket" >daemon.log 2>&1 &
+finish() {
+  local status=$?
+  trap - EXIT
+  if ! cleanup && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
+}
+trap finish EXIT
+st3 up --node smoke --state-dir "$state" --socket "$socket" --pty-root "$pty_root" >daemon.log 2>&1 &
 daemon=$!
 for _ in $(seq 1 100); do st3 --endpoint "$socket" doctor >/dev/null 2>&1 && break; sleep 0.05; done
 st3 --endpoint "$socket" doctor >/dev/null
@@ -55,8 +64,10 @@ subgraph {
       agent "net.dev" {
         workspace "$PWD"
         command "sleep 300"
-        restart "never"
-        env { ST3_MESSAGE_ROOT "$state/messages" }
+        restart "on-failure"
+        exec "ding" {
+          argv "st3" "driver" "ding"
+        }
       }
     }
   }
@@ -64,7 +75,8 @@ subgraph {
 KDL
 run_id="$(st3 --endpoint "$socket" --json run network.kdl --detach | jq -er .id)"
 agent="agent/$run_id/net.dev"
-for _ in $(seq 1 100); do st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .status == "ready")' >/dev/null 2>&1 && break; sleep 0.05; done
+for _ in $(seq 1 100); do st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null 2>&1 && break; sleep 0.05; done
+st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null
 id="$(st3 --endpoint "$socket" message send "$agent" --from tester -m NETWORK-SMOKE-ROUNDTRIP)"
 for _ in $(seq 1 100); do
   st3 --endpoint "$socket" inspect "message/$id" --json | jq -e '.recent_claims | map(.kind) | index("message.delivered") != null' >/dev/null 2>&1 && break

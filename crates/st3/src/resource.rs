@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,10 +42,56 @@ impl ResourceProvider for RegisteredResourceProvider {
         Box::pin(async move {
             match request.provider.as_str() {
                 "github.pull-request" => observe_github_pull_request(request).await,
+                "local.file" => observe_local_file(request),
                 provider => bail!("resource provider `{provider}` is not registered"),
             }
         })
     }
+}
+
+fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation> {
+    let path = Path::new(&request.locator);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "a local file locator must be an absolute path"
+    );
+    let mut facts = serde_json::Map::new();
+    facts.insert("path".into(), Value::String(request.locator.clone()));
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            facts.insert("status".into(), Value::String("ready".into()));
+            facts.insert(
+                "content_hash".into(),
+                Value::String(hex::encode(Sha256::digest(&bytes))),
+            );
+            facts.insert("size".into(), Value::from(bytes.len() as u64));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+                facts.insert("mode".into(), Value::from(mode));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            facts.insert("status".into(), Value::String("missing".into()));
+        }
+        Err(error) => {
+            facts.insert("status".into(), Value::String("unreadable".into()));
+            facts.insert("reason".into(), Value::String(error.to_string()));
+        }
+    }
+    facts.retain(|name, _| request.fields.contains(name) || name == "status" || name == "path");
+    let facts = Value::Object(facts);
+    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(ProviderObservation {
+        facts,
+        cursor,
+        next_check_unix_ms: now.saturating_add(60_000),
+    })
 }
 
 async fn observe_github_pull_request(request: ObservationRequest) -> Result<ProviderObservation> {
@@ -202,5 +249,43 @@ mod tests {
             .unwrap();
         assert_eq!(observation.cursor.as_deref(), Some("fake-cursor"));
         assert_eq!(observation.facts["provider"], "fake.issue");
+    }
+
+    #[tokio::test]
+    async fn a_local_file_observer_records_metadata_without_content() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("proof.txt");
+        std::fs::write(&path, "secret proof\n").unwrap();
+        let observation = RegisteredResourceProvider
+            .observe(ObservationRequest {
+                provider: "local.file".into(),
+                locator: path.display().to_string(),
+                fields: BTreeSet::from(["content_hash".into(), "size".into(), "status".into()]),
+                cursor: None,
+                previous_facts: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(observation.facts["status"], "ready");
+        assert_eq!(observation.facts["size"], 13);
+        assert!(observation.facts.get("content_hash").is_some());
+        assert!(observation.facts.get("content").is_none());
+        assert_eq!(observation.facts["path"], path.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn a_missing_local_file_is_a_distinct_observation() {
+        let path = std::env::temp_dir().join("st3-file-that-does-not-exist");
+        let observation = RegisteredResourceProvider
+            .observe(ObservationRequest {
+                provider: "local.file".into(),
+                locator: path.display().to_string(),
+                fields: BTreeSet::from(["status".into()]),
+                cursor: None,
+                previous_facts: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(observation.facts["status"], "missing");
     }
 }

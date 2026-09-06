@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use notify::Watcher as _;
 use serde_json::Value;
 use sha2::Digest as _;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::model::{
     ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec, MemberKind,
@@ -44,7 +44,6 @@ pub trait RuntimeControl: Send + Sync + 'static {
     ) -> Result<()>;
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()>;
     fn attach(&self, runtime_id: &str) -> Result<()>;
-    fn send(&self, runtime_id: &str, text: &str) -> Result<()>;
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
@@ -184,10 +183,6 @@ impl RuntimeControl for NativeRuntime {
         self.pty.attach(runtime_id)
     }
 
-    fn send(&self, runtime_id: &str, text: &str) -> Result<()> {
-        self.pty.send_line(runtime_id, text)
-    }
-
     fn screen(&self, runtime_id: &str) -> Result<String> {
         self.pty.screen(runtime_id)
     }
@@ -209,7 +204,7 @@ pub struct Reconciler<R = NativeRuntime> {
     driver_state_dir: PathBuf,
     runtime_environment: BTreeMap<String, String>,
     notify: Arc<Notify>,
-    event_notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
@@ -225,7 +220,7 @@ impl Reconciler<NativeRuntime> {
         host: String,
         endpoint: String,
         notify: Arc<Notify>,
-        event_notify: Arc<Notify>,
+        event_notify: watch::Sender<u64>,
     ) -> Self {
         let selected_pty_root = pty_root
             .map(Path::to_path_buf)
@@ -261,7 +256,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
             runtime_environment: BTreeMap::new(),
             notify,
-            event_notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
@@ -273,6 +268,12 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[cfg(test)]
     fn with_resource_provider(mut self, provider: Arc<dyn ResourceProvider>) -> Self {
         self.resource_provider = provider;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_event_notify(mut self, event_notify: watch::Sender<u64>) -> Self {
+        self.event_notify = event_notify;
         self
     }
 
@@ -292,7 +293,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     ]),
                 );
             }
-            self.event_notify.notify_waiters();
+            self.event_notify
+                .send_modify(|generation| *generation = generation.saturating_add(1));
         }
     }
 
@@ -326,6 +328,26 @@ impl<R: RuntimeControl> Reconciler<R> {
         };
 
         let active = desired.iter().collect::<Vec<_>>();
+        let rendered = crate::render::apply_all(&self.store, &active, &self.host)?;
+        for (subject, result) in rendered {
+            for warning in result.warnings {
+                self.record_once(
+                    &subject,
+                    "harness.diagnostic",
+                    BTreeMap::from([
+                        ("status".into(), Value::String("warning".into())),
+                        ("reason".into(), Value::String(warning)),
+                    ]),
+                )?;
+            }
+            if !result.receipts.is_empty() {
+                self.record_once(
+                    &subject,
+                    "render.applied",
+                    BTreeMap::from([("writes".into(), serde_json::to_value(result.receipts)?)]),
+                )?;
+            }
+        }
         for subject in &active {
             if subject.kind == "stop" {
                 self.reconcile_stop(subject, &ptys)?;
@@ -426,7 +448,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.reconcile_resource_observers(&desired)?;
         self.reconcile_schedules(&desired)?;
-        self.deliver_messages(&desired)?;
         self.evaluate_plan_runs()?;
         Ok(())
     }
@@ -648,17 +669,21 @@ impl<R: RuntimeControl> Reconciler<R> {
         member: &MemberSpec,
         reason: &str,
     ) -> Result<()> {
-        for warning in
-            crate::render::apply(&self.store, &subject.desired, Path::new(&member.workspace))?
-        {
-            self.record_once(
-                &subject.subject,
-                "harness.diagnostic",
-                BTreeMap::from([
-                    ("status".into(), Value::String("warning".into())),
-                    ("reason".into(), Value::String(warning)),
-                ]),
-            )?;
+        let workspace = Path::new(&member.workspace);
+        if workspace.exists() {
+            anyhow::ensure!(
+                workspace.is_dir(),
+                "workspace {} is not a directory",
+                workspace.display()
+            );
+        } else if member.workspace_create {
+            std::fs::create_dir_all(workspace)
+                .with_context(|| format!("create workspace {}", workspace.display()))?;
+        } else {
+            anyhow::bail!(
+                "workspace {} does not exist; add create=#true to its workspace declaration to create it",
+                workspace.display()
+            );
         }
         let mut launch_member = member.clone();
         for (key, value) in &self.runtime_environment {
@@ -676,7 +701,18 @@ impl<R: RuntimeControl> Reconciler<R> {
         );
         launch_member
             .environment
-            .insert("ST_AGENT".into(), subject.subject.clone());
+            .insert("ST3_SUBJECT".into(), subject.subject.clone());
+        if subject.kind == "agent" {
+            launch_member
+                .environment
+                .insert("ST_AGENT".into(), subject.subject.clone());
+        } else if let Some(owner) = member.tags.get("st3.agent") {
+            launch_member
+                .environment
+                .insert("ST_AGENT".into(), owner.clone());
+        } else {
+            launch_member.environment.remove("ST_AGENT");
+        }
         let executable = std::env::current_exe()?;
         prepend_executable_dir(&mut launch_member.environment, &executable)?;
         if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
@@ -832,6 +868,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let resets = self
             .store
             .claims_for(&subject.subject, Some("runtime.restart-window-reset"))?;
+        let incarnation = observation.incarnation_id.as_deref().unwrap_or("unknown");
         let reset_index = resets
             .iter()
             .filter(|claim| {
@@ -840,6 +877,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .pointer("/fields/desired_token")
                     .and_then(Value::as_str)
                     == Some(desired_token.as_str())
+                    && claim
+                        .body
+                        .pointer("/fields/incarnation_id")
+                        .and_then(Value::as_str)
+                        == Some(incarnation)
             })
             .map(|claim| claim.store_index)
             .max()
@@ -851,7 +893,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 && now.saturating_sub(last.accepted_at_unix_ms)
                     >= member.restart_intensity.interval_ms as u128
             {
-                let incarnation = observation.incarnation_id.as_deref().unwrap_or("unknown");
                 self.store.append_claim(&ClaimInput {
                     subject: subject.subject.clone(),
                     kind: "runtime.restart-window-reset".into(),
@@ -859,6 +900,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     fields: BTreeMap::from([
                         ("desired_token".into(), Value::String(desired_token.clone())),
                         ("incarnation_id".into(), Value::String(incarnation.into())),
+                        (
+                            "reason".into(),
+                            Value::String("the stable interval cleared the restart window".into()),
+                        ),
                     ]),
                     evidence: vec![last.id.clone()],
                     expected_subject: None,
@@ -1006,18 +1051,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.store
-            .append_claim(&ClaimInput {
-                subject: subject.into(),
-                kind: kind.into(),
-                actor: None,
-                fields,
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            })
-            .map_err(Into::into)
-            .map(|_| ())
+        self.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: kind.into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })?;
+        self.signal_changed();
+        Ok(())
     }
 
     fn evaluate_plan_runs(&self) -> Result<()> {
@@ -1883,9 +1927,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 member
                     .environment
                     .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
-                member
-                    .environment
-                    .insert("ST_AGENT".into(), subject.subject.clone());
             }
         }
         self.reject_runtime_collisions(&intent, run, Some(&view.subject))?;
@@ -1954,9 +1995,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 member
                     .environment
                     .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
-                member
-                    .environment
-                    .insert("ST_AGENT".into(), subject.subject.clone());
             }
         }
         self.reject_runtime_collisions(&intent, run, None)?;
@@ -2251,68 +2289,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(false)
     }
 
-    fn deliver_messages(&self, desired: &[DesiredSubject]) -> Result<()> {
-        for message in self.store.messages(None, false)? {
-            if message.status != "sent" {
-                continue;
-            }
-            let recipient = if message.to.starts_with("agent/") {
-                message.to.clone()
-            } else {
-                format!("agent/{}", message.to)
-            };
-            let driver = desired
-                .iter()
-                .find(|item| item.subject == recipient)
-                .and_then(|item| item.member.as_ref())
-                .and_then(|member| member.driver.as_deref());
-            if matches!(driver, Some("claude" | "codex")) {
-                continue;
-            }
-            let Some(actual) = self.store.latest_actual_value(&recipient)? else {
-                continue;
-            };
-            let Some(runtime_id) = actual_field(&actual, "runtime_id").and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let status = actual_field(&actual, "status").and_then(Value::as_str);
-            if !matches!(status, Some("running" | "ready" | "working" | "idle")) {
-                continue;
-            }
-            let id = message
-                .subject
-                .strip_prefix("message/")
-                .unwrap_or(&message.subject);
-            let wake = format!(
-                "[DING] new st3 message: [id:{id}] {} (from {}); run `st3 message ls`",
-                message.title.as_deref().unwrap_or("message"),
-                message.from
-            );
-            self.runtime.send(runtime_id, &wake)?;
-            self.record_once(
-                &message.subject,
-                "message.delivered",
-                BTreeMap::from([
-                    ("status".into(), Value::String("delivered".into())),
-                    ("runtime_id".into(), Value::String(runtime_id.into())),
-                ]),
-            )?;
-            if let Some(root) = desired
-                .iter()
-                .find(|item| item.subject == recipient)
-                .and_then(|item| item.member.as_ref())
-                .and_then(|member| member.environment.get("ST3_MESSAGE_ROOT"))
-            {
-                crate::projection::export_messages(
-                    Path::new(root),
-                    &self.store.messages(None, true)?,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
             let Some(spec) = crate::graph::schedule_spec(&schedule.desired, &self.host) else {
@@ -2425,7 +2401,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("clock-wake:{operation}")),
             })?;
-            self.event_notify.notify_waiters();
+            self.event_notify
+                .send_modify(|generation| *generation = generation.saturating_add(1));
             let template = spec.message.clone();
             let store = self.store.clone();
             let notify = self.notify.clone();
@@ -2537,7 +2514,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .filter(|(_, subscription)| subscription.observer == observer.subject)
                 .cloned()
                 .collect::<Vec<_>>();
-            if spec.stopped || selected.is_empty() {
+            if spec.stopped {
                 let is_stopped = self
                     .store
                     .latest_actual_value(&observer.subject)?
@@ -2570,23 +2547,44 @@ impl<R: RuntimeControl> Reconciler<R> {
             {
                 continue;
             }
-            spec.fields = selected
-                .iter()
-                .flat_map(|(_, subscription)| subscription.fields.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            spec.fields.extend(
+                selected
+                    .iter()
+                    .flat_map(|(_, subscription)| subscription.fields.iter().cloned()),
+            );
+            spec.fields.sort();
+            spec.fields.dedup();
             let Some(revision) = self.store.selected_desired_revision(&observer.subject)? else {
                 continue;
             };
             let observer_actual = self.store.latest_actual_value(&observer.subject)?;
+            let refresh_attempt = self
+                .store
+                .latest_claim(&observer.subject, None)?
+                .filter(|claim| claim.kind == "observer.state")
+                .filter(|claim| {
+                    claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
+                        && claim.body.pointer("/fields/reason").and_then(Value::as_str)
+                            == Some("manual refresh")
+                })
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/attempt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
             let next_check = observer_actual
                 .as_ref()
                 .and_then(|actual| actual.get("next_check_unix_ms"))
                 .and_then(Value::as_str)
                 .and_then(|value| value.parse::<u128>().ok())
                 .unwrap_or_else(now_ms);
-            let operation = format!("{}:{revision}:{next_check}", observer.subject);
+            let operation = format!(
+                "{}:{revision}:{next_check}:{}",
+                observer.subject,
+                refresh_attempt.as_deref().unwrap_or("scheduled")
+            );
             if !self
                 .armed_observers
                 .lock()
@@ -2640,6 +2638,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             let _ = store.record_resource_observation(
                                 &observer_subject,
                                 &revision,
+                                refresh_attempt.as_deref(),
                                 &spec.resource,
                                 observation.cursor.as_deref(),
                                 &observation.facts,
@@ -2651,19 +2650,23 @@ impl<R: RuntimeControl> Reconciler<R> {
                             let failure_hash = hex::encode(sha2::Sha256::digest(
                                 format!("{operation}:{error}").as_bytes(),
                             ));
+                            let mut fields = BTreeMap::from([
+                                ("state".into(), Value::String("unreachable".into())),
+                                ("reason".into(), Value::String(error.to_string())),
+                                ("revision".into(), Value::String(revision.clone())),
+                                (
+                                    "next_check_unix_ms".into(),
+                                    Value::String(now_ms().saturating_add(60_000).to_string()),
+                                ),
+                            ]);
+                            if let Some(attempt) = &refresh_attempt {
+                                fields.insert("attempt".into(), Value::String(attempt.clone()));
+                            }
                             let _ = store.append_claim(&ClaimInput {
                                 subject: observer_subject.clone(),
                                 kind: "observer.state".into(),
                                 actor: None,
-                                fields: BTreeMap::from([
-                                    ("state".into(), Value::String("unreachable".into())),
-                                    ("reason".into(), Value::String(error.to_string())),
-                                    ("revision".into(), Value::String(revision.clone())),
-                                    (
-                                        "next_check_unix_ms".into(),
-                                        Value::String(now_ms().saturating_add(60_000).to_string()),
-                                    ),
-                                ]),
+                                fields,
                                 evidence: Vec::new(),
                                 expected_subject: None,
                                 idempotency_key: Some(format!(
@@ -2988,6 +2991,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             host: host.into(),
             runtime_id,
             workspace: workspace.into(),
+            workspace_create: false,
             cwd: workspace.into(),
             terminal: false,
             launch: LaunchSpec::Shell(command.into()),
@@ -3222,6 +3226,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             host: host.into(),
             runtime_id: result_subject.replace('/', "."),
             workspace: workspace.into(),
+            workspace_create: false,
             cwd: workspace.into(),
             terminal: false,
             launch: LaunchSpec::Argv(argv),
@@ -3530,6 +3535,7 @@ fn run_variables(
         ("ST_REQUESTER".into(), run.requester.clone()),
         ("ST_PARENT_STEP_RUN".into(), parent_step_run),
         ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
+        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
     ]);
     variables.extend(
         run.inputs
@@ -3621,9 +3627,9 @@ fn expand_gate(
     Ok(())
 }
 
-fn signal_changed(reconcile_notify: &Notify, event_notify: &Notify) {
+fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
     reconcile_notify.notify_one();
-    event_notify.notify_waiters();
+    event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
 fn structured_token_usage(log: &str) -> Option<u64> {
@@ -3805,11 +3811,13 @@ fn prepend_executable_dir(
     let Some(directory) = executable.parent() else {
         return Ok(());
     };
-    let current = environment
+    let ambient = std::env::var_os("PATH").unwrap_or_default();
+    let declared = environment
         .get("PATH")
-        .map(std::ffi::OsString::from)
-        .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_default();
+        .map(String::as_str)
+        .unwrap_or("${PATH}");
+    let expanded = declared.replace("${PATH}", &ambient.to_string_lossy());
+    let current = std::ffi::OsString::from(expanded);
     let paths = std::iter::once(directory.to_path_buf())
         .chain(std::env::split_paths(&current).filter(|path| path != directory));
     environment.insert(
@@ -3841,7 +3849,6 @@ mod tests {
         removes: Mutex<Vec<String>>,
         screen: Mutex<String>,
         keys: Mutex<Vec<String>>,
-        sent_lines: Mutex<Vec<(String, String)>>,
     }
 
     impl RuntimeControl for FakeRuntime {
@@ -3895,13 +3902,6 @@ mod tests {
             Ok(())
         }
         fn attach(&self, _runtime_id: &str) -> Result<()> {
-            Ok(())
-        }
-        fn send(&self, runtime_id: &str, text: &str) -> Result<()> {
-            self.sent_lines
-                .lock()
-                .unwrap()
-                .push((runtime_id.into(), text.into()));
             Ok(())
         }
         fn screen(&self, _runtime_id: &str) -> Result<String> {
@@ -4232,6 +4232,12 @@ subgraph {
             subgraph {
               plan "context" state="ready" {
                 goal "Expose the run context."
+                subgraph {
+                  exec "plan-task" {
+                    command "true"
+                    env { CUSTOM_PATH "/opt/st3-shims:${PATH}" }
+                  }
+                }
                 step "work" {
                   subgraph {
                     exec "task" {
@@ -4276,7 +4282,7 @@ subgraph {
             .lock()
             .unwrap()
             .iter()
-            .find(|member| member.driver.is_none())
+            .find(|member| member.environment.contains_key("CUSTOM_RUN"))
             .cloned()
             .expect("the step task did not start");
         for name in [
@@ -4292,11 +4298,24 @@ subgraph {
             "ST_ATTEMPT",
             "ST_ASSIGNEE",
             "ST_PARENT_STEP_RUN",
-            "ST_AGENT",
         ] {
             assert!(task.environment.contains_key(name), "missing {name}");
         }
+        assert!(!task.environment.contains_key("ST_AGENT"));
         assert_eq!(task.environment["CUSTOM_RUN"], run.id);
+        let plan_task = runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|member| member.environment.contains_key("CUSTOM_PATH"))
+            .cloned()
+            .expect("the plan task did not start");
+        assert!(plan_task.environment["CUSTOM_PATH"].starts_with("/opt/st3-shims:"));
+        assert!(
+            plan_task.environment["CUSTOM_PATH"]
+                .ends_with(&std::env::var("PATH").unwrap_or_default())
+        );
 
         runtime.execs.lock().unwrap().insert(
             task.runtime_id.clone(),
@@ -5835,8 +5854,9 @@ subgraph {
                 version 2
                 subgraph {
                   agent "worker" {
-                    workspace "/tmp/one"
+                    workspace "/tmp"
                     command "true"
+                    env { REVISION "one" }
                     restart "never"
                   }
                 }
@@ -5868,8 +5888,9 @@ subgraph {
                 version 2
                 subgraph {
                   agent "worker" {
-                    workspace "/tmp/two"
+                    workspace "/tmp"
                     command "true"
+                    env { REVISION "two" }
                     restart "never"
                   }
                 }
@@ -5881,20 +5902,20 @@ subgraph {
 
         assert_eq!(runtime.starts.lock().unwrap().len(), 2);
         assert_eq!(
-            runtime.started_members.lock().unwrap()[1].workspace,
-            "/tmp/two"
+            runtime.started_members.lock().unwrap()[1].environment["REVISION"],
+            "two"
         );
     }
 
     #[test]
-    fn a_reconcile_does_not_redeliver_a_read_message() {
+    fn a_ding_is_an_explicit_child_runtime_not_a_reconciler_side_effect() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
             subgraph {
               agent "worker" {
                 command "sleep 60"
-                ding
+                exec "ding" { command "true" }
               }
               message "one" {
                 from "requester"
@@ -5922,7 +5943,14 @@ subgraph {
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
 
-        assert_eq!(runtime.sent_lines.lock().unwrap().len(), 1);
+        assert!(
+            runtime
+                .started_members
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|member| member.runtime_id == "exec.node.worker.ding")
+        );
     }
 
     #[test]
@@ -5979,6 +6007,47 @@ subgraph {
             actual_field(&actual, "reachability"),
             Some(&Value::String("unreachable".into()))
         );
+        let desired_token = store
+            .selected_desired_token("agent/node.worker")
+            .unwrap()
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "runtime.restart-window-reset".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("desired_token".into(), Value::String(desired_token.clone())),
+                    ("incarnation_id".into(), Value::String("other".into())),
+                    ("reason".into(), Value::String("test the fence".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("wrong-incarnation-reset".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "runtime.restart-window-reset".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("desired_token".into(), Value::String(desired_token)),
+                    ("incarnation_id".into(), Value::String("first".into())),
+                    (
+                        "reason".into(),
+                        Value::String("clear this incarnation window".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("matching-incarnation-reset".into()),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -6554,6 +6623,67 @@ subgraph { plan "zero" state="ready" { goal "Remain open with no steps." } }
     }
 
     #[test]
+    fn a_zero_step_standing_plan_materializes_its_runtime_graph() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+subgraph {
+  plan "standing-agent" state="ready" {
+    goal "Keep one agent available."
+    subgraph {
+      agent "worker" {
+        command "sleep 60"
+        restart "on-failure"
+        exec "ding" { argv "st3" "driver" "ding" }
+      }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-standing-agent");
+        let run = store
+            .create_plan_run(&PlanRunRequest {
+                plan: "standing-agent".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-standing-agent".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let subjects = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .map(|subject| subject.subject)
+            .collect::<BTreeSet<_>>();
+        assert!(subjects.contains(&format!("agent/{}/worker", run.id)));
+        assert!(subjects.contains(&format!("exec/{}/worker/ding", run.id)));
+        let started = runtime
+            .started_members
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|member| member.runtime_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(started.len(), 2);
+        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "standing");
+    }
+
+    #[test]
     fn a_terminal_plan_stops_its_owned_runtimes() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
@@ -6874,6 +7004,84 @@ subgraph {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn an_observer_without_a_subscription_still_observes_its_resource() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+subgraph {
+  resource "standalone" { kind "custom.example.state" }
+  observer "standalone" {
+    resource "resource/standalone"
+    provider "example.state"
+    locator "standalone"
+    field "state"
+  }
+}
+"#;
+        apply_source(&store, source, "publish-standalone-observer");
+        let (event_notify, mut event_changed) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(FakeResourceProvider))
+        .with_event_notify(event_notify.clone());
+
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .expect("the standalone observer did not finish")
+            .expect("the event sender closed");
+
+        assert_eq!(
+            store
+                .latest_actual_value("resource/standalone")
+                .unwrap()
+                .unwrap()["facts"]["state"],
+            "open"
+        );
+        assert_eq!(
+            store
+                .latest_actual_value("observer/standalone")
+                .unwrap()
+                .unwrap()["status"],
+            "healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_reconciler_record_wakes_event_waiters() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let (event_notify, mut event_changed) = watch::channel(0_u64);
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_event_notify(event_notify.clone());
+        reconciler
+            .record_once(
+                "daemon/node",
+                "daemon.diagnostic",
+                BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("code".into(), Value::String("test".into())),
+                    ("status".into(), Value::String("warning".into())),
+                    ("reason".into(), Value::String("test record".into())),
+                ]),
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
+            .await
+            .expect("the reconciler record did not wake the event waiter")
+            .expect("the event sender closed");
     }
 
     #[tokio::test]

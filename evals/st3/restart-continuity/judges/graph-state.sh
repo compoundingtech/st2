@@ -45,7 +45,7 @@ while read -r name kind state_name; do
   test "$bindings" -eq 1
 done <<'PRODUCTS'
 pre-restart vcs.commit published
-restart cold-restart injected
+restart custom.st3.cold-restart injected
 batch vcs.commit published
 worker-report custom.st3.message-receipt published
 verification custom.st3.message-receipt published

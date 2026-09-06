@@ -2945,6 +2945,11 @@ impl Store {
             blockers,
             warnings,
             subject_tokens: tokens,
+            plan_revisions: intent
+                .plans
+                .values()
+                .map(|plan| (plan.subject.clone(), plan.revision.clone()))
+                .collect(),
         })
     }
 
@@ -4022,6 +4027,7 @@ impl Store {
         &self,
         observer: &str,
         desired_revision: &str,
+        attempt: Option<&str>,
         resource: &str,
         cursor: Option<&str>,
         facts: &Value,
@@ -4031,6 +4037,7 @@ impl Store {
         let operation_hash = canonical_hash(&(
             observer,
             desired_revision,
+            attempt,
             cursor,
             facts,
             next_check_unix_ms,
@@ -4139,18 +4146,26 @@ impl Store {
             .map_err(internal)?
             .into_iter()
             .collect::<Vec<_>>();
+        let mut observer_fields = json!({
+            "status": "healthy",
+            "revision": desired_revision,
+            "cursor": cursor,
+            "next_check_unix_ms": next_check_unix_ms.to_string(),
+            "changed": baseline || !changed_fields.is_empty(),
+        });
+        if let Some(attempt) = attempt {
+            observer_fields
+                .as_object_mut()
+                .expect("observer fields are an object")
+                .insert("attempt".into(), Value::String(attempt.into()));
+        }
         append_claim_tx(
             &transaction,
             &self.origin,
             observer,
             "observer.observed",
             None,
-            &json!({"fields": {
-                "status": "healthy",
-                "revision": desired_revision,
-                "cursor": cursor,
-                "next_check_unix_ms": next_check_unix_ms.to_string(),
-            }}),
+            &json!({"fields": observer_fields}),
             &observer_predecessors,
             Some(&batch_id),
         )
@@ -7151,6 +7166,7 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
         ),
         ("ST_WORKSPACE".into(), run.workspace.clone()),
         ("ST_REQUESTER".into(), run.requester.clone()),
+        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
         (
             "ST_PARENT_STEP_RUN".into(),
             run.parent_step_run.clone().unwrap_or_default(),
@@ -7777,7 +7793,7 @@ fn cancel_plan_run_tx(
                 "message.sent",
                 None,
                 &json!({"fields": {
-                    "from": "st3/runtime",
+                    "from": "daemon/runtime",
                     "to": claimant,
                     "title": "Plan work cancelled",
                     "content": format!("Plan run plan-run/{run_id} cancelled step {subject}. Stop this work. Reason: {reason}"),
@@ -8199,6 +8215,39 @@ mod tests {
         assert_eq!(error.details["subject"], "exec/work");
         assert_eq!(error.details["expected_heads"], json!([]));
         assert_eq!(error.details["current_heads"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_plan_response_reports_the_server_normalized_revision() {
+        let source = r#"
+version 2
+subgraph {
+  plan "portable" state="ready" {
+    goal "Keep one worker available."
+    subgraph { agent "worker" { workspace "."; command "true" } }
+  }
+}
+"#;
+        let server_intent = crate::graph::parse_intent(source, "server-node").unwrap();
+        let client_intent = crate::graph::parse_intent(source, "local").unwrap();
+        let server_plan = server_intent.plans.values().next().unwrap();
+        let client_plan = client_intent.plans.values().next().unwrap();
+        assert_ne!(server_plan.revision, client_plan.revision);
+
+        let store = Store::open_memory("server-node").unwrap();
+        let response = store
+            .plan(
+                &server_intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response.plan_revisions["plan/portable"],
+            server_plan.revision
+        );
     }
 
     #[test]
@@ -10336,10 +10385,11 @@ subgraph {
         let source = r#"
 version 2
 subgraph {
+  agent "worker" { workspace "."; command "true" }
   plan "cancel" state="ready" {
     goal "Cancel this plan through the graph."
     completion { when "all-steps-exhausted" }
-    step "work" { agentless }
+    step "work" { assigned-to "agent/node.worker" }
     finally { step "cleanup" { agentless } }
   }
 }
@@ -10367,6 +10417,52 @@ subgraph {
                 inputs: BTreeMap::new(),
                 idempotency_key: "run-cancel-plan".into(),
             })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("worker-incarnation".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("cancel-worker-ready".into()),
+            })
+            .unwrap();
+        store
+            .set_step_state(
+                &run.steps
+                    .iter()
+                    .find(|step| step.step == "work")
+                    .unwrap()
+                    .subject,
+                "ready",
+                None,
+            )
+            .unwrap();
+        store
+            .work_action(
+                &run.steps
+                    .iter()
+                    .find(|step| step.step == "work")
+                    .unwrap()
+                    .subject,
+                "claim",
+                &WorkRequest {
+                    actor: Some("agent/node.worker".into()),
+                    incarnation: Some("worker-incarnation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-cancel-work".into(),
+                },
+            )
             .unwrap();
         let child_source = r#"
 version 2
@@ -10484,6 +10580,14 @@ subgraph {
                 .status,
             "pending"
         );
+        let cancellation_message = store
+            .messages(None, true)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.title.as_deref() == Some("Plan work cancelled"))
+            .expect("the claimant receives a cancellation message");
+        assert_eq!(cancellation_message.from, "daemon/runtime");
+        assert_eq!(cancellation_message.to, "agent/node.worker");
     }
 
     #[test]
@@ -10562,6 +10666,7 @@ subgraph {
                 .record_resource_observation(
                     "observer/github/acme/demo/pull/1",
                     "stale-revision",
+                    None,
                     "resource/github/acme/demo/pull/1",
                     Some("stale-cursor"),
                     &json!({"head": "stale"}),
@@ -10576,6 +10681,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
                 &json!({
@@ -10610,6 +10716,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-one"),
                 &json!({
@@ -10627,6 +10734,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
                 &json!({
@@ -10644,6 +10752,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-two"),
                 &json!({
@@ -10679,6 +10788,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-after-stop"),
                 &json!({
@@ -10696,6 +10806,7 @@ subgraph {
             .record_resource_observation(
                 "observer/github/acme/demo/pull/1",
                 &observer_revision,
+                None,
                 "resource/github/acme/demo/pull/1",
                 Some("cursor-three"),
                 &json!({

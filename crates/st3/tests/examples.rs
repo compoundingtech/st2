@@ -160,13 +160,14 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
 }
 
 #[test]
-fn st3_eval_inventory_has_twelve_model_free_and_twelve_model_backed_evals() {
+fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let model_free = [
         "context-resource-continuity",
         "crash-escalation",
+        "local-file-refresh",
         "network-isolation",
         "network-smoke",
         "plan-inputs",

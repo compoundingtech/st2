@@ -15,5 +15,5 @@ pub mod resource;
 pub mod service;
 pub mod store;
 
-pub use graph::parse_intent;
+pub use graph::{parse_intent, validate_plan_runtimes};
 pub use model::{NormalizedIntent, St3Error};

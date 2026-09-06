@@ -45,7 +45,7 @@ jq -e \
   --arg new "$new_incarnation" \
   --arg duplicate "$duplicate" \
   '.status.subjects[0].actual | (.fields // .)
-    | .kind == "cold-restart"
+    | .kind == "custom.st3.cold-restart"
     and .state == "injected"
     and .old_incarnation == $old
     and .new_incarnation == $new

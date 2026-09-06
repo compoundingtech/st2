@@ -26,10 +26,11 @@ const VARIABLES: &[&str] = &[
     "ST_PARENT_STEP_RUN",
     "ST_GATE",
     "ST_AGENT",
+    "PATH",
 ];
 
 pub(crate) fn is_reserved_context_name(name: &str) -> bool {
-    VARIABLES.contains(&name)
+    (VARIABLES.contains(&name) && name != "PATH") || name == "ST3_SUBJECT"
 }
 
 pub(crate) fn validate_plan_id(value: &str) -> Result<(), St3Error> {

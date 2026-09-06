@@ -121,6 +121,8 @@ pub struct MemberSpec {
     pub host: String,
     pub runtime_id: String,
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_create: bool,
     pub cwd: String,
     pub terminal: bool,
     pub launch: LaunchSpec,
@@ -523,6 +525,7 @@ pub struct PlanResponse {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
+    pub plan_revisions: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -755,6 +758,34 @@ pub struct SubjectStatus {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeResetRequest {
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeResetView {
+    pub subject: String,
+    pub desired_token: String,
+    pub incarnation_id: String,
+    pub reset_claim: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceRefreshRequest {
+    pub timeout_ms: u64,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceRefreshView {
+    pub resource: String,
+    pub observers: Vec<String>,
+    pub changed: bool,
+    pub completed_at_index: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

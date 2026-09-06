@@ -36,14 +36,17 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Planning Mode | Not supported | `st3/planning-mode` |
 | Run Generation Revision | Not supported | `st3/run-generation-revision` |
 | Plan Inputs | Not supported | `st3/plan-inputs` |
+| Local File Refresh | Not supported | `st3/local-file-refresh` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
 The Ghost bug, Signal rename, Fork in the road, Poisoned pull request, Test Writing, and Weird Git Setup pairs use Codex.
 
-The ten remaining pairs are model-free. Run Generation Revision and Plan Inputs are also model-free.
+The ten remaining pairs are model-free.
 
-The st3 corpus has 24 evals. Twelve are model-free, and twelve use at least one model.
+Run Generation Revision, Plan Inputs, and Local File Refresh are also model-free.
+
+The st3 corpus has 25 evals. Thirteen are model-free, and twelve use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -79,7 +82,7 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 
 The paired and st3-only corpus has 11 Claude seats and 34 Codex seats. It also has three Codex LLM judges.
 
-The twelve model-free st3 evals add no model seats and no LLM judges.
+The thirteen model-free st3 evals add no model seats and no LLM judges.
 
 All Claude seats use `claude-sonnet-5`.
 

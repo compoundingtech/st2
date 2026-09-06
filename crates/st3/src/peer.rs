@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::config::PeerConfig;
 use crate::model::{ApiResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse};
@@ -13,7 +13,7 @@ pub fn start(
     node: String,
     peers: Vec<PeerConfig>,
     notify: Arc<Notify>,
-    event_notify: Arc<Notify>,
+    event_notify: watch::Sender<u64>,
 ) {
     for peer in peers {
         let store = store.clone();
@@ -52,7 +52,9 @@ pub fn start(
                         }
                         if changed || recovered {
                             notify.notify_one();
-                            event_notify.notify_waiters();
+                            event_notify.send_modify(|generation| {
+                                *generation = generation.saturating_add(1)
+                            });
                         }
                         backoff = Duration::from_secs(1);
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -81,7 +83,9 @@ pub fn start(
                             });
                             transport_status = Some("down");
                             notify.notify_one();
-                            event_notify.notify_waiters();
+                            event_notify.send_modify(|generation| {
+                                *generation = generation.saturating_add(1)
+                            });
                         }
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -132,4 +136,118 @@ async fn exchange(store: &Store, node: &str, peer: &PeerConfig) -> Result<bool> 
             .await?;
     }
     Ok(pulled || pushed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{AppState, router, serve_tcp};
+    use crate::model::ClaimInput;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn free_loopback_address() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    fn state(store: Arc<Store>, node: &str, peer: &str, root: &std::path::Path) -> AppState {
+        AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.join(node),
+            pty_root: root.join(format!("{node}-pty")),
+            trusted_peers: BTreeSet::from([peer.into()]),
+        }
+    }
+
+    async fn wait_ready(address: &str) {
+        let url = format!("http://{address}/v1/health");
+        for _ in 0..100 {
+            if reqwest::get(&url).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the peer test server at {address} did not start");
+    }
+
+    #[tokio::test]
+    async fn two_loopback_daemons_replicate_claims_in_both_directions() {
+        let root = tempfile::tempdir().unwrap();
+        let store_a = Arc::new(Store::open(&root.path().join("a.sqlite3"), "node-a").unwrap());
+        let store_b = Arc::new(Store::open(&root.path().join("b.sqlite3"), "node-b").unwrap());
+        let address_a = free_loopback_address();
+        let address_b = free_loopback_address();
+        let state_a = router(state(store_a.clone(), "node-a", "node-b", root.path()));
+        let state_b = router(state(store_b.clone(), "node-b", "node-a", root.path()));
+        let server_address_a = address_a.clone();
+        let server_address_b = address_b.clone();
+        let server_a = tokio::spawn(async move { serve_tcp(&server_address_a, state_a).await });
+        let server_b = tokio::spawn(async move { serve_tcp(&server_address_b, state_b).await });
+        wait_ready(&address_a).await;
+        wait_ready(&address_b).await;
+
+        store_a
+            .append_claim(&ClaimInput {
+                subject: "custom/test/from-a".into(),
+                kind: "custom.test.observed".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("from-a".into()),
+            })
+            .unwrap();
+        exchange(
+            &store_a,
+            "node-a",
+            &PeerConfig {
+                name: "node-b".into(),
+                url: format!("http://{address_b}"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store_b
+                .claims_for("custom/test/from-a", None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store_b
+            .append_claim(&ClaimInput {
+                subject: "custom/test/from-b".into(),
+                kind: "custom.test.observed".into(),
+                actor: Some("person/test".into()),
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("from-b".into()),
+            })
+            .unwrap();
+        exchange(
+            &store_b,
+            "node-b",
+            &PeerConfig {
+                name: "node-a".into(),
+                url: format!("http://{address_a}"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store_a
+                .claims_for("custom/test/from-b", None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        server_a.abort();
+        server_b.abort();
+    }
 }

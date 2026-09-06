@@ -28,7 +28,10 @@ const ST3_CONTEXT_VARIABLES: &[&str] = &[
     "ST_PARENT_STEP_RUN",
     "ST_GATE",
     "ST_AGENT",
+    "ST3_SUBJECT",
 ];
+const EXPERIMENTAL_WARNING: &str =
+    "Experimental output. Review every generated KDL file before you run it.";
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +74,8 @@ struct TreeArgs {
 #[derive(Debug, Serialize)]
 struct Report {
     schema: &'static str,
+    experimental: bool,
+    review_required: bool,
     mode: String,
     input: String,
     output: String,
@@ -97,6 +102,7 @@ struct DocumentReport {
 }
 
 fn main() -> Result<()> {
+    eprintln!("st3-migrate: {EXPERIMENTAL_WARNING}");
     match Cli::parse().command {
         Command::File(args) => migrate_file(args),
         Command::Catalog(args) => migrate_catalog(args),
@@ -110,23 +116,33 @@ fn migrate_file(args: FileArgs) -> Result<()> {
         "the output must differ from the input"
     );
     let source = fs::read_to_string(&args.input)?;
+    let mut warnings = vec![EXPERIMENTAL_WARNING.into()];
+    warnings.extend(legacy_resource_warnings(&source, &args.input)?);
     let transformed = transform_declaration(&source, None)?;
     let host = "local";
     let normalized = st3::parse_intent(&transformed, host)?;
+    let runtime_subjects = st3::validate_plan_runtimes(&normalized, host)?;
     write_file(&args.output, transformed.as_bytes())?;
     let report = Report {
         schema: "st3-migrate-report.v1",
+        experimental: true,
+        review_required: true,
         mode: "file".into(),
         input: args.input.display().to_string(),
         output: args.output.display().to_string(),
         files: vec![FileReport {
             input: args.input.display().to_string(),
             output: args.output.display().to_string(),
-            subjects: normalized.subjects.keys().cloned().collect(),
+            subjects: normalized
+                .subjects
+                .keys()
+                .cloned()
+                .chain(runtime_subjects)
+                .collect(),
             source_hash: normalized.source_hash,
         }],
         documents: Vec::new(),
-        warnings: Vec::new(),
+        warnings,
     };
     write_report(&args.report, &report)
 }
@@ -168,6 +184,9 @@ fn migrate_catalog(args: TreeArgs) -> Result<()> {
         let relative = input.strip_prefix(&args.input)?;
         let output = args.output.join(relative);
         let source = fs::read_to_string(&input)?;
+        report
+            .warnings
+            .extend(legacy_resource_warnings(&source, &input)?);
         let running = states.get(&input).copied();
         let mut transformed = transform_declaration(&source, running)?;
         let documents =
@@ -175,11 +194,18 @@ fn migrate_catalog(args: TreeArgs) -> Result<()> {
         report.documents.extend(documents);
         let normalized = st3::parse_intent(&transformed, &args.host)
             .with_context(|| format!("validate transformed {}", input.display()))?;
+        let runtime_subjects = st3::validate_plan_runtimes(&normalized, &args.host)
+            .with_context(|| format!("validate deferred runtimes in {}", input.display()))?;
         write_file(&output, transformed.as_bytes())?;
         report.files.push(FileReport {
             input: input.display().to_string(),
             output: output.display().to_string(),
-            subjects: normalized.subjects.keys().cloned().collect(),
+            subjects: normalized
+                .subjects
+                .keys()
+                .cloned()
+                .chain(runtime_subjects)
+                .collect(),
             source_hash: normalized.source_hash,
         });
     }
@@ -217,12 +243,19 @@ fn migrate_evals(args: TreeArgs) -> Result<()> {
         report.documents.extend(documents);
         let normalized = st3::parse_intent(&transformed, &args.host)
             .with_context(|| format!("validate transformed {}", input.display()))?;
+        let runtime_subjects = st3::validate_plan_runtimes(&normalized, &args.host)
+            .with_context(|| format!("validate deferred runtimes in {}", input.display()))?;
         let output = output_cell.join("eval.kdl");
         write_file(&output, transformed.as_bytes())?;
         report.files.push(FileReport {
             input: input.display().to_string(),
             output: output.display().to_string(),
-            subjects: normalized.subjects.keys().cloned().collect(),
+            subjects: normalized
+                .subjects
+                .keys()
+                .cloned()
+                .chain(runtime_subjects)
+                .collect(),
             source_hash: normalized.source_hash,
         });
     }
@@ -279,16 +312,36 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
         };
         let mut agent = node.clone();
         let body = agent.children_mut().get_or_insert_with(KdlDocument::new);
+        let needs_ding = body
+            .nodes()
+            .iter()
+            .any(|child| child.name().value() == "ding");
         body.nodes_mut().retain(|child| {
             !matches!(
                 child.name().value(),
-                "retired" | "desired-state" | "suspended"
+                "retired"
+                    | "desired-state"
+                    | "suspended"
+                    | "role"
+                    | "type"
+                    | "supervisor"
+                    | "keep"
+                    | "lifecycle"
+                    | "deliver"
+                    | "ding"
+                    | "meta"
+                    | "resource"
+                    | "stream"
             ) && !(child.name().value() == "harness" && child.children().is_none())
         });
+        if needs_ding {
+            body.nodes_mut().push(ding_exec_node());
+        }
         rewrite_harness_nodes(body);
         remove_legacy_context_hooks(body);
         remove_legacy_lifecycle_metadata(body);
         remove_reserved_context_envs(body);
+        rewrite_path_variables(body);
         let has_restart_type = body.nodes().iter().any(|child| {
             child.name().value() == "restart"
                 && child.children().is_none()
@@ -339,7 +392,7 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
 fn rewrite_harness_nodes(document: &mut KdlDocument) {
     for node in document.nodes_mut() {
         let provider = match node.name().value() {
-            "claude" | "codex" | "pi" | "opencode" if node.children().is_some() => {
+            "claude" | "codex" | "pi" | "opencode" | "omp" if node.children().is_some() => {
                 Some(node.name().value().to_owned())
             }
             _ => None,
@@ -349,6 +402,107 @@ fn rewrite_harness_nodes(document: &mut KdlDocument) {
             node.entries_mut().insert(0, KdlEntry::new(provider));
         }
     }
+}
+
+fn ding_exec_node() -> KdlNode {
+    let mut exec = KdlNode::new("exec");
+    exec.entries_mut().push(KdlEntry::new("ding"));
+    let mut body = KdlDocument::new();
+    let mut argv = KdlNode::new("argv");
+    for value in ["st3", "driver", "ding"] {
+        argv.entries_mut().push(KdlEntry::new(value));
+    }
+    body.nodes_mut().push(argv);
+    exec.set_children(body);
+    exec
+}
+
+fn rewrite_path_variables(document: &mut KdlDocument) {
+    for node in document.nodes_mut() {
+        for entry in node.entries_mut() {
+            if let KdlValue::String(value) = entry.value_mut() {
+                *value = rewrite_path_variable(value);
+            }
+        }
+        if let Some(children) = node.children_mut() {
+            rewrite_path_variables(children);
+        }
+    }
+}
+
+fn rewrite_path_variable(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(index) = remaining.find("$PATH") {
+        output.push_str(&remaining[..index]);
+        let suffix = &remaining[index + "$PATH".len()..];
+        if suffix
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            output.push_str("$PATH");
+        } else {
+            output.push_str("${PATH}");
+        }
+        remaining = suffix;
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn legacy_resource_warnings(source: &str, input: &Path) -> Result<Vec<String>> {
+    fn visit(
+        document: &KdlDocument,
+        identity: Option<&str>,
+        input: &Path,
+        warnings: &mut Vec<String>,
+    ) {
+        for node in document.nodes() {
+            let next_identity = if node.name().value() == "agent" {
+                node.children()
+                    .and_then(|body| body.get("identity"))
+                    .and_then(|identity| identity.get(0))
+                    .and_then(|value| value.as_string())
+                    .or_else(|| node.get(0).and_then(|value| value.as_string()))
+                    .or(identity)
+            } else {
+                identity
+            };
+            if node.name().value() == "resource" {
+                let name = node
+                    .get(0)
+                    .and_then(|value| value.as_string())
+                    .unwrap_or("resource");
+                let uri = node
+                    .get("uri")
+                    .and_then(|value| value.as_string())
+                    .unwrap_or("");
+                if let Some(path) = uri.strip_prefix("file://") {
+                    let owner = next_identity.unwrap_or("agent").replace('/', "-");
+                    warnings.push(format!(
+                        "{}: import legacy resource `{name}` as a document after review: st3 doc put {} --as {}",
+                        input.display(),
+                        shell(path),
+                        shell(&format!("doc/migration/{owner}/{name}")),
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "{}: legacy resource `{name}` was not migrated; declare a typed st3 resource after review",
+                        input.display()
+                    ));
+                }
+            }
+            if let Some(children) = node.children() {
+                visit(children, next_identity, input, warnings);
+            }
+        }
+    }
+
+    let document: KdlDocument = source.parse()?;
+    let mut warnings = Vec::new();
+    visit(&document, None, input, &mut warnings);
+    Ok(warnings)
 }
 
 fn remove_legacy_context_hooks(document: &mut KdlDocument) {
@@ -1305,12 +1459,14 @@ fn validate_tree_args(args: &TreeArgs) -> Result<()> {
 fn new_report(mode: &str, args: &TreeArgs) -> Report {
     Report {
         schema: "st3-migrate-report.v1",
+        experimental: true,
+        review_required: true,
         mode: mode.into(),
         input: args.input.display().to_string(),
         output: args.output.display().to_string(),
         files: Vec::new(),
         documents: Vec::new(),
-        warnings: Vec::new(),
+        warnings: vec![EXPERIMENTAL_WARNING.into()],
     }
 }
 
@@ -1425,6 +1581,102 @@ agent "worker" {
         assert!(graph.contains("PATH \"/bin\""));
         assert!(!translated.contains("ST_AGENT"));
         assert!(!translated.contains("lifetime"));
+    }
+
+    #[test]
+    fn catalog_translation_removes_legacy_metadata_and_builds_an_explicit_ding_exec() {
+        let translated = transform_declaration(
+            r#"version 1
+agent "worker" {
+  identity "host-a.worker"
+  workspace "/work"
+  supervisor "host-a.root"
+  role "worker"
+  meta { note "legacy" }
+  resource "proof" uri="file:///tmp/proof.txt" reason="Legacy proof."
+  ding
+  env { PATH "/opt/tools:$PATH" }
+  omp { prompt "Do the work." }
+}"#,
+            Some(true),
+        )
+        .unwrap();
+
+        assert!(!translated.contains("supervisor"));
+        assert!(!translated.contains("role worker"));
+        assert!(!translated.contains("meta {"));
+        assert!(!translated.contains("resource proof"));
+        assert!(!translated.contains("$PATH"));
+        assert!(translated.contains("${PATH}"));
+        assert!(translated.contains("harness omp"));
+        assert!(translated.contains("exec ding"));
+        assert!(translated.contains("argv st3 driver ding"));
+        let intent = st3::parse_intent(&translated, "local").unwrap();
+        let runtimes = st3::validate_plan_runtimes(&intent, "local").unwrap();
+        assert!(runtimes.contains("agent/migration-proof/host-a.worker"));
+        assert!(runtimes.contains("exec/migration-proof/host-a.worker/ding"));
+    }
+
+    #[test]
+    fn path_rewrite_changes_only_the_path_variable() {
+        assert_eq!(
+            rewrite_path_variable("/opt/tools:$PATH:$PATHOLOGY:${PATH}"),
+            "/opt/tools:${PATH}:$PATHOLOGY:${PATH}"
+        );
+    }
+
+    #[test]
+    fn catalog_translation_warns_with_a_document_import_command() {
+        let warnings = legacy_resource_warnings(
+            r#"agent "worker" {
+              identity "host-a.worker"
+              resource "proof" uri="file:///tmp/proof file.txt" reason="Legacy proof."
+            }"#,
+            Path::new("agent.kdl"),
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("st3 doc put '/tmp/proof file.txt'"));
+        assert!(warnings[0].contains("'doc/migration/host-a.worker/proof'"));
+    }
+
+    #[test]
+    fn file_migration_reports_legacy_resource_import_work() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("agent.kdl");
+        let output = root.path().join("agent.st3.kdl");
+        let report = root.path().join("report.json");
+        fs::write(
+            &input,
+            r#"agent "worker" {
+  identity "host-a.worker"
+  workspace "/work"
+  command "true"
+  resource "proof" uri="file:///tmp/proof.txt" reason="Legacy proof."
+}"#,
+        )
+        .unwrap();
+
+        migrate_file(FileArgs {
+            input,
+            output,
+            report: report.clone(),
+        })
+        .unwrap();
+
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert!(report["experimental"].as_bool().unwrap());
+        assert!(report["review_required"].as_bool().unwrap());
+        assert!(
+            report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap()
+                    .contains("st3 doc put '/tmp/proof.txt'"))
+        );
     }
 
     #[test]

@@ -8,9 +8,11 @@ An agent or a person can request a message when selected facts about an external
 
 The request is durable graph state. A supervised observer checks the external resource without using an agent turn.
 
-The first provider for this design observes a GitHub pull request. The graph model does not depend on GitHub.
+The first provider observes a GitHub pull request. The second provider observes one local file.
 
 The GitHub provider supports `head`, `state`, `review`, and `checks`.
+
+The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
 ## Agent command
 
@@ -74,6 +76,41 @@ A provider locator is an opaque provider value. st3 does not assign meaning to i
 
 The GitHub provider reads `GH_TOKEN` first and `GITHUB_TOKEN` second. It uses public API access when both values are absent.
 
+## Observation without delivery
+
+An observer does not need a subscription. This form records one resource without sending a message:
+
+```kdl
+resource "workspace/config" {
+  kind "filesystem.file"
+}
+
+plan "observe-config" state="ready" {
+  goal "Keep the configuration metadata current."
+  subgraph {
+    observer "config" {
+      resource "resource/workspace/config"
+      provider "local.file"
+      locator "/work/project/config.toml"
+      field "status"
+      field "content_hash"
+      field "size"
+      field "mode"
+    }
+  }
+}
+```
+
+The plan run owns the observer. Plan cancellation stops the observer.
+
+Use this command to request an immediate observation and wait for that exact attempt:
+
+```sh
+st3 resource refresh resource/workspace/config --timeout 30s
+```
+
+The command returns `changed=false` when the provider confirms the same facts. That success adds no resource claim.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.
@@ -88,7 +125,7 @@ Conditional requests use provider cursors such as an ETag. Cursors are local pro
 
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
 
-One observer serves all subscriptions for the same provider locator. Its field set is the union of their selected fields.
+An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
 
 st3 does not fetch once for each target. A subscription update can expand or reduce the observer field set.
 
@@ -99,6 +136,8 @@ The first successful observation establishes the baseline. It sends no update me
 A later observed field change creates one `resource.observed` claim. An unchanged observation creates no resource claim.
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
+
+A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same plan run.
 
 A daemon restart can repeat an external request. It cannot create a duplicate observation or message.
 
@@ -129,4 +168,6 @@ A later version can add an `until` predicate or one deadline. This option is not
 - Two subscriptions share one observer and receive separate messages.
 - A missing target stays pending without blocking observation.
 - A provider failure changes observer health without changing the last good resource facts.
-- A second provider passes the same contract without a GitHub-specific graph field.
+- The local file provider reports metadata and never reports file content.
+- A direct observer without a subscription records observations and sends no message.
+- A manual refresh waits for its exact attempt and reports an unchanged success without a new resource claim.

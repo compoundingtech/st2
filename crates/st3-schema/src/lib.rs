@@ -748,6 +748,40 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
             ],
         ),
     );
+    resources.insert(
+        "filesystem.file".into(),
+        resource(
+            "filesystem.file",
+            "A file observed through an explicit local path.",
+            &[
+                ("status", enumeration(&["ready", "missing", "unreadable"])),
+                ("path", immutable_string()),
+                ("content_hash", string()),
+                ("size", integer()),
+                ("mode", integer()),
+                ("reason", string()),
+            ],
+        ),
+    );
+    resources.insert(
+        "harness.session-file".into(),
+        resource(
+            "harness.session-file",
+            "A harness session file that can outlive one runtime incarnation.",
+            &[
+                ("harness", immutable_string()),
+                ("path", string()),
+                ("session_id", string()),
+                ("agent", reference()),
+                ("incarnation_id", string()),
+                (
+                    "status",
+                    enumeration(&["active", "inactive", "missing", "unknown"]),
+                ),
+                ("modified_at", string()),
+            ],
+        ),
+    );
     resources
 }
 
@@ -1071,6 +1105,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "render.applied",
+            &["agent", "exec", "pty"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("runtimes"),
+            false,
+            &[],
+        ),
+        (
             "runtime.restart-window-reset",
             &["agent", "exec", "pty"],
             WritePolicy::SystemOnly,
@@ -1155,7 +1198,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             "terminal.input.result",
             &["agent", "pty"],
             WritePolicy::SystemOnly,
-            Cardinality::Once,
+            Cardinality::Append,
             Some("terminal-control"),
             true,
             &[],
@@ -1499,6 +1542,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "observer.observed" => &[
             ("status", string()),
             ("revision", string()),
+            ("attempt", string()),
+            ("changed", boolean()),
             ("cursor", string()),
             ("next_check_unix_ms", string()),
             ("resource", reference()),
@@ -1514,6 +1559,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ),
             ("reason", string()),
             ("revision", string()),
+            ("attempt", string()),
             ("next_check_unix_ms", string()),
         ],
         "subscription.state" => &[
@@ -1580,9 +1626,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("host", string()),
             ("shutdown_timeout_ms", integer()),
         ],
-        "runtime.restart-window-reset" => {
-            &[("desired_token", string()), ("incarnation_id", string())]
-        }
+        "render.applied" => &[("writes", array())],
+        "runtime.restart-window-reset" => &[
+            ("desired_token", string()),
+            ("incarnation_id", required_string()),
+            ("reason", required_string()),
+        ],
         "runtime.reconcile-decision" => &[
             ("decision", string()),
             ("reachability", string()),
@@ -1939,6 +1988,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "ci.run",
+                "filesystem.file",
+                "harness.session-file",
                 "human.review",
                 "vcs.commit",
                 "vcs.pull-request",
@@ -1984,6 +2035,7 @@ mod tests {
                 "planning-session.previewed",
                 "planning-session.revision-requested",
                 "planning-session.started",
+                "render.applied",
                 "resource.observed",
                 "revision-proposal.applied",
                 "revision-proposal.approved",
@@ -2172,6 +2224,24 @@ mod tests {
                 .unwrap_err()
                 .code,
             "claim-write-forbidden"
+        );
+    }
+
+    #[test]
+    fn terminal_input_accepts_more_than_one_request_and_result() {
+        assert_eq!(
+            registry()
+                .claim("terminal.input.requested")
+                .unwrap()
+                .cardinality,
+            Cardinality::Append
+        );
+        assert_eq!(
+            registry()
+                .claim("terminal.input.result")
+                .unwrap()
+                .cardinality,
+            Cardinality::Append
         );
     }
 

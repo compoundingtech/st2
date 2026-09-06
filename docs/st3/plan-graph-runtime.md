@@ -557,15 +557,55 @@ st3 supplies these exact context names:
 | `ST_ASSIGNEE` | Fixed `assigned-to` agent, or an empty value for pools and agentless work. |
 | `ST_PARENT_STEP_RUN` | Parent step-run subject, or an empty value. |
 | `ST_GATE` | Gate name in a running gate context. |
-| `ST_AGENT` | Runtime agent or member identity. |
+| `ST3_SUBJECT` | Full subject of the current runtime member. |
+| `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
 
-The values are available for `${NAME}` KDL interpolation when the current plan, step, member, or gate context defines them. Step members and running gates receive the same applicable values as environment variables.
+The plan and step values are available for `${NAME}` KDL interpolation when the current context defines them. Step members and running gates receive those values as environment variables.
+
+`ST3_SUBJECT` and `ST_AGENT` are runtime-only values because their values depend on the materialized member.
 
 For example, use `${ST_PLAN_RUN}` directly. Do not write a manual mapping such as `env { PLAN_RUN "${ST_PLAN_RUN}" }` only to rename the built-in value.
 
 The exact built-in names are reserved in authored `env` maps. st3 rejects an attempt to replace them. Other names, including other `ST_*` names, remain available to applications.
 
+`${PATH}` is also available for KDL interpolation. It uses the deterministic daemon service path.
+
+An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested task receives its task subject in `ST3_SUBJECT` and its parent agent in `ST_AGENT`.
+
+An agentless `exec` or `pty` receives `ST3_SUBJECT` and no `ST_AGENT`.
+
 An unknown variable or a variable that is not available in the current phase is an error.
+
+## Workspace existence
+
+st3 requires every member workspace to exist before the member starts.
+
+Use an explicit create property when the plan owns creation of that directory:
+
+```kdl
+workspace "${ST_WORKSPACE}/generated" create=#true
+```
+
+The default refusal prevents a spelling error from creating an unintended directory.
+
+## Message delivery for generic harnesses
+
+A harness driver can implement native message delivery. A generic terminal harness can use an explicit DING child:
+
+```kdl
+agent "worker" {
+  workspace "${ST_WORKSPACE}/worker"
+  command "worker-harness"
+  exec "ding" {
+    argv "st3" "driver" "ding"
+    restart "on-failure"
+  }
+}
+```
+
+The nested exec receives the agent subject through `ST_AGENT`. It checks the local st3 API once per second and sends an incarnation-fenced terminal line.
+
+The plan run owns and cleans up both runtimes. No implicit `ding` field exists in st3 KDL.
 
 ## Agent grouping
 

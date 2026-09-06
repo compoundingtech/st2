@@ -13,7 +13,7 @@ direct_tag="plan-run:$ST_PLAN_RUN"
 injector="exec/$ST_PLAN_RUN/eval/restart-continuity/inject"
 
 assignments="$(jq --arg tag "$work_tag" \
-  '[.[] | select(.from == "st3/runtime" and (.tags | index($tag)))]' <<<"$dev_messages")"
+  '[.[] | select(.from == "daemon/runtime" and (.tags | index($tag)))]' <<<"$dev_messages")"
 duplicates="$(jq --arg tag "$direct_tag" --arg injector "$injector" \
   '[.[] | select(
     .from == $injector

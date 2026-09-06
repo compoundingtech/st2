@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -80,6 +81,15 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        if let Some(address) = &self.peer_listen {
+            let address = address
+                .parse::<SocketAddr>()
+                .with_context(|| format!("parse peer listener `{address}`"))?;
+            anyhow::ensure!(
+                address.ip().is_loopback(),
+                "the peer listener must bind to a loopback address"
+            );
+        }
         anyhow::ensure!(
             self.peers
                 .iter()
@@ -133,5 +143,25 @@ mod tests {
         assert!(config.peer_listen.is_none());
         assert!(config.peers.is_empty());
         assert!(config.socket.ends_with("st3.sock"));
+    }
+
+    #[test]
+    fn a_peer_listener_must_use_a_loopback_address() {
+        let mut config = Config {
+            peer_listen: Some("0.0.0.0:31313".into()),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
+        );
+
+        config.peer_listen = Some("127.0.0.1:31313".into());
+        config.validate().unwrap();
+        config.peer_listen = Some("[::1]:31313".into());
+        config.validate().unwrap();
     }
 }

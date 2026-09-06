@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tower::ServiceExt as _;
 
 use crate::archive::hydrate_eval;
@@ -48,7 +48,7 @@ use crate::store::Store;
 pub struct AppState {
     pub store: Arc<Store>,
     pub notify: Arc<Notify>,
-    pub event_notify: Arc<Notify>,
+    pub event_notify: watch::Sender<u64>,
     pub node: String,
     pub state_dir: std::path::PathBuf,
     pub pty_root: std::path::PathBuf,
@@ -57,7 +57,9 @@ pub struct AppState {
 
 fn signal_changed(state: &AppState) {
     state.notify.notify_one();
-    state.event_notify.notify_waiters();
+    state
+        .event_notify
+        .send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
 #[derive(Debug)]
@@ -166,6 +168,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/resource-watches/{*subscription}",
             post(unwatch_resource),
         )
+        .route("/v1/resources/refresh/{*resource}", post(refresh_resource))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/claims/by-id/{id}", get(get_claim))
@@ -175,6 +178,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/close/{*subject}", post(close_message))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/status", get(status))
+        .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
         .route("/v1/claude", post(quick_claude))
@@ -341,6 +345,11 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
 }
 
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
+    let address = address.parse::<std::net::SocketAddr>()?;
+    anyhow::ensure!(
+        address.ip().is_loopback(),
+        "the peer listener must bind to a loopback address"
+    );
     let listener = TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -1661,6 +1670,31 @@ async fn watch_resource(
                 "vcs.pull-request",
             )
         }
+        "local.file" => {
+            let path = std::path::Path::new(&request.locator);
+            if !path.is_absolute() {
+                return Err(ApiError::bad(St3Error::new(
+                    "invalid-resource-locator",
+                    "a local file locator must be an absolute path",
+                )));
+            }
+            for field in &request.fields {
+                if !matches!(
+                    field.as_str(),
+                    "status" | "path" | "content_hash" | "size" | "mode" | "reason"
+                ) {
+                    return Err(ApiError::bad(St3Error::new(
+                        "invalid-subscription-field",
+                        format!("local file provider does not support field `{field}`"),
+                    )));
+                }
+            }
+            let hash = hex::encode(Sha256::digest(request.locator.as_bytes()));
+            (
+                format!("local-file/{}/{}", state.node, &hash[..24]),
+                "filesystem.file",
+            )
+        }
         provider => {
             return Err(ApiError::bad(St3Error::new(
                 "unsupported-capability",
@@ -1789,6 +1823,168 @@ async fn unwatch_resource(
         "status": "stopped",
         "actor": request.actor,
     })))
+}
+
+async fn refresh_resource(
+    State(state): State<AppState>,
+    AxumPath(resource): AxumPath<String>,
+    Json(request): Json<crate::model::ResourceRefreshRequest>,
+) -> Result<Json<crate::model::ResourceRefreshView>, ApiError> {
+    if request.timeout_ms == 0 || request.timeout_ms > 3_600_000 {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-refresh-timeout",
+            "a resource refresh timeout must be between 1 ms and 1 hour",
+        )));
+    }
+    let resource = if resource.starts_with("resource/") {
+        resource
+    } else {
+        format!("resource/{resource}")
+    };
+    let observers = state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .filter(|subject| subject.kind == "observer")
+        .filter_map(|subject| {
+            crate::graph::observer_spec(&subject.desired)
+                .filter(|spec| !spec.stopped && spec.resource == resource)
+                .map(|spec| (subject.subject, spec))
+        })
+        .collect::<Vec<_>>();
+    if observers.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "resource-not-observed",
+            format!("resource `{resource}` has no active observer"),
+        )));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let attempts = observers
+        .iter()
+        .map(|(observer, _)| {
+            let stable = format!(
+                "st3.resource-refresh.v1\0{}\0{observer}",
+                request.idempotency_key
+            );
+            (observer.clone(), hex::encode(Sha256::digest(stable)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(completed) = completed_resource_refresh(&state.store, &resource, &attempts)? {
+        return Ok(Json(completed));
+    }
+    for (observer, _) in &observers {
+        let revision = state
+            .store
+            .selected_desired_revision(observer)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal(format!("observer `{observer}` has no revision")))?;
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: observer.clone(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("healthy".into())),
+                    ("reason".into(), Value::String("manual refresh".into())),
+                    ("revision".into(), Value::String(revision)),
+                    ("attempt".into(), Value::String(attempts[observer].clone())),
+                    ("next_check_unix_ms".into(), Value::String(now.to_string())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{}:{observer}", request.idempotency_key)),
+            })
+            .map_err(ApiError::bad)?;
+    }
+    signal_changed(&state);
+    let wait = async {
+        let mut event_changed = state.event_notify.subscribe();
+        loop {
+            if let Some(completed) = completed_resource_refresh(&state.store, &resource, &attempts)?
+            {
+                return Ok(completed);
+            }
+            event_changed.changed().await.map_err(ApiError::internal)?;
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(request.timeout_ms), wait)
+        .await
+        .map_err(|_| {
+            ApiError::bad(St3Error::new(
+                "resource-refresh-timeout",
+                format!("resource `{resource}` did not finish its refresh before the timeout"),
+            ))
+        })?
+        .map(Json)
+}
+
+fn completed_resource_refresh(
+    store: &Store,
+    resource: &str,
+    attempts: &BTreeMap<String, String>,
+) -> Result<Option<crate::model::ResourceRefreshView>, ApiError> {
+    let mut changed = false;
+    let mut completed_at_index = 0;
+    for (observer, attempt) in attempts {
+        let completed = store
+            .claims_for(observer, Some("observer.observed"))
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/attempt")
+                    .and_then(Value::as_str)
+                    == Some(attempt.as_str())
+            });
+        if let Some(completed) = completed {
+            changed |= completed
+                .body
+                .pointer("/fields/changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            completed_at_index = completed_at_index.max(completed.store_index);
+            continue;
+        }
+        let failed = store
+            .claims_for(observer, Some("observer.state"))
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/attempt")
+                    .and_then(Value::as_str)
+                    == Some(attempt.as_str())
+                    && claim.body.pointer("/fields/state").and_then(Value::as_str)
+                        == Some("unreachable")
+            });
+        if let Some(failed) = failed {
+            let reason = failed
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the observer failed");
+            return Err(ApiError::bad(St3Error::new(
+                "resource-refresh-failed",
+                format!("observer `{observer}` could not refresh `{resource}`: {reason}"),
+            )));
+        }
+        return Ok(None);
+    }
+    Ok(Some(crate::model::ResourceRefreshView {
+        resource: resource.into(),
+        observers: attempts.keys().cloned().collect(),
+        changed,
+        completed_at_index,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2275,6 +2471,81 @@ async fn status(
         .map_err(ApiError::internal)
 }
 
+async fn reset_runtime(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<crate::model::RuntimeResetRequest>,
+) -> Result<Json<crate::model::RuntimeResetView>, ApiError> {
+    if request.reason.trim().is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-reset-reason",
+            "runtime reset needs a reason",
+        )));
+    }
+    let status = state
+        .store
+        .status_at(Some(&subject), None, None)
+        .map_err(ApiError::internal)?;
+    let runtime = status
+        .subjects
+        .into_iter()
+        .find(|item| item.subject == subject)
+        .ok_or_else(|| ApiError::not_found(format!("runtime `{subject}` does not exist")))?;
+    if !matches!(runtime.kind.as_deref(), Some("agent" | "exec" | "pty")) {
+        return Err(ApiError::bad(St3Error::new(
+            "not-a-runtime",
+            format!("subject `{subject}` is not an agent, exec, or PTY runtime"),
+        )));
+    }
+    let desired_token = runtime.desired_token.ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "runtime-not-desired",
+            format!("runtime `{subject}` has no selected desired state"),
+        ))
+    })?;
+    let subject_head = runtime.claims.last().cloned();
+    let incarnation_id = runtime
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .and_then(|actual| actual.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "runtime-not-incarnated",
+                format!("runtime `{subject}` has no current incarnation"),
+            ))
+        })?;
+    let fields = BTreeMap::from([
+        ("desired_token".into(), Value::String(desired_token.clone())),
+        (
+            "incarnation_id".into(),
+            Value::String(incarnation_id.clone()),
+        ),
+        ("reason".into(), Value::String(request.reason)),
+    ]);
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "runtime.restart-window-reset".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: Some(subject_head),
+            idempotency_key: Some(request.idempotency_key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(crate::model::RuntimeResetView {
+        subject,
+        desired_token,
+        incarnation_id,
+        reset_claim: claim.id,
+    }))
+}
+
 #[derive(Deserialize)]
 struct EventQuery {
     #[serde(default, alias = "after_index")]
@@ -2282,39 +2553,39 @@ struct EventQuery {
     subject: Option<String>,
     owner_run: Option<String>,
     wait: Option<bool>,
+    timeout_ms: Option<u64>,
 }
 
 async fn events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventRecord>>, ApiError> {
-    let notified = state.event_notify.notified();
-    tokio::pin!(notified);
-    notified.as_mut().enable();
-    let current = state
-        .store
-        .events_after_filtered(
+    let read = || {
+        state.store.events_after_filtered(
             query.after,
             query.subject.as_deref(),
             query.owner_run.as_deref(),
         )
-        .map_err(ApiError::internal)?;
-    if !current.is_empty() {
+    };
+    let current = read().map_err(ApiError::internal)?;
+    if !current.is_empty() || query.wait == Some(false) {
         return Ok(Json(current));
     }
-    if query.wait == Some(false) {
-        return Ok(Json(Vec::new()));
+    let wait = async {
+        let mut event_changed = state.event_notify.subscribe();
+        loop {
+            let current = read().map_err(ApiError::internal)?;
+            if !current.is_empty() {
+                return Ok(current);
+            }
+            event_changed.changed().await.map_err(ApiError::internal)?;
+        }
+    };
+    let timeout_ms = query.timeout_ms.unwrap_or(30_000).clamp(10, 30_000);
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
+        Ok(result) => result.map(Json),
+        Err(_) => Ok(Json(Vec::new())),
     }
-    let _ = tokio::time::timeout(Duration::from_secs(30), notified).await;
-    state
-        .store
-        .events_after_filtered(
-            query.after,
-            query.subject.as_deref(),
-            query.owner_run.as_deref(),
-        )
-        .map(Json)
-        .map_err(ApiError::internal)
 }
 
 async fn quick_claude(
@@ -4126,7 +4397,9 @@ async fn peer_cursor(
 }
 
 fn normalize_message_party(value: &str) -> String {
-    if value == "requester" || value.contains('/') {
+    if value == "requester" {
+        "person/requester".into()
+    } else if value.contains('/') {
         value.into()
     } else {
         format!("agent/{value}")
@@ -4143,7 +4416,7 @@ mod tests {
         AppState {
             store: Arc::new(Store::open_memory("node").unwrap()),
             notify: Arc::new(Notify::new()),
-            event_notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
             node: "node".into(),
             state_dir: root.to_path_buf(),
             pty_root: root.join("pty"),
@@ -4155,18 +4428,64 @@ mod tests {
     async fn an_event_waiter_cannot_consume_the_reconciler_signal() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
-        let event = state.event_notify.notified();
-        tokio::pin!(event);
-        event.as_mut().enable();
+        let mut event = state.event_notify.subscribe();
 
         signal_changed(&state);
 
-        tokio::time::timeout(Duration::from_millis(50), event)
+        tokio::time::timeout(Duration::from_millis(50), event.changed())
             .await
-            .expect("the event waiter did not wake");
+            .expect("the event waiter did not wake")
+            .expect("the event sender closed");
         tokio::time::timeout(Duration::from_millis(50), state.notify.notified())
             .await
             .expect("the reconciler signal was lost");
+    }
+
+    #[tokio::test]
+    async fn an_event_wait_ignores_a_wake_without_a_matching_event() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            events(
+                State(waiter_state),
+                Query(EventQuery {
+                    after: 0,
+                    subject: None,
+                    owner_run: None,
+                    wait: Some(true),
+                    timeout_ms: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        signal_changed(&state);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished(), "an empty wake ended the event wait");
+
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/test/event".into(),
+                kind: "custom.test.recorded".into(),
+                actor: None,
+                fields: BTreeMap::new(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        signal_changed(&state);
+        let observed = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the event wait did not finish")
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].kind, "custom.test.recorded");
     }
 
     #[tokio::test]
@@ -4187,6 +4506,252 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|check| check["name"] == "runtime-ownership")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_is_bound_to_the_selected_desire_and_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = format!(
+            r#"
+version 2
+subgraph {{
+  agent "resettable" {{
+    workspace {workspace:?}
+    command "true"
+    restart "on-failure"
+  }}
+}}
+"#,
+            workspace = root.path().display().to_string()
+        );
+        let intent = crate::graph::parse_execution_intent(&source, "node", "reset-run").unwrap();
+        store
+            .apply_internal(&intent, "runtime-reset-desire")
+            .unwrap();
+        let subject = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "agent")
+            .unwrap()
+            .subject
+            .clone();
+        let desired_token = store.selected_desired_token(&subject).unwrap().unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("resettable-runtime".into()),
+                    ),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("incarnation-one".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("runtime-reset-observed".into()),
+            })
+            .unwrap();
+
+        let app = router(state);
+        let (status, reset) = json_request(
+            app,
+            &format!("/v1/runtimes/reset/{}", urlencoding::encode(&subject)),
+            serde_json::to_value(crate::model::RuntimeResetRequest {
+                reason: "clear the failed restart window".into(),
+                idempotency_key: "runtime-reset-request".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reset}");
+        assert_eq!(reset["subject"], subject);
+        assert_eq!(reset["desired_token"], desired_token);
+        assert_eq!(reset["incarnation_id"], "incarnation-one");
+        let claim = store
+            .latest_claim(&subject, Some("runtime.restart-window-reset"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.body["fields"]["desired_token"], desired_token);
+        assert_eq!(claim.body["fields"]["incarnation_id"], "incarnation-one");
+        assert_eq!(
+            claim.body["fields"]["reason"],
+            "clear the failed restart window"
+        );
+        assert!(claim.body.get("actor").is_none());
+    }
+
+    #[tokio::test]
+    async fn resource_refresh_waits_for_its_observation_and_reports_unchanged_success() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = format!(
+            r#"
+version 2
+subgraph {{
+  resource "refresh/file" {{ kind "filesystem.file" }}
+  observer "refresh/file" {{
+    resource "resource/refresh/file"
+    provider "local.file"
+    locator {locator:?}
+    field "status"
+    field "content_hash"
+  }}
+}}
+"#,
+            locator = root.path().join("watched.txt").display().to_string()
+        );
+        let intent = crate::graph::parse_execution_intent(&source, "node", "refresh-run").unwrap();
+        store
+            .apply_internal(&intent, "resource-refresh-desire")
+            .unwrap();
+        let observer = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "observer")
+            .unwrap()
+            .subject
+            .clone();
+        let resource = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "resource")
+            .unwrap()
+            .subject
+            .clone();
+        let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
+        let app = router(state.clone());
+
+        let mut refresh_started = state.event_notify.subscribe();
+        let first_app = app.clone();
+        let refresh_path = format!("/v1/resources/refresh/{}", urlencoding::encode(&resource));
+        let refresh_request = serde_json::to_value(crate::model::ResourceRefreshRequest {
+            timeout_ms: 1_000,
+            idempotency_key: "resource-refresh-first".into(),
+        })
+        .unwrap();
+        let first =
+            tokio::spawn(
+                async move { json_request(first_app, &refresh_path, refresh_request).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), refresh_started.changed())
+            .await
+            .expect("the first refresh did not start")
+            .expect("the event sender closed");
+        let first_attempt = store
+            .latest_claim(&observer, Some("observer.state"))
+            .unwrap()
+            .unwrap()
+            .body["fields"]["attempt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let facts = json!({
+            "status": "ready",
+            "path": root.path().join("watched.txt").display().to_string(),
+            "content_hash": "hash-one",
+        });
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some("an-unrelated-attempt"),
+                &resource,
+                Some("unrelated-cursor"),
+                &json!({
+                    "status": "ready",
+                    "path": root.path().join("watched.txt").display().to_string(),
+                    "content_hash": "unrelated-hash",
+                }),
+                1,
+                &[],
+            )
+            .unwrap();
+        signal_changed(&state);
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some(&first_attempt),
+                &resource,
+                Some("cursor-one"),
+                &facts,
+                1,
+                &[],
+            )
+            .unwrap();
+        signal_changed(&state);
+        let (status, first) = first.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["resource"], resource);
+        assert_eq!(first["observers"], json!([observer.clone()]));
+        assert_eq!(first["changed"], true);
+
+        let mut refresh_started = state.event_notify.subscribe();
+        let refresh_path = format!("/v1/resources/refresh/{}", urlencoding::encode(&resource));
+        let refresh_request = serde_json::to_value(crate::model::ResourceRefreshRequest {
+            timeout_ms: 1_000,
+            idempotency_key: "resource-refresh-second".into(),
+        })
+        .unwrap();
+        let second =
+            tokio::spawn(async move { json_request(app, &refresh_path, refresh_request).await });
+        tokio::time::timeout(Duration::from_secs(1), refresh_started.changed())
+            .await
+            .expect("the second refresh did not start")
+            .expect("the event sender closed");
+        let second_attempt = store
+            .latest_claim(&observer, Some("observer.state"))
+            .unwrap()
+            .unwrap()
+            .body["fields"]["attempt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some(&second_attempt),
+                &resource,
+                Some("cursor-two"),
+                &facts,
+                2,
+                &[],
+            )
+            .unwrap();
+        signal_changed(&state);
+        let (status, second) = second.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["changed"], false);
+        assert!(
+            second["completed_at_index"].as_u64().unwrap()
+                > first["completed_at_index"].as_u64().unwrap()
+        );
+        assert_eq!(
+            store
+                .claims_for(&resource, Some("resource.observed"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .claims_for(&observer, Some("observer.observed"))
+                .unwrap()
+                .len(),
+            3
         );
     }
 
@@ -4861,6 +5426,53 @@ subgraph {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["code"], "empty-message");
+    }
+
+    #[tokio::test]
+    async fn a_runtime_work_message_uses_a_valid_daemon_sender() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, body) = json_request(
+            app,
+            "/v1/messages",
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: "runtime-work-message".into(),
+                from: "daemon/runtime".into(),
+                to: "agent/worker".into(),
+                content: "A durable plan step is ready.".into(),
+                title: Some("Plan step ready".into()),
+                in_reply_to: None,
+                tags: vec!["st3-work:step-run/run/build@1@1@incarnation".into()],
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["from"], "daemon/runtime");
+        assert_eq!(body["to"], "agent/worker");
+    }
+
+    #[tokio::test]
+    async fn a_requester_message_uses_a_full_person_subject() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, body) = json_request(
+            app,
+            "/v1/messages",
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: "requester-message".into(),
+                from: "requester".into(),
+                to: "agent/worker".into(),
+                content: "Please do the work.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["from"], "person/requester");
     }
 
     #[tokio::test]

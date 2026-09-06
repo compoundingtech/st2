@@ -166,11 +166,17 @@ Exact built-in names are reserved. An authored `env` block cannot replace them. 
 
 The complete table is in [plan-graph-runtime.md](./plan-graph-runtime.md#automatic-context).
 
-### External resource subscriptions
+### External resource observation
 
-An external resource watch contains a resource, one supervised observer, and one or more delivery subscriptions.
+An external resource watch contains a resource, one observer, and zero or more delivery subscriptions.
 
 The observer normalizes provider facts without using an agent turn. A subscription selects fields and a message target.
+
+`local.file` observes metadata for one absolute local path. It never publishes file content.
+
+`st3 resource refresh` requests an immediate observation. It waits for that exact observer attempt through the event API.
+
+An unchanged refresh succeeds without a new `resource.observed` claim.
 
 The first observation establishes a baseline. A later selected change creates one observation claim and one idempotent message.
 
@@ -217,7 +223,7 @@ st3 has these components:
 5. The reconciler requests bounded runtime changes.
 6. Native drivers supervise Codex, Claude, and other supported harnesses.
 7. Process and PTY adapters observe runtime state.
-8. Small Talk maps durable message claims to native harness delivery.
+8. Small Talk maps durable message claims to native harness delivery or an explicit DING child.
 9. Gate runners execute bounded mechanical or LLM checks.
 10. The peer adapter exchanges causal claim batches between trusted nodes.
 
@@ -240,6 +246,35 @@ The parser is strict. Unknown fields, duplicate single fields, invalid identifie
 A plan occurs at the root. A nested plan occurs inside one step.
 
 The plan runtime is the only execution model. st3 has no checkpoint, supervisor, or link node.
+
+### Workspaces and member environment
+
+A member workspace must exist by default. `workspace "/path" create=#true` lets st3 create that exact directory.
+
+st3 supplies `ST3_SUBJECT` with the current runtime subject. It supplies `ST_AGENT` only when an agent owns the runtime.
+
+A nested agent task receives its owning agent subject in `ST_AGENT`. An agentless runtime has no `ST_AGENT` value.
+
+`${PATH}` expands from the deterministic service path. It never reads the shell path of the person who installed the service.
+
+### Explicit DING delivery
+
+A harness without native message delivery can declare one DING child:
+
+```kdl
+agent "worker" {
+  workspace "/work/worker"
+  command "worker-harness"
+  exec "ding" {
+    argv "st3" "driver" "ding"
+    restart "on-failure"
+  }
+}
+```
+
+The plan run owns the DING child. The child checks the local st3 API once per second and sends one incarnation-fenced terminal line.
+
+The DING child then records `message.delivered`. It does not read or write an st2 mailbox.
 
 ## Identity and authority
 
@@ -272,14 +307,30 @@ One reconcile pass performs these operations in order:
 3. Reduce actual state and registered observations.
 4. Record gaps and warnings.
 5. Advance active plan runs.
-6. Request required start, stop, message, review, or gate operations.
-7. Record operation results as new claims.
+6. Preflight all selected render writes as one transaction.
+7. Commit all render writes, or roll back all writes after one failure.
+8. Request required start, stop, review, or gate operations.
+9. Record operation results as new claims.
+
+No runtime starts before the complete render transaction succeeds. Each successful render records exact paths, hashes, and modes.
 
 Every external action is idempotent or fenced by an incarnation, capability, expected subject head, or stable operation key.
 
 Stopping a member requests TERM first. A shutdown deadline can cause a fenced hard kill of the same incarnation. A replacement incarnation is not killed by an older stop result.
 
 Nonterminal runtime exits follow the declared restart type and intensity. The store records each request, result, observation, and parking decision.
+
+`st3 runtime ls` shows all agent, exec, and PTY runtime subjects. `st3 runtime reset SUBJECT --reason TEXT` clears one restart window.
+
+The reset claim binds to the current desired token and current incarnation. An older reset cannot affect a replacement desire or incarnation.
+
+`st3 service install`, `status`, `restart`, and `uninstall` use a systemd user service on Linux and a launchd agent on macOS.
+
+Installation uses a deterministic path and waits for the configured socket. A failed install restores the prior unit or property list.
+
+`st3 service reset` needs three interactive confirmations. It stops the service and owned runtimes, erases st3 state, and starts an empty service.
+
+Service reset retains the binary, service definition, configuration, workspaces, and rendered files.
 
 ## Plan execution
 
@@ -383,6 +434,7 @@ Main endpoint groups are:
 - planning: `/v1/planning-sessions` and its session actions;
 - plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
 - graph data: `/v1/claims`, `/v1/claims/by-id/{id}`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
+- runtime repair: `/v1/runtimes/reset/{subject}` and `/v1/resources/refresh/{resource}`;
 - schema: `/v1/schema`;
 - documents: `/v1/documents` and `/v1/documents/content`;
 - Small Talk: `/v1/messages` and message lifecycle actions;
@@ -390,7 +442,9 @@ Main endpoint groups are:
 - evaluation: `/v1/evals`;
 - replication: `/v1/peer/...`.
 
-The Unix socket mode is `0600`. A configured TCP peer listener assumes a trusted private network. The first version has no TLS or peer ACL protocol.
+The Unix socket mode is `0600`. A configured TCP peer listener must bind to an IPv4 or IPv6 loopback address.
+
+Cross-host replication uses a trusted local port exposer such as Fabric. st3 does not accept a direct non-loopback peer listener.
 
 ## Claim vocabulary
 
@@ -410,7 +464,8 @@ Important plan and gate kinds include:
 - `planning-session.started`, `planning-session.candidate-submitted`, and `planning-session.previewed`;
 - `planning-session.revision-requested`, `planning-session.approved`, and `planning-session.cancelled`;
 - `observer.observed`, `observer.state`, `resource.observed`, and `subscription.state`.
-- `file.observed`, `daemon.started`, and `daemon.diagnostic`.
+- `runtime.restart-window-reset`, `render.applied`, and `file.observed`;
+- `daemon.started` and `daemon.diagnostic`.
 
 The registry pins the exact subject, resource, and claim manifests. A registry change must update the generated schema document.
 

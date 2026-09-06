@@ -24,15 +24,16 @@ use st3::model::{
     PlanResponse, PlanRevisionRequest, PlanRunRequest, PlanRunView, PlanState,
     PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
     PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ResourceUnwatchRequest,
-    ResourceWatchRequest, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ResourceRefreshRequest,
+    ResourceRefreshView, ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, RuntimeResetRequest, RuntimeResetView,
     SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
     SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -94,6 +95,11 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Install and inspect the Claude channel plugin used by st3.
+    ClaudeChannel {
+        #[command(subcommand)]
+        command: ClaudeChannelCommand,
+    },
     /// Store or read immutable documents.
     Doc {
         #[command(subcommand)]
@@ -107,6 +113,11 @@ enum Command {
     Status(StatusArgs),
     /// Show declared agents and their current graph state.
     Agents(AgentsArgs),
+    /// Inspect and recover plan-owned runtimes.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
     /// Read or update durable agent context documents.
     Context {
         #[command(subcommand)]
@@ -418,7 +429,36 @@ enum ServiceCommand {
         config: Option<PathBuf>,
     },
     Status,
+    Restart {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Stop every st3 runtime, erase all st3 state, and restart an empty daemon.
+    Reset {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ClaudeChannelCommand {
+    /// Install or update the user plugin and its machine approval policy.
+    Install {
+        #[arg(long)]
+        no_policy: bool,
+    },
+    /// Verify the embedded files, registration, plugin, and machine policy.
+    Status,
+    /// Remove the plugin, marketplace, embedded files, and machine policy.
+    Uninstall {
+        #[arg(long)]
+        keep_policy: bool,
+    },
+    #[command(hide = true)]
+    InstallPolicy,
+    #[command(hide = true)]
+    UninstallPolicy,
 }
 
 #[derive(Subcommand)]
@@ -474,6 +514,18 @@ struct AgentsArgs {
 }
 
 #[derive(Subcommand)]
+enum RuntimeCommand {
+    /// List agent, exec, and PTY runtimes.
+    Ls,
+    /// Clear one runtime restart window with exact desired-state fencing.
+    Reset {
+        subject: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ContextCommand {
     Read(ContextReadArgs),
     Write(ContextIdentityArgs),
@@ -516,6 +568,12 @@ enum ResourceCommand {
     Watch(ResourceWatchArgs),
     /// Stop one resource subscription.
     Unwatch(ResourceUnwatchArgs),
+    /// Observe one resource now and wait for the exact attempt.
+    Refresh {
+        resource: String,
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
 }
 
 #[derive(Args)]
@@ -716,7 +774,7 @@ struct MessageSendArgs {
         long = "from",
         alias = "as",
         env = "ST_AGENT",
-        default_value = "requester"
+        default_value = "person/requester"
     )]
     from: String,
 }
@@ -756,7 +814,7 @@ struct MessageReplyArgs {
         long = "from",
         alias = "as",
         env = "ST_AGENT",
-        default_value = "requester"
+        default_value = "person/requester"
     )]
     from: String,
 }
@@ -802,7 +860,7 @@ struct GateResultArgs {
 
 #[derive(Args)]
 struct DriverArgs {
-    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "opencode", "exec"])]
+    #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "opencode", "ding", "exec"])]
     driver: String,
     #[arg(long, env = "ST_AGENT")]
     subject: Option<String>,
@@ -896,11 +954,13 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Wait(args) => run_wait(&client, args, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
         Command::Service { command } => run_service(command),
+        Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Doc { command } => run_doc(&client, command, cli.json).await,
         Command::Eval(args) => run_eval(&client, args, cli.json).await,
         Command::Graph(args) => run_graph(&client, args, cli.json).await,
         Command::Status(args) => run_status(&client, args, cli.json).await,
         Command::Agents(args) => run_agents(&client, args, cli.json).await,
+        Command::Runtime { command } => run_runtime(&client, command, cli.json).await,
         Command::Context { command } => run_context(&client, command, cli.json).await,
         Command::Resource { command } => run_resource(&client, command, cli.json).await,
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
@@ -981,7 +1041,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         )),
     })?;
     let notify = Arc::new(Notify::new());
-    let event_notify = Arc::new(Notify::new());
+    let (event_notify, _event_receiver) = watch::channel(0_u64);
     let pty_root = config
         .pty_root
         .clone()
@@ -1258,6 +1318,7 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
         .await?;
     anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
     let resolved_intent = plan.resolved_intent.clone();
+    let plan_revisions = plan.plan_revisions.clone();
     let idempotency_key = idempotency(&resolved_intent.kdl, &plan.subject_tokens);
     let response: ApplyResponse = client
         .post(
@@ -1293,13 +1354,22 @@ async fn run_file(client: &Client, args: RunArgs, json_output: bool) -> Result<(
         ready[0]
     };
     let workspace = resolve_plan_run_workspace(args.workspace, file.as_deref())?;
+    let revision = plan_revisions
+        .get(&selected.subject)
+        .with_context(|| {
+            format!(
+                "the server did not return a revision for `{}`",
+                selected.subject
+            )
+        })?
+        .clone();
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let started: PlanRunView = client
         .post(
             "/v1/plan-runs",
             &PlanRunRequest {
                 plan: selected.id.clone(),
-                revision: Some(selected.revision.clone()),
+                revision: Some(revision),
                 workspace: workspace.to_string_lossy().into_owned(),
                 requester: args.requester,
                 mode: Some(if args.eval { "eval" } else { "run" }.into()),
@@ -2026,18 +2096,14 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
     }
     let status = status_for(client, subject).await?;
     let item = status.subjects.first();
-    let fields = item
-        .and_then(|item| item.actual.as_ref())
-        .map(|actual| actual.get("fields").unwrap_or(actual));
-    let actual_status = fields
-        .and_then(|fields| fields.get("status"))
-        .and_then(Value::as_str);
+    let actual_status = projected_actual_status(item.and_then(|item| item.actual.as_ref()));
     let matches = match condition {
         "running" => matches!(actual_status, Some("running" | "ready")),
         "ready" => actual_status == Some("ready"),
         "completed" => actual_status == Some("completed"),
         "failed" => actual_status == Some("failed"),
         "cancelled" => actual_status == Some("cancelled"),
+        "delivered" => actual_status == Some("delivered"),
         "terminal" => matches!(actual_status, Some("completed" | "failed" | "cancelled")),
         "exited" => actual_status == Some("exited"),
         "stopped" => {
@@ -2049,6 +2115,14 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
     Ok(matches.then(|| json!(status)))
 }
 
+fn projected_actual_status(actual: Option<&Value>) -> Option<&str> {
+    let fields = actual.map(|actual| actual.get("fields").unwrap_or(actual))?;
+    fields
+        .get("status")
+        .or_else(|| fields.pointer("/facts/status"))
+        .and_then(Value::as_str)
+}
+
 fn validate_wait_condition(condition: &str) -> Result<()> {
     anyhow::ensure!(
         matches!(
@@ -2058,6 +2132,7 @@ fn validate_wait_condition(condition: &str) -> Result<()> {
                 | "completed"
                 | "failed"
                 | "cancelled"
+                | "delivered"
                 | "terminal"
                 | "exited"
                 | "stopped"
@@ -2107,7 +2182,55 @@ fn run_service(command: ServiceCommand) -> Result<()> {
             st3::service::install(Config::load(config.as_deref())?)
         }
         ServiceCommand::Status => st3::service::status(),
+        ServiceCommand::Restart { config } => {
+            st3::service::restart(Config::load(config.as_deref())?)
+        }
+        ServiceCommand::Reset { config } => {
+            let config = Config::load(config.as_deref())?;
+            confirm_service_reset(&config)?;
+            st3::service::reset(config)
+        }
         ServiceCommand::Uninstall => st3::service::uninstall(),
+    }
+}
+
+fn confirm_service_reset(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "st3 service reset requires an interactive terminal"
+    );
+    let mut answer = String::new();
+    for (prompt, expected) in [
+        ("Erase all st3 state? Type `yes`: ", "yes"),
+        (
+            &format!("Type the node name `{}`: ", config.node),
+            config.node.as_str(),
+        ),
+        ("Type `erase st3 state`: ", "erase st3 state"),
+    ] {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        answer.clear();
+        std::io::stdin().read_line(&mut answer)?;
+        anyhow::ensure!(
+            answer.trim() == expected,
+            "the st3 state reset was cancelled"
+        );
+    }
+    Ok(())
+}
+
+fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
+    match command {
+        ClaudeChannelCommand::Install { no_policy } => {
+            st2::claude_channel::install(no_policy).map(|_| ())
+        }
+        ClaudeChannelCommand::Status => st2::claude_channel::status(),
+        ClaudeChannelCommand::Uninstall { keep_policy } => {
+            st2::claude_channel::uninstall(keep_policy)
+        }
+        ClaudeChannelCommand::InstallPolicy => st2::claude_channel::install_policy().map(|_| ()),
+        ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_policy(),
     }
 }
 
@@ -2399,15 +2522,37 @@ async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Res
                     .and_then(Value::as_str)
             })
             .unwrap_or("unknown");
+        let display_name = agent
+            .desired
+            .as_ref()
+            .and_then(|desired| desired_child_string(desired, "name"));
         if args.enrich {
+            let driver = agent
+                .desired
+                .as_ref()
+                .and_then(|desired| desired_child_string(desired, "harness"))
+                .unwrap_or("-");
+            let incarnation = actual
+                .and_then(|value| value.get("incarnation_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                agent.subject,
+                display_name.unwrap_or("-"),
+                state,
+                agent.reachability,
+                driver,
+                agent.owner_run.as_deref().unwrap_or("-"),
+            );
+            println!("  incarnation {incarnation}");
+        } else {
             println!(
                 "{}\t{}\t{}",
-                agent.subject.trim_start_matches("agent/"),
-                state,
-                agent.reachability
+                agent.subject,
+                display_name.unwrap_or("-"),
+                state
             );
-        } else {
-            println!("{}\t{}", agent.subject.trim_start_matches("agent/"), state);
         }
         for grouping in agent.under {
             match grouping.reason {
@@ -2417,6 +2562,70 @@ async fn run_agents(client: &Client, args: AgentsArgs, json_output: bool) -> Res
         }
     }
     Ok(())
+}
+
+fn desired_child_string<'a>(desired: &'a Value, child_name: &str) -> Option<&'a str> {
+    desired
+        .get("children")?
+        .as_array()?
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some(child_name))?
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()
+}
+
+async fn run_runtime(client: &Client, command: RuntimeCommand, json_output: bool) -> Result<()> {
+    match command {
+        RuntimeCommand::Ls => {
+            let response: StatusResponse = client.get("/v1/status").await?;
+            let runtimes = response
+                .subjects
+                .into_iter()
+                .filter(|subject| matches!(subject.kind.as_deref(), Some("agent" | "exec" | "pty")))
+                .collect::<Vec<_>>();
+            if json_output {
+                return print_value(&runtimes, true);
+            }
+            for runtime in runtimes {
+                let status = runtime
+                    .actual
+                    .as_ref()
+                    .and_then(|actual| actual.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let parked = runtime.reachability == "unreachable";
+                println!(
+                    "{}\t{}\t{}{}",
+                    runtime.subject,
+                    status,
+                    runtime.reachability,
+                    if parked { "\tparked" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        RuntimeCommand::Reset { subject, reason } => {
+            anyhow::ensure!(
+                subject.starts_with("agent/")
+                    || subject.starts_with("exec/")
+                    || subject.starts_with("pty/"),
+                "runtime reset needs a full agent, exec, or PTY subject"
+            );
+            let key = format!("runtime-reset:{}:{}", subject, now_ms());
+            let response: RuntimeResetView = client
+                .post(
+                    &format!("/v1/runtimes/reset/{}", urlencoding::encode(&subject)),
+                    &RuntimeResetRequest {
+                        reason,
+                        idempotency_key: key,
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+    }
 }
 
 async fn run_context(client: &Client, command: ContextCommand, json_output: bool) -> Result<()> {
@@ -2702,6 +2911,22 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                             subscription,
                             normalize_agent_subject(&actor)
                         ),
+                    },
+                )
+                .await?;
+            print_value(&response, json_output)
+        }
+        ResourceCommand::Refresh { resource, timeout } => {
+            let timeout = parse_timeout(&timeout)?;
+            let timeout_ms =
+                u64::try_from(timeout.as_millis()).context("the refresh timeout is too large")?;
+            let resource = normalize_resource_subject(&resource);
+            let response: ResourceRefreshView = client
+                .post(
+                    &format!("/v1/resources/refresh/{}", urlencoding::encode(&resource)),
+                    &ResourceRefreshRequest {
+                        timeout_ms,
+                        idempotency_key: format!("resource-refresh:{resource}:{}", now_ms()),
                     },
                 )
                 .await?;
@@ -3337,6 +3562,28 @@ async fn accept_message(client: &Client, message: &MessageView, actor: Option<&s
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-read:{}", message.subject),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn deliver_message(
+    client: &Client,
+    reference: &str,
+    actor: &str,
+    idempotency_key: String,
+) -> Result<()> {
+    let reference = normalize_message_reference(reference);
+    let _: ClaimRecord = client
+        .post(
+            &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
+            &MessageLifecycleRequest {
+                lifecycle: "delivered".into(),
+                actor: Some(actor.into()),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key,
             },
         )
         .await?;
@@ -4011,6 +4258,14 @@ async fn run_quick(
 }
 
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
+    if args.driver == "ding" {
+        anyhow::ensure!(
+            args.argv.is_empty(),
+            "the DING driver takes no provider argv"
+        );
+        let target = std::env::var("ST_AGENT").context("the DING exec has no owning ST_AGENT")?;
+        return run_ding_driver(client, &normalize_agent_subject(&target)).await;
+    }
     if args.driver == "pi-channel" {
         let identity = args
             .identity
@@ -4037,7 +4292,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
     if args.driver == "codex" {
         return run_codex_native(client, subject, args.argv).await;
     }
-    if matches!(args.driver.as_str(), "claude" | "pi" | "opencode") {
+    if matches!(args.driver.as_str(), "claude" | "pi" | "omp" | "opencode") {
         return run_st2_native_driver(client, subject, &args.driver, args.argv).await;
     }
     let (program, arguments) = args.argv.split_first().context("driver argv is empty")?;
@@ -4092,6 +4347,66 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
     Ok(())
 }
 
+async fn run_ding_driver(client: &Client, target: &str) -> Result<()> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let status: StatusResponse = client
+            .get(&format!(
+                "/v1/status?subject={}",
+                urlencoding::encode(target)
+            ))
+            .await?;
+        let Some(agent) = status.subjects.first() else {
+            anyhow::bail!("DING target `{target}` does not exist");
+        };
+        let incarnation = agent
+            .actual
+            .as_ref()
+            .and_then(|actual| actual.get("incarnation_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(incarnation) = incarnation {
+            let messages: Vec<MessageView> = client
+                .get(&format!("/v1/messages?to={}", urlencoding::encode(target)))
+                .await?;
+            for message in messages
+                .into_iter()
+                .filter(|message| message.status == "sent")
+            {
+                let id = message.subject.trim_start_matches("message/");
+                let wake = format!(
+                    "[DING] new st3 message: [id:{id}] {} (from {}); run `st3 message ls`",
+                    message.title.as_deref().unwrap_or("message"),
+                    message.from
+                );
+                let _: SessionControlResponse = client
+                    .post(
+                        &format!("/v1/sessions/input/{}", urlencoding::encode(target)),
+                        &SessionInputRequest {
+                            expected_incarnation: incarnation.clone(),
+                            mode: SessionInputMode::Line,
+                            value: wake,
+                            idempotency_key: format!(
+                                "ding-input:{}:{incarnation}",
+                                message.subject
+                            ),
+                        },
+                    )
+                    .await?;
+                deliver_message(
+                    client,
+                    &message.subject,
+                    target,
+                    format!("ding-delivered:{}:{incarnation}", message.subject),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
 async fn run_st2_native_driver(
     client: &Client,
     subject: &str,
@@ -4112,6 +4427,7 @@ async fn run_st2_native_driver(
     let mut task = tokio::task::spawn_blocking(move || match task_driver.as_str() {
         "claude" => st2::claude_session::run(&task_catalog, task_identity, task_runtime, argv),
         "pi" => st2::pi_session::run(&task_catalog, task_identity, task_runtime, argv),
+        "omp" => st2::omp_session::run(&task_catalog, task_identity, task_runtime, argv),
         "opencode" => st2::opencode_session::run(&task_catalog, task_identity, task_runtime, argv),
         _ => unreachable!("the native driver was checked"),
     });
@@ -4201,7 +4517,7 @@ fn prepare_st3_claude_channel_argv(subject: &str, argv: Vec<String>) -> Result<V
             eprintln!(
                 "warning: the approved st3 Claude channel plugin is unavailable: {error:#}\n\
                  warning: using Claude's interactive development channel; Claude can ask for confirmation\n\
-                 warning: run `st2 claude-channel install` for unattended startup"
+                 warning: run `st3 claude-channel install` for unattended startup"
             );
             let executable = std::env::current_exe()
                 .context("resolving the st3 executable for the Claude development channel")?;
@@ -4419,19 +4735,13 @@ async fn run_pi_channel(client: &Client, subject: &str) -> Result<()> {
                     }
                     Some("delivered") => {
                         let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: message.into(),
-                            kind: "message.delivered".into(),
-                            actor: Some(subject.into()),
-                            fields: BTreeMap::from([
-                                ("status".into(), Value::String("delivered".into())),
-                                ("recipient".into(), Value::String(subject.into())),
-                                ("transport".into(), Value::String("pi-channel".into())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!("pi-delivered:{subject}:{message}")),
-                        }).await?;
+                        deliver_message(
+                            client,
+                            message,
+                            subject,
+                            format!("pi-delivered:{subject}:{message}"),
+                        )
+                        .await?;
                     }
                     _ => {}
                 }
@@ -4749,7 +5059,7 @@ fn work_message_request(
 ) -> MessageSendRequest {
     MessageSendRequest {
         idempotency_key: format!("work-message:{subject}:{tag_value}"),
-        from: "st3/runtime".into(),
+        from: "daemon/runtime".into(),
         to: subject.into(),
         content: work_notification(step),
         title: Some(format!(
@@ -4876,27 +5186,13 @@ async fn forward_projected_messages(
                 &content,
             )?;
         }
-        let _: ClaimRecord = client
-            .post(
-                "/v1/claims",
-                &ClaimInput {
-                    subject: message.subject.clone(),
-                    kind: "message.delivered".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("delivered".into())),
-                        ("recipient".into(), Value::String(subject.into())),
-                        ("transport".into(), Value::String(transport.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!(
-                        "native-delivered:{transport}:{subject}:{}",
-                        message.subject
-                    )),
-                },
-            )
-            .await?;
+        deliver_message(
+            client,
+            &message.subject,
+            subject,
+            format!("native-delivered:{transport}:{subject}:{}", message.subject),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -5026,18 +5322,13 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                     stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
-                    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                        subject: message.subject.clone(),
-                        kind: "message.delivered".into(),
-                        actor: Some(subject.into()),
-                        fields: BTreeMap::from([
-                            ("status".into(), Value::String("delivered".into())),
-                            ("recipient".into(), Value::String(subject.into())),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(format!("message-delivered:{}:{subject}", message.subject)),
-                    }).await?;
+                    deliver_message(
+                        client,
+                        &message.subject,
+                        subject,
+                        format!("message-delivered:{}:{subject}", message.subject),
+                    )
+                    .await?;
                 }
             }
             _ = work_interval.tick(), if initialized => {
@@ -5292,6 +5583,26 @@ mod tests {
     }
 
     #[test]
+    fn wait_reads_resource_status_from_observed_facts() {
+        let resource = json!({
+            "baseline": true,
+            "facts": {"status": "ready"},
+            "kind": "filesystem.file"
+        });
+        assert_eq!(projected_actual_status(Some(&resource)), Some("ready"));
+
+        let runtime = json!({"fields": {"status": "running"}});
+        assert_eq!(projected_actual_status(Some(&runtime)), Some("running"));
+    }
+
+    #[test]
+    fn wait_accepts_message_delivery() {
+        validate_wait_condition("delivered").unwrap();
+        let message = serde_json::json!({ "status": "delivered" });
+        assert_eq!(projected_actual_status(Some(&message)), Some("delivered"));
+    }
+
+    #[test]
     fn an_ended_harness_uses_the_registered_state() {
         assert_eq!(
             harness_activity_state(st2::harness_state::Activity::Ended),
@@ -5502,7 +5813,7 @@ mod tests {
             "step-run/run-1/build@2@1@incarnation".into(),
         );
 
-        assert_eq!(request.from, "st3/runtime");
+        assert_eq!(request.from, "daemon/runtime");
         assert_eq!(request.to, "agent/worker");
         assert_eq!(
             request.idempotency_key,

@@ -129,15 +129,18 @@ jq -e --arg plan "$PLAN_SUBJECT" '
 st3 --json inspect "$PLAN_SUBJECT" > "$EVAL_ROOT/plan-inspect.json"
 jq -e '
   ([.recent_claims[] | select(.kind == "plan.published")] | length) == 1
-  and ([.recent_claims[] | select(.kind == "planning-session.approved")] | length) == 1
 ' "$EVAL_ROOT/plan-inspect.json" >/dev/null
+st3 --json inspect "$session_subject" > "$EVAL_ROOT/planning-session-inspect.json"
+jq -e '
+  ([.recent_claims[] | select(.kind == "planning-session.approved")] | length) == 1
+' "$EVAL_ROOT/planning-session-inspect.json" >/dev/null
 
 markdown_ref=$(jq -er \
   '.recent_claims[] | select(.kind == "planning-session.approved") | .body.fields.markdown' \
-  "$EVAL_ROOT/plan-inspect.json")
+  "$EVAL_ROOT/planning-session-inspect.json")
 kdl_ref=$(jq -er \
   '.recent_claims[] | select(.kind == "planning-session.approved") | .body.fields.kdl' \
-  "$EVAL_ROOT/plan-inspect.json")
+  "$EVAL_ROOT/planning-session-inspect.json")
 jq -e --arg markdown "$markdown_ref" --arg kdl "$kdl_ref" '
   .candidate.markdown == $markdown
   and .candidate.kdl == $kdl

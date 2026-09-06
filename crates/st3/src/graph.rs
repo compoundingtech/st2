@@ -61,6 +61,73 @@ pub(crate) fn parse_execution_intent(
     parse_intent_with_owner(source, default_host, Some(&owner), true)
 }
 
+pub fn validate_plan_runtimes(
+    intent: &NormalizedIntent,
+    default_host: &str,
+) -> Result<BTreeSet<String>, St3Error> {
+    fn validate_plan(
+        plan: &crate::model::PlanSpec,
+        default_host: &str,
+        subjects: &mut BTreeSet<String>,
+    ) -> Result<(), St3Error> {
+        fn validate_source(
+            source: &str,
+            variables: &BTreeMap<String, String>,
+            default_host: &str,
+            subjects: &mut BTreeSet<String>,
+        ) -> Result<(), St3Error> {
+            let source = crate::plan::interpolate_kdl(source, variables)?;
+            let runtime = parse_execution_intent(&source, default_host, "migration-proof")?;
+            subjects.extend(runtime.subjects.keys().cloned());
+            Ok(())
+        }
+
+        let mut variables = BTreeMap::from([
+            ("ST_PLAN".into(), plan.id.clone()),
+            ("ST_PLAN_REVISION".into(), plan.revision.clone()),
+            ("ST_PLAN_RUN".into(), "migration-proof".into()),
+            ("ST_RUN_GENERATION".into(), "migration-generation".into()),
+            ("ST_ROOT_PLAN_RUN".into(), "migration-proof".into()),
+            ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
+            ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
+            ("ST_STEP".into(), "migration-step".into()),
+            (
+                "ST_STEP_RUN".into(),
+                "step-run/migration-generation/migration-step".into(),
+            ),
+            ("ST_ATTEMPT".into(), "1".into()),
+            ("ST_ASSIGNEE".into(), "agent/migration-proof/worker".into()),
+            ("ST_PARENT_STEP_RUN".into(), String::new()),
+            ("ST_GATE".into(), "migration-gate".into()),
+            ("ST_AGENT".into(), "agent/migration-proof/worker".into()),
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+        ]);
+        variables.extend(
+            plan.inputs
+                .keys()
+                .map(|name| (format!("input.{name}"), format!("migration-{name}"))),
+        );
+        if let Some(source) = &plan.subgraph_kdl {
+            validate_source(source, &variables, default_host, subjects)?;
+        }
+        for step in plan.steps.values() {
+            if let Some(source) = &step.subgraph_kdl {
+                validate_source(source, &variables, default_host, subjects)?;
+            }
+            if let Some(nested) = &step.nested_plan {
+                validate_plan(nested, default_host, subjects)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut subjects = BTreeSet::new();
+    for plan in intent.plans.values() {
+        validate_plan(plan, default_host, &mut subjects)?;
+    }
+    Ok(subjects)
+}
+
 fn owner_run_id(owner: &str) -> &str {
     owner.strip_prefix("plan-run/").unwrap_or(owner)
 }
@@ -342,10 +409,11 @@ fn parse_agent(
         || bus_id.clone(),
         |run| format!("{}.{}", owner_run_id(run), identity.replace('/', ".")),
     );
-    let workspace = child_string(children, "workspace")?.unwrap_or_else(|| ".".into());
+    let (workspace, workspace_create) =
+        parse_workspace(children)?.unwrap_or_else(|| (".".into(), false));
     let environment = parse_map_child(children, "env")?;
     let display_name = child_string(children, "name")?;
-    let lifecycle = parse_lifecycle(child_string(children, "lifecycle")?)?;
+    let lifecycle = MemberLifecycle::Service;
     let restart = parse_restart_type(restart_type_value(children)?)?;
     let restart_intensity = parse_restart_intensity(children)?;
     let shutdown_timeout_ms = child_string(children, "shutdown-timeout")?
@@ -381,6 +449,7 @@ fn parse_agent(
             &runtime_id,
             &host,
             &workspace,
+            workspace_create,
             &environment,
             display_name.clone(),
             lifecycle.clone(),
@@ -394,6 +463,7 @@ fn parse_agent(
             host: host.clone(),
             runtime_id: runtime_id.clone(),
             workspace: workspace.clone(),
+            workspace_create,
             cwd: workspace.clone(),
             terminal: true,
             launch,
@@ -406,6 +476,10 @@ fn parse_agent(
             shutdown_timeout_ms,
             driver: None,
         });
+    }
+
+    if let Some(member) = primary.as_mut() {
+        member.tags.insert("st3.subject".into(), subject.clone());
     }
 
     let mut desired = canonical_node(node)?;
@@ -445,12 +519,13 @@ fn parse_agent(
                 )
             },
         );
-        let member = task_member(
+        let mut member = task_member(
             child,
             &task_subject,
             child.name().value() == "pty",
             &host,
             &workspace,
+            workspace_create,
             &environment,
             lifecycle.clone(),
             restart.clone(),
@@ -458,6 +533,10 @@ fn parse_agent(
             shutdown_timeout_ms,
             false,
         )?;
+        member.tags.insert("st3.agent".into(), subject.clone());
+        member
+            .tags
+            .insert("st3.subject".into(), task_subject.clone());
         insert_subject(
             context,
             DesiredSubject {
@@ -508,21 +587,23 @@ fn parse_standalone_member(
         .or_else(|| enclosing_host.map(str::to_owned))
         .unwrap_or_else(|| context.default_host.clone());
     let host = placement_host(host, &context.default_host);
-    let workspace = child_string(children, "workspace")?.unwrap_or_else(|| ".".into());
+    let (workspace, workspace_create) =
+        parse_workspace(children)?.unwrap_or_else(|| (".".into(), false));
     let environment = parse_map_child(children, "env")?;
-    let lifecycle = parse_lifecycle(child_string(children, "lifecycle")?)?;
+    let lifecycle = MemberLifecycle::Service;
     let restart = parse_restart_type(restart_type_value(children)?)?;
     let restart_intensity = parse_restart_intensity(children)?;
     let shutdown_timeout_ms = child_string(children, "shutdown-timeout")?
         .map(|value| parse_duration(&value, true))
         .transpose()?
         .unwrap_or(5_000);
-    let member = task_member(
+    let mut member = task_member(
         node,
         &subject,
         kind == "pty",
         &host,
         &workspace,
+        workspace_create,
         &environment,
         lifecycle,
         restart,
@@ -530,6 +611,7 @@ fn parse_standalone_member(
         shutdown_timeout_ms,
         true,
     )?;
+    member.tags.insert("st3.subject".into(), subject.clone());
     insert_subject(
         context,
         DesiredSubject {
@@ -1046,6 +1128,7 @@ fn driver_member(
     runtime_id: &str,
     host: &str,
     workspace: &str,
+    workspace_create: bool,
     environment: &BTreeMap<String, String>,
     display_name: Option<String>,
     lifecycle: MemberLifecycle,
@@ -1083,7 +1166,7 @@ fn driver_member(
     if let Some(effort) = effort {
         match name.as_str() {
             "codex" => provider.extend(["-c".into(), format!("model_reasoning_effort={effort}")]),
-            "pi" => provider.extend(["--thinking".into(), effort]),
+            "pi" | "omp" => provider.extend(["--thinking".into(), effort]),
             "opencode" => {
                 return Err(St3Error::new(
                     "invalid-driver-child",
@@ -1112,6 +1195,7 @@ fn driver_member(
         host: host.into(),
         runtime_id: runtime_id.into(),
         workspace: workspace.into(),
+        workspace_create,
         cwd: workspace.into(),
         terminal: true,
         launch: LaunchSpec::Argv(wrapper),
@@ -1133,6 +1217,7 @@ fn task_member(
     terminal: bool,
     default_host: &str,
     default_workspace: &str,
+    default_workspace_create: bool,
     default_environment: &BTreeMap<String, String>,
     default_lifecycle: MemberLifecycle,
     default_restart: RestartType,
@@ -1151,7 +1236,14 @@ fn task_member(
         child_string(body, "host")?.unwrap_or_else(|| default_host.into()),
         default_host,
     );
-    let workspace = child_string(body, "workspace")?.unwrap_or_else(|| default_workspace.into());
+    let workspace_spec = parse_workspace(body)?;
+    let workspace = workspace_spec
+        .as_ref()
+        .map(|(workspace, _)| workspace.clone())
+        .unwrap_or_else(|| default_workspace.into());
+    let workspace_create = workspace_spec
+        .map(|(_, create)| create)
+        .unwrap_or(default_workspace_create);
     let cwd = child_string(body, "cwd")?.unwrap_or_else(|| workspace.clone());
     let runtime_id = child_string(body, "id")?.unwrap_or_else(|| runtime_id(subject));
     let mut environment = default_environment.clone();
@@ -1169,10 +1261,7 @@ fn task_member(
             format!("member `{subject}` needs command or argv"),
         )
     })?;
-    let lifecycle = child_string(body, "lifecycle")?
-        .map(|value| parse_lifecycle(Some(value)))
-        .transpose()?
-        .unwrap_or(default_lifecycle);
+    let lifecycle = default_lifecycle;
     let restart = restart_type_value(body)?
         .map(|value| parse_restart_type(Some(value)))
         .transpose()?
@@ -1195,6 +1284,7 @@ fn task_member(
         host,
         runtime_id,
         workspace,
+        workspace_create,
         cwd,
         terminal,
         launch,
@@ -1222,17 +1312,6 @@ fn compact_launch(
             "a member cannot contain both command and argv",
         )),
         (None, Some(_)) => Err(St3Error::new("empty-argv", "argv needs a program")),
-    }
-}
-
-fn parse_lifecycle(value: Option<String>) -> Result<MemberLifecycle, St3Error> {
-    match value.as_deref() {
-        None | Some("service") => Ok(MemberLifecycle::Service),
-        Some("adopt-only") => Ok(MemberLifecycle::AdoptOnly),
-        Some(value) => Err(St3Error::new(
-            "invalid-lifecycle",
-            format!("invalid lifecycle `{value}`"),
-        )),
     }
 }
 
@@ -1320,46 +1399,30 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "identity",
         "name",
         "description",
-        "role",
-        "type",
         "host",
         "workspace",
         "under",
-        "keep",
-        "lifecycle",
         "restart",
         "shutdown-timeout",
-        "deliver",
         "command",
         "argv",
-        "ding",
         "env",
-        "meta",
         "render",
         "harness",
         "pty",
         "exec",
-        "resource",
-        "stream",
     ];
     reject_unknown_children(document, ALLOWED, "agent", owner)?;
     for child in [
         "identity",
         "name",
         "description",
-        "role",
-        "type",
         "host",
         "workspace",
-        "keep",
-        "lifecycle",
         "shutdown-timeout",
-        "deliver",
         "command",
         "argv",
-        "ding",
         "env",
-        "meta",
         "render",
         "harness",
     ] {
@@ -1384,17 +1447,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         }
     }
     validate_restart_forms(document)?;
-    if let Some(value) = child_string(document, "type")?
-        && value != "service"
-    {
-        return Err(St3Error::new(
-            "invalid-agent-type",
-            "an agent type must be `service`",
-        ));
-    }
-    if let Some(node) = unique_child(document, "keep")? {
-        one_bool(node)?;
-    }
     if let Some(name) = child_string(document, "name")?
         && name.len() > 160
     {
@@ -1411,39 +1463,9 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
             "an agent description cannot exceed 1,000 bytes",
         ));
     }
-    if let Some(deliver) = child_string(document, "deliver")? {
-        if !matches!(deliver.as_str(), "mcp" | "app-server" | "pi-channel") {
-            return Err(St3Error::new(
-                "invalid-delivery",
-                format!("invalid delivery transport `{deliver}`"),
-            ));
-        }
-        if document
-            .nodes()
-            .iter()
-            .any(|node| node.name().value() == "harness")
-        {
-            return Err(St3Error::new(
-                "multiple-agent-launches",
-                "a typed driver cannot occur with `deliver`",
-            ));
-        }
-    }
-    if let Some(ding) = unique_child(document, "ding")? {
-        ensure_bare(ding)?;
-        ensure_no_children(ding)?;
-        if child_string(document, "deliver")?.is_some() {
-            return Err(St3Error::new(
-                "invalid-ding",
-                "`ding` cannot occur with `deliver`",
-            ));
-        }
-    }
+    parse_workspace(document)?;
     if let Some(env) = unique_child(document, "env")? {
         validate_string_map(env, true)?;
-    }
-    if let Some(meta) = unique_child(document, "meta")? {
-        validate_scalar_map(meta)?;
     }
     if let Some(render) = unique_child(document, "render")? {
         validate_render(render)?;
@@ -1455,20 +1477,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     {
         validate_driver(driver)?;
     }
-    for resource in document
-        .nodes()
-        .iter()
-        .filter(|node| node.name().value() == "resource")
-    {
-        validate_agent_resource(resource)?;
-    }
-    for stream in document
-        .nodes()
-        .iter()
-        .filter(|node| node.name().value() == "stream")
-    {
-        validate_stream(stream)?;
-    }
     Ok(())
 }
 
@@ -1477,32 +1485,12 @@ fn validate_task_body(
     owner: &str,
     standalone: bool,
 ) -> Result<(), St3Error> {
-    let mut allowed = vec![
-        "id",
-        "command",
-        "argv",
-        "cwd",
-        "keep",
-        "lifecycle",
-        "tags",
-        "env",
-        "unset",
-    ];
+    let mut allowed = vec!["id", "command", "argv", "cwd", "tags", "env", "unset"];
     if standalone {
         allowed.extend(["host", "workspace", "restart", "shutdown-timeout", "render"]);
     }
     reject_unknown_children(document, &allowed, "member", owner)?;
-    for child in [
-        "id",
-        "command",
-        "argv",
-        "cwd",
-        "keep",
-        "lifecycle",
-        "tags",
-        "env",
-        "unset",
-    ] {
+    for child in ["id", "command", "argv", "cwd", "tags", "env", "unset"] {
         unique_child(document, child)?;
     }
     if standalone {
@@ -1510,9 +1498,7 @@ fn validate_task_body(
             unique_child(document, child)?;
         }
         validate_restart_forms(document)?;
-    }
-    if let Some(node) = unique_child(document, "keep")? {
-        one_bool(node)?;
+        parse_workspace(document)?;
     }
     if let Some(tags) = unique_child(document, "tags")? {
         validate_tags(tags)?;
@@ -1590,7 +1576,7 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     })?;
     let allowed: &[&str] = match provider.as_str() {
         "claude" => &["model", "effort", "dev-channels", "prompt", "args"],
-        "codex" | "pi" => &["model", "effort", "prompt", "args"],
+        "codex" | "pi" | "omp" => &["model", "effort", "prompt", "args"],
         "opencode" => &["model", "prompt", "args"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
@@ -1602,43 +1588,6 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     if let Some(node) = unique_child(body, "dev-channels")? {
         one_bool(node)?;
     }
-    Ok(())
-}
-
-fn validate_agent_resource(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_only_properties(node, &["uri", "reason", "inactive-reason"])?;
-    one_string(node)?;
-    let uri = property_string(node, "uri")?
-        .ok_or_else(|| St3Error::new("missing-resource-uri", "an agent resource needs `uri`"))?;
-    if !uri.contains(':') {
-        return Err(St3Error::new(
-            "invalid-resource-uri",
-            "an agent resource URI needs an absolute scheme",
-        ));
-    }
-    let reason = property_string(node, "reason")?.ok_or_else(|| {
-        St3Error::new(
-            "missing-resource-reason",
-            "an agent resource needs `reason`",
-        )
-    })?;
-    validate_reason(&reason)?;
-    if let Some(reason) = property_string(node, "inactive-reason")? {
-        validate_reason(&reason)?;
-    }
-    Ok(())
-}
-
-fn validate_stream(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_no_properties(node)?;
-    one_string_with_children(node)?;
-    let Some(body) = node.children() else {
-        return Ok(());
-    };
-    reject_unknown_children(body, &["command", "argv"], "stream", "stream")?;
-    let command = child_string(body, "command")?;
-    let argv = child_strings(body, "argv")?;
-    compact_launch(command, argv)?;
     Ok(())
 }
 
@@ -2066,26 +2015,6 @@ pub(crate) fn validate_deferred_subgraph(node: &KdlNode) -> Result<(), St3Error>
     Ok(())
 }
 
-fn validate_scalar_map(node: &KdlNode) -> Result<(), St3Error> {
-    ensure_bare(node)?;
-    let Some(body) = node.children() else {
-        return Ok(());
-    };
-    let mut names = HashSet::new();
-    for child in body.nodes() {
-        ensure_no_properties(child)?;
-        ensure_no_children(child)?;
-        if !names.insert(child.name().value()) || positional_values(child).len() != 1 {
-            return Err(St3Error::new(
-                "invalid-meta",
-                "meta keys must be unique and have one scalar",
-            ));
-        }
-        json_value(positional_values(child)[0])?;
-    }
-    Ok(())
-}
-
 fn validate_tags(node: &KdlNode) -> Result<(), St3Error> {
     reject_type(node)?;
     ensure_no_children(node)?;
@@ -2121,16 +2050,6 @@ fn validate_environment_name(name: &str) -> Result<(), St3Error> {
         return Err(St3Error::new(
             "invalid-environment-name",
             format!("invalid environment name `{name}`"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reason(reason: &str) -> Result<(), St3Error> {
-    if reason.is_empty() || reason.len() > 160 || reason.chars().any(char::is_control) {
-        return Err(St3Error::new(
-            "invalid-resource-reason",
-            "a resource reason must contain 1 through 160 printable bytes",
         ));
     }
     Ok(())
@@ -2690,6 +2609,16 @@ fn child_string(document: &KdlDocument, name: &str) -> Result<Option<String>, St
     unique_child(document, name)?.map(one_string).transpose()
 }
 
+fn parse_workspace(document: &KdlDocument) -> Result<Option<(String, bool)>, St3Error> {
+    let Some(node) = unique_child(document, "workspace")? else {
+        return Ok(None);
+    };
+    ensure_only_properties(node, &["create"])?;
+    let workspace = one_string(node)?;
+    let create = property_bool(node, "create")?.unwrap_or(false);
+    Ok(Some((workspace, create)))
+}
+
 fn required_child_string(
     document: &KdlDocument,
     child: &str,
@@ -3085,6 +3014,49 @@ subgraph {
     }
 
     #[test]
+    fn model_free_provider_contracts_build_exact_native_argv() {
+        for (provider, extra, expected) in [
+            (
+                "pi",
+                "effort \"high\"",
+                vec!["pi", "--thinking", "high", "Do the work."],
+            ),
+            ("opencode", "", vec!["opencode", "--prompt", "Do the work."]),
+            (
+                "omp",
+                "effort \"medium\"",
+                vec!["omp", "--thinking", "medium", "Do the work."],
+            ),
+        ] {
+            let source = format!(
+                r#"version 2
+subgraph {{
+  agent "worker" {{
+    workspace "/work"
+    harness {provider:?} {{
+      {extra}
+      prompt "Do the work."
+    }}
+  }}
+}}"#,
+            );
+            let intent = parse_test_intent(&source, "node").unwrap();
+            let member = intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap();
+            let LaunchSpec::Argv(argv) = &member.launch else {
+                panic!("the typed provider did not build argv");
+            };
+            assert!(
+                argv.windows(expected.len())
+                    .any(|window| window == expected),
+                "{provider}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_plan_order_and_dependencies() {
         let intent = parse_intent(
             r#"
@@ -3155,14 +3127,13 @@ subgraph {
     }
 
     #[test]
-    fn nested_tasks_inherit_lifecycle_and_restart_controls() {
+    fn nested_tasks_inherit_restart_controls() {
         let intent = parse_test_intent(
             r#"
 version 2
 subgraph {
   agent "worker" {
     workspace "/work"
-    lifecycle "adopt-only"
     restart "never"
     shutdown-timeout "9s"
     restart {
@@ -3182,13 +3153,44 @@ subgraph {
             .member
             .as_ref()
             .unwrap();
-        assert_eq!(member.lifecycle, MemberLifecycle::AdoptOnly);
+        assert_eq!(member.lifecycle, MemberLifecycle::Service);
         assert_eq!(member.restart, RestartType::Never);
         assert_eq!(member.shutdown_timeout_ms, 9_000);
         assert_eq!(member.restart_intensity.attempts, 7);
         assert_eq!(member.restart_intensity.interval_ms, 120_000);
         assert_eq!(member.restart_intensity.delay_ms, 3_000);
         assert_eq!(member.restart_intensity.mode, "fail");
+    }
+
+    #[test]
+    fn every_terminal_member_records_its_st3_subject() {
+        let intent = parse_test_intent(
+            r#"
+version 2
+subgraph {
+  pty "standalone" { command "sleep 1" }
+  agent "worker" {
+    workspace "/work"
+    command "sleep 1"
+    pty "helper" { command "sleep 1" }
+  }
+}
+"#,
+            "node",
+        )
+        .unwrap();
+        let agent = intent.subjects["agent/node.worker"]
+            .member
+            .as_ref()
+            .unwrap();
+        let standalone = intent.subjects["pty/standalone"].member.as_ref().unwrap();
+        let helper = intent.subjects["pty/node.worker/helper"]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(agent.tags["st3.subject"], "agent/node.worker");
+        assert_eq!(standalone.tags["st3.subject"], "pty/standalone");
+        assert_eq!(helper.tags["st3.subject"], "pty/node.worker/helper");
     }
 
     #[test]

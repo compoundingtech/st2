@@ -1,20 +1,22 @@
-//! Install the st3 daemon as a Linux systemd user service.
+//! Install the st3 daemon as a native user service.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-use std::{fs, process::Command};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Command;
 
 use anyhow::{Context as _, Result};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use anyhow::bail;
 
 use crate::config::Config;
 
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "st3.service";
+const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,7 @@ impl ServiceSpec {
 }
 
 pub fn install(mut config: Config) -> Result<()> {
+    #[cfg(target_os = "linux")]
     anyhow::ensure!(
         st_runtime::isolation_mode() != st_runtime::Isolation::DegradedDetached,
         "st3 service install needs a working systemd user manager and transient user scopes"
@@ -97,7 +100,7 @@ pub fn install(mut config: Config) -> Result<()> {
         .map(|root| absolute_from(&current, root));
     let path = service_path(&exe)?;
     let spec = ServiceSpec::new(exe, config, path, DEFAULT_MEMORY_MAX_MB)?;
-    install_systemd_user(&spec)?;
+    install_native_service(&spec)?;
     println!("installed");
     Ok(())
 }
@@ -110,27 +113,336 @@ fn absolute_from(current: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn read_existing_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
+    match previous {
+        Some(bytes) => {
+            fs::write(path, bytes).with_context(|| format!("restore {}", path.display()))
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        },
+    }
+}
+
 pub fn status() -> Result<()> {
-    status_systemd_user()
+    status_native_service()
+}
+
+pub fn restart(mut config: Config) -> Result<()> {
+    let current = env::current_dir().context("resolve the service restart directory")?;
+    config.state_dir = absolute_from(&current, &config.state_dir);
+    config.socket = absolute_from(&current, &config.socket);
+    config.pty_root = config
+        .pty_root
+        .as_ref()
+        .map(|root| absolute_from(&current, root));
+    restart_native_service(&config)
+}
+
+pub fn reset(mut config: Config) -> Result<()> {
+    let current = env::current_dir().context("resolve the service reset directory")?;
+    config.state_dir = absolute_from(&current, &config.state_dir);
+    config.socket = absolute_from(&current, &config.socket);
+    config.pty_root = config
+        .pty_root
+        .as_ref()
+        .map(|root| absolute_from(&current, root));
+    validate_reset_target(&config)?;
+
+    stop_native_service()?;
+    stop_owned_runtimes(&config)?;
+    match fs::remove_dir_all(&config.state_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("erase the st3 state directory"),
+    }
+    if !config.socket.starts_with(&config.state_dir) {
+        match fs::remove_file(&config.socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("erase the st3 socket"),
+        }
+    }
+    start_native_service()?;
+    wait_for_socket(&config.socket)?;
+    println!("reset\t{}", config.state_dir.display());
+    Ok(())
 }
 
 pub fn uninstall() -> Result<()> {
-    uninstall_systemd_user()?;
+    uninstall_native_service()?;
     println!("uninstalled");
     Ok(())
 }
 
 fn service_path(exe: &Path) -> Result<String> {
-    let ambient = env::var_os("PATH").context("PATH is not set")?;
-    let mut entries = env::split_paths(&ambient).collect::<Vec<_>>();
-    if let Some(parent) = exe.parent()
-        && !entries.iter().any(|entry| entry == parent)
-    {
-        entries.insert(0, parent.to_path_buf());
+    let mut entries = Vec::new();
+    if let Some(parent) = exe.parent() {
+        entries.push(parent.to_path_buf());
     }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        entries.push(home.join(".local/bin"));
+        entries.push(home.join(".cargo/bin"));
+    }
+    entries.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
+    ]);
+    entries.dedup();
     env::join_paths(entries)
         .context("the service PATH contains an unsupported byte")
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn validate_reset_target(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.state_dir.is_absolute(),
+        "the st3 state directory must be absolute"
+    );
+    anyhow::ensure!(
+        config.state_dir != Path::new("/"),
+        "refusing to erase the filesystem root"
+    );
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        anyhow::ensure!(
+            config.state_dir != home,
+            "refusing to erase the home directory"
+        );
+    }
+    anyhow::ensure!(
+        config.state_dir.components().count() >= 3,
+        "the st3 state directory is too broad to erase"
+    );
+    Ok(())
+}
+
+fn stop_owned_runtimes(config: &Config) -> Result<()> {
+    let pty_root = config
+        .pty_root
+        .clone()
+        .unwrap_or_else(|| config.state_dir.join("pty"));
+    let pty = st_runtime::PtyRuntime::new(pty_root.clone());
+    if pty_root.exists() {
+        let owned = pty
+            .snapshot()?
+            .into_iter()
+            .filter(|item| item.tags.contains_key("st3.subject"))
+            .map(|item| {
+                let incarnation = match (item.pid, item.created_at) {
+                    (Some(pid), Some(created)) => Some(format!("{pid}:{created}")),
+                    _ => None,
+                };
+                (item.name, incarnation)
+            })
+            .collect::<Vec<_>>();
+        for (id, incarnation) in &owned {
+            let _ = pty.stop_if(id, incarnation.as_deref());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let survivors = running_pty_ids(pty.snapshot()?);
+        for (id, incarnation) in &owned {
+            if survivors.contains(id) {
+                pty.kill_if(id, incarnation.as_deref())?;
+            }
+            let _ = pty.remove(id);
+        }
+    }
+
+    let exec_root = config.state_dir.join("exec");
+    let exec = st_runtime::ExecRuntime::new(exec_root.clone(), config.state_dir.join("logs"));
+    if exec_root.is_dir() {
+        let mut ids = fs::read_dir(&exec_root)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".json").map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            if let Some(st_runtime::ExecObservation::Running(generation)) = exec.observe(id)? {
+                exec.stop_if(id, Some(&generation.generation_id))?;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        for id in &ids {
+            if let Some(st_runtime::ExecObservation::Running(generation)) = exec.observe(id)? {
+                exec.kill_if(id, Some(&generation.generation_id))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn running_pty_ids(
+    snapshot: impl IntoIterator<Item = st_runtime::PtyObservation>,
+) -> std::collections::HashSet<String> {
+    snapshot
+        .into_iter()
+        .filter(|item| item.status == "running")
+        .map(|item| item.name)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn install_native_service(spec: &ServiceSpec) -> Result<()> {
+    install_systemd_user(spec)
+}
+
+#[cfg(target_os = "linux")]
+fn status_native_service() -> Result<()> {
+    status_systemd_user()
+}
+
+#[cfg(target_os = "linux")]
+fn restart_native_service(config: &Config) -> Result<()> {
+    run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    wait_for_socket(&config.socket)
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_native_service() -> Result<()> {
+    uninstall_systemd_user()
+}
+
+#[cfg(target_os = "linux")]
+fn stop_native_service() -> Result<()> {
+    run_command("systemctl", &["--user", "stop", SERVICE_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn start_native_service() -> Result<()> {
+    run_command("systemctl", &["--user", "start", SERVICE_NAME])
+}
+
+#[cfg(target_os = "macos")]
+fn install_native_service(spec: &ServiceSpec) -> Result<()> {
+    let plist = launch_agent_path()?;
+    let logs = spec.config.state_dir.join("logs");
+    fs::create_dir_all(&logs)?;
+    if let Some(parent) = plist.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let previous = read_existing_file(&plist)?;
+    fs::write(&plist, render_launchd_plist(spec))?;
+    let domain = launch_domain();
+    let service = format!("{domain}/{SERVICE_LABEL}");
+    let install = (|| -> Result<()> {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &service])
+            .status();
+        run_command("launchctl", &["enable", &service])?;
+        run_command(
+            "launchctl",
+            &["bootstrap", &domain, &plist.display().to_string()],
+        )?;
+        run_command("launchctl", &["kickstart", &service])?;
+        wait_for_socket(&spec.config.socket)
+    })();
+    if let Err(error) = install {
+        let rollback = (|| -> Result<()> {
+            let _ = Command::new("launchctl")
+                .args(["bootout", &service])
+                .status();
+            restore_file(&plist, previous.as_deref())?;
+            if previous.is_some() {
+                run_command("launchctl", &["enable", &service])?;
+                run_command(
+                    "launchctl",
+                    &["bootstrap", &domain, &plist.display().to_string()],
+                )?;
+                run_command("launchctl", &["kickstart", &service])?;
+            } else {
+                let _ = Command::new("launchctl")
+                    .args(["disable", &service])
+                    .status();
+            }
+            Ok(())
+        })();
+        if let Err(rollback) = rollback {
+            return Err(error).context(format!(
+                "the launchd install failed, and rollback also failed: {rollback:#}"
+            ));
+        }
+        return Err(error).context("the launchd install failed; st3 restored the prior service");
+    }
+    println!("plist\t{}", plist.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn status_native_service() -> Result<()> {
+    run_command(
+        "launchctl",
+        &["print", &format!("{}/{SERVICE_LABEL}", launch_domain())],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn restart_native_service(config: &Config) -> Result<()> {
+    run_command(
+        "launchctl",
+        &[
+            "kickstart",
+            "-k",
+            &format!("{}/{SERVICE_LABEL}", launch_domain()),
+        ],
+    )?;
+    wait_for_socket(&config.socket)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_native_service() -> Result<()> {
+    let service = format!("{}/{SERVICE_LABEL}", launch_domain());
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service])
+        .status();
+    let _ = Command::new("launchctl")
+        .args(["disable", &service])
+        .status();
+    let plist = launch_agent_path()?;
+    if plist.exists() {
+        fs::remove_file(plist)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_native_service() -> Result<()> {
+    run_command(
+        "launchctl",
+        &["bootout", &format!("{}/{SERVICE_LABEL}", launch_domain())],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn start_native_service() -> Result<()> {
+    let domain = launch_domain();
+    let plist = launch_agent_path()?;
+    run_command(
+        "launchctl",
+        &["bootstrap", &domain, &plist.display().to_string()],
+    )?;
+    run_command(
+        "launchctl",
+        &["kickstart", &format!("{domain}/{SERVICE_LABEL}")],
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -139,17 +451,38 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let previous = read_existing_file(&unit_path)?;
     fs::write(&unit_path, render_systemd_user_unit(spec))?;
-    run_command("systemctl", &["--user", "daemon-reload"])?;
-    run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
-    run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    let install = (|| -> Result<()> {
+        run_command("systemctl", &["--user", "daemon-reload"])?;
+        run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
+        run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+        wait_for_socket(&spec.config.socket)
+    })();
+    if let Err(error) = install {
+        let rollback = (|| -> Result<()> {
+            if previous.is_some() {
+                restore_file(&unit_path, previous.as_deref())?;
+                run_command("systemctl", &["--user", "daemon-reload"])?;
+                run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+            } else {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "disable", "--now", SERVICE_NAME])
+                    .status();
+                restore_file(&unit_path, None)?;
+                run_command("systemctl", &["--user", "daemon-reload"])?;
+            }
+            Ok(())
+        })();
+        if let Err(rollback) = rollback {
+            return Err(error).context(format!(
+                "the systemd install failed, and rollback also failed: {rollback:#}"
+            ));
+        }
+        return Err(error).context("the systemd install failed; st3 restored the prior service");
+    }
     println!("unit\t{}", unit_path.display());
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn install_systemd_user(_spec: &ServiceSpec) -> Result<()> {
-    unsupported()
 }
 
 #[cfg(target_os = "linux")]
@@ -158,11 +491,6 @@ fn status_systemd_user() -> Result<()> {
         "systemctl",
         &["--user", "status", SERVICE_NAME, "--no-pager"],
     )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn status_systemd_user() -> Result<()> {
-    unsupported()
 }
 
 #[cfg(target_os = "linux")]
@@ -177,17 +505,42 @@ fn uninstall_systemd_user() -> Result<()> {
     run_command("systemctl", &["--user", "daemon-reload"])
 }
 
-#[cfg(not(target_os = "linux"))]
-fn uninstall_systemd_user() -> Result<()> {
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported() -> Result<()> {
+    bail!("st3 service is available only on Linux and macOS")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn install_native_service(_spec: &ServiceSpec) -> Result<()> {
     unsupported()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn unsupported() -> Result<()> {
-    bail!("st3 service is available only with a Linux systemd user manager")
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn status_native_service() -> Result<()> {
+    unsupported()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn restart_native_service(_config: &Config) -> Result<()> {
+    unsupported()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn uninstall_native_service() -> Result<()> {
+    unsupported()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stop_native_service() -> Result<()> {
+    unsupported()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn start_native_service() -> Result<()> {
+    unsupported()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, arguments: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(arguments)
@@ -195,6 +548,20 @@ fn run_command(program: &str, arguments: &[&str]) -> Result<()> {
         .with_context(|| format!("run {program} {}", arguments.join(" ")))?;
     anyhow::ensure!(status.success(), "{program} failed with {status}");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_LABEL}.plist")),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn launch_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
 }
 
 #[cfg(target_os = "linux")]
@@ -206,6 +573,34 @@ fn systemd_user_unit_path() -> Result<PathBuf> {
         .context("HOME and XDG_CONFIG_HOME are not set")?
         .join("systemd/user")
         .join(SERVICE_NAME))
+}
+
+fn wait_for_socket(socket: &Path) -> Result<()> {
+    wait_for_socket_for(socket, std::time::Duration::from_secs(10))
+}
+
+fn wait_for_socket_for(socket: &Path, timeout: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if service_socket_accepts(socket) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    anyhow::bail!(
+        "the st3 service did not accept connections at {}",
+        socket.display()
+    )
+}
+
+#[cfg(unix)]
+fn service_socket_accepts(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+#[cfg(not(unix))]
+fn service_socket_accepts(socket: &Path) -> bool {
+    socket.exists()
 }
 
 pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
@@ -233,6 +628,45 @@ WantedBy=default.target\n",
         systemd_quote_arg(&format!("PATH={}", spec.path)),
         spec.memory_max_mb,
     )
+}
+
+pub fn render_launchd_plist(spec: &ServiceSpec) -> String {
+    let arguments = spec
+        .program_arguments()
+        .iter()
+        .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
+        .collect::<String>();
+    let stdout = spec.config.state_dir.join("logs/st3.stdout.log");
+    let stderr = spec.config.state_dir.join("logs/st3.stderr.log");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+  <key>Label</key><string>{SERVICE_LABEL}</string>\n\
+  <key>ProgramArguments</key>\n  <array>\n{arguments}  </array>\n\
+  <key>EnvironmentVariables</key>\n  <dict><key>PATH</key><string>{}</string></dict>\n\
+  <key>RunAtLoad</key><true/>\n\
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
+  <key>ProcessType</key><string>Background</string>\n\
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>8192</integer></dict>\n\
+  <key>StandardOutPath</key><string>{}</string>\n\
+  <key>StandardErrorPath</key><string>{}</string>\n\
+</dict>\n\
+</plist>\n",
+        xml_escape(&spec.path),
+        xml_escape(&stdout.display().to_string()),
+        xml_escape(&stderr.display().to_string()),
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn systemd_quote_arg(argument: &str) -> String {
@@ -299,5 +733,94 @@ mod tests {
         assert!(unit.contains("\"/opt/st3 tools/st3\""));
         assert!(unit.contains("\"/tmp/st3 state 100%%\""));
         Ok(())
+    }
+
+    #[test]
+    fn launchd_plist_has_supervision_logs_and_a_file_limit() -> Result<()> {
+        let config = Config {
+            node: "node-a".into(),
+            state_dir: "/Users/test/Library/Application Support/st3".into(),
+            socket: "/tmp/st3.sock".into(),
+            ..Config::default()
+        };
+        let spec = ServiceSpec::new(
+            "/Users/test/bin/st3",
+            config,
+            "/Users/test/bin:/usr/bin:/bin",
+            1024,
+        )?;
+        let plist = render_launchd_plist(&spec);
+        assert!(plist.contains("<string>com.compoundingtech.st3</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+        assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
+        assert!(plist.contains("<key>NumberOfFiles</key><integer>8192</integer>"));
+        assert!(plist.contains("st3.stdout.log"));
+        assert!(plist.contains("Application Support/st3"));
+        Ok(())
+    }
+
+    #[test]
+    fn state_reset_rejects_broad_directories() {
+        let mut config = Config {
+            state_dir: "/".into(),
+            socket: "/tmp/st3.sock".into(),
+            ..Config::default()
+        };
+        assert!(validate_reset_target(&config).is_err());
+        config.state_dir = "/var/lib/st3".into();
+        validate_reset_target(&config).unwrap();
+    }
+
+    #[test]
+    fn service_file_rollback_restores_or_removes_the_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("st3.service");
+        fs::write(&file, b"candidate").unwrap();
+        restore_file(&file, Some(b"previous")).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"previous");
+
+        restore_file(&file, None).unwrap();
+        assert!(!file.exists());
+        restore_file(&file, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_readiness_requires_an_accepting_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        fs::write(&socket, b"stale").unwrap();
+        let error = wait_for_socket_for(&socket, std::time::Duration::from_millis(40))
+            .expect_err("a stale path is not a ready service");
+        assert!(error.to_string().contains("did not accept connections"));
+
+        fs::remove_file(&socket).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        wait_for_socket_for(&socket, std::time::Duration::from_millis(40)).unwrap();
+    }
+
+    #[test]
+    fn reset_does_not_force_stop_an_already_exited_pty() {
+        let ids = running_pty_ids([
+            st_runtime::PtyObservation {
+                name: "running".into(),
+                status: "running".into(),
+                exit_code: None,
+                pid: Some(1),
+                created_at: Some("now".into()),
+                display_name: None,
+                tags: Default::default(),
+            },
+            st_runtime::PtyObservation {
+                name: "exited".into(),
+                status: "exited".into(),
+                exit_code: Some(129),
+                pid: None,
+                created_at: Some("before".into()),
+                display_name: None,
+                tags: Default::default(),
+            },
+        ]);
+        assert_eq!(ids, ["running".to_owned()].into_iter().collect());
     }
 }
