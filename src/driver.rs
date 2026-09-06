@@ -378,6 +378,7 @@ mod tests {
             workspace: Some("/work".into()),
             supervisor: None,
             desired_state: AgentDesiredState::Running,
+            residency_policy: agent_spec::ResidencyPolicy::Always,
             keep: false,
             restart: None,
             delivery: None,

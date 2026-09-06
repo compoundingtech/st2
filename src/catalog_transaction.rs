@@ -709,6 +709,13 @@ fn normalize_agent(spec: &agent_spec::AgentSpec) -> Result<BTreeMap<String, Sema
         SemanticType::String,
         spec.desired_state.reason(),
     );
+    insert_default_value(
+        &mut fields,
+        &format!("{base}/residency-policy"),
+        SemanticType::String,
+        spec.residency_policy.as_str().to_owned(),
+        spec.residency_policy == agent_spec::ResidencyPolicy::Always,
+    );
     insert_default_bool(&mut fields, &format!("{base}/keep"), spec.keep, false);
     insert_optional(
         &mut fields,
@@ -3480,6 +3487,38 @@ mod tests {
             .get("/agents/host/worker/streams/webhook/launch")
             .expect("external stream must affect semantic projection");
         assert_eq!(atom, &present_atom(SemanticType::String, "external"));
+    }
+
+    #[test]
+    fn residency_policy_participates_in_semantic_catalog_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = root.path().join("agents/host/worker");
+        std::fs::create_dir_all(&agent).unwrap();
+        let path = agent.join("agent.kdl");
+        std::fs::write(
+            &path,
+            "agent \"worker\" {\n  host \"host\"\n  command \"worker\"\n}\n",
+        )
+        .unwrap();
+        let discovered = agent_spec::discover_strict(root.path());
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+        let address = "/agents/host/worker/residency-policy";
+        assert_eq!(
+            normalize_agent(&discovered.specs[0]).unwrap()[address],
+            default_atom(SemanticType::String)
+        );
+
+        std::fs::write(
+            path,
+            "agent \"worker\" {\n  host \"host\"\n  command \"worker\"\n  session-driver \"codex\"\n  residency-policy \"on-demand\"\n}\n",
+        )
+        .unwrap();
+        let discovered = agent_spec::discover_strict(root.path());
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+        assert_eq!(
+            normalize_agent(&discovered.specs[0]).unwrap()[address],
+            present_atom(SemanticType::String, "on-demand")
+        );
     }
 
     #[test]

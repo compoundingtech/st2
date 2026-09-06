@@ -93,6 +93,22 @@ fn agent_node_to_raw(agent: &DeclaredAgent) -> anyhow::Result<RawSpec> {
             "workspace" => raw.workspace = arg_string(child),
             "supervisor" => raw.supervisor = arg_string(child),
             "retired" | "desired-state" => {}
+            "residency-policy" => {
+                anyhow::ensure!(
+                    raw.residency_policy.is_none(),
+                    "agent declares `residency-policy` more than once"
+                );
+                anyhow::ensure!(
+                    child.type_name.is_none()
+                        && child.children.is_empty()
+                        && child.entries.len() == 1
+                        && child.entries[0].name.is_none(),
+                    "agent `residency-policy` must contain exactly one positional string"
+                );
+                raw.residency_policy = Some(Some(arg_string(child).ok_or_else(|| {
+                    anyhow::anyhow!("agent residency-policy value must be a string")
+                })?));
+            }
             "keep" => raw.keep = arg_bool(child),
             "lifecycle" => raw.lifecycle = arg_string(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),

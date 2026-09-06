@@ -687,6 +687,53 @@ registry has independent producers which catalog EX cannot reserve, so atomic
 process adoption, continuity, or PTY-root migration requires a separate PTY
 registry protocol. Bootstrap claims only atomic declaration publication.
 
+## On-demand residency (R44-R46)
+
+Desired lifecycle and runtime residency are independent:
+
+```text
+desired state:      running | suspended | retired
+residency policy:   always | on-demand
+runtime residency:  active -> quiescing -> stopping -> cold
+                                 demand waits |          |
+                                              `-> starting -> active
+```
+
+The canonical declaration is `residency-policy "on-demand"`; omission and
+`"always"` are semantically equal. On-demand policy requires a native session
+driver. It grants eligibility only while desired state is running. A transition
+to suspended or retired hands ownership back to ordinary desired-state
+reconciliation rather than adding a second desired lifecycle.
+
+Runtime residency is recorded in one
+`st2.residency-ledger.v1` host-local record keyed by the immutable agent ID and
+host. The record carries the native driver, a positive generation, the closed
+runtime-residency state, and whether external demand was observed during a
+transition. It does not carry message filenames, delivery attempts, native
+session identifiers, or process observations. Those remain authoritative in
+the inbox and delivery ledger, provider binding, and task inventory.
+
+Every transition is generation-fenced. After idle confirmation, the monotonic
+order is checkpoint native session, stop the complete owned task group, verify
+absence, and become cold. Demand observed after checkpointing sets a durable
+wake-pending fact but does not cancel teardown. A cold or newly absent runtime
+then prepares exact native resume, launches the owned group, verifies the saved
+native session, and becomes active. A mismatch, unsupported driver capability,
+indeterminate presence, malformed ledger, or foreign ownership becomes a
+fail-closed refusal. No path substitutes a fresh session.
+
+`st2 tasks --json` uses schema `st2.task-inventory.v3`. Each task row appends
+`residencyPolicy` and nullable `runtimeResidency` beside the existing process
+`runtime` observation. A missing ledger is `null`, never inferred as active or
+cold. A malformed, unsupported, or wrongly owned ledger makes the inventory
+incomplete and reports the error without mutating state.
+
+The first wake authorities are an unread durable inbox message and an explicit
+operator wake or attach request. Passive CPU, filesystem access, PTY attachment
+state, and Resource observation are not demand. Host policy owns idle thresholds
+and warm capacity. Telemetry measures resume-to-ready and demand-to-delivery
+latency before the project assigns a latency objective.
+
 ## Host-local scheduling and supervision
 
 ```text
@@ -874,14 +921,16 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   resume or replacement authority.
 
 - **R23:** `st2 tasks --json` is a read-only diagnostic boundary. It emits one
-  `st2.task-inventory.v2` envelope for the selected host. Rows are sorted by
+  `st2.task-inventory.v3` envelope for the selected host. Rows are sorted by
   immutable agent ID, task name, and runtime ID and cover both PTY and
-  terminal-free exec tasks. Each row includes immutable agent ID and nullable
-  current bus address; a proved non-routable retired subject has a null address
+  terminal-free exec tasks. Each row includes immutable agent ID, nullable
+  current bus address, declared residency policy, and nullable host-local
+  runtime residency; a proved non-routable retired subject has a null address
   without weakening completeness. `complete=false` plus a non-zero exit is a
-  closed result: a consumer must not turn a missing row into absence. A running
-  row always carries a PID, creation time, opaque generation ID derived from
-  stable backend evidence, and the required `runtime.resourceTarget`.
+  closed result: a consumer must not turn a missing row or residency record
+  into absence. A running row always carries a PID, creation time, opaque
+  generation ID derived from stable backend evidence, and the required
+  `runtime.resourceTarget`.
 
   `resourceTarget` is internally tagged by `type` and has exactly these wire
   shapes:

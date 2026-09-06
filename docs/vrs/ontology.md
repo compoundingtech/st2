@@ -31,6 +31,37 @@ A running instance of an agent declaration.
 Authority: [declared runtime vision](vision.md);
 [`AgentSpec` runtime model](../../crates/agent-spec/src/spec.rs)
 
+### residency policy
+
+The Agent Spec choice `always | on-demand`. `always` requires a
+desired-running agent to remain resident. `on-demand` permits host policy to
+make it cold. The policy never changes desired state.
+
+The declaration field is `residency-policy`. Avoid using *suspended* for the
+cold runtime state; suspended is explicit desired lifecycle.
+
+Authority: [R44 declared residency policy](requirements.md);
+[on-demand residency](spec.md#on-demand-residency-r44-r46)
+
+### runtime residency
+
+The host-local on-demand lifecycle state `active | quiescing | stopping | cold
+| starting | refused`. Runtime residency is distinct from desired state,
+[session state](#session-state), [observed harness state](#observed-harness-state),
+and delivery evidence.
+
+Authority: [R45 lossless on-demand transition](requirements.md);
+[`residency`](../../src/residency.rs)
+
+### wake demand
+
+Durable work that requires a cold agent to become active. The initial sources
+are an unread inbox message and an explicit operator wake or attach request.
+Observation alone is not wake demand.
+
+Authority: [R46 durable wake demand](requirements.md);
+[on-demand residency](spec.md#on-demand-residency-r44-r46)
+
 ### agent task
 
 A terminal-backed or terminal-free unit declared for an agent.

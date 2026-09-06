@@ -58,6 +58,7 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
+pub mod residency;
 pub mod resource_observe;
 pub mod resource_profile;
 pub mod resource_profile_supervisor;
@@ -80,8 +81,8 @@ pub use agent_spec::{discovery, spec};
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, SessionDriver, Task,
-    TaskKind, TaskLifecycle, parse_duration,
+    OmpDriver, OpenCodeDriver, PiDriver, ResidencyPolicy, Resource, Restart, RestartMode,
+    SessionDriver, Task, TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
