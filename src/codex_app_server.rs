@@ -90,6 +90,8 @@ const CLASSIFIED_CODEX_THREAD_ITEMS: &[&str] = &[
 const RUNTIME_SCHEMA: &str = "st2.codex-runtime.v1";
 const BINDING_SCHEMA: &str = "st2.codex-thread-binding.v1";
 const CONTROL_STATE_SCHEMA: &str = "st2.codex-control-state.v1";
+const RESIDENCY_CHECKPOINT_SCHEMA: &str = "st2.codex-residency-checkpoint.v1";
+const RESIDENCY_CHECKPOINT_FILE: &str = "residency-checkpoint.json";
 const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st2.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
@@ -156,11 +158,19 @@ pub struct CodexRuntime {
 
 impl CodexRuntime {
     fn fresh(agent: String, runtime_id: String) -> Result<Self> {
+        Self::with_incarnation(agent, runtime_id, random_token()?)
+    }
+
+    fn with_incarnation(agent: String, runtime_id: String, incarnation: String) -> Result<Self> {
+        anyhow::ensure!(
+            !incarnation.is_empty(),
+            "Codex runtime incarnation is empty"
+        );
         Ok(Self {
             schema: RUNTIME_SCHEMA.to_string(),
             agent,
             runtime_id,
-            incarnation: random_token()?,
+            incarnation,
         })
     }
 
@@ -204,6 +214,21 @@ impl CodexThreadBinding {
 
     pub fn runtime_incarnation(&self) -> &str {
         &self.runtime_incarnation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexResidencyCheckpoint {
+    schema: String,
+    source_generation: crate::residency::Generation,
+    resume_generation: crate::residency::Generation,
+    binding: CodexThreadBinding,
+}
+
+impl CodexResidencyCheckpoint {
+    pub fn thread_id(&self) -> &str {
+        self.binding.thread_id()
     }
 }
 
@@ -1456,10 +1481,73 @@ pub fn run_controlled(
     runtime_id: String,
     codex_argv: Vec<String>,
 ) -> Result<()> {
+    run_controlled_with_required_resume(
+        catalog_root,
+        identity,
+        runtime_id,
+        codex_argv,
+        None,
+        None,
+    )
+}
+
+/// Run one host-owned cold-residency attempt under its exact incarnation.
+pub fn run_controlled_residency_attempt(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+    resume_generation: crate::residency::Generation,
+    required_incarnation: String,
+) -> Result<()> {
+    anyhow::ensure!(
+        !required_incarnation.is_empty(),
+        "Codex required runtime incarnation is empty"
+    );
+    run_controlled_with_required_resume(
+        catalog_root,
+        identity,
+        runtime_id,
+        codex_argv,
+        Some(resume_generation),
+        Some(required_incarnation),
+    )
+}
+
+fn run_controlled_with_required_resume(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+    required_resume_generation: Option<crate::residency::Generation>,
+    required_incarnation: Option<String>,
+) -> Result<()> {
     anyhow::ensure!(
         !codex_argv.is_empty(),
         "Codex controlled launch argv is empty"
     );
+    anyhow::ensure!(
+        required_resume_generation.is_some() == required_incarnation.is_some(),
+        "Codex residency launch has an incomplete attempt fence"
+    );
+    // Install before any protocol preflight child exists. A SIGTERM in the preflight window must
+    // set the stop flag instead of leaving a detached app server and stale socket behind.
+    crate::provider_session::install_signal_handler();
+    let state_dir = state_dir(catalog_root, &identity);
+    secure_dir(&state_dir)?;
+    let _owner_lock = acquire_owner_lock(&state_dir)?;
+    let binding_path = state_dir.join("binding.json");
+    let resume_thread = match required_resume_generation {
+        Some(generation) => Some(required_residency_resume(
+            &state_dir,
+            &identity,
+            &runtime_id,
+            generation,
+            &codex_argv[1..],
+        )?),
+        None => load_resume_thread(&binding_path, &identity, &runtime_id)?,
+    };
+
     let mut delivery = CodexDeliveryConfig::resolve(catalog_root, &identity)?;
     match ensure_supported_protocol(&codex_argv[0]) {
         // The admitted version is the one fact the gate learns that outlives it: the diagnostic
@@ -1471,9 +1559,6 @@ pub fn run_controlled(
         }
     }
 
-    let state_dir = state_dir(catalog_root, &identity);
-    secure_dir(&state_dir)?;
-    let _owner_lock = acquire_owner_lock(&state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(&state_dir, &identity, &runtime_id)?;
     diagnostics.record("ownerAcquired", json!({}))?;
 
@@ -1484,6 +1569,8 @@ pub fn run_controlled(
         runtime_id,
         codex_argv,
         delivery,
+        resume_thread,
+        required_incarnation,
         &mut diagnostics,
     );
     match result {
@@ -1512,16 +1599,10 @@ fn run_controlled_owned(
     runtime_id: String,
     codex_argv: Vec<String>,
     delivery: CodexDeliveryConfig,
+    resume_thread: Option<String>,
+    required_incarnation: Option<String>,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
-    // Installed before ANY child exists — the hook-trust preflight spawns a detached app-server
-    // first, and a SIGTERM landing in that window must set the stop flag its connect loop polls
-    // rather than killing this wrapper around a leaked server and a stale socket. (Installing
-    // resets the flag, so this must also run exactly once per launch.)
-    crate::provider_session::install_signal_handler();
-    let binding_path = state_dir.join("binding.json");
-    let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
-
     let socket_path = socket_path(catalog_root, &identity)?;
     let socket_dir = socket_path
         .parent()
@@ -1529,9 +1610,12 @@ fn run_controlled_owned(
     secure_dir(socket_dir)?;
     prepare_socket_for_launch(&socket_path)?;
 
-    // Publish a new incarnation only after this process holds the owner lock and has proved that no
-    // older daemon is live. A rejected second owner must not invalidate the first owner's binding.
-    let runtime = CodexRuntime::fresh(identity, runtime_id)?;
+    // Publish the host-owned incarnation for a residency attempt only after this process holds
+    // the owner lock. Ordinary launches continue to mint their incarnation at this boundary.
+    let runtime = match required_incarnation {
+        Some(incarnation) => CodexRuntime::with_incarnation(identity, runtime_id, incarnation)?,
+        None => CodexRuntime::fresh(identity, runtime_id)?,
+    };
     atomic_json(&state_dir.join("runtime.json"), &runtime)?;
     diagnostics.record(
         "runtimePublished",
@@ -3061,7 +3145,85 @@ fn load_current_control_state(
     Ok(Some(state))
 }
 
-fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Option<String>> {
+pub fn checkpoint_residency(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    source_generation: crate::residency::Generation,
+    resume_generation: crate::residency::Generation,
+) -> Result<CodexResidencyCheckpoint> {
+    anyhow::ensure!(
+        source_generation.0.checked_add(1) == Some(resume_generation.0),
+        "Codex residency checkpoint generation is not monotonic"
+    );
+    let binding = load_thread_binding(&state_dir.join("binding.json"), agent, runtime_id)?
+        .with_context(|| format!("Codex runtime {runtime_id:?} has no native thread binding"))?;
+    let checkpoint = CodexResidencyCheckpoint {
+        schema: RESIDENCY_CHECKPOINT_SCHEMA.to_owned(),
+        source_generation,
+        resume_generation,
+        binding,
+    };
+    atomic_json(&state_dir.join(RESIDENCY_CHECKPOINT_FILE), &checkpoint)?;
+    Ok(checkpoint)
+}
+
+pub fn required_residency_resume(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_generation: crate::residency::Generation,
+    authored_args: &[String],
+) -> Result<String> {
+    anyhow::ensure!(
+        resume_insertion_index(authored_args)?.is_some(),
+        "authored Codex session selection conflicts with mandatory residency resume"
+    );
+    let checkpoint = load_residency_checkpoint(state_dir, agent, runtime_id, resume_generation)?;
+    let current = load_thread_binding(&state_dir.join("binding.json"), agent, runtime_id)?
+        .with_context(|| format!("Codex runtime {runtime_id:?} has no native thread binding"))?;
+    anyhow::ensure!(
+        current == checkpoint.binding,
+        "Codex native thread binding changed after residency checkpoint"
+    );
+    Ok(current.thread_id)
+}
+
+fn load_residency_checkpoint(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_generation: crate::residency::Generation,
+) -> Result<CodexResidencyCheckpoint> {
+    let path = state_dir.join(RESIDENCY_CHECKPOINT_FILE);
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading Codex residency checkpoint {}", path.display()))?;
+    let checkpoint: CodexResidencyCheckpoint = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        checkpoint.schema == RESIDENCY_CHECKPOINT_SCHEMA,
+        "unsupported Codex residency checkpoint schema"
+    );
+    anyhow::ensure!(
+        checkpoint.resume_generation == resume_generation
+            && checkpoint.source_generation.0.checked_add(1) == Some(resume_generation.0),
+        "Codex residency checkpoint belongs to a different generation"
+    );
+    anyhow::ensure!(
+        checkpoint.binding.agent == agent && checkpoint.binding.runtime_id == runtime_id,
+        "Codex residency checkpoint belongs to a different agent runtime"
+    );
+    anyhow::ensure!(
+        !checkpoint.binding.thread_id.is_empty(),
+        "Codex residency checkpoint has an empty native thread id"
+    );
+    Ok(checkpoint)
+}
+
+fn load_thread_binding(
+    path: &Path,
+    agent: &str,
+    runtime_id: &str,
+) -> Result<Option<CodexThreadBinding>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3080,7 +3242,11 @@ fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Opti
         !binding.thread_id.is_empty(),
         "Codex resume binding has an empty thread id"
     );
-    Ok(Some(binding.thread_id))
+    Ok(Some(binding))
+}
+
+fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Option<String>> {
+    Ok(load_thread_binding(path, agent, runtime_id)?.map(|binding| binding.thread_id))
 }
 
 fn random_token() -> Result<String> {

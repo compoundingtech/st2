@@ -133,6 +133,12 @@ pub(crate) enum Command {
         /// Exact reconciled PTY task identity for this runtime.
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed thread.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         /// Original structured Codex invocation, including its provider executable.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         codex_argv: Vec<String>,
@@ -339,6 +345,12 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed thread.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },

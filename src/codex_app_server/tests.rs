@@ -2661,6 +2661,213 @@ fn a_binding_from_another_runtime_incarnation_is_rejected() {
 }
 
 #[test]
+fn residency_checkpoint_requires_and_preserves_the_exact_bound_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&runtime, "thread-prior".into()),
+    )
+    .unwrap();
+
+    let checkpoint = checkpoint_residency(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(1),
+        crate::residency::Generation(2),
+    )
+    .unwrap();
+    assert_eq!(checkpoint.thread_id(), "thread-prior");
+    assert_eq!(
+        required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            &["--model".into(), "gpt-test".into(), "boot".into()],
+        )
+        .unwrap(),
+        "thread-prior"
+    );
+
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&runtime, "thread-replaced".into()),
+    )
+    .unwrap();
+    let error = required_residency_resume(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        &["boot".into()],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("changed after residency checkpoint")
+    );
+}
+
+#[test]
+fn mandatory_residency_resume_refuses_missing_or_authored_session_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let error = checkpoint_residency(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(1),
+        crate::residency::Generation(2),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("has no native thread binding"));
+
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&runtime, "thread-prior".into()),
+    )
+    .unwrap();
+    checkpoint_residency(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(1),
+        crate::residency::Generation(2),
+    )
+    .unwrap();
+    for authored in [
+        vec!["resume".into(), "thread-other".into()],
+        vec!["fork".into(), "thread-other".into()],
+    ] {
+        let error = required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            &authored,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authored Codex session selection")
+        );
+    }
+}
+
+#[test]
+fn residency_resume_rejects_missing_corrupt_foreign_and_stale_checkpoints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&runtime, "thread-prior".into()),
+    )
+    .unwrap();
+
+    let missing = required_residency_resume(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        &["boot".into()],
+    )
+    .unwrap_err();
+    assert!(missing.to_string().contains("residency checkpoint"));
+
+    checkpoint_residency(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(1),
+        crate::residency::Generation(2),
+    )
+    .unwrap();
+    let stale = required_residency_resume(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(3),
+        &["boot".into()],
+    )
+    .unwrap_err();
+    assert!(stale.to_string().contains("different generation"));
+
+    let foreign_runtime = CodexRuntime::fresh("h.other".into(), "h.other".into()).unwrap();
+    atomic_json(
+        &state.join(RESIDENCY_CHECKPOINT_FILE),
+        &CodexResidencyCheckpoint {
+            schema: RESIDENCY_CHECKPOINT_SCHEMA.into(),
+            source_generation: crate::residency::Generation(1),
+            resume_generation: crate::residency::Generation(2),
+            binding: CodexThreadBinding::new(&foreign_runtime, "thread-prior".into()),
+        },
+    )
+    .unwrap();
+    let foreign = required_residency_resume(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        &["boot".into()],
+    )
+    .unwrap_err();
+    assert!(foreign.to_string().contains("different agent runtime"));
+
+    fs::write(state.join(RESIDENCY_CHECKPOINT_FILE), b"{").unwrap();
+    assert!(
+        required_residency_resume(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            &["boot".into()],
+        )
+        .is_err(),
+        "a corrupt residency checkpoint was accepted"
+    );
+}
+
+#[test]
+fn mandatory_residency_failure_does_not_spawn_a_provider_child() {
+    let _stop_exclusive = stop_flag_tests();
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("provider-started");
+    let codex = tmp.path().join("codex");
+    fs::write(
+        &codex,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = run_controlled_residency_attempt(
+        tmp.path(),
+        "h.worker".into(),
+        "h.worker".into(),
+        vec![codex.display().to_string(), "boot".into()],
+        crate::residency::Generation(2),
+        "attempt-test".into(),
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("residency checkpoint"),
+        "{error:#}"
+    );
+    assert!(
+        !marker.exists(),
+        "a provider process started before mandatory resume validation"
+    );
+}
+
+#[test]
 fn watcher_holds_without_an_exact_turn_and_tracks_one_unmatched_lifecycle() {
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let mut state = CodexControlState::new(&runtime, "thread-main".into());

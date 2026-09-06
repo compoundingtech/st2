@@ -97,11 +97,31 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::CodexAppServer {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             codex_argv,
         } => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, codex_argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::codex_app_server::run_controlled_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        codex_argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => st2::codex_app_server::run_controlled(
+                    &catalog,
+                    identity,
+                    runtime_id,
+                    codex_argv,
+                ),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::ClaudeMcp { identity } => {
             let catalog = catalog_arg(None)?;
@@ -111,11 +131,28 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::Codex {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::codex_app_server::run_controlled_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => {
+                    st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+                }
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
             let catalog = catalog_arg(None)?;
