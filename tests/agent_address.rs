@@ -596,3 +596,100 @@ fn authoring_selects_the_declaration_key_and_not_the_current_address() {
         assert_eq!(admitted["address"], "back.alpha", "for {selector}");
     }
 }
+
+/// Message resolution deduplicates candidates by agent ID, so two declarations sharing one
+/// effective ID must refuse rather than deliver into whichever file came first in path order.
+#[test]
+fn two_declarations_sharing_one_effective_id_refuse_a_reference() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/alpha/agent.kdl",
+        &declaration(
+            "alpha",
+            "h",
+            "catalog",
+            "  id \"dup\"\n  address \"chat\"\n",
+        ),
+    );
+    write(
+        root,
+        "h/beta/agent.kdl",
+        &declaration("beta", "h", "catalog", "  id \"dup\"\n"),
+    );
+
+    let refused = run(
+        root,
+        &[
+            "message", "send", "chat", "--host", "h", "--as", "h.beta", "-m", "who am I",
+        ],
+        None,
+    );
+    assert!(
+        !refused.status.success(),
+        "one id naming two declarations must not deliver: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("ambiguous") && stderr.contains("2 subjects"),
+        "{stderr}"
+    );
+}
+
+/// Both routing planes pin the local host first, so one reference decides identically whether it
+/// arrives through `message send` or through stream ingress.
+#[test]
+fn a_bare_address_declared_on_two_hosts_resolves_to_the_local_subject() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/local/agent.kdl",
+        &declaration("local", "h", "catalog", "  address \"chat\"\n"),
+    );
+    write(
+        root,
+        "g/remote/agent.kdl",
+        &declaration("remote", "g", "catalog", "  address \"chat\"\n"),
+    );
+    write(
+        root,
+        "h/sender/agent.kdl",
+        &declaration("sender", "h", "catalog", ""),
+    );
+
+    let sent = run(
+        root,
+        &[
+            "message",
+            "send",
+            "chat",
+            "--host",
+            "h",
+            "--as",
+            "h.sender",
+            "-m",
+            "local wins",
+        ],
+        None,
+    );
+    assert!(
+        sent.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert_eq!(
+        st2::message::list_dir(&st2::message::inbox_dir(&root.join("h/local")))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        st2::message::list_dir(&st2::message::inbox_dir(&root.join("g/remote")))
+            .unwrap()
+            .is_empty(),
+        "the foreign host's subject must not receive a locally pinned reference"
+    );
+}

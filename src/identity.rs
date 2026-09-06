@@ -38,8 +38,11 @@ pub enum AgentSelector {
 
 /// One routable subject in the address book.
 ///
-/// Retired subjects are absent: retirement releases the address and makes the subject
-/// non-routable, so it neither resolves nor occupies the namespace. Suspended subjects are present.
+/// Retired subjects are absent: retirement releases the address for *claiming*, so a retired
+/// subject never occupies the namespace and never makes a live claimant's reference ambiguous.
+/// It still answers on its own declared address when no routable subject does, which is what
+/// keeps its retained state — status, context, message boxes — reachable by name (Q3: retirement
+/// keeps the bytes). Suspended subjects are fully present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressBookEntry {
     /// The immutable catalog-global agent ID: the explicit `id`, else the positional bus identity
@@ -67,10 +70,12 @@ impl AddressBookEntry {
 pub enum ResolveError {
     /// No routable subject carries this address, in any admitted reading.
     Unknown { reference: String },
-    /// More than one distinct subject survives, so the reference is undecidable.
+    /// More than one subject survives, so the reference is undecidable.
     Ambiguous {
         reference: String,
-        /// The surviving subjects' IDs, sorted, so a diagnostic can name them.
+        /// One key per surviving subject, sorted, so a diagnostic can name and count them: the
+        /// agent ID, or the declaration key where two declarations share one ID and the ID would
+        /// name the same bytes twice.
         ids: Vec<String>,
     },
 }
@@ -80,14 +85,17 @@ impl std::fmt::Display for ResolveError {
         match self {
             Self::Unknown { reference } => write!(
                 formatter,
-                "no routable agent has the address '{reference}'; a retired subject releases its address and does not resolve"
+                "no routable agent has the address '{reference}'; a retired subject releases its address for claiming and answers only when nothing routable does"
             ),
-            Self::Ambiguous { reference, ids } => write!(
-                formatter,
-                "the reference '{reference}' is ambiguous: it names {} subjects ({}); qualify it with a host or select the subject by its exact id",
-                ids.len(),
-                ids.join(", ")
-            ),
+            Self::Ambiguous { reference, ids } => {
+                let count = ids.len();
+                let subjects = if count == 1 { "subject" } else { "subjects" };
+                write!(
+                    formatter,
+                    "the reference '{reference}' is ambiguous: it names {count} {subjects} ({}); qualify it with a host or select the subject by its exact id",
+                    ids.join(", ")
+                )
+            }
         }
     }
 }
@@ -121,8 +129,9 @@ pub fn resolve_id<'a>(
     if ids.len() == 1 {
         return Ok(selected);
     }
+    // Not deduplicated: two declarations sharing one effective ID are two subjects, and reporting
+    // one name for them would say "names 1 subject" about an undecidable reference.
     ids.sort();
-    ids.dedup();
     Err(ResolveError::Ambiguous {
         reference: id.to_owned(),
         ids,
@@ -199,6 +208,24 @@ pub fn resolve<'a>(
     match selector {
         AgentSelector::Id(id) => resolve_id(entries, id),
         AgentSelector::Address(reference) => resolve_address(entries, reference, pinned_host),
+    }
+}
+
+/// Resolve a reference on the local host first, then across the whole catalog.
+///
+/// A bare address names this host's subject even when another host declares the same address —
+/// today's behavior — while a reference only a foreign host answers still resolves, so a caller
+/// that owns only local subjects can refuse it by name instead of reporting an absence. Every
+/// plane that routes uses this, so `st2 message send chat` and `st2 event emit chat` decide one
+/// reference the same way.
+pub fn resolve_local_first<'a>(
+    entries: &'a [AddressBookEntry],
+    selector: &AgentSelector,
+    this_host: &str,
+) -> std::result::Result<&'a AddressBookEntry, ResolveError> {
+    match resolve(entries, selector, Some(this_host)) {
+        Err(ResolveError::Unknown { .. }) => resolve(entries, selector, None),
+        other => other,
     }
 }
 

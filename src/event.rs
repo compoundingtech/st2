@@ -340,7 +340,7 @@ fn resolve_stream(
     // address when nothing routable does, which is what turns "no such agent" into the
     // `RecipientNotRunning` refusal a supervisor can act on.
     let book = crate::identity::address_book(&discovered.specs, this_host);
-    let selected = match pinned_then_unpinned(&book, recipient, this_host) {
+    let selected = match crate::identity::resolve_local_first(&book, recipient, this_host) {
         Err(crate::identity::ResolveError::Unknown { .. }) => {
             let every_subject = discovered
                 .specs
@@ -352,7 +352,7 @@ fn resolve_stream(
                     address: spec.effective_address().to_owned(),
                 })
                 .collect::<Vec<_>>();
-            pinned_then_unpinned(&every_subject, recipient, this_host)
+            crate::identity::resolve_local_first(&every_subject, recipient, this_host)
                 .map(|entry| (entry.id.clone(), entry.bus_identity.clone()))
         }
         other => other.map(|entry| (entry.id.clone(), entry.bus_identity.clone())),
@@ -367,11 +367,23 @@ fn resolve_stream(
             format!("agent recipient '{reference}' is ambiguous; {error}"),
         ),
     })?;
-    let spec = discovered
+    let mut claimants = discovered
         .specs
         .iter()
-        .find(|spec| spec.bus_id(this_host) == bus_identity)
+        .filter(|spec| spec.bus_id(this_host) == bus_identity);
+    let spec = claimants
+        .next()
         .context("the resolved agent left the discovery it was resolved against")?;
+    // Two declarations under one key answer nothing decidably: the resolved subject and the spec
+    // this walk would publish against could be different files.
+    if claimants.next().is_some() {
+        return Err(StreamRefusal::new(
+            RefusalKind::Permanent,
+            format!(
+                "agent recipient '{reference}' names more than one declaration of '{bus_identity}'"
+            ),
+        ));
+    }
     let key = bus_identity;
     if spec.resolved_host(this_host) != this_host {
         return Err(StreamRefusal::new(
@@ -416,24 +428,6 @@ fn resolve_stream(
         selector: AgentSelector::Id(agent_id),
         recipient: key,
     })
-}
-
-/// Try the local host first, then the whole catalog.
-///
-/// A bare address names this host's subject even when another host declares the same address —
-/// today's behavior — while a reference only a foreign host answers still resolves, so the caller
-/// can refuse it by name.
-fn pinned_then_unpinned<'a>(
-    book: &'a [crate::identity::AddressBookEntry],
-    recipient: &AgentSelector,
-    this_host: &str,
-) -> std::result::Result<&'a crate::identity::AddressBookEntry, crate::identity::ResolveError> {
-    match crate::identity::resolve(book, recipient, Some(this_host)) {
-        Err(crate::identity::ResolveError::Unknown { .. }) => {
-            crate::identity::resolve(book, recipient, None)
-        }
-        other => other,
-    }
 }
 
 pub fn render_event(

@@ -1178,7 +1178,7 @@ fn find_agent_handle(
         if before != after {
             continue;
         }
-        return Ok(select_agent(candidates, selector));
+        return Ok(select_agent(candidates, selector, this_host));
     }
     anyhow::bail!("catalog address book changed repeatedly while resolving {selector:?}")
 }
@@ -1225,10 +1225,12 @@ fn selector_reference(selector: &AgentSelector) -> &str {
 fn select_agent(
     candidates: Vec<AddressableAgent>,
     selector: &AgentSelector,
+    this_host: &str,
 ) -> std::result::Result<AddressableAgent, ResolveError> {
     let index = select_index(
         &candidates,
         selector,
+        this_host,
         AddressableAgent::entry,
         |candidate| candidate.retired,
     )?;
@@ -1244,6 +1246,7 @@ fn select_spec<'a>(
     let index = select_index(
         specs,
         selector,
+        this_host,
         |spec| crate::identity::AddressBookEntry {
             id: spec.effective_id(this_host),
             bus_identity: spec.bus_id(this_host),
@@ -1262,9 +1265,12 @@ fn select_spec<'a>(
 /// a live claimant's reference ambiguous. It answers to its own declaration address only when no
 /// routable subject answers at all, which keeps its retained state — status, context, message
 /// boxes — reachable by name exactly as it is today.
+///
+/// The local host is the pin, so this plane and stream ingress decide one reference identically.
 fn select_index<T>(
     candidates: &[T],
     selector: &AgentSelector,
+    this_host: &str,
     entry: impl Fn(&T) -> crate::identity::AddressBookEntry,
     retired: impl Fn(&T) -> bool,
 ) -> std::result::Result<usize, ResolveError> {
@@ -1275,17 +1281,34 @@ fn select_index<T>(
         .filter(|(candidate, _)| !retired(candidate))
         .map(|(_, entry)| entry.clone())
         .collect::<Vec<_>>();
-    let resolved = match crate::identity::resolve(&routable, selector, None) {
+    let resolved = match crate::identity::resolve_local_first(&routable, selector, this_host) {
         Err(ResolveError::Unknown { .. }) if routable.len() != book.len() => {
-            crate::identity::resolve(&book, selector, None)
+            crate::identity::resolve_local_first(&book, selector, this_host)
         }
         other => other,
     };
     let id = &resolved?.id;
-    Ok(book
+    // Resolution deduplicates by agent ID, so two declarations sharing one effective ID collapse
+    // into one surviving entry — and then a positional lookup could hand back the other one. Two
+    // candidates under one ID are two subjects, not a first match.
+    let mut positions = book
         .iter()
-        .position(|candidate| &candidate.id == id)
-        .expect("the resolved entry came from this candidate set"))
+        .enumerate()
+        .filter(|(_, candidate)| &candidate.id == id);
+    let (index, _) = positions
+        .next()
+        .expect("the resolved entry came from this candidate set");
+    if positions.next().is_some() {
+        return Err(ResolveError::Ambiguous {
+            reference: selector_reference(selector).to_owned(),
+            ids: book
+                .iter()
+                .filter(|candidate| &candidate.id == id)
+                .map(|candidate| candidate.bus_identity.clone())
+                .collect(),
+        });
+    }
+    Ok(index)
 }
 
 fn address_fence(
