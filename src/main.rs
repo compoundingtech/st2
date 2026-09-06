@@ -67,6 +67,8 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             interval,
             agent,
             task,
+            residency_idle_after,
+            residency_warm_capacity,
         } => {
             let root = catalog_arg(root)?;
             if task.is_some() && !materialize_only && !once {
@@ -75,9 +77,23 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             if agent.is_some() && !materialize_only {
                 anyhow::bail!("--agent requires --materialize-only");
             }
-            up(&root, host, once, materialize_only, interval, agent, task)
+            up(
+                &root,
+                host,
+                once,
+                materialize_only,
+                interval,
+                agent,
+                task,
+                residency_idle_after.zip(residency_warm_capacity),
+            )
         }
         Command::Message(cmd) => message_cmd(cmd),
+        Command::Wake {
+            identity,
+            agent_id,
+            host,
+        } => wake_cmd(identity, agent_id, host),
         Command::Event(cmd) => event_cmd(cmd),
         Command::Stream(cmd) => stream_cmd(cmd),
         Command::Request(cmd) => request_cmd(cmd),
@@ -284,9 +300,8 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 Some(_) => (None, first),
                 None => (first, second),
             };
-            let state = state.context(
-                "a desired state is required: `running`, `suspended`, or `retired`",
-            )?;
+            let state = state
+                .context("a desired state is required: `running`, `suspended`, or `retired`")?;
             anyhow::ensure!(
                 matches!(state.as_str(), "running" | "suspended" | "retired"),
                 "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
@@ -900,6 +915,47 @@ fn catalog_root_for_env() -> Result<PathBuf> {
         )?;
     absolute_catalog_path(&root)
 }
+fn wake_cmd(
+    identity: Option<String>,
+    agent_id: Option<String>,
+    host: Option<String>,
+) -> Result<()> {
+    let root = catalog_root_for_env()?;
+    let host = host.unwrap_or_else(detect_host);
+    let declaration = selected_declaration(&root, &host, identity, agent_id)?
+        .context("wake requires an agent reference")?;
+    let found = discover(&root);
+    let spec = found
+        .specs
+        .iter()
+        .find(|spec| spec.bus_id(&host) == declaration)
+        .context("selected wake declaration disappeared")?;
+    anyhow::ensure!(
+        spec.residency_policy == st2::ResidencyPolicy::OnDemand && spec.desired_state.is_running(),
+        "wake target is not a running on-demand agent"
+    );
+    let agent_id = spec.effective_id(&host);
+    let path = st2::residency_host::request_wake(&root, &host, &agent_id)?;
+    println!(
+        "wake requested for '{}' on {host}; request {}",
+        spec.bus_id(&host),
+        path.display()
+    );
+    Ok(())
+}
+
+fn request_attach_wake(root: &Path, target: &str) -> Result<()> {
+    let host = detect_host();
+    let found = discover(root);
+    if let Some(spec) = found.specs.iter().find(|spec| {
+        spec.residency_policy == st2::ResidencyPolicy::OnDemand
+            && spec.desired_state.is_running()
+            && spec.bus_id(&host) == target
+    }) {
+        st2::residency_host::request_wake(root, &host, &spec.effective_id(&host))?;
+    }
+    Ok(())
+}
 
 /// Set the same native catalog environment that `st2 env` prints. The catalog's own declared session
 /// registry is used, not the caller's ambient one: these hand `pty` the roots of the *catalog*.
@@ -916,6 +972,11 @@ fn pty_cmd(args: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let root = catalog_root_for_env()?;
+    if args.first().is_some_and(|argument| argument == "attach")
+        && let Some(target) = args.get(1)
+    {
+        request_attach_wake(&root, target)?;
+    }
     let mut cmd = std::process::Command::new("pty");
     cmd.args(args);
     with_bus_env(&mut cmd, &root);
@@ -2136,10 +2197,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_route(&root, &host, &ctx)?,
             };
-            let mut view =
-                message::with_resolved_agent_dir(&root, &route_selector(&id), &host, |agent_dir| {
-                message::list_sent(agent_dir, include_body)
-            })?;
+            let mut view = message::with_resolved_agent_dir(
+                &root,
+                &route_selector(&id),
+                &host,
+                |agent_dir| message::list_sent(agent_dir, include_body),
+            )?;
             if let Some(recipient) = &to {
                 view.messages.retain(|message| message.to == *recipient);
             }
@@ -2369,8 +2432,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let recipient =
-                resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
+            let recipient = resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,
@@ -3230,12 +3292,16 @@ fn up(
     interval: u64,
     agent: Option<String>,
     task: Option<String>,
+    residency_policy: Option<(Duration, usize)>,
 ) -> Result<()> {
     // An st2-SPEC path (a `*.kdl` file, or a folder with one top-level spec `*.kdl`) supervises its
     // top-level team directly — no catalog discovery. Otherwise, the classic catalog reconcile loop.
     if let Some(spec_file) = st2::eval_run::resolve_spec_path(root) {
         if task.is_some() {
             anyhow::bail!("--task is for folder catalogs, not single-file specs");
+        }
+        if residency_policy.is_some() {
+            anyhow::bail!("host residency policy is supported only for folder catalogs");
         }
         if materialize_only {
             anyhow::bail!(
@@ -3318,11 +3384,23 @@ fn up(
 
     if once {
         let targeted = task.is_some();
-        let report = match task.as_deref() {
-            Some(selector) => {
+        let report = match (task.as_deref(), residency_policy) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--task cannot be combined with host residency policy")
+            }
+            (Some(selector), None) => {
                 st2::run::up_once_selected(&catalog_root, selector, &this_host, &runner)?
             }
-            None => up_once(&catalog_root, &this_host, &runner)?,
+            (None, Some((idle_after, warm_capacity))) => st2::up_once_with_residency(
+                &catalog_root,
+                &this_host,
+                &runner,
+                st2::residency_host::HostPolicy {
+                    idle_after,
+                    warm_capacity,
+                },
+            )?,
+            (None, None) => up_once(&catalog_root, &this_host, &runner)?,
         };
         println!("reconcile pass on host '{this_host}':");
         print_report(&report);
@@ -3347,17 +3425,31 @@ fn up(
         "st2: supervising {} on host '{this_host}' (reconcile every {interval}s + on change; Ctrl-C to stop)",
         root.display()
     );
-    let result = up_loop(
-        &catalog_root,
-        &this_host,
-        &runner,
-        Duration::from_secs(interval),
-        |report| {
-            if report.is_noteworthy() {
-                print_report(report);
-            }
-        },
-    );
+    let on_report = |report: &UpReport| {
+        if report.is_noteworthy() {
+            print_report(report);
+        }
+    };
+    let result = match residency_policy {
+        Some((idle_after, warm_capacity)) => st2::up_loop_with_residency(
+            &catalog_root,
+            &this_host,
+            &runner,
+            Duration::from_secs(interval),
+            st2::residency_host::HostPolicy {
+                idle_after,
+                warm_capacity,
+            },
+            on_report,
+        ),
+        None => up_loop(
+            &catalog_root,
+            &this_host,
+            &runner,
+            Duration::from_secs(interval),
+            on_report,
+        ),
+    };
     lock.release();
     result
 }

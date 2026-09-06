@@ -1635,6 +1635,7 @@ fn live_resync_specs(
 /// pass is SKIPPED (the error is recorded but nothing is reconciled) — treating a transient list
 /// failure as "no sessions" would double-spawn everything. `cap` carries flapping state across passes;
 /// `debounce` carries per-id liveness so a transient not-alive flicker isn't destructively reaped.
+#[cfg(test)]
 fn reconcile_pass(
     root: &Path,
     this_host: &str,
@@ -1645,6 +1646,32 @@ fn reconcile_pass(
     presentation_cursor: &mut PresentationPatchCursor,
     resync: Option<&crate::resync::ResyncSupervisor>,
     resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
+) -> UpReport {
+    reconcile_pass_with_residency(
+        root,
+        this_host,
+        task_context,
+        runner,
+        cap,
+        debounce,
+        presentation_cursor,
+        resync,
+        resource_profiles,
+        None,
+    )
+}
+
+fn reconcile_pass_with_residency(
+    root: &Path,
+    this_host: &str,
+    task_context: &TaskCompileContext,
+    runner: &dyn Runner,
+    cap: &mut FlappingCap,
+    debounce: &mut LivenessDebounce,
+    presentation_cursor: &mut PresentationPatchCursor,
+    resync: Option<&crate::resync::ResyncSupervisor>,
+    resource_profiles: Option<&crate::resource_profile_supervisor::ResourceProfileSupervisor>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
 ) -> UpReport {
     let catalog_lock = {
         let span = catalog_lock_span();
@@ -1797,7 +1824,7 @@ fn reconcile_pass(
         }
         compiled_specs.push(spec);
     }
-    let eligible_specs = compiled_specs
+    let mut eligible_specs = compiled_specs
         .iter()
         .filter(|spec| !materialized.failed_agents.contains(&spec.bus_id(this_host)))
         .cloned()
@@ -1825,6 +1852,37 @@ fn reconcile_pass(
     };
     let now = Instant::now();
     debounce.observe(&sessions, now);
+    if residency_policy.is_none() {
+        let mut gated = Vec::new();
+        for spec in &mut eligible_specs {
+            if spec.residency_policy == crate::ResidencyPolicy::OnDemand
+                && spec.desired_state.is_running()
+                && spec.resolved_host(this_host) == this_host
+            {
+                for task in &mut spec.tasks {
+                    task.lifecycle = crate::TaskLifecycle::AdoptOnly;
+                }
+                gated.push(spec.bus_id(this_host));
+            }
+        }
+        if !gated.is_empty() {
+            report.errors.push(format!(
+                "on-demand agents require host --residency-idle-after and --residency-warm-capacity: {}; launches suppressed",
+                gated.join(", ")
+            ));
+        }
+    }
+    let residency_pass = residency_policy.map(|policy| {
+        crate::residency_host::before_reconcile(
+            root,
+            this_host,
+            &mut eligible_specs,
+            &sessions,
+            runner,
+            policy,
+            &mut report,
+        )
+    });
     let mut plan = match crate::reconcile(&eligible_specs, &sessions, this_host) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1876,6 +1934,9 @@ fn reconcile_pass(
         &mut report,
         &mut install_new_live_seat,
     );
+    if let Some(pass) = residency_pass {
+        crate::residency_host::after_reconcile(runner, pass, &mut report);
+    }
     report.warnings.extend(boundary_warnings);
     if resync.is_some() || resource_profiles.is_some() {
         let loaded = crate::catalog::declared_profile_catalog(root)
@@ -2247,20 +2308,42 @@ fn finish_failed_reconcile_pass(span: &tracing::Span) {
 /// never `Err` — all failures are collected in `report.errors`. The debounce is throwaway too: a
 /// single pass has no prior liveness history, so it defers nothing (correct — one-shot has no flicker).
 pub fn up_once(root: &Path, this_host: &str, runner: &dyn Runner) -> anyhow::Result<UpReport> {
+    up_once_with_optional_residency(root, this_host, runner, None)
+}
+
+pub fn up_once_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    policy: crate::residency_host::HostPolicy,
+) -> anyhow::Result<UpReport> {
+    up_once_with_optional_residency(root, this_host, runner, Some(policy))
+}
+
+fn up_once_with_optional_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    policy: Option<crate::residency_host::HostPolicy>,
+) -> anyhow::Result<UpReport> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let started = Instant::now();
     let span = reconcile_span(this_host, "catalog");
     let report = {
         let _entered = span.enter();
-        let report = reconcile_pass(root,
-        this_host,
-        &task_context,
-        runner,
-        &mut FlappingCap::default(),
-        &mut debounce,
-        &mut PresentationPatchCursor::default(),
-        None, None);
+        let report = reconcile_pass_with_residency(
+            root,
+            this_host,
+            &task_context,
+            runner,
+            &mut FlappingCap::default(),
+            &mut debounce,
+            &mut PresentationPatchCursor::default(),
+            None,
+            None,
+            policy,
+        );
         finish_reconcile_pass(&span, &report);
         report
     };
@@ -2859,6 +2942,27 @@ pub fn up_loop(
     )
 }
 
+pub fn up_loop_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    policy: crate::residency_host::HostPolicy,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    install_signal_handler();
+    up_loop_until_with_residency(
+        root,
+        this_host,
+        runner,
+        interval,
+        &STOP,
+        best_effort_catalog_watcher,
+        Some(policy),
+        on_report,
+    )
+}
+
 fn up_loop_until(
     root: &Path,
     this_host: &str,
@@ -2866,10 +2970,40 @@ fn up_loop_until(
     interval: Duration,
     stop: &AtomicBool,
     install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogReconcileWatcher>,
+    on_report: impl FnMut(&UpReport),
+) -> anyhow::Result<()> {
+    up_loop_until_with_residency(
+        root,
+        this_host,
+        runner,
+        interval,
+        stop,
+        install_watcher,
+        None,
+        on_report,
+    )
+}
+
+fn up_loop_until_with_residency(
+    root: &Path,
+    this_host: &str,
+    runner: &dyn Runner,
+    interval: Duration,
+    stop: &AtomicBool,
+    install_watcher: impl FnOnce(&Path, Sender<()>) -> Option<crate::watch::CatalogReconcileWatcher>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     mut on_report: impl FnMut(&UpReport),
 ) -> anyhow::Result<()> {
     let task_context = TaskCompileContext::current(root.to_path_buf())?;
     let (tx, rx) = channel::<()>();
+    // Residency wake requests live under `.st2`, which declaration watching deliberately prunes.
+    // Create the bounded control directory durably before subscribing to it with an independent
+    // watcher so a request wakes this loop immediately without expanding declaration authority.
+    let _residency_watcher = residency_policy
+        .map(|_| crate::residency_host::prepare_wake_dir(root))
+        .transpose()
+        .context("prepare residency wake control directory")?
+        .and_then(|dir| crate::watch::watch_recursive_mutations(&dir, tx.clone()));
     let mut watcher = install_watcher(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
@@ -2934,15 +3068,18 @@ fn up_loop_until(
             let span = reconcile_span(this_host, "catalog");
             let pass = {
                 let _entered = span.enter();
-                let pass = reconcile_pass(root,
-                this_host,
-                &task_context,
-                runner,
-                &mut cap,
-                &mut debounce,
-                &mut presentation_cursor,
-                resync.as_ref(),
-                resource_profiles.as_ref());
+                let pass = reconcile_pass_with_residency(
+                    root,
+                    this_host,
+                    &task_context,
+                    runner,
+                    &mut cap,
+                    &mut debounce,
+                    &mut presentation_cursor,
+                    resync.as_ref(),
+                    resource_profiles.as_ref(),
+                    residency_policy,
+                );
                 finish_reconcile_pass(&span, &pass);
                 pass
             };

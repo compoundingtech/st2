@@ -201,6 +201,7 @@ pub(crate) fn describe_exit(exit: ExitStatus) -> String {
 /// `refresh_interval` for exactly as long as the spawned child lives. Fails on a nonzero exit;
 /// wrappers that need the exit itself use [`run_provider_observed`]. With an observer, the
 /// terminal record lands on every exit path this process survives.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider(
     provider: &str,
@@ -466,6 +467,35 @@ mod tests {
         let stopped = ExitStatus::from_raw(0x7f);
         assert_eq!((stopped.code(), stopped.signal()), (None, None));
     }
+    #[test]
+    fn an_explicit_session_incarnation_is_claimed_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _observer = SessionObserver::with_session(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            "hetz.worker",
+            "attempt-exact".into(),
+        )
+        .unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(harness_state::harness_state_path(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["incarnation"], "attempt-exact");
+
+        let error = SessionObserver::with_session(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            "hetz.worker",
+            String::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("incarnation is empty"));
+    }
+
     #[test]
     fn explicit_environment_removal_precedes_managed_values() {
         const FENCE: &str = "ST2_TEST_PROVIDER_FENCE";

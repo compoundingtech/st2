@@ -5,6 +5,7 @@
 //! binary crate: nothing here is part of any public API.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -60,6 +61,28 @@ pub(crate) enum Command {
         /// immediately regardless).
         #[arg(long, default_value_t = 30)]
         interval: u64,
+        /// Host idle threshold before an eligible on-demand agent may become cold.
+        #[arg(
+            long,
+            value_parser = st2::parse_duration,
+            requires = "residency_warm_capacity"
+        )]
+        residency_idle_after: Option<Duration>,
+        /// Minimum number of eligible on-demand agents that this host keeps warm.
+        #[arg(long, requires = "residency_idle_after")]
+        residency_warm_capacity: Option<usize>,
+    },
+    /// Durably request that the host supervisor wake one on-demand agent.
+    Wake {
+        /// Agent bus address or unique local identity.
+        #[arg(required_unless_present = "agent_id")]
+        identity: Option<String>,
+        /// Exact immutable agent ID.
+        #[arg(long = "agent-id", conflicts_with = "identity")]
+        agent_id: Option<String>,
+        /// Host whose supervisor owns residency. Defaults to this host.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Native message bus: send/list/read/archive/reply over agents' `resources/inbox`.
     /// The stable wire format is a `<unix-ms>-<rand6>.md` Markdown file.

@@ -991,8 +991,7 @@ impl CodexInboxDelivery {
             .entries()
             .iter()
             .filter(|entry| {
-                entry.binding == state.thread_id()
-                    && entry.phase < delivery_ledger::Phase::Consumed
+                entry.binding == state.thread_id() && entry.phase < delivery_ledger::Phase::Consumed
             })
             .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
             .collect();
@@ -1500,6 +1499,7 @@ pub fn run_controlled_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
+
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "Codex required runtime incarnation is empty"
@@ -2614,8 +2614,7 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_ledger_path =
-            control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
+        let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
@@ -3196,6 +3195,34 @@ pub fn required_residency_resume(
     Ok(current.thread_id)
 }
 
+/// Whether the initialized binding proves an exact cold-residency resume.
+///
+/// A missing binding means the replacement provider has not initialized yet. Every binding that
+/// does exist must belong to the requested runtime, retain the checkpointed native thread, and
+/// come from the independently expected wrapper incarnation.
+pub fn residency_ready(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+    resume_generation: crate::residency::Generation,
+    expected_runtime_incarnation: &str,
+) -> Result<bool> {
+    let checkpoint = load_residency_checkpoint(state_dir, agent, runtime_id, resume_generation)?;
+    let Some(current) = load_thread_binding(&state_dir.join("binding.json"), agent, runtime_id)?
+    else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        current.runtime_incarnation != checkpoint.binding.runtime_incarnation,
+        "Codex residency binding did not advance to a new runtime incarnation"
+    );
+    anyhow::ensure!(
+        current.thread_id == checkpoint.binding.thread_id,
+        "Codex residency binding does not match the checkpointed native thread"
+    );
+    Ok(current.runtime_incarnation == expected_runtime_incarnation)
+}
+
 fn load_residency_checkpoint(
     state_dir: &Path,
     agent: &str,
@@ -3216,12 +3243,15 @@ fn load_residency_checkpoint(
         "Codex residency checkpoint belongs to a different generation"
     );
     anyhow::ensure!(
-        checkpoint.binding.agent == agent && checkpoint.binding.runtime_id == runtime_id,
+        checkpoint.binding.schema == BINDING_SCHEMA
+            && checkpoint.binding.agent == agent
+            && checkpoint.binding.runtime_id == runtime_id,
         "Codex residency checkpoint belongs to a different agent runtime"
     );
     anyhow::ensure!(
-        !checkpoint.binding.thread_id.is_empty(),
-        "Codex residency checkpoint has an empty native thread id"
+        !checkpoint.binding.runtime_incarnation.is_empty()
+            && !checkpoint.binding.thread_id.is_empty(),
+        "Codex residency checkpoint has an incomplete native thread binding"
     );
     Ok(checkpoint)
 }
@@ -3246,8 +3276,8 @@ fn load_thread_binding(
         "Codex resume binding belongs to a different agent runtime"
     );
     anyhow::ensure!(
-        !binding.thread_id.is_empty(),
-        "Codex resume binding has an empty thread id"
+        !binding.runtime_incarnation.is_empty() && !binding.thread_id.is_empty(),
+        "Codex resume binding is incomplete"
     );
     Ok(Some(binding))
 }
