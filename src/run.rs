@@ -236,6 +236,15 @@ pub(crate) fn output_full_stdout_with_timeout(
     run_captured(command, timeout, None, |_| {}, true)
 }
 
+#[cfg(test)]
+fn output_full_stdout_with_timeout_observed(
+    command: &mut Command,
+    timeout: Duration,
+    on_spawn: impl FnOnce(i32),
+) -> anyhow::Result<Output> {
+    run_captured(command, timeout, None, on_spawn, true)
+}
+
 /// Shared spawn/wait/read-back core. The child is `setsid`, so its pid is also its process group
 /// id — the group this function signals on every failure path.
 fn run_captured(
@@ -371,6 +380,8 @@ pub struct PtyCli {
     bin: String,
     /// The catalog root — the value of `$CATALOG` during `$`-expansion (spec.md §2 / R11).
     catalog_root: PathBuf,
+    #[cfg(test)]
+    on_command_spawn: Option<std::sync::Arc<dyn Fn(i32)>>,
 }
 
 impl Default for PtyCli {
@@ -378,6 +389,8 @@ impl Default for PtyCli {
         Self {
             bin: "pty".to_string(),
             catalog_root: PathBuf::from("."),
+            #[cfg(test)]
+            on_command_spawn: None,
         }
     }
 }
@@ -509,6 +522,8 @@ impl PtyCli {
         Self {
             bin: "pty".to_string(),
             catalog_root,
+            #[cfg(test)]
+            on_command_spawn: None,
         }
     }
 
@@ -883,14 +898,25 @@ impl PtyCli {
             display_name: presentation.display_name.as_ref(),
             tags: &presentation.tags,
         })?;
-        let out = output_with_input_timeout(
-            Command::new(&self.bin)
-                .args(["metadata", "patch", "--id", &presentation.pty_id])
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root)),
+        let mut command = Command::new(&self.bin);
+        command
+            .args(["metadata", "patch", "--id", &presentation.pty_id])
+            .env("PTY_ROOT", effective_pty_root(&self.catalog_root));
+        #[cfg(test)]
+        let out = output_with_input_timeout_observed(
+            &mut command,
             PTY_LIST_TIMEOUT,
             Some(payload),
-        )
-        .map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
+            |pid| {
+                if let Some(on_spawn) = &self.on_command_spawn {
+                    on_spawn(pid);
+                }
+            },
+        );
+        #[cfg(not(test))]
+        let out = output_with_input_timeout(&mut command, PTY_LIST_TIMEOUT, Some(payload));
+        let out =
+            out.map_err(|error| anyhow::anyhow!("`pty metadata patch --id` failed: {error}"))?;
         if !out.status.success() {
             anyhow::bail!(
                 "`pty metadata patch --id {}` failed: {}",
@@ -906,13 +932,26 @@ impl PtyCli {
     }
 
     fn list_entries_at(&self, root: &Path) -> anyhow::Result<Vec<PtyListEntry>> {
+        #[cfg(test)]
+        let out = output_full_stdout_with_timeout_observed(
+            Command::new(&self.bin)
+                .args(["list", "--json"])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+            |pid| {
+                if let Some(on_spawn) = &self.on_command_spawn {
+                    on_spawn(pid);
+                }
+            },
+        );
+        #[cfg(not(test))]
         let out = output_full_stdout_with_timeout(
             Command::new(&self.bin)
                 .args(["list", "--json"])
                 .env("PTY_ROOT", root),
             PTY_LIST_TIMEOUT,
-        )
-        .map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
+        );
+        let out = out.map_err(|error| anyhow::anyhow!("`pty list --json` failed: {error}"))?;
         if !out.status.success() {
             anyhow::bail!(
                 "`pty list --json` failed: {}",
@@ -3385,6 +3424,27 @@ mod tests {
         }
     }
 
+    fn fixture_barrier_path(executable: &Path, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}.{suffix}", executable.display()))
+    }
+
+    fn reset_fixture_barrier(executable: &Path) {
+        for suffix in ["ready", "release"] {
+            let marker = fixture_barrier_path(executable, suffix);
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove stale fixture marker {}: {error}", marker.display()),
+            }
+        }
+    }
+
+    fn release_ready_fixture(pid: i32, executable: &Path, what: &str) {
+        let ready = fixture_barrier_path(executable, "ready");
+        await_fixture_ready(pid, &ready, what);
+        std::fs::write(fixture_barrier_path(executable, "release"), b"go\n").unwrap();
+    }
+
     fn process_can_retain_cleanup_resources(pid: i32) -> bool {
         #[cfg(target_os = "linux")]
         if linux_process_state(pid) == Some('Z') {
@@ -5758,13 +5818,28 @@ mod tests {
         let executable = temporary.path().join("pty-capture");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$0.args"
+printf '' > "$0.ready.tmp"
+mv "$0.ready.tmp" "$0.ready"
+while [ ! -e "$0.release" ]; do sleep 0.01; done
+cat > "$0.stdin"
+"#,
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        reset_fixture_barrier(&executable);
+        let observed_executable = executable.clone();
         let cli = PtyCli {
             bin: executable.display().to_string(),
             catalog_root: temporary.path().to_path_buf(),
+            on_command_spawn: Some(std::sync::Arc::new(move |pid| {
+                release_ready_fixture(
+                    pid,
+                    &observed_executable,
+                    "fake PTY metadata command was not ready",
+                );
+            })),
         };
         let presentation = PtyPresentation {
             pty_id: "stable.agent.id".to_owned(),
@@ -6680,16 +6755,32 @@ mod tests {
         let fake = tmp.path().join("pty-bin");
         std::fs::write(
             &fake,
-            "#!/bin/sh\nrmdir \"$PTY_ROOT\"\nmkdir \"$PTY_ROOT\"\nprintf '%s\\n' '[]'\n",
+            r#"#!/bin/sh
+rmdir "$PTY_ROOT"
+mkdir "$PTY_ROOT"
+printf '%s\n' '[]'
+printf '' > "$0.ready.tmp"
+mv "$0.ready.tmp" "$0.ready"
+while [ ! -e "$0.release" ]; do sleep 0.01; done
+"#,
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
 
+        reset_fixture_barrier(&fake);
+        let observed_fake = fake.clone();
         let batch = PtyCli {
             bin: fake.display().to_string(),
             catalog_root: tmp.path().join("catalog"),
+            on_command_spawn: Some(std::sync::Arc::new(move |pid| {
+                release_ready_fixture(
+                    pid,
+                    &observed_fake,
+                    "fake PTY inventory was not published",
+                );
+            })),
         }
         .task_observations_at_root(&HashSet::from(["h.worker"]), &root);
         assert!(!batch.complete);
@@ -6778,6 +6869,7 @@ esac
         let cli = PtyCli {
             bin: fake.display().to_string(),
             catalog_root: tmp.path().join("catalog"),
+            on_command_spawn: None,
         };
         let desired_ids = HashSet::from(["h.a", "h.b"]);
         let unavailable = cli.task_observations_at_root(&desired_ids, &root);
@@ -6837,6 +6929,9 @@ esac
             &fake,
             r#"#!/bin/sh
 printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-07-31T10:00:00.000Z","displayName":"Build owner","tags":{"agent.presentation.schema":"1","unrelated":"preserved"}},{"name":"h.exit","status":"exited","exitCode":0,"pid":42,"createdAt":"2026-07-31T09:00:00.000Z"},{"name":"h.gone","status":"vanished","pid":43,"createdAt":"2026-07-31T08:00:00.000Z"}]'
+printf '' > "$0.ready.tmp"
+mv "$0.ready.tmp" "$0.ready"
+while [ ! -e "$0.release" ]; do sleep 0.01; done
 "#,
         )
         .unwrap();
@@ -6844,12 +6939,22 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
 
+        let observed_fake = fake.clone();
         let cli = PtyCli {
             bin: fake.display().to_string(),
             catalog_root: catalog,
+            on_command_spawn: Some(std::sync::Arc::new(move |pid| {
+                release_ready_fixture(
+                    pid,
+                    &observed_fake,
+                    "fake PTY inventory was not published",
+                );
+            })),
         };
         let desired = HashSet::from(["h.live", "h.exit", "h.gone"]);
+        reset_fixture_barrier(&fake);
         let first = cli.task_observations(&desired);
+        reset_fixture_barrier(&fake);
         let second = cli.task_observations(&desired);
         assert!(first.complete, "{:?}", first.errors);
         assert_eq!(first, second, "same PTY evidence changed generation");
@@ -6862,6 +6967,7 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         assert_eq!(first.observations[1].state, ObservedState::Exited);
         assert_eq!(first.observations[2].state, ObservedState::Vanished);
 
+        reset_fixture_barrier(&fake);
         let sessions = cli.list_sessions().unwrap();
         let presentation = sessions[0].presentation.as_ref().unwrap();
         assert_eq!(presentation.display_name.as_deref(), Some("Build owner"));
@@ -6898,15 +7004,29 @@ printf '%s\n' '[{"name":"h.live","status":"running","pid":41,"createdAt":"2026-0
         let fake = tmp.path().join("pty-bin");
         std::fs::write(
             &fake,
-            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"h.live\",\"status\":\"running\"}]'\n",
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"h.live","status":"running"}]'
+printf '' > "$0.ready.tmp"
+mv "$0.ready.tmp" "$0.ready"
+while [ ! -e "$0.release" ]; do sleep 0.01; done
+"#,
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
+        reset_fixture_barrier(&fake);
+        let observed_fake = fake.clone();
         let batch = PtyCli {
             bin: fake.display().to_string(),
             catalog_root: catalog,
+            on_command_spawn: Some(std::sync::Arc::new(move |pid| {
+                release_ready_fixture(
+                    pid,
+                    &observed_fake,
+                    "fake PTY inventory was not published",
+                );
+            })),
         }
         .task_observations(&HashSet::from(["h.live"]));
         assert!(!batch.complete);
