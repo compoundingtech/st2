@@ -4,6 +4,12 @@
 //! harness-specific observations into [`Evidence`]; this module owns persistence, phase grading,
 //! retry authorization, and binding isolation. Inbox archive remains the recipient's settlement
 //! authority and is reconciled through [`Ledger::prune`].
+//!
+//! One phase can reach this ledger without this build observing anything: an attempt an earlier
+//! release made and left behind. [`Attestation`] is the whole vocabulary for that — an asserted
+//! phase bounds what already happened, so it suppresses a duplicate, and it is not evidence, so
+//! it authorizes no transport. The translation itself lives outside this module, behind the one
+//! seam in [`Ledger::open`].
 
 use std::fs;
 use std::io::Write as _;
@@ -133,6 +139,21 @@ pub enum Evidence {
     Consumed,
 }
 
+/// Whether this build observed the evidence behind a phase, or another authority asserted it.
+///
+/// An assertion is a true lower bound on what already happened, so it may suppress a duplicate;
+/// it is not an observation, so it authorizes no transport until fresh evidence arrives. Nothing
+/// here names the authority: any party that can bound an attempt this build never watched
+/// asserts, and the record boundary in `crate::migrations::delivery_state` is one such party.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Attestation {
+    /// This build graded the evidence that set the phase through [`Profile::graded`].
+    Observed,
+    /// Another authority asserted the phase: enough to hold a delivery, never enough to send one.
+    Asserted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
@@ -140,6 +161,8 @@ pub struct Entry {
     pub binding: String,
     pub correlation: Correlation,
     pub phase: Phase,
+    /// Whether `phase` is this build's own grading or a claim it accepted from elsewhere.
+    pub attestation: Attestation,
     /// The runtime incarnation that made the attempt. Live evidence acknowledges only its own
     /// incarnation; history reconciliation settles attempts from earlier incarnations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +192,9 @@ pub enum HoldReason {
     AmbiguousAttempt,
     UnreadReceipt,
     NegativeReceipt,
+    /// The phase was asserted, not observed: enough to suppress a duplicate, never enough to
+    /// authorize a transport. Only fresh evidence about the world clears it.
+    UnattestedClaim,
     Quarantined,
     Settled,
 }
@@ -222,7 +248,24 @@ impl Ledger {
         };
         let outcome = match fs::read(path) {
             Ok(bytes) => ledger.load(&bytes, &correlate),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // THE RECOVERY SEAM. The only statement in this module that knows any other delivery
+            // record has ever existed; deleting `crate::migrations::delivery_state` deletes this
+            // arm and nothing else. What it degrades to — `Ok(())`, no entries — is exactly a
+            // first run on a fresh seat. DELETION TRIGGER: docs/vrs/.delta/DELTA-006.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path
+                .parent()
+                .map_or_else(
+                    || Ok(Vec::new()),
+                    |state_dir| {
+                        crate::migrations::delivery_state::recover(
+                            state_dir,
+                            profile.harness,
+                            agent,
+                            &correlate,
+                        )
+                    },
+                )
+                .and_then(|recovered| ledger.seed(recovered, &correlate)),
             Err(error) => Err(error).with_context(|| format!("reading delivery ledger {}", path.display())),
         };
         if let Err(error) = outcome {
@@ -249,18 +292,46 @@ impl Ledger {
             record.agent == self.record.agent,
             "delivery ledger belongs to a different agent"
         );
-        for entry in &record.entries {
+        self.accept(&record.entries, correlate)?;
+        record.runtime_id.clone_from(&self.record.runtime_id);
+        self.record = record;
+        Ok(())
+    }
+
+    /// Accept entries this process did not itself create, then make them durable.
+    ///
+    /// They are validated exactly as bytes from this module's own file would be, so a claim about
+    /// evidence the harness cannot produce fails closed instead of being written. Recovery
+    /// happens once: the ledger file's existence is what stops it happening twice, and a driver
+    /// that never delivered leaves no file behind.
+    fn seed(
+        &mut self,
+        entries: Vec<Entry>,
+        correlate: &impl Fn(&str, &str) -> String,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.accept(&entries, correlate)?;
+        self.record.entries = entries;
+        self.persist()
+    }
+
+    /// Every check a set of entries from outside this process must pass.
+    fn accept(
+        &self,
+        entries: &[Entry],
+        correlate: &impl Fn(&str, &str) -> String,
+    ) -> Result<()> {
+        for entry in entries {
             self.validate(entry, correlate)?;
         }
         anyhow::ensure!(
-            record
-                .entries
+            entries
                 .windows(2)
                 .all(|pair| pair[0].binding == pair[1].binding),
             "delivery ledger holds entries from more than one binding"
         );
-        record.runtime_id.clone_from(&self.record.runtime_id);
-        self.record = record;
         Ok(())
     }
 
@@ -335,6 +406,9 @@ impl Ledger {
                 entry.correlation = begin.correlation;
                 entry.incarnation = begin.incarnation;
                 entry.phase = entry.phase.max(Phase::Attempted);
+                // This build is about to transport it, so the attempt is no longer someone
+                // else's claim about the world.
+                entry.attestation = Attestation::Observed;
                 entry.negative = None;
                 entry.clone()
             }
@@ -344,6 +418,7 @@ impl Ledger {
                     binding: begin.binding,
                     correlation: begin.correlation,
                     phase: Phase::Attempted,
+                    attestation: Attestation::Observed,
                     incarnation: begin.incarnation,
                     negative: None,
                 };
@@ -371,6 +446,8 @@ impl Ledger {
             return Ok(Some(entry.phase));
         }
         entry.phase = phase;
+        // This build graded the evidence, so the phase is no longer a carried-forward claim.
+        entry.attestation = Attestation::Observed;
         entry.negative = None;
         self.persist()?;
         Ok(Some(phase))
@@ -395,6 +472,9 @@ impl Ledger {
             return Ok(Retention::Hold(HoldReason::NegativeReceipt));
         }
         entry.negative = Some(receipt);
+        // An authoritative absence is itself an observation about this attempt, and it is the
+        // only receipt that may re-authorize a transport of a carried-forward one.
+        entry.attestation = Attestation::Observed;
         self.persist()?;
         Ok(Retention::Hold(HoldReason::NegativeReceipt))
     }
@@ -414,6 +494,9 @@ impl Ledger {
         }
         if entry.phase >= Phase::Persisted {
             return Retention::Hold(HoldReason::UnreadReceipt);
+        }
+        if entry.attestation == Attestation::Asserted {
+            return Retention::Hold(HoldReason::UnattestedClaim);
         }
         Retention::Hold(HoldReason::AmbiguousAttempt)
     }
@@ -472,6 +555,30 @@ impl Ledger {
     fn persist(&self) -> Result<()> {
         atomic_json(&self.path, &self.record)
             .with_context(|| format!("writing delivery ledger {}", self.path.display()))
+    }
+}
+
+/// Build an entry whose phase another authority asserted rather than this build observing it.
+///
+/// The only constructor the recovery seam may use. The phase it carries is still checked against
+/// the harness [`Profile`] by [`Ledger::seed`], so a claim of evidence the harness cannot produce
+/// fails closed instead of being written, and [`Attestation::Asserted`] keeps the entry holding
+/// until this build observes something: it can suppress a duplicate, it can authorize nothing.
+pub fn asserted(
+    filename: String,
+    binding: String,
+    correlation: Correlation,
+    phase: Phase,
+    incarnation: Option<String>,
+) -> Entry {
+    Entry {
+        filename,
+        binding,
+        correlation,
+        phase,
+        attestation: Attestation::Asserted,
+        incarnation,
+        negative: None,
     }
 }
 
@@ -576,6 +683,65 @@ mod tests {
             reopened.retry(FILE_A),
             RetryDecision::Hold(HoldReason::AmbiguousAttempt)
         );
+    }
+
+    /// The safety property the whole record boundary rests on: an asserted phase is a bound on
+    /// what already happened, so it holds the delivery, and it is not evidence, so it authorizes
+    /// no transport. This build's own observation is what clears it.
+    #[test]
+    fn an_asserted_phase_suppresses_a_duplicate_and_authorizes_no_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = open(tmp.path(), Harness::Codex);
+        ledger
+            .seed(
+                vec![asserted(
+                    FILE_A.to_owned(),
+                    "thread-main".to_owned(),
+                    Correlation::native(correlation("thread-main", FILE_A)),
+                    Phase::Attempted,
+                    Some("incarnation-0".to_owned()),
+                )],
+                &correlation,
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.retention(FILE_A),
+            Retention::Hold(HoldReason::UnattestedClaim)
+        );
+        assert_eq!(
+            ledger.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::UnattestedClaim)
+        );
+
+        // The seed is durable, so a restart still holds instead of re-sending.
+        let reopened = open(tmp.path(), Harness::Codex);
+        assert_eq!(
+            reopened.entry(FILE_A).unwrap().attestation,
+            Attestation::Asserted
+        );
+        assert_eq!(
+            reopened.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::UnattestedClaim)
+        );
+
+        // An authoritative absence is an observation: it clears the claim and re-authorizes one
+        // transport of the same identity.
+        let mut ledger = open(tmp.path(), Harness::Codex);
+        ledger.negative(FILE_A, NegativeReceipt::Absent).unwrap();
+        assert_eq!(
+            ledger.entry(FILE_A).unwrap().attestation,
+            Attestation::Observed
+        );
+        assert_eq!(ledger.retry(FILE_A), RetryDecision::Retry);
+
+        // And so is a graded receipt: the entry stops being a carried-forward claim.
+        let mut ledger = open(tmp.path(), Harness::Codex);
+        ledger.record(FILE_A, Evidence::Consumed).unwrap();
+        assert_eq!(
+            ledger.entry(FILE_A).unwrap().attestation,
+            Attestation::Observed
+        );
+        assert_eq!(ledger.retention(FILE_A), Retention::Release);
     }
 
     #[test]
@@ -709,6 +875,7 @@ mod tests {
                     binding: "thread-main".to_owned(),
                     correlation: Correlation::native("injected"),
                     phase: Phase::Attempted,
+                    attestation: Attestation::Observed,
                     incarnation: None,
                     negative: None,
                 }],
