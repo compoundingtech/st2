@@ -1341,6 +1341,216 @@ fn a_rejected_spec_source_names_the_filename_it_rejected() {
     );
 }
 
+/// One `host.<identity>` seat under the shared root, optionally carrying an ownership marker.
+fn seat(identity: &str, marker: Option<&str>, argv: &str) -> String {
+    let meta = marker
+        .map(|marker| format!("  meta {{ managed-by \"{marker}\" }}\n"))
+        .unwrap_or_default();
+    format!(
+        "agent \"{identity}\" {{\n  host \"host\"\n  supervisor \"host.root\"\n{meta}  argv \"{argv}\"\n}}\n"
+    )
+}
+
+/// #486: `agent publish` rewrites a whole declaration, which makes it the widest st2 write path
+/// onto the bytes `agent desired-state --managed-by` guards (#473). So the incumbent's ownership
+/// marker is the authority here too: every inexact assertion fails closed before anything is
+/// written, while creation, a byte-identical replay, and non-`nix` markers stay open because none
+/// of them replaces bytes the Nix projection owns.
+#[test]
+fn publication_honours_the_incumbent_ownership_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agents = catalog.join("agents/host");
+    fs::create_dir_all(agents.join("root")).unwrap();
+    fs::write(
+        agents.join("root/agent.kdl"),
+        "agent \"root\" {\n  host \"host\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    let publish_bytes = |bytes: &str, arguments: &[&str]| {
+        fs::write(&candidate, bytes).unwrap();
+        publish(&catalog, &candidate, arguments)
+    };
+
+    // Creating a Nix-owned declaration needs no assertion: there is no incumbent to protect.
+    let projected = seat("worker", Some("nix"), "true");
+    let created = publish_bytes(&projected, &["--expect-absent"]);
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created["status"], "published");
+    assert_eq!(created["managedBy"], Value::Null);
+
+    // Nor does a byte-identical replay, which authors nothing.
+    let replayed = publish_bytes(&projected, &["--expect-absent"]);
+    assert!(
+        replayed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replayed.stdout).unwrap()["status"],
+        "unchanged"
+    );
+
+    let worker_spec = agents.join("worker/agent.kdl");
+    let inbox = agents.join("worker/resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(inbox.join("message.md"), "keep me").unwrap();
+    let plain = seat("plain", None, "true");
+    let authored = seat("authored", Some("agent-spec-authoring"), "true");
+    for (identity, bytes) in [("plain", &plain), ("authored", &authored)] {
+        fs::create_dir_all(agents.join(identity)).unwrap();
+        fs::write(agents.join(identity).join("agent.kdl"), bytes).unwrap();
+    }
+
+    // Every replacement of the projected bytes fails closed unless it names their owner exactly.
+    let rewrite = seat("worker", Some("nix"), "sleep 60");
+    let live = sha256(projected.as_bytes());
+    for (assertion, code) in [
+        (Vec::new(), "nix-managed-declaration"),
+        (
+            vec!["--managed-by", "agent-spec-authoring"],
+            "managed-by-mismatch",
+        ),
+        (vec!["--managed-by", ""], "invalid-managed-by"),
+    ] {
+        let arguments = [&["--expect-sha256", live.as_str()][..], &assertion].concat();
+        let refused = publish_bytes(&rewrite, &arguments);
+        assert!(
+            !refused.status.success(),
+            "stdout: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(&format!("[{code}]")), "stderr: {stderr}");
+        assert_eq!(fs::read_to_string(&worker_spec).unwrap(), projected);
+    }
+
+    // The matched assertion publishes, and touches nothing but that declaration.
+    let published = publish_bytes(
+        &rewrite,
+        &["--expect-sha256", live.as_str(), "--managed-by", "nix"],
+    );
+    assert!(
+        published.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let published: Value = serde_json::from_slice(&published.stdout).unwrap();
+    assert_eq!(published["status"], "published");
+    assert_eq!(published["managedBy"], "nix");
+    assert_eq!(published["beforeSha256"], live);
+    assert_eq!(fs::read_to_string(&worker_spec).unwrap(), rewrite);
+    assert_eq!(
+        fs::read_to_string(inbox.join("message.md")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(
+        fs::read_to_string(agents.join("plain/agent.kdl")).unwrap(),
+        plain
+    );
+    assert_eq!(
+        fs::read_to_string(agents.join("authored/agent.kdl")).unwrap(),
+        authored
+    );
+
+    // An assertion an unmarked incumbent cannot confirm refuses; the unasserted path is unchanged.
+    let plain_rewrite = seat("plain", None, "sleep 60");
+    let plain_live = sha256(plain.as_bytes());
+    let claimed = publish_bytes(
+        &plain_rewrite,
+        &[
+            "--expect-sha256",
+            plain_live.as_str(),
+            "--managed-by",
+            "nix",
+        ],
+    );
+    assert!(!claimed.status.success());
+    let stderr = String::from_utf8_lossy(&claimed.stderr);
+    assert!(stderr.contains("[managed-by-unmarked]"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(agents.join("plain/agent.kdl")).unwrap(),
+        plain
+    );
+    let unmarked = publish_bytes(&plain_rewrite, &["--expect-sha256", plain_live.as_str()]);
+    assert!(
+        unmarked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unmarked.stderr)
+    );
+
+    // The unasserted refusal stays scoped to `nix`, so st2's own authoring marker keeps publishing
+    // without an assertion — the sequencing that lets callers adopt one at a time.
+    let owned_by_st2 = publish_bytes(
+        &seat("authored", Some("agent-spec-authoring"), "sleep 60"),
+        &["--expect-sha256", &sha256(authored.as_bytes())],
+    );
+    assert!(
+        owned_by_st2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&owned_by_st2.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&owned_by_st2.stdout).unwrap()["managedBy"],
+        Value::Null
+    );
+}
+
+/// Ownership that cannot be resolved to one marker admits no assertion at all, and bytes that
+/// carry no readable declaration carry no claim: publication over them is the ordinary repair
+/// path, not a bypass, because writing such bytes already requires direct filesystem authority.
+#[test]
+fn publication_refuses_an_unresolvable_owner_and_repairs_unreadable_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let agent = catalog.join("agents/host/worker");
+    fs::create_dir_all(&agent).unwrap();
+    let contested = "agent \"worker\" {\n  host \"host\"\n  meta { managed-by \"nix\"; managed-by \"catalog\" }\n  argv \"true\"\n}\n";
+    fs::write(agent.join("agent.kdl"), contested).unwrap();
+    let candidate = temp.path().join("candidate.kdl");
+    fs::write(&candidate, valid_spec(false)).unwrap();
+    let live = sha256(contested.as_bytes());
+
+    for (assertion, code) in [
+        (Vec::new(), "nix-managed-declaration"),
+        (vec!["--managed-by", "nix"], "managed-by-mismatch"),
+        (vec!["--managed-by", "catalog"], "managed-by-mismatch"),
+    ] {
+        let arguments = [&["--expect-sha256", live.as_str()][..], &assertion].concat();
+        let refused = publish(&catalog, &candidate, &arguments);
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(&format!("[{code}]")), "stderr: {stderr}");
+        assert_eq!(
+            fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+            contested
+        );
+    }
+
+    let unreadable = "agent \"worker\" {";
+    fs::write(agent.join("agent.kdl"), unreadable).unwrap();
+    let repaired = publish(
+        &catalog,
+        &candidate,
+        &["--expect-sha256", &sha256(unreadable.as_bytes())],
+    );
+    assert!(
+        repaired.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("agent.kdl")).unwrap(),
+        valid_spec(false)
+    );
+}
+
 fn wait_for_path(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !path.exists() {

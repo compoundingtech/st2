@@ -751,7 +751,11 @@ verdict. Without the directive, Agent Spec-shaped files inside a fixture remain 
 evals retain their flat bus and completion semantics.
 
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR) --input-sha256 HEX
-(--expect-absent | --expect-sha256 HEX)` is the single-agent declaration writer.
+(--expect-absent | --expect-sha256 HEX) [--managed-by MARKER]` is the single-agent declaration
+writer. Replacing an incumbent that carries `meta { managed-by "nix" }` requires
+`--managed-by nix`, because that publication rewrites bytes the Nix projection owns; an assertion
+is admitted only when it names exactly the marker the incumbent carries. Creating a declaration
+and republishing byte-identical bytes need no assertion.
 `st2 catalog apply --catalog ROOT
 (--prepared DIR --input-sha256 INPUT_HEX --expect-sha256 ROOT_HEX [--raw-preimage] | --resume)` is the complete
 declaration-plane writer. Each admits the complete prospective catalog under a

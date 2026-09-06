@@ -523,6 +523,14 @@ enum AgentCmd {
         /// SHA-256 returned by `st2 agent digest` for the exact source capability.
         #[arg(long, value_name = "HEX")]
         input_sha256: String,
+        /// Assert the ownership marker that owns the declaration being replaced, e.g. `nix`.
+        ///
+        /// A declaration carrying `meta { managed-by "nix" }` refuses an unasserted
+        /// replacement, because the Nix projection is the writer of those bytes. The
+        /// assertion is admitted only when it names exactly the one marker the incumbent
+        /// carries. Create-only publication has no incumbent and needs no assertion.
+        #[arg(long = "managed-by", value_name = "MARKER")]
+        managed_by: Option<String>,
         /// Emit the typed publication result as JSON.
         #[arg(long)]
         json: bool,
@@ -1462,6 +1470,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             expect_absent,
             expect_sha256,
             input_sha256,
+            managed_by,
             json,
         }) => {
             let catalog = catalog_arg(None)?;
@@ -1480,6 +1489,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 source,
                 expectation,
                 input_sha256,
+                managed_by,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

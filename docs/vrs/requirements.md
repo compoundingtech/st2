@@ -238,6 +238,15 @@ accepted.
   yet.
   Presence, messages, context, and Resource state remain independently writable
   and are never serialized behind catalog authoring.
+  A publication that replaces an incumbent declaration carrying an ownership
+  marker is admitted only when the caller asserts exactly that marker, which
+  makes publication no weaker an authority boundary than the lifecycle verb
+  authoring the same bytes; an unasserted replacement refuses only for the Nix
+  marker, and a mismatched, unresolvable, or malformed assertion always fails
+  closed. Creating a declaration and republishing byte-identical bytes replace
+  no owned bytes and require no assertion; a candidate that merely claims a
+  marker is not an authority, so the receipt records only a marker the
+  incumbent confirmed.
   A caller binds single-agent publication to the exact no-follow source capture
   with an authoritative input digest. A canonical whole-catalog snapshot
   externalizes the declaration-root digest while excluding runtime state and
