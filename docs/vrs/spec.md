@@ -16,6 +16,13 @@ delivers messages. The agent grammar and harness-facing contract remain
 canonical in
 [`compoundingtech/evals/AGENT-SPEC.md`](https://github.com/compoundingtech/evals/blob/main/AGENT-SPEC.md).
 
+## Decision citations
+
+Decision records are cited by their full filename stem, `NNNN-<slug>`. Bare
+numbers are ambiguous for 0005, 0007, 0014, and 0015; their collisions are
+recorded history, and numbers are never reused under
+[`0006-observed-harness-state-is-a-driver-written-catalog-record`](.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md).
+
 ## Canonical Agent Spec eval teams
 
 An eval may opt into `canonical-agents` after its fixture copy and deterministic
@@ -67,7 +74,7 @@ implemented: the grammar, host-local address uniqueness, `st2 agent address`,
 and the fail-closed bare-or-qualified reference resolution. Its immutable-ID half
 is not: no writer emits `id`, so the positional `<host>.<identity>` bus identity
 remains the durable key every ownership, task-identity, and record surface uses.
-[0015 Amendment 1](.decisions/0015-immutable-agent-id-and-mutable-address.md)
+[`0015-immutable-agent-id-and-mutable-address` Amendment 1](.decisions/0015-immutable-agent-id-and-mutable-address.md)
 stages that half behind named triggers and
 [DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) records what it
 still requires.
@@ -285,7 +292,7 @@ its own durable waits. st2 provides no wait loop or timer and does not turn the
 request into agent lifecycle authority.
 
 This transport is design-superseded but still normative for the shipped
-implementation: [decision 0004](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
+implementation: [`0004-stream-events-are-a-distinct-record-kind`](.decisions/0004-stream-events-are-a-distinct-record-kind.md)
 absorbs typed requests into stream events plus ordinary replies, staged behind
 a deprecation window ([04-stream DQ-S4](04-stream/open-questions.md)). Until
 that staging completes, this section and its invariant row remain the truth;
@@ -777,7 +784,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   manual PTY restart under a different ambient environment reconstructs the
   same effective color policy. Adoption of an already-live task remains
   non-mutating: this policy is applied only when st2 creates a generation.
-- **R40:** [Launch argv](ontology.md#launch-argv) is opaque at every
+- **R42:** [Launch argv](ontology.md#launch-argv) is opaque at every
   st2-added wrapper boundary. In Linux systemd scope mode the exact outer
   command order is:
 
@@ -798,7 +805,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   proves both pass-through modes. The live-system distinction and unaffected
   scope semantics are recorded in the
   [systemd scope argv experiment](.experiments/2026-09-05-systemd-scope-argv-transparency.md)
-  and [decision 0016](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
+  and [`0016-systemd-scope-wrappers-disable-environment-expansion`](.decisions/0016-systemd-scope-wrappers-disable-environment-expansion.md).
 - **R07:** Hook bundles are explicit, content-addressed, installed separately,
   and verified before materialization references them. Their receipts use the
   same resolved build identity as the binary's version surfaces for both
@@ -911,7 +918,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   only the marker channel owned by the exact canonical catalog folder and host
   it is observing.
 
-- **R27/R28:** Agent lifecycle intent is one closed declaration state:
+- **R41/R28:** Agent lifecycle intent is one closed declaration state:
   `running`, `suspended`, or `retired`. The KDL form is a direct child such as
   `desired-state "suspended" reason="Waiting for capacity"`. Omission means
   running. New suspended and retired states require a bounded rationale;
@@ -987,7 +994,7 @@ parses structured output that must be whole, so it uses the explicitly named
 full-stdout variant; that read is intentionally uncapped and visible at its
 call site. Eval run steps and agent log dumps stream child output straight to
 their catalog log files without buffering it. Rationale and rejected
-alternatives: [decision 0007](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
+alternatives: [`0007-child-output-capture-is-bounded-and-tail-preserving`](.decisions/0007-child-output-capture-is-bounded-and-tail-preserving.md).
 
 ## Catalog graph and native delivery admission (R35–R38)
 
@@ -1385,7 +1392,7 @@ The measured basis for this design, including the runs that fixed `steer` and
 the modal case, is recorded in
 [2026-08-18-pi-harness-integration](./.experiments/2026-08-18-pi-harness-integration.md);
 the ruling is
-[decision 0005](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
+[`0005-pi-delivers-natively-through-an-injected-extension`](./.decisions/0005-pi-delivers-natively-through-an-injected-extension.md).
 
 ## Event contracts (R13–R15, R40)
 

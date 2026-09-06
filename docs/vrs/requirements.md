@@ -126,7 +126,7 @@ accepted.
 - **R06 Restartable launch definitions:** A restarted PTY or exec receives the
   complete effective launch definition, including environment and supported
   launch fields.
-- **R40 Launch argv transparency:** Every st2-added launch wrapper preserves the
+- **R42 Launch argv transparency:** Every st2-added launch wrapper preserves the
   effective task program and each argument as ordered, opaque OS strings. A
   Linux systemd scope launch disables systemd command-line environment
   expansion before the wrapper separator, so dollar-bearing literals including
@@ -411,7 +411,7 @@ accepted.
   the only source of address, name, and description; an explicit ID roster
   query returns the subject's current address and presentation without
   publishing a duplicate Agent Spec state file.
-- **R27 Typed agent desired state:** Every admitted Agent Spec has exactly one
+- **R41 Typed agent desired state:** Every admitted Agent Spec has exactly one
   whole-agent desired state: `running`, `suspended`, or `retired`. Omission and
   legacy `retired #false` mean running; legacy `retired #true` means retired
   without a rationale. New suspended and retired declarations require one

@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Accepted on 2026-09-05 for R40 launch argv transparency.
+Accepted on 2026-09-05 for R42 launch argv transparency.
 
 ## Context
 
