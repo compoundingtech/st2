@@ -497,13 +497,13 @@ from retired to running or suspended validates effective-address uniqueness
 against the complete prospective catalog before publication. The receipt does
 not imply that reconciliation or Doctor has observed convergence.
 
-A declaration carrying `meta { managed-by "<marker>" }` refuses authoring
-unless the caller asserts exactly that marker with `--managed-by`, which is how
-a projection authors the one transition its own generated source cannot express
-— the seat's removal from that source. The asserted arm additionally admits the
-complete prospective catalog, as an `agent publish` of the same bytes would,
-and the receipt records the confirmed marker. Every other authoring verb
-refuses a marked declaration unconditionally.
+A declaration carrying `meta { managed-by "nix" }` refuses authoring unless the
+caller asserts exactly the marker that declaration carries with `--managed-by`,
+which is how a projection authors the one transition its own generated source
+cannot express — the seat's removal from that source. The asserted arm
+additionally admits the complete prospective catalog, as an `agent publish` of
+the same bytes would, and the receipt records the confirmed marker. Every other
+authoring verb refuses a Nix-owned declaration unconditionally.
 
 The exact-ID selector and reactivation validation are target behavior fenced by
 [DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md); the linked

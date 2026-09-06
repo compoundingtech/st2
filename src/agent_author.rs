@@ -3,9 +3,9 @@
 //! Presentation is declaration state, not runtime identity. Every edit holds the shared persistent
 //! catalog-authoring lock, rechecks the original bytes, and atomically replaces exactly one
 //! canonical KDL declaration. TOML, JSON, and callers outside the supplied actor relationship fail
-//! closed. A declaration marked `meta { managed-by "<marker>" }` fails closed too, except on the
-//! lifecycle verb, where the marker's own generator may assert it and author the one transition
-//! its source can no longer express (#473). `ST_AGENT` is a trusted-fleet guardrail rather than
+//! closed. A declaration marked `meta { managed-by "nix" }` fails closed too, except on the
+//! lifecycle verb, where the projection may assert that marker and author the one transition its
+//! own source can no longer express (#473). `ST_AGENT` is a trusted-fleet guardrail rather than
 //! authentication. The lock serializes cooperating local st2 writers; it is not a cross-host lock.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -590,7 +590,7 @@ fn author_resource(
 /// Author one whole-agent desired state without claiming runtime convergence.
 ///
 /// `managed_by` is the ownership marker the caller asserts owns the declaration. `None` is the
-/// ordinary path and refuses any marked declaration, exactly as presentation, address, stream, and
+/// ordinary path and refuses a Nix-owned declaration, exactly as presentation, address, stream, and
 /// Resource authoring do. `Some(marker)` is a generator saying "I am the writer of these bytes",
 /// and is admitted only when the declaration's own `meta { managed-by "..." }` names exactly that
 /// marker: it is the projection's typed route to the one transition its own source can no longer
@@ -2038,8 +2038,8 @@ fn declared_id(node: &KdlNode) -> Option<String> {
 
 /// Every ownership marker this declaration carries, in source order.
 ///
-/// A well-formed declaration carries at most one. More than one is not a resolvable ownership
-/// claim, so it is returned as-is and every caller treats it as unauthorizable.
+/// A well-formed declaration carries at most one. Several is not a resolvable ownership claim, so
+/// they are returned as-is and no assertion can match them.
 fn declared_markers(node: &KdlNode) -> Vec<&str> {
     node.children()
         .into_iter()
@@ -2058,13 +2058,16 @@ fn is_nix_managed(node: &KdlNode) -> bool {
 
 /// Decide whether `asserted` authorizes authoring on a possibly generator-owned declaration.
 ///
-/// `meta { managed-by "<marker>" }` says a generator, not st2, is the writer of these bytes: an
-/// edit made behind its back is silently reverted on its next run, which is why unasserted
-/// authoring refuses (R25, decision 0003). The generator itself is the one writer that
-/// legitimately authors the declaration, and the assertion is how it says so. It is admitted only
-/// when it names exactly the declaration's own marker — a caller wrong about who owns the bytes is
-/// wrong about the edit, so a mismatched marker, an unmarked declaration, and an unresolvable
-/// multi-marker declaration all fail closed. Returns whether an assertion was matched.
+/// `meta { managed-by "nix" }` says the Nix projection, not st2, is the writer of these bytes: an
+/// edit made behind it is silently reverted on the next activation, which is why unasserted
+/// authoring refuses (R25, decision 0003). Only that marker refuses; the others are labels on
+/// declarations st2's own verbs are expected to edit.
+///
+/// The generator itself is the one writer that legitimately authors the declaration, and
+/// `--managed-by` is how it says so. An assertion is admitted only when it names exactly the one
+/// marker the declaration carries — a caller wrong about who owns the bytes is wrong about the
+/// edit, so a mismatched marker, an unmarked declaration, and an unresolvable multi-marker
+/// declaration all fail closed. Returns whether an assertion was matched.
 fn authorize_marker(
     target: &KdlNode,
     expected_identity: &str,
@@ -2073,11 +2076,11 @@ fn authorize_marker(
 ) -> Result<bool, AuthorError> {
     let declared = declared_markers(target);
     match (asserted, declared.as_slice()) {
-        (None, []) => Ok(false),
-        (None, [marker, ..]) => Err(AuthorError::new(
+        (None, _) if !declared.contains(&"nix") => Ok(false),
+        (None, _) => Err(AuthorError::new(
             "nix-managed-declaration",
             format!(
-                "agent {expected_identity:?} is owned by {marker:?}; edit its source instead of {}, or pass --managed-by {marker:?} if you are that generator",
+                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}, or pass --managed-by \"nix\" if you are that projection",
                 path.display()
             ),
         )),

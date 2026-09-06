@@ -427,7 +427,7 @@ accepted.
   changes lifecycle intent only in one canonical KDL declaration selected by
   explicit immutable agent ID. It uses the same source-preserving, durable,
   exact-target, trusted-fleet authority boundary as presentation authoring and
-  refuses malformed, ambiguous, or unsupported declarations. A generator-owned
+  refuses malformed, ambiguous, or unsupported declarations. A Nix-owned
   declaration refuses authoring unless the caller asserts exactly the ownership
   marker that declaration carries; a mismatched, absent, unresolvable, or
   malformed assertion fails closed, and the asserted arm additionally admits the

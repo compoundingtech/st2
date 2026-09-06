@@ -934,11 +934,12 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   prove observed convergence.
 
   Lifecycle is the one authoring verb a declaration's own generator may use.
+  Without an assertion, a Nix-owned declaration refuses exactly as before.
   `--managed-by <marker>` asserts the ownership marker the caller believes owns
   the declaration, and is admitted only when `meta { managed-by "..." }` names
-  exactly that marker; a mismatched marker, an unmarked declaration, an
+  exactly that one marker; a mismatched marker, an unmarked declaration, an
   unresolvable multi-marker declaration, and an empty or padded assertion all
-  refuse. Without the assertion a marked declaration refuses as before. The
+  refuse. The
   authority exists because a projection has exactly one transition its own
   source cannot express: the source change being projected is the seat's
   removal, so "edit the generated source instead" names an edit the operator

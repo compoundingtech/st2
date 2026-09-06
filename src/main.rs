@@ -447,11 +447,12 @@ enum AgentCmd {
         reason: Option<String>,
         /// Assert the ownership marker that owns this declaration, e.g. `nix`.
         ///
-        /// A declaration carrying `meta { managed-by "<marker>" }` refuses ordinary authoring,
-        /// because its generator is the writer of those bytes. This is how that generator
-        /// authors lifecycle on its own declaration — the transition it cannot express in its
-        /// own source, because the source change being projected is the seat's removal. The
-        /// assertion is admitted only when it names exactly the declaration's marker.
+        /// A declaration carrying `meta { managed-by "nix" }` refuses ordinary authoring,
+        /// because the Nix projection is the writer of those bytes. This is how that
+        /// projection authors lifecycle on its own declaration — the transition it cannot
+        /// express in its own source, because the source change being projected is the
+        /// seat's removal. The assertion is admitted only when it names exactly the one
+        /// marker the declaration carries.
         #[arg(long = "managed-by", value_name = "MARKER")]
         managed_by: Option<String>,
         /// Host used only to resolve declarations whose host is omitted.
