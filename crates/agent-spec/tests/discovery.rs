@@ -2687,20 +2687,29 @@ fn explicit_id_and_address_lower_as_separate_typed_namespaces() {
     assert_eq!(opaque.effective_address(), "dev3.frozen.legacy");
 }
 
-/// A declaration whose only agent-shaped signal is an `id` or an `address` is still a candidate:
-/// migration adds `id` to declarations that may carry nothing else st2 reads.
+/// A declaration whose *only* agent-shaped signal is an `id` or an `address` is not a candidate.
+/// Both are among the most common keys in arbitrary JSON/TOML, so admitting them turns a stray
+/// file beside a real declaration — a dropped GitHub payload, a task cache, a session record —
+/// into a phantom agent, and because such a file carries no launch it also stops the catalog from
+/// admitting at all. Migration adds `id` to declarations that are candidates for other reasons.
 #[test]
-fn a_lone_id_or_address_is_a_spec_candidate() {
-    for (field, value) in [("id", "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"), ("address", "worker")] {
+fn a_lone_id_or_address_is_not_a_spec_candidate() {
+    for (field, value) in [("id", "gh-123"), ("address", "0.0.0.0:8080")] {
         let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
-            "agents/h/worker/agent.json",
-            &format!("{{\"{field}\":\"{value}\"}}"),
+            "agents/h/root/agent.kdl",
+            "agent \"root\" { host \"h\"; command \"work\" }",
+        );
+        write(
+            tmp.path(),
+            "agents/h/root/notes.toml",
+            &format!("{field} = \"{value}\"\ntitle = \"notes\"\n"),
         );
         let found = discover_strict(tmp.path());
         assert!(found.errors.is_empty(), "{field}: {:?}", found.errors);
-        assert_eq!(found.specs.len(), 1, "{field} must be an agent signal");
+        assert_eq!(found.specs.len(), 1, "{field} must not be an agent signal");
+        assert_eq!(find(&found.specs, "root").bus_id("h"), "h.root");
     }
 }
 

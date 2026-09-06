@@ -1252,10 +1252,14 @@ impl RawSpec {
     /// A parsed file is a *spec candidate* when it carries an agent-shaped signal — an identity,
     /// lifecycle intent, the supported `service` type, or task blocks. Random TOML/JSON in the tree
     /// has none of these and is skipped.
+    ///
+    /// `id` and `address` are deliberately not signals. They are two of the most common keys in
+    /// arbitrary JSON/TOML — a dropped GitHub payload, a task cache, a session record — and a file
+    /// whose only agent-shaped key is one of them cannot be a valid declaration anyway: it carries
+    /// no launch, so it would only ever join the roster as a phantom agent and stop the catalog
+    /// from admitting. Migration adds `id` to declarations that are already candidates.
     pub(crate) fn looks_like_spec(&self) -> bool {
-        self.id.is_some()
-            || self.address.is_some()
-            || self.identity.is_some()
+        self.identity.is_some()
             || self.job_type.as_deref() == Some("service")
             || self.retired.is_some()
             || self.desired_state.is_some()
