@@ -1098,4 +1098,42 @@ mod tests {
             "the explicit installer must not rewrite a partial content-addressed set"
         );
     }
+
+    #[test]
+    fn claude_observer_propagates_only_mandatory_resume_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join("claude-observe.sh");
+        let fake_st2 = temp.path().join("st2");
+        fs::write(&hook, CLAUDE_OBSERVE).unwrap();
+        fs::write(&fake_st2, "#!/bin/sh\nexit 7\n").unwrap();
+        for path in [&hook, &fake_st2] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |mandatory: bool, event: &str| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&hook)
+                .arg(event)
+                .env("PATH", &path)
+                .env("ST_AGENT", "h.worker")
+                .env("CATALOG", temp.path());
+            if mandatory {
+                command.env("ST2_CLAUDE_RESUME_GENERATION", "2");
+            }
+            command.status().unwrap()
+        };
+        assert!(run(false, "SessionStart").success());
+        assert!(run(true, "PreToolUse").success());
+        assert_eq!(run(true, "SessionStart").code(), Some(7));
+    }
 }

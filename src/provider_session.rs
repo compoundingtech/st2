@@ -81,7 +81,24 @@ impl SessionObserver {
         harness: &'static str,
         pty_session: &str,
     ) -> anyhow::Result<Self> {
-        let session = harness_state::session_token();
+        Self::with_session(
+            agent_dir,
+            identity,
+            harness,
+            pty_session,
+            harness_state::session_token(),
+        )
+    }
+
+    /// Claim an explicitly supplied session incarnation for a host-owned launch attempt.
+    pub(crate) fn with_session(
+        agent_dir: &Path,
+        identity: &str,
+        harness: &'static str,
+        pty_session: &str,
+        session: String,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!session.is_empty(), "provider session incarnation is empty");
         let seq = harness_state::claim(agent_dir, identity, harness, &session)?;
         Ok(Self {
             seq,
@@ -195,11 +212,37 @@ pub(crate) fn run_provider(
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
 ) -> Result<()> {
-    match run_provider_observed(
+    run_provider_with_env_removals(
         provider,
         status_path,
         argv,
         env,
+        &[],
+        refresh_interval,
+        poll,
+        stop,
+        observed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_provider_with_env_removals(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    removed_env: &[&str],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<()> {
+    match run_provider_observed_with_env_removals(
+        provider,
+        status_path,
+        argv,
+        env,
+        removed_env,
         refresh_interval,
         poll,
         stop,

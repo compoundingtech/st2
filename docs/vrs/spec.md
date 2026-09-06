@@ -722,6 +722,29 @@ native session, and becomes active. A mismatch, unsupported driver capability,
 indeterminate presence, malformed ledger, or foreign ownership becomes a
 fail-closed refusal. No path substitutes a fresh session.
 
+For Claude, the provider binding owns the exact native UUID, wrapper incarnation,
+canonical workspace, transcript path, and optional resume generation. Checkpointing
+first resolves the UUID to exactly one file in the active managed Claude
+transcript store, rejects a matching Codex transcript, opens the file with
+`O_NOFOLLOW`, requires a regular `<uuid>.jsonl` file, validates every recorded
+`sessionId`, derives one rooted workspace lineage, and stores the SHA-256 of
+the exact bytes. Resume revalidates that lineage and digest before any provider
+child starts, rejects authored
+session selectors, and lowers to `claude <options> --resume <uuid> -- <prompt>`.
+Ordinary launches also use the option terminator and explicitly remove inherited
+residency fence variables.
+
+The synchronous `SessionStart` observer is Claude's native identity proof.
+Ordinary observation remains fail-open. During mandatory resume, observer setup,
+payload validation, transcript validation, and durable candidate publication
+propagate failure. The hook stores the candidate under the new wrapper
+incarnation and resume generation without replacing the checkpoint binding.
+After complete-group presence establishes the current wrapper incarnation,
+exact native-session verification promotes only that incarnation's candidate.
+A failed start therefore leaves the checkpoint
+retryable. A later explicit in-process session switch becomes the next
+authoritative binding and does not inherit the consumed resume fence.
+
 `st2 tasks --json` uses schema `st2.task-inventory.v3`. Each task row appends
 `residencyPolicy` and nullable `runtimeResidency` beside the existing process
 `runtime` observation. A missing ledger is `null`, never inferred as active or
