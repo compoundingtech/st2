@@ -695,7 +695,7 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   successful launch spends its declared budget. Each completed pass supplies
   the exact task IDs it proved alive; uninterrupted observed liveness may
   forgive a fail-mode budget according to the
-  [restart field contract](./02-agent-spec/spec.md#f12), while an unobserved task
+  [restart field contract](./02-agent-spec/spec.md#f12-future-policy-r31), while an unobserved task
   loses accrued recovery uptime. A pass that exits before execution neither
   supplies a liveness observation nor closes the accounting pass.
   [PR #191](https://github.com/compoundingtech/st2/pull/191) provides cadence,

@@ -93,7 +93,7 @@ Four facts fall out of that table.
    end is unambiguous in the other direction: `stopReason: "stop"` with no
    error fields is the recovery edge.
 
-## Consequence
+## Conclusion
 
 The omp extension forwards omp's own words — the bounded prose plus `errorId` —
 on a `type: "turn"` frame at every turn that actually ended, and st2 owns the
@@ -102,3 +102,9 @@ verdict, as it does for every other producer: `Source::TurnResult` +
 on the observed-state record. `errorStatus` is deliberately NOT on the wire: it
 classifies nothing this record needs, and it is already inside the prose omp
 puts in `errorMessage` (`"403 {…}"`).
+
+## VRS Impact
+
+The result grounds omp provider-auth classification in the `errorId` bitfield,
+including the negative capacity and policy flags, rather than HTTP status or
+error prose.
