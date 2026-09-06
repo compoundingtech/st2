@@ -31,6 +31,7 @@ pub mod harness_state;
 pub mod harness_version;
 pub mod hooks;
 pub mod host_lock;
+pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;

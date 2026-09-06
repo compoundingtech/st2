@@ -227,10 +227,15 @@ replacement, or state migration. Positional `identity` remains the declaration
 key and address fallback; it is not immutable subject identity.
 
 Authoring: future canonical `id` plus the pinned legacy
-[discovery and identity contract][evals-discovery]. Current st2 source:
-[`AgentSpec::identity`](../../../crates/agent-spec/src/spec.rs). Evidence:
+[discovery and identity contract][evals-discovery]. st2 source:
+[`AgentSpec::{id, address, effective_id, effective_address}`](../../../crates/agent-spec/src/spec.rs),
+[selection and reference resolution](../../../src/identity.rs),
+[address authoring](../../../src/agent_author.rs). Evidence:
+[address proof](../../../tests/agent_address.rs),
 [reconciliation](../../../src/reconcile.rs).
-This target remains fenced by
+`id` is optional in the shipped grammar, required in the target one, and no
+writer emits it yet; positional `identity` is still the durable key. That gap is
+fenced by
 [DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md).
 
 <h3 id="f03">F03 <code>host</code></h3>

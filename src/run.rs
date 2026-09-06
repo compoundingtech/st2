@@ -3261,6 +3261,11 @@ fn up_loop_until(
 /// be watching (the exact miss that let a 45-min outage run). Best-effort — a missing supervisor,
 /// an unresolvable supervisor, or a send failure is logged, never fatal. Dedup (once per park) is the
 /// caller's job.
+///
+/// `supervisor` is a declaration key, never a route: it is resolved through the same two exact
+/// readings [`crate::supervisor_chain::resolve_spec`] walks the org chart with, so a parent that
+/// declares an `address` keeps receiving its children's crash-loop notices. An address is a
+/// routing alias for humans and messages, and this edge is neither.
 pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) {
     let agent = cl.agent_bus_id(this_host);
     let Some(supervisor) = cl.supervisor.as_deref() else {
@@ -3270,7 +3275,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
         );
         return;
     };
-    let Ok(Some(agent_dir)) = message::resolve_agent_dir(catalog_root, supervisor, this_host)
+    let Ok(Some(agent_dir)) = message::resolve_declared_dir(catalog_root, supervisor, this_host)
     else {
         tracing::warn!(
             "st2: crash-loop '{}': supervisor '{supervisor}' not found in the catalog to notify.",

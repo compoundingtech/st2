@@ -390,7 +390,7 @@ struct CodexDeliveryConfig {
 impl CodexDeliveryConfig {
     fn resolve(catalog_root: &Path, identity: &str) -> Result<Self> {
         let this_host = run::detect_host();
-        let agent_dir = message::resolve_agent_dir(catalog_root, identity, &this_host)?
+        let agent_dir = message::resolve_declared_dir(catalog_root, identity, &this_host)?
             .with_context(|| {
                 format!(
                     "Codex native delivery agent '{identity}' is not declared in {}",
@@ -431,11 +431,34 @@ impl CodexDeliveryConfig {
         key_hash.update(body.as_bytes());
         let idempotency_key = format!("st2.codex-protocol-rejection.v1:{:x}", key_hash.finalize());
         let tags = ["codex-protocol".to_string(), "launch-rejected".to_string()];
+        // Both endpoints are declaration keys, never routes: this runtime names itself by exact
+        // key, and `supervisor` is the positional edge the org chart walks, so a parent that
+        // declares an `address` still receives the report.
+        let endpoints =
+            message::declared_selector(&self.catalog_root, &self.identity, &self.this_host)
+                .and_then(|sender| {
+                    let recipient = message::declared_selector(
+                        &self.catalog_root,
+                        supervisor,
+                        &self.this_host,
+                    )?;
+                    Ok((sender, recipient))
+                });
+        let (sender, recipient) = match endpoints {
+            Ok(endpoints) => endpoints,
+            Err(resolve_error) => {
+                eprintln!(
+                    "st2 codex: failed to resolve the endpoints of agent '{}' protocol rejection report: {resolve_error:#}",
+                    self.identity
+                );
+                return;
+            }
+        };
         if let Err(report_error) = message::send_to_resolved_inbox(
             &self.catalog_root,
-            supervisor,
+            &recipient,
             &self.this_host,
-            &self.identity,
+            &sender,
             Some(&subject),
             None,
             &tags,

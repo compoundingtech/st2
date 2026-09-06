@@ -1,16 +1,27 @@
-# DELTA-003: immutable subject ID and mutable address are not implemented
+# DELTA-003: the immutable subject ID is not implemented
 
 Status: open
+
+Narrowed by [0015 Amendment 1](../.decisions/0015-immutable-agent-id-and-mutable-address.md)
+on 2026-09-05: the mutable address shipped, the immutable ID is staged behind the
+triggers that amendment names.
 
 ## Divergence
 
 [Decision 0015](../.decisions/0015-immutable-agent-id-and-mutable-address.md)
 and root requirements R19 and R24-R26 define the accepted target identity
-model. The implementation still uses positional `identity` plus current host as
-logical subject ID, human route, ownership key, task prefix, state selector, and
-`ST_AGENT`. `AgentSpec` has no explicit `id` or `address`; ordinary resolution,
-roster output, graph output, supervisor edges, messages, authoring, and PTY
-metadata all retain the pre-decision behavior.
+model. `AgentSpec` now admits an optional `id` and an optional `address`;
+`st2 agent address` authors the route; ordinary references, inbox and status
+selection, recipients, and stream ingress all resolve through the fail-closed
+bare-or-qualified address algorithm; roster and graph publish `id`, `address`,
+and `busAddress`.
+
+What remains divergent is the ID half. No writer emits `id`, so the effective ID
+of every subject is still its positional `<host>.<identity>` bus identity, and
+that value — not an explicit ID — is what ownership keys, task prefixes, durable
+record endpoints, supervisor edges, PTY tags, and `ST_AGENT` carry. A subject
+created after this delta closes would need UUIDv7 and ID-keyed resolution to be
+reachable at all.
 
 ## VRS
 
@@ -37,48 +48,63 @@ the fail-closed bare-or-qualified address algorithm.
 Agent endpoints persist an immutable ID plus a publication-time address
 snapshot. Principal and external endpoints persist an explicit endpoint kind
 and canonical typed address instead of pretending that address is an agent ID.
-New durable message records use version 2 because strict version-1 readers
-reject the new endpoint and snapshot fields.
+That is a new durable record version for `SentRecord`, which rejects unknown
+fields (`src/message.rs`). It is not one for harness-state or harness-context,
+whose readers ignore unknown fields by policy
+(`crates/st2-wire/src/lib.rs`) — the premise that strict version-1 readers reject
+additive fields was wrong for every record but the sender ledger, and each
+version-2 reader belongs in the pull request that adds the writer emitting it.
 
 ## Implementation
 
-No runtime code changes are part of the VRS pull request that opens this delta.
-Implementation must begin with tests at the Agent Spec and address-book
-boundaries. It must then propagate one typed ID/address distinction through:
+The address half is implemented. What it leaves is the ID half, and it must
+propagate one typed ID distinction through:
 
 - live and archived catalog validation, explicit-ID migration, unarchive, and
-  ID-keyed supervisor references;
-- every agent-selecting CLI, generated hook, channel adapter, driver argument,
-  ambient `ST_AGENT` consumer, authoring command, graph, roster, and Doctor
-  projection;
+  ID-keyed supervisor references — `supervisor_chain::resolve_spec` resolves a
+  parent by `bus_id(host)` or bare `identity` only, so it must accept
+  `effective_id` before a UUIDv7-born subject can hold an org-chart edge, and
+  `st2 catalog migrate-ids` must exempt `agent-id-missing` from its own
+  pre-admission gate or the prescribed rollout order deadlocks;
+- every ambient `ST_AGENT` consumer, generated hook, channel adapter, and driver
+  argument, which today carry the positional bus identity;
 - runtime ownership, default task IDs, task inventory, socket admission, PTY
   schema-2 metadata, and launch metadata while keeping declaration-parent state
   and Resource paths stable;
-- ordinary messages, replies, version-2 Sent records, typed non-Agent endpoints,
-  DING sender projection, stream ingress and ownership, resync subscriptions,
-  harness-state, and harness-context records; and
+- version-2 Sent records, typed non-Agent endpoints, DING sender projection,
+  stream and resync ownership keys, harness-state, and harness-context records;
+  and
 - all supported downstream evals and generators.
 
-Activation is a reader-first transition, not a one-version flag day:
+The remaining reader-first obligation of the shipped half is single-field and
+about routing: a build that does not read `address` routes the positional
+identity and refuses an authored address, so an `address`-reading build must be
+deployed on every admitted host **before** any address is authored. That is
+satisfied by the release carrying the grammar; no record version, downstream
+reader survey, or catalog transaction is implied by it.
+
+Activating the ID half is still a reader-first transition, not a one-version flag
+day:
 
 1. Deploy readers that accept legacy and target Agent Specs, message versions 1
-   and 2, PTY schemas 1 and 2, harness-state and harness-context schemas 1 and
-   2, and old and new projections. Keep every writer on legacy output.
+   and 2, and PTY schemas 1 and 2. Keep every writer on legacy output. The
+   harness-state and harness-context readers are additively tolerant already, so
+   their version-2 arms ship with their writers rather than ahead of them.
 2. Prove reader readiness on every admitted host and supported downstream
    consumer. An unreadable or unknown reader is not ready.
 3. In one catalog transaction, add migrated unique IDs to live and structurally
    archived declarations, update archived tombstones, and rewrite every
    supervisor reference to its already-resolved migrated ID.
 4. Re-prove reader readiness immediately before enabling target writers.
-5. Activate UUIDv7 creation, mutable-address routing, raw-ID `ST_AGENT`, ID-keyed
-   runtime ownership, message version 2, harness-state and harness-context
-   version 2, and PTY schema 2 together.
+5. Activate UUIDv7 creation, raw-ID `ST_AGENT`, ID-keyed runtime ownership,
+   message version 2, harness-state and harness-context version 2, and PTY
+   schema 2 together.
 
-No timeout substitutes for readiness. Until step 5 completes, existing identity
-resolution and every current invariant remain normative implementation behavior.
-After activation, an unmigrated archived declaration cannot re-enter the
-catalog; unarchive validates ID uniqueness, and a transition from retired to
-routable validates full-catalog address uniqueness.
+No timeout substitutes for readiness. Until step 5 completes, the positional bus
+identity remains the normative durable key and every current invariant remains
+normative implementation behavior. After activation, an unmigrated archived
+declaration cannot re-enter the catalog; unarchive validates ID uniqueness, and a
+transition from retired to routable validates full-catalog address uniqueness.
 
 ## Direction
 

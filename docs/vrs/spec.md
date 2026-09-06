@@ -62,9 +62,15 @@ legacy control in `tests/eval_run_e2e.rs`.
 
 ## Immutable agent ID, mutable address, and presentation (R02, R08, R11, R13, R19, R24-R26)
 
-This section is the accepted target contract. The current implementation remains
-on the pre-decision identity model until
-[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) closes.
+This section is the accepted target contract. Its mutable-address half is
+implemented: the grammar, host-local address uniqueness, `st2 agent address`,
+and the fail-closed bare-or-qualified reference resolution. Its immutable-ID half
+is not: no writer emits `id`, so the positional `<host>.<identity>` bus identity
+remains the durable key every ownership, task-identity, and record surface uses.
+[0015 Amendment 1](.decisions/0015-immutable-agent-id-and-mutable-address.md)
+stages that half behind named triggers and
+[DELTA-003](.delta/DELTA-003-agent-address-not-implemented.md) records what it
+still requires.
 
 An Agent Spec separates four values that the current implementation overloads:
 
