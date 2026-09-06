@@ -661,8 +661,9 @@ struct MsgCtx {
     /// default st2 catalog.
     #[arg(long, conflicts_with = "catalog_path")]
     root: Option<PathBuf>,
-    /// The acting identity — who the message is `from` / whose inbox is "mine". Defaults to
-    /// `$ST_AGENT`.
+    /// The acting identity — who the message is `from` / whose inbox is "mine". An ordinary
+    /// address reference, unlike `$ST_AGENT`, which carries the exact agent ID; the two are
+    /// different strings once a subject declares an explicit `address`. Defaults to `$ST_AGENT`.
     #[arg(long = "as")]
     as_id: Option<String>,
     /// Host used to resolve `<host>.<identity>` bus ids. Defaults to the local hostname.
