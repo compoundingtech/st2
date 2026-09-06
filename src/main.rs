@@ -445,6 +445,16 @@ enum AgentCmd {
         /// Required rationale for suspended/retired; forbidden for running.
         #[arg(long)]
         reason: Option<String>,
+        /// Assert the ownership marker that owns this declaration, e.g. `nix`.
+        ///
+        /// A declaration carrying `meta { managed-by "nix" }` refuses ordinary authoring,
+        /// because the Nix projection is the writer of those bytes. This is how that
+        /// projection authors lifecycle on its own declaration — the transition it cannot
+        /// express in its own source, because the source change being projected is the
+        /// seat's removal. The assertion is admitted only when it names exactly the one
+        /// marker the declaration carries.
+        #[arg(long = "managed-by", value_name = "MARKER")]
+        managed_by: Option<String>,
         /// Host used only to resolve declarations whose host is omitted.
         #[arg(long)]
         host: Option<String>,
@@ -1429,6 +1439,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
             second,
             agent_id,
             reason,
+            managed_by,
             host,
             json,
         }) => {
@@ -1443,7 +1454,7 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 matches!(state.as_str(), "running" | "suspended" | "retired"),
                 "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
             );
-            desired_state_cmd(identity, agent_id, state, reason, host, json)
+            desired_state_cmd(identity, agent_id, state, reason, managed_by, host, json)
         }
         Command::Agent(AgentCmd::Publish {
             spec,
@@ -2657,6 +2668,7 @@ fn desired_state_cmd(
     agent_id: Option<String>,
     state: String,
     reason: Option<String>,
+    managed_by: Option<String>,
     host: Option<String>,
     json: bool,
 ) -> Result<()> {
@@ -2679,19 +2691,25 @@ fn desired_state_cmd(
         actor.as_deref(),
         state,
         reason.as_deref(),
+        managed_by.as_deref(),
     ) {
         Ok(receipt) => {
             if json {
                 println!("{}", serde_json::to_string(&receipt)?);
             } else {
                 println!(
-                    "{} desired-state {}{} ({})",
+                    "{} desired-state {}{}{} ({})",
                     receipt.identity,
                     receipt.desired_state.as_str(),
                     receipt
                         .reason
                         .as_deref()
                         .map(|reason| format!(" reason={reason:?}"))
+                        .unwrap_or_default(),
+                    receipt
+                        .managed_by
+                        .as_deref()
+                        .map(|marker| format!(" managed-by={marker:?}"))
                         .unwrap_or_default(),
                     match receipt.result {
                         st2::agent_author::AuthorOutcome::Changed => "changed",

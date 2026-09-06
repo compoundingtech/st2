@@ -207,6 +207,88 @@ fn cli_canonicalizes_legacy_retirement_and_refuses_nix_owned_declarations() {
     assert_eq!(fs::read(root.join("h/worker/agent.kdl")).unwrap(), before);
 }
 
+/// #473: the Nix projection retires a seat it stopped declaring through the typed verb rather than
+/// republishing the whole declaration under CAS. `--managed-by` is the authority: it must name the
+/// declaration's own marker exactly, and it changes nothing but the lifecycle line.
+#[test]
+fn cli_managed_by_authority_retires_a_projected_seat_and_refuses_every_inexact_claim() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    write(
+        root,
+        "h/root/agent.kdl",
+        "agent \"root\" { host \"h\"; command \"true\" }\n",
+    );
+    let projected = "agent \"seat\" {\n  host \"h\"\n  supervisor \"h.root\"\n  meta { managed-by \"nix\" }\n  command \"true\"\n}\n";
+    write(root, "h/seat/agent.kdl", projected);
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args(["--catalog", root.to_str().unwrap(), "agent", "desired-state"])
+            .args(args)
+            .args(["--host", "h", "--json"])
+            .env_remove("ST_AGENT")
+            .output()
+            .unwrap()
+    };
+    let retire: &[&str] = &["h.seat", "retired", "--reason", "nix: no longer declared"];
+
+    let unasserted = run(retire);
+    assert!(!unasserted.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unasserted.stdout).unwrap()["code"],
+        "nix-managed-declaration"
+    );
+
+    let mismatched = run(&[retire, &["--managed-by", "agent-spec-authoring"]].concat());
+    assert!(!mismatched.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&mismatched.stdout).unwrap()["code"],
+        "managed-by-mismatch"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("h/seat/agent.kdl")).unwrap(),
+        projected
+    );
+
+    let retired = run(&[retire, &["--managed-by", "nix"]].concat());
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+    assert_eq!(receipt["result"], "changed");
+    assert_eq!(receipt["managed_by"], "nix");
+    let authored = fs::read_to_string(root.join("h/seat/agent.kdl")).unwrap();
+    assert_eq!(
+        authored.replace(
+            "  desired-state \"retired\" reason=\"nix: no longer declared\"\n",
+            ""
+        ),
+        projected,
+        "the projection's own bytes must survive the transition"
+    );
+
+    // The seat now reads back as retired, which is what the activation leg verifies.
+    let found = st2::discover(root);
+    assert!(found.errors.is_empty(), "{:?}", found.errors);
+    assert!(
+        found
+            .specs
+            .iter()
+            .any(|spec| spec.identity == "seat" && spec.desired_state.is_retired())
+    );
+
+    // Replaying the leg is safe: the activation runs on every switch, not only on the first.
+    let replay = run(&[retire, &["--managed-by", "nix"]].concat());
+    assert!(replay.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["result"],
+        "unchanged"
+    );
+}
+
 #[test]
 fn cli_applies_the_existing_self_or_descendant_authority_guardrail() {
     let temporary = tempfile::tempdir().unwrap();

@@ -557,6 +557,54 @@ fn build_overlay(
     Ok(shadow)
 }
 
+/// Admit one prospective in-place rewrite of `declaration` against the live catalog.
+///
+/// This is the admission half of `publish` without its transaction: the live plane is copied into
+/// a shadow with exactly this declaration's bytes replaced, and the result must pass the same
+/// full-catalog gate a publication passes. A source-preserving authoring verb that stands in for a
+/// CAS publication uses it so the two paths refuse the same candidates — a retirement that would
+/// leave an active descendant under a retired root (`retired-root`) is refused before any commit,
+/// rather than written and discovered later.
+pub(crate) fn admit_declaration_rewrite(
+    catalog: &Path,
+    staging_parent: &Path,
+    declaration: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let catalog = catalog
+        .canonicalize()
+        .with_context(|| format!("canonicalize catalog {}", catalog.display()))?;
+    let declaration = declaration
+        .canonicalize()
+        .with_context(|| format!("canonicalize declaration {}", declaration.display()))?;
+    let relative = declaration
+        .strip_prefix(&catalog)
+        .with_context(|| {
+            format!(
+                "declaration {} is not inside catalog {}",
+                declaration.display(),
+                catalog.display()
+            )
+        })?
+        .to_path_buf();
+    let live_target = declaration
+        .parent()
+        .context("declaration has no parent directory")?;
+    let shadow = tempfile::Builder::new()
+        .prefix("catalog-admission-")
+        .tempdir_in(staging_parent)
+        .with_context(|| format!("create validation shadow in {}", staging_parent.display()))?;
+    copy_filtered_catalog(&catalog, shadow.path(), &catalog, live_target)?;
+    let target = shadow.path().join(&relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create validation overlay {}", parent.display()))?;
+    }
+    fs::write(&target, bytes).context("write candidate into validation shadow")?;
+    crate::catalog_transaction::validate_full_catalog(shadow.path())
+        .context("candidate fails full-catalog validation")
+}
+
 fn copy_filtered_catalog(
     source: &Path,
     destination: &Path,

@@ -427,7 +427,15 @@ accepted.
   changes lifecycle intent only in one canonical KDL declaration selected by
   explicit immutable agent ID. It uses the same source-preserving, durable,
   exact-target, trusted-fleet authority boundary as presentation authoring and
-  refuses Nix-owned, malformed, ambiguous, or unsupported declarations. A
+  refuses malformed, ambiguous, or unsupported declarations. A Nix-owned
+  declaration refuses authoring unless the caller asserts exactly the ownership
+  marker that declaration carries; a mismatched, absent, unresolvable, or
+  malformed assertion fails closed, and the asserted arm additionally admits the
+  complete prospective catalog exactly as a compare-and-swap publication of the
+  same bytes would, so it cannot commit a declaration the catalog would reject.
+  It is the only authoring verb with that authority, because a projection has
+  one transition its own source cannot express: the source change being
+  projected is the seat's removal. A
   transition from retired to running or suspended validates effective-address
   uniqueness against the complete prospective catalog before publication,
   including the positional identity fallback. Running is canonically omitted;

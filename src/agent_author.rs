@@ -2,8 +2,10 @@
 //!
 //! Presentation is declaration state, not runtime identity. Every edit holds the shared persistent
 //! catalog-authoring lock, rechecks the original bytes, and atomically replaces exactly one
-//! canonical KDL declaration. TOML, JSON, declarations marked Nix-owned, and callers outside the
-//! supplied actor relationship fail closed. `ST_AGENT` is a trusted-fleet guardrail rather than
+//! canonical KDL declaration. TOML, JSON, and callers outside the supplied actor relationship fail
+//! closed. A declaration marked `meta { managed-by "nix" }` fails closed too, except on the
+//! lifecycle verb, where the projection may assert that marker and author the one transition its
+//! own source can no longer express (#473). `ST_AGENT` is a trusted-fleet guardrail rather than
 //! authentication. The lock serializes cooperating local st2 writers; it is not a cross-host lock.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,12 +155,16 @@ impl DesiredStateValue {
 }
 
 /// Stable machine-readable receipt from one desired-state edit.
+///
+/// `managed_by` is the ownership marker the caller asserted and the declaration confirmed, so the
+/// receipt records which authority admitted the edit; `null` is the ordinary unmarked path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DesiredStateReceipt {
     pub result: AuthorOutcome,
     pub identity: String,
     pub desired_state: DesiredStateValue,
     pub reason: Option<String>,
+    pub managed_by: Option<String>,
 }
 
 /// Stable machine-readable receipt from adding one agent-owned stream.
@@ -582,6 +588,13 @@ fn author_resource(
 }
 
 /// Author one whole-agent desired state without claiming runtime convergence.
+///
+/// `managed_by` is the ownership marker the caller asserts owns the declaration. `None` is the
+/// ordinary path and refuses a Nix-owned declaration, exactly as presentation, address, stream, and
+/// Resource authoring do. `Some(marker)` is a generator saying "I am the writer of these bytes",
+/// and is admitted only when the declaration's own `meta { managed-by "..." }` names exactly that
+/// marker: it is the projection's typed route to the one transition its own source can no longer
+/// express, because the source edit that has to be projected is the seat's removal (#473).
 pub fn set_desired_state(
     catalog_root: &Path,
     selector: &str,
@@ -589,6 +602,7 @@ pub fn set_desired_state(
     actor: Option<&str>,
     state: DesiredStateValue,
     reason: Option<&str>,
+    managed_by: Option<&str>,
 ) -> Result<DesiredStateReceipt, AuthorError> {
     match state {
         DesiredStateValue::Running if reason.is_some() => {
@@ -608,6 +622,14 @@ pub fn set_desired_state(
     if let Some(reason) = reason {
         validate_desired_state_reason(reason)
             .map_err(|error| AuthorError::new("invalid-desired-state", error.to_string()))?;
+    }
+    if let Some(marker) = managed_by
+        && (marker.is_empty() || marker.trim() != marker)
+    {
+        return Err(AuthorError::new(
+            "invalid-managed-by",
+            format!("asserted ownership marker {marker:?} is empty or padded"),
+        ));
     }
     let catalog_lock = CatalogLock::exclusive(catalog_root).map_err(|error| {
         AuthorError::new(
@@ -645,6 +667,7 @@ pub fn set_desired_state(
         &target.source_identity,
         state,
         reason,
+        managed_by,
         || {},
     )?;
     Ok(DesiredStateReceipt {
@@ -652,6 +675,7 @@ pub fn set_desired_state(
         identity: target.identity,
         desired_state: state,
         reason: reason.map(str::to_owned),
+        managed_by: managed_by.map(str::to_owned),
     })
 }
 
@@ -1015,6 +1039,7 @@ fn edit_desired_state_for_test(
         "worker",
         state,
         reason,
+        None,
         before_commit,
     )
 }
@@ -1756,6 +1781,7 @@ fn edit_desired_state_declaration(
     expected_agent: &str,
     state: DesiredStateValue,
     reason: Option<&str>,
+    managed_by: Option<&str>,
     before_commit: impl FnOnce(),
 ) -> Result<AuthorOutcome, AuthorError> {
     if path.extension().and_then(|value| value.to_str()) != Some("kdl") {
@@ -1799,15 +1825,7 @@ fn edit_desired_state_declaration(
         )
     })?;
     let target = exact_agent_node(&document, expected_identity, expected_host, expected_agent)?;
-    if is_nix_managed(target) {
-        return Err(AuthorError::new(
-            "nix-managed-declaration",
-            format!(
-                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}",
-                path.display()
-            ),
-        ));
-    }
+    let marker_matched = authorize_marker(target, expected_identity, path, managed_by)?;
     let Some(replacement) = desired_state_edit(text, target, state, reason)? else {
         return Ok(AuthorOutcome::Unchanged);
     };
@@ -1819,6 +1837,24 @@ fn edit_desired_state_declaration(
         state,
         reason,
     )?;
+    // A marker-matched edit stands in for the CAS `agent publish` the projection would otherwise
+    // have to perform, so it inherits that path's admission gate rather than only the local
+    // candidate reparse: the whole prospective catalog must still be admissible. That is what
+    // makes retiring a supervisor with a live descendant refuse (`retired-root`) instead of
+    // committing bytes the next reconcile pass rejects (#434).
+    if marker_matched
+        && let Err(error) = crate::agent_publish::admit_declaration_rewrite(
+            catalog,
+            control,
+            path,
+            replacement.as_bytes(),
+        )
+    {
+        return Err(AuthorError::new(
+            "candidate-not-admissible",
+            format!("{error:#}"),
+        ));
+    }
     atomic_replace_checked(
         catalog_lock,
         catalog,
@@ -2000,17 +2036,75 @@ fn declared_id(node: &KdlNode) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Every ownership marker this declaration carries, in source order.
+///
+/// A well-formed declaration carries at most one. Several is not a resolvable ownership claim, so
+/// they are returned as-is and no assertion can match them.
+fn declared_markers(node: &KdlNode) -> Vec<&str> {
+    node.children()
+        .into_iter()
+        .flat_map(|children| children.nodes())
+        .filter(|child| child.name().value() == "meta")
+        .filter_map(KdlNode::children)
+        .flat_map(|meta| meta.nodes())
+        .filter(|child| child.name().value() == "managed-by")
+        .filter_map(|child| child.get(0).and_then(|value| value.as_string()))
+        .collect()
+}
+
 fn is_nix_managed(node: &KdlNode) -> bool {
-    node.children().is_some_and(|children| {
-        children
-            .nodes()
-            .iter()
-            .filter(|child| child.name().value() == "meta")
-            .filter_map(KdlNode::children)
-            .flat_map(|meta| meta.nodes())
-            .filter(|child| child.name().value() == "managed-by")
-            .any(|child| child.get(0).and_then(|value| value.as_string()) == Some("nix"))
-    })
+    declared_markers(node).contains(&"nix")
+}
+
+/// Decide whether `asserted` authorizes authoring on a possibly generator-owned declaration.
+///
+/// `meta { managed-by "nix" }` says the Nix projection, not st2, is the writer of these bytes: an
+/// edit made behind it is silently reverted on the next activation, which is why unasserted
+/// authoring refuses (R25, decision 0003). Only that marker refuses; the others are labels on
+/// declarations st2's own verbs are expected to edit.
+///
+/// The generator itself is the one writer that legitimately authors the declaration, and
+/// `--managed-by` is how it says so. An assertion is admitted only when it names exactly the one
+/// marker the declaration carries — a caller wrong about who owns the bytes is wrong about the
+/// edit, so a mismatched marker, an unmarked declaration, and an unresolvable multi-marker
+/// declaration all fail closed. Returns whether an assertion was matched.
+fn authorize_marker(
+    target: &KdlNode,
+    expected_identity: &str,
+    path: &Path,
+    asserted: Option<&str>,
+) -> Result<bool, AuthorError> {
+    let declared = declared_markers(target);
+    match (asserted, declared.as_slice()) {
+        (None, _) if !declared.contains(&"nix") => Ok(false),
+        (None, _) => Err(AuthorError::new(
+            "nix-managed-declaration",
+            format!(
+                "agent {expected_identity:?} is Nix-owned; edit its Nix source instead of {}, or pass --managed-by \"nix\" if you are that projection",
+                path.display()
+            ),
+        )),
+        (Some(asserted), [marker]) if *marker == asserted => Ok(true),
+        (Some(asserted), []) => Err(AuthorError::new(
+            "managed-by-unmarked",
+            format!(
+                "--managed-by {asserted:?} claims agent {expected_identity:?}, whose declaration {} carries no `meta {{ managed-by }}` marker",
+                path.display()
+            ),
+        )),
+        (Some(asserted), markers) => Err(AuthorError::new(
+            "managed-by-mismatch",
+            format!(
+                "--managed-by {asserted:?} does not own agent {expected_identity:?}: {} declares owner {}",
+                path.display(),
+                markers
+                    .iter()
+                    .map(|marker| format!("{marker:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        )),
+    }
 }
 
 fn presentation_edit(
@@ -2710,6 +2804,138 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "agent \"worker\" { host \"h\"; command \"sleep 60\"; desired-state \"suspended\" reason=\"Waiting for capacity\" }\nagent { host \"h\"; command \"sleep 60\" }\n"
         );
+    }
+
+    /// #473: a generator-owned declaration refuses ordinary authoring because the generator is the
+    /// writer of those bytes — but the generator has exactly one transition it cannot express in
+    /// its own source, since the source change being projected is the seat's removal. The
+    /// assertion is the authority, and only an exact marker match is one.
+    #[test]
+    fn marker_matched_lifecycle_authority_is_exact_and_source_preserving() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write(
+            root,
+            "h/root/agent.kdl",
+            &declaration("root", "h", None, "catalog"),
+        );
+        let projected = write(
+            root,
+            "h/nix/agent.kdl",
+            &declaration("nix", "h", Some("root"), "nix"),
+        );
+        let plain = "agent \"plain\" {\n  host \"h\"\n  supervisor \"root\"\n  command \"sleep 60\"\n}\n";
+        let unmarked = write(root, "h/plain/agent.kdl", plain);
+        let original = fs::read_to_string(&projected).unwrap();
+        let retire = |marker: Option<&str>, selector: &str| {
+            set_desired_state(
+                root,
+                selector,
+                "h",
+                None,
+                DesiredStateValue::Retired,
+                Some("nix: no longer declared"),
+                marker,
+            )
+        };
+
+        // Unasserted authoring still refuses, and now names the assertion that would carry it.
+        let refused = retire(None, "h.nix").unwrap_err();
+        assert_eq!(refused.code(), "nix-managed-declaration");
+        assert!(
+            refused.to_string().contains("--managed-by \"nix\""),
+            "{refused}"
+        );
+
+        // Every inexact assertion fails closed: wrong marker, unmarked subject, unusable marker.
+        assert_eq!(
+            retire(Some("catalog"), "h.nix").unwrap_err().code(),
+            "managed-by-mismatch"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.root").unwrap_err().code(),
+            "managed-by-mismatch"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.plain").unwrap_err().code(),
+            "managed-by-unmarked"
+        );
+        assert_eq!(
+            retire(Some(""), "h.nix").unwrap_err().code(),
+            "invalid-managed-by"
+        );
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
+
+        // The matched assertion authors exactly the lifecycle line and nothing else.
+        let receipt = retire(Some("nix"), "h.nix").unwrap();
+        assert_eq!(receipt.result, AuthorOutcome::Changed);
+        assert_eq!(receipt.managed_by.as_deref(), Some("nix"));
+        let authored = fs::read_to_string(&projected).unwrap();
+        assert_eq!(
+            authored.replace(
+                "  desired-state \"retired\" reason=\"nix: no longer declared\"\n",
+                ""
+            ),
+            original,
+            "only the lifecycle line may differ"
+        );
+        assert_eq!(
+            retire(Some("nix"), "h.nix").unwrap().result,
+            AuthorOutcome::Unchanged
+        );
+
+        // The same authority reverses it, restoring the projected bytes exactly.
+        assert_eq!(
+            set_desired_state(
+                root,
+                "h.nix",
+                "h",
+                None,
+                DesiredStateValue::Running,
+                None,
+                Some("nix"),
+            )
+            .unwrap()
+            .result,
+            AuthorOutcome::Changed
+        );
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
+        assert_eq!(fs::read_to_string(&unmarked).unwrap(), plain);
+    }
+
+    /// The marker-matched arm stands in for the CAS `agent publish` the projection would otherwise
+    /// run, so it refuses what that publication refuses: a retirement leaving an active agent
+    /// descended from a tombstone root is rejected by admission before any byte is written.
+    #[test]
+    fn marker_matched_retirement_refuses_a_candidate_admission_would_reject() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let projected = write(
+            root,
+            "h/root/agent.kdl",
+            &declaration("root", "h", None, "nix"),
+        );
+        write(
+            root,
+            "h/worker/agent.kdl",
+            &declaration("worker", "h", Some("root"), "catalog"),
+        );
+        let original = fs::read_to_string(&projected).unwrap();
+
+        let error = set_desired_state(
+            root,
+            "h.root",
+            "h",
+            None,
+            DesiredStateValue::Retired,
+            Some("nix: no longer declared"),
+            Some("nix"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "candidate-not-admissible");
+        assert!(error.to_string().contains("[retired-root]"), "{error}");
+        assert_eq!(fs::read_to_string(&projected).unwrap(), original);
     }
 
     #[test]
