@@ -185,7 +185,7 @@ core publication and do not claim managed admission.
 
 ## Field rules
 
-<h3 id="f01">F01 Source form or path</h3>
+### F01 Source form or path
 
 Formatting, comments, order, and a source path change are `no-op` only when all
 normalized fields, render plans, task IDs, fallback `cwd`, exact resolved paths,
@@ -197,7 +197,7 @@ Authoring: [pinned discovery, identity, and host][evals-discovery]. st2 source:
 [KDL parser](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [discovery](../../../crates/agent-spec/src/discovery.rs).
 
-<h3 id="f02">F02 Agent <code>id</code> and legacy <code>identity</code></h3>
+### F02 Agent `id` and legacy `identity`
 
 The target `id` field is the immutable catalog-global agent ID. IDs are unique
 across live and structurally archived subjects, across hosts and desired states.
@@ -238,7 +238,7 @@ writer emits it yet; positional `identity` is still the durable key. That gap is
 fenced by
 [DELTA-003](../.delta/DELTA-003-agent-address-not-implemented.md).
 
-<h3 id="f03">F03 <code>host</code></h3>
+### F03 `host`
 
 Each supervisor evaluates only local membership. A complete present-to-absent
 change removes locally; absent-to-present adds locally. This is not migration,
@@ -249,7 +249,7 @@ Authoring: [pinned discovery and host][evals-discovery]. st2 source:
 [`AgentSpec::host`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [host filtering](../../../src/reconcile.rs).
 
-<h3 id="f04">F04 <code>type</code></h3>
+### F04 `type`
 
 An omitted value and `service` have the same effect. Any other value refuses
 changes to the related agent, tasks, and files before launch, write, or teardown.
@@ -258,7 +258,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`JobType` and `RawSpec::job_type`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs).
 
-<h3 id="f05">F05 <code>role</code></h3>
+### F05 `role`
 
 Update observable declaration metadata only. Do not change the fingerprint,
 workspace files, notification state, or a healthy task.
@@ -267,7 +267,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::role`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [KDL lowering](../../../crates/agent-spec/src/kdl_format.rs).
 
-<h3 id="f06">F06 <code>workspace</code></h3>
+### F06 `workspace`
 
 For a healthy survivor, keep the process and commit the new live context. After
 commit, write one durable event with the old and new paths, then try
@@ -281,7 +281,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentSpec::workspace`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [`cwd` resolution](../../../src/run.rs).
 
-<h3 id="f07">F07 Resource <code>name</code> or <code>uri</code></h3>
+### F07 Resource `name` or `uri`
 
 Update Resource data without changing the launch fingerprint. Notify a
 survivor once after commit. New or replaced work reads the latest state at boot
@@ -292,7 +292,7 @@ st2 `9887b28` predate Resource bindings. Current st2 source:
 [`Resource`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [declared Resource projection](../../../src/agents.rs).
 
-<h3 id="f08">F08 <code>render {}</code> operation, template, or resolved target</h3>
+### F08 `render {}` operation, template, or resolved target
 
 Prove ownership for every affected local owner before writing. Conflicts refuse
 all affected owners. Write changed bytes and enforce the declared mode. The
@@ -307,7 +307,7 @@ declaration.
 Authoring: [pinned render contract][evals-render]. st2 implementation and
 evidence: [materializer](../../../src/materialize.rs).
 
-<h3 id="f09">F09 Task set: <code>pty</code>, <code>exec</code>, or compact <code>ding</code></h3>
+### F09 Task set: `pty`, `exec`, or compact `ding`
 
 Add only the unique missing child. Remove and clean only an old child with exact
 ownership proof. A compact DING is a derived child: it starts only after its
@@ -329,7 +329,7 @@ Authoring: [pinned compact and explicit tasks][evals-tasks]. st2 source:
 [`Task` and `TaskKind`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [task reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f10">F10 Task <code>name</code> or explicit <code>id</code></h3>
+### F10 Task `name` or explicit `id`
 
 Remove the exact old ID and add the new ID. Do not infer one incarnation.
 Report both actions, or `hold` or `refuse` when ownership proof is missing.
@@ -338,7 +338,7 @@ Authoring: [pinned explicit tasks][evals-tasks]. st2 source:
 [`Task::name` and `Task::id`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [task reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f11">F11 Spawn inputs</h3>
+### F11 Spawn inputs
 
 Task `kind`, `command`, `argv`, explicit `cwd`, and task `env`, plus agent
 `env`, `tags`, `supervisor`, and any other start input form the versioned launch
@@ -354,7 +354,7 @@ Authoring: [pinned tasks][evals-tasks] and [environment][evals-environment]. The
 Current st2 source: [`AgentSpec` and `Task`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [spawn construction](../../../src/run.rs).
 
-<h3 id="f12">F12 Future policy (R31)</h3>
+### F12 Future policy (R31)
 
 ```text
 canonical catalog folder + host = supervisor scope
@@ -416,7 +416,7 @@ Authoring: [pinned complete declaration][evals-fields]. The
 [`execute`](../../../src/run.rs). Evidence:
 [policy planning](../../../src/reconcile.rs).
 
-<h3 id="f13">F13 <code>retired #true</code></h3>
+### F13 `retired #true`
 
 Fence, stop, and clean every declared task ID with exact ownership proof, and
 prevent relaunch. Retirement preserves the agent ID, removes the subject from
@@ -429,7 +429,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs). Evidence:
 [retirement planning](../../../src/reconcile.rs).
 
-<h3 id="f14">F14 Compact agent fields</h3>
+### F14 Compact agent fields
 
 Compact `command`, `argv`, `env`, `lifecycle`, and `ding` convert to the
 generated agent PTY and derived sidecar. The tasks use F09, F11, and F12;
@@ -441,7 +441,7 @@ predate compact `argv` and `lifecycle`. Current st2 source:
 [KDL fields](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [`RawSpec` lowering](../../../crates/agent-spec/src/spec.rs).
 
-<h3 id="f15">F15 Provider and ignored fields</h3>
+### F15 Provider and ignored fields
 
 Core st2 ignores `harness`, `model`, `persona`, `permissions`, `transport`,
 `strategy`, `meta`, and provider extensions. They do not change core equality,
@@ -452,7 +452,7 @@ Authoring: [pinned complete declaration][evals-fields]. st2 source:
 [KDL field boundary](../../../crates/agent-spec/src/kdl_format.rs). Evidence:
 [`RawSpec` lowering](../../../crates/agent-spec/src/spec.rs).
 
-<h3 id="f16">F16 Invalid or incomplete state</h3>
+### F16 Invalid or incomplete state
 
 Refuse changes to an agent, task, or file when its desired or actual state is
 unreadable, invalid, ambiguous, or conflicting. Keep last-known-good ownership
@@ -464,7 +464,7 @@ source: [`RawSpec` and `AgentSpec`](../../../crates/agent-spec/src/spec.rs).
 Evidence: [validation](../../../src/validate.rs) and
 [reconciliation](../../../src/reconcile.rs).
 
-<h3 id="f18">F18 <code>desired-state</code> and <code>reason</code></h3>
+### F18 `desired-state` and `reason`
 
 `desired-state` is one of `running`, `suspended`, or `retired`. Its omission is
 running. A suspended or new-style retired declaration carries exactly one
@@ -517,7 +517,7 @@ st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [authoring](../../../tests/agent_desired_state.rs), and
 [planning](../../../tests/reconcile.rs).
 
-<h3 id="f17">F17 Agent <code>name</code> and <code>description</code></h3>
+### F17 Agent `name` and `description`
 
 Update observable declaration and runtime presentation metadata only. Neither
 field participates in agent ID, address routing, selection, authorization,
@@ -546,11 +546,11 @@ change lands. st2 source: [`AgentSpec`](../../../crates/agent-spec/src/spec.rs),
 Evidence: parser, roster, exact-ID metadata, and no-restart presentation tests.
 
 
-<h3 id="f19">F19 Agent <code>stream</code></h3>
+### F19 Agent `stream`
 
 A `stream "<name>" {}` declares one agent-owned event ingress endpoint. Names
-are 1..=40 characters matching
-`[a-z0-9]([a-z0-9-]*[a-z0-9])?` and cannot collide with an authored task named
+are 1..=40 lowercase alphanumeric characters with optional interior hyphens
+and cannot collide with an authored task named
 `stream-<name>`. The declaration contains at most one launch: `command` is an
 opaque shell command, `argv` is a non-empty structured argument vector, and an
 empty body means external ingress. Unknown children, including the reserved
@@ -571,7 +571,7 @@ lands. st2 source: [`Stream`](../../../crates/agent-spec/src/spec.rs),
 [`streams_are_typed_and_only_launched_streams_lower_to_derived_exec_tasks`](../../../crates/agent-spec/tests/discovery.rs)
 and stream lifecycle tests in [`tests/run.rs`](../../../tests/run.rs).
 
-<h3 id="f20">F20 Agent <code>address</code></h3>
+### F20 Agent `address`
 
 `address` is an optional mutable semantic alias for human routing. Its omission
 uses positional `identity` as the effective legacy address. Its presence
