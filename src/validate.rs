@@ -240,9 +240,12 @@ pub(crate) fn validate_discovered(
     // hosts is legal, and equal bytes in the ID namespace never collide with it. Keyed by
     // (resolved logical host, effective address).
     let mut seen_addresses: HashMap<(String, String), PathBuf> = HashMap::new();
-    // Placeholder host for bus-id collision: catalogs carry explicit host, and an empty host still
-    // makes two unset-host same-identity specs collide (which is the real bug).
-    let collision_host = "";
+    // One host key for both namespaces, so the two rules judge the same physical subject: under
+    // `--host h` a host-less declaration and an explicit `host "h"` one resolve to one agent and
+    // collide on both keys. Without a selected host the key is the empty placeholder, which still
+    // makes two unset-host same-identity specs collide (the real bug) while keeping an explicit
+    // host's own bytes.
+    let collision_host = this_host.unwrap_or_default();
 
     for s in &d.specs {
         let rp = rel(root, &s.path);
@@ -269,13 +272,33 @@ pub(crate) fn validate_discovered(
         // legacy/legacy, explicit/explicit across different hosts, and an explicit `id` that
         // collides with another subject's still-unmigrated frozen identity.
         //
-        // DELTA-003: the structurally archived subject set joins this check once
+        // Duplicate effective address, inside one resolved logical host. A retired subject does
+        // not resolve, so it releases its address and neither claims nor collides; a suspended
+        // subject still occupies the namespace. Explicit-vs-explicit and
+        // explicit-vs-identity-fallback collisions are the same collision here, because both
+        // sides are read through `effective_address`.
+        //
+        // Both keys register in one pass, before either is reported: a declaration refused for a
+        // duplicate ID still claims its address, so the authoring gate — `refuse_address_collision`
+        // re-runs exactly this rule over a prospective catalog — cannot admit a second claim on an
+        // address an already-duplicated declaration holds. Only the first fault is reported: an
+        // unmigrated duplicate identity is one authoring fault in one place, and reporting it
+        // twice would only inflate a legacy catalog's diagnostics.
+        //
+        // DELTA-003: the structurally archived subject set joins the ID check once
         // `st2 catalog migrate-ids` lands (PR D2) — migration may freeze an archived subject's
         // legacy bytes only while they remain unique across the combined live-and-archived set,
         // and `st2 catalog unarchive` validates ID uniqueness against that prospective
         // live-and-archived set rather than the live catalog alone.
         let bid = s.effective_id(collision_host);
         let duplicate_id = seen.insert(bid.clone(), s.path.clone());
+        let address_host = s.resolved_host(collision_host).to_string();
+        let address = s.effective_address().to_string();
+        let duplicate_address = (!s.desired_state.is_retired())
+            .then(|| {
+                seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone())
+            })
+            .flatten();
         if let Some(prev) = &duplicate_id {
             issues.push(Issue::error(
                 "dup-id",
@@ -287,36 +310,21 @@ pub(crate) fn validate_discovered(
                     rel(root, prev)
                 ),
             ));
-        }
-
-        // Duplicate effective address within one resolved logical host. A retired subject does not
-        // resolve, so it releases its address and neither claims nor collides; a suspended subject
-        // still occupies the namespace. Explicit-vs-explicit and explicit-vs-identity-fallback
-        // collisions are the same collision here, because both sides are read through
-        // `effective_address`. A declaration already refused for a duplicate ID says nothing
-        // further about its address: an unmigrated duplicate identity is one authoring fault in
-        // one place, and reporting it twice would only inflate a legacy catalog's diagnostics.
-        if duplicate_id.is_none() && !s.desired_state.is_retired() {
-            let address_host = s.resolved_host(this_host.unwrap_or_default()).to_string();
-            let address = s.effective_address().to_string();
-            if let Some(prev) =
-                seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone())
-            {
-                issues.push(Issue::error(
-                    "dup-address",
-                    rp.clone(),
-                    ag.clone(),
-                    format!(
-                        "duplicate agent address '{address}' on host '{}' (also declared in {})",
-                        if address_host.is_empty() {
-                            "<default>"
-                        } else {
-                            &address_host
-                        },
-                        rel(root, &prev)
-                    ),
-                ));
-            }
+        } else if let Some(prev) = &duplicate_address {
+            issues.push(Issue::error(
+                "dup-address",
+                rp.clone(),
+                ag.clone(),
+                format!(
+                    "duplicate agent address '{address}' on host '{}' (also declared in {})",
+                    if address_host.is_empty() {
+                        "<default>"
+                    } else {
+                        &address_host
+                    },
+                    rel(root, prev)
+                ),
+            ));
         }
 
         if let Some(Err(error)) = &compiled {

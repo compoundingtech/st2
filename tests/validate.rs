@@ -1302,3 +1302,65 @@ fn a_legacy_catalog_produces_byte_identical_duplicate_diagnostics() {
         r.issues
     );
 }
+
+/// Both duplicate rules read the same host key, so one physical subject declared twice — once
+/// host-less, once with an explicit `host "h"` — is a duplicate ID under `--host h`, not a
+/// conflict reported only under the address code.
+#[test]
+fn a_host_less_and_an_explicit_host_declaration_collide_as_one_duplicate_id() {
+    let c = catalog(&[
+        (
+            "h/worker/agent.kdl",
+            r#"agent "worker" { host "h"; command "x" }"#,
+        ),
+        ("worker.kdl", r#"agent "worker" { command "x" }"#),
+    ]);
+
+    let r = validate_for_host(c.path(), "h");
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-id"
+            && i.severity == Severity::Error
+            && i.message.contains("duplicate agent id 'h.worker'")),
+        "one resolved subject declared twice must collide on the id key: {:?}",
+        r.issues
+    );
+    assert!(
+        !has(&r, "dup-address", Severity::Error),
+        "one physical conflict is one diagnostic: {:?}",
+        r.issues
+    );
+}
+
+/// A declaration refused for a duplicate ID still claims its address. Otherwise a third subject
+/// could take that address undetected — and `st2 agent address` admits exactly what this rule
+/// admits, so the writer's gate would hand out a second claim on one route.
+#[test]
+fn a_declaration_refused_for_a_duplicate_id_still_claims_its_address() {
+    let c = catalog(&[
+        ("h/a/agent.kdl", r#"agent "x" { host "h"; command "x" }"#),
+        (
+            "h/b/agent.kdl",
+            r#"agent "x" { host "h"; address "ops"; command "x" }"#,
+        ),
+        (
+            "h/c/agent.kdl",
+            r#"agent "c" { host "h"; address "ops"; command "x" }"#,
+        ),
+    ]);
+
+    let r = validate(c.path());
+    assert!(
+        has(&r, "dup-id", Severity::Error),
+        "the duplicate identity must still be reported: {:?}",
+        r.issues
+    );
+    assert!(
+        r.issues.iter().any(|i| i.code == "dup-address"
+            && i.severity == Severity::Error
+            && i.message
+                .contains("duplicate agent address 'ops' on host 'h'")
+            && i.message.contains("h/b/agent.kdl")),
+        "the address a duplicated-id declaration holds must still collide: {:?}",
+        r.issues
+    );
+}
