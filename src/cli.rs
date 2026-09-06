@@ -412,6 +412,12 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Internal cold-residency generation that must resume its exact checkpointed session.
+        #[arg(long, hide = true, requires = "required_resume_incarnation")]
+        required_resume_generation: Option<u64>,
+        /// Host-minted incarnation that fences this exact launch attempt.
+        #[arg(long, hide = true, requires = "required_resume_generation")]
+        required_resume_incarnation: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },

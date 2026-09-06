@@ -25,6 +25,8 @@ const IDENTITY = "ST2_OMP_CHANNEL_IDENTITY";
 const RUNTIME_ID = "ST2_OMP_CHANNEL_RUNTIME_ID";
 const SESSION = "ST2_OMP_CHANNEL_SESSION";
 const SEQ = "ST2_OMP_CHANNEL_SEQ";
+const EXPECTED_NATIVE_SESSION = "ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
+const RESUME_GENERATION = "ST2_OMP_CHANNEL_RESUME_GENERATION";
 
 // omp starts the session even if st2 is slow to answer. Restored context is worth a short wait
 // and never worth a hung agent.
@@ -54,6 +56,8 @@ type Stash = {
   runtimeId?: string;
   session?: string;
   seq?: string;
+  expectedNativeSession?: string;
+  resumeGeneration?: string;
   child?: childProcess.ChildProcess;
   /**
    * The last assistant message's `usage.cost.total`.
@@ -177,6 +181,8 @@ const stash = (): Stash => {
       runtimeId: process.env[RUNTIME_ID],
       session: process.env[SESSION],
       seq: process.env[SEQ],
+      expectedNativeSession: process.env[EXPECTED_NATIVE_SESSION],
+      resumeGeneration: process.env[RESUME_GENERATION],
     };
     delete process.env[BIN];
     delete process.env[CATALOG];
@@ -184,6 +190,8 @@ const stash = (): Stash => {
     delete process.env[RUNTIME_ID];
     delete process.env[SESSION];
     delete process.env[SEQ];
+    delete process.env[EXPECTED_NATIVE_SESSION];
+    delete process.env[RESUME_GENERATION];
   }
   return globals.__st2OmpChannel;
 };
@@ -203,7 +211,8 @@ const idleProof = (ctx: ExtensionContext): boolean => {
 export default function (pi: ExtensionAPI) {
   const state = stash();
   const { bin, catalog, identity, runtimeId, session, seq } = state;
-
+  let expectedNativeSession = state.expectedNativeSession;
+  let resumeGeneration = state.resumeGeneration;
 
   const cancelSettle = () => {
     state.settleGeneration = (state.settleGeneration ?? 0) + 1;
@@ -242,6 +251,14 @@ export default function (pi: ExtensionAPI) {
       );
       return Promise.resolve("");
     }
+    const nativeSessionId = ctx.sessionManager.getSessionId();
+    if (typeof nativeSessionId !== "string" || nativeSessionId.trim() === "") {
+      ctx.ui?.notify?.(
+        "st2: omp reported no native session id; refusing to open the st2 channel",
+        "error",
+      );
+      return Promise.resolve("");
+    }
     // Close the PREVIOUS session's channel and wait (bounded) before spawning: the successor
     // shares the seat's record, and a predecessor draining its queued frames after the new
     // session's seed would land stale state into fresh records.
@@ -259,6 +276,10 @@ export default function (pi: ExtensionAPI) {
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
     if (session) channelEnv[SESSION] = session;
     if (seq) channelEnv[SEQ] = seq;
+    if (expectedNativeSession) {
+      channelEnv[EXPECTED_NATIVE_SESSION] = expectedNativeSession;
+    }
+    if (resumeGeneration) channelEnv[RESUME_GENERATION] = resumeGeneration;
     const child = childProcess.spawn(
       bin,
       ["--catalog", catalog, "driver", "omp-channel", "--identity", identity],
@@ -290,6 +311,7 @@ export default function (pi: ExtensionAPI) {
         if (child.stdin.destroyed) return;
         child.stdin.write(JSON.stringify(frame) + "\n");
       };
+      send({ type: "session", sessionId: nativeSessionId });
 
       const handle = async (line: string) => {
         let frame: Frame;
@@ -310,6 +332,13 @@ export default function (pi: ExtensionAPI) {
             settle("");
             return;
           }
+          send({ type: "ready", sessionId: nativeSessionId });
+          // The fence proves only the first session restored by this cold launch. A later explicit
+          // in-process session switch becomes the current binding and must not inherit the old ID.
+          expectedNativeSession = undefined;
+          resumeGeneration = undefined;
+          state.expectedNativeSession = undefined;
+          state.resumeGeneration = undefined;
           clearTimeout(timer);
           settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");
           return;

@@ -230,6 +230,31 @@ pub(crate) fn run_provider_observed(
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
 ) -> Result<ProviderOutcome> {
+    run_provider_observed_with_env_removals(
+        provider,
+        status_path,
+        argv,
+        env,
+        &[],
+        refresh_interval,
+        poll,
+        stop,
+        observed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_provider_observed_with_env_removals(
+    provider: &str,
+    status_path: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+    removed_env: &[&str],
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<ProviderOutcome> {
     let (program, args) = argv
         .split_first()
         .with_context(|| format!("{provider} provider argv is empty"))?;
@@ -239,9 +264,7 @@ pub(crate) fn run_provider_observed(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    apply_provider_environment(&mut command, env, removed_env);
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -285,6 +308,19 @@ pub(crate) fn run_provider_observed(
             next_refresh = now + refresh_interval;
         }
         thread::sleep(poll.min(next_refresh.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn apply_provider_environment(
+    command: &mut Command,
+    env: &[(String, String)],
+    removed_env: &[&str],
+) {
+    for key in removed_env {
+        command.env_remove(key);
+    }
+    for (key, value) in env {
+        command.env(key, value);
     }
 }
 
@@ -386,5 +422,32 @@ mod tests {
         // The arm the label calls unknown really is the one neither half of the pair answers.
         let stopped = ExitStatus::from_raw(0x7f);
         assert_eq!((stopped.code(), stopped.signal()), (None, None));
+    }
+    #[test]
+    fn explicit_environment_removal_precedes_managed_values() {
+        const FENCE: &str = "ST2_TEST_PROVIDER_FENCE";
+        let value_for = |command: &Command| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(FENCE))
+                .map(|(_, value)| value.map(|value| value.to_owned()))
+        };
+
+        let mut ordinary = Command::new("true");
+        ordinary.env(FENCE, "ambient");
+        apply_provider_environment(&mut ordinary, &[], &[FENCE]);
+        assert_eq!(value_for(&ordinary), Some(None));
+
+        let mut required = Command::new("true");
+        required.env(FENCE, "ambient");
+        apply_provider_environment(
+            &mut required,
+            &[(FENCE.to_string(), "required".to_string())],
+            &[FENCE],
+        );
+        assert_eq!(
+            value_for(&required),
+            Some(Some(std::ffi::OsString::from("required")))
+        );
     }
 }
