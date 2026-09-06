@@ -164,6 +164,11 @@ fn a_colliding_address_refuses_on_the_same_host_and_is_admitted_on_another() {
     let refused = receipt(&refused);
     assert_eq!(refused["result"], "error");
     assert_eq!(refused["code"], "address-conflict");
+    let message = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("h.alpha") && message.contains("h/alpha/agent.kdl"),
+        "the refusal must name the incumbent claimant, not the edited file: {message}"
+    );
     assert!(
         !fs::read_to_string(root.join("h/beta/agent.kdl"))
             .unwrap()

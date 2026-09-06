@@ -820,25 +820,49 @@ fn refuse_address_collision(
         }
     }
     let report = crate::validate::validate_discovered(catalog_root, Some(this_host), &prospective);
-    match report
+    if !report
         .issues
         .iter()
-        .find(|issue| issue.code == "dup-address")
+        .any(|issue| issue.code == "dup-address")
     {
-        None => Ok(()),
-        Some(issue) => Err(AuthorError::new(
-            "address-conflict",
-            format!(
-                "{} is not unique on host {:?}: {}",
-                requested.map_or_else(
-                    || format!("identity fallback address {:?}", target.source_identity),
-                    |value| format!("address {value:?}")
-                ),
-                target.source_host,
-                issue.message
-            ),
-        )),
+        return Ok(());
     }
+    // Name the incumbent, not the first declaration in path order: the forwarded diagnostic often
+    // pointed at the candidate's own file, because that is where `dup-address` first saw the
+    // address. The claimant is the *other* subject reading the same effective address on this
+    // host.
+    let candidate = requested.unwrap_or(&target.source_identity);
+    let claimant = prospective
+        .specs
+        .iter()
+        .find(|spec| {
+            spec.bus_id(this_host) != target.identity
+                && !spec.desired_state.is_retired()
+                && spec.resolved_host(this_host) == target.source_host
+                && spec.effective_address() == candidate
+        })
+        .map(|spec| {
+            format!(
+                "{} declared in {}",
+                spec.bus_id(this_host),
+                spec.path
+                    .strip_prefix(catalog_root)
+                    .unwrap_or(&spec.path)
+                    .display()
+            )
+        });
+    Err(AuthorError::new(
+        "address-conflict",
+        format!(
+            "{} is not unique on host {:?}: already claimed by {}",
+            requested.map_or_else(
+                || format!("identity fallback address {:?}", target.source_identity),
+                |value| format!("address {value:?}")
+            ),
+            target.source_host,
+            claimant.unwrap_or_else(|| "another declaration in this catalog".to_owned())
+        ),
+    ))
 }
 
 fn resolve_target(
