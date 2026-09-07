@@ -6,8 +6,8 @@
 //! authority and is reconciled through [`Ledger::prune`].
 //!
 //! One phase can reach this ledger without this build observing anything: an attempt an earlier
-//! release made and left behind. Such a phase holds exactly as far as a phase holds — no harness
-//! profile proves `Attempted`, so nothing is re-sent — and [`Attestation`] records that this
+//! release made and left behind. Such a phase holds exactly as far as a phase holds — no evidence
+//! policy releases `Attempted`, so nothing is re-sent — and [`Attestation`] records that this
 //! build never watched it, which is what makes the leftover countable and therefore removable.
 //! The translation itself lives outside this module, behind the one seam in [`Ledger::open`].
 
