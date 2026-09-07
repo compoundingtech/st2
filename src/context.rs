@@ -117,7 +117,7 @@ pub fn write_now_if_blank(context_dir: &Path, content: &str) -> anyhow::Result<b
     }
 }
 
-fn lock_now(context_dir: &Path) -> anyhow::Result<fs::File> {
+fn lock_now(context_dir: &Path) -> anyhow::Result<crate::flock::FileLock> {
     crate::harness_state::lock_exclusive(&context_dir.join(NOW_LOCK))
         .context("acquire now.md writer lock")
 }
@@ -341,5 +341,28 @@ mod tests {
         assert!(append_decision_to_dir(&decisions_dir(&dir), "", "why").is_err());
         assert!(append_decision_to_dir(&decisions_dir(&dir), "d", "").is_err());
         assert!(append_decision_to_dir(&decisions_dir(&dir), "line1\nline2", "why").is_err());
+    }
+
+    /// `now.md` writes serialize on a lock file the transport hardened with `O_NOFOLLOW`;
+    /// nothing pinned that before, and this module had no lock test at all.
+    #[test]
+    fn a_symlinked_now_lock_refuses_the_write_instead_of_locking_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(NOW_LOCK)).unwrap();
+
+        let error = write_now(&dir, "fresh").unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "a symlinked now.md lock must refuse the write, got {error:#}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+        assert!(!now_file(&dir).exists(), "a refused lock must publish nothing");
     }
 }

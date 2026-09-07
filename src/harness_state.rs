@@ -15,11 +15,11 @@
 //! transport.
 
 use std::fs;
-use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 /// A valid observation at least this old reads as `unknown`. Deliberately its own constant rather
@@ -307,7 +307,7 @@ impl Writer {
 
     /// Hold the record's exclusive cross-process lock for one read→decide→rename cycle. The lock
     /// file is a permanent sibling; the guard releases on drop (close).
-    fn locked(&self) -> anyhow::Result<fs::File> {
+    fn locked(&self) -> anyhow::Result<crate::flock::FileLock> {
         lock_exclusive(&self.lock_path)
     }
 
@@ -694,17 +694,13 @@ fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
 /// The lock file is a permanent sibling of the record and the guard releases on drop (close).
 /// Shared with [`crate::harness_context`], which owns a sibling record with its own lock file:
 /// the transport is common, the ownership protocol above it is not.
-pub(crate) fn lock_exclusive(lock_path: &Path) -> anyhow::Result<fs::File> {
+pub(crate) fn lock_exclusive(lock_path: &Path) -> anyhow::Result<crate::flock::FileLock> {
     if let Some(dir) = lock_path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(lock_path)?;
-    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    anyhow::ensure!(rc == 0, "locking {} failed", lock_path.display());
-    Ok(lock)
+    let lock = crate::flock::open(lock_path, crate::flock::Open::Create)?;
+    crate::flock::FileLock::hold_blocking(lock, crate::flock::Mode::Exclusive)
+        .with_context(|| format!("locking {} failed", lock_path.display()))
 }
 
 /// Stage-and-rename one newline-terminated JSON record. Atomic when `staging_dir` is on the
@@ -2151,5 +2147,52 @@ mod tests {
             live,
             "nothing renamed over the live record"
         );
+    }
+
+    /// Both driver records and `context`'s `now.md` share this one acquisition, so this is the
+    /// only place the newly hardened `O_NOFOLLOW` needs pinning. None of the three had a lock
+    /// test before.
+    #[test]
+    fn a_symlinked_record_lock_is_refused_instead_of_locking_its_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        let lock_path = tmp.path().join("agent/.harness-state.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &lock_path).unwrap();
+
+        let error = lock_exclusive(&lock_path).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "a symlinked record lock must be refused, got {error:#}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+
+        let fresh = tmp.path().join("agent/.harness-context.lock");
+        let held = lock_exclusive(&fresh).unwrap();
+        assert_eq!(
+            fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a freshly created record lock must be private"
+        );
+        // `flock` locks the open file description, so a second open in this process contends.
+        let probe = || {
+            let file = crate::flock::open(&fresh, crate::flock::Open::Existing).unwrap();
+            crate::flock::FileLock::hold(
+                file,
+                crate::flock::Mode::Exclusive,
+                crate::flock::Wait::Now,
+            )
+            .unwrap()
+            .is_some()
+        };
+        assert!(!probe(), "a live record-lock holder must exclude a second writer");
+        drop(held);
+        assert!(probe(), "dropping the guard must release the record lock");
     }
 }

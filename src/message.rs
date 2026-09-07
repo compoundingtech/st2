@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use st2_wire::message::{SentCoverage, SentMessageRow, SentMessages};
 
+use crate::flock::{self, FileLock};
 use crate::identity::{AgentSelector, ResolveError};
 
 const SENT_VERSION: u32 = 1;
@@ -2344,53 +2345,48 @@ fn validate_idempotency_key(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One sender's ledger lock. Read only by `Drop`: the guard's job is to outlive the read-decide-
+/// publish cycle, and closing the descriptor is what releases it.
 struct SentLock {
-    file: Option<File>,
+    _held: FileLock,
 }
 
 impl SentLock {
     fn shared(root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
-        Self::acquire(root, libc::LOCK_SH)
+        Self::acquire(root, flock::Mode::Shared)
     }
 
     fn exclusive(root: &Path) -> anyhow::Result<Self> {
         fs::create_dir_all(root)?;
-        Self::acquire(root, libc::LOCK_EX)
+        Self::acquire(root, flock::Mode::Exclusive)
     }
 
+    /// The read-only path: `Ok(None)` means this sender has never published, which a reader
+    /// answers without creating the sender's ledger directory or its lock file.
+    ///
+    /// It opens the lock file `O_RDWR` rather than `O_RDONLY`, because the transport has one open
+    /// shape. That is a real narrowing — a reader who may read the lock file but not write it now
+    /// fails here — and it is admissible only because every ledger is single-uid: its owner and
+    /// root are the only readers, and a lock file this build creates is `0600` anyway.
     fn shared_existing(root: &Path) -> anyhow::Result<Option<Self>> {
-        use std::os::fd::AsRawFd as _;
-        let file = match OpenOptions::new().read(true).open(root.join(SENT_LOCK)) {
+        let file = match flock::open(&root.join(SENT_LOCK), flock::Open::Existing) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
-        anyhow::ensure!(result == 0, "locking sent-message ledger failed");
-        Ok(Some(Self { file: Some(file) }))
+        Ok(Some(Self {
+            _held: FileLock::hold_blocking(file, flock::Mode::Shared)
+                .context("locking sent-message ledger failed")?,
+        }))
     }
 
-    fn acquire(root: &Path, operation: libc::c_int) -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join(SENT_LOCK))?;
-        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-        anyhow::ensure!(result == 0, "locking sent-message ledger failed");
-        Ok(Self { file: Some(file) })
-    }
-}
-
-impl Drop for SentLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        if let Some(file) = &self.file {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
+    fn acquire(root: &Path, mode: flock::Mode) -> anyhow::Result<Self> {
+        let file = flock::open(&root.join(SENT_LOCK), flock::Open::Create)?;
+        Ok(Self {
+            _held: FileLock::hold_blocking(file, mode)
+                .context("locking sent-message ledger failed")?,
+        })
     }
 }
 
@@ -2938,5 +2934,75 @@ mod tests {
                 "accepted unsafe external identity {identity:?}"
             );
         }
+    }
+
+    /// The transport hardened this lock file with `O_NOFOLLOW`; nothing pinned it before.
+    #[test]
+    fn a_symlinked_ledger_lock_is_refused_instead_of_locking_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        let root = sent_dir(tmp.path());
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(SENT_LOCK)).unwrap();
+
+        for error in [
+            list_sent(tmp.path(), false).unwrap_err(),
+            inspect_sent(tmp.path(), false).unwrap_err(),
+        ] {
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(libc::ELOOP),
+                "a symlinked ledger lock must be refused, got {error:#}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+    }
+
+    /// `flock` locks the open file description rather than the process, so a second open of the
+    /// same lock file observes a live holder without a second thread or process.
+    fn ledger_lock_is_free(root: &Path, mode: crate::flock::Mode) -> bool {
+        let file = crate::flock::open(&root.join(SENT_LOCK), crate::flock::Open::Existing).unwrap();
+        FileLock::hold(file, mode, crate::flock::Wait::Now)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_ledger_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sent_dir(tmp.path());
+        let held = SentLock::exclusive(&root).unwrap();
+        assert!(
+            !ledger_lock_is_free(&root, crate::flock::Mode::Shared),
+            "an exclusive ledger holder must exclude a reader"
+        );
+        drop(held);
+        assert!(
+            ledger_lock_is_free(&root, crate::flock::Mode::Shared),
+            "dropping the guard must release the ledger lock"
+        );
+    }
+
+    /// `inspect_sent` takes two sequential guards around one unlocked read. Neither may outlive
+    /// the call, or the doctor read would block every subsequent publication by that sender.
+    #[test]
+    fn inspect_sent_leaves_no_guard_held_and_creates_no_sender_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = sent_dir(tmp.path());
+        inspect_sent(tmp.path(), false).unwrap();
+        assert!(
+            !root.exists(),
+            "the read-only path must not create sender state"
+        );
+
+        drop(SentLock::exclusive(&root).unwrap());
+        inspect_sent(tmp.path(), false).unwrap();
+        assert!(
+            ledger_lock_is_free(&root, crate::flock::Mode::Exclusive),
+            "inspect_sent must release both of its shared guards before returning"
+        );
     }
 }
