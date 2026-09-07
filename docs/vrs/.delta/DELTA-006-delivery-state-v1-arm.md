@@ -41,16 +41,23 @@ point, the ownership filter, the legacy filename), `codex_v1.rs`, and
 labels — Codex's `accepted` was a typed in-turn receipt and grades to
 `consumed`, OpenCode's was a storage read-back and grades to `persisted`).
 
-Canonical code gains one version-free concept, `Attestation{Observed,
-Asserted}` on `Entry`: a phase this build graded versus a phase another
-authority asserted. An assertion bounds what already happened, so it suppresses
-a duplicate; it is not an observation, so it authorizes no transport until this
-build sees something itself. That distinction is permanent and would be needed
-by any future asserting authority, so it stays when the arm goes.
+Canonical code gains one version-free field, `Attestation{Observed, Asserted}`
+on `Entry`: whether this build graded the phase or another authority asserted
+it. It changes no decision — no `Retention`, `RetryDecision`, or transport
+arm reads it. What holds a carried-forward attempt is its `Phase` measured
+against the harness `Profile`: no profile proves `Attempted`, and `Ledger::seed`
+refuses an asserted phase its profile cannot prove at all, so the safety
+property is delivered by the phase, not by the label. The field is there so the
+fleet can *see* an unobserved phase — it is clause 2 of the Resolution Signal
+below — which makes it trigger instrumentation for this arm, not a permanent
+concept. It is deleted **with** the arm.
 
-Deletion is `git rm -r src/migrations` plus replacing the seam arm with
-`Ok(())`, which is byte-for-byte a first run on a fresh seat. Measured cost of
-that deletion: one compile error, at the seam.
+Deletion is `git rm -r src/migrations`, replacing the seam arm with `Ok(())`,
+and removing the instrumentation the trigger needed: `Entry.attestation` and
+`Attestation`, `delivery_ledger::asserted_entries`,
+`migrations::delivery_state::resolution_signal`, and the `st2 doctor` row that
+prints it. What remains is byte-for-byte a first run on a fresh seat. Measured
+cost of the boundary deletion itself: one compile error, at the seam.
 
 ## Direction
 
@@ -58,8 +65,16 @@ update implementation
 
 ## Resolution Signal
 
-Both commands below print nothing, on every admitted host, for seven
-consecutive days:
+`st2 doctor` prints, per seat, a `pre-ledger delivery state (DELTA-006)`
+advisory carrying `preLedgerRecords` and `assertedEntries`, and prints nothing
+when both are zero. The trigger resolves when that line is absent from
+`st2 doctor` on every admitted host for seven consecutive days. Producer:
+`migrations::delivery_state::resolution_signal`, pinned by
+`migrations::delivery_state::tests::the_resolution_signal_counts_each_clause_without_consuming_it`;
+measuring is read-only, so a diagnostic cannot make the record it counts
+disappear.
+
+The two clauses, and the equivalent commands for a host with no `st2` on PATH:
 
 ```sh
 state="${XDG_STATE_HOME:-$HOME/.local/state}/st2"
@@ -74,10 +89,14 @@ find "$state/codex" "$state/opencode" -maxdepth 2 -name delivery-ledger.json -pr
   | xargs -0 -r jq -r 'select([.entries[].attestation] | any(. == "asserted")) | input_filename'
 ```
 
-Clause 1 also requires that rollback to a pre-ledger release has stopped being
-supported: while it is supported, a rolled-back binary can write a new
-`delivery-state.json`, and the roll-forward window it opens is pinned by
+Clause 1 additionally requires a named artifact, not a recollection: a ratified
+decision under `docs/vrs/.decisions/` recording that the pre-ledger release line
+is no longer a supported rollback target. While no such record exists clause 1
+stays open, because a rolled-back binary can write a new `delivery-state.json`
+and the roll-forward window it opens is pinned by
 `migrations::delivery_state::tests::a_rollback_then_roll_forward_does_not_see_the_record_written_in_between`.
+That record's existence is what closes the clause; cite it by number here when
+it lands.
 
 The local half of the trigger — that with no old record present the module
 contributes nothing and writes nothing, so removing it cannot change observed

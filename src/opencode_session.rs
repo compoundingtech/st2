@@ -1631,7 +1631,7 @@ fn stable_message_id(recipient: &str, session_id: &str, filename: &str) -> Strin
     format!("msg{:.26}", format!("{:x}", hash.finalize()))
 }
 
-fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
+pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))

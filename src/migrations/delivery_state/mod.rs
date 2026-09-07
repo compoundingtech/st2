@@ -17,20 +17,27 @@
 //!
 //! * **Fresh namespace.** The canonical record is a different filename, so nothing is rewritten
 //!   and a translation can be re-derived from bytes that are still there.
-//! * **Assertion, not observation.** Every entry this module produces is
-//!   [`crate::delivery_ledger::Attestation::Asserted`] via
-//!   [`crate::delivery_ledger::asserted`], so a carried-forward phase can suppress a duplicate
-//!   and can never authorize a transport. That is the whole safety argument, and it is enforced
-//!   by the canonical validator, not by care taken here.
+//! * **Phase, not label.** Every entry this module produces is graded no higher than the
+//!   evidence the old record actually carried, and no harness
+//!   [`Profile`](crate::delivery_ledger::Profile) proves `Attempted`, so a carried-forward
+//!   attempt suppresses a duplicate and authorizes no transport.
+//!   [`Ledger::seed`](crate::delivery_ledger::Ledger::seed) re-checks that against the profile
+//!   and fails closed, so the safety argument is enforced by the canonical validator, not by
+//!   care taken here.
+//!   [`crate::delivery_ledger::asserted`] additionally marks each entry
+//!   [`crate::delivery_ledger::Attestation::Asserted`], which changes no decision and exists to
+//!   make the leftover countable — see the trigger below.
 //!
 //! # Deletion trigger
 //!
-//! `docs/vrs/.delta/DELTA-006-delivery-state-v1-arm.md`, whose Resolution Signal is the live
-//! query that makes this directory removable — no `delivery-state.json` beside a ledger on any
-//! admitted host for seven days, and no ledger entry still carrying an asserted phase. Deleting
-//! it is this directory plus the one seam statement in
-//! [`crate::delivery_ledger::Ledger::open`]. The local half of the trigger is
-//! [`tests::deletion_trigger_absent_old_record_makes_this_module_a_no_op`].
+//! `docs/vrs/.delta/DELTA-006-delivery-state-v1-arm.md`, whose Resolution Signal is produced by
+//! [`resolution_signal`] and printed per seat by `st2 doctor`: no `delivery-state.json` beside a
+//! ledger and no ledger entry still carrying an asserted phase, on every admitted host, for
+//! seven days. Deleting this arm is this directory, the one seam statement in
+//! [`crate::delivery_ledger::Ledger::open`], and the attestation instrumentation the trigger
+//! needed. The local half of the trigger is
+//! [`tests::deletion_trigger_absent_old_record_makes_this_module_a_no_op`]; the signal itself is
+//! pinned by [`tests::the_resolution_signal_counts_each_clause_without_consuming_it`].
 
 mod codex_v1;
 mod opencode_v1;
@@ -38,9 +45,9 @@ mod opencode_v1;
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::delivery_ledger::{Entry, Harness};
+use crate::delivery_ledger::{Entry, Harness, LEDGER_FILE};
 
 /// The filename every pre-ledger release wrote. Named here only.
 const LEGACY_FILE: &str = "delivery-state.json";
@@ -92,6 +99,45 @@ where
         Harness::Codex => translate::<codex_v1::Record>(&bytes, agent, correlate),
         Harness::OpenCode => translate::<opencode_v1::Record>(&bytes, agent, correlate),
     }
+}
+
+/// DELTA-006's Resolution Signal, counted instead of remembered.
+///
+/// Clause 1 is a pre-ledger record still sitting beside a per-harness state dir; clause 2 is a
+/// ledger entry whose phase this fleet asserted rather than observed. Both must read zero, on
+/// every admitted host, before this directory and the seam in
+/// [`crate::delivery_ledger::Ledger::open`] can go — and a trigger nothing produces resolves on
+/// someone remembering, which is a date in disguise. `st2 doctor` prints this per seat so the
+/// observation exists.
+///
+/// Read-only: it opens no ledger and translates nothing, so running the diagnostic cannot make
+/// the record it is counting disappear.
+pub struct ResolutionSignal {
+    pub pre_ledger_records: usize,
+    pub asserted_entries: usize,
+}
+
+impl ResolutionSignal {
+    /// Whether both clauses are clear for the seats measured, i.e. nothing to print.
+    pub fn is_clear(&self) -> bool {
+        self.pre_ledger_records == 0 && self.asserted_entries == 0
+    }
+}
+
+/// Measure the signal across one seat's per-harness state directories.
+pub fn resolution_signal(state_dirs: &[PathBuf]) -> Result<ResolutionSignal> {
+    let mut signal = ResolutionSignal {
+        pre_ledger_records: 0,
+        asserted_entries: 0,
+    };
+    for state_dir in state_dirs {
+        if state_dir.join(LEGACY_FILE).exists() {
+            signal.pre_ledger_records += 1;
+        }
+        signal.asserted_entries +=
+            crate::delivery_ledger::asserted_entries(&state_dir.join(LEDGER_FILE))?;
+    }
+    Ok(signal)
 }
 
 /// Decode, filter by ownership, convert.
@@ -194,8 +240,7 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
     use crate::delivery_ledger::{
-        Attestation, HoldReason, LEDGER_FILE, LEDGER_SCHEMA, Ledger, Phase, Retention,
-        RetryDecision,
+        Attestation, HoldReason, LEDGER_SCHEMA, Ledger, Phase, Retention, RetryDecision,
     };
 
     const FILE_A: &str = "1786380000000-aaa111.md";
@@ -235,6 +280,54 @@ mod tests {
                 "a driver that never delivered leaves no record behind"
             );
         }
+    }
+
+    /// The fleet half of the deletion trigger needs a producer, or it resolves on someone
+    /// remembering. Each clause must read nonzero exactly while the thing it names is present,
+    /// and measuring must not consume it.
+    #[test]
+    fn the_resolution_signal_counts_each_clause_without_consuming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let dirs = [state_dir.clone()];
+
+        assert!(resolution_signal(&dirs).unwrap().is_clear());
+
+        fixture::place(
+            &state_dir,
+            &fixture::codex_attempted(
+                "h.worker",
+                "h.worker",
+                "incarnation-0",
+                "thread-main",
+                FILE_A,
+                &correlate("thread-main", FILE_A),
+            ),
+        );
+        let signal = resolution_signal(&dirs).unwrap();
+        assert_eq!(signal.pre_ledger_records, 1);
+        assert_eq!(
+            signal.asserted_entries, 0,
+            "clause 2 counts translated entries, and nothing has opened the ledger yet"
+        );
+
+        // Opening translates: the old record stays (clause 1) and the carried-forward phase is
+        // now visible as asserted (clause 2).
+        let ledger = open(&state_dir, Harness::Codex);
+        assert_eq!(
+            ledger.entry(FILE_A).unwrap().attestation,
+            Attestation::Asserted
+        );
+        let signal = resolution_signal(&dirs).unwrap();
+        assert_eq!(signal.pre_ledger_records, 1);
+        assert_eq!(signal.asserted_entries, 1);
+        assert!(!signal.is_clear());
+
+        // Measuring is read-only: both clauses still hold after a second look.
+        assert!(state_dir.join(LEGACY_FILE).exists());
+        let signal = resolution_signal(&dirs).unwrap();
+        assert_eq!(signal.pre_ledger_records, 1);
+        assert_eq!(signal.asserted_entries, 1);
     }
 
     #[test]
@@ -305,7 +398,7 @@ mod tests {
         );
         assert_eq!(
             ledger.retry(FILE_A),
-            RetryDecision::Hold(HoldReason::UnattestedClaim),
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt),
             "a drifted runtime id is carried forward and held, not ignored into a second delivery"
         );
     }

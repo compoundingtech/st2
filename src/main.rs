@@ -2229,6 +2229,30 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 ),
             }
         }
+        // DELTA-006's Resolution Signal, per seat. Silence means both clauses are clear here, so
+        // the `delivery-state.json` boundary arm is removable once every admitted host is silent
+        // for the record's window — a trigger nobody produces resolves on memory instead.
+        // Advisory, not a problem: a carried-forward attempt is correct behaviour today.
+        let delivery_state_dirs = [
+            st2::codex_app_server::state_dir(&catalog, &bus_id),
+            st2::opencode_session::state_dir(&catalog, &bus_id),
+        ];
+        match st2::migrations::delivery_state::resolution_signal(&delivery_state_dirs) {
+            Ok(signal) if signal.is_clear() => {}
+            Ok(signal) => report_advisory(
+                &format!("{bus_id} pre-ledger delivery state (DELTA-006)"),
+                &format!(
+                    "preLedgerRecords={} assertedEntries={}",
+                    signal.pre_ledger_records, signal.asserted_entries
+                ),
+            ),
+            Err(error) => report_check(
+                &mut problems,
+                false,
+                &format!("{bus_id} delivery ledger readable"),
+                &format!("{error:#}"),
+            ),
+        }
         if spec.desired_state.is_retired() {
             let still_present = spec
                 .tasks
@@ -3094,12 +3118,7 @@ fn resolve_selected(
     let entries = found
         .specs
         .iter()
-        .map(|spec| st2::identity::AddressBookEntry {
-            id: spec.effective_id(host),
-            bus_identity: spec.bus_id(host),
-            host: spec.resolved_host(host).to_owned(),
-            address: spec.effective_address().to_owned(),
-        })
+        .map(|spec| st2::identity::AddressBookEntry::of(spec, host))
         .collect::<Vec<_>>();
     let resolved = &st2::identity::resolve_id(&entries, &id)?.id;
     let spec = found

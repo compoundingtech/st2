@@ -6,10 +6,10 @@
 //! authority and is reconciled through [`Ledger::prune`].
 //!
 //! One phase can reach this ledger without this build observing anything: an attempt an earlier
-//! release made and left behind. [`Attestation`] is the whole vocabulary for that — an asserted
-//! phase bounds what already happened, so it suppresses a duplicate, and it is not evidence, so
-//! it authorizes no transport. The translation itself lives outside this module, behind the one
-//! seam in [`Ledger::open`].
+//! release made and left behind. Such a phase holds exactly as far as a phase holds — no harness
+//! profile proves `Attempted`, so nothing is re-sent — and [`Attestation`] records that this
+//! build never watched it, which is what makes the leftover countable and therefore removable.
+//! The translation itself lives outside this module, behind the one seam in [`Ledger::open`].
 
 use std::fs;
 use std::io::Write as _;
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::message;
 
-pub const LEDGER_SCHEMA: &str = "st2.delivery-ledger.v1";
-pub const LEDGER_FILE: &str = "delivery-ledger.json";
+pub(crate) const LEDGER_SCHEMA: &str = "st2.delivery-ledger.v1";
+pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
@@ -141,16 +141,20 @@ pub enum Evidence {
 
 /// Whether this build observed the evidence behind a phase, or another authority asserted it.
 ///
-/// An assertion is a true lower bound on what already happened, so it may suppress a duplicate;
-/// it is not an observation, so it authorizes no transport until fresh evidence arrives. Nothing
-/// here names the authority: any party that can bound an attempt this build never watched
-/// asserts, and the record boundary in `crate::migrations::delivery_state` is one such party.
+/// This is provenance, not authority: no [`Retention`], [`RetryDecision`] or transport decision
+/// reads it. What holds a carried-forward attempt is its [`Phase`] measured against the harness
+/// [`Profile`] — `Profile::releases` releases only a phase that harness can actually prove, and
+/// [`Ledger::seed`] refuses an asserted phase the profile cannot prove at all. The field exists
+/// so the fleet can *see* an unobserved phase: it is clause 2 of DELTA-006's Resolution Signal
+/// (`st2 doctor` counts it per seat), and it is deleted with the record boundary that produces
+/// it. Nothing here names the authority: any party that can bound an attempt this build never
+/// watched asserts, and the boundary in `crate::migrations::delivery_state` is one such party.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Attestation {
     /// This build graded the evidence that set the phase through [`Profile::graded`].
     Observed,
-    /// Another authority asserted the phase: enough to hold a delivery, never enough to send one.
+    /// Another authority asserted the phase: this build never watched the attempt it describes.
     Asserted,
 }
 
@@ -192,9 +196,6 @@ pub enum HoldReason {
     AmbiguousAttempt,
     UnreadReceipt,
     NegativeReceipt,
-    /// The phase was asserted, not observed: enough to suppress a duplicate, never enough to
-    /// authorize a transport. Only fresh evidence about the world clears it.
-    UnattestedClaim,
     Quarantined,
     Settled,
 }
@@ -495,9 +496,6 @@ impl Ledger {
         if entry.phase >= Phase::Persisted {
             return Retention::Hold(HoldReason::UnreadReceipt);
         }
-        if entry.attestation == Attestation::Asserted {
-            return Retention::Hold(HoldReason::UnattestedClaim);
-        }
         Retention::Hold(HoldReason::AmbiguousAttempt)
     }
 
@@ -562,8 +560,9 @@ impl Ledger {
 ///
 /// The only constructor the recovery seam may use. The phase it carries is still checked against
 /// the harness [`Profile`] by [`Ledger::seed`], so a claim of evidence the harness cannot produce
-/// fails closed instead of being written, and [`Attestation::Asserted`] keeps the entry holding
-/// until this build observes something: it can suppress a duplicate, it can authorize nothing.
+/// fails closed instead of being written, and the phase itself is what keeps the entry holding:
+/// an [`Attestation::Asserted`] entry suppresses a duplicate exactly as far as its phase does,
+/// and authorizes a transport only where the profile proves that phase.
 pub fn asserted(
     filename: String,
     binding: String,
@@ -580,6 +579,31 @@ pub fn asserted(
         incarnation,
         negative: None,
     }
+}
+
+/// How many entries in the ledger at `path` carry a phase this build never observed.
+///
+/// Clause 2 of DELTA-006's Resolution Signal, and the reason [`Attestation`] is serialized at
+/// all. Read-only on purpose: [`Ledger::open`] runs the record boundary and may write, and a
+/// diagnostic must not change what it measures. A missing ledger counts zero; bytes that will
+/// not parse are an error, because "I hold a delivery record I cannot read" is exactly what an
+/// operator needs told.
+pub(crate) fn asserted_entries(path: &Path) -> Result<usize> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading delivery ledger {}", path.display()));
+        }
+    };
+    let record: Record = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing delivery ledger {}", path.display()))?;
+    Ok(record
+        .entries
+        .iter()
+        .filter(|entry| entry.attestation == Attestation::Asserted)
+        .count())
 }
 
 /// Durable replacement: file bytes reach disk before rename, then the directory entry is synced.
@@ -685,9 +709,11 @@ mod tests {
         );
     }
 
-    /// The safety property the whole record boundary rests on: an asserted phase is a bound on
-    /// what already happened, so it holds the delivery, and it is not evidence, so it authorizes
-    /// no transport. This build's own observation is what clears it.
+    /// The safety property the whole record boundary rests on, and where it comes from: a
+    /// carried-forward `Attempted` phase is a bound on what already happened, so it holds the
+    /// delivery, and no harness profile proves `Attempted`, so it authorizes no transport. The
+    /// phase does that work; the attestation only records who saw it. This build's own
+    /// observation — here an authoritative absence — is what clears the hold.
     #[test]
     fn an_asserted_phase_suppresses_a_duplicate_and_authorizes_no_transport() {
         let tmp = tempfile::tempdir().unwrap();
@@ -706,11 +732,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             ledger.retention(FILE_A),
-            Retention::Hold(HoldReason::UnattestedClaim)
+            Retention::Hold(HoldReason::AmbiguousAttempt)
         );
         assert_eq!(
             ledger.retry(FILE_A),
-            RetryDecision::Hold(HoldReason::UnattestedClaim)
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt)
         );
 
         // The seed is durable, so a restart still holds instead of re-sending.
@@ -721,7 +747,7 @@ mod tests {
         );
         assert_eq!(
             reopened.retry(FILE_A),
-            RetryDecision::Hold(HoldReason::UnattestedClaim)
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt)
         );
 
         // An authoritative absence is an observation: it clears the claim and re-authorizes one
