@@ -606,26 +606,6 @@ fn submit_retained_after_final_observation(
     observe_receipt_with_window(text, peek, poll, observation_window)
 }
 
-#[allow(dead_code)]
-fn observed_poke(
-    text: &str,
-    peek: &mut dyn FnMut() -> anyhow::Result<String>,
-    stage: &mut dyn FnMut() -> anyhow::Result<()>,
-    submit: &mut dyn FnMut() -> anyhow::Result<()>,
-    poll: &mut dyn FnMut(),
-    before_submit: &mut dyn FnMut() -> anyhow::Result<()>,
-) -> anyhow::Result<PokeOutcome> {
-    observed_poke_with_window(
-        text,
-        peek,
-        stage,
-        submit,
-        poll,
-        before_submit,
-        COMPOSER_OBSERVATION_WINDOW,
-    )
-}
-
 /// Two-phase DING delivery with injected operations for deterministic regression tests.
 fn observed_poke_with_window(
     text: &str,

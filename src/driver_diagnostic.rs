@@ -624,7 +624,33 @@ fn emit(
     );
 }
 
+/// Create the staging sibling exclusively at `0600`.
+///
+/// An existing regular file, a directory, or a symlink an agent planted at this path is refused
+/// with `AlreadyExists` rather than followed or truncated. This directory is agent-writable, so
+/// that refusal is the whole security property.
+fn create_staging(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Durable replacement: the record's bytes reach disk before the rename and the directory entry is
+/// synced after it.
+///
+/// The staging file is created exclusively at `0600` under a name unique to this process *and*
+/// write, so a stale or adversarial path cannot be followed or truncated and two writes to the
+/// same agent directory cannot collide. Its sibling in `delivery_ledger` documents why that
+/// matters; this helper used to be the one that did not do it.
 fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WRITE: AtomicU64 = AtomicU64::new(0);
+
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -632,14 +658,26 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
         ));
     };
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".driver-diagnostic.{}.tmp", std::process::id()));
-    let mut file = fs::File::create(&tmp)?;
-    serde_json::to_writer(&mut file, value).map_err(std::io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    if let Err(error) = fs::rename(&tmp, path) {
+    let tmp = parent.join(format!(
+        ".driver-diagnostic.tmp-{}-{}",
+        std::process::id(),
+        WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = create_staging(&tmp)?;
+    let staged = (|| -> std::io::Result<()> {
+        serde_json::to_writer(&mut file, value).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = staged.and_then(|()| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
+    }
+    // Best-effort, exactly like `delivery_ledger`: the record is already durable, and a directory
+    // that cannot be synced must not turn a published diagnostic into a reported failure.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -864,5 +902,63 @@ mod tests {
             out.extend_from_slice(&self[at + from.len()..]);
             out
         }
+    }
+
+    /// The publication path writes into an agent-writable directory, so its staging file is the
+    /// one place an agent could aim st2's own privilege at a file it does not own. Refusing an
+    /// existing path is what stops that, and `0600` is what stops the diagnostic being readable
+    /// by anyone who can reach the directory.
+    #[test]
+    fn a_planted_staging_symlink_is_refused_and_the_record_is_owner_only() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agents/h/worker");
+        fs::create_dir_all(&agent).unwrap();
+
+        let victim = tmp.path().join("authored");
+        fs::write(&victim, b"authored bytes").unwrap();
+        let planted = agent.join(".driver-diagnostic.tmp-planted");
+        symlink(&victim, &planted).unwrap();
+
+        let refused = create_staging(&planted).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a planted symlink at the staging path must be refused, not followed"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"authored bytes",
+            "the planted symlink was followed and its target was truncated"
+        );
+
+        let record = Record {
+            schema: SCHEMA.to_owned(),
+            driver: Driver::OpenCode,
+            stage: Stage::Seed,
+            reason: Reason::UnknownStatus,
+            source: Source::StatusSnapshot,
+            producer_version: None,
+            support: Support::Supported,
+            observed_at: 100,
+            recovery: RECOVERY.to_owned(),
+        };
+        let path = agent.join("driver-diagnostic");
+        atomic_json(&path, &record).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the diagnostic is readable by anyone who can reach the agent directory"
+        );
+        let residue = fs::read_dir(&agent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(".driver-diagnostic.tmp-") && name != ".driver-diagnostic.tmp-planted"
+            })
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
     }
 }

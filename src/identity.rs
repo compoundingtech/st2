@@ -72,10 +72,6 @@ impl AddressBookEntry {
         }
     }
 
-    /// The human-routable bus address `<host>.<address>`.
-    pub fn bus_address(&self) -> String {
-        format!("{}.{}", self.host, self.address)
-    }
 }
 
 /// Why an ordinary reference did not name exactly one subject.
