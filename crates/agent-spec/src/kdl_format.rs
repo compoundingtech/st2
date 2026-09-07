@@ -7,7 +7,9 @@
 //! render-only fields (`harness`, `model`, `persona`, `permissions`, `transport`, `strategy`) and
 //! the inert `meta{}` block are ignored.
 
-use crate::declared::{DeclaredDocument, DeclaredNode, DeclaredValue};
+use crate::declared::{
+    DeclaredAgent, DeclaredDocument, DeclaredLifecycleSource, DeclaredNode, DeclaredValue,
+};
 use crate::spec::{
     ClaudeDriver, CodexDriver, DeliveryReadiness, OmpDriver, OpenCodeDriver, PiDriver, RawResource,
     RawRestart, RawSpec, RawTask, SessionDriver,
@@ -15,11 +17,7 @@ use crate::spec::{
 
 /// Lower an already parsed declaration document into the runner's raw representation.
 pub(crate) fn lower_declared_document(document: &DeclaredDocument) -> anyhow::Result<Vec<RawSpec>> {
-    document
-        .agents
-        .iter()
-        .map(|agent| agent_node_to_raw(&agent.node))
-        .collect()
+    document.agents.iter().map(agent_node_to_raw).collect()
 }
 
 /// First positional (unnamed) argument of a node, as a string.
@@ -55,11 +53,24 @@ fn arg_u32(node: &DeclaredNode) -> Option<u32> {
         .and_then(|i| u32::try_from(i).ok())
 }
 
-fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
+fn agent_node_to_raw(agent: &DeclaredAgent) -> anyhow::Result<RawSpec> {
+    let node = &agent.node;
+    let lifecycle = agent.lifecycle()?;
     let mut raw = RawSpec {
         identity: arg_string(node), // agent "<identity>" — may be overridden by an `identity` child
         ..Default::default()
     };
+    match lifecycle.source {
+        DeclaredLifecycleSource::Implicit => {}
+        DeclaredLifecycleSource::DesiredState => {
+            raw.desired_state = Some(Some(lifecycle.desired_state.as_str().to_owned()));
+            raw.desired_state_reason = lifecycle
+                .desired_state
+                .reason()
+                .map(|reason| Some(reason.to_owned()));
+        }
+        DeclaredLifecycleSource::Retired(retired) => raw.retired = Some(Some(retired)),
+    }
 
     // Environment is an agent-level scope in the compact format and cascades into explicit legacy
     // tasks too. Parse it first so declaration order does not change semantics.
@@ -81,47 +92,7 @@ fn agent_node_to_raw(node: &DeclaredNode) -> anyhow::Result<RawSpec> {
             "type" => raw.job_type = arg_string(child),
             "workspace" => raw.workspace = arg_string(child),
             "supervisor" => raw.supervisor = arg_string(child),
-            "retired" => {
-                anyhow::ensure!(
-                    raw.retired.is_none(),
-                    "agent declares `retired` more than once"
-                );
-                raw.retired = Some(Some(arg_bool(child)));
-            }
-            "desired-state" => {
-                anyhow::ensure!(
-                    raw.desired_state.is_none(),
-                    "agent declares `desired-state` more than once"
-                );
-                anyhow::ensure!(
-                    child.type_name.is_none()
-                        && child.children.is_empty()
-                        && child.arguments().count() == 1
-                        && child.properties_named("reason").count() <= 1
-                        && child.entries.len() <= 2,
-                    "agent `desired-state` must contain one state string and at most one `reason` property"
-                );
-                anyhow::ensure!(
-                    child.entries.iter().all(|entry| {
-                        entry.name.is_none() || entry.name.as_deref() == Some("reason")
-                    }),
-                    "agent `desired-state` accepts only the `reason` property"
-                );
-                let desired_state = arg_string(child);
-                anyhow::ensure!(
-                    desired_state.is_some(),
-                    "agent desired-state value must be a string"
-                );
-                raw.desired_state = Some(desired_state);
-                raw.desired_state_reason = child
-                    .property("reason")
-                    .map(|reason| reason.as_str().map(String::from));
-                anyhow::ensure!(
-                    child.property("reason").is_none()
-                        || matches!(raw.desired_state_reason, Some(Some(_))),
-                    "agent desired-state `reason` must be a string"
-                );
-            }
+            "retired" | "desired-state" => {}
             "keep" => raw.keep = arg_bool(child),
             "lifecycle" => raw.lifecycle = arg_string(child),
             "restart" => raw.restart = Some(restart_node_to_raw(child)),
@@ -490,10 +461,9 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
                 }
                 let encoded = value
                     .ok_or_else(|| anyhow::anyhow!("resource binding needs string `selector`"))?;
-                selector = Some(
-                    serde_json::from_str(&encoded)
-                        .map_err(|error| anyhow::anyhow!("resource binding `selector` is not valid JSON: {error}"))?,
-                );
+                selector = Some(serde_json::from_str(&encoded).map_err(|error| {
+                    anyhow::anyhow!("resource binding `selector` is not valid JSON: {error}")
+                })?);
             }
             other => anyhow::bail!("resource binding has unsupported property `{other}`"),
         }

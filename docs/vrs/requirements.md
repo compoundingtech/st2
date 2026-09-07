@@ -50,6 +50,14 @@ accepted.
   directly owned by a declaration.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
+- **R43 Lifecycle-scoped launch readiness:** Declaration parsing, path
+  resolution and authority, render grammar and destination safety, delivery
+  shape and coherence, identity, and topology validity apply in every desired
+  lifecycle state. Address occupancy applies to running and suspended subjects.
+  Ambient filesystem, render-input, socket, overlay, hook, and delivery
+  readiness apply only to running subjects. Suspended and retired declarations
+  neither require those dependencies to be present nor cause Resource Profile
+  resolution; activation re-establishes every readiness gate before launch.
 
 ### Must provide intelligent host supervision
 
@@ -247,9 +255,8 @@ accepted.
   no owned bytes and require no assertion; a candidate that merely claims a
   marker is not an authority, so the receipt records only a marker the
   incumbent confirmed.
-  A caller binds single-agent publication to the exact no-follow source capture
-  with an authoritative input digest. A canonical whole-catalog snapshot
-  externalizes the declaration-root digest while excluding runtime state and
+  A canonical whole-catalog snapshot externalizes the
+  `st2.catalog-declaration-root.v1` projection while excluding runtime state and
   workspace content. Its closed projection includes every regular file in a
   bounded `_templates` library and exact declared canonical workspace directory
   facts. Whole-catalog apply binds its exact captured desired projection to a
@@ -439,15 +446,20 @@ accepted.
   refuses malformed, ambiguous, or unsupported declarations. A Nix-owned
   declaration refuses authoring unless the caller asserts exactly the ownership
   marker that declaration carries; a mismatched, absent, unresolvable, or
-  malformed assertion fails closed, and the asserted arm additionally admits the
-  complete prospective catalog exactly as a compare-and-swap publication of the
-  same bytes would, so it cannot commit a declaration the catalog would reject.
-  It is the only authoring verb with that authority, because a projection has
-  one transition its own source cannot express: the source change being
-  projected is the seat's removal. A
-  transition from retired to running or suspended validates effective-address
-  uniqueness against the complete prospective catalog before publication,
-  including the positional identity fallback. Running is canonically omitted;
+  malformed assertion fails closed. Every desired-state mutation builds one
+  complete prospective catalog under the authoring lock and compares incumbent
+  and prospective core `ERROR` identities as `(code, catalog-relative path,
+  agent)` multisets. It refuses every positive delta, without using messages
+  that contain shadow paths, so lifecycle authoring cannot introduce a core
+  error but an unrelated pre-existing error does not block repair or teardown.
+  This lifecycle-delta admission applies equally to ordinary and marker-matched
+  authoring; the marker remains authority only. It is the only authoring verb
+  with asserted generator authority, because a projection has one transition
+  its own source cannot express: the source change being projected is the
+  seat's removal. Entering running activates launch readiness and address
+  admission; entering suspended reacquires address and topology admission while
+  readiness remains inactive; entering retired exposes retirement topology
+  admission. Running is canonically omitted;
   suspended and retired states persist their rationale. Its receipt proves the
   declaration edit, never runtime convergence. Human listing, roster JSON, task
   inventory, and Doctor expose desired state without conflating it with

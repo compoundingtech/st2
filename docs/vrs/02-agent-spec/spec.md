@@ -497,17 +497,24 @@ desired-state "suspended" reason="Waiting for capacity"
 The safe authoring surface is
 `st2 agent desired-state --id <agent-id> <state> [--reason ...]
 [--managed-by <marker>]`. It serializes with other catalog writers, preserves
-unrelated source bytes, and returns an authored-intent receipt. A transition
-from retired to running or suspended validates effective-address uniqueness
-against the complete prospective catalog before publication. The receipt does
-not imply that reconciliation or Doctor has observed convergence.
+unrelated source bytes, and returns an authored-intent receipt. While holding
+the catalog-authoring lock, every lifecycle mutation constructs one prospective
+shadow and compares incumbent and prospective core `ERROR` identities as
+`(code, catalog-relative path, agent)` multisets. A positive delta refuses
+before publication; messages are not identities because they may contain the
+shadow path. This admits repair and teardown despite unrelated pre-existing
+errors while preventing a transition from introducing an error. Entering
+running activates launch-readiness and address checks. Entering suspended
+reacquires address and topology checks without launch readiness. Entering
+retired applies retirement topology checks. The receipt does not imply that
+reconciliation or Doctor has observed convergence.
 
 A declaration carrying `meta { managed-by "nix" }` refuses authoring unless the
 caller asserts exactly the marker that declaration carries with `--managed-by`,
 which is how a projection authors the one transition its own generated source
-cannot express — the seat's removal from that source. The asserted arm
-additionally admits the complete prospective catalog, as an `agent publish` of
-the same bytes would, and the receipt records the confirmed marker. Every other
+cannot express — the seat's removal from that source. The asserted arm uses the
+same lifecycle-delta admission as ordinary authoring, and the receipt records
+the confirmed marker. Every other
 authoring verb refuses a Nix-owned declaration unconditionally.
 
 The exact-ID selector and reactivation validation are target behavior fenced by
