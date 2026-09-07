@@ -807,6 +807,7 @@ mod tests {
         assert!(!argv_invokes_omp(&["/opt/bin/omph".into()], root));
     }
 
+    #[test]
     fn pi_launch_classification_is_exact() {
         let root = Path::new("/catalog");
         assert!(command_invokes_pi("exec pi -a 'boot'"));
