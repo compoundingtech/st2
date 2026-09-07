@@ -834,12 +834,22 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
 /// keeps a torn write from corrupting the current floor, and a failed write is logged — the
 /// ownership still stands (losing the floor only matters if the record later becomes
 /// unreadable), but never silently.
+///
+/// The staging name carries the writer's pid and a counter for the same reason every other
+/// publication's does. It used to be the fixed literal `.harness-state.seq.tmp`, written with a
+/// truncating, symlink-following `fs::write`: two writers persisting a floor for one agent shared
+/// that one path, so each could truncate and rename the other's half-written bytes — a torn floor,
+/// which defeats exactly the failure the floor exists for. One caller holds the record's lock; the
+/// other is the token-only virgin-record path, whose lock coverage is not established here, so the
+/// staging name must not depend on it.
 fn persist_floor(record_path: &Path, seq: u64) {
     let floor_path = record_path.with_file_name(SEQ_FLOOR_NAME);
-    let staged = floor_path.with_file_name(".harness-state.seq.tmp");
-    if let Err(error) =
-        fs::write(&staged, format!("{seq}\n")).and_then(|()| fs::rename(&staged, &floor_path))
-    {
+    if let Err(error) = crate::fsatomic::replace(
+        &floor_path,
+        format!("{seq}\n").as_bytes(),
+        crate::fsatomic::Staging::new(SEQ_FLOOR_NAME),
+        crate::fsatomic::Durability::Rename,
+    ) {
         tracing::warn!(
             "st2 harness-state: writing the sequence floor {} failed: {error}",
             floor_path.display()
@@ -2038,6 +2048,44 @@ mod tests {
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.incarnation, token);
         assert_eq!(record.reason.as_deref(), Some("superseded"));
+    }
+
+    /// The floor is staged under a per-writer name, created exclusively, so a path an agent
+    /// planted is refused instead of followed and two writers cannot tear each other's bytes.
+    ///
+    /// Both are the same defect: the staging name used to be the fixed literal
+    /// `.harness-state.seq.tmp` written with a truncating, symlink-following `fs::write`. A
+    /// symlink there aimed st2's write at a file of the agent's choosing, and two writers for one
+    /// agent could rename each other's half-written floor into place — a torn floor, which is
+    /// exactly the failure the floor exists to survive.
+    #[test]
+    fn the_sequence_floor_refuses_a_planted_staging_path() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents/hetz/worker");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let victim = tmp.path().join("authored");
+        fs::write(&victim, b"authored bytes").unwrap();
+        symlink(&victim, agent_dir.join(".harness-state.seq.tmp")).unwrap();
+
+        persist_floor(&harness_state_path(&agent_dir), 7);
+
+        let floor = agent_dir.join(SEQ_FLOOR_NAME);
+        assert_eq!(
+            fs::read_to_string(&floor).unwrap().trim(),
+            "7",
+            "the floor landed despite the planted staging path"
+        );
+        assert_eq!(
+            fs::metadata(&floor).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"authored bytes",
+            "the planted symlink was followed and its target was truncated"
+        );
     }
 
     /// The virgin token-only path also establishes initial ownership (sequence one), so it
