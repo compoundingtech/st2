@@ -93,3 +93,93 @@ fn root_delta_ids_are_unique() {
         }
     }
 }
+
+/// The four collided decision numbers are recorded history, so `0015` alone names two different
+/// files and a reader cannot tell which. Every citation of a collided number must therefore carry
+/// its stem — `0015-immutable-agent-id-and-mutable-address`, not `0015` — and this ratchets that:
+/// a new bare citation fails here rather than being discovered by a confused reader.
+///
+/// Two files legitimately name the bare numbers, because their subject IS the collision.
+#[test]
+fn collided_decision_numbers_are_never_cited_bare() {
+    const COLLIDED: [&str; 4] = ["0005", "0007", "0014", "0015"];
+    const DOCUMENTS_THE_COLLISION: [&str; 2] = [
+        "docs/vrs/spec.md",
+        "docs/vrs/.decisions/0006-observed-harness-state-is-a-driver-written-catalog-record.md",
+    ];
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut bare = Vec::new();
+    let mut checked = 0usize;
+
+    let mut pending = vec![
+        root.join("docs/vrs"),
+        root.join("src"),
+        root.join("tests"),
+        root.join("crates"),
+    ];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("citation source directory must be readable") {
+            let path = entry.expect("citation source entry must be readable").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                pending.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .expect("walked path is under the manifest directory")
+                .to_string_lossy()
+                .into_owned();
+            let is_source = matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("md" | "rs")
+            );
+            if !is_source
+                || relative == "tests/vrs_ledger.rs"
+                || DOCUMENTS_THE_COLLISION.contains(&relative.as_str())
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("citation source must be readable");
+            for (number, line) in source.lines().enumerate() {
+                for collided in COLLIDED {
+                    // A line that names the stem anywhere — including as a Markdown link target
+                    // behind a bare label — has already said which file it means.
+                    let stem_named = line.contains(&format!("{collided}-"));
+                    let mut rest = line;
+                    while let Some(at) = rest.find(collided) {
+                        let after = &rest[at + collided.len()..];
+                        let inside_longer_token = after
+                            .chars()
+                            .next()
+                            .is_some_and(|character| character.is_numeric())
+                            || rest[..at]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|character| character.is_alphanumeric());
+                        if !stem_named && !after.starts_with('-') && !inside_longer_token {
+                            bare.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+                        }
+                        if !inside_longer_token {
+                            checked += 1;
+                        }
+                        rest = after;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        checked >= 20,
+        "expected a substantial citation set, found only {checked}"
+    );
+    assert!(
+        bare.is_empty(),
+        "a collided decision number is cited without its stem, so it names two files:\n{}",
+        bare.join("\n")
+    );
+}

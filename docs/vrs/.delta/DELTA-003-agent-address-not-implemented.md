@@ -126,7 +126,7 @@ message/DING sender projection and cosmetic fallback, version-1 record
 compatibility including collision-aware legacy attribution, harness-state and
 harness-context version-2 records read by tolerant readers, typed non-Agent
 endpoints, host/graph/launch lifecycle controls, and every public machine wire
-shape named by decision 0015.
+shape named by decision 0015-immutable-agent-id-and-mutable-address.
 
 Update these load-bearing invariant rows and their named tests in the same
 implementation:

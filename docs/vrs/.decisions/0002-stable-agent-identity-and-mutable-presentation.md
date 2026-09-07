@@ -1,10 +1,10 @@
 # Stable agent identity is separate from mutable presentation
 
-Status: superseded by 0015
+Status: superseded by 0015-immutable-agent-id-and-mutable-address
 
 Johannes authorized the requirements direction on 2026-07-31. The draft
 required Nathan's merge and acceptance approval, which was not recorded.
-Decision 0015 independently accepted the replacement contract.
+Decision 0015-immutable-agent-id-and-mutable-address independently accepted the replacement contract.
 
 ## Context
 
@@ -70,7 +70,7 @@ driver responsibilities; this read interface grants no lifecycle authority.
   the new fields are optional and additive. Adoption begins only after
   compatible PTY and st2 binaries are deployed; Nix-generated declarations
   first add their ownership marker.
-- Decision 0015 superseded this unaccepted draft and independently accepted the
+- Decision 0015-immutable-agent-id-and-mutable-address superseded this unaccepted draft and independently accepted the
   presentation behavior it retained.
 
 ## Options
@@ -91,7 +91,7 @@ existing runtime without changing task incarnation or durable state.
 
 ## Amendment 1 — immutable subject ID and mutable address
 
-Accepted decision 0015 supersedes this draft's routing model and independently
+Accepted decision 0015-immutable-agent-id-and-mutable-address supersedes this draft's routing model and independently
 accepts its bounded presentation and authoring behavior. The target adds an
 explicit immutable `id`; legacy subjects receive their existing host-qualified
 bus identities as IDs during migration. Positional `identity` remains the
@@ -99,7 +99,7 @@ legacy address fallback. Agent ID is catalog-global; agent address is mutable
 and unique per logical host; bus address is `<host>.<address>`. Exact ID
 selection is explicit.
 
-Decision 0015 also independently accepts nondisruptive PTY presentation
+Decision 0015-immutable-agent-id-and-mutable-address also independently accepts nondisruptive PTY presentation
 projection. Its rejection of a stable-ID alias remains: address is a mutable
 route to the subject, not a second stable ID, and old addresses receive no
 redirect or history.
@@ -117,4 +117,4 @@ The unaccepted draft proposed:
   generation across Agent Spec presentation changes;
 - a genuine lifecycle-change control that still performs ordinary replacement.
 
-Decision 0015 carries the accepted proof obligations.
+Decision 0015-immutable-agent-id-and-mutable-address carries the accepted proof obligations.

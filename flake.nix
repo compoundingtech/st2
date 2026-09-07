@@ -188,6 +188,8 @@
             "--test"
             "agent_desired_state"
             "--test"
+            "claude_hooks"
+            "--test"
             "agent_publish"
             "--test"
             "catalog_graph"

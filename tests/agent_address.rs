@@ -368,7 +368,7 @@ fn the_exact_id_form_selects_by_id_and_never_falls_through_to_address_lookup() {
 
 /// One exact-ID selector feeds two different resolvers: authoring matches the positional
 /// declaration key, while inbox/status resolution answers on the current address. Handing either
-/// resolver the other's string is the ID-through-a-mutable-address hop decision 0015 forbids, so
+/// resolver the other's string is the ID-through-a-mutable-address hop decision 0015-immutable-agent-id-and-mutable-address forbids, so
 /// the same `--id` must work on both sides once a subject's address diverges from its identity.
 #[test]
 fn the_exact_id_form_serves_declaration_and_route_resolution_alike() {

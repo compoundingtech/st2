@@ -1,6 +1,6 @@
 //! Agent selection: immutable IDs and mutable addresses.
 //!
-//! Decision 0015 splits one overloaded string into two typed namespaces. The immutable **agent ID**
+//! Decision 0015-immutable-agent-id-and-mutable-address splits one overloaded string into two typed namespaces. The immutable **agent ID**
 //! is catalog-global and never routes for humans; the mutable **agent address** is unique per
 //! logical host and is the only thing an ordinary human reference resolves against. Equal bytes in
 //! the two namespaces do not collide, so an exact-ID selector performs only ID lookup and never

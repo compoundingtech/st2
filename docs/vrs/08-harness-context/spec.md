@@ -817,7 +817,7 @@ The producer is otherwise the pi one with two divergences, both measured:
 The version pin (HC-R13, HC-T03) extends the existing launch gate rather than
 adding a mechanism beside it, and the two answer deliberately different
 questions. `SUPPORTED_OMP_MINORS` admits a **minor series**, because a patch
-inside an admitted minor costs no new evidence (decision 0007); the fixture pins
+inside an admitted minor costs no new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate); the fixture pins
 the **exact builds** a number's meaning was measured on, because "`tokens` is
 prompt-only input" is a property of a build and not of any documented contract.
 `src/omp_session.rs::the_measured_context_builds_are_admitted_by_this_gate`
