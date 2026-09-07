@@ -45,6 +45,9 @@ pub mod migrations;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
+/// The launch body shared by the pi-family wrappers; crate-internal, reached through
+/// `pi_session::run` and `omp_session::run`.
+mod pi_family_session;
 pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
