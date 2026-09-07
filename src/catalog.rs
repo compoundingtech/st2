@@ -641,7 +641,7 @@ pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> 
             matches!(
                 *name,
                 ".workspace" | "resources" | "archive" | "inbox" | "status"
-            ) || name.starts_with(".status.tmp-")
+            ) || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         });
     let reserved_template_subtree = first == "_templates"
         && components.iter().skip(1).any(|name| {
@@ -657,7 +657,7 @@ pub(crate) fn validate_catalog_relative_profile_module_path(relative: &Path) -> 
                     | "archive"
                     | "inbox"
                     | "status"
-            ) || name.starts_with(".status.tmp-")
+            ) || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         });
     anyhow::ensure!(
         !(reserved_control || reserved_root || reserved_agent_state || reserved_template_subtree),

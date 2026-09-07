@@ -11,7 +11,6 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// A valid status heartbeat at least this old reads as `unknown`.
@@ -285,37 +284,77 @@ fn write_record(path: &Path, state: State, written_at_ms: u64) -> anyhow::Result
     )
 }
 
-/// Atomic write: a temp sibling + rename, so a concurrent reader sees either the old bytes or the new
-/// bytes, never a partial file.
+/// The staging-name prefix this module hands [`crate::fsatomic`].
+const TMP_PREFIX: &str = ".status";
+
+/// The full staged-name prefix six catalog and publication walkers match, spelled ONCE here so a
+/// walker can never drift from the writer. Tied to [`TMP_PREFIX`] by
+/// `the_staging_prefix_is_the_one_the_catalog_walkers_match`.
+pub(crate) const TMP_STAGING_PREFIX: &str = ".status.tmp-";
+
+/// Atomic write: a staged sibling + rename, so a concurrent reader sees either the old bytes or
+/// the new bytes, never a partial file.
+///
+/// Deliberately the lenient durability level: this record is rewritten per agent per refresh
+/// tick, and a lost write reads as `unknown` rather than as a wrong state, so buying crash
+/// durability with two fsyncs per tick per agent would be paying for nothing.
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(tmp_name());
-    fs::write(&tmp, content)?;
-    // rename over the target — atomic on the same filesystem.
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp); // best-effort cleanup
-        return Err(e.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        content.as_bytes(),
+        crate::fsatomic::Staging::new(TMP_PREFIX),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
-}
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A per-write-unique temp filename (pid + a process-local counter — no collisions within a process,
-/// and the pid separates processes).
-fn tmp_name() -> String {
-    format!(
-        ".status.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration as Dur, SystemTime};
+
+    /// The staged name is a contract with six walkers that skip it by prefix, in three other
+    /// modules: `catalog.rs`, `catalog_transaction.rs` and `agent_publish.rs` all match
+    /// [`TMP_STAGING_PREFIX`], so a changed writer prefix cannot desynchronize them. What a const
+    /// cannot catch is the prefix being renamed on BOTH sides at once — a staged status file would
+    /// then still be skipped locally, but the fleet's existing records and any other reader of the
+    /// old name would not. That is what this assertion is for.
+    #[test]
+    fn the_staging_prefix_is_the_one_the_catalog_walkers_match() {
+        assert_eq!(TMP_PREFIX, ".status");
+        assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
+    }
+
+    /// [`write_atomic`]'s publication contract: the target ends up carrying the complete new
+    /// bytes, no staged sibling survives, and the record is owner-only.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — this record used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask). The
+    /// staging-name grammar `{prefix}.tmp-{pid}-{counter}` is unchanged and stays load-bearing:
+    /// six catalog and publication walkers match `.status.tmp-` by prefix, and the grammar itself
+    /// is asserted by `fsatomic`'s own test.
+    #[test]
+    fn a_status_write_replaces_the_target_and_leaves_no_staged_sibling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = status_path(tmp.path());
+        write_atomic(&path, "available\n").unwrap();
+        write_atomic(&path, "working\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the status record is published owner-only"
+        );
+
+        let residue = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".status.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
 
     #[test]
     fn missing_is_offline() {

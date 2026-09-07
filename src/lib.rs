@@ -27,6 +27,9 @@ pub mod event;
 pub mod exec_backend;
 pub mod expand;
 pub mod flapping;
+/// Private on purpose: every consumer is a sibling module in this crate, and the publishers that
+/// deliberately keep their own primitive are documented in the module itself.
+mod fsatomic;
 pub mod harness_context;
 pub mod harness_state;
 pub mod harness_version;

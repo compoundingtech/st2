@@ -12,7 +12,6 @@
 //! The translation itself lives outside this module, behind the one seam in [`Ledger::open`].
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -608,37 +607,18 @@ pub(crate) fn asserted_entries(path: &Path) -> Result<usize> {
 
 /// Durable replacement: file bytes reach disk before rename, then the directory entry is synced.
 ///
-/// The temp file is created exclusively at `0600` under a name unique to this process and write,
-/// so a stale or adversarial path cannot be followed or truncated and two writes cannot collide.
+/// The directory sync is now STRICT — a parent that cannot be opened for it fails
+/// [`Ledger::persist`], where it used to be swallowed. A ledger whose directory entry may not
+/// survive a crash is exactly the state the ledger exists to prevent being invisible, and a
+/// failure edge nothing can observe is a guarantee nothing can review.
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static WRITE: AtomicU64 = AtomicU64::new(0);
-
     let bytes = serde_json::to_vec(value)?;
-    let parent = path.parent().context("ledger file has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".delivery-ledger.{}.{}.tmp",
-        std::process::id(),
-        WRITE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    crate::fsatomic::replace(
+        path,
+        &bytes,
+        crate::fsatomic::Staging::new(".delivery-ledger"),
+        crate::fsatomic::Durability::FsyncFileAndDir,
+    )?;
     Ok(())
 }
 
@@ -786,9 +766,52 @@ mod tests {
         let residue = fs::read_dir(tmp.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp"))
+            // By staging-name PREFIX, not by a `.tmp` suffix: the suffix is this helper's own
+            // spelling, and a filter that only matches its current spelling stops testing the
+            // moment the spelling changes.
+            .filter(|name| name.starts_with(".delivery-ledger"))
             .collect::<Vec<_>>();
         assert!(residue.is_empty(), "temp residue left behind: {residue:?}");
+    }
+
+    /// The directory sync is strict since the fold onto `fsatomic`: a parent that cannot be
+    /// opened for it fails the publication, where it used to be swallowed. This is the deliberate
+    /// behaviour change of that fold on this caller — `Ledger::persist` can now fail on an edge it
+    /// previously reported success for.
+    ///
+    /// Real only for a non-root uid; the hermetic gate runs as the sandbox's unprivileged build
+    /// user, and a local root run skips the edge instead of asserting what root cannot observe.
+    #[test]
+    fn a_directory_that_cannot_be_synced_fails_the_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEDGER_FILE);
+        let record = Record {
+            schema: LEDGER_SCHEMA.to_owned(),
+            harness: "codex".to_owned(),
+            agent: "h.worker".to_owned(),
+            runtime_id: "runtime".to_owned(),
+            entries: Vec::new(),
+        };
+
+        // Write and traverse, but not read: staging and renaming still work, opening the
+        // directory to sync it does not.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let published = atomic_json(&path, &record);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            published.is_err(),
+            "the ledger's directory sync is strict: {published:?}"
+        );
+        // The bytes did land — the rename happens before the sync — so the failure is a report
+        // about durability, not about the record's contents.
+        assert!(path.exists(), "the record still landed");
     }
 
     #[test]

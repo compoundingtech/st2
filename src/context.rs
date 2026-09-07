@@ -181,20 +181,19 @@ fn trim_trailing_period(s: &str) -> &str {
     s.strip_suffix('.').unwrap_or(s)
 }
 
-/// Atomic write: tmp sibling + rename.
+/// Atomic write: staged sibling + rename.
+///
+/// The staging name used to end in `now_ms()`, so two writers in the same millisecond shared one
+/// staging path and the second truncated the first's staged bytes before renaming it. The shared
+/// primitive names the sibling with a counter and creates it exclusively, which turns that race
+/// into an impossible `AlreadyExists`.
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".ctx.tmp-{}-{}",
-        std::process::id(),
-        message::now_ms()
-    ));
-    fs::write(&tmp, content)?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        content.as_bytes(),
+        crate::fsatomic::Staging::new(".ctx"),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
 }
 
@@ -221,6 +220,37 @@ fn iso_utc_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`write_atomic`]'s publication contract: the target ends up carrying the complete new
+    /// bytes, no staged sibling survives a successful write, and the record is owner-only.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — this record used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask), and the
+    /// shared primitive stages exclusively at `0600`. An agent's context is its own working
+    /// notes; nothing but st2 and that agent has ever read it.
+    #[test]
+    fn a_context_write_replaces_the_target_and_leaves_no_staged_sibling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+        let path = now_file(&dir);
+        write_atomic(&path, "first\n").unwrap();
+        write_atomic(&path, "second\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the context record is published owner-only"
+        );
+
+        let staged = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ctx"))
+            .collect::<Vec<_>>();
+        assert!(staged.is_empty(), "staging residue left behind: {staged:?}");
+    }
 
     #[test]
     fn missing_context_reads_empty() {

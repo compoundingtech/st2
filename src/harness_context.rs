@@ -392,8 +392,14 @@ pub(crate) fn is_legacy_harness_context_staging_file(
     Ok(true)
 }
 
+/// The matcher and the writer must agree on the prefix, so both read [`TMP_PREFIX`]: this name is
+/// the one INVARIANTS row 29 says current-catalog identity walkers overlook, and a writer that
+/// drifted from this matcher would leave a staged file the walkers no longer recognize.
 fn is_legacy_staging_name(name: &str) -> bool {
-    let Some(suffix) = name.strip_prefix(".harness-context.tmp-") else {
+    let Some(suffix) = name
+        .strip_prefix(TMP_PREFIX)
+        .and_then(|rest| rest.strip_prefix(".tmp-"))
+    else {
         return false;
     };
     let Some((pid, counter)) = suffix.split_once('-') else {

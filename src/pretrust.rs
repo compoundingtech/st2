@@ -92,18 +92,9 @@ pub fn pretrust_codex_at(config: &Path, dirs: &[PathBuf]) -> Result<usize> {
         n += 1;
     }
     if !appended.is_empty() {
-        if let Some(parent) = config.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let mut out = existing;
         out.push_str(&appended);
-        // Atomic replace so a crashed write never corrupts the codex config.
-        let mut tmp = config.as_os_str().to_owned();
-        tmp.push(format!(".st2trust.{}", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, config)
-            .with_context(|| format!("renaming {} into {}", tmp.display(), config.display()))?;
+        write_atomic_str(config, &out)?;
     }
     Ok(n)
 }
@@ -197,17 +188,28 @@ fn canonical_key(dir: &Path) -> String {
         .into_owned()
 }
 
-/// Write `value` to `config` atomically (temp in the same dir + rename), so a crashed write never
-/// corrupts the real config. The temp name carries the pid so concurrent pretrusts don't collide.
+/// Write `value` to `config` atomically, so a crashed write never corrupts the real config.
 fn write_atomic(config: &Path, value: &Value) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(value).context("serializing claude config")?;
+    write_atomic_str(config, &rendered)
+}
+
+/// Stage-and-rename `contents` over `config`. The staging name carries the pid so concurrent
+/// pretrusts do not collide.
+///
+/// Deliberately NOT the shared `fsatomic` primitive, and the reason is the same one that keeps
+/// this module out of it: these are files st2 does not own — `~/.claude.json` and
+/// `~/.codex/config.toml` — so the staged file must inherit the umask a harness's own config
+/// carries rather than st2's `0600`, and the staging path must sit beside the config under a name
+/// its owner will recognize.
+fn write_atomic_str(config: &Path, contents: &str) -> Result<()> {
     let mut tmp = config.as_os_str().to_owned();
     tmp.push(format!(".st2trust.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if let Some(parent) = config.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let s = serde_json::to_string_pretty(value).context("serializing claude config")?;
-    std::fs::write(&tmp, s).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, config)
         .with_context(|| format!("renaming {} into {}", tmp.display(), config.display()))?;
     Ok(())
