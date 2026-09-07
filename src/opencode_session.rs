@@ -21,7 +21,6 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +37,9 @@ use crate::driver_diagnostic::{
     Source as DiagnosticSource, Stage as DiagnosticStage, Support as DiagnosticSupport,
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
-use crate::provider_session::{PROVIDER_POLL, STOP, install_signal_handler};
+use crate::provider_session::{
+    PROVIDER_POLL, STOP, completed_provider, describe_exit, install_signal_handler,
+};
 use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
@@ -252,7 +253,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         match child.try_wait() {
             Ok(Some(exit)) => {
                 let _ = session.writer.ended(describe_exit(exit));
-                break completed(exit);
+                break completed_provider("opencode", exit);
             }
             Ok(None) => {}
             Err(error) => {
@@ -430,11 +431,6 @@ fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
         .with_context(|| format!("starting opencode provider {program}"))
 }
 
-fn completed(exit: ExitStatus) -> Result<()> {
-    anyhow::ensure!(exit.success(), "opencode provider exited with {exit}");
-    Ok(())
-}
-
 fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
     anyhow::ensure!(
@@ -455,14 +451,6 @@ fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
         libc::kill(-process_group, libc::SIGKILL);
     }
     Ok(child.wait().ok())
-}
-
-fn describe_exit(exit: ExitStatus) -> String {
-    match (exit.code(), exit.signal()) {
-        (Some(code), _) => format!("exit {code}"),
-        (None, Some(signal)) => format!("signal {signal}"),
-        (None, None) => "exit unknown".to_string(),
-    }
 }
 
 fn supported_version(binary: &str) -> Result<String> {

@@ -17,7 +17,6 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1820,12 +1819,13 @@ enum TuiEnd {
     Stopped(Option<ExitStatus>),
 }
 
+/// The label for a TUI end whose status may not have been observable at all. A status that WAS
+/// reaped is spelled by the one shared exit-label map; no status is the same "unknown" the map's
+/// own unanswerable arm reports.
 fn describe_tui_exit(status: Option<ExitStatus>) -> String {
-    match status.map(|status| (status.code(), status.signal())) {
-        Some((Some(code), _)) => format!("exit {code}"),
-        Some((None, Some(signal))) => format!("signal {signal}"),
-        _ => "exit unknown".to_string(),
-    }
+    status
+        .map(crate::provider_session::describe_exit)
+        .unwrap_or_else(|| "exit unknown".to_string())
 }
 
 /// Start app-server with the authored global configuration inputs that its CLI supports.

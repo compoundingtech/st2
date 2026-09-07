@@ -5,7 +5,7 @@
 //! Claude session wrapper owns presence because Claude can close this child before the session ends.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Write as _};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -15,15 +15,9 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use crate::message;
+use crate::native_channel::{channel_content, write_json};
 
 const POLL: Duration = Duration::from_millis(250);
-
-fn channel_content(subject: Option<&str>, body: &str) -> String {
-    match subject.filter(|value| !value.is_empty()) {
-        Some(subject) => format!("Subject: {subject}\n\n{body}"),
-        None => body.to_owned(),
-    }
-}
 
 pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
     let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
@@ -108,26 +102,5 @@ pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
         }
         stdout.flush()?;
         thread::sleep(POLL);
-    }
-}
-
-fn write_json(out: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *out, value)?;
-    out.write_all(b"\n")?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::channel_content;
-
-    #[test]
-    fn channel_content_reuses_subject_and_body_envelope() {
-        assert_eq!(
-            channel_content(Some("subject"), "body"),
-            "Subject: subject\n\nbody"
-        );
-        assert_eq!(channel_content(None, "body"), "body");
-        assert_eq!(channel_content(Some(""), "body"), "body");
     }
 }

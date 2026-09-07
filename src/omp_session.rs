@@ -3,9 +3,7 @@
 //! omp is pi-family: its integration point is a pi-style extension loaded into the interactive
 //! process, which reaches st2 by spawning `st2 driver omp-channel` (`hooks/omp-channel.ts`,
 //! forked from the pi channel — see `docs/vrs/06-omp-driver/spec.md` for the measured
-//! divergences). The wrapper owns presence for the same reason the pi wrapper does: the extension
-//! lives only as long as omp's process, and a SIGKILL of omp produces no terminal record at all,
-//! so presence decays by staleness exactly as for the other harnesses.
+//! divergences). The launch body itself is shared with pi in [`crate::pi_family_session`].
 //!
 //! Unlike pi, the wrapper hard-gates the provider version (OMP-R05): the delivery-critical
 //! surface — event names, the sampled idle edge, the approval events — is versioned behavior, not
@@ -13,14 +11,11 @@
 //! Patches inside an admitted minor launch without new evidence (decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate).
 
 use std::path::Path;
-use std::process::ExitStatus;
 
 use anyhow::{Context as _, Result};
 
-use crate::provider_session::{
-    install_signal_handler, run_provider_observed, ProviderOutcome, PROVIDER_POLL, STOP,
-};
-use crate::{harness_state, harness_version, hooks, message, status};
+use crate::harness_version;
+use crate::pi_family_session::{self, HarnessKind};
 
 /// The extension file inside this binary's immutable hook set.
 const EXTENSION: &str = "omp-channel.ts";
@@ -38,11 +33,6 @@ pub const CHANNEL_RUNTIME_ID: &str = "ST2_OMP_CHANNEL_RUNTIME_ID";
 pub const CHANNEL_SESSION: &str = "ST2_OMP_CHANNEL_SESSION";
 /// The ownership sequence the wrapper claimed at startup.
 pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
-
-/// omp reads its pi ancestor's env fallbacks, so the same offline defaults apply. Whether they
-/// suppress the update banner in interactive boots is still open (DQ-OMP-5); shipping them is
-/// harmless either way.
-const OFFLINE_DEFAULTS: [(&str, &str); 2] = [("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")];
 
 /// The omp MINORS verified against the admission checks in `docs/vrs/06-omp-driver/spec.md`.
 ///
@@ -66,9 +56,20 @@ const SUPPORTED_OMP_MINORS: [(u32, u32); 2] = [(18, 0), (18, 1)];
 /// `the_measured_context_builds_are_admitted_by_this_gate` keeps them from drifting apart.
 pub const MEASURED_CONTEXT_VERSIONS: [&str; 2] = ["18.0.9", "18.0.3"];
 
-/// What the wrapper hands the provider process: the channel environment plus the launch argv with
-/// the channel extension spliced in.
-type PreparedLaunch = (Vec<(String, String)>, Vec<String>);
+/// omp's half of the pi-family launch fork. The version gate rides on the descriptor so the shared
+/// body runs it where omp has always run it: after the empty-argv check and before the ownership
+/// claim, so an unadmitted minor fails without claiming the seat.
+pub(crate) const OMP_KIND: HarnessKind = HarnessKind {
+    label: "omp",
+    extension: EXTENSION,
+    bin_env: CHANNEL_BIN,
+    catalog_env: CHANNEL_CATALOG,
+    identity_env: CHANNEL_IDENTITY,
+    runtime_id_env: CHANNEL_RUNTIME_ID,
+    session_env: CHANNEL_SESSION,
+    seq_env: CHANNEL_SEQ,
+    verify_version: Some(verify_supported_version),
+};
 
 /// Run one interactive omp provider and maintain its presence until it exits.
 pub fn run(
@@ -77,93 +78,7 @@ pub fn run(
     runtime_id: String,
     omp_argv: Vec<String>,
 ) -> Result<()> {
-    let agent_dir =
-        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
-            .with_context(|| format!("omp driver agent '{identity}' is not declared"))?;
-    anyhow::ensure!(
-        !omp_argv.is_empty(),
-        "omp driver '{runtime_id}' has no provider argv"
-    );
-    verify_supported_version(&omp_argv[0])?;
-    let executable =
-        std::env::current_exe().context("resolving st2 executable for the omp channel")?;
-    let session = harness_state::session_token();
-    // The claim is written: it supersedes whatever the predecessor left — including a
-    // still-fresh live record — before the channel or terminal writer act under it.
-    let seq = harness_state::claim(&agent_dir, identity.clone(), "omp", &session)?;
-    // Every fallible step past the claim must end the record honestly on failure — the claim
-    // placeholder standing as the last word would read as a takeover, not a launch that never
-    // ran.
-    let prepared = (|| -> Result<PreparedLaunch> {
-        let mut env = channel_env(
-            &executable,
-            catalog_root,
-            &identity,
-            &runtime_id,
-            &session,
-            seq,
-        )?;
-        env.extend(offline_defaults(|key| std::env::var_os(key).is_some()));
-        let set = hooks::verify_required_set().with_context(|| {
-            format!(
-                "omp driver '{runtime_id}' needs this binary's verified hook set for {EXTENSION}; run `st2 hooks install`"
-            )
-        })?;
-        Ok((env, with_channel_extension(omp_argv, &set)?))
-    })();
-    let (env, omp_argv) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let mut writer = harness_state::Writer::new(
-                &agent_dir,
-                identity.clone(),
-                "omp",
-                Some(runtime_id.clone()),
-            )
-            .with_ownership(session.clone(), seq);
-            let _ = writer.observe(
-                harness_state::Observation::new(
-                    harness_state::Activity::Ended,
-                    harness_state::BlockedOn::None,
-                    harness_state::InputBuffer::Unknown,
-                )
-                .with_reason("launch-error")
-                .with_exit("exit unknown"),
-            );
-            return Err(error);
-        }
-    };
-    install_signal_handler();
-    // Terminal-only: the channel owns the live record and its heartbeat, but only this wrapper
-    // survives long enough to see the stop path. Same token as the channel, so the terminal
-    // record fences exactly this session's live records.
-    let observer = crate::provider_session::SessionObserver::terminal_only(
-        &agent_dir,
-        &identity,
-        "omp",
-        &runtime_id,
-        &session,
-        seq,
-    );
-    let outcome = run_provider_observed(
-        "omp",
-        &status::status_path(&agent_dir),
-        &omp_argv,
-        &env,
-        status::STATUS_REFRESH,
-        PROVIDER_POLL,
-        &STOP,
-        Some(&observer),
-    )
-    .with_context(|| format!("running omp driver '{runtime_id}'"))?;
-    record_session_end(&agent_dir, &identity, &runtime_id, &session, seq, &outcome);
-    match outcome {
-        ProviderOutcome::Exited(exit) => {
-            anyhow::ensure!(exit.success(), "omp provider exited with {exit}");
-            Ok(())
-        }
-        ProviderOutcome::Stopped(_) => Ok(()),
-    }
+    pi_family_session::run_for(catalog_root, identity, runtime_id, omp_argv, &OMP_KIND)
 }
 
 /// Refuse any provider whose MINOR this binary was not verified against. Failing loudly at launch
@@ -188,86 +103,6 @@ fn verify_supported_version(binary: &str) -> Result<()> {
         harness_version::series_display(&SUPPORTED_OMP_MINORS)
     );
     Ok(())
-}
-
-/// The wrapper's one write into observed harness state: the terminal record. Live states and
-/// heartbeats belong to the omp channel; the wrapper sees exactly one fact the channel cannot —
-/// that the provider process is gone.
-fn record_session_end(
-    agent_dir: &Path,
-    identity: &str,
-    runtime_id: &str,
-    session: &str,
-    seq: u64,
-    outcome: &ProviderOutcome,
-) {
-    let label = match outcome {
-        ProviderOutcome::Exited(exit) | ProviderOutcome::Stopped(Some(exit)) => exit_label(*exit),
-        ProviderOutcome::Stopped(None) => "stopped".to_string(),
-    };
-    let mut writer =
-        harness_state::Writer::new(agent_dir, identity, "omp", Some(runtime_id.to_string()))
-            .with_ownership(session, seq);
-    if let Err(error) = writer.ended(label) {
-        eprintln!("st2 omp driver: recording session end failed: {error}");
-    }
-}
-
-fn exit_label(exit: ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (exit.code(), exit.signal()) {
-        (Some(code), _) => format!("exit {code}"),
-        (None, Some(signal)) => format!("signal {signal}"),
-        (None, None) => "exited".to_string(),
-    }
-}
-
-/// Load the channel extension from the verified set, immediately after the provider program.
-///
-/// Resolving it here means a launch uses the exact asset this binary was built with; a rendered
-/// machine-local path in a declaration would pin one host's layout into a catalog.
-fn with_channel_extension(mut argv: Vec<String>, set: &Path) -> Result<Vec<String>> {
-    let extension = set.join(EXTENSION);
-    let extension = extension
-        .to_str()
-        .context("verified hook set path is not UTF-8")?
-        .to_owned();
-    argv.splice(1..1, ["-e".to_string(), extension]);
-    Ok(argv)
-}
-
-/// The offline defaults this launch should add, skipping any the operator already declared.
-fn offline_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
-    OFFLINE_DEFAULTS
-        .iter()
-        .filter(|(key, _)| !is_set(key))
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// The environment the shipped omp extension reads to reach this exact control plane.
-///
-/// Fresh variable names: an omp seat must never adopt a stray pi channel configuration.
-fn channel_env(
-    executable: &Path,
-    catalog_root: &Path,
-    identity: &str,
-    runtime_id: &str,
-    session: &str,
-    seq: u64,
-) -> Result<Vec<(String, String)>> {
-    let executable = executable
-        .to_str()
-        .context("st2 executable path is not UTF-8")?;
-    let catalog_root = catalog_root.to_str().context("catalog root is not UTF-8")?;
-    Ok(vec![
-        (CHANNEL_BIN.to_string(), executable.to_string()),
-        (CHANNEL_CATALOG.to_string(), catalog_root.to_string()),
-        (CHANNEL_IDENTITY.to_string(), identity.to_string()),
-        (CHANNEL_RUNTIME_ID.to_string(), runtime_id.to_string()),
-        (CHANNEL_SESSION.to_string(), session.to_string()),
-        (CHANNEL_SEQ.to_string(), seq.to_string()),
-    ])
 }
 
 #[cfg(test)]
@@ -486,24 +321,19 @@ mod tests {
         assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len());
     }
 
+    /// The gate must run before the wrapper claims the seat: an unadmitted minor that took
+    /// ownership would leave the seat's record owned by a session that never launched.
     #[test]
-    fn offline_defaults_skip_operator_declared_keys() {
-        let defaults = offline_defaults(|key| key == "PI_OFFLINE");
-        assert_eq!(
-            defaults,
-            vec![("PI_SKIP_VERSION_CHECK".to_string(), "1".to_string())]
+    fn the_version_gate_is_wired_into_the_shared_launch_fork() {
+        assert!(
+            OMP_KIND.verify_version.is_some(),
+            "omp must carry a launch-time version gate"
         );
-    }
-
-    #[test]
-    fn channel_extension_is_spliced_right_after_the_program() {
-        let dir = tempfile::tempdir().unwrap();
-        let argv =
-            with_channel_extension(vec!["omp".into(), "--model".into(), "x".into()], dir.path())
-                .unwrap();
-        assert_eq!(argv[0], "omp");
-        assert_eq!(argv[1], "-e");
-        assert!(argv[2].ends_with("omp-channel.ts"));
-        assert_eq!(argv[3], "--model");
+        let fake = FakeExecutable::new("#!/bin/sh\nprintf '18.2.0\\n'\n");
+        let gate = OMP_KIND.verify_version.unwrap();
+        assert!(
+            gate(fake.path().to_str().unwrap()).is_err(),
+            "the descriptor's gate must be the refusing one"
+        );
     }
 }

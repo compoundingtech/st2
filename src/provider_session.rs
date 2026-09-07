@@ -164,7 +164,15 @@ impl SessionObserver {
     }
 }
 
-fn describe_exit(exit: ExitStatus) -> String {
+/// The one exit-label map: how every wrapper spells a reaped child's outcome into the observed
+/// record's `exit` field.
+///
+/// `(None, None)` is unreachable for a child this process reaped — `Child::wait`/`try_wait` call
+/// `waitpid` with neither `WUNTRACED` nor `WCONTINUED`, so every status they return satisfies
+/// `WIFEXITED` or `WIFSIGNALED` — but the label still has to be honest for the arm the type
+/// admits, which is why it says "unknown" rather than inventing an ordinary exit.
+/// `the_exit_label_map_covers_every_arm` pins the whole table.
+pub(crate) fn describe_exit(exit: ExitStatus) -> String {
     match (exit.code(), exit.signal()) {
         (Some(code), _) => format!("exit {code}"),
         (None, Some(signal)) => format!("signal {signal}"),
@@ -280,7 +288,7 @@ pub(crate) fn run_provider_observed(
     }
 }
 
-fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
+pub(crate) fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
     anyhow::ensure!(exit.success(), "{provider} provider exited with {exit}");
     Ok(())
 }
@@ -347,5 +355,36 @@ mod tests {
         assert_eq!(record.state, Activity::Ended);
         assert_eq!(record.exit.as_deref(), Some("exit unknown"));
         assert_eq!(record.reason.as_deref(), Some("launch-error"));
+    }
+
+    /// The whole `(status, signal) -> label` table, including the `(None, None)` arm no reaped
+    /// child can produce. Every wrapper's terminal record now spells its exit through this map,
+    /// so the table is the contract: a fifth harness that wants a different word has to change
+    /// it here, in front of this test, rather than forking a private copy that quietly disagrees.
+    #[test]
+    fn the_exit_label_map_covers_every_arm() {
+        // `wait_status` values as `waitpid` yields them: `code << 8` for an ordinary exit,
+        // the bare signal number for a killed child, and `0x7f` for the stopped shape only
+        // `WUNTRACED` could deliver — which is what makes `(None, None)` constructible at all.
+        for (raw, label) in [
+            (0, "exit 0"),
+            (3 << 8, "exit 3"),
+            (127 << 8, "exit 127"),
+            (libc::SIGKILL, "signal 9"),
+            (libc::SIGTERM, "signal 15"),
+            (0x7f, "exit unknown"),
+        ] {
+            let exit = ExitStatus::from_raw(raw);
+            assert_eq!(
+                describe_exit(exit),
+                label,
+                "raw wait status {raw:#x} => {:?}/{:?}",
+                exit.code(),
+                exit.signal()
+            );
+        }
+        // The arm the label calls unknown really is the one neither half of the pair answers.
+        let stopped = ExitStatus::from_raw(0x7f);
+        assert_eq!((stopped.code(), stopped.signal()), (None, None));
     }
 }

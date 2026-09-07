@@ -15,6 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 
+use crate::driver_diagnostic::ProviderAuthEdge;
 use crate::harness_context::{self, Compaction, CompactionTrigger, Harness, RateLimits, Reading};
 use crate::harness_state::{Activity, Ask, BlockedOn, InputBuffer, Observation};
 use crate::provider_session::{
@@ -178,7 +179,11 @@ pub fn run_observe(
     // applied before the observation guard below for the same reason the compaction write is:
     // an edge that carries no top-level state change must still reach its own record.
     if let Some(edge) = provider_auth_edge(event, &payload) {
-        publish_provider_auth(&agent_dir, edge);
+        driver_diagnostic::publish_provider_auth(
+            &agent_dir,
+            driver_diagnostic::Driver::Claude,
+            edge,
+        );
     }
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
@@ -619,13 +624,6 @@ fn stop_failure_error(payload: &serde_json::Value) -> Option<&str> {
     payload.get("error").and_then(serde_json::Value::as_str)
 }
 
-/// What one hook event proves about the seat's provider credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderAuthEdge {
-    Rejected,
-    Accepted,
-}
-
 /// Read the credential edge out of one hook event, or `None` when the event proves nothing about
 /// it — which must leave a standing rejection alone rather than clearing it.
 fn provider_auth_edge(event: &str, payload: &serde_json::Value) -> Option<ProviderAuthEdge> {
@@ -636,33 +634,6 @@ fn provider_auth_edge(event: &str, payload: &serde_json::Value) -> Option<Provid
         // `SessionStart` is not: a fresh session has made no provider call yet.
         "Stop" => Some(ProviderAuthEdge::Accepted),
         _ => None,
-    }
-}
-
-/// Record one credential edge on the seat's native-driver diagnostic.
-///
-/// Each hook invocation is its own short-lived writer, so the publisher's stage set starts empty
-/// and its on-disk fallback is what lets a later `Stop` clear a rejection an earlier `StopFailure`
-/// wrote from a different process. Fail-open like every other observation here: the publisher only
-/// warns on a write it cannot land.
-fn publish_provider_auth(agent_dir: &Path, edge: ProviderAuthEdge) {
-    let mut publisher = driver_diagnostic::Publisher::new(
-        agent_dir,
-        driver_diagnostic::Driver::Claude,
-        // A hook payload carries no Claude version — the common hook input is session id,
-        // transcript path, cwd, prompt id, permission mode, agent identity and effort, and
-        // nothing else (2.1.259) — and st2 gates no Claude version, so neither the producer
-        // version nor its support status is knowable from here.
-        None,
-        driver_diagnostic::Support::Unknown,
-    );
-    match edge {
-        ProviderAuthEdge::Rejected => publisher.publish(
-            driver_diagnostic::Stage::ProviderAuth,
-            driver_diagnostic::Reason::ProviderAuthRejected,
-            driver_diagnostic::Source::TurnResult,
-        ),
-        ProviderAuthEdge::Accepted => publisher.clear(driver_diagnostic::Stage::ProviderAuth),
     }
 }
 
@@ -862,8 +833,9 @@ mod tests {
             "error": "authentication_failed",
         });
 
-        publish_provider_auth(
+        driver_diagnostic::publish_provider_auth(
             tmp.path(),
+            driver_diagnostic::Driver::Claude,
             provider_auth_edge("StopFailure", &rejected).unwrap(),
         );
         let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
@@ -897,7 +869,11 @@ mod tests {
             driver_diagnostic::Observed::Failure(_)
         ));
 
-        publish_provider_auth(tmp.path(), ProviderAuthEdge::Accepted);
+        driver_diagnostic::publish_provider_auth(
+            tmp.path(),
+            driver_diagnostic::Driver::Claude,
+            ProviderAuthEdge::Accepted,
+        );
         assert_eq!(
             driver_diagnostic::read(&record),
             driver_diagnostic::Observed::Absent,

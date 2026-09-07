@@ -39,12 +39,17 @@ pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+/// The stdio framing shared by the native channels; crate-internal.
+mod native_channel;
 pub mod omp_session;
 pub mod metrics;
 pub mod migrations;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
+/// The launch body shared by the pi-family wrappers; crate-internal, reached through
+/// `pi_session::run` and `omp_session::run`.
+mod pi_family_session;
 pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
