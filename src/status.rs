@@ -11,7 +11,6 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// A valid status heartbeat at least this old reads as `unknown`.
@@ -285,31 +284,20 @@ fn write_record(path: &Path, state: State, written_at_ms: u64) -> anyhow::Result
     )
 }
 
-/// Atomic write: a temp sibling + rename, so a concurrent reader sees either the old bytes or the new
-/// bytes, never a partial file.
+/// Atomic write: a staged sibling + rename, so a concurrent reader sees either the old bytes or
+/// the new bytes, never a partial file.
+///
+/// Deliberately the lenient durability level: this record is rewritten per agent per refresh
+/// tick, and a lost write reads as `unknown` rather than as a wrong state, so buying crash
+/// durability with two fsyncs per tick per agent would be paying for nothing.
 fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(tmp_name());
-    fs::write(&tmp, content)?;
-    // rename over the target — atomic on the same filesystem.
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp); // best-effort cleanup
-        return Err(e.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        content.as_bytes(),
+        crate::fsatomic::Staging::new(".status"),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
-}
-
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A per-write-unique temp filename (pid + a process-local counter — no collisions within a process,
-/// and the pid separates processes).
-fn tmp_name() -> String {
-    format!(
-        ".status.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 #[cfg(test)]
@@ -317,10 +305,14 @@ mod tests {
     use super::*;
     use std::time::{Duration as Dur, SystemTime};
 
-    /// [`write_atomic`]'s publication contract, pinned before the helper is folded into one
-    /// shared primitive. The staging name is part of the contract, not decoration: six catalog
-    /// and publication walkers match `.status.tmp-` by prefix, so the grammar
-    /// `{prefix}.tmp-{pid}-{counter}` is asserted here as well as by those walkers' own tests.
+    /// [`write_atomic`]'s publication contract: the target ends up carrying the complete new
+    /// bytes, no staged sibling survives, and the record is owner-only.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — this record used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask). The
+    /// staging-name grammar `{prefix}.tmp-{pid}-{counter}` is unchanged and stays load-bearing:
+    /// six catalog and publication walkers match `.status.tmp-` by prefix, and the grammar itself
+    /// is asserted by `fsatomic`'s own test.
     #[test]
     fn a_status_write_replaces_the_target_and_leaves_no_staged_sibling() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -330,22 +322,10 @@ mod tests {
         write_atomic(&path, "available\n").unwrap();
         write_atomic(&path, "working\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");
-
-        let staging = tmp_name();
-        let (pid, counter) = staging
-            .strip_prefix(".status.tmp-")
-            .and_then(|rest| rest.split_once('-'))
-            .expect("the staging grammar is `.status.tmp-<pid>-<counter>`");
-        assert!(pid.bytes().all(|byte| byte.is_ascii_digit()) && !pid.is_empty());
-        assert!(counter.bytes().all(|byte| byte.is_ascii_digit()) && !counter.is_empty());
-
-        let reference = tmp.path().join("ordinary-write");
-        fs::write(&reference, b"x").unwrap();
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode(&path),
-            mode(&reference),
-            "the status record is published at the mode an ordinary write produces"
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the status record is published owner-only"
         );
 
         let residue = fs::read_dir(tmp.path())

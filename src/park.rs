@@ -28,7 +28,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -378,31 +377,27 @@ impl ParkProjection {
                 .context("timestamping park")?,
             reason: reason.to_string(),
         };
-        write_json_atomically(&path, &record, ".park.")
+        write_json_atomically(&path, &record, ".park")
     }
 }
 
+/// The strictest publication level in the state plane, and deliberately so: a park marker is what
+/// tells the next supervisor generation that a runtime is deliberately down, so a marker lost to a
+/// crash reads as "nobody parked this" and the runtime comes back up.
 fn write_json_atomically<T: Serialize>(
     path: &Path,
     value: &T,
     temp_prefix: &str,
 ) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
-    fs::create_dir_all(parent)?;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    let mut temp = tempfile::Builder::new()
-        .prefix(temp_prefix)
-        .tempfile_in(parent)?;
-    temp.write_all(&bytes)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("publishing {}", path.display()))?;
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    crate::fsatomic::replace(
+        path,
+        &bytes,
+        crate::fsatomic::Staging::new(temp_prefix),
+        crate::fsatomic::Durability::FsyncFileAndDir,
+    )
+    .with_context(|| format!("publishing {}", path.display()))
 }
 
 /// Reject anything that is not a plain filename, so an operator's typo (or a hostile argument) cannot
@@ -487,7 +482,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("park");
         let path = marker_path(&dir, "runtime");
-        write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park.").unwrap();
+        write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{\"schema\":\"test\"}\n");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -509,7 +504,7 @@ mod tests {
         // directory to sync it does not.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
         let refused =
-            write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park.");
+            write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             refused.is_err(),
@@ -633,7 +628,7 @@ mod tests {
         let path = marker_path(dir.path(), "a");
         let mut record: ParkRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         record.supervisor_start_time_ticks = record.supervisor_start_time_ticks.wrapping_add(1);
-        write_json_atomically(&path, &record, ".park.").unwrap();
+        write_json_atomically(&path, &record, ".park").unwrap();
 
         let batch = DirParkObserver::new(dir.path().to_path_buf()).observe(&desired(&["a"]));
         assert_eq!(
@@ -692,7 +687,7 @@ mod tests {
                 parked_at: "2026-08-09T10:00:00.000Z".to_string(),
                 reason: "crash-looped".to_string(),
             };
-            write_json_atomically(&marker_path(dir.path(), runtime_id), &record, ".park.").unwrap();
+            write_json_atomically(&marker_path(dir.path(), runtime_id), &record, ".park").unwrap();
         }
 
         let observer = DirParkObserver::new(dir.path().to_path_buf());

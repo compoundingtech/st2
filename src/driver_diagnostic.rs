@@ -7,7 +7,6 @@
 
 use std::array;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -624,62 +623,22 @@ fn emit(
     );
 }
 
-/// Create the staging sibling exclusively at `0600`.
-///
-/// An existing regular file, a directory, or a symlink an agent planted at this path is refused
-/// with `AlreadyExists` rather than followed or truncated. This directory is agent-writable, so
-/// that refusal is the whole security property.
-fn create_staging(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
 /// Durable replacement: the record's bytes reach disk before the rename and the directory entry is
 /// synced after it.
 ///
-/// The staging file is created exclusively at `0600` under a name unique to this process *and*
-/// write, so a stale or adversarial path cannot be followed or truncated and two writes to the
-/// same agent directory cannot collide. Its sibling in `delivery_ledger` documents why that
-/// matters; this helper used to be the one that did not do it.
+/// The directory sync is now STRICT — a parent that cannot be opened for it makes this fail, where
+/// it used to be swallowed. [`Publisher::persist`] already logs a failed publication and carries
+/// on, so the visible consequence is one warning line, and the alternative was keeping a
+/// durability level nothing can be made to fail.
 fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static WRITE: AtomicU64 = AtomicU64::new(0);
-
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "diagnostic path has no parent",
-        ));
-    };
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".driver-diagnostic.tmp-{}-{}",
-        std::process::id(),
-        WRITE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = create_staging(&tmp)?;
-    let staged = (|| -> std::io::Result<()> {
-        serde_json::to_writer(&mut file, value).map_err(std::io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })();
-    drop(file);
-    if let Err(error) = staged.and_then(|()| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error);
-    }
-    // Best-effort, exactly like `delivery_ledger`: the record is already durable, and a directory
-    // that cannot be synced must not turn a published diagnostic into a reported failure.
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    crate::fsatomic::replace(
+        path,
+        &bytes,
+        crate::fsatomic::Staging::new(".driver-diagnostic"),
+        crate::fsatomic::Durability::FsyncFileAndDir,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -921,7 +880,7 @@ mod tests {
         let planted = agent.join(".driver-diagnostic.tmp-planted");
         symlink(&victim, &planted).unwrap();
 
-        let refused = create_staging(&planted).unwrap_err();
+        let refused = crate::fsatomic::create_staging(&planted).unwrap_err();
         assert_eq!(
             refused.kind(),
             std::io::ErrorKind::AlreadyExists,
@@ -962,14 +921,16 @@ mod tests {
         assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
     }
 
-    /// Same best-effort directory sync as `delivery_ledger`, and pinned for the same reason: the
-    /// record is already renamed into place when the sync runs, so a parent that cannot be opened
-    /// for it reports success. `park` fails that edge, so the two levels genuinely differ, and a
-    /// difference nothing observes is a difference nobody can review changing. Real only for a
-    /// non-root uid; the hermetic gate runs as the sandbox's unprivileged build user, and a local
-    /// root run skips the edge instead of asserting what root cannot observe.
+    /// The directory sync is strict since the fold onto `fsatomic`: a parent that cannot be opened
+    /// for it fails the publication, where it used to be swallowed. This is the deliberate
+    /// behaviour change of that fold on this caller — [`Publisher::persist`] already logs a failed
+    /// publication and carries on, so the visible consequence is one warning line for a record
+    /// whose bytes did land.
+    ///
+    /// Real only for a non-root uid; the hermetic gate runs as the sandbox's unprivileged build
+    /// user, and a local root run skips the edge instead of asserting what root cannot observe.
     #[test]
-    fn a_directory_that_cannot_be_synced_does_not_fail_the_publication() {
+    fn a_directory_that_cannot_be_synced_fails_the_publication() {
         use std::os::unix::fs::PermissionsExt as _;
 
         if unsafe { libc::geteuid() } == 0 {
@@ -997,9 +958,11 @@ mod tests {
         let published = atomic_json(&path, &record);
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
-            published.is_ok(),
-            "the diagnostic's directory sync is best-effort: {published:?}"
+            published.is_err(),
+            "the diagnostic's directory sync is strict: {published:?}"
         );
+        // The bytes did land — the rename happens before the sync — so the failure is a report
+        // about durability, not about the record's contents.
         assert!(path.exists(), "the record still landed");
     }
 }

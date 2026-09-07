@@ -16,7 +16,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -400,14 +399,12 @@ pub fn materialize_message_once(
     result
 }
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// The staging-name prefix for everything this module stages. Four sent-record and inbox walkers
+/// match `.message.tmp-` by prefix, so the name is a contract with them, not a local detail.
+const TMP_PREFIX: &str = ".message";
 
 fn tmp_name() -> String {
-    format!(
-        ".message.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    crate::fsatomic::staging_name(TMP_PREFIX)
 }
 
 /// Read a canonical entry that was already returned by `read_dir`. Removing a message concurrently
@@ -2306,29 +2303,24 @@ fn write_sent_head(root: &Path, head: &SentHead) -> anyhow::Result<()> {
     atomic_replace_file(&root.join(SENT_HEAD), &serde_json::to_vec(head)?)
 }
 
+/// Publish `bytes` at `path` unless the name is already taken, reporting whether this call
+/// created it. The staged sibling is hardlinked rather than renamed, so the name being taken is an
+/// answer instead of a failure — that boolean is how a caller tells a replay from a first send.
 fn atomic_create_file(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
-    let parent = path.parent().context("atomic file has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(tmp_name());
-    fs::write(&temporary, bytes)?;
-    let result = match fs::hard_link(&temporary, path) {
-        Ok(()) => Ok(true),
-        Err(_) if path.is_file() => Ok(false),
-        Err(error) => Err(error.into()),
-    };
-    let _ = fs::remove_file(temporary);
-    result
+    Ok(crate::fsatomic::create_once(
+        path,
+        bytes,
+        crate::fsatomic::Staging::new(TMP_PREFIX),
+    )?)
 }
 
 fn atomic_replace_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().context("atomic file has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(tmp_name());
-    fs::write(&temporary, bytes)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        bytes,
+        crate::fsatomic::Staging::new(TMP_PREFIX),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
 }
 
@@ -2569,10 +2561,15 @@ fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// [`atomic_create_file`]'s create-once contract, pinned before the helper is folded into one
-    /// shared primitive. It is a hardlink, not a rename, and that is the whole point: the first
-    /// publication wins, a second reports `false` instead of replacing the winner's bytes, and
-    /// neither leaves a staged sibling behind for the four `.message.tmp-` walkers to trip over.
+    /// [`atomic_create_file`]'s create-once contract. It is a hardlink, not a rename, and that is
+    /// the whole point: the first publication wins, a second reports `false` instead of replacing
+    /// the winner's bytes, and neither leaves a staged sibling behind for the four `.message.tmp-`
+    /// walkers to trip over.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic` — these records used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask). Bus
+    /// records are per-agent state in the agent's own directory; a reader that is not st2 or that
+    /// agent was never a supported reader.
     #[test]
     fn a_create_once_message_write_keeps_the_first_bytes_and_reports_the_duplicate() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2582,14 +2579,10 @@ mod tests {
         assert!(atomic_create_file(&path, b"first").unwrap());
         assert!(!atomic_create_file(&path, b"second").unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"first");
-
-        let reference = path.with_file_name("ordinary-write");
-        fs::write(&reference, b"x").unwrap();
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode(&path),
-            mode(&reference),
-            "the record is published at the mode an ordinary write produces"
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the record is published owner-only"
         );
 
         let residue = fs::read_dir(path.parent().unwrap())
@@ -2771,11 +2764,21 @@ mod tests {
         fs::create_dir_all(&inbox).unwrap();
         let victim = tmp.path().join("victim");
         fs::write(&victim, "must remain unchanged").unwrap();
-        let start = TMP_COUNTER.load(Ordering::Relaxed);
-        for counter in start..start + 4096 {
+        // The counter now lives in `fsatomic`, so the next names are predicted from a probe
+        // rather than read off a module-local static: one call consumes `start`, so the writes
+        // this test blocks are the 4096 after it.
+        let probe = tmp_name();
+        let start = probe
+            .rsplit_once('-')
+            .and_then(|(_, counter)| counter.parse::<u64>().ok())
+            .expect("the staging grammar ends in the counter");
+        for counter in start + 1..start + 1 + 4096 {
             symlink(
                 &victim,
-                inbox.join(format!(".message.tmp-{}-{counter}", std::process::id())),
+                inbox.join(format!(
+                    "{TMP_PREFIX}.tmp-{}-{counter}",
+                    std::process::id()
+                )),
             )
             .unwrap();
         }

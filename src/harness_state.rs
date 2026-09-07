@@ -718,21 +718,12 @@ pub(crate) fn write_json_atomic<T: Serialize>(
 ) -> anyhow::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::create_dir_all(staging_dir)?;
-    let tmp = staging_dir.join(format!(
-        "{tmp_prefix}.tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&tmp, &bytes)?;
-    // rename over the target — atomic on the same filesystem.
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp); // best-effort cleanup
-        return Err(e.into());
-    }
+    crate::fsatomic::replace(
+        path,
+        &bytes,
+        crate::fsatomic::Staging::new(tmp_prefix).in_dir(staging_dir),
+        crate::fsatomic::Durability::Rename,
+    )?;
     Ok(())
 }
 
@@ -916,14 +907,19 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use super::*;
 
-    /// [`write_json_atomic`]'s contract, pinned before the helper is folded into one shared
-    /// primitive: one newline-terminated JSON record, replaced whole, and staged in the directory
-    /// the CALLER named. The staging directory is not a detail — the harness-context record
-    /// stages in the catalog control plane precisely because a staged name inside the replicated
-    /// `agents` namespace becomes a durable replicated key (INVARIANTS row 29, HC-R05) — so an
-    /// unusable staging directory must fail the publication instead of quietly staging beside the
-    /// record. Proven with a staging path that is a regular file, which no uid can turn into a
-    /// directory.
+    /// [`write_json_atomic`]'s contract: one newline-terminated JSON record, replaced whole,
+    /// staged in the directory the CALLER named, and owner-only. The staging directory is not a
+    /// detail — the harness-context record stages in the catalog control plane precisely because a
+    /// staged name inside the replicated `agents` namespace becomes a durable replicated key
+    /// (INVARIANTS row 29, HC-R05) — so an unusable staging directory must fail the publication
+    /// instead of quietly staging beside the record. Proven with a staging path that is a regular
+    /// file, which no uid can turn into a directory.
+    ///
+    /// The mode is the deliberate change of the fold onto `fsatomic`: this pair used to be
+    /// published at whatever an ordinary write produces (`0644` under the fleet's umask). These
+    /// are the two records a replication transport's include list names (HC-R05), and no such
+    /// transport runs on the fleet today (`DQ-C1`/`DQ-H2`), so nothing reads them as another uid;
+    /// the tightening is recorded against HC-T08 for whoever adopts one.
     #[test]
     fn a_record_is_one_json_line_staged_in_the_directory_the_caller_named() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -937,14 +933,10 @@ mod tests {
         write_json_atomic(&path, &record, &staging, ".harness-state").unwrap();
         write_json_atomic(&path, &record, &staging, ".harness-state").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{\"schema\":\"test\"}\n");
-
-        let reference = agent_dir.join("ordinary-write");
-        fs::write(&reference, b"x").unwrap();
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode(&path),
-            mode(&reference),
-            "the driver record is published at the mode an ordinary write produces"
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the driver record is published owner-only"
         );
 
         for dir in [&agent_dir, &staging] {

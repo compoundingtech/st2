@@ -2975,6 +2975,15 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Stage-and-rename this runtime's own state files, deliberately NOT through the shared
+/// `fsatomic` primitive.
+///
+/// Two reasons, and neither is the durability: [`secure_dir`] re-establishes `0700` on the state
+/// directory on EVERY write, because this directory holds the Codex socket and its owner lock and
+/// a mode drifting open there is a takeover surface rather than a readability question; and the
+/// bytes are `to_writer_pretty`, because these files are read by humans debugging a live runtime.
+/// The shared primitive owns neither, and giving it a "chmod the parent" mode would hand every
+/// caller a directory-permissions policy it has no business having.
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("state file has no parent")?;
     secure_dir(parent)?;
