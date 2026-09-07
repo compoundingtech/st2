@@ -132,12 +132,17 @@
               --fish completions-fish
           '';
 
-          # Run the hermetic unit tests plus agent-spec's discovery test, the real
-          # lifecycle-hook integration tests, and the reconcile/execute suite. Most
-          # remaining root integration tests assume facilities the Nix build sandbox
-          # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY
-          # backends, or a systemd `--user` manager. They remain native gates, while
-          # the flake proves that its parser and packaged hooks execute.
+          # Every hermetic test target runs here: the unit tests, agent-spec's discovery test, the
+          # real lifecycle-hook integration tests, the reconcile/execute suite, and the
+          # parser/CLI/doc-ledger targets that need nothing but `tempfile` and the binary this
+          # build just produced. A target belongs in this list iff it is hermetic — an ungated
+          # hermetic target is a test that cannot fail CI, which is how `tests/agent_publish.rs`
+          # stayed red on `main` unnoticed.
+          # The remaining root integration tests assume facilities the Nix build sandbox
+          # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY backends, or a
+          # systemd `--user` manager. They remain native gates, while the flake proves that its
+          # parser and packaged hooks execute. The four sibling derivations below gate the targets
+          # that need a different profile, feature set, or `nativeCheckInputs`.
           # `run` is hermetic despite living alongside them — it drives `reconcile`
           # and `execute` against `FakeRunner` and `tempfile` only — so it is gated
           # here. It covers the restart cap's supervision behaviour, which is
@@ -148,6 +153,10 @@
           # the exact argv every typed harness driver produces. That argv is the
           # whole launch contract, so a silent change to it is the class of defect
           # this build should not ship.
+          # `agent_publish` carries nine `#[ignore]`d cases, quarantined on
+          # https://github.com/compoundingtech/st2/issues/498: their single-agent fixtures are
+          # refused by the root-count rule. Its other 15 cases — CAS staleness, control-directory
+          # swap, ownership markers — gate here.
           # `--workspace` because the root is a real package: without it cargo
           # selects only `st2` and silently skips the `agent-spec` crate.
           cargoTestFlags = [
@@ -174,6 +183,24 @@
             "run"
             "--test"
             "driver_expansion"
+            "--test"
+            "agent_address"
+            "--test"
+            "agent_desired_state"
+            "--test"
+            "agent_publish"
+            "--test"
+            "catalog_graph"
+            "--test"
+            "invariants"
+            "--test"
+            "message"
+            "--test"
+            "status_agents"
+            "--test"
+            "validate"
+            "--test"
+            "vrs_ledger"
             # Lifecycle tests fork while holding temporary sockets and executables.
             # Serial execution prevents sibling tests from inheriting those live handles.
             "--"

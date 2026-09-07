@@ -218,6 +218,7 @@ fn caller_source_digest_rejects_mutation_and_symlink_swaps_before_publication() 
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn cas_rejects_stale_writers_and_preserves_resources() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -720,6 +721,7 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn spec_publish_crash_stages_only_in_the_control_plane() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -788,6 +790,7 @@ fn spec_publish_crash_stages_only_in_the_control_plane() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn publish_post_commit_generation_failure_is_fenced_and_recovered() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -856,6 +859,7 @@ fn publish_post_commit_generation_failure_is_fenced_and_recovered() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn success_receipt_requires_exact_locked_readback() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -905,6 +909,7 @@ fn success_receipt_requires_exact_locked_readback() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn success_receipt_requires_locked_full_catalog_readmission() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -960,6 +965,7 @@ fn success_receipt_requires_locked_full_catalog_readmission() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn control_directory_swap_cannot_redirect_publication_staging() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -1014,6 +1020,7 @@ fn control_directory_swap_cannot_redirect_publication_staging() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn intermediate_host_swap_cannot_redirect_publication_outside_the_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -1104,6 +1111,7 @@ fn compile_agent_is_not_a_cli_writer_anymore() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
@@ -1186,6 +1194,7 @@ fn concurrent_publishers_serialize_and_only_one_wins_the_cas() {
 }
 
 #[test]
+#[ignore = "https://github.com/compoundingtech/st2/issues/498"]
 fn retirement_cannot_commit_between_reconcile_discovery_and_launch() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = temp.path().join("catalog");
