@@ -59,6 +59,19 @@ pub struct AddressBookEntry {
 }
 
 impl AddressBookEntry {
+    /// The one mapping from a declaration to its routable subject.
+    ///
+    /// Every caller that hand-built this struct was re-deriving the same four fields from the
+    /// same spec, so the derivation lives here and the address book itself uses it too.
+    pub fn of(spec: &agent_spec::AgentSpec, this_host: &str) -> Self {
+        Self {
+            id: spec.effective_id(this_host),
+            bus_identity: spec.bus_id(this_host),
+            host: spec.resolved_host(this_host).to_owned(),
+            address: spec.effective_address().to_owned(),
+        }
+    }
+
     /// The human-routable bus address `<host>.<address>`.
     pub fn bus_address(&self) -> String {
         format!("{}.{}", self.host, self.address)
@@ -146,7 +159,7 @@ pub fn resolve_id<'a>(
 ///    try every dotted split whose prefix is an admitted logical host and whose suffix is an
 ///    effective address in that host.
 /// 3. Deduplicate by agent ID and succeed only when exactly one subject remains.
-pub fn resolve_address<'a>(
+fn resolve_address<'a>(
     entries: &'a [AddressBookEntry],
     reference: &str,
     pinned_host: Option<&str>,
@@ -200,7 +213,7 @@ pub fn resolve_address<'a>(
 }
 
 /// Resolve either selector form against one coherent address book.
-pub fn resolve<'a>(
+fn resolve<'a>(
     entries: &'a [AddressBookEntry],
     selector: &AgentSelector,
     pinned_host: Option<&str>,
@@ -237,12 +250,7 @@ pub fn address_book(specs: &[agent_spec::AgentSpec], this_host: &str) -> Vec<Add
     specs
         .iter()
         .filter(|spec| !spec.desired_state.is_retired())
-        .map(|spec| AddressBookEntry {
-            id: spec.effective_id(this_host),
-            bus_identity: spec.bus_id(this_host),
-            host: spec.resolved_host(this_host).to_owned(),
-            address: spec.effective_address().to_owned(),
-        })
+        .map(|spec| AddressBookEntry::of(spec, this_host))
         .collect()
 }
 
