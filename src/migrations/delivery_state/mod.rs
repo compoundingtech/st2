@@ -47,7 +47,7 @@ use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::delivery_ledger::{Entry, Harness, LEDGER_FILE};
+use crate::delivery_ledger::{Entry, EvidencePolicy, Harness, LEDGER_FILE};
 
 /// The filename every pre-ledger release wrote. Named here only.
 const LEGACY_FILE: &str = "delivery-state.json";
@@ -85,6 +85,9 @@ pub(crate) fn recover<F>(
 where
     F: Fn(&str, &str) -> String,
 {
+    if harness.policy() == EvidencePolicy::AttemptOnly {
+        return Ok(Vec::new());
+    }
     let path = state_dir.join(LEGACY_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -98,6 +101,7 @@ where
     match harness {
         Harness::Codex => translate::<codex_v1::Record>(&bytes, agent, correlate),
         Harness::OpenCode => translate::<opencode_v1::Record>(&bytes, agent, correlate),
+        Harness::Claude | Harness::Pi | Harness::Omp => unreachable!(),
     }
 }
 

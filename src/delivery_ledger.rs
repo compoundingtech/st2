@@ -24,38 +24,67 @@ pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
+    Claude,
     Codex,
+    Pi,
     OpenCode,
+    Omp,
 }
 
 impl Harness {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
             Self::OpenCode => "opencode",
+            Self::Omp => "omp",
         }
     }
 
     fn parse(name: &str) -> Result<Self> {
         match name {
+            "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
             "opencode" => Ok(Self::OpenCode),
+            "omp" => Ok(Self::Omp),
             other => anyhow::bail!("unknown native delivery harness '{other}'"),
         }
     }
 
-    pub fn profile(self) -> Profile {
-        Profile { harness: self }
+    pub const fn policy(self) -> EvidencePolicy {
+        match self {
+            Self::Claude | Self::Pi | Self::Omp => EvidencePolicy::AttemptOnly,
+            Self::Codex => EvidencePolicy::CodexReceipts,
+            Self::OpenCode => EvidencePolicy::OpenCodeReceipts,
+        }
+    }
+
+    pub const fn profile(self) -> Profile {
+        Profile::new(self, self.policy())
     }
 }
 
-/// The evidence vocabulary one harness can honestly produce.
+/// The evidence vocabulary and settlement threshold a harness can honestly observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidencePolicy {
+    AttemptOnly,
+    CodexReceipts,
+    OpenCodeReceipts,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
     harness: Harness,
+    policy: EvidencePolicy,
 }
 
 impl Profile {
+    pub const fn new(harness: Harness, policy: EvidencePolicy) -> Self {
+        Self { harness, policy }
+    }
+
     fn graded(self, evidence: Evidence) -> Result<Phase> {
         let phase = match evidence {
             Evidence::TransportAccepted => Phase::TransportAccepted,
@@ -70,18 +99,15 @@ impl Profile {
         Ok(phase)
     }
 
-    /// Whether this harness has a concrete observation for `phase`.
+    /// Whether this evidence policy has a concrete observation for `phase`.
     fn proves(self, phase: Phase) -> bool {
-        match self.harness {
-            // Codex exposes transport acceptance and a typed completed user message, but no
-            // storage receipt.
-            Harness::Codex => matches!(
+        match self.policy {
+            EvidencePolicy::AttemptOnly => matches!(phase, Phase::Attempted),
+            EvidencePolicy::CodexReceipts => matches!(
                 phase,
                 Phase::Attempted | Phase::TransportAccepted | Phase::Consumed
             ),
-            // OpenCode exposes transport acceptance and durable read-back, but no observation
-            // that the scheduler or model consumed the prompt.
-            Harness::OpenCode => matches!(
+            EvidencePolicy::OpenCodeReceipts => matches!(
                 phase,
                 Phase::Attempted | Phase::TransportAccepted | Phase::Persisted
             ),
@@ -89,7 +115,7 @@ impl Profile {
     }
 
     fn releases(self, phase: Phase) -> bool {
-        matches!(self.harness, Harness::Codex) && phase >= Phase::Consumed
+        matches!(self.policy, EvidencePolicy::CodexReceipts) && phase >= Phase::Consumed
     }
 }
 
@@ -634,9 +660,13 @@ mod tests {
     }
 
     fn open(dir: &Path, harness: Harness) -> Ledger {
+        open_with(dir, harness.profile())
+    }
+
+    fn open_with(dir: &Path, profile: Profile) -> Ledger {
         Ledger::open(
             &dir.join(LEDGER_FILE),
-            harness.profile(),
+            profile,
             "h.worker",
             "h.worker.runtime",
             correlation,
@@ -663,6 +693,14 @@ mod tests {
 
     #[test]
     fn profiles_accept_only_evidence_their_harness_can_produce() {
+        for harness in [Harness::Claude, Harness::Pi, Harness::Omp] {
+            let attempt_only = harness.profile();
+            assert!(attempt_only.proves(Phase::Attempted));
+            assert!(attempt_only.graded(Evidence::TransportAccepted).is_err());
+            assert!(attempt_only.graded(Evidence::Persisted).is_err());
+            assert!(attempt_only.graded(Evidence::Consumed).is_err());
+        }
+
         let codex = Harness::Codex.profile();
         assert!(codex.graded(Evidence::TransportAccepted).is_ok());
         assert!(codex.graded(Evidence::Persisted).is_err());
@@ -672,6 +710,78 @@ mod tests {
         assert!(opencode.graded(Evidence::TransportAccepted).is_ok());
         assert!(opencode.graded(Evidence::Persisted).is_ok());
         assert!(opencode.graded(Evidence::Consumed).is_err());
+    }
+
+    #[test]
+    fn five_harness_identities_map_onto_three_evidence_policies() {
+        for (harness, name, policy) in [
+            (Harness::Claude, "claude", EvidencePolicy::AttemptOnly),
+            (Harness::Codex, "codex", EvidencePolicy::CodexReceipts),
+            (Harness::Pi, "pi", EvidencePolicy::AttemptOnly),
+            (
+                Harness::OpenCode,
+                "opencode",
+                EvidencePolicy::OpenCodeReceipts,
+            ),
+            (Harness::Omp, "omp", EvidencePolicy::AttemptOnly),
+        ] {
+            assert_eq!(harness.as_str(), name);
+            assert_eq!(Harness::parse(name).unwrap(), harness);
+            assert_eq!(harness.policy(), policy);
+        }
+    }
+
+    #[test]
+    fn the_ledger_core_grades_by_policy_not_harness_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = Profile::new(Harness::Codex, EvidencePolicy::OpenCodeReceipts);
+        let mut ledger = open_with(tmp.path(), profile);
+        begin(&mut ledger, "session-main", FILE_A);
+
+        assert_eq!(
+            ledger.record(FILE_A, Evidence::Persisted).unwrap(),
+            Some(Phase::Persisted)
+        );
+        assert!(ledger.record(FILE_A, Evidence::Consumed).is_err());
+
+        let bytes = fs::read(tmp.path().join(LEDGER_FILE)).unwrap();
+        let record: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.harness, "codex");
+    }
+
+    #[test]
+    fn attempt_only_holds_an_attempt_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = open(tmp.path(), Harness::Pi);
+        begin(&mut ledger, "stable", FILE_A);
+
+        let reopened = open(tmp.path(), Harness::Pi);
+        assert!(reopened.quarantined().is_none());
+        assert_eq!(
+            reopened.retry(FILE_A),
+            RetryDecision::Hold(HoldReason::AmbiguousAttempt)
+        );
+    }
+
+    #[test]
+    fn codex_and_opencode_compact_wire_bytes_are_stable() {
+        let codex_dir = tempfile::tempdir().unwrap();
+        let mut codex = open(codex_dir.path(), Harness::Codex);
+        begin(&mut codex, "thread-main", FILE_A);
+        codex.record(FILE_A, Evidence::Consumed).unwrap();
+        assert_eq!(
+            fs::read(codex_dir.path().join(LEDGER_FILE)).unwrap(),
+            br#"{"schema":"st2.delivery-ledger.v1","harness":"codex","agent":"h.worker","runtimeId":"h.worker.runtime","entries":[{"filename":"1786380000000-aaa111.md","binding":"thread-main","correlation":{"value":"thread-main:1786380000000-aaa111.md"},"phase":"consumed","attestation":"observed","incarnation":"incarnation-1"}]}"#
+        );
+
+        let opencode_dir = tempfile::tempdir().unwrap();
+        let mut opencode = open(opencode_dir.path(), Harness::OpenCode);
+        begin(&mut opencode, "session-main", FILE_A);
+        opencode.record(FILE_A, Evidence::Persisted).unwrap();
+        assert_eq!(
+            fs::read(opencode_dir.path().join(LEDGER_FILE)).unwrap(),
+            br#"{"schema":"st2.delivery-ledger.v1","harness":"opencode","agent":"h.worker","runtimeId":"h.worker.runtime","entries":[{"filename":"1786380000000-aaa111.md","binding":"session-main","correlation":{"value":"session-main:1786380000000-aaa111.md"},"phase":"persisted","attestation":"observed","incarnation":"incarnation-1"}]}"#
+        );
     }
 
     #[test]
@@ -820,9 +930,7 @@ mod tests {
         let mut ledger = open(tmp.path(), Harness::Codex);
         begin(&mut ledger, "thread-main", FILE_A);
         ledger.record(FILE_A, Evidence::Consumed).unwrap();
-        ledger
-            .record(FILE_A, Evidence::TransportAccepted)
-            .unwrap();
+        ledger.record(FILE_A, Evidence::TransportAccepted).unwrap();
         assert_eq!(ledger.entry(FILE_A).unwrap().phase, Phase::Consumed);
         assert_eq!(ledger.retention(FILE_A), Retention::Release);
     }

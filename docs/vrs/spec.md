@@ -1119,6 +1119,34 @@ and response definitions st2 reads. Only reviewed fingerprints are admitted.
 Live turn, resume, and durable-receipt evidence remains a separate behavioral
 check and is not inferred from the fingerprint.
 
+## Native delivery evidence policy (R43)
+
+Native delivery keeps persisted harness identity separate from evidence policy.
+The harness discriminator owns wire identity, foreign-ledger rejection, and
+pre-ledger migration selection. The evidence policy owns phase grading,
+retention, and release.
+
+| Harness identity | Evidence policy | Evidence above `Attempted` |
+| --- | --- | --- |
+| `claude` | attempt-only | none |
+| `codex` | Codex receipts | correlated transport acceptance and consumption |
+| `pi` | attempt-only | none |
+| `opencode` | OpenCode receipts | correlated transport acceptance and durable read-back |
+| `omp` | attempt-only | none |
+
+These are five stable identities and three closed policies. The ledger core
+does not branch on provider identity when it grades evidence. A synthetic
+identity-policy pairing proves that separation without adding a provider
+registry or another core branch.
+
+This section specifies the complete R43 target. At this stage, only Codex and
+OpenCode own delivery through the ledger. Claude, pi, and OMP have the
+attempt-only policy, but their drivers adopt durable ownership in separate
+changes. Transactional mutation, exact attempt tokens, FIFO enforcement,
+provider-visible correlation, and operator-negative evidence are also separate
+implementation steps. `INVARIANTS.md` names only the subset proved by the
+current implementation.
+
 ## Message lifecycle
 
 ```text
