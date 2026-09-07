@@ -470,6 +470,53 @@ pub fn take_unpark_requests(dir: &Path) -> (Vec<String>, Vec<String>) {
 mod tests {
     use super::*;
 
+    /// [`write_json_atomically`] is the strict end of the publication range and the reference the
+    /// shared primitive is unified onto: the record's bytes are fsynced before the rename and the
+    /// parent directory entry after it, and a directory that cannot be opened for that sync
+    /// FAILS the publication rather than reporting success for a write that may not survive a
+    /// crash. That failure edge is the only observable difference between a best-effort sync and
+    /// a strict one, which is why it is pinned here.
+    ///
+    /// The mode denial is real only for a non-root uid; the hermetic gate runs as the sandbox's
+    /// unprivileged build user, and a local root run skips the edge rather than asserting
+    /// something root cannot observe.
+    #[test]
+    fn a_park_publication_is_owner_only_and_fails_when_its_directory_cannot_be_synced() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("park");
+        let path = marker_path(&dir, "runtime");
+        write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park.").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"schema\":\"test\"}\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the park marker is published owner-only"
+        );
+
+        let residue = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".park."))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // Write and traverse, but not read: staging and renaming still work, opening the
+        // directory to sync it does not.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let refused =
+            write_json_atomically(&path, &serde_json::json!({"schema": "test"}), ".park.");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            refused.is_err(),
+            "a directory that cannot be synced must fail the publication"
+        );
+    }
+
     fn projection(dir: &Path) -> ParkProjection {
         ParkProjection::current(dir.to_path_buf()).expect("this process has a generation")
     }

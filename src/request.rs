@@ -504,3 +504,39 @@ fn read_inbox_or_archive(agent_dir: &Path, filename: &str) -> anyhow::Result<mes
     message::read_msg(&message::inbox_dir(agent_dir), filename)
         .or_else(|_| message::read_msg(&message::archive_dir(agent_dir), filename))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`atomic_create`]'s create-once contract, pinned before the helper is folded into one
+    /// shared primitive. The idempotency record IS the deduplication: a second publication of the
+    /// same key must report `false` rather than replace the record the first request registered,
+    /// because the caller reads that boolean to decide whether it is replaying or racing.
+    #[test]
+    fn a_create_once_state_record_keeps_the_first_bytes_and_reports_the_duplicate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = record_path(&tmp.path().join("state"), "key");
+        assert!(atomic_create(&path, b"first").unwrap());
+        assert!(!atomic_create(&path, b"second").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+
+        let reference = path.with_file_name("ordinary-write");
+        fs::write(&reference, b"x").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&reference),
+            "the state record is published at the mode an ordinary write produces"
+        );
+
+        let residue = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".request-state.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+}

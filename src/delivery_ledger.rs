@@ -786,9 +786,50 @@ mod tests {
         let residue = fs::read_dir(tmp.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp"))
+            // By staging-name PREFIX, not by a `.tmp` suffix: the suffix is this helper's own
+            // spelling, and a filter that only matches its current spelling stops testing the
+            // moment the spelling changes.
+            .filter(|name| name.starts_with(".delivery-ledger"))
             .collect::<Vec<_>>();
         assert!(residue.is_empty(), "temp residue left behind: {residue:?}");
+    }
+
+    /// The directory sync is best-effort today: the record is already renamed into place when it
+    /// runs, so a parent that cannot be opened for syncing does not fail the publication.
+    ///
+    /// Pinned because it is a real difference from `park`, which fails that same edge, and a
+    /// difference nothing observes is a difference nobody can review changing. The denial is
+    /// real only for a non-root uid; the hermetic gate runs as the sandbox's unprivileged build
+    /// user, and a local root run skips the edge instead of asserting what root cannot observe.
+    #[test]
+    fn a_directory_that_cannot_be_synced_does_not_fail_the_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agent");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEDGER_FILE);
+        let record = Record {
+            schema: LEDGER_SCHEMA.to_owned(),
+            harness: "codex".to_owned(),
+            agent: "h.worker".to_owned(),
+            runtime_id: "runtime".to_owned(),
+            entries: Vec::new(),
+        };
+
+        // Write and traverse, but not read: staging and renaming still work, opening the
+        // directory to sync it does not.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let published = atomic_json(&path, &record);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            published.is_ok(),
+            "the ledger's directory sync is best-effort: {published:?}"
+        );
+        assert!(path.exists(), "the record still landed");
     }
 
     #[test]

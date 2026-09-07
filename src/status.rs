@@ -317,6 +317,45 @@ mod tests {
     use super::*;
     use std::time::{Duration as Dur, SystemTime};
 
+    /// [`write_atomic`]'s publication contract, pinned before the helper is folded into one
+    /// shared primitive. The staging name is part of the contract, not decoration: six catalog
+    /// and publication walkers match `.status.tmp-` by prefix, so the grammar
+    /// `{prefix}.tmp-{pid}-{counter}` is asserted here as well as by those walkers' own tests.
+    #[test]
+    fn a_status_write_replaces_the_target_and_leaves_no_staged_sibling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = status_path(tmp.path());
+        write_atomic(&path, "available\n").unwrap();
+        write_atomic(&path, "working\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "working\n");
+
+        let staging = tmp_name();
+        let (pid, counter) = staging
+            .strip_prefix(".status.tmp-")
+            .and_then(|rest| rest.split_once('-'))
+            .expect("the staging grammar is `.status.tmp-<pid>-<counter>`");
+        assert!(pid.bytes().all(|byte| byte.is_ascii_digit()) && !pid.is_empty());
+        assert!(counter.bytes().all(|byte| byte.is_ascii_digit()) && !counter.is_empty());
+
+        let reference = tmp.path().join("ordinary-write");
+        fs::write(&reference, b"x").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&reference),
+            "the status record is published at the mode an ordinary write produces"
+        );
+
+        let residue = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".status.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+
     #[test]
     fn missing_is_offline() {
         let tmp = tempfile::tempdir().unwrap();

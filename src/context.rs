@@ -222,6 +222,39 @@ fn iso_utc_now() -> String {
 mod tests {
     use super::*;
 
+    /// [`write_atomic`]'s publication contract, pinned before the helper is folded into one
+    /// shared primitive: the target ends up carrying the complete new bytes, no staged sibling
+    /// survives a successful write, and the published file's mode is whatever an ordinary write
+    /// produces. That last assertion is the umask-independent way to say "as readable as any
+    /// other file this process writes" — the property the fold deliberately tightens.
+    #[test]
+    fn a_context_write_replaces_the_target_and_leaves_no_staged_sibling() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = context_dir(tmp.path());
+        let path = now_file(&dir);
+        write_atomic(&path, "first\n").unwrap();
+        write_atomic(&path, "second\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
+
+        let reference = dir.join("ordinary-write");
+        fs::write(&reference, b"x").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&reference),
+            "the context record is published at the mode an ordinary write produces"
+        );
+
+        let staged = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ctx"))
+            .collect::<Vec<_>>();
+        assert!(staged.is_empty(), "staging residue left behind: {staged:?}");
+    }
+
     #[test]
     fn missing_context_reads_empty() {
         let tmp = tempfile::tempdir().unwrap();

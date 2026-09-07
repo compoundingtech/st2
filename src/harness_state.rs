@@ -916,6 +916,54 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod tests {
     use super::*;
 
+    /// [`write_json_atomic`]'s contract, pinned before the helper is folded into one shared
+    /// primitive: one newline-terminated JSON record, replaced whole, and staged in the directory
+    /// the CALLER named. The staging directory is not a detail — the harness-context record
+    /// stages in the catalog control plane precisely because a staged name inside the replicated
+    /// `agents` namespace becomes a durable replicated key (INVARIANTS row 29, HC-R05) — so an
+    /// unusable staging directory must fail the publication instead of quietly staging beside the
+    /// record. Proven with a staging path that is a regular file, which no uid can turn into a
+    /// directory.
+    #[test]
+    fn a_record_is_one_json_line_staged_in_the_directory_the_caller_named() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents/hetz/worker");
+        let path = harness_state_path(&agent_dir);
+        let staging = tmp.path().join("staging");
+        let record = serde_json::json!({"schema": "test"});
+
+        write_json_atomic(&path, &record, &staging, ".harness-state").unwrap();
+        write_json_atomic(&path, &record, &staging, ".harness-state").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"schema\":\"test\"}\n");
+
+        let reference = agent_dir.join("ordinary-write");
+        fs::write(&reference, b"x").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&reference),
+            "the driver record is published at the mode an ordinary write produces"
+        );
+
+        for dir in [&agent_dir, &staging] {
+            let residue = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".harness-state.tmp-"))
+                .collect::<Vec<_>>();
+            assert!(residue.is_empty(), "staging residue in {dir:?}: {residue:?}");
+        }
+
+        let blocked = tmp.path().join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+        assert!(
+            write_json_atomic(&path, &record, &blocked, ".harness-state").is_err(),
+            "an unusable staging directory must fail the publication, not fall back"
+        );
+    }
+
     fn writer(dir: &Path) -> Writer {
         Writer::new(dir, "hetz.worker", "codex", Some("worker".to_string()))
     }

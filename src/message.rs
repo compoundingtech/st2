@@ -2569,6 +2569,55 @@ fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// [`atomic_create_file`]'s create-once contract, pinned before the helper is folded into one
+    /// shared primitive. It is a hardlink, not a rename, and that is the whole point: the first
+    /// publication wins, a second reports `false` instead of replacing the winner's bytes, and
+    /// neither leaves a staged sibling behind for the four `.message.tmp-` walkers to trip over.
+    #[test]
+    fn a_create_once_message_write_keeps_the_first_bytes_and_reports_the_duplicate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/record.json");
+        assert!(atomic_create_file(&path, b"first").unwrap());
+        assert!(!atomic_create_file(&path, b"second").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+
+        let reference = path.with_file_name("ordinary-write");
+        fs::write(&reference, b"x").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&reference),
+            "the record is published at the mode an ordinary write produces"
+        );
+
+        let residue = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".message.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+
+    /// [`atomic_replace_file`]'s contract, pinned for the same fold: replacement is unconditional
+    /// and complete, and the staged sibling never survives it.
+    #[test]
+    fn a_replacing_message_write_lands_the_complete_bytes_and_leaves_no_staged_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(SENT_HEAD);
+        atomic_replace_file(&path, b"first").unwrap();
+        atomic_replace_file(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+
+        let residue = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".message.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+    }
+
     #[test]
     fn filename_grammar() {
         assert!(is_message_filename("1784649988123-abc23z.md"));

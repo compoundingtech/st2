@@ -961,4 +961,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
     }
+
+    /// Same best-effort directory sync as `delivery_ledger`, and pinned for the same reason: the
+    /// record is already renamed into place when the sync runs, so a parent that cannot be opened
+    /// for it reports success. `park` fails that edge, so the two levels genuinely differ, and a
+    /// difference nothing observes is a difference nobody can review changing. Real only for a
+    /// non-root uid; the hermetic gate runs as the sandbox's unprivileged build user, and a local
+    /// root run skips the edge instead of asserting what root cannot observe.
+    #[test]
+    fn a_directory_that_cannot_be_synced_does_not_fail_the_publication() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agents/h/worker");
+        fs::create_dir_all(&agent).unwrap();
+        let path = path(&agent);
+        let record = Record {
+            schema: SCHEMA.to_owned(),
+            driver: Driver::OpenCode,
+            stage: Stage::Seed,
+            reason: Reason::UnknownStatus,
+            source: Source::StatusSnapshot,
+            producer_version: None,
+            support: Support::Supported,
+            observed_at: 100,
+            recovery: RECOVERY.to_owned(),
+        };
+
+        // Write and traverse, but not read: staging and renaming still work, opening the
+        // directory to sync it does not.
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o300)).unwrap();
+        let published = atomic_json(&path, &record);
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            published.is_ok(),
+            "the diagnostic's directory sync is best-effort: {published:?}"
+        );
+        assert!(path.exists(), "the record still landed");
+    }
 }
