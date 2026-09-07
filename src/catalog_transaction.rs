@@ -398,7 +398,8 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let before = project(&retained_catalog, ProjectionSource::Current, &catalog)?;
     validate_projection_link_counts(&retained_catalog, &before, "live catalog")?;
     validate_live_workspace_facts(&catalog, &before.workspace_dirs)?;
-    validate_full_catalog(&retained_catalog).context("validate live catalog for diff")?;
+    validate_full_catalog(&retained_catalog, crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate live catalog for diff")?;
     anyhow::ensure!(
         before.root_sha256 == request.expect_sha256,
         "catalog diff precondition failed: expected root sha256 {}, found {}",
@@ -409,7 +410,8 @@ pub fn diff(request: DiffRequest) -> Result<DiffResult> {
     let captured = tempfile::tempdir().context("create prepared diff capture root")?;
     capture_prepared_catalog(&prepared, captured.path())?;
     let after = project(captured.path(), ProjectionSource::Prepared, &catalog)?;
-    validate_full_catalog(captured.path()).context("validate prepared catalog for diff")?;
+    validate_full_catalog(captured.path(), crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate prepared catalog for diff")?;
 
     let before_specs = canonical_semantic_specs(&retained_catalog)?;
     let after_specs = canonical_semantic_specs(captured.path())?;
@@ -1297,7 +1299,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
 
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    validate_full_catalog(admission.path(), crate::validate::RuntimeRoot::Catalog(&catalog))?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1337,7 +1339,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
             desired.root_sha256,
             staged.root_sha256
         );
-        validate_full_catalog(&stage)?;
+        validate_full_catalog(&stage, crate::validate::RuntimeRoot::Catalog(&catalog))?;
         let lock = initialize_bootstrap_control(&stage)?;
         sync_tree_dirs(&stage)?;
         Ok(lock)
@@ -1405,7 +1407,7 @@ fn inspect_existing_bootstrap(
         &catalog,
         &desired.workspace_dirs,
     )?;
-    validate_full_catalog(&retained_catalog)?;
+    validate_full_catalog(&retained_catalog, crate::validate::RuntimeRoot::Catalog(&catalog))?;
     anyhow::ensure!(
         current.root_sha256 == desired.root_sha256,
         "catalog bootstrap target already exists with root sha256 {}, expected {}",
@@ -1616,7 +1618,7 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     // are mirrored as empty directories; their live content is never copied or hashed.
     let admission = tempfile::tempdir().context("create prepared-catalog admission root")?;
     materialize_projection(&desired, admission.path())?;
-    validate_full_catalog(admission.path())?;
+    validate_full_catalog(admission.path(), crate::validate::RuntimeRoot::Catalog(&catalog))?;
     let desired_config = crate::catalog::load(admission.path())?;
     validate_external_pty_root(
         &catalog,
@@ -1728,7 +1730,8 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
         staged.root_sha256,
         verified.root_sha256
     );
-    validate_full_catalog(&catalog).context("validate applied live catalog")?;
+    validate_full_catalog(&catalog, crate::validate::RuntimeRoot::Catalog(&catalog))
+        .context("validate applied live catalog")?;
     sync_dir(&catalog)?;
     generation.commit()?;
     test_checkpoint("before-clear");
@@ -1755,7 +1758,13 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
 }
 
 /// Full structural and host-scoped validation for a complete prospective catalog.
-pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
+///
+/// `runtime` names the catalog whose resolved pty root bounds session sockets. It is a separate
+/// argument because `root` is frequently NOT that catalog: admission validates a projection, diff
+/// validates a capture, bootstrap validates a stage, and a retained live catalog is addressed
+/// through a file-descriptor path. Reading the bound off `root` charged declarations for the depth
+/// of whichever temporary tree happened to be under inspection.
+pub(crate) fn validate_full_catalog(root: &Path, runtime: crate::validate::RuntimeRoot<'_>) -> Result<()> {
     let found = crate::discover(root);
     let mut hosts = BTreeSet::new();
     for spec in &found.specs {
@@ -1775,7 +1784,7 @@ pub(crate) fn validate_full_catalog(root: &Path) -> Result<()> {
             .map(format_issue),
     );
     for host in hosts {
-        let report = crate::validate::validate_for_host(root, &host);
+        let report = crate::validate::validate_for_host_at(root, &host, runtime);
         errors.extend(
             report
                 .issues

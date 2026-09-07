@@ -418,12 +418,20 @@ Host-scoped validation rejects a pty task whose session socket path would exceed
 portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a
 bind over the limit, so such a task can never spawn and fails identically on every
 reconcile pass, which also makes the pass result useless as a health signal for that
-host. The bound is derived from the pty root resolved for the selected host, never a
-fixed maximum identity length: the usable identity length is what remains of the limit
-after that root. The portable 104-byte bound applies so a declaration admitted on Linux
-does not fail on Darwin, and the diagnostic states the resolved path and the byte
-overage so the author can shorten the identity rather than discover the failure as a
-spawn error later.
+host. The bound is derived from the pty root resolved for the RUNTIME catalog — the
+one the supervisor will bind sockets from — and never from the tree under inspection,
+which is frequently a different tree: publication admits a candidate through a
+disposable projection nested in the catalog, transactions validate captures and stages,
+and a retained catalog is addressed through a file-descriptor path that canonicalizes
+back to the real one. A caller that knows where sockets will be bound supplies that
+root; only a deliberately context-free validation omits the guard. Measuring the
+inspected tree instead charges every identity for the depth of whichever temporary tree
+is being validated and refuses declarations whose real socket is bindable. The bound is
+never a fixed maximum identity length either: the usable identity length is what
+remains of the limit after the runtime root. The portable 104-byte bound applies so a
+declaration admitted on Linux does not fail on Darwin, and the diagnostic states the
+resolved path and the byte overage so the author can shorten the identity rather than
+discover the failure as a spawn error later.
 
 A park notice whose cause is structurally unrecoverable says so instead of offering
 `st2 unpark`, which would relaunch into the identical failure. The test is the same
