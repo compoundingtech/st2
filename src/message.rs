@@ -2986,8 +2986,13 @@ mod tests {
         );
     }
 
-    /// `inspect_sent` takes two sequential guards around one unlocked read. Neither may outlive
-    /// the call, or the doctor read would block every subsequent publication by that sender.
+    /// `inspect_sent` takes up to two sequential guards around one unlocked read, and neither may
+    /// outlive the call, or the doctor read would block every subsequent publication by that
+    /// sender. This pins the *first* guard only: once the lock file exists, `shared_existing`
+    /// answers `Some` and the function early-returns on that first guard, which is the guard held
+    /// on this path. Reaching the second guard needs `shared_existing` to answer `None` and then
+    /// `Some` — a race a single-threaded test cannot arrange — so it stays unpinned rather than
+    /// fake-covered.
     #[test]
     fn inspect_sent_leaves_no_guard_held_and_creates_no_sender_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3002,7 +3007,7 @@ mod tests {
         inspect_sent(tmp.path(), false).unwrap();
         assert!(
             ledger_lock_is_free(&root, crate::flock::Mode::Exclusive),
-            "inspect_sent must release both of its shared guards before returning"
+            "inspect_sent must release the shared guard it early-returns on"
         );
     }
 }
