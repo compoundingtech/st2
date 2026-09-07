@@ -21,12 +21,12 @@ The JSON publication receipt contains the resolved KDL, subject changes, accepte
 
 ## Definitions do not start work
 
-This publication creates or updates one immutable plan revision. It does not start a run.
+This publication creates or updates one immutable mission revision. It does not start a run.
 
 ```kdl
 version 2
 
-plan "release" state="ready" {
+mission "release" state="ready" {
   goal "Publish a verified release decision."
   completion { when "all-steps-exhausted" }
 
@@ -38,35 +38,35 @@ plan "release" state="ready" {
   }
 
   step "build" {
-    assigned-to "agent/${ST_PLAN_RUN}/builder"
+    assigned-to "agent/${ST_MISSION_RUN}/builder"
     goal "Build and test the release."
   }
 }
 ```
 
-Direct runtime declarations in a plan belong to each run of that plan. Direct declarations in a step become desired when that step activates. They stop being desired when their owner run ends or a successor generation removes them.
+Direct runtime declarations in a mission belong to each run of that mission. Direct declarations in a step become desired when that step activates. They stop being desired when their owner run ends or a successor generation removes them.
 
-## Starting a plan run
+## Starting a mission run
 
-A plan run names one exact plan revision. A custom run ID can be a readable operational name. The helper generates a UUIDv7 suffix when no ID is supplied.
+A mission run names one exact mission revision. A custom run ID can be a readable operational name. The helper generates a UUIDv7 suffix when no ID is supplied.
 
 ```kdl
 version 2
 
-plan-run "release/demo" {
-  plan "plan/release@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+mission-run "release/demo" {
+  mission "mission/release@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   workspace "/work/release"
   requester "person/operator"
   input "target" "demo"
 }
 ```
 
-The plan and plan-run can be in one atomic publication when the run names the revision in that same file. They can also be two publications. The second form is useful when a person wants to review the plan definition before starting it.
+The mission and mission-run can be in one atomic publication when the run names the revision in that same file. They can also be two publications. The second form is useful when a person wants to review the mission definition before starting it.
 
 The helper reads the current ready revision and publishes the exact run declaration:
 
 ```sh
-st3 plan start release \
+st3 mission start release \
   --id release/demo \
   --workspace /work/release \
   --input target=demo \
@@ -75,13 +75,13 @@ st3 plan start release \
 
 Use `--follow` to wait for a terminal or standing run. Use `--print-kdl` to inspect or save the generated declaration without publishing it.
 
-The default plan capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
+The default mission capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
 
 ## Standing work
 
-A plan completes only through `completion`. A plan with no completion block remains open after it exhausts its current work. The run is then standing.
+A mission completes only through `completion`. A mission with no completion block remains open after it exhausts its current work. The run is then standing.
 
-This rule supports a long-lived conversation agent without a separate plan type. The open plan continues to assert the agent declaration. New plan revisions can add work. A named revision moves the run to a successor generation.
+This rule supports a long-lived conversation agent without a separate mission type. The open mission continues to assert the agent declaration. New mission revisions can add work. A named revision moves the run to a successor generation.
 
 ## Named operations
 
@@ -90,7 +90,7 @@ An operational block has an ID inside its owner subject.
 ```kdl
 version 2
 
-plan-run "release/demo" {
+mission-run "release/demo" {
   cancellation "operator-stop" {
     reason "the release was withdrawn"
   }
@@ -103,14 +103,14 @@ Failed static validation does not record the operation. The caller can correct t
 
 ### Revision
 
-Publish the candidate plan revision first. Then publish an operation against the run's exact current generation.
+Publish the candidate mission revision first. Then publish an operation against the run's exact current generation.
 
 ```kdl
 version 2
 
-plan-run "release/demo" {
+mission-run "release/demo" {
   revision "add-security-gate" {
-    plan "plan/release@fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+    mission "mission/release@fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
     from "run-generation/01990000000070008000000000000000"
     reason "the build exposed a new security boundary"
   }
@@ -128,7 +128,7 @@ A human-protected revision creates a durable revision proposal. The named operat
 ```kdl
 version 2
 
-plan-run "release/demo" {
+mission-run "release/demo" {
   reset "retry-builder" {
     runtime "agent/builder"
     from "run-generation/01990000000070008000000000000000"
@@ -153,7 +153,7 @@ resource "release-pr" {
 
 The resource must already have an active observer. `st3 resource refresh` publishes this form and waits for the exact observer attempts. An unchanged observation is a successful refresh.
 
-## Planning a new plan
+## Planning a new mission
 
 Planning uses an immutable request document and a declarative planning session.
 
@@ -170,7 +170,7 @@ The helper stores the request first. It then publishes a declaration like this:
 version 2
 
 planning-session "planning/release/01990000000070008000000000000000" {
-  plan "release"
+  mission "release"
   request "doc/planning/release/request@REQUEST_SHA256"
   workspace "/work/release"
   requester "person/operator"
@@ -180,7 +180,7 @@ planning-session "planning/release/01990000000070008000000000000000" {
 
 The session creates a session-scoped Codex planner with a bounded runtime ID. Candidate submission is an observed result, so it is not authored in KDL. Candidate submission creates an exact preview automatically. A blocked preview stays durable for review.
 
-Human approval is also observed input. It publishes the approved plan revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new plan separately with `st3 plan start`.
+Human approval is also observed input. It publishes the approved mission revision but does not start it. Approval and cancellation stop the session planner. Repeating either terminal action repairs a missing planner stop. The operator starts an approved new mission separately with `st3 mission start`.
 
 `st3 planning start --print-kdl` does not store the request. It prints the required `st3 doc put` command and the planning-session KDL.
 
@@ -199,12 +199,12 @@ st3 planning approve planning/release/SESSION_ID PREVIEW_HASH --as person/operat
 
 Use `st3 planning cancel SESSION --reason TEXT --as ACTOR` to end an unwanted session. Use `--print-kdl` to inspect the cancellation declaration before publication.
 
-## Revising a plan through planning mode
+## Revising a mission through planning mode
 
 Use `--run` to bind the session to one exact run generation.
 
 ```sh
-st3 planning start --run plan-run/release/demo feedback.md \
+st3 planning start --run mission-run/release/demo feedback.md \
   --workspace /work/release \
   --as person/operator
 ```
@@ -226,11 +226,11 @@ planning-session "planning/release/01990000000070008000000000000000" {
 
 The exact feedback document is stored first. The session returns to the planner and replaces the prior preview.
 
-Approval of a targeted planning preview publishes the candidate plan and creates its revision proposal. When the same person is the required revision reviewer, that one approval counts at both boundaries.
+Approval of a targeted planning preview publishes the candidate mission and creates its revision proposal. When the same person is the required revision reviewer, that one approval counts at both boundaries.
 
 ## Human gates
 
-A human gate is declared with the plan. Its decision is observed input, not authored intent.
+A human gate is declared with the mission. Its decision is observed input, not authored intent.
 
 ```kdl
 gate "the operator approves deployment" type="human" {
@@ -240,7 +240,7 @@ gate "the operator approves deployment" type="human" {
 }
 ```
 
-The plan pauses at the gate. A later review command records the decision against the exact gate request. Editing and republishing the plan does not forge a decision.
+The mission pauses at the gate. A later review command records the decision against the exact gate request. Editing and republishing the mission does not forge a decision.
 
 ```sh
 st3 review approve resource/release-decision \
@@ -255,14 +255,14 @@ Cancellation is explicit and additive. Omission never cancels a run.
 ```kdl
 version 2
 
-plan-run "release/demo" {
+mission-run "release/demo" {
   cancellation "withdraw-release" {
     reason "the requester withdrew the release"
   }
 }
 ```
 
-Cancellation revokes active work claims, enters adjacent `finally` work, and cascades to descendant plan runs. The run becomes terminal only after its owned runtimes stop.
+Cancellation revokes active work claims, enters adjacent `finally` work, and cascades to descendant mission runs. The run becomes terminal only after its owned runtimes stop.
 
 A planning session uses the same noun:
 
@@ -291,11 +291,11 @@ The main helpers are:
 - `st3 work revise --print-kdl`;
 - `st3 eval --print-kdl`.
 
-The eval helper prints the resolved eval plan. Eval bundle upload remains a packaging boundary because it transfers the complete fixture workspace before it publishes and starts the eval plan.
+The eval helper prints the resolved eval mission. Eval bundle upload remains a packaging boundary because it transfers the complete fixture workspace before it publishes and starts the eval mission.
 
 ## Publication failure boundaries
 
-Static failures reject the full publication. Examples include an unknown field, a missing exact document, a stale subject head, a stale generation, an immutable operation ID mismatch, a missing plan revision, or a capacity violation.
+Static failures reject the full publication. Examples include an unknown field, a missing exact document, a stale subject head, a stale generation, an immutable operation ID mismatch, a missing mission revision, or a capacity violation.
 
 An accepted operation can cause later runtime work. A later start, stop, observer, delivery, or gate failure is a durable claim. It does not roll back the accepted intent.
 

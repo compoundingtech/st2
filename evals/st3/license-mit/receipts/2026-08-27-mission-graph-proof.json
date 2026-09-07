@@ -1,9 +1,9 @@
 {
-  "schema": "st3-plan-graph-proof.v1",
+  "schema": "st3-mission-graph-proof.v1",
   "date": "2026-08-27",
   "eval": "license-mit-codex",
-  "plan_run": "a2bc8b2a55fd29d9791d30bb4eca0c9a",
-  "plan_revision": "dc20eb27ab168cc1d45922dae0b39cd8179477eb7789109f6b0c1ed9085670e2",
+  "mission_run": "a2bc8b2a55fd29d9791d30bb4eca0c9a",
+  "mission_revision": "dc20eb27ab168cc1d45922dae0b39cd8179477eb7789109f6b0c1ed9085670e2",
   "candidate": {
     "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
     "working_tree": "dirty",

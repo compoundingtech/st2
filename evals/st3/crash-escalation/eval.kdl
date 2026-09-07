@@ -1,8 +1,8 @@
 version 2
 
-  plan "eval/crash-escalation" state="ready" {
+  mission "eval/crash-escalation" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Complete plan eval/crash-escalation."
+    goal "Complete mission eval/crash-escalation."
     step "faults" timeout="1m" {
       title "The runtime classifies abnormal and clean exits"
         exec "eval/crash-escalation/crash" {
@@ -18,10 +18,10 @@ version 2
           command "exit 0"
           restart "never"
         }
-      gate "condition-1" { field "reachability" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" "unreachable" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/crash-escalation/crash" "is" 17 }
-      gate "condition-3" { field "status" "exec/${ST_PLAN_RUN}/eval/crash-escalation/clean" "is" "exited" }
-      gate "condition-4" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/crash-escalation/clean" "is" 0 }
+      gate "condition-1" { field "reachability" "exec/${ST_MISSION_RUN}/eval/crash-escalation/crash" "is" "unreachable" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/crash-escalation/crash" "is" 17 }
+      gate "condition-3" { field "status" "exec/${ST_MISSION_RUN}/eval/crash-escalation/clean" "is" "exited" }
+      gate "condition-4" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/crash-escalation/clean" "is" 0 }
     }
     step "gate" timeout="1m" {
       depends-on { step "faults" completed }

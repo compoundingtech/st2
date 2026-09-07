@@ -20,13 +20,13 @@ use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, IntentInput, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, PlanOutputView, PlanProductionRequest, PlanRequest,
-    PlanResponse, PlanRunView, PlanState, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningSessionView, QuickAgentResponse, ResourceRefreshView,
-    ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
-    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
-    StatusResponse, StepRunView, WorkRequest,
+    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
+    MissionResponse, MissionRunView, MissionState, PlanningApprovalRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
+    QuickAgentResponse, ResourceRefreshView, ResourceWatchView, ReviewRequest,
+    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -61,10 +61,10 @@ enum Command {
         #[command(subcommand)]
         command: PlanningCommand,
     },
-    /// Inspect a plan or its one active run.
-    Plan {
+    /// Inspect a mission or its one active run.
+    Mission {
         #[command(subcommand)]
-        command: PlanViewCommand,
+        command: MissionViewCommand,
     },
     /// Publish one KDL file as an atomic graph upsert.
     Publish(PublishArgs),
@@ -110,7 +110,7 @@ enum Command {
     Status(StatusArgs),
     /// Show declared agents and their current graph state.
     Agents(AgentsArgs),
-    /// Inspect and recover plan-owned runtimes.
+    /// Inspect and recover mission-owned runtimes.
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
@@ -137,7 +137,7 @@ enum Command {
         #[command(subcommand)]
         command: ReviewCommand,
     },
-    /// Claim and update durable plan work.
+    /// Claim and update durable mission work.
     Work {
         #[command(subcommand)]
         command: WorkCommand,
@@ -184,7 +184,7 @@ struct QuickArgs {
     model: Option<String>,
     #[arg(long)]
     effort: Option<String>,
-    /// Print the generated plan KDL without publishing it.
+    /// Print the generated mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
     #[arg(long = "as", env = "ST_AGENT")]
@@ -200,32 +200,32 @@ struct FileArgs {
 
 #[derive(Subcommand)]
 enum PlanningCommand {
-    Start(PlanStartArgs),
-    Show(PlanSessionArgs),
-    Preview(PlanPreviewArgs),
-    Submit(PlanSubmitArgs),
-    Revise(PlanReviseArgs),
-    Approve(PlanApproveArgs),
-    Cancel(PlanCancelArgs),
-    Compare(PlanCompareArgs),
-    Propose(PlanProposeArgs),
+    Start(PlanningStartArgs),
+    Show(PlanningSessionArgs),
+    Preview(PlanningPreviewArgs),
+    Submit(PlanningSubmitArgs),
+    Revise(PlanningReviseArgs),
+    Approve(PlanningApproveArgs),
+    Cancel(PlanningCancelArgs),
+    Compare(PlanningCompareArgs),
+    Propose(PlanningProposeArgs),
 }
 
 #[derive(Subcommand)]
-enum PlanViewCommand {
-    Show(PlanShowArgs),
-    /// Start one run from the current ready plan revision.
-    Start(PlanRunStartArgs),
+enum MissionViewCommand {
+    Show(MissionShowArgs),
+    /// Start one run from the current ready mission revision.
+    Start(MissionRunStartArgs),
 }
 
 #[derive(Args)]
-struct PlanShowArgs {
-    plan_or_run: String,
+struct MissionShowArgs {
+    mission_or_run: String,
 }
 
 #[derive(Args)]
-struct PlanRunStartArgs {
-    plan: String,
+struct MissionRunStartArgs {
+    mission: String,
     #[arg(long)]
     id: Option<String>,
     #[arg(long, default_value = ".")]
@@ -236,13 +236,13 @@ struct PlanRunStartArgs {
     follow: bool,
     #[arg(long = "as", env = "ST_AGENT")]
     actor: Option<String>,
-    /// Print the exact plan-run KDL without publishing it.
+    /// Print the exact mission-run KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
 }
 
 #[derive(Args)]
-struct PlanStartArgs {
+struct PlanningStartArgs {
     #[arg(long, required_unless_present = "run", conflicts_with = "run")]
     id: Option<String>,
     #[arg(long)]
@@ -262,19 +262,19 @@ struct PlanStartArgs {
 }
 
 #[derive(Args)]
-struct PlanSessionArgs {
+struct PlanningSessionArgs {
     session: String,
 }
 
 #[derive(Args)]
-struct PlanPreviewArgs {
+struct PlanningPreviewArgs {
     session: String,
     #[arg(long)]
     variant: Option<String>,
 }
 
 #[derive(Args)]
-struct PlanSubmitArgs {
+struct PlanningSubmitArgs {
     session: String,
     #[arg(long, default_value = "default")]
     variant: String,
@@ -287,14 +287,14 @@ struct PlanSubmitArgs {
 }
 
 #[derive(Args)]
-struct PlanCompareArgs {
+struct PlanningCompareArgs {
     session: String,
     left: String,
     right: String,
 }
 
 #[derive(Args)]
-struct PlanProposeArgs {
+struct PlanningProposeArgs {
     session: String,
     variant: String,
     #[arg(long = "as", env = "ST_AGENT")]
@@ -304,7 +304,7 @@ struct PlanProposeArgs {
 }
 
 #[derive(Args)]
-struct PlanReviseArgs {
+struct PlanningReviseArgs {
     session: String,
     feedback: PathBuf,
     #[arg(long = "as")]
@@ -315,7 +315,7 @@ struct PlanReviseArgs {
 }
 
 #[derive(Args)]
-struct PlanApproveArgs {
+struct PlanningApproveArgs {
     session: String,
     preview_hash: String,
     #[arg(long = "as")]
@@ -323,7 +323,7 @@ struct PlanApproveArgs {
 }
 
 #[derive(Args)]
-struct PlanCancelArgs {
+struct PlanningCancelArgs {
     session: String,
     #[arg(long = "as")]
     actor: Option<String>,
@@ -362,7 +362,7 @@ struct ExecArgs {
     detach: bool,
     #[arg(long)]
     cancel_on_interrupt: bool,
-    /// Print the generated plan KDL without publishing or running it.
+    /// Print the generated mission KDL without publishing or running it.
     #[arg(long)]
     print_kdl: bool,
     #[arg(long = "as", env = "ST_AGENT")]
@@ -511,14 +511,14 @@ struct EvalArgs {
     /// Show one live graph screen with semantic state transitions.
     #[arg(long)]
     graph: bool,
-    /// Print the resolved eval plan KDL without publishing or running it.
+    /// Print the resolved eval mission KDL without publishing or running it.
     #[arg(long)]
     print_kdl: bool,
 }
 
 #[derive(Args)]
 struct GraphArgs {
-    plan_run: String,
+    mission_run: String,
 }
 
 #[derive(Args)]
@@ -649,7 +649,7 @@ struct ResourceWatchArgs {
     fields: Vec<String>,
     #[arg(long = "to", alias = "as", env = "ST_AGENT")]
     target: Option<String>,
-    /// Print the generated watch plan KDL without publishing it.
+    /// Print the generated watch mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
 }
@@ -719,8 +719,8 @@ enum WorkCommand {
     Complete(WorkActionArgs),
     Fail(WorkActionArgs),
     Release(WorkActionArgs),
-    /// Publish the exact ready plan produced by one claimed step.
-    PublishPlan(WorkPublishPlanArgs),
+    /// Publish the exact ready mission produced by one claimed step.
+    PublishMission(WorkPublishMissionArgs),
     Revise(WorkReviseArgs),
     Revision {
         #[command(subcommand)]
@@ -777,13 +777,13 @@ struct WorkReviseArgs {
     actor: Option<String>,
     #[arg(long)]
     reason: String,
-    /// Print the revision KDL without publishing the candidate plan or revision.
+    /// Print the revision KDL without publishing the candidate mission or revision.
     #[arg(long)]
     print_kdl: bool,
 }
 
 #[derive(Args)]
-struct WorkPublishPlanArgs {
+struct WorkPublishMissionArgs {
     subject: String,
     file: PathBuf,
     #[arg(long = "as", env = "ST_AGENT")]
@@ -824,7 +824,7 @@ struct MessageSendArgs {
         default_value = "person/requester"
     )]
     from: String,
-    /// Print the generated message plan KDL without publishing it.
+    /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
 }
@@ -867,7 +867,7 @@ struct MessageReplyArgs {
         default_value = "person/requester"
     )]
     from: String,
-    /// Print the generated reply plan KDL without publishing it.
+    /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
 }
@@ -996,7 +996,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Preview(args) => run_preview(&client, args, cli.json).await,
         Command::Planning { command } => run_planning(&client, command, cli.json).await,
-        Command::Plan { command } => run_plan_view(&client, command, cli.json).await,
+        Command::Mission { command } => run_mission_view(&client, command, cli.json).await,
         Command::Publish(args) => publish_file(&client, args, cli.json).await,
         Command::Import(args) => run_import(&client, args, cli.json).await,
         Command::Exec(args) => run_exec(&client, args, cli.json).await,
@@ -1144,16 +1144,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
 
 async fn run_preview(client: &Client, args: FileArgs, json_output: bool) -> Result<()> {
     let (kdl, source_name) = read_intent(args.file.as_deref())?;
-    let response: PlanResponse = client
+    let response: MissionResponse = client
         .post(
-            "/v1/intent/plan",
-            &PlanRequest {
+            "/v1/intent/mission",
+            &MissionRequest {
                 intent: IntentInput { kdl, source_name },
                 at_index: args.at_index,
             },
         )
         .await?;
-    print_plan(&response, json_output)
+    print_mission(&response, json_output)
 }
 
 async fn run_planning(client: &Client, command: PlanningCommand, json_output: bool) -> Result<()> {
@@ -1169,19 +1169,22 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
                 .with_context(|| format!("resolve workspace {}", args.workspace.display()))?;
             let target = args.run.as_deref().map(|run| async {
                 client
-                    .get::<PlanRunView>(&format!("/v1/plan-runs/{}", urlencoding::encode(run)))
+                    .get::<MissionRunView>(&format!(
+                        "/v1/mission-runs/{}",
+                        urlencoding::encode(run)
+                    ))
                     .await
             });
             let target = match target {
                 Some(target) => Some(target.await?),
                 None => None,
             };
-            let plan_id = target
+            let mission_id = target
                 .as_ref()
-                .map(|run| run.plan.trim_start_matches("plan/").to_owned())
+                .map(|run| run.mission.trim_start_matches("mission/").to_owned())
                 .or(args.id)
                 .context("planning start needs --id or --run")?;
-            let session_id = format!("planning/{plan_id}/{}", uuid::Uuid::now_v7().simple());
+            let session_id = format!("planning/{mission_id}/{}", uuid::Uuid::now_v7().simple());
             let request_hash = hex::encode(Sha256::digest(request.as_bytes()));
             let request_name = format!("doc/planning/{session_id}/request");
             let request_reference = format!("{request_name}@{request_hash}");
@@ -1190,7 +1193,7 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
             )?;
             let kdl = planning_session_intent(
                 &session_id,
-                &plan_id,
+                &mission_id,
                 &request_reference,
                 &workspace,
                 &requester,
@@ -1384,80 +1387,88 @@ async fn run_planning(client: &Client, command: PlanningCommand, json_output: bo
         return print_value(&response, true);
     }
     println!("{}\t{}", response.status, response.subject);
-    println!("Plan: plan/{}", response.plan);
+    println!("Mission: mission/{}", response.mission);
     println!("Planner: {}", response.planner);
     if let Some(candidate) = &response.candidate {
         println!(
             "Candidate: {} ({})",
-            candidate.revision, candidate.plan_revision
+            candidate.revision, candidate.mission_revision
         );
     }
     if let Some(preview) = &response.preview {
         println!("Preview: {}", preview.hash);
         println!("\nGraph:\n{}", preview.graph);
         println!("\nDiff:\n{}", preview.diff);
-        for warning in &preview.plan.warnings {
+        for warning in &preview.mission.warnings {
             println!("Warning: {warning}");
         }
-        for blocker in &preview.plan.blockers {
+        for blocker in &preview.mission.blockers {
             println!("Blocker: {blocker}");
         }
     }
     Ok(())
 }
 
-async fn run_plan_view(client: &Client, command: PlanViewCommand, json_output: bool) -> Result<()> {
+async fn run_mission_view(
+    client: &Client,
+    command: MissionViewCommand,
+    json_output: bool,
+) -> Result<()> {
     match command {
-        PlanViewCommand::Show(args) => {
-            let selected = args.plan_or_run;
-            let run = if selected.starts_with("plan-run/") {
+        MissionViewCommand::Show(args) => {
+            let selected = args.mission_or_run;
+            let run = if selected.starts_with("mission-run/") {
                 client
-                    .get::<PlanRunView>(&format!(
-                        "/v1/plan-runs/{}",
+                    .get::<MissionRunView>(&format!(
+                        "/v1/mission-runs/{}",
                         urlencoding::encode(&selected)
                     ))
                     .await?
             } else {
-                let runs: Vec<PlanRunView> = client
+                let runs: Vec<MissionRunView> = client
                     .get(&format!(
-                        "/v1/plan-runs?plan={}",
+                        "/v1/mission-runs?mission={}",
                         urlencoding::encode(&selected)
                     ))
                     .await?;
                 anyhow::ensure!(
                     runs.len() == 1,
-                    "plan `{selected}` has {} active runs; use an exact plan run subject",
+                    "mission `{selected}` has {} active runs; use an exact mission run subject",
                     runs.len()
                 );
                 runs.into_iter().next().expect("one active run was checked")
             };
             print_value(&run, json_output)
         }
-        PlanViewCommand::Start(args) => start_plan_run(client, args, json_output).await,
+        MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
     }
 }
 
 async fn publish_file(client: &Client, args: PublishArgs, json_output: bool) -> Result<()> {
     let (kdl, source_name) = read_intent(args.file.as_deref())?;
     let intent = IntentInput { kdl, source_name };
-    let plan: PlanResponse = client
+    let mission: MissionResponse = client
         .post(
-            "/v1/intent/plan",
-            &PlanRequest {
+            "/v1/intent/mission",
+            &MissionRequest {
                 intent: intent.clone(),
                 at_index: args.at_index,
             },
         )
         .await?;
-    anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
-    let resolved_intent = plan.resolved_intent.clone();
-    let idempotency_key = idempotency(&resolved_intent.kdl, &plan.subject_tokens);
+    anyhow::ensure!(
+        mission.blockers.is_empty(),
+        "{}",
+        mission.blockers.join("; ")
+    );
+    let resolved_intent = mission.resolved_intent.clone();
+    let idempotency_key = idempotency(&resolved_intent.kdl, &mission.subject_tokens);
     let response: ApplyResponse = client
         .post(
             "/v1/intent/apply",
             &ApplyRequest {
                 intent: resolved_intent.clone(),
-                expected_subjects: plan.subject_tokens,
+                expected_subjects: mission.subject_tokens,
                 idempotency_key,
                 actor: Some(args.actor),
             },
@@ -1466,19 +1477,26 @@ async fn publish_file(client: &Client, args: PublishArgs, json_output: bool) -> 
     print_value(&response, json_output)
 }
 
-async fn start_plan_run(client: &Client, args: PlanRunStartArgs, json_output: bool) -> Result<()> {
-    let plan_id = args.plan.strip_prefix("plan/").unwrap_or(&args.plan);
-    let plan: st3::model::PlanSpec = client
-        .get(&format!("/v1/plans/{}", urlencoding::encode(plan_id)))
+async fn start_mission_run(
+    client: &Client,
+    args: MissionRunStartArgs,
+    json_output: bool,
+) -> Result<()> {
+    let mission_id = args
+        .mission
+        .strip_prefix("mission/")
+        .unwrap_or(&args.mission);
+    let mission: st3::model::MissionSpec = client
+        .get(&format!("/v1/missions/{}", urlencoding::encode(mission_id)))
         .await?;
     anyhow::ensure!(
-        plan.state == PlanState::Ready,
-        "plan `plan/{plan_id}` is not ready"
+        mission.state == MissionState::Ready,
+        "mission `mission/{mission_id}` is not ready"
     );
     let run_id = args
         .id
-        .unwrap_or_else(|| format!("{plan_id}/{}", uuid::Uuid::now_v7().simple()));
-    let run_id = run_id.strip_prefix("plan-run/").unwrap_or(&run_id);
+        .unwrap_or_else(|| format!("{mission_id}/{}", uuid::Uuid::now_v7().simple()));
+    let run_id = run_id.strip_prefix("mission-run/").unwrap_or(&run_id);
     let workspace = args
         .workspace
         .canonicalize()
@@ -1486,10 +1504,10 @@ async fn start_plan_run(client: &Client, args: PlanRunStartArgs, json_output: bo
     let inputs = unique_pairs(args.inputs, "input")?;
     let actor = args.actor.unwrap_or_else(|| "person/requester".into());
     let requester = normalize_requester_subject(&actor);
-    let kdl = plan_run_intent(
+    let kdl = mission_run_intent(
         run_id,
-        plan_id,
-        &plan.revision,
+        mission_id,
+        &mission.revision,
         &workspace,
         &requester,
         &inputs,
@@ -1499,33 +1517,45 @@ async fn start_plan_run(client: &Client, args: PlanRunStartArgs, json_output: bo
         print!("{kdl}");
         return Ok(());
     }
-    let response = publish_text(client, kdl, format!("st3 plan start {plan_id}"), actor).await?;
-    let subject = format!("plan-run/{run_id}");
-    let started: PlanRunView = client
-        .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
+    let response = publish_text(
+        client,
+        kdl,
+        format!("st3 mission start {mission_id}"),
+        actor,
+    )
+    .await?;
+    let subject = format!("mission-run/{run_id}");
+    let started: MissionRunView = client
+        .get(&format!(
+            "/v1/mission-runs/{}",
+            urlencoding::encode(&subject)
+        ))
         .await?;
     if !args.follow {
         return if json_output {
-            print_value(&json!({"publication": response, "plan_run": started}), true)
+            print_value(
+                &json!({"publication": response, "mission_run": started}),
+                true,
+            )
         } else {
             println!("{}", started.subject);
             Ok(())
         };
     }
-    follow_plan_run(client, started, response.store_index, json_output).await
+    follow_mission_run(client, started, response.store_index, json_output).await
 }
 
-async fn follow_plan_run(
+async fn follow_mission_run(
     client: &Client,
-    mut run: PlanRunView,
+    mut run: MissionRunView,
     mut cursor: u64,
     json_output: bool,
 ) -> Result<()> {
     let mut prior = String::new();
     loop {
-        let summary = plan_run_signature(&run)?;
+        let summary = mission_run_signature(&run)?;
         if summary != prior && !json_output {
-            print_plan_run_tree(&run);
+            print_mission_run_tree(&run);
             prior = summary;
         }
         match run.status.as_str() {
@@ -1536,7 +1566,9 @@ async fn follow_plan_run(
                     Ok(())
                 };
             }
-            "failed" | "cancelled" => anyhow::bail!("plan run {} is {}", run.subject, run.status),
+            "failed" | "cancelled" => {
+                anyhow::bail!("mission run {} is {}", run.subject, run.status)
+            }
             _ => {}
         }
         let events: Vec<EventRecord> = client
@@ -1550,14 +1582,14 @@ async fn follow_plan_run(
         }
         run = client
             .get(&format!(
-                "/v1/plan-runs/{}",
+                "/v1/mission-runs/{}",
                 urlencoding::encode(&run.subject)
             ))
             .await?;
     }
 }
 
-fn plan_run_signature(run: &PlanRunView) -> Result<String> {
+fn mission_run_signature(run: &MissionRunView) -> Result<String> {
     serde_json::to_string(&json!({
         "revision": run.revision,
         "status": run.status,
@@ -1572,7 +1604,7 @@ fn plan_run_signature(run: &PlanRunView) -> Result<String> {
     .map_err(Into::into)
 }
 
-fn print_plan_run_tree(run: &PlanRunView) {
+fn print_mission_run_tree(run: &MissionRunView) {
     println!(
         "{} {} ({}, revision {})",
         run.subject,
@@ -1634,13 +1666,19 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
     }
     let actor = args.actor.context("st3 exec needs --as or ST_AGENT")?;
     let parsed = st3::parse_intent(&kdl, &args.host)?;
-    let plan_id = format!("exec/{name}");
-    let revision = parsed.plans[&plan_id].revision.clone();
-    publish_text(client, kdl, format!("st3 exec {name} plan"), actor.clone()).await?;
-    let run_id = format!("{plan_id}/{}", uuid::Uuid::now_v7().simple());
-    let run_kdl = plan_run_intent(
+    let mission_id = format!("exec/{name}");
+    let revision = parsed.missions[&mission_id].revision.clone();
+    publish_text(
+        client,
+        kdl,
+        format!("st3 exec {name} mission"),
+        actor.clone(),
+    )
+    .await?;
+    let run_id = format!("{mission_id}/{}", uuid::Uuid::now_v7().simple());
+    let run_kdl = mission_run_intent(
         &run_id,
-        &plan_id,
+        &mission_id,
         &revision,
         &cwd,
         &normalize_requester_subject(&actor),
@@ -1654,10 +1692,10 @@ async fn run_exec(client: &Client, args: ExecArgs, json_output: bool) -> Result<
         actor.clone(),
     )
     .await?;
-    let run: PlanRunView = client
+    let run: MissionRunView = client
         .get(&format!(
-            "/v1/plan-runs/{}",
-            urlencoding::encode(&format!("plan-run/{run_id}"))
+            "/v1/mission-runs/{}",
+            urlencoding::encode(&format!("mission-run/{run_id}"))
         ))
         .await?;
     let subject = format!("exec/{}/{name}", run.id);
@@ -1788,7 +1826,7 @@ fn exec_intent(
     let mut gate = KdlNode::new("gate");
     gate.entries_mut().push(KdlEntry::new("the command exits"));
     let mut gate_body = KdlDocument::new();
-    let subject = format!("exec/${{ST_PLAN_RUN}}/{name}");
+    let subject = format!("exec/${{ST_MISSION_RUN}}/{name}");
     gate_body.nodes_mut().push(kdl_node(
         "field",
         ["status", subject.as_str(), "is", "exited"],
@@ -1802,42 +1840,44 @@ fn exec_intent(
         .nodes_mut()
         .push(kdl_node("when", ["all-steps-exhausted"]));
     completion.set_children(completion_body);
-    let mut plan = KdlNode::new("plan");
-    plan.entries_mut()
+    let mut mission = KdlNode::new("mission");
+    mission
+        .entries_mut()
         .push(KdlEntry::new(format!("exec/{name}")));
-    plan.entries_mut()
+    mission
+        .entries_mut()
         .push(KdlEntry::new_prop("state", "ready"));
-    let mut plan_body = KdlDocument::new();
-    plan_body
+    let mut mission_body = KdlDocument::new();
+    mission_body
         .nodes_mut()
         .push(kdl_node("goal", ["Run the command to completion."]));
-    plan_body.nodes_mut().push(step);
-    plan_body.nodes_mut().push(completion);
-    plan.set_children(plan_body);
-    publication_document(plan)
+    mission_body.nodes_mut().push(step);
+    mission_body.nodes_mut().push(completion);
+    mission.set_children(mission_body);
+    publication_document(mission)
 }
 
 fn cancel_run_intent(subject: &str) -> String {
     format!(
-        "version 2\nplan-run {subject:?} {{ cancellation \"command-interrupted\" {{ reason \"the command was interrupted\" }} }}\n"
+        "version 2\nmission-run {subject:?} {{ cancellation \"command-interrupted\" {{ reason \"the command was interrupted\" }} }}\n"
     )
 }
 
-fn plan_run_intent(
+fn mission_run_intent(
     run_id: &str,
-    plan_id: &str,
+    mission_id: &str,
     revision: &str,
     workspace: &Path,
     requester: &str,
     inputs: &BTreeMap<String, String>,
     mode: &str,
 ) -> String {
-    let mut run = KdlNode::new("plan-run");
+    let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
     let mut body = KdlDocument::new();
-    let exact_plan = format!("plan/{plan_id}@{revision}");
+    let exact_mission = format!("mission/{mission_id}@{revision}");
     body.nodes_mut()
-        .push(kdl_node("plan", [exact_plan.as_str()]));
+        .push(kdl_node("mission", [exact_mission.as_str()]));
     body.nodes_mut().push(kdl_node(
         "workspace",
         [workspace.to_string_lossy().as_ref()],
@@ -1893,24 +1933,28 @@ async fn publish_text(
         kdl,
         source_name: Some(source_name),
     };
-    let plan: PlanResponse = client
+    let mission: MissionResponse = client
         .post(
-            "/v1/intent/plan",
-            &PlanRequest {
+            "/v1/intent/mission",
+            &MissionRequest {
                 intent: intent.clone(),
                 at_index: None,
             },
         )
         .await?;
-    anyhow::ensure!(plan.blockers.is_empty(), "{}", plan.blockers.join("; "));
-    let resolved = plan.resolved_intent;
+    anyhow::ensure!(
+        mission.blockers.is_empty(),
+        "{}",
+        mission.blockers.join("; ")
+    );
+    let resolved = mission.resolved_intent;
     client
         .post(
             "/v1/intent/apply",
             &ApplyRequest {
-                idempotency_key: idempotency(&resolved.kdl, &plan.subject_tokens),
+                idempotency_key: idempotency(&resolved.kdl, &mission.subject_tokens),
                 intent: resolved,
-                expected_subjects: plan.subject_tokens,
+                expected_subjects: mission.subject_tokens,
                 actor: Some(actor),
             },
         )
@@ -2781,10 +2825,10 @@ async fn run_runtime(client: &Client, command: RuntimeCommand, json_output: bool
                 .with_context(|| format!("runtime `{subject}` does not exist"))?;
             let run_subject = runtime
                 .owner_run
-                .context("the runtime has no owning plan run")?;
-            let run: PlanRunView = client
+                .context("the runtime has no owning mission run")?;
+            let run: MissionRunView = client
                 .get(&format!(
-                    "/v1/plan-runs/{}",
+                    "/v1/mission-runs/{}",
                     urlencoding::encode(&run_subject)
                 ))
                 .await?;
@@ -2816,7 +2860,7 @@ fn runtime_reset_intent(
     reason: &str,
 ) -> String {
     format!(
-        "version 2\nplan-run {run:?} {{\n  reset {operation:?} {{\n    runtime {runtime:?}\n    from {generation:?}\n    reason {reason:?}\n  }}\n}}\n"
+        "version 2\nmission-run {run:?} {{\n  reset {operation:?} {{\n    runtime {runtime:?}\n    from {generation:?}\n    reason {reason:?}\n  }}\n}}\n"
     )
 }
 
@@ -3057,14 +3101,14 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 .target
                 .context("a resource watch needs --to or ST_AGENT")?;
             let target = normalize_message_subject(&target);
-            let (kdl, plan_id, resource) =
+            let (kdl, mission_id, resource) =
                 resource_watch_intent(&args.provider, &args.locator, &args.fields, &target)?;
             if args.print_kdl {
                 print!("{kdl}");
                 return Ok(());
             }
             let parsed = st3::parse_intent(&kdl, "local")?;
-            let revision = parsed.plans[&plan_id].revision.clone();
+            let revision = parsed.missions[&mission_id].revision.clone();
             let published = publish_text(
                 client,
                 kdl,
@@ -3072,27 +3116,27 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 target.clone(),
             )
             .await?;
-            let mut active: Vec<PlanRunView> = client
+            let mut active: Vec<MissionRunView> = client
                 .get(&format!(
-                    "/v1/plan-runs?plan={}",
-                    urlencoding::encode(&plan_id)
+                    "/v1/mission-runs?mission={}",
+                    urlencoding::encode(&mission_id)
                 ))
                 .await?;
             anyhow::ensure!(
                 active.len() <= 1,
-                "resource watch plan `plan/{plan_id}` has more than one active run"
+                "resource watch mission `mission/{mission_id}` has more than one active run"
             );
             let run = if let Some(run) = active.pop() {
                 anyhow::ensure!(
                     run.revision == revision,
-                    "the resource watch plan has an unexpected active revision"
+                    "the resource watch mission has an unexpected active revision"
                 );
                 run
             } else {
                 let workspace = std::env::current_dir()?.canonicalize()?;
-                let run_kdl = plan_run_intent(
-                    &plan_id,
-                    &plan_id,
+                let run_kdl = mission_run_intent(
+                    &mission_id,
+                    &mission_id,
                     &revision,
                     &workspace,
                     &target,
@@ -3108,9 +3152,9 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 .await?;
                 let _ = published.store_index.max(applied.store_index);
                 client
-                    .get::<PlanRunView>(&format!(
-                        "/v1/plan-runs/{}",
-                        urlencoding::encode(&format!("plan-run/{plan_id}"))
+                    .get::<MissionRunView>(&format!(
+                        "/v1/mission-runs/{}",
+                        urlencoding::encode(&format!("mission-run/{mission_id}"))
                     ))
                     .await?
             };
@@ -3149,7 +3193,7 @@ async fn run_resource(client: &Client, command: ResourceCommand, json_output: bo
                 .into_iter()
                 .find(|item| item.subject == subject)
                 .and_then(|item| item.owner_run)
-                .context("the subscription has no owning plan run")?;
+                .context("the subscription has no owning mission run")?;
             let operation = format!("unwatch-{}", uuid::Uuid::now_v7().simple());
             let kdl = cancellation_intent(&run, &operation, "the resource watch stopped");
             if args.print_kdl {
@@ -3362,7 +3406,7 @@ fn resource_watch_intent(
         "delivery": "message",
     }))?;
     let hash = hex::encode(Sha256::digest(stable));
-    let plan_id = format!("resource-watch/{resource_name}/{}", &hash[..16]);
+    let mission_id = format!("resource-watch/{resource_name}/{}", &hash[..16]);
     let observer_fields = fields
         .iter()
         .map(|field| format!("      field {field:?}\n"))
@@ -3372,10 +3416,10 @@ fn resource_watch_intent(
         .map(|field| format!("      on {field:?}\n"))
         .collect::<String>();
     let kdl = format!(
-        "version 2\nresource {resource_name:?} {{\n  kind {resource_kind:?}\n}}\nplan {plan_id:?} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {:?}\n    provider {provider:?}\n    locator {locator:?}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {target:?}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
+        "version 2\nresource {resource_name:?} {{\n  kind {resource_kind:?}\n}}\nmission {mission_id:?} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {:?}\n    provider {provider:?}\n    locator {locator:?}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {target:?}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
         format!("resource/{resource_name}")
     );
-    Ok((kdl, plan_id, format!("resource/{resource_name}")))
+    Ok((kdl, mission_id, format!("resource/{resource_name}")))
 }
 
 fn resource_refresh_intent(resource: &str, operation: &str, timeout_ms: u64) -> String {
@@ -3388,7 +3432,7 @@ fn resource_refresh_intent(resource: &str, operation: &str, timeout_ms: u64) -> 
 
 fn cancellation_intent(run: &str, operation: &str, reason: &str) -> String {
     format!(
-        "version 2\nplan-run {run:?} {{\n  cancellation {operation:?} {{\n    reason {reason:?}\n  }}\n}}\n"
+        "version 2\nmission-run {run:?} {{\n  cancellation {operation:?} {{\n    reason {reason:?}\n  }}\n}}\n"
     )
 }
 
@@ -3609,40 +3653,43 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
         WorkCommand::Complete(args) => post_work(client, "complete", args, json_output).await,
         WorkCommand::Fail(args) => post_work(client, "fail", args, json_output).await,
         WorkCommand::Release(args) => post_work(client, "release", args, json_output).await,
-        WorkCommand::PublishPlan(args) => publish_work_plan(client, args, json_output).await,
+        WorkCommand::PublishMission(args) => publish_work_mission(client, args, json_output).await,
         WorkCommand::Revise(args) => {
             let actor = args
                 .actor
-                .context("a plan revision needs --as or ST_AGENT")?;
+                .context("a mission revision needs --as or ST_AGENT")?;
             let kdl = fs::read_to_string(&args.file)
                 .with_context(|| format!("read KDL {}", args.file.display()))?;
-            let run: PlanRunView = client
-                .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&args.run)))
+            let run: MissionRunView = client
+                .get(&format!(
+                    "/v1/mission-runs/{}",
+                    urlencoding::encode(&args.run)
+                ))
                 .await?;
             let parsed = st3::parse_intent(&kdl, "local")?;
-            let plan_id = run.plan.strip_prefix("plan/").unwrap_or(&run.plan);
-            let candidate = parsed.plans.get(plan_id).with_context(|| {
+            let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+            let candidate = parsed.missions.get(mission_id).with_context(|| {
                 format!(
-                    "{} must contain the current plan `{plan_id}`",
+                    "{} must contain the current mission `{mission_id}`",
                     args.file.display()
                 )
             })?;
             anyhow::ensure!(
-                parsed.plans.len() == 1,
-                "a plan revision file must contain exactly one plan"
+                parsed.missions.len() == 1,
+                "a mission revision file must contain exactly one mission"
             );
             let operation = format!("revision-{}", uuid::Uuid::now_v7().simple());
-            let revision_kdl = plan_revision_intent(
+            let revision_kdl = mission_revision_intent(
                 &run.subject,
                 &operation,
-                plan_id,
+                mission_id,
                 &candidate.revision,
                 &run.generation,
                 &args.reason,
             );
             if args.print_kdl {
                 eprintln!(
-                    "Publish the candidate plan first: st3 publish {} --as {}",
+                    "Publish the candidate mission first: st3 publish {} --as {}",
                     args.file.display(),
                     actor
                 );
@@ -3663,15 +3710,15 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 actor,
             )
             .await?;
-            let current: PlanRunView = client
+            let current: MissionRunView = client
                 .get(&format!(
-                    "/v1/plan-runs/{}",
+                    "/v1/mission-runs/{}",
                     urlencoding::encode(&run.subject)
                 ))
                 .await?;
             let proposal = client
                 .get::<RevisionProposalView>(&format!(
-                    "/v1/plan-runs/{}/revision-proposal",
+                    "/v1/mission-runs/{}/revision-proposal",
                     urlencoding::encode(&run.subject)
                 ))
                 .await
@@ -3680,7 +3727,7 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 print_value(
                     &RevisionSubmissionView {
                         status: proposal.status.clone(),
-                        plan_run: current,
+                        mission_run: current,
                         proposal: Some(proposal),
                     },
                     json_output,
@@ -3702,7 +3749,7 @@ async fn run_work_revision(
         WorkRevisionCommand::Show { run } => {
             let proposal: RevisionProposalView = client
                 .get(&format!(
-                    "/v1/plan-runs/{}/revision-proposal",
+                    "/v1/mission-runs/{}/revision-proposal",
                     urlencoding::encode(&run)
                 ))
                 .await?;
@@ -3711,7 +3758,7 @@ async fn run_work_revision(
         WorkRevisionCommand::Generations { run } => {
             let generations: Vec<RunGenerationView> = client
                 .get(&format!(
-                    "/v1/plan-runs/{}/generations",
+                    "/v1/mission-runs/{}/generations",
                     urlencoding::encode(&run)
                 ))
                 .await?;
@@ -3773,14 +3820,14 @@ async fn run_work_revision(
     }
 }
 
-async fn publish_work_plan(
+async fn publish_work_mission(
     client: &Client,
-    args: WorkPublishPlanArgs,
+    args: WorkPublishMissionArgs,
     json_output: bool,
 ) -> Result<()> {
     let actor = args
         .actor
-        .context("publishing a plan output needs --as or ST_AGENT")?;
+        .context("publishing a mission output needs --as or ST_AGENT")?;
     let incarnation = match args.incarnation {
         Some(incarnation) => Some(incarnation),
         None => current_agent_incarnation(client, &actor).await?,
@@ -3788,24 +3835,24 @@ async fn publish_work_plan(
     let kdl = fs::read_to_string(&args.file)
         .with_context(|| format!("read KDL {}", args.file.display()))?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let output: PlanOutputView = client
+    let output: MissionOutputView = client
         .post(
-            &format!("/v1/work/plan/{}", urlencoding::encode(&args.subject)),
-            &PlanProductionRequest {
+            &format!("/v1/work/mission/{}", urlencoding::encode(&args.subject)),
+            &MissionProductionRequest {
                 intent: IntentInput {
                     kdl,
                     source_name: Some(args.file.display().to_string()),
                 },
                 actor,
                 incarnation,
-                idempotency_key: format!("plan-output:{}:{nonce}", args.subject),
+                idempotency_key: format!("mission-output:{}:{nonce}", args.subject),
             },
         )
         .await?;
     if json_output {
         print_value(&output, true)
     } else {
-        println!("{}@{}", output.plan, output.revision);
+        println!("{}@{}", output.mission, output.revision);
         Ok(())
     }
 }
@@ -4031,9 +4078,9 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
 
 async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
-    let plan_id = format!("message/{id}");
-    let kdl = message_plan_intent(
-        &plan_id,
+    let mission_id = format!("message/{id}");
+    let kdl = message_mission_intent(
+        &mission_id,
         &id,
         &args.from,
         &args.to,
@@ -4048,18 +4095,18 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
     }
     let actor = normalize_message_subject(&args.from);
     let parsed = st3::parse_intent(&kdl, "local")?;
-    let revision = parsed.plans[&plan_id].revision.clone();
+    let revision = parsed.missions[&mission_id].revision.clone();
     publish_text(
         client,
         kdl,
-        format!("st3 message send {id} plan"),
+        format!("st3 message send {id} mission"),
         actor.clone(),
     )
     .await?;
     let workspace = std::env::current_dir()?.canonicalize()?;
-    let run_kdl = plan_run_intent(
-        &plan_id,
-        &plan_id,
+    let run_kdl = mission_run_intent(
+        &mission_id,
+        &mission_id,
         &revision,
         &workspace,
         &normalize_requester_subject(&actor),
@@ -4074,8 +4121,8 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
 }
 
 #[allow(clippy::too_many_arguments)]
-fn message_plan_intent(
-    plan_id: &str,
+fn message_mission_intent(
+    mission_id: &str,
     message_id: &str,
     from: &str,
     to: &str,
@@ -4121,18 +4168,19 @@ fn message_plan_intent(
         .push(kdl_node("when", ["all-steps-exhausted"]));
     completion.set_children(completion_body);
 
-    let mut plan = KdlNode::new("plan");
-    plan.entries_mut().push(KdlEntry::new(plan_id));
-    plan.entries_mut()
+    let mut mission = KdlNode::new("mission");
+    mission.entries_mut().push(KdlEntry::new(mission_id));
+    mission
+        .entries_mut()
         .push(KdlEntry::new_prop("state", "ready"));
-    let mut plan_body = KdlDocument::new();
-    plan_body
+    let mut mission_body = KdlDocument::new();
+    mission_body
         .nodes_mut()
         .push(kdl_node("goal", ["Deliver one message."]));
-    plan_body.nodes_mut().push(step);
-    plan_body.nodes_mut().push(completion);
-    plan.set_children(plan_body);
-    publication_document(plan)
+    mission_body.nodes_mut().push(step);
+    mission_body.nodes_mut().push(completion);
+    mission.set_children(mission_body);
+    publication_document(mission)
 }
 
 async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
@@ -4320,17 +4368,20 @@ async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<
     if json_output {
         print_value(&started, true)?;
     } else {
-        println!("started {}", started.plan_run);
+        println!("started {}", started.mission_run);
     }
     let cursor = started.event_cursor;
-    let subject = started.plan_run;
-    let run: PlanRunView = client
-        .get(&format!("/v1/plan-runs/{}", urlencoding::encode(&subject)))
+    let subject = started.mission_run;
+    let run: MissionRunView = client
+        .get(&format!(
+            "/v1/mission-runs/{}",
+            urlencoding::encode(&subject)
+        ))
         .await?;
     if args.graph {
         follow_eval_graph(client, &run.subject).await
     } else {
-        follow_plan_run(client, run, cursor, json_output).await
+        follow_mission_run(client, run, cursor, json_output).await
     }
 }
 
@@ -4343,10 +4394,10 @@ async fn run_graph(client: &Client, args: GraphArgs, json_output: bool) -> Resul
     let eval: EvalStatus = client
         .get(&format!(
             "/v1/evals/{}",
-            urlencoding::encode(&args.plan_run)
+            urlencoding::encode(&args.mission_run)
         ))
         .await?;
-    follow_eval_graph(client, &eval.plan_run).await
+    follow_eval_graph(client, &eval.mission_run).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4367,7 +4418,7 @@ struct GraphTransition {
 
 struct EvalGraphSnapshot {
     eval: EvalStatus,
-    runs: Vec<PlanRunView>,
+    runs: Vec<MissionRunView>,
 }
 
 struct TerminalScreen;
@@ -4415,7 +4466,7 @@ async fn follow_eval_graph(client: &Client, root: &str) -> Result<()> {
             "failed" | "cancelled" => {
                 anyhow::bail!(
                     "eval {} is {}",
-                    snapshot.eval.plan_run,
+                    snapshot.eval.mission_run,
                     snapshot.eval.lifecycle
                 )
             }
@@ -4429,17 +4480,20 @@ async fn load_eval_graph(client: &Client, root: &str) -> Result<EvalGraphSnapsho
     let eval: EvalStatus = client
         .get(&format!("/v1/evals/{}", urlencoding::encode(root)))
         .await?;
-    let runs: Vec<PlanRunView> = client
-        .get(&format!("/v1/plan-runs?root={}", urlencoding::encode(root)))
+    let runs: Vec<MissionRunView> = client
+        .get(&format!(
+            "/v1/mission-runs?root={}",
+            urlencoding::encode(root)
+        ))
         .await?;
-    anyhow::ensure!(!runs.is_empty(), "the eval graph has no plan runs");
+    anyhow::ensure!(!runs.is_empty(), "the eval graph has no mission runs");
     Ok(EvalGraphSnapshot { eval, runs })
 }
 
 fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNodeState> {
     let mut states = BTreeMap::new();
     states.insert(
-        snapshot.eval.plan_run.clone(),
+        snapshot.eval.mission_run.clone(),
         GraphNodeState {
             label: "eval".into(),
             state: format!("{} / {}", snapshot.eval.lifecycle, snapshot.eval.phase),
@@ -4451,9 +4505,9 @@ fn graph_node_states(snapshot: &EvalGraphSnapshot) -> BTreeMap<String, GraphNode
             run.subject.clone(),
             GraphNodeState {
                 label: run
-                    .plan
-                    .strip_prefix("plan/")
-                    .unwrap_or(&run.plan)
+                    .mission
+                    .strip_prefix("mission/")
+                    .unwrap_or(&run.mission)
                     .to_owned(),
                 state: format!("{} / {}", run.status, run.phase),
                 assignee: None,
@@ -4531,9 +4585,9 @@ fn render_eval_graph(
     let mut output = String::new();
     let name = snapshot
         .eval
-        .plan_run
-        .strip_prefix("plan-run/")
-        .unwrap_or(&snapshot.eval.plan_run);
+        .mission_run
+        .strip_prefix("mission-run/")
+        .unwrap_or(&snapshot.eval.mission_run);
     let steps = snapshot
         .runs
         .iter()
@@ -4575,11 +4629,11 @@ fn render_eval_graph(
     if let Some(root) = snapshot
         .runs
         .iter()
-        .find(|run| run.subject == snapshot.eval.plan_run)
+        .find(|run| run.subject == snapshot.eval.mission_run)
     {
-        render_plan_steps(&mut output, root, &children, "  ");
+        render_mission_steps(&mut output, root, &children, "  ");
     } else {
-        let _ = writeln!(output, "  ! the root plan run is not available");
+        let _ = writeln!(output, "  ! the root mission run is not available");
     }
 
     let _ = writeln!(output);
@@ -4607,10 +4661,10 @@ fn render_eval_graph(
     output
 }
 
-fn render_plan_steps(
+fn render_mission_steps(
     output: &mut String,
-    run: &PlanRunView,
-    children: &BTreeMap<&str, &PlanRunView>,
+    run: &MissionRunView,
+    children: &BTreeMap<&str, &MissionRunView>,
     indent: &str,
 ) {
     use std::fmt::Write as _;
@@ -4668,13 +4722,16 @@ fn render_plan_steps(
             .count();
         let child_summary = format!(
             "{indent}  ↳ {} · {} · {child_completed}/{} completed",
-            child.plan.strip_prefix("plan/").unwrap_or(&child.plan),
+            child
+                .mission
+                .strip_prefix("mission/")
+                .unwrap_or(&child.mission),
             child.status,
             child.steps.len()
         );
         let _ = writeln!(output, "{child_summary}");
         if !matches!(child.status.as_str(), "completed" | "cancelled") {
-            render_plan_steps(output, child, children, &format!("{indent}    "));
+            render_mission_steps(output, child, children, &format!("{indent}    "));
         }
     }
 }
@@ -4778,9 +4835,9 @@ async fn run_quick(
     };
     let worktree = fs::canonicalize(&args.worktree)
         .with_context(|| format!("resolve worktree {}", args.worktree.display()))?;
-    let plan_id = format!("standing/{bus_id}");
+    let mission_id = format!("standing/{bus_id}");
     let kdl = quick_agent_intent(
-        &plan_id,
+        &mission_id,
         &bus_id,
         &worktree,
         driver,
@@ -4793,33 +4850,33 @@ async fn run_quick(
     }
     let actor = args.actor.context("a quick agent needs --as or ST_AGENT")?;
     let parsed = st3::parse_intent(&kdl, node)?;
-    let plan = parsed.plans[&plan_id].clone();
-    let plan_publication = publish_text(
+    let mission = parsed.missions[&mission_id].clone();
+    let mission_publication = publish_text(
         client,
         kdl,
-        format!("st3 {driver} {bus_id} plan"),
+        format!("st3 {driver} {bus_id} mission"),
         actor.clone(),
     )
     .await?;
-    let mut active: Vec<PlanRunView> = client
+    let mut active: Vec<MissionRunView> = client
         .get(&format!(
-            "/v1/plan-runs?plan={}",
-            urlencoding::encode(&plan_id)
+            "/v1/mission-runs?mission={}",
+            urlencoding::encode(&mission_id)
         ))
         .await?;
     anyhow::ensure!(
         active.len() <= 1,
-        "standing plan `plan/{plan_id}` has more than one active run"
+        "standing mission `mission/{mission_id}` has more than one active run"
     );
-    let mut cursor = plan_publication.store_index;
+    let mut cursor = mission_publication.store_index;
     let run = if let Some(current) = active.pop() {
-        if current.revision != plan.revision {
+        if current.revision != mission.revision {
             let revision_id = format!("quick-{}", uuid::Uuid::now_v7().simple());
-            let revision_kdl = plan_revision_intent(
+            let revision_kdl = mission_revision_intent(
                 &current.subject,
                 &revision_id,
-                &plan_id,
-                &plan.revision,
+                &mission_id,
+                &mission.revision,
                 &current.generation,
                 "the quick agent declaration changed",
             );
@@ -4832,8 +4889,8 @@ async fn run_quick(
             .await?;
             cursor = cursor.max(applied.store_index);
             client
-                .get::<PlanRunView>(&format!(
-                    "/v1/plan-runs/{}",
+                .get::<MissionRunView>(&format!(
+                    "/v1/mission-runs/{}",
                     urlencoding::encode(&current.subject)
                 ))
                 .await?
@@ -4841,11 +4898,11 @@ async fn run_quick(
             current
         }
     } else {
-        let run_id = plan_id.clone();
-        let run_kdl = plan_run_intent(
+        let run_id = mission_id.clone();
+        let run_kdl = mission_run_intent(
             &run_id,
-            &plan_id,
-            &plan.revision,
+            &mission_id,
+            &mission.revision,
             &worktree,
             &normalize_requester_subject(&actor),
             &BTreeMap::new(),
@@ -4860,9 +4917,9 @@ async fn run_quick(
         .await?;
         cursor = cursor.max(applied.store_index);
         client
-            .get::<PlanRunView>(&format!(
-                "/v1/plan-runs/{}",
-                urlencoding::encode(&format!("plan-run/{run_id}"))
+            .get::<MissionRunView>(&format!(
+                "/v1/mission-runs/{}",
+                urlencoding::encode(&format!("mission-run/{run_id}"))
             ))
             .await?
     };
@@ -4884,8 +4941,8 @@ async fn run_quick(
     });
     let created = QuickAgentResponse {
         subject,
-        plan: format!("plan/{plan_id}"),
-        plan_run: run.subject,
+        mission: format!("mission/{mission_id}"),
+        mission_run: run.subject,
         generation: run.generation,
         runtime_id: format!("{}.{}", run.id, bus_id.replace('/', ".")),
         event_cursor: cursor,
@@ -4941,7 +4998,7 @@ async fn run_quick(
 }
 
 fn quick_agent_intent(
-    plan_id: &str,
+    mission_id: &str,
     agent_id: &str,
     worktree: &Path,
     driver: &str,
@@ -4980,48 +5037,49 @@ fn quick_agent_intent(
     agent_body.nodes_mut().push(harness);
     agent.set_children(agent_body);
 
-    let mut plan = KdlNode::new("plan");
-    plan.entries_mut().push(KdlEntry::new(plan_id));
-    plan.entries_mut()
+    let mut mission = KdlNode::new("mission");
+    mission.entries_mut().push(KdlEntry::new(mission_id));
+    mission
+        .entries_mut()
         .push(KdlEntry::new_prop("state", "ready"));
-    let mut plan_body = KdlDocument::new();
-    plan_body.nodes_mut().push(kdl_node(
+    let mut mission_body = KdlDocument::new();
+    mission_body.nodes_mut().push(kdl_node(
         "goal",
         ["Keep the agent ready for work and conversation."],
     ));
-    plan_body.nodes_mut().push(agent);
-    plan.set_children(plan_body);
-    publication_document(plan)
+    mission_body.nodes_mut().push(agent);
+    mission.set_children(mission_body);
+    publication_document(mission)
 }
 
-fn plan_revision_intent(
+fn mission_revision_intent(
     run: &str,
     operation_id: &str,
-    plan_id: &str,
+    mission_id: &str,
     revision: &str,
     from_generation: &str,
     reason: &str,
 ) -> String {
     format!(
-        "version 2\nplan-run {run:?} {{\n  revision {operation_id:?} {{\n    plan {:?}\n    from {from_generation:?}\n    reason {reason:?}\n  }}\n}}\n",
-        format!("plan/{plan_id}@{revision}")
+        "version 2\nmission-run {run:?} {{\n  revision {operation_id:?} {{\n    mission {:?}\n    from {from_generation:?}\n    reason {reason:?}\n  }}\n}}\n",
+        format!("mission/{mission_id}@{revision}")
     )
 }
 
 fn planning_session_intent(
     session_id: &str,
-    plan_id: &str,
+    mission_id: &str,
     request: &str,
     workspace: &Path,
     requester: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    target: Option<&PlanRunView>,
+    target: Option<&MissionRunView>,
 ) -> String {
     let mut session = KdlNode::new("planning-session");
     session.entries_mut().push(KdlEntry::new(session_id));
     let mut body = KdlDocument::new();
-    body.nodes_mut().push(kdl_node("plan", [plan_id]));
+    body.nodes_mut().push(kdl_node("mission", [mission_id]));
     body.nodes_mut().push(kdl_node("request", [request]));
     body.nodes_mut().push(kdl_node(
         "workspace",
@@ -5887,13 +5945,13 @@ fn work_message_request(
         to: subject.into(),
         content: work_notification(step),
         title: Some(format!(
-            "Plan step ready: {}",
+            "Mission step ready: {}",
             step.title.as_deref().unwrap_or(&step.step)
         )),
         in_reply_to: None,
         tags: vec![
             format!("st3-work:{tag_value}"),
-            format!("plan-run:{}", step.run),
+            format!("mission-run:{}", step.run),
         ],
     }
 }
@@ -5924,7 +5982,7 @@ fn work_notification(step: &StepRunView) -> String {
         )
     };
     format!(
-        "A durable st3 plan step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goals. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoals:\n{2}{3}",
+        "A durable st3 mission step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goals. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoals:\n{2}{3}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
         goals,
@@ -6246,7 +6304,7 @@ fn combine_kdl_tree(root: &Path) -> Result<String> {
     Ok(document.to_string())
 }
 
-fn print_plan(response: &PlanResponse, json_output: bool) -> Result<()> {
+fn print_mission(response: &MissionResponse, json_output: bool) -> Result<()> {
     if json_output {
         return print_value(response, true);
     }
@@ -6342,9 +6400,9 @@ fn parse_env(value: &str) -> Result<(String, String), String> {
 fn parse_input(value: &str) -> Result<(String, String), String> {
     let (name, value) = value
         .split_once('=')
-        .ok_or_else(|| "a plan input must use NAME=VALUE".to_owned())?;
+        .ok_or_else(|| "a mission input must use NAME=VALUE".to_owned())?;
     if name.is_empty() || name.contains('/') || name.chars().any(char::is_whitespace) {
-        return Err("a plan input name is invalid".into());
+        return Err("a mission input name is invalid".into());
     }
     Ok((name.into(), value.into()))
 }
@@ -6365,10 +6423,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_start_accepts_an_explicit_run_id() {
+    fn mission_start_accepts_an_explicit_run_id() {
         let cli = Cli::try_parse_from([
             "st3",
-            "plan",
+            "mission",
             "start",
             "release/demo",
             "--id",
@@ -6377,15 +6435,20 @@ mod tests {
             "agent/operator",
         ])
         .unwrap();
-        let Command::Plan {
-            command: PlanViewCommand::Start(args),
+        let Command::Mission {
+            command: MissionViewCommand::Start(args),
         } = cli.command
         else {
-            panic!("the plan start command did not parse");
+            panic!("the mission start command did not parse");
         };
-        assert_eq!(args.plan, "release/demo");
+        assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
         assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+    }
+
+    #[test]
+    fn cli_rejects_the_removed_plan_command() {
+        assert!(Cli::try_parse_from(["st3", "plan", "show", "example"]).is_err());
     }
 
     #[test]
@@ -6399,12 +6462,15 @@ mod tests {
         );
         assert!(source.starts_with("version 2\n"));
         let intent = st3::parse_intent(&source, "node").unwrap();
-        let plan = &intent.plans["exec/cli-test"];
+        let mission = &intent.missions["exec/cli-test"];
         assert!(matches!(
-            plan.completion,
+            mission.completion,
             Some(st3::model::CompletionSpec::AllStepsExhausted)
         ));
-        let execution = plan.steps["execute"].declarations_kdl.as_deref().unwrap();
+        let execution = mission.steps["execute"]
+            .declarations_kdl
+            .as_deref()
+            .unwrap();
         assert!(execution.contains("exec cli-test"), "{execution}");
         assert!(execution.contains("host local"));
         assert!(execution.contains("workspace \"/work/tree\""));
@@ -6413,9 +6479,9 @@ mod tests {
         assert!(execution.contains("MODE test"));
         assert!(execution.contains("restart never"));
         assert!(matches!(
-            &plan.steps["execute"].gates[0],
+            &mission.steps["execute"].gates[0],
             st3::model::GateSpec::Field { subject, .. }
-                if subject == "exec/${ST_PLAN_RUN}/cli-test"
+                if subject == "exec/${ST_MISSION_RUN}/cli-test"
         ));
     }
 
@@ -6503,12 +6569,12 @@ mod tests {
 
     #[test]
     fn publish_accepts_a_file_and_actor() {
-        let cli =
-            Cli::try_parse_from(["st3", "publish", "plan.kdl", "--as", "agent/operator"]).unwrap();
+        let cli = Cli::try_parse_from(["st3", "publish", "mission.kdl", "--as", "agent/operator"])
+            .unwrap();
         let Command::Publish(args) = cli.command else {
             panic!("the publish command did not parse");
         };
-        assert_eq!(args.file.as_deref(), Some(Path::new("plan.kdl")));
+        assert_eq!(args.file.as_deref(), Some(Path::new("mission.kdl")));
         assert_eq!(args.actor, "agent/operator");
     }
 
@@ -6523,9 +6589,9 @@ mod tests {
             None,
         );
         let quick = st3::parse_intent(&quick, "node").unwrap();
-        assert!(quick.plans.contains_key("standing/example.worker"));
+        assert!(quick.missions.contains_key("standing/example.worker"));
 
-        let message = message_plan_intent(
+        let message = message_mission_intent(
             "message/test",
             "test",
             "person/sender",
@@ -6536,9 +6602,9 @@ mod tests {
             &["example".into()],
         );
         let message = st3::parse_intent(&message, "node").unwrap();
-        assert!(message.plans.contains_key("message/test"));
+        assert!(message.missions.contains_key("message/test"));
 
-        let (watch, plan, resource) = resource_watch_intent(
+        let (watch, mission, resource) = resource_watch_intent(
             "github.pull-request",
             "example/project#1",
             &["state".into()],
@@ -6546,7 +6612,7 @@ mod tests {
         )
         .unwrap();
         let watch = st3::parse_intent(&watch, "node").unwrap();
-        assert!(watch.plans.contains_key(&plan));
+        assert!(watch.missions.contains_key(&mission));
         assert!(watch.subjects.contains_key(&resource));
 
         let refresh = resource_refresh_intent("resource/example", "after-change", 30_000);
@@ -6554,14 +6620,14 @@ mod tests {
         assert_eq!(refresh.resource_refreshes.len(), 1);
 
         let reset = runtime_reset_intent(
-            "plan-run/example",
+            "mission-run/example",
             "retry",
             "agent/worker",
             "run-generation/01990000000070008000000000000000",
             "retry the worker",
         );
         let reset = st3::parse_intent(&reset, "node").unwrap();
-        assert_eq!(reset.plan_runs["plan-run/example"].resets.len(), 1);
+        assert_eq!(reset.mission_runs["mission-run/example"].resets.len(), 1);
 
         let planning = planning_session_intent(
             "planning/example/01990000000070008000000000000000",
@@ -6583,7 +6649,7 @@ mod tests {
             "st3",
             "work",
             "revise",
-            "plan-run/release",
+            "mission-run/release",
             "release.kdl",
             "--reason",
             "add a gate",
@@ -6718,7 +6784,7 @@ mod tests {
     fn ready_work_is_an_idempotent_graph_message() {
         let mut step = StepRunView {
             subject: "step-run/run-1/build".into(),
-            run: "plan-run/run-1".into(),
+            run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: "build".into(),
             definition_hash: "definition".into(),
@@ -6757,7 +6823,7 @@ mod tests {
             request.tags,
             [
                 "st3-work:step-run/run-1/build@2@1@incarnation",
-                "plan-run:plan-run/run-1"
+                "mission-run:mission-run/run-1"
             ]
         );
         assert!(
@@ -6822,7 +6888,7 @@ mod tests {
     fn inherited_nested_work_uses_the_parent_message() {
         let step = |subject: &str, path: &str, assignee: &str| StepRunView {
             subject: subject.into(),
-            run: "plan-run/run-1".into(),
+            run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: path.into(),
             definition_hash: "definition".into(),
@@ -6864,7 +6930,7 @@ mod tests {
 
     #[test]
     fn eval_graph_renders_nested_state_and_semantic_transitions() {
-        let root_subject = "plan-run/root";
+        let root_subject = "mission-run/root";
         let parent_step = graph_step(
             "step-run/root/rename",
             root_subject,
@@ -6896,7 +6962,7 @@ mod tests {
         );
         let snapshot = EvalGraphSnapshot {
             eval: EvalStatus {
-                plan_run: root_subject.into(),
+                mission_run: root_subject.into(),
                 lifecycle: "running".into(),
                 phase: "normal".into(),
                 active_steps: vec!["rename".into()],
@@ -6969,16 +7035,19 @@ mod tests {
         root: &str,
         parent_step_run: Option<&str>,
         steps: Vec<StepRunView>,
-    ) -> PlanRunView {
-        PlanRunView {
+    ) -> MissionRunView {
+        MissionRunView {
             subject: subject.into(),
-            id: subject.strip_prefix("plan-run/").unwrap_or(subject).into(),
-            plan: "plan/work".into(),
+            id: subject
+                .strip_prefix("mission-run/")
+                .unwrap_or(subject)
+                .into(),
+            mission: "mission/work".into(),
             generation: "run-generation/current".into(),
             initial_revision: "initial-revision".into(),
             revision: "revision".into(),
             root_revision: "root-revision".into(),
-            root_plan_run: root.into(),
+            root_mission_run: root.into(),
             parent_step_run: parent_step_run.map(str::to_owned),
             workspace: "/tmp/eval".into(),
             requester: "person/eval-requester".into(),

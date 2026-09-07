@@ -1,10 +1,10 @@
 version 2
 
-  resource "plan-inputs/source" {
+  resource "mission-inputs/source" {
     kind "custom.st3.document-source"
   }
 
-  plan "eval/plan-inputs" state="ready" {
+  mission "eval/mission-inputs" state="ready" {
     input "message" kind="text"
     input "source" kind="resource"
     completion { when "all-steps-exhausted" }
@@ -12,8 +12,8 @@ version 2
 
     step "capture-inputs" timeout="1m" {
       agentless
-      title "The plan run captures both input kinds"
-        exec "eval/plan-inputs/capture" {
+      title "The mission run captures both input kinds"
+        exec "eval/mission-inputs/capture" {
           host "local"
           workspace "${ST_WORKSPACE}"
           cwd "${ST_WORKSPACE}"
@@ -24,8 +24,8 @@ version 2
           }
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/plan-inputs/capture" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/plan-inputs/capture" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/mission-inputs/capture" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/mission-inputs/capture" "is" 0 }
     }
 
     step "verify-inputs" timeout="1m" {

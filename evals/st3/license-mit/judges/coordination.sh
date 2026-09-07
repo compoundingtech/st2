@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
-supervisor="agent/$ST_PLAN_RUN/lmc.sup"
-worker="agent/$ST_PLAN_RUN/lmc.worker"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
+supervisor="agent/$ST_MISSION_RUN/lmc.sup"
+worker="agent/$ST_MISSION_RUN/lmc.worker"
 
 messages_to() {
   local recipient=$1

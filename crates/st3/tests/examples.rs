@@ -170,7 +170,7 @@ fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
         "local-file-refresh",
         "network-isolation",
         "network-smoke",
-        "plan-inputs",
+        "mission-inputs",
         "pty-attach-machine-stream",
         "pty-attach-only",
         "pty-send-peek",
@@ -185,7 +185,7 @@ fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
         "ghost-bug",
         "license-mit",
         "mixed-worker-pool",
-        "plan-document-lift",
+        "mission-document-lift",
         "planning-mode",
         "poisoned-pr",
         "restart-continuity",
@@ -375,12 +375,12 @@ fn selected_eval_harness_counts_match_the_inventory() {
         assert_eq!(st3_counts, st3_expected, "st3 {name}");
         model_gates.extend(authored_model_gates(&st3_source));
     }
-    let plan_lift = fs::read_to_string(root.join("st3/plan-document-lift/eval.kdl")).unwrap();
+    let mission_lift = fs::read_to_string(root.join("st3/mission-document-lift/eval.kdl")).unwrap();
     assert_eq!(
-        authored_harness_counts(&plan_lift, "st3 plan-document-lift"),
+        authored_harness_counts(&mission_lift, "st3 mission-document-lift"),
         (0, 1)
     );
-    model_gates.extend(authored_model_gates(&plan_lift));
+    model_gates.extend(authored_model_gates(&mission_lift));
     model_gates.sort();
     assert_eq!(
         model_gates,
@@ -399,19 +399,19 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             "license-mit",
             "eval/license-mit",
             [
-                ("delegate-license-change", "agent/${ST_PLAN_RUN}/lmc.sup"),
+                ("delegate-license-change", "agent/${ST_MISSION_RUN}/lmc.sup"),
                 (
                     "implement-license-change",
-                    "agent/${ST_PLAN_RUN}/lmc.worker",
+                    "agent/${ST_MISSION_RUN}/lmc.worker",
                 ),
-                ("verify-and-confirm", "agent/${ST_PLAN_RUN}/lmc.sup"),
+                ("verify-and-confirm", "agent/${ST_MISSION_RUN}/lmc.sup"),
             ]
             .as_slice(),
             [
-                "resource/plan-run/${ST_PLAN_RUN}/license-brief",
-                "resource/plan-run/${ST_PLAN_RUN}/license-revision",
-                "resource/plan-run/${ST_PLAN_RUN}/worker-report",
-                "resource/plan-run/${ST_PLAN_RUN}/final-confirmation",
+                "resource/mission-run/${ST_MISSION_RUN}/license-brief",
+                "resource/mission-run/${ST_MISSION_RUN}/license-revision",
+                "resource/mission-run/${ST_MISSION_RUN}/worker-report",
+                "resource/mission-run/${ST_MISSION_RUN}/final-confirmation",
             ]
             .as_slice(),
         ),
@@ -419,35 +419,35 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
             "ghost-bug",
             "eval/ghost-bug-codex",
             [
-                ("delegate-debug-brief", "agent/${ST_PLAN_RUN}/gbx.sup"),
-                ("diagnose-and-fix", "agent/${ST_PLAN_RUN}/gbx.fix"),
-                ("verify-and-confirm", "agent/${ST_PLAN_RUN}/gbx.sup"),
+                ("delegate-debug-brief", "agent/${ST_MISSION_RUN}/gbx.sup"),
+                ("diagnose-and-fix", "agent/${ST_MISSION_RUN}/gbx.fix"),
+                ("verify-and-confirm", "agent/${ST_MISSION_RUN}/gbx.sup"),
             ]
             .as_slice(),
             [
-                "resource/plan-run/${ST_PLAN_RUN}/debug-brief",
-                "resource/plan-run/${ST_PLAN_RUN}/fix-revision",
-                "resource/plan-run/${ST_PLAN_RUN}/worker-report",
-                "resource/plan-run/${ST_PLAN_RUN}/final-confirmation",
+                "resource/mission-run/${ST_MISSION_RUN}/debug-brief",
+                "resource/mission-run/${ST_MISSION_RUN}/fix-revision",
+                "resource/mission-run/${ST_MISSION_RUN}/worker-report",
+                "resource/mission-run/${ST_MISSION_RUN}/final-confirmation",
             ]
             .as_slice(),
         ),
     ];
 
-    for (name, plan_id, assignments, products) in cases {
+    for (name, mission_id, assignments, products) in cases {
         let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
         assert!(!source.contains("message \"kickoff"));
         assert!(!source.contains("wait-team-done"));
         let intent = st3::parse_intent(&source, "local").unwrap();
-        let plan = &intent.plans[plan_id];
+        let mission = &intent.missions[mission_id];
         for (step, assignee) in assignments {
-            assert_eq!(assigned_to(&plan.steps[*step]), Some(*assignee));
-            assert!(plan.steps[*step].nested_plan.is_some());
+            assert_eq!(assigned_to(&mission.steps[*step]), Some(*assignee));
+            assert!(mission.steps[*step].nested_mission.is_some());
         }
-        let declared = plan
+        let declared = mission
             .steps
             .values()
-            .filter_map(|step| step.nested_plan.as_ref())
+            .filter_map(|step| step.nested_mission.as_ref())
             .flat_map(|nested| nested.steps.values())
             .flat_map(|step| &step.products)
             .map(|product| product.subject.as_str())
@@ -459,31 +459,33 @@ fn license_and_ghost_bug_keep_the_complete_team_loop_in_the_graph() {
 }
 
 #[test]
-fn plan_document_lift_produces_and_uses_one_exact_plan_output() {
+fn mission_document_lift_produces_and_uses_one_exact_mission_output() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("evals/st3/plan-document-lift");
+        .join("evals/st3/mission-document-lift");
     let source = fs::read_to_string(root.join("eval.kdl")).unwrap();
     let intent = st3::parse_intent(&source, "local").unwrap();
-    let plan = &intent.plans["eval/plan-document-lift"];
-    assert_eq!(plan.baselines.len(), 1);
+    let mission = &intent.missions["eval/mission-document-lift"];
+    assert_eq!(mission.baselines.len(), 1);
     assert_eq!(
-        plan.baselines[0].name,
-        "the exact source plan exists before planning starts"
+        mission.baselines[0].name,
+        "the exact source mission exists before planning starts"
     );
     assert_eq!(
-        plan.steps["lift-plan-document"].produces_plan.as_deref(),
-        Some("eval/plan-document-lift/work")
+        mission.steps["lift-mission-document"]
+            .produces_mission
+            .as_deref(),
+        Some("eval/mission-document-lift/work")
     );
     assert_eq!(
-        plan.steps["execute-lifted-plan"].uses_plan,
-        Some(st3::model::UsedPlanSpec::StepOutput {
-            step: "lift-plan-document".into()
+        mission.steps["execute-lifted-mission"].uses_mission,
+        Some(st3::model::UsedMissionSpec::StepOutput {
+            step: "lift-mission-document".into()
         })
     );
-    let document = fs::read(root.join("repo/PLAN.md")).unwrap();
+    let document = fs::read(root.join("repo/MISSION.md")).unwrap();
     let hash = hex::encode(Sha256::digest(&document));
-    let reference = format!("doc/evals/plan-document-lift/plan@{hash}");
+    let reference = format!("doc/evals/mission-document-lift/mission@{hash}");
     assert!(intent.document_refs.contains(&reference));
     assert_eq!(
         fs::read(root.join(".st3-documents").join(hash)).unwrap(),
@@ -547,7 +549,7 @@ fn restart_continuity_fixtures_match_their_claude_teams() {
 }
 
 #[test]
-fn signal_rename_keeps_work_structure_in_the_plan_graph() {
+fn signal_rename_keeps_work_structure_in_the_mission_graph() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/signal-rename/eval.kdl");
@@ -556,9 +558,9 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
     assert!(!source.contains("message \"kickoff"));
 
     let intent = st3::parse_intent(&source, "local").expect("parse Signal Rename eval");
-    let plan = &intent.plans["eval/signal-rename-codex"];
+    let mission = &intent.missions["eval/signal-rename-codex"];
     assert_eq!(
-        plan.display_order,
+        mission.display_order,
         [
             "materialize",
             "start-team",
@@ -574,22 +576,28 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
     );
 
     let expected_assignments = [
-        ("open-base-compatibility", "agent/${ST_PLAN_RUN}/sig.base"),
-        ("migrate-relay", "agent/${ST_PLAN_RUN}/sig.relay"),
-        ("migrate-hub", "agent/${ST_PLAN_RUN}/sig.hub"),
-        ("update-root-and-config", "agent/${ST_PLAN_RUN}/sig.sup"),
-        ("close-base-compatibility", "agent/${ST_PLAN_RUN}/sig.base"),
-        ("integrate-and-verify", "agent/${ST_PLAN_RUN}/sig.sup"),
-        ("publish-final-report", "agent/${ST_PLAN_RUN}/sig.sup"),
+        (
+            "open-base-compatibility",
+            "agent/${ST_MISSION_RUN}/sig.base",
+        ),
+        ("migrate-relay", "agent/${ST_MISSION_RUN}/sig.relay"),
+        ("migrate-hub", "agent/${ST_MISSION_RUN}/sig.hub"),
+        ("update-root-and-config", "agent/${ST_MISSION_RUN}/sig.sup"),
+        (
+            "close-base-compatibility",
+            "agent/${ST_MISSION_RUN}/sig.base",
+        ),
+        ("integrate-and-verify", "agent/${ST_MISSION_RUN}/sig.sup"),
+        ("publish-final-report", "agent/${ST_MISSION_RUN}/sig.sup"),
     ];
     for (step, assignee) in expected_assignments {
-        let step = &plan.steps[step];
+        let step = &mission.steps[step];
         assert_eq!(assigned_to(step), Some(assignee));
-        assert!(step.nested_plan.is_some());
+        assert!(step.nested_mission.is_some());
     }
 
     let dependencies = |step: &str| {
-        plan.steps[step]
+        mission.steps[step]
             .dependencies
             .iter()
             .filter_map(|dependency| match dependency {
@@ -621,38 +629,38 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
     let required_products = [
         (
             "open-base-compatibility",
-            "resource/plan-run/${ST_PLAN_RUN}/base-compatibility",
+            "resource/mission-run/${ST_MISSION_RUN}/base-compatibility",
         ),
         (
             "migrate-relay",
-            "resource/plan-run/${ST_PLAN_RUN}/relay-revision",
+            "resource/mission-run/${ST_MISSION_RUN}/relay-revision",
         ),
         (
             "migrate-hub",
-            "resource/plan-run/${ST_PLAN_RUN}/hub-revision",
+            "resource/mission-run/${ST_MISSION_RUN}/hub-revision",
         ),
         (
             "update-root-and-config",
-            "resource/plan-run/${ST_PLAN_RUN}/config-revision",
+            "resource/mission-run/${ST_MISSION_RUN}/config-revision",
         ),
         (
             "close-base-compatibility",
-            "resource/plan-run/${ST_PLAN_RUN}/base-final-revision",
+            "resource/mission-run/${ST_MISSION_RUN}/base-final-revision",
         ),
         (
             "integrate-and-verify",
-            "resource/plan-run/${ST_PLAN_RUN}/integrated-revision",
+            "resource/mission-run/${ST_MISSION_RUN}/integrated-revision",
         ),
         (
             "publish-final-report",
-            "resource/plan-run/${ST_PLAN_RUN}/final-report",
+            "resource/mission-run/${ST_MISSION_RUN}/final-report",
         ),
     ];
     for (parent, product) in required_products {
-        let nested = plan.steps[parent]
-            .nested_plan
+        let nested = mission.steps[parent]
+            .nested_mission
             .as_ref()
-            .expect("nested plan");
+            .expect("nested mission");
         assert!(
             nested
                 .steps
@@ -664,7 +672,7 @@ fn signal_rename_keeps_work_structure_in_the_plan_graph() {
 }
 
 #[test]
-fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
+fn restart_continuity_keeps_recovery_state_in_the_mission_graph() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/restart-continuity/eval.kdl");
@@ -672,9 +680,9 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
     assert!(!source.contains("message \"kickoff"));
 
     let intent = st3::parse_intent(&source, "local").expect("parse Restart continuity eval");
-    let plan = &intent.plans["eval/restart-continuity"];
+    let mission = &intent.missions["eval/restart-continuity"];
     assert_eq!(
-        plan.display_order,
+        mission.display_order,
         [
             "start-team",
             "process-before-restart",
@@ -686,16 +694,16 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
     );
 
     for (step, assignee) in [
-        ("process-before-restart", "agent/${ST_PLAN_RUN}/rc.dev"),
-        ("process-after-restart", "agent/${ST_PLAN_RUN}/rc.dev"),
-        ("verify-and-confirm", "agent/${ST_PLAN_RUN}/rc.sup"),
+        ("process-before-restart", "agent/${ST_MISSION_RUN}/rc.dev"),
+        ("process-after-restart", "agent/${ST_MISSION_RUN}/rc.dev"),
+        ("verify-and-confirm", "agent/${ST_MISSION_RUN}/rc.sup"),
     ] {
-        assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
-        assert!(plan.steps[step].nested_plan.is_some());
+        assert_eq!(assigned_to(&mission.steps[step]), Some(assignee));
+        assert!(mission.steps[step].nested_mission.is_some());
     }
 
     let dependencies = |step: &str| {
-        plan.steps[step]
+        mission.steps[step]
             .dependencies
             .iter()
             .filter_map(|dependency| match dependency {
@@ -722,18 +730,18 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
     assert_eq!(dependencies("held-out-gates"), ["verify-and-confirm"]);
 
     let required_products = [
-        "resource/plan-run/${ST_PLAN_RUN}/pre-restart",
-        "resource/plan-run/${ST_PLAN_RUN}/restart",
-        "resource/plan-run/${ST_PLAN_RUN}/batch",
-        "resource/plan-run/${ST_PLAN_RUN}/worker-report",
-        "resource/plan-run/${ST_PLAN_RUN}/verification",
+        "resource/mission-run/${ST_MISSION_RUN}/pre-restart",
+        "resource/mission-run/${ST_MISSION_RUN}/restart",
+        "resource/mission-run/${ST_MISSION_RUN}/batch",
+        "resource/mission-run/${ST_MISSION_RUN}/worker-report",
+        "resource/mission-run/${ST_MISSION_RUN}/verification",
     ];
     for product in required_products {
-        assert!(plan.steps.values().any(|step| {
+        assert!(mission.steps.values().any(|step| {
             step.products
                 .iter()
                 .any(|candidate| candidate.subject == product)
-                || step.nested_plan.as_ref().is_some_and(|nested| {
+                || step.nested_mission.as_ref().is_some_and(|nested| {
                     nested
                         .steps
                         .values()
@@ -745,7 +753,7 @@ fn restart_continuity_keeps_recovery_state_in_the_plan_graph() {
 }
 
 #[test]
-fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
+fn fork_in_the_road_keeps_parallel_debate_in_the_mission_graph() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/fork-in-the-road/eval.kdl");
@@ -753,8 +761,8 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
     assert!(!source.contains("message \"kickoff"));
 
     let intent = st3::parse_intent(&source, "local").expect("parse Fork in the road eval");
-    let plan = &intent.plans["eval/fork-in-the-road"];
-    let team = plan.steps["start-team"]
+    let mission = &intent.missions["eval/fork-in-the-road"];
+    let team = mission.steps["start-team"]
         .declarations_kdl
         .as_deref()
         .expect("team declarations")
@@ -795,7 +803,7 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
         );
     }
     assert_eq!(
-        plan.display_order,
+        mission.display_order,
         [
             "start-team",
             "draft-per-human",
@@ -813,23 +821,23 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
     );
 
     for (step, assignee) in [
-        ("draft-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
-        ("draft-shared", "agent/${ST_PLAN_RUN}/fd.b"),
-        ("draft-federated", "agent/${ST_PLAN_RUN}/fd.c"),
-        ("critique-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
-        ("critique-shared", "agent/${ST_PLAN_RUN}/fd.b"),
-        ("critique-federated", "agent/${ST_PLAN_RUN}/fd.c"),
-        ("revise-per-human", "agent/${ST_PLAN_RUN}/fd.a"),
-        ("revise-shared", "agent/${ST_PLAN_RUN}/fd.b"),
-        ("revise-federated", "agent/${ST_PLAN_RUN}/fd.c"),
-        ("synthesize", "agent/${ST_PLAN_RUN}/fd.sup"),
+        ("draft-per-human", "agent/${ST_MISSION_RUN}/fd.a"),
+        ("draft-shared", "agent/${ST_MISSION_RUN}/fd.b"),
+        ("draft-federated", "agent/${ST_MISSION_RUN}/fd.c"),
+        ("critique-per-human", "agent/${ST_MISSION_RUN}/fd.a"),
+        ("critique-shared", "agent/${ST_MISSION_RUN}/fd.b"),
+        ("critique-federated", "agent/${ST_MISSION_RUN}/fd.c"),
+        ("revise-per-human", "agent/${ST_MISSION_RUN}/fd.a"),
+        ("revise-shared", "agent/${ST_MISSION_RUN}/fd.b"),
+        ("revise-federated", "agent/${ST_MISSION_RUN}/fd.c"),
+        ("synthesize", "agent/${ST_MISSION_RUN}/fd.sup"),
     ] {
-        assert_eq!(assigned_to(&plan.steps[step]), Some(assignee));
-        assert!(plan.steps[step].nested_plan.is_some());
+        assert_eq!(assigned_to(&mission.steps[step]), Some(assignee));
+        assert!(mission.steps[step].nested_mission.is_some());
     }
 
     let dependencies = |step: &str| {
-        plan.steps[step]
+        mission.steps[step]
             .dependencies
             .iter()
             .filter_map(|dependency| match dependency {
@@ -859,30 +867,30 @@ fn fork_in_the_road_keeps_parallel_debate_in_the_plan_graph() {
     );
     assert_eq!(dependencies("held-out-gates"), ["synthesize"]);
 
-    let products = plan
+    let products = mission
         .steps
         .values()
-        .filter_map(|step| step.nested_plan.as_ref())
+        .filter_map(|step| step.nested_mission.as_ref())
         .flat_map(|nested| nested.steps.values())
         .flat_map(|step| &step.products)
         .map(|product| product.subject.as_str())
         .collect::<Vec<_>>();
     for product in [
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-a-draft",
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-b-draft",
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-c-draft",
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-a-final",
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-b-final",
-        "resource/plan-run/${ST_PLAN_RUN}/proposal-c-final",
-        "resource/plan-run/${ST_PLAN_RUN}/recommendation",
-        "resource/plan-run/${ST_PLAN_RUN}/final-report",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-a-draft",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-b-draft",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-c-draft",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-a-final",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-b-final",
+        "resource/mission-run/${ST_MISSION_RUN}/proposal-c-final",
+        "resource/mission-run/${ST_MISSION_RUN}/recommendation",
+        "resource/mission-run/${ST_MISSION_RUN}/final-report",
     ] {
         assert!(products.contains(&product));
     }
 }
 
 #[test]
-fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
+fn poisoned_pr_keeps_review_state_in_the_mission_graph() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/poisoned-pr/eval.kdl");
@@ -890,9 +898,9 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
     assert!(!source.contains("message \"kickoff"));
 
     let intent = st3::parse_intent(&source, "local").expect("parse Poisoned pull request eval");
-    let plan = &intent.plans["eval/poisoned-pr"];
+    let mission = &intent.missions["eval/poisoned-pr"];
     assert_eq!(
-        plan.display_order,
+        mission.display_order,
         [
             "start-team",
             "review-pull-request",
@@ -901,30 +909,34 @@ fn poisoned_pr_keeps_review_state_in_the_plan_graph() {
         ]
     );
     assert_eq!(
-        assigned_to(&plan.steps["review-pull-request"]),
-        Some("agent/${ST_PLAN_RUN}/prx.rev")
+        assigned_to(&mission.steps["review-pull-request"]),
+        Some("agent/${ST_MISSION_RUN}/prx.rev")
     );
     assert_eq!(
-        assigned_to(&plan.steps["assess-review"]),
-        Some("agent/${ST_PLAN_RUN}/prx.sup")
+        assigned_to(&mission.steps["assess-review"]),
+        Some("agent/${ST_MISSION_RUN}/prx.sup")
     );
-    assert!(plan.steps["review-pull-request"].nested_plan.is_some());
-    assert!(plan.steps["assess-review"].nested_plan.is_some());
+    assert!(
+        mission.steps["review-pull-request"]
+            .nested_mission
+            .is_some()
+    );
+    assert!(mission.steps["assess-review"].nested_mission.is_some());
 
-    let products = plan
+    let products = mission
         .steps
         .values()
-        .filter_map(|step| step.nested_plan.as_ref())
+        .filter_map(|step| step.nested_mission.as_ref())
         .flat_map(|nested| nested.steps.values())
         .flat_map(|step| &step.products)
         .map(|product| product.subject.as_str())
         .collect::<Vec<_>>();
-    assert!(products.contains(&"resource/plan-run/${ST_PLAN_RUN}/reviewer-report"));
-    assert!(products.contains(&"resource/plan-run/${ST_PLAN_RUN}/final-verdict"));
+    assert!(products.contains(&"resource/mission-run/${ST_MISSION_RUN}/reviewer-report"));
+    assert!(products.contains(&"resource/mission-run/${ST_MISSION_RUN}/final-verdict"));
 }
 
 #[test]
-fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
+fn new_paid_evals_keep_work_and_products_in_the_mission_graph() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -933,50 +945,50 @@ fn new_paid_evals_keep_work_and_products_in_the_plan_graph() {
             "test-writing",
             "eval/test-writing",
             [
-                ("prepare-test-brief", "agent/${ST_PLAN_RUN}/tw.sup"),
-                ("write-regression-suite", "agent/${ST_PLAN_RUN}/tw.dev"),
-                ("verify-test-suite", "agent/${ST_PLAN_RUN}/tw.sup"),
+                ("prepare-test-brief", "agent/${ST_MISSION_RUN}/tw.sup"),
+                ("write-regression-suite", "agent/${ST_MISSION_RUN}/tw.dev"),
+                ("verify-test-suite", "agent/${ST_MISSION_RUN}/tw.sup"),
             ]
             .as_slice(),
             [
-                "resource/plan-run/${ST_PLAN_RUN}/test-brief",
-                "resource/plan-run/${ST_PLAN_RUN}/test-revision",
-                "resource/plan-run/${ST_PLAN_RUN}/developer-report",
-                "resource/plan-run/${ST_PLAN_RUN}/final-assessment",
+                "resource/mission-run/${ST_MISSION_RUN}/test-brief",
+                "resource/mission-run/${ST_MISSION_RUN}/test-revision",
+                "resource/mission-run/${ST_MISSION_RUN}/developer-report",
+                "resource/mission-run/${ST_MISSION_RUN}/final-assessment",
             ]
             .as_slice(),
         ),
         (
             "weird-git-setup",
             "eval/weird-git-setup",
-            [("repair-feature-worktree", "agent/${ST_PLAN_RUN}/wg.dev")].as_slice(),
+            [("repair-feature-worktree", "agent/${ST_MISSION_RUN}/wg.dev")].as_slice(),
             [
-                "resource/plan-run/${ST_PLAN_RUN}/feature-revision",
-                "resource/plan-run/${ST_PLAN_RUN}/final-report",
+                "resource/mission-run/${ST_MISSION_RUN}/feature-revision",
+                "resource/mission-run/${ST_MISSION_RUN}/final-report",
             ]
             .as_slice(),
         ),
         (
             "claude-skill-inheritance",
             "eval/claude-skill-inheritance",
-            [("exercise-skill-union", "agent/${ST_PLAN_RUN}/si.agent")].as_slice(),
-            ["resource/plan-run/${ST_PLAN_RUN}/skill-report"].as_slice(),
+            [("exercise-skill-union", "agent/${ST_MISSION_RUN}/si.agent")].as_slice(),
+            ["resource/mission-run/${ST_MISSION_RUN}/skill-report"].as_slice(),
         ),
     ];
 
-    for (name, plan_id, assignments, expected_products) in cases {
+    for (name, mission_id, assignments, expected_products) in cases {
         let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
         assert!(!source.contains("message \"kickoff"));
         let intent = st3::parse_intent(&source, "local").unwrap();
-        let plan = &intent.plans[plan_id];
+        let mission = &intent.missions[mission_id];
         for (step, assignee) in assignments {
-            assert_eq!(assigned_to(&plan.steps[*step]), Some(*assignee));
-            assert!(plan.steps[*step].nested_plan.is_some());
+            assert_eq!(assigned_to(&mission.steps[*step]), Some(*assignee));
+            assert!(mission.steps[*step].nested_mission.is_some());
         }
-        let products = plan
+        let products = mission
             .steps
             .values()
-            .filter_map(|step| step.nested_plan.as_ref())
+            .filter_map(|step| step.nested_mission.as_ref())
             .flat_map(|nested| nested.steps.values())
             .flat_map(|step| &step.products)
             .map(|product| product.subject.as_str())

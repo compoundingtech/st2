@@ -1,6 +1,6 @@
 # Candidate catalog rollout contract
 
-This document is a design plan. It does not change a catalog or a running service.
+This document is a design specification. It does not change a catalog or a running service.
 
 ## Outcome
 
@@ -146,7 +146,7 @@ A new network still needs this gate. A rebuild does not make its declarations co
 
 The st3 bootstrap catalog becomes the selected snapshot. Its expected declaration count is part of the receipt.
 
-The exact st3 candidate validates, plans, and checks runtime prerequisites against that snapshot before activation.
+The exact st3 candidate validates, missions, and checks runtime prerequisites against that snapshot before activation.
 
 The first live reconcile then verifies the same snapshot digest. It does not discover a different catalog during rollout.
 

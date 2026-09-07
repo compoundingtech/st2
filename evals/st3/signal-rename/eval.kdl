@@ -1,8 +1,8 @@
 version 2
 
-  plan "eval/signal-rename-codex" state="ready" {
+  mission "eval/signal-rename-codex" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Complete plan eval/signal-rename-codex."
+    goal "Complete mission eval/signal-rename-codex."
     step "materialize" timeout="30m" {
       title "The isolated workspace exists"
         exec "eval/signal-rename-codex/materialize" {
@@ -17,8 +17,8 @@ version 2
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/signal-rename-codex/materialize" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/signal-rename-codex/materialize" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/signal-rename-codex/materialize" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/signal-rename-codex/materialize" "is" 0 }
     }
 
     step "start-team" timeout="10m" {
@@ -29,7 +29,7 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Use messages only for blockers and the required final report. End the turn when no message remains."
+            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Use messages only for blockers and the required final report. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -44,7 +44,7 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
+            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -59,7 +59,7 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
+            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -74,7 +74,7 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent plan as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
+            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -89,13 +89,13 @@ version 2
     step "open-base-compatibility" timeout="30m" {
       title "The base provides Beacon through a temporary compatibility window"
       goal "Rename the base package, CLI, and protocol first. Provide the Beacon product while temporarily honoring the old product surface. Preserve only a migration window. Do not close it in this step."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.base"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.base"
       depends-on { step "start-team" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "inspect-product-surface" {
           title "Classify every base product identifier"
           goal "Inspect the base package, CLI, protocol, tests, and documentation. Separate product identifiers from unrelated runtime primitives."
@@ -112,10 +112,10 @@ version 2
         }
         step "publish-base-compatibility" {
           title "The base compatibility revision is published"
-          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-compatibility resource.observed --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/base-compatibility resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-base-compatibility" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/base-compatibility" {
+            resource "mission-run/${ST_MISSION_RUN}/base-compatibility" {
               kind "vcs.commit"
               state "published"
             }
@@ -127,13 +127,13 @@ version 2
     step "migrate-relay" timeout="30m" {
       title "The relay uses the Beacon product"
       goal "Migrate only the relay product surface after the base compatibility revision exists. Preserve AbortSignal, controller.signal, the signal cancellation option, SIGTERM, and all OS signal behavior."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.relay"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.relay"
       depends-on { step "open-base-compatibility" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "sync-base-compatibility" {
           title "The relay clone contains the base compatibility revision"
           goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the relay."
@@ -155,10 +155,10 @@ version 2
         }
         step "publish-relay-revision" {
           title "The relay revision is published"
-          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/relay-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/relay-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-relay" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/relay-revision" {
+            resource "mission-run/${ST_MISSION_RUN}/relay-revision" {
               kind "vcs.commit"
               state "published"
             }
@@ -170,13 +170,13 @@ version 2
     step "migrate-hub" timeout="30m" {
       title "The hub uses the Beacon product"
       goal "Migrate only the hub product surface after the base compatibility revision exists. Rename the resource scheme consistently with the relay."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.hub"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.hub"
       depends-on { step "open-base-compatibility" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "sync-base-compatibility" {
           title "The hub clone contains the base compatibility revision"
           goal "Fetch and fast-forward or rebase onto origin/main. Confirm that the Beacon base surface exists before changing the hub."
@@ -198,10 +198,10 @@ version 2
         }
         step "publish-hub-revision" {
           title "The hub revision is published"
-          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/hub-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/hub-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-hub" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/hub-revision" {
+            resource "mission-run/${ST_MISSION_RUN}/hub-revision" {
               kind "vcs.commit"
               state "published"
             }
@@ -213,16 +213,16 @@ version 2
     step "update-root-and-config" timeout="20m" {
       title "The workspace root and configuration use Beacon"
       goal "Update only config/app.toml and the workspace-root files after both consumers publish. Integrate their directory names without editing a package lane."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.sup"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
       depends-on {
         step "migrate-relay" completed
         step "migrate-hub" completed
       }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "sync-consumer-revisions" {
           title "The supervisor clone contains both consumer revisions"
           goal "Fetch and integrate origin/main. Confirm that the relay and hub revision resources match changes present in the clone."
@@ -234,10 +234,10 @@ version 2
         }
         step "publish-config-revision" {
           title "The root and config revision is published"
-          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/config-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/config-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "rename-root-and-config" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/config-revision" {
+            resource "mission-run/${ST_MISSION_RUN}/config-revision" {
               kind "vcs.commit"
               state "published"
             }
@@ -249,13 +249,13 @@ version 2
     step "close-base-compatibility" timeout="20m" {
       title "The temporary base compatibility window is closed"
       goal "After both consumers and the root use Beacon, remove every legacy base product alias. The final base must contain no @acme/signal export, signal CLI, signal/1 protocol, old product test, comment, or documentation reference."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.base"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.base"
       depends-on { step "update-root-and-config" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "sync-complete-consumer-cutover" {
           title "The base clone contains every consumer and config revision"
           goal "Fetch and integrate origin/main. Confirm that the relay, hub, root, and config all use Beacon before removing compatibility."
@@ -272,10 +272,10 @@ version 2
         }
         step "publish-final-base-revision" {
           title "The alias-free base revision is published"
-          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/base-final-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/base-final-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-final-base" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/base-final-revision" {
+            resource "mission-run/${ST_MISSION_RUN}/base-final-revision" {
               kind "vcs.commit"
               state "published"
             }
@@ -287,13 +287,13 @@ version 2
     step "integrate-and-verify" timeout="20m" {
       title "The supervisor verifies the complete alias-free cutover"
       goal "Integrate the final origin/main without editing package lanes. Verify every package test, the complete product rename, the preserved runtime primitives, and the final clean worktree."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.sup"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
       depends-on { step "close-base-compatibility" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "sync-final-origin" {
           title "The supervisor clone matches final origin/main"
           goal "Fetch and fast-forward to the final base revision. Confirm that all four published revision resources are represented in history."
@@ -310,10 +310,10 @@ version 2
         }
         step "publish-integrated-revision" {
           title "The integrated revision is published"
-          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/integrated-revision resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/integrated-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "verify-clean-product-cutover" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/integrated-revision" {
+            resource "mission-run/${ST_MISSION_RUN}/integrated-revision" {
               kind "vcs.commit"
               state "published"
             }
@@ -368,30 +368,30 @@ version 2
 
         token-budget 98304
         time-limit "3m"
-        prompt "Run exactly one evidence command before gate result: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the plan claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
+        prompt "Run exactly one evidence command before gate result: bash ./judges/semantic-evidence.sh. Do not run another evidence command. PASS only if the mission claims prove the base compatibility revision preceded both consumer revisions, both consumers completed before the root/config revision, the compatibility window closed after that revision, and the integrated revision is green. Also require lane isolation and preserved AbortSignal, controller.signal, signal cancellation options, SIGTERM, and SIGINT."
       }
     }
 
     step "publish-final-report" timeout="10m" {
       title "The supervisor publishes one final report"
       goal "Send local.morgan exactly one final message after every held-out gate passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
-      assigned-to "agent/${ST_PLAN_RUN}/sig.sup"
+      assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
       depends-on { step "held-out-gates" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "send-final-report" {
           title "Morgan receives the final result"
-          goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=plan-run:$ST_PLAN_RUN -m=\"Plan $ST_PLAN_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
+          goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=mission-run:$ST_MISSION_RUN -m=\"Mission $ST_MISSION_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
         }
         step "publish-report-receipt" {
           title "The final report receipt is published"
-          goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/final-report resource.observed --actor agent/${ST_PLAN_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
+          goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
           depends-on { step "send-final-report" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/final-report" {
+            resource "mission-run/${ST_MISSION_RUN}/final-report" {
               kind "custom.st3.coordination-report"
               state "published"
               recipient "agent/local.morgan"

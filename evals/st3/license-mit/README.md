@@ -6,7 +6,7 @@ This st3 eval runs the license MIT task with two native Claude Sonnet agents.
 - **Team/persona mechanism**: the fixture pre-seeds `CLAUDE.md` and `PERSONA.md` in both workspaces.
   The KDL uses native `harness "claude" {}` blocks. `lmc.sup` coordinates and owns no repo;
   `lmc.worker` owns the `widget` repo and makes/commits the change; `lmc.sup` verifies read-only and
-  confirms. The KDL records delegation, implementation, verification, and products as nested plans.
+  confirms. The KDL records delegation, implementation, verification, and products as nested missions.
   Every eval starts from the frozen `worker/_git` snapshot, rehydrated as `.git` only inside
   the throwaway catalog.
 - **Gates** (all held-out): structural isolation (sup owns no repo), the coordination loop on the bus

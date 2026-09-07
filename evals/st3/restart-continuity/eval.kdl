@@ -1,8 +1,8 @@
 version 2
 
-  plan "eval/restart-continuity" state="ready" {
+  mission "eval/restart-continuity" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Complete plan eval/restart-continuity."
+    goal "Complete mission eval/restart-continuity."
     step "start-team" timeout="10m" {
       title "The native Claude team is ready"
         agent "rc.sup" {
@@ -43,20 +43,20 @@ version 2
             ST3_MESSAGE_ROOT "${ST_WORKSPACE}/.st3-messages"
           }
         }
-      gate "condition-1" { exists "agent/${ST_PLAN_RUN}/rc.sup" }
-      gate "condition-2" { exists "agent/${ST_PLAN_RUN}/rc.dev" }
+      gate "condition-1" { exists "agent/${ST_MISSION_RUN}/rc.sup" }
+      gate "condition-2" { exists "agent/${ST_MISSION_RUN}/rc.dev" }
     }
 
     step "process-before-restart" timeout="20m" {
       title "Items 1 and 2 are durable before the restart"
       goal "Process only items 1 and 2. Record each stable item in PROGRESS.md, test it, and commit it. Publish the pre-restart revision. Do not start item 3."
-      assigned-to "agent/${ST_PLAN_RUN}/rc.dev"
+      assigned-to "agent/${ST_MISSION_RUN}/rc.dev"
       depends-on { step "start-team" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "inspect-durable-state" {
           title "The initial batch state is understood"
           goal "Read items.json, PROGRESS.md, git log, and the tests. Confirm that no item is complete."
@@ -73,10 +73,10 @@ version 2
         }
         step "publish-pre-restart-revision" {
           title "The pre-restart revision is published"
-          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/pre-restart resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
+          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/pre-restart resource.observed --actor agent/${ST_MISSION_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
           depends-on { step "process-item-2" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/pre-restart" {
+            resource "mission-run/${ST_MISSION_RUN}/pre-restart" {
               kind "vcs.commit"
               state "published"
             }
@@ -99,25 +99,25 @@ version 2
           }
         }
       produces {
-        resource "plan-run/${ST_PLAN_RUN}/restart" {
+        resource "mission-run/${ST_MISSION_RUN}/restart" {
           kind "custom.st3.cold-restart"
           state "injected"
         }
       }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/eval/restart-continuity/inject" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/restart-continuity/inject" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/eval/restart-continuity/inject" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/restart-continuity/inject" "is" 0 }
     }
 
     step "process-after-restart" timeout="20m" {
       title "The restarted worker resumes items 3 and 4"
       goal "Use the durable graph, PROGRESS.md, and git history. Do not repeat items 1 or 2. Process items 3 and 4, verify the batch, publish the final revision, and report once to rc.sup."
-      assigned-to "agent/${ST_PLAN_RUN}/rc.dev"
+      assigned-to "agent/${ST_MISSION_RUN}/rc.dev"
       depends-on { step "inject-cold-restart" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "inspect-recovered-state" {
           title "The restarted worker finds the durable boundary"
           goal "Read the graph work, PROGRESS.md, and git log. Confirm that items 1 and 2 are complete exactly once. Archive the repeated delivery without redoing either item."
@@ -139,10 +139,10 @@ version 2
         }
         step "publish-batch-revision" {
           title "The complete batch revision is published"
-          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/plan-run/$ST_PLAN_RUN/batch resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
+          goal #"Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/batch resource.observed --actor agent/${ST_MISSION_RUN}/rc.dev --field kind=vcs.commit --field state=published --field sha=$SHA. Complete this step after the claim."#
           depends-on { step "verify-complete-batch" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/batch" {
+            resource "mission-run/${ST_MISSION_RUN}/batch" {
               kind "vcs.commit"
               state "published"
             }
@@ -150,10 +150,10 @@ version 2
         }
         step "report-to-supervisor" {
           title "The worker reports one result to the supervisor"
-          goal #"Send agent/${ST_PLAN_RUN}/rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/worker-report resource.observed --actor agent/${ST_PLAN_RUN}/rc.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+          goal #"Send agent/${ST_MISSION_RUN}/rc.sup exactly one Small Talk message with the four item commit IDs, the final SHA, the green npm test result, and the clean worktree result. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Then run: st3 claim resource/mission-run/$ST_MISSION_RUN/worker-report resource.observed --actor agent/${ST_MISSION_RUN}/rc.dev --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
           depends-on { step "publish-batch-revision" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/worker-report" {
+            resource "mission-run/${ST_MISSION_RUN}/worker-report" {
               kind "custom.st3.message-receipt"
               state "published"
             }
@@ -165,16 +165,16 @@ version 2
     step "verify-and-confirm" timeout="15m" {
       title "The supervisor verifies the recovered batch"
       goal "Verify the graph-owned restart boundary, all four item results, the final repository, and the worker report. Do not edit the ledger. Send person/eval-requester one final confirmation."
-      assigned-to "agent/${ST_PLAN_RUN}/rc.sup"
+      assigned-to "agent/${ST_MISSION_RUN}/rc.sup"
       depends-on { step "process-after-restart" completed }
 
-      plan "work" {
+      mission "work" {
 
         completion { when "all-steps-exhausted" }
-        goal "Complete plan work."
+        goal "Complete mission work."
         step "inspect-graph-history" {
           title "The restart and work phases are visible in the graph"
-          goal "Inspect the plan run and the pre-restart, restart, batch, and worker-report resources. Confirm that the two work phases completed around the restart."
+          goal "Inspect the mission run and the pre-restart, restart, batch, and worker-report resources. Confirm that the two work phases completed around the restart."
         }
         step "verify-ledger-read-only" {
           title "The supervisor verifies the ledger without editing it"
@@ -183,10 +183,10 @@ version 2
         }
         step "confirm-requester" {
           title "The requester receives one verified confirmation"
-          goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag plan-run:$ST_PLAN_RUN. Save the bare message ID as MID. Then run: st3 claim resource/plan-run/$ST_PLAN_RUN/verification resource.observed --actor agent/${ST_PLAN_RUN}/rc.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
+          goal #"Send person/eval-requester exactly one Small Talk message with the restart evidence, duplicate-delivery result, four item commits, final SHA, green tests, and clean tree. Use tag mission-run:$ST_MISSION_RUN. Save the bare message ID as MID. Then run: st3 claim resource/mission-run/$ST_MISSION_RUN/verification resource.observed --actor agent/${ST_MISSION_RUN}/rc.sup --field kind=custom.st3.message-receipt --field state=published --field message=message/$MID. Complete this step after the claim."#
           depends-on { step "verify-ledger-read-only" completed }
           produces {
-            resource "plan-run/${ST_PLAN_RUN}/verification" {
+            resource "mission-run/${ST_MISSION_RUN}/verification" {
               kind "custom.st3.message-receipt"
               state "published"
             }

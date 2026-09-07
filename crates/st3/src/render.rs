@@ -45,7 +45,7 @@ pub fn apply(store: &Store, desired: &Value, workspace: &Path) -> Result<RenderR
         "render workspace {} does not exist",
         workspace.display()
     );
-    let (writes, warnings) = plan_render(store, render, workspace)?;
+    let (writes, warnings) = prepare_render(store, render, workspace)?;
     commit_transaction(&writes)?;
     Ok(RenderResult {
         warnings,
@@ -60,7 +60,7 @@ pub fn apply(store: &Store, desired: &Value, workspace: &Path) -> Result<RenderR
     })
 }
 
-fn plan_render(
+fn prepare_render(
     store: &Store,
     render: &Value,
     workspace: &Path,
@@ -236,7 +236,7 @@ pub fn apply_all(
         if !workspace.exists() && !member.workspace_create {
             anyhow::bail!("workspace {} does not exist", workspace.display());
         }
-        let (writes, warnings) = plan_render(store, render, workspace)?;
+        let (writes, warnings) = prepare_render(store, render, workspace)?;
         let receipts = writes
             .iter()
             .map(|write| RenderReceipt {

@@ -1,6 +1,6 @@
 # Ordered ledger batch
 
-The st3 plan assigns four stable ledger items across two work phases.
+The st3 mission assigns four stable ledger items across two work phases.
 
 Items 1 and 2 complete before the cold restart. Items 3 and 4 complete after the new worker incarnation becomes ready.
 

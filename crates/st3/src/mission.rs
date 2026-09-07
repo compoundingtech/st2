@@ -6,17 +6,17 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, PlanInputKind, PlanInputSpec, PlanSpec,
-    PlanState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec, UsedPlanSpec,
-    WorkSelector,
+    BaselineSpec, CompletionSpec, DependencySpec, GateSpec, MissionInputKind, MissionInputSpec,
+    MissionSpec, MissionState, ProductSpec, RetrySpec, RevisionCutover, St3Error, StepSpec,
+    UsedMissionSpec, WorkSelector,
 };
 
 const VARIABLES: &[&str] = &[
-    "ST_PLAN",
-    "ST_PLAN_REVISION",
-    "ST_PLAN_RUN",
+    "ST_MISSION",
+    "ST_MISSION_REVISION",
+    "ST_MISSION_RUN",
     "ST_RUN_GENERATION",
-    "ST_ROOT_PLAN_RUN",
+    "ST_ROOT_MISSION_RUN",
     "ST_WORKSPACE",
     "ST_REQUESTER",
     "ST_STEP",
@@ -33,34 +33,34 @@ pub(crate) fn is_reserved_context_name(name: &str) -> bool {
     (VARIABLES.contains(&name) && name != "PATH") || name == "ST3_SUBJECT"
 }
 
-pub(crate) fn validate_plan_id(value: &str) -> Result<(), St3Error> {
-    validate_id(value, "plan")
+pub(crate) fn validate_mission_id(value: &str) -> Result<(), St3Error> {
+    validate_id(value, "mission")
 }
 
-pub fn parse_plans(
+pub fn parse_missions(
     document: &KdlDocument,
     default_host: &str,
-) -> Result<BTreeMap<String, PlanSpec>, St3Error> {
-    let mut plans = BTreeMap::new();
+) -> Result<BTreeMap<String, MissionSpec>, St3Error> {
+    let mut missions = BTreeMap::new();
     let outer_owners = direct_agent_owners(document, default_host)?;
     for node in document.nodes() {
-        if node.name().value() == "plan" {
-            insert_plan(
-                &mut plans,
-                parse_plan(node, outer_owners.clone(), default_host, true)?,
+        if node.name().value() == "mission" {
+            insert_mission(
+                &mut missions,
+                parse_mission(node, outer_owners.clone(), default_host, true)?,
             )?;
         }
     }
-    Ok(plans)
+    Ok(missions)
 }
 
-pub fn find_step<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a StepSpec> {
-    for id in &plan.display_order {
-        let step = &plan.steps[id];
+pub fn find_step<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a StepSpec> {
+    for id in &mission.display_order {
+        let step = &mission.steps[id];
         if step.path == path {
             return Some(step);
         }
-        if let Some(nested) = &step.nested_plan
+        if let Some(nested) = &step.nested_mission
             && let Some(found) = find_step(nested, path)
         {
             return Some(found);
@@ -69,14 +69,14 @@ pub fn find_step<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a StepSpec> {
     None
 }
 
-pub fn parent_step_path<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a str> {
-    fn find<'a>(plan: &'a PlanSpec, path: &str, parent: Option<&'a str>) -> Option<&'a str> {
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
+pub fn parent_step_path<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a str> {
+    fn find<'a>(mission: &'a MissionSpec, path: &str, parent: Option<&'a str>) -> Option<&'a str> {
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
             if step.path == path {
                 return parent;
             }
-            if let Some(nested) = &step.nested_plan
+            if let Some(nested) = &step.nested_mission
                 && let Some(found) = find(nested, path, Some(&step.path))
             {
                 return Some(found);
@@ -84,25 +84,31 @@ pub fn parent_step_path<'a>(plan: &'a PlanSpec, path: &str) -> Option<&'a str> {
         }
         None
     }
-    find(plan, path, None)
+    find(mission, path, None)
 }
 
-fn insert_plan(plans: &mut BTreeMap<String, PlanSpec>, plan: PlanSpec) -> Result<(), St3Error> {
-    if plans.insert(plan.id.clone(), plan.clone()).is_some() {
+fn insert_mission(
+    missions: &mut BTreeMap<String, MissionSpec>,
+    mission: MissionSpec,
+) -> Result<(), St3Error> {
+    if missions
+        .insert(mission.id.clone(), mission.clone())
+        .is_some()
+    {
         return Err(St3Error::new(
-            "duplicate-plan",
-            format!("plan `{}` repeats", plan.id),
+            "duplicate-mission",
+            format!("mission `{}` repeats", mission.id),
         ));
     }
     Ok(())
 }
 
-fn parse_plan(
+fn parse_mission(
     node: &KdlNode,
     outer_owners: Vec<String>,
     default_host: &str,
     require_state: bool,
-) -> Result<PlanSpec, St3Error> {
+) -> Result<MissionSpec, St3Error> {
     reject_type(node)?;
     ensure_only_properties(
         node,
@@ -114,18 +120,18 @@ fn parse_plan(
         ],
     )?;
     let id = first_string(node)?;
-    validate_id(&id, "plan")?;
+    validate_id(&id, "mission")?;
     let authored_state = property_string(node, "state")?;
     if require_state && authored_state.is_none() {
         return Err(St3Error::new(
-            "missing-plan-state",
-            format!("plan `{id}` needs an explicit state"),
+            "missing-mission-state",
+            format!("mission `{id}` needs an explicit state"),
         ));
     }
     let state = authored_state
-        .map(|value| parse_plan_state(&value))
+        .map(|value| parse_mission_state(&value))
         .transpose()?
-        .unwrap_or(PlanState::Ready);
+        .unwrap_or(MissionState::Ready);
     let revisions_human_only = parse_revision_protection(node)?;
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let revision_cutover = match property_string(node, "revision-cutover")?.as_deref() {
@@ -134,24 +140,24 @@ fn parse_plan(
         Some(value) => {
             return Err(St3Error::new(
                 "invalid-revision-cutover",
-                format!("plan `{id}` has invalid revision cutover `{value}`"),
+                format!("mission `{id}` has invalid revision cutover `{value}`"),
             ));
         }
     };
     let children = node
         .children()
-        .ok_or_else(|| St3Error::new("empty-plan", format!("plan `{id}` has no steps")))?;
+        .ok_or_else(|| St3Error::new("empty-mission", format!("mission `{id}` has no steps")))?;
     let mut inputs = BTreeMap::new();
     for input_node in children
         .nodes()
         .iter()
         .filter(|child| child.name().value() == "input")
     {
-        let input = parse_plan_input(input_node)?;
+        let input = parse_mission_input(input_node)?;
         if inputs.insert(input.name.clone(), input.clone()).is_some() {
             return Err(St3Error::new(
-                "duplicate-plan-input",
-                format!("plan `{id}` repeats input `{}`", input.name),
+                "duplicate-mission-input",
+                format!("mission `{id}` repeats input `{}`", input.name),
             ));
         }
     }
@@ -180,8 +186,8 @@ fn parse_plan(
             "concurrent-runs" => {
                 if concurrent_runs_seen {
                     return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `concurrent-runs`"),
+                        "duplicate-mission-field",
+                        format!("mission `{id}` repeats `concurrent-runs`"),
                     ));
                 }
                 max_active_runs = parse_concurrent_runs(child)?;
@@ -190,8 +196,8 @@ fn parse_plan(
             "assigned-to" => {
                 if assigned_to.is_some() {
                     return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `assigned-to`"),
+                        "duplicate-mission-field",
+                        format!("mission `{id}` repeats `assigned-to`"),
                     ));
                 }
                 assigned_to = Some(normalize_assignee(&first_string(child)?, default_host));
@@ -201,7 +207,7 @@ fn parse_plan(
                 if available_to.contains(&agent) {
                     return Err(St3Error::new(
                         "duplicate-work-agent",
-                        format!("plan `{id}` repeats available agent `{agent}`"),
+                        format!("mission `{id}` repeats available agent `{agent}`"),
                     ));
                 }
                 available_to.push(agent);
@@ -211,7 +217,7 @@ fn parse_plan(
                 if !baseline_names.insert(baseline.name.clone()) {
                     return Err(St3Error::new(
                         "duplicate-baseline",
-                        format!("plan `{id}` repeats baseline `{}`", baseline.name),
+                        format!("mission `{id}` repeats baseline `{}`", baseline.name),
                     ));
                 }
                 baselines.push(baseline);
@@ -222,8 +228,8 @@ fn parse_plan(
             }
             "produces" => {
                 return Err(St3Error::new(
-                    "duplicate-plan-field",
-                    format!("plan `{id}` repeats `produces`"),
+                    "duplicate-mission-field",
+                    format!("mission `{id}` repeats `produces`"),
                 ));
             }
             "gate" => {
@@ -232,7 +238,7 @@ fn parse_plan(
                     return Err(St3Error::new(
                         "duplicate-gate",
                         format!(
-                            "plan `{id}` repeats gate `{}`",
+                            "mission `{id}` repeats gate `{}`",
                             crate::graph::gate_name(&gate)
                         ),
                     ));
@@ -244,7 +250,7 @@ fn parse_plan(
                 if steps.insert(step.id.clone(), step.clone()).is_some() {
                     return Err(St3Error::new(
                         "duplicate-step",
-                        format!("plan `{id}` repeats step `{}`", step.id),
+                        format!("mission `{id}` repeats step `{}`", step.id),
                     ));
                 }
                 display_order.push(step.id);
@@ -252,8 +258,8 @@ fn parse_plan(
             "completion" => {
                 if completion.is_some() {
                     return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `completion`"),
+                        "duplicate-mission-field",
+                        format!("mission `{id}` repeats `completion`"),
                     ));
                 }
                 completion = Some(parse_completion(child, default_host)?);
@@ -261,21 +267,21 @@ fn parse_plan(
             "finally" => {
                 if finally_seen {
                     return Err(St3Error::new(
-                        "duplicate-plan-field",
-                        format!("plan `{id}` repeats `finally`"),
+                        "duplicate-mission-field",
+                        format!("mission `{id}` repeats `finally`"),
                     ));
                 }
                 ensure_bare(child)?;
                 let body = child.children().ok_or_else(|| {
                     St3Error::new(
                         "empty-finally",
-                        format!("plan `{id}` has an empty finally block"),
+                        format!("mission `{id}` has an empty finally block"),
                     )
                 })?;
                 if body.nodes().is_empty() {
                     return Err(St3Error::new(
                         "empty-finally",
-                        format!("plan `{id}` has an empty finally block"),
+                        format!("mission `{id}` has an empty finally block"),
                     ));
                 }
                 for final_node in body.nodes() {
@@ -283,7 +289,7 @@ fn parse_plan(
                         return Err(St3Error::new(
                             "invalid-finally-child",
                             format!(
-                                "plan `{id}` finally cannot contain `{}`",
+                                "mission `{id}` finally cannot contain `{}`",
                                 final_node.name().value()
                             ),
                         ));
@@ -292,7 +298,7 @@ fn parse_plan(
                     if steps.insert(step.id.clone(), step.clone()).is_some() {
                         return Err(St3Error::new(
                             "duplicate-step",
-                            format!("plan `{id}` repeats step `{}`", step.id),
+                            format!("mission `{id}` repeats step `{}`", step.id),
                         ));
                     }
                     display_order.push(step.id);
@@ -301,11 +307,11 @@ fn parse_plan(
             }
             "account" => {
                 return Err(St3Error::new(
-                    "account-inside-plan",
-                    format!("plan `{id}` cannot own an account"),
+                    "account-inside-mission",
+                    format!("mission `{id}` cannot own an account"),
                 ));
             }
-            name if crate::graph::is_plan_declaration(name) => {
+            name if crate::graph::is_mission_declaration(name) => {
                 crate::graph::validate_deferred_declaration(child)?;
                 let mut declaration = KdlDocument::new();
                 declaration.nodes_mut().push(child.clone());
@@ -316,15 +322,15 @@ fn parse_plan(
             }
             other => {
                 return Err(St3Error::new(
-                    "invalid-plan-child",
-                    format!("plan `{id}` cannot contain `{other}`"),
+                    "invalid-mission-child",
+                    format!("mission `{id}` cannot contain `{other}`"),
                 ));
             }
         }
     }
-    validate_goal_count(&format!("plan `{id}`"), &goals, true)?;
+    validate_goal_count(&format!("mission `{id}`"), &goals, true)?;
     let work_selector =
-        build_work_selector(&format!("plan `{id}`"), assigned_to, available_to, false)?;
+        build_work_selector(&format!("mission `{id}`"), assigned_to, available_to, false)?;
     validate_dependencies(&id, &steps)?;
     if let Some(CompletionSpec::Dependencies { dependencies }) = &completion {
         validate_dependency_targets(&id, "completion", dependencies, &steps)?;
@@ -334,14 +340,14 @@ fn parse_plan(
             {
                 return Err(St3Error::new(
                     "completion-depends-on-final-step",
-                    format!("completion in plan `{id}` cannot depend on final step `{step}`"),
+                    format!("completion in mission `{id}` cannot depend on final step `{step}`"),
                 ));
             }
         }
     }
     let declarations_kdl = declarations_document(declarations);
-    let mut plan = PlanSpec {
-        subject: format!("plan/{id}"),
+    let mut mission = MissionSpec {
+        subject: format!("mission/{id}"),
         id,
         state,
         revision: String::new(),
@@ -362,11 +368,11 @@ fn parse_plan(
         display_order,
     };
     validate_variables(
-        &serde_json::to_value(&plan).map_err(internal)?,
+        &serde_json::to_value(&mission).map_err(internal)?,
         &input_names,
     )?;
-    plan.revision = hash(&plan)?;
-    Ok(plan)
+    mission.revision = hash(&mission)?;
+    Ok(mission)
 }
 
 fn parse_step(
@@ -400,10 +406,10 @@ fn parse_step(
     let mut documents = Vec::new();
     let mut declarations = Vec::new();
     let mut products = Vec::new();
-    let mut produces_plan = None;
-    let mut uses_plan = None;
+    let mut produces_mission = None;
+    let mut uses_mission = None;
     let mut gates = Vec::new();
-    let mut nested_plan = None;
+    let mut nested_mission = None;
     let mut retry = RetrySpec::default();
     let mut revision_owners = Vec::new();
     if let Some(children) = node.children() {
@@ -415,7 +421,7 @@ fn parse_step(
             if !matches!(
                 name,
                 "goal" | "baseline" | "gate" | "depends-on" | "document" | "available-to"
-            ) && !crate::graph::is_plan_declaration(name)
+            ) && !crate::graph::is_mission_declaration(name)
                 && !names.insert(name.to_owned())
             {
                 return Err(St3Error::new(
@@ -457,11 +463,11 @@ fn parse_step(
                 "document" => documents.push(parse_step_document(child)?),
                 "account" => {
                     return Err(St3Error::new(
-                        "account-inside-plan",
+                        "account-inside-mission",
                         format!("step `{path}` cannot own an account"),
                     ));
                 }
-                name if crate::graph::is_plan_declaration(name) => {
+                name if crate::graph::is_mission_declaration(name) => {
                     crate::graph::validate_deferred_declaration(child)?;
                     let mut declaration = KdlDocument::new();
                     declaration.nodes_mut().push(child.clone());
@@ -471,13 +477,13 @@ fn parse_step(
                     declarations.push(child.clone());
                 }
                 "produces" => products = parse_products(child)?,
-                "produces-plan" => produces_plan = Some(parse_produced_plan(child)?),
-                "uses-plan" => uses_plan = Some(parse_used_plan(child)?),
+                "produces-mission" => produces_mission = Some(parse_produced_mission(child)?),
+                "uses-mission" => uses_mission = Some(parse_used_mission(child)?),
                 "gate" => {
                     let gate = crate::graph::parse_gate(child, default_host)?;
                     if matches!(gate, GateSpec::Deadline { .. }) {
                         return Err(St3Error::new(
-                            "invalid-plan-deadline",
+                            "invalid-mission-deadline",
                             format!("step `{path}` must use its timeout property"),
                         ));
                     }
@@ -492,10 +498,10 @@ fn parse_step(
                     }
                     gates.push(gate);
                 }
-                "plan" => {
-                    let mut plan = parse_plan(child, Vec::new(), default_host, false)?;
-                    rewrite_nested_paths(&mut plan, &path)?;
-                    nested_plan = Some(Box::new(plan));
+                "mission" => {
+                    let mut mission = parse_mission(child, Vec::new(), default_host, false)?;
+                    rewrite_nested_paths(&mut mission, &path)?;
+                    nested_mission = Some(Box::new(mission));
                 }
                 "retry" => retry = parse_retry(child)?,
                 other => {
@@ -532,10 +538,10 @@ fn parse_step(
         documents,
         declarations_kdl,
         products,
-        produces_plan,
-        uses_plan,
+        produces_mission,
+        uses_mission,
         gates,
-        nested_plan,
+        nested_mission,
         definition_hash: String::new(),
     };
     validate_variables(&serde_json::to_value(&step).map_err(internal)?, input_names)?;
@@ -572,35 +578,35 @@ fn build_work_selector(
     })
 }
 
-fn parse_plan_input(node: &KdlNode) -> Result<PlanInputSpec, St3Error> {
+fn parse_mission_input(node: &KdlNode) -> Result<MissionInputSpec, St3Error> {
     reject_type(node)?;
     ensure_only_properties(node, &["kind"])?;
     ensure_no_children(node)?;
     let name = first_string(node)?;
     if name.contains('/') {
         return Err(St3Error::new(
-            "invalid-plan-input",
-            format!("plan input `{name}` cannot contain `/`"),
+            "invalid-mission-input",
+            format!("mission input `{name}` cannot contain `/`"),
         ));
     }
-    validate_id(&name, "plan input")?;
+    validate_id(&name, "mission input")?;
     let kind = match property_string(node, "kind")?.as_deref() {
-        Some("text") => PlanInputKind::Text,
-        Some("resource") => PlanInputKind::Resource,
+        Some("text") => MissionInputKind::Text,
+        Some("resource") => MissionInputKind::Resource,
         Some(value) => {
             return Err(St3Error::new(
-                "invalid-plan-input-kind",
-                format!("plan input `{name}` has invalid kind `{value}`"),
+                "invalid-mission-input-kind",
+                format!("mission input `{name}` has invalid kind `{value}`"),
             ));
         }
         None => {
             return Err(St3Error::new(
-                "missing-plan-input-kind",
-                format!("plan input `{name}` needs `kind`"),
+                "missing-mission-input-kind",
+                format!("mission input `{name}` needs `kind`"),
             ));
         }
     };
-    Ok(PlanInputSpec { name, kind })
+    Ok(MissionInputSpec { name, kind })
 }
 
 fn parse_concurrent_runs(node: &KdlNode) -> Result<Option<u32>, St3Error> {
@@ -861,19 +867,19 @@ fn parse_step_document(node: &KdlNode) -> Result<String, St3Error> {
     Ok(format!("{name}@{}", revision.to_ascii_lowercase()))
 }
 
-fn rewrite_nested_paths(plan: &mut PlanSpec, parent: &str) -> Result<(), St3Error> {
-    let old = std::mem::take(&mut plan.steps);
+fn rewrite_nested_paths(mission: &mut MissionSpec, parent: &str) -> Result<(), St3Error> {
+    let old = std::mem::take(&mut mission.steps);
     let mut rewritten = BTreeMap::new();
     for (id, mut step) in old {
-        step.path = format!("{parent}/{}/{}", plan.id, step.id);
-        if let Some(nested) = step.nested_plan.as_mut() {
+        step.path = format!("{parent}/{}/{}", mission.id, step.id);
+        if let Some(nested) = step.nested_mission.as_mut() {
             rewrite_nested_paths(nested, &step.path)?;
         }
         step.definition_hash = hash(&step)?;
         rewritten.insert(id, step);
     }
-    plan.steps = rewritten;
-    plan.revision = hash(plan)?;
+    mission.steps = rewritten;
+    mission.revision = hash(mission)?;
     Ok(())
 }
 
@@ -1013,31 +1019,31 @@ fn parse_products(node: &KdlNode) -> Result<Vec<ProductSpec>, St3Error> {
     Ok(output)
 }
 
-fn parse_produced_plan(node: &KdlNode) -> Result<String, St3Error> {
+fn parse_produced_mission(node: &KdlNode) -> Result<String, St3Error> {
     reject_type(node)?;
     ensure_only_properties(node, &[])?;
     let values = positional_strings(node)?;
     if values.len() != 1 || node.children().is_some() {
         return Err(St3Error::new(
-            "invalid-produces-plan",
-            "produces-plan needs exactly one plan ID",
+            "invalid-produces-mission",
+            "produces-mission needs exactly one mission ID",
         ));
     }
     let id = values[0]
-        .strip_prefix("plan/")
+        .strip_prefix("mission/")
         .unwrap_or(&values[0])
         .to_owned();
-    validate_id(&id, "plan")?;
+    validate_id(&id, "mission")?;
     Ok(id)
 }
 
-fn parse_used_plan(node: &KdlNode) -> Result<UsedPlanSpec, St3Error> {
+fn parse_used_mission(node: &KdlNode) -> Result<UsedMissionSpec, St3Error> {
     reject_type(node)?;
     ensure_only_properties(node, &["output-of"])?;
     if node.children().is_some() {
         return Err(St3Error::new(
-            "invalid-uses-plan",
-            "uses-plan cannot contain a block",
+            "invalid-uses-mission",
+            "uses-mission cannot contain a block",
         ));
     }
     let values = positional_strings(node)?;
@@ -1045,31 +1051,31 @@ fn parse_used_plan(node: &KdlNode) -> Result<UsedPlanSpec, St3Error> {
     match (values.as_slice(), output) {
         ([], Some(step)) => {
             validate_id(&step, "step")?;
-            Ok(UsedPlanSpec::StepOutput { step })
+            Ok(UsedMissionSpec::StepOutput { step })
         }
         ([reference], None) => {
-            let reference = reference.strip_prefix("plan/").unwrap_or(reference);
-            let (plan, revision) = reference.rsplit_once('@').ok_or_else(|| {
+            let reference = reference.strip_prefix("mission/").unwrap_or(reference);
+            let (mission, revision) = reference.rsplit_once('@').ok_or_else(|| {
                 St3Error::new(
-                    "unpinned-plan-reference",
-                    "uses-plan needs an exact PLAN@REVISION reference",
+                    "unpinned-mission-reference",
+                    "uses-mission needs an exact MISSION@REVISION reference",
                 )
             })?;
-            validate_id(plan, "plan")?;
+            validate_id(mission, "mission")?;
             if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(St3Error::new(
-                    "invalid-plan-revision",
-                    "a used plan revision must be a 64-character hexadecimal hash",
+                    "invalid-mission-revision",
+                    "a used mission revision must be a 64-character hexadecimal hash",
                 ));
             }
-            Ok(UsedPlanSpec::Revision {
-                plan: plan.to_owned(),
+            Ok(UsedMissionSpec::Revision {
+                mission: mission.to_owned(),
                 revision: revision.to_ascii_lowercase(),
             })
         }
         _ => Err(St3Error::new(
-            "invalid-uses-plan",
-            "uses-plan needs one exact plan reference or one output-of property",
+            "invalid-uses-mission",
+            "uses-mission needs one exact mission reference or one output-of property",
         )),
     }
 }
@@ -1096,10 +1102,13 @@ fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
     })
 }
 
-fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Result<(), St3Error> {
+fn validate_dependencies(
+    mission: &str,
+    steps: &BTreeMap<String, StepSpec>,
+) -> Result<(), St3Error> {
     for step in steps.values() {
         validate_dependency_targets(
-            plan,
+            mission,
             &format!("step `{}`", step.id),
             &step.dependencies,
             steps,
@@ -1111,36 +1120,36 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
                 return Err(St3Error::new(
                     "cross-phase-dependency",
                     format!(
-                        "step `{}` in plan `{plan}` cannot depend on step `{target}` from another phase",
+                        "step `{}` in mission `{mission}` cannot depend on step `{target}` from another phase",
                         step.id
                     ),
                 ));
             }
         }
-        if step.produces_plan.is_some() && step.uses_plan.is_some() {
+        if step.produces_mission.is_some() && step.uses_mission.is_some() {
             return Err(St3Error::new(
-                "conflicting-plan-step",
+                "conflicting-mission-step",
                 format!(
-                    "step `{}` in plan `{plan}` cannot produce and use a plan",
+                    "step `{}` in mission `{mission}` cannot produce and use a mission",
                     step.id
                 ),
             ));
         }
-        if let Some(UsedPlanSpec::StepOutput { step: target }) = &step.uses_plan {
+        if let Some(UsedMissionSpec::StepOutput { step: target }) = &step.uses_mission {
             let Some(producer) = steps.get(target) else {
                 return Err(St3Error::new(
-                    "unknown-plan-output",
+                    "unknown-mission-output",
                     format!(
-                        "step `{}` in plan `{plan}` uses unknown step output `{target}`",
+                        "step `{}` in mission `{mission}` uses unknown step output `{target}`",
                         step.id
                     ),
                 ));
             };
-            if producer.produces_plan.is_none() {
+            if producer.produces_mission.is_none() {
                 return Err(St3Error::new(
-                    "not-a-plan-output",
+                    "not-a-mission-output",
                     format!(
-                        "step `{}` in plan `{plan}` does not produce a plan",
+                        "step `{}` in mission `{mission}` does not produce a mission",
                         producer.id
                     ),
                 ));
@@ -1150,9 +1159,9 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
             });
             if !waits_for_output {
                 return Err(St3Error::new(
-                    "missing-plan-output-dependency",
+                    "missing-mission-output-dependency",
                     format!(
-                        "step `{}` must depend on completed step `{target}` before it uses that plan output",
+                        "step `{}` must depend on completed step `{target}` before it uses that mission output",
                         step.id
                     ),
                 ));
@@ -1171,7 +1180,7 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
         if !visiting.insert(id.to_owned()) {
             return Err(St3Error::new(
                 "dependency-cycle",
-                format!("the plan has a dependency cycle through step `{id}`"),
+                format!("the mission has a dependency cycle through step `{id}`"),
             ));
         }
         for dependency in &steps[id].dependencies {
@@ -1192,7 +1201,7 @@ fn validate_dependencies(plan: &str, steps: &BTreeMap<String, StepSpec>) -> Resu
 }
 
 fn validate_dependency_targets(
-    plan: &str,
+    mission: &str,
     context: &str,
     dependencies: &[DependencySpec],
     steps: &BTreeMap<String, StepSpec>,
@@ -1203,7 +1212,7 @@ fn validate_dependency_targets(
         {
             return Err(St3Error::new(
                 "unknown-step-dependency",
-                format!("{context} in plan `{plan}` depends on unknown step `{target}`"),
+                format!("{context} in mission `{mission}` depends on unknown step `{target}`"),
             ));
         }
     }
@@ -1313,14 +1322,14 @@ fn validate_variables(value: &Value, input_names: &BTreeSet<String>) -> Result<(
     Ok(())
 }
 
-fn parse_plan_state(value: &str) -> Result<PlanState, St3Error> {
+fn parse_mission_state(value: &str) -> Result<MissionState, St3Error> {
     match value {
-        "draft" => Ok(PlanState::Draft),
-        "ready" => Ok(PlanState::Ready),
-        "retired" => Ok(PlanState::Retired),
+        "draft" => Ok(MissionState::Draft),
+        "ready" => Ok(MissionState::Ready),
+        "retired" => Ok(MissionState::Retired),
         _ => Err(St3Error::new(
-            "invalid-plan-state",
-            format!("plan state `{value}` is not registered"),
+            "invalid-mission-state",
+            format!("mission state `{value}` is not registered"),
         )),
     }
 }
@@ -1343,7 +1352,7 @@ fn normalize_assignee(value: &str, default_host: &str) -> String {
 }
 
 fn validate_id(value: &str, kind: &str) -> Result<(), St3Error> {
-    let invalid_path = kind != "plan" && value.contains('/');
+    let invalid_path = kind != "mission" && value.contains('/');
     if value.is_empty()
         || value.len() > 160
         || invalid_path
@@ -1353,7 +1362,7 @@ fn validate_id(value: &str, kind: &str) -> Result<(), St3Error> {
         || value.chars().any(char::is_whitespace)
     {
         return Err(St3Error::new(
-            "invalid-plan-id",
+            "invalid-mission-id",
             format!("{kind} ID `{value}` is invalid"),
         ));
     }
@@ -1563,8 +1572,8 @@ mod tests {
         let source = r#"
 version 2
 
-  plan "demo" state="ready" {
-    goal "Complete plan demo."
+  mission "demo" state="ready" {
+    goal "Complete mission demo."
     step "start" {
       agentless
 
@@ -1575,11 +1584,11 @@ version 2
 
     }
     step "one" {
-      assigned-to "agent/${ST_PLAN_RUN}/worker"
+      assigned-to "agent/${ST_MISSION_RUN}/worker"
       depends-on { step "start" completed }
-      plan "work" { goal "Complete plan work."; step "inspect" { } }
+      mission "work" { goal "Complete mission work."; step "inspect" { } }
       produces {
-        resource "plan-run/${ST_PLAN_RUN}/change" { kind "vcs.commit"; state "published" }
+        resource "mission-run/${ST_MISSION_RUN}/change" { kind "vcs.commit"; state "published" }
       }
     }
     step "two" { agentless; depends-on { step "start" completed } }
@@ -1588,20 +1597,20 @@ version 2
     finally {
       step "cleanup" {
         agentless
-         stop "agent/${ST_PLAN_RUN}/worker"
+         stop "agent/${ST_MISSION_RUN}/worker"
       }
     }
   }
 
 "#;
         let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let plan = &intent.plans["demo"];
-        assert_eq!(plan.steps.len(), 5);
-        assert_eq!(plan.max_active_runs, Some(1));
-        assert!(plan.steps["one"].nested_plan.is_some());
+        let mission = &intent.missions["demo"];
+        assert_eq!(mission.steps.len(), 5);
+        assert_eq!(mission.max_active_runs, Some(1));
+        assert!(mission.steps["one"].nested_mission.is_some());
         assert_eq!(
-            plan.steps["one"].products[0].subject,
-            "resource/plan-run/${ST_PLAN_RUN}/change"
+            mission.steps["one"].products[0].subject,
+            "resource/mission-run/${ST_MISSION_RUN}/change"
         );
     }
 
@@ -1611,7 +1620,7 @@ version 2
             crate::graph::parse_intent("version 2\n checkpoints \"old\" { } ", "node").unwrap_err();
         assert_eq!(old.code, "unknown-node");
         let cycle = crate::graph::parse_intent(
-            "version 2\n\n  plan \"cycle\" state=\"ready\" {\n    goal \"The cycle is rejected.\"\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n\n",
+            "version 2\n\n  mission \"cycle\" state=\"ready\" {\n    goal \"The cycle is rejected.\"\n    step \"a\" { depends-on \"b\" }\n    step \"b\" { depends-on \"a\" }\n  }\n\n",
             "node",
         )
         .unwrap_err();
@@ -1624,13 +1633,13 @@ version 2
             r#"
 version 2
 
-  plan "review" state="ready" {
-    goal "Complete plan review."
+  mission "review" state="ready" {
+    goal "Complete mission review."
     step "approval" {
       gate "human-review" type="human" {
         reviewer "person/nathan"
         question "Is this change ready to merge?"
-        review "resource/plan-run/${ST_PLAN_RUN}/pull-request"
+        review "resource/mission-run/${ST_MISSION_RUN}/pull-request"
         review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     }
@@ -1640,7 +1649,7 @@ version 2
             "node",
         )
         .unwrap();
-        let gate = &intent.plans["review"].steps["approval"].gates[0];
+        let gate = &intent.missions["review"].steps["approval"].gates[0];
         let crate::model::GateSpec::Human {
             reviewer,
             question,
@@ -1655,31 +1664,31 @@ version 2
         assert_eq!(
             review_targets,
             &[
-                "resource/plan-run/${ST_PLAN_RUN}/pull-request",
+                "resource/mission-run/${ST_MISSION_RUN}/pull-request",
                 "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]
         );
     }
 
     #[test]
-    fn parses_attempt_bound_plan_production_and_exact_plan_use() {
+    fn parses_attempt_bound_mission_production_and_exact_mission_use() {
         let intent = crate::graph::parse_intent(
             &format!(
                 r#"
 version 2
 
-  plan "bootstrap" state="ready" {{
-    goal "Complete plan bootstrap."
+  mission "bootstrap" state="ready" {{
+    goal "Complete mission bootstrap."
     step "compile" {{
-      document "doc/project/plan@{}"
-      produces-plan "project/work"
+      document "doc/project/mission@{}"
+      produces-mission "project/work"
     }}
     step "execute" {{
       depends-on {{ step "compile" completed }}
-      uses-plan output-of="compile"
+      uses-mission output-of="compile"
     }}
     step "reuse" {{
-      uses-plan "project/work@{}"
+      uses-mission "project/work@{}"
     }}
   }}
 
@@ -1690,43 +1699,43 @@ version 2
             "node",
         )
         .unwrap();
-        let plan = &intent.plans["bootstrap"];
+        let mission = &intent.missions["bootstrap"];
         assert_eq!(
-            plan.steps["compile"].produces_plan.as_deref(),
+            mission.steps["compile"].produces_mission.as_deref(),
             Some("project/work")
         );
         assert_eq!(
-            plan.steps["compile"].documents,
-            vec![format!("doc/project/plan@{}", "b".repeat(64))]
+            mission.steps["compile"].documents,
+            vec![format!("doc/project/mission@{}", "b".repeat(64))]
         );
         assert_eq!(
-            plan.steps["execute"].uses_plan,
-            Some(crate::model::UsedPlanSpec::StepOutput {
+            mission.steps["execute"].uses_mission,
+            Some(crate::model::UsedMissionSpec::StepOutput {
                 step: "compile".into()
             })
         );
         assert_eq!(
-            plan.steps["reuse"].uses_plan,
-            Some(crate::model::UsedPlanSpec::Revision {
-                plan: "project/work".into(),
+            mission.steps["reuse"].uses_mission,
+            Some(crate::model::UsedMissionSpec::Revision {
+                mission: "project/work".into(),
                 revision: "a".repeat(64),
             })
         );
     }
 
     #[test]
-    fn rejects_unpinned_or_unordered_plan_use() {
+    fn rejects_unpinned_or_unordered_mission_use() {
         let unpinned = crate::graph::parse_intent(
             r#"version 2
- plan "bad" state="ready" { goal "Use a plan."; step "use" { uses-plan "work" } } "#,
+ mission "bad" state="ready" { goal "Use a mission."; step "use" { uses-mission "work" } } "#,
             "node",
         )
         .unwrap_err();
-        assert_eq!(unpinned.code, "unpinned-plan-reference");
+        assert_eq!(unpinned.code, "unpinned-mission-reference");
 
         let unpinned_document = crate::graph::parse_intent(
             r#"version 2
- plan "bad" state="ready" { goal "Use a document."; step "use" { document "doc/project/plan" } } "#,
+ mission "bad" state="ready" { goal "Use a document."; step "use" { document "doc/project/mission" } } "#,
             "node",
         )
         .unwrap_err();
@@ -1735,25 +1744,25 @@ version 2
         let unordered = crate::graph::parse_intent(
             r#"version 2
 
-  plan "bad" state="ready" {
-    goal "Complete plan bad."
-    step "compile" { produces-plan "work" }
-    step "use" { uses-plan output-of="compile" }
+  mission "bad" state="ready" {
+    goal "Complete mission bad."
+    step "compile" { produces-mission "work" }
+    step "use" { uses-mission output-of="compile" }
   }
 "#,
             "node",
         )
         .unwrap_err();
-        assert_eq!(unordered.code, "missing-plan-output-dependency");
+        assert_eq!(unordered.code, "missing-mission-output-dependency");
     }
 
     #[test]
-    fn plan_and_step_contracts_accept_the_new_flat_language() {
+    fn mission_and_step_contracts_accept_the_new_flat_language() {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
 
-  plan "release" state="ready" {
+  mission "release" state="ready" {
     goal "Publish the release."
     goal "Keep the workspace clean."
     baseline "release is open" { field "state" "resource/release" is "open" }
@@ -1774,21 +1783,21 @@ version 2
             "node",
         )
         .unwrap();
-        let plan = &intent.plans["release"];
-        assert_eq!(plan.goals.len(), 2);
-        assert_eq!(plan.baselines.len(), 1);
-        assert_eq!(plan.products.len(), 1);
-        assert_eq!(plan.gates.len(), 1);
-        assert_eq!(plan.steps["build"].goals.len(), 2);
-        assert_eq!(plan.steps["build"].baselines.len(), 1);
-        assert_eq!(plan.steps["build"].products.len(), 1);
-        assert_eq!(plan.steps["build"].gates.len(), 1);
-        assert!(plan.steps["publish"].goals.is_empty());
+        let mission = &intent.missions["release"];
+        assert_eq!(mission.goals.len(), 2);
+        assert_eq!(mission.baselines.len(), 1);
+        assert_eq!(mission.products.len(), 1);
+        assert_eq!(mission.gates.len(), 1);
+        assert_eq!(mission.steps["build"].goals.len(), 2);
+        assert_eq!(mission.steps["build"].baselines.len(), 1);
+        assert_eq!(mission.steps["build"].products.len(), 1);
+        assert_eq!(mission.steps["build"].gates.len(), 1);
+        assert!(mission.steps["publish"].goals.is_empty());
 
         let unknown_product = crate::graph::parse_intent(
             r#"version 2
 
-  plan "bad-product" state="ready" {
+  mission "bad-product" state="ready" {
     goal "Publish one invalid resource."
     produces { resource "result" { kind "document.result"; state "published" } }
   }
@@ -1801,7 +1810,7 @@ version 2
         let duplicate_field = crate::graph::parse_intent(
             r#"version 2
 
-  plan "duplicate-product-field" state="ready" {
+  mission "duplicate-product-field" state="ready" {
     goal "Reject an ambiguous product."
     produces {
       resource "result" {
@@ -1824,7 +1833,7 @@ version 2
             r#"
 version 2
 
-  plan "pool" state="ready" {
+  mission "pool" state="ready" {
     goal "Complete the pool work."
     available-to "agent/node.one"
     available-to "agent/node.two"
@@ -1841,68 +1850,68 @@ version 2
             "node",
         )
         .unwrap();
-        let plan = &intent.plans["pool"];
+        let mission = &intent.missions["pool"];
         assert_eq!(
-            plan.work_selector,
+            mission.work_selector,
             Some(crate::model::WorkSelector::Available {
                 agents: vec!["agent/node.one".into(), "agent/node.two".into()]
             })
         );
-        assert_eq!(plan.steps["inherited"].work_selector, None);
+        assert_eq!(mission.steps["inherited"].work_selector, None);
         assert_eq!(
-            plan.steps["assigned"].work_selector,
+            mission.steps["assigned"].work_selector,
             Some(crate::model::WorkSelector::Assigned {
                 agent: "agent/node.one".into()
             })
         );
-        assert!(plan.steps["cleanup"].finally);
+        assert!(mission.steps["cleanup"].finally);
         assert_eq!(
-            plan.steps["cleanup"].work_selector,
+            mission.steps["cleanup"].work_selector,
             Some(crate::model::WorkSelector::Agentless)
         );
         assert!(matches!(
-            plan.completion,
+            mission.completion,
             Some(crate::model::CompletionSpec::Dependencies { .. })
         ));
 
         for source in [
             r#"version 2
- plan "bad" state="ready" { goal "Reject selectors."; assigned-to "agent/node.one"; agentless; step "work" { } } "#,
+ mission "bad" state="ready" { goal "Reject selectors."; assigned-to "agent/node.one"; agentless; step "work" { } } "#,
             r#"version 2
- plan "bad" state="ready" { goal "Reject selectors."; available-to "agent/node.one"; available-to "agent/node.one"; step "work" { } } "#,
+ mission "bad" state="ready" { goal "Reject selectors."; available-to "agent/node.one"; available-to "agent/node.one"; step "work" { } } "#,
             r#"version 2
- plan "bad" state="ready" { goal "Reject completion."; completion { when "all-steps-exhausted"; depends-on { step "work" completed } }; step "work" { } } "#,
+ mission "bad" state="ready" { goal "Reject completion."; completion { when "all-steps-exhausted"; depends-on { step "work" completed } }; step "work" { } } "#,
             r#"version 2
- plan "bad" state="ready" { goal "Reject a final completion dependency."; completion { depends-on { step "cleanup" completed } }; finally { step "cleanup" { } } } "#,
+ mission "bad" state="ready" { goal "Reject a final completion dependency."; completion { depends-on { step "cleanup" completed } }; finally { step "cleanup" { } } } "#,
             r#"version 2
- plan "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } "#,
+ mission "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } "#,
         ] {
             assert!(crate::graph::parse_intent(source, "node").is_err());
         }
     }
 
     #[test]
-    fn a_zero_step_plan_is_valid_and_has_no_implicit_completion() {
+    fn a_zero_step_mission_is_valid_and_has_no_implicit_completion() {
         let intent = crate::graph::parse_intent(
             r#"version 2
- plan "standing" state="ready" { goal "Keep the agent available." } "#,
+ mission "standing" state="ready" { goal "Keep the agent available." } "#,
             "node",
         )
         .unwrap();
-        let plan = &intent.plans["standing"];
-        assert!(plan.steps.is_empty());
-        assert!(plan.completion.is_none());
+        let mission = &intent.missions["standing"];
+        assert!(mission.steps.is_empty());
+        assert!(mission.completion.is_none());
     }
 
     #[test]
-    fn goal_limits_and_removed_plan_language_are_strict() {
+    fn goal_limits_and_removed_mission_language_are_strict() {
         for source in [
             r#"version 2
- plan "none" state="ready" { step "work" { } } "#,
+ mission "none" state="ready" { step "work" { } } "#,
             r#"version 2
- plan "four" state="ready" { goal "1"; goal "2"; goal "3"; goal "4"; step "work" { } } "#,
+ mission "four" state="ready" { goal "1"; goal "2"; goal "3"; goal "4"; step "work" { } } "#,
             r#"version 2
- plan "step-four" state="ready" { goal "Run."; step "work" { goal "1"; goal "2"; goal "3"; goal "4" } } "#,
+ mission "step-four" state="ready" { goal "Run."; step "work" { goal "1"; goal "2"; goal "3"; goal "4" } } "#,
         ] {
             assert_eq!(
                 crate::graph::parse_intent(source, "node").unwrap_err().code,
@@ -1911,15 +1920,15 @@ version 2
         }
         for removed in [
             r#"version 2
- plan "old" state="ready" { goal "Run."; outcome { } ; step "work" { } } "#,
+ mission "old" state="ready" { goal "Run."; outcome { } ; step "work" { } } "#,
             r#"version 2
- plan "old" state="ready" { goal "Run."; judges { } ; step "work" { } } "#,
+ mission "old" state="ready" { goal "Run."; judges { } ; step "work" { } } "#,
             r#"version 2
- plan "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } "#,
+ mission "old" state="ready" { goal "Run."; step "work" { judge "old" { exec "true" } } } "#,
             r#"version 2
- plan "old" state="ready" change-policy="agent" { goal "Run."; step "work" { } } "#,
+ mission "old" state="ready" change-policy="agent" { goal "Run."; step "work" { } } "#,
             r#"version 2
- plan "old" state="ready" change-authority="agent/worker" { goal "Run."; step "work" { } } "#,
+ mission "old" state="ready" change-authority="agent/worker" { goal "Run."; step "work" { } } "#,
         ] {
             assert!(crate::graph::parse_intent(removed, "node").is_err());
         }
@@ -1931,9 +1940,9 @@ version 2
             r#"
 version 2
 
-  plan "placed" state="ready" revisions="human-only" revision-reviewer="person/plan" revision-cutover="when-idle" {
+  mission "placed" state="ready" revisions="human-only" revision-reviewer="person/mission" revision-cutover="when-idle" {
     goal "Test revision placement."
-     agent "plan-owner" { workspace "."; command "true" }
+     agent "mission-owner" { workspace "."; command "true" }
     step "work" revisions="human-only" revision-reviewer="person/step" {
       assigned-to "agent/assignee"
        agent "step-owner" { workspace "."; command "true" }
@@ -1944,15 +1953,15 @@ version 2
             "node",
         )
         .unwrap();
-        let plan = &intent.plans["placed"];
-        assert_eq!(plan.revision_owners, vec!["agent/node.plan-owner"]);
-        assert!(plan.revisions_human_only);
-        assert_eq!(plan.revision_reviewer.as_deref(), Some("person/plan"));
+        let mission = &intent.missions["placed"];
+        assert_eq!(mission.revision_owners, vec!["agent/node.mission-owner"]);
+        assert!(mission.revisions_human_only);
+        assert_eq!(mission.revision_reviewer.as_deref(), Some("person/mission"));
         assert_eq!(
-            plan.revision_cutover,
+            mission.revision_cutover,
             crate::model::RevisionCutover::WhenIdle
         );
-        let step = &plan.steps["work"];
+        let step = &mission.steps["work"];
         assert_eq!(step.revision_owners, vec!["agent/node.step-owner"]);
         assert!(step.revisions_human_only);
         assert_eq!(step.revision_reviewer.as_deref(), Some("person/step"));
@@ -1965,10 +1974,10 @@ version 2
             r#"
 version 2
 
-  plan "reserved" state="ready" {
+  mission "reserved" state="ready" {
     goal "Reject a context override."
     step "work" {
-       exec "task" { command "true"; env { ST_PLAN_RUN "forged" } }
+       exec "task" { command "true"; env { ST_MISSION_RUN "forged" } }
     }
   }
 
@@ -1982,7 +1991,7 @@ version 2
             r#"
 version 2
 
-  plan "allowed" state="ready" {
+  mission "allowed" state="ready" {
     goal "Allow an application variable."
     step "work" {
        exec "task" { command "true"; env { ST_ROOT "allowed" } }
@@ -1996,12 +2005,12 @@ version 2
     }
 
     #[test]
-    fn plan_inputs_and_run_limits_use_the_explicit_language() {
+    fn mission_inputs_and_run_limits_use_the_explicit_language() {
         let intent = crate::graph::parse_intent(
             r#"
 version 2
 
-  plan "parameterized" state="ready" {
+  mission "parameterized" state="ready" {
     input "message" kind="text"
     input "source" kind="resource"
     concurrent-runs max=4
@@ -2012,7 +2021,7 @@ version 2
       gate "the source is ready" { field "state" "${input.source}" is "ready" }
     }
   }
-  plan "unbounded" state="ready" {
+  mission "unbounded" state="ready" {
     concurrent-runs
     goal "Allow concurrent runs."
   }
@@ -2021,30 +2030,30 @@ version 2
             "node",
         )
         .unwrap();
-        let parameterized = &intent.plans["parameterized"];
+        let parameterized = &intent.missions["parameterized"];
         assert_eq!(parameterized.inputs.len(), 2);
         assert_eq!(
             parameterized.inputs["message"].kind,
-            crate::model::PlanInputKind::Text
+            crate::model::MissionInputKind::Text
         );
         assert_eq!(
             parameterized.inputs["source"].kind,
-            crate::model::PlanInputKind::Resource
+            crate::model::MissionInputKind::Resource
         );
         assert_eq!(parameterized.max_active_runs, Some(4));
-        assert_eq!(intent.plans["unbounded"].max_active_runs, None);
+        assert_eq!(intent.missions["unbounded"].max_active_runs, None);
 
         for source in [
             r#"version 2
- plan "bad" state="ready" { input "x" kind="text"; input "x" kind="text"; goal "Reject duplicate input." } "#,
+ mission "bad" state="ready" { input "x" kind="text"; input "x" kind="text"; goal "Reject duplicate input." } "#,
             r#"version 2
- plan "bad" state="ready" { input "x" kind="secret"; goal "Reject the input kind." } "#,
+ mission "bad" state="ready" { input "x" kind="secret"; goal "Reject the input kind." } "#,
             r#"version 2
- plan "bad" state="ready" { concurrent-runs max=0; goal "Reject the run limit." } "#,
+ mission "bad" state="ready" { concurrent-runs max=0; goal "Reject the run limit." } "#,
             r#"version 2
- plan "bad" state="ready" { goal "Use ${input.missing}." } "#,
+ mission "bad" state="ready" { goal "Use ${input.missing}." } "#,
             r#"version 2
- plan "bad" state="ready" { agentless; goal "Reject a plan selector." } "#,
+ mission "bad" state="ready" { agentless; goal "Reject a mission selector." } "#,
         ] {
             assert!(crate::graph::parse_intent(source, "node").is_err());
         }

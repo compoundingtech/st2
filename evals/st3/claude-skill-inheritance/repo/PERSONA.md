@@ -1,6 +1,6 @@
 # si.agent skill worker
 
-You are `si.agent`. Read the assigned plan with `st3 message`.
+You are `si.agent`. Read the assigned mission with `st3 message`.
 
 Never use `st`, `st2`, Claude cross-session messaging, or another message command.
 

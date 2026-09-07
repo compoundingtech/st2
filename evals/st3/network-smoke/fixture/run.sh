@@ -10,12 +10,12 @@ run_id=""
 wait_for_terminal_cleanup() {
   local phase=""
   for _ in $(seq 1 200); do
-    phase="$(st3 --endpoint "$socket" inspect "plan-run/$run_id" --json 2>/dev/null \
+    phase="$(st3 --endpoint "$socket" inspect "mission-run/$run_id" --json 2>/dev/null \
       | jq -r '.status.subjects[0].actual.phase // .status.subjects[0].actual.fields.phase // empty')"
     [ "$phase" = terminal ] && return
     sleep 0.05
   done
-  printf 'plan-run/%s did not finish runtime cleanup\n' "$run_id" >&2
+  printf 'mission-run/%s did not finish runtime cleanup\n' "$run_id" >&2
   return 1
 }
 remove_test_ptys() {
@@ -28,7 +28,7 @@ remove_test_ptys() {
 cleanup() {
   local failed=0
   if [ -S "$socket" ] && [ -n "$run_id" ]; then
-    printf 'version 2\nplan-run "%s" { cancellation "fixture-complete" { reason "the fixture completed" } }\n' "$run_id" >stop.kdl
+    printf 'version 2\nmission-run "%s" { cancellation "fixture-complete" { reason "the fixture completed" } }\n' "$run_id" >stop.kdl
     if st3 --endpoint "$socket" publish stop.kdl --as person/fixture >/dev/null 2>&1; then
       wait_for_terminal_cleanup || failed=1
     else
@@ -57,7 +57,7 @@ st3 --endpoint "$socket" doctor >/dev/null
 printf 'NETWORK-SMOKE-HEALTH-GREEN\n' >result.txt
 cat >network.kdl <<KDL
 version 2
-plan "fixture/network-smoke" state="ready" {
+mission "fixture/network-smoke" state="ready" {
   goal "Keep one message target available."
   agent "net.dev" {
     workspace "$PWD"
@@ -70,7 +70,7 @@ plan "fixture/network-smoke" state="ready" {
 }
 KDL
 st3 --endpoint "$socket" publish network.kdl --as person/fixture >/dev/null
-run_id="$(st3 --endpoint "$socket" --json plan start fixture/network-smoke --workspace "$PWD" --as person/fixture | jq -er .plan_run.id)"
+run_id="$(st3 --endpoint "$socket" --json mission start fixture/network-smoke --workspace "$PWD" --as person/fixture | jq -er .mission_run.id)"
 agent="agent/$run_id/net.dev"
 for _ in $(seq 1 100); do st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null 2>&1 && break; sleep 0.05; done
 st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null

@@ -46,15 +46,15 @@ wait_for_event() {
 }
 
 st3 publish "$EVAL_ROOT/initial.kdl" --as "$REQUESTER" >/dev/null
-st3 --json plan start generation-proof \
-  --id "generation-proof/${ST_PLAN_RUN}" \
+st3 --json mission start generation-proof \
+  --id "generation-proof/${ST_MISSION_RUN}" \
   --workspace "$EVAL_ROOT" \
   --as "$REQUESTER" > "$EVAL_ROOT/initial-run.json"
 
-run_subject=$(jq -er '.plan_run.subject' "$EVAL_ROOT/initial-run.json")
-run_id=$(jq -er '.plan_run.id' "$EVAL_ROOT/initial-run.json")
-old_generation=$(jq -er '.plan_run.generation' "$EVAL_ROOT/initial-run.json")
-stable_subject=$(jq -er '.plan_run.steps[] | select(.step == "stable") | .subject' "$EVAL_ROOT/initial-run.json")
+run_subject=$(jq -er '.mission_run.subject' "$EVAL_ROOT/initial-run.json")
+run_id=$(jq -er '.mission_run.id' "$EVAL_ROOT/initial-run.json")
+old_generation=$(jq -er '.mission_run.generation' "$EVAL_ROOT/initial-run.json")
+stable_subject=$(jq -er '.mission_run.steps[] | select(.step == "stable") | .subject' "$EVAL_ROOT/initial-run.json")
 
 st3 claim "resource/generation-proof/$run_id/stable" resource.observed \
   --actor "$REQUESTER" \
@@ -80,7 +80,7 @@ wait_for_event \
   "$EVAL_ROOT/planning-events.jsonl"
 
 st3 --json work revision generation "$old_generation" > "$EVAL_ROOT/before-approval.json"
-jq -e --arg revision "$(jq -er '.plan_run.revision' "$EVAL_ROOT/initial-run.json")" '
+jq -e --arg revision "$(jq -er '.mission_run.revision' "$EVAL_ROOT/initial-run.json")" '
   .status == "running"
   and .revision == $revision
 ' "$EVAL_ROOT/before-approval.json" >/dev/null
@@ -93,8 +93,8 @@ jq -e '
   and (.preview.graph | contains("stable [root]"))
   and (.preview.graph | contains("changed [after stable]"))
   and (.preview.graph | contains("generation-environment [root]"))
-  and (.preview.diff | contains("update plan/generation-proof"))
-  and (.preview.plan.blockers | length == 0)
+  and (.preview.diff | contains("update mission/generation-proof"))
+  and (.preview.mission.blockers | length == 0)
 ' "$EVAL_ROOT/preview.json" >/dev/null
 
 st3 --json planning approve \
@@ -106,12 +106,12 @@ st3 --json planning approve \
 jq -e --arg hash "$preview_hash" '
   .status == "approved"
   and .preview.hash == $hash
-  and .published_revision == .candidate.plan_revision
-  and .target_plan_run != null
+  and .published_revision == .candidate.mission_revision
+  and .target_mission_run != null
   and .source_generation != null
 ' "$EVAL_ROOT/approved.json" >/dev/null
 
-st3 --json plan show "$run_subject" > "$EVAL_ROOT/applied.json"
+st3 --json mission show "$run_subject" > "$EVAL_ROOT/applied.json"
 new_generation=$(jq -er '.generation' "$EVAL_ROOT/applied.json")
 environment_subject=$(jq -er '.steps[] | select(.step == "generation-environment") | .subject' "$EVAL_ROOT/applied.json")
 st3 wait "$environment_subject" --for completed --timeout 2m >/dev/null

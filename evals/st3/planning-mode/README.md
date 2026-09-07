@@ -6,11 +6,11 @@ The controller starts a durable planning session. It waits on the planning-sessi
 
 Mechanical gates prove these boundaries:
 
-- No plan is published before approval.
+- No mission is published before approval.
 - The preview shows the explicit `inspect` to `verify` dependency.
-- Approval publishes exactly one ready plan.
-- Approval does not start a plan run.
-- The published plan links the immutable Markdown and KDL documents.
+- Approval publishes exactly one ready mission.
+- Approval does not start a mission run.
+- The published mission links the immutable Markdown and KDL documents.
 - The planner stops after approval.
 - The planning workspace does not change.
 

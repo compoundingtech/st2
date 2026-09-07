@@ -1,9 +1,9 @@
 # Sourced helper. Aggregate the reviewer report and the supervisor verdict from Small Talk.
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 ROOT="${CATALOG:-$PWD}"
 R="$ROOT/rev"
-SUP_ID="agent/$ST_PLAN_RUN/prx.sup"
-REVIEWER_ID="agent/$ST_PLAN_RUN/prx.rev"
+SUP_ID="agent/$ST_MISSION_RUN/prx.sup"
+REVIEWER_ID="agent/$ST_MISSION_RUN/prx.rev"
 
 messages_to() {
   local recipient=$1

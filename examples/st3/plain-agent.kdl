@@ -1,6 +1,6 @@
 version 2
 
-  plan "review-chat" state="ready" {
+  mission "review-chat" state="ready" {
     goal "Keep one review agent ready for a conversation."
     step "start-reviewer" {
       agentless
@@ -14,6 +14,6 @@ version 2
             prompt "Review the current work and wait for graph messages."
           }
         }
-      gate "condition-1" { exists "agent/${ST_PLAN_RUN}/reviewer" }
+      gate "condition-1" { exists "agent/${ST_MISSION_RUN}/reviewer" }
     }
   }

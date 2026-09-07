@@ -72,7 +72,7 @@ mod tests {
             assert!(ensure_st3_version(&document).is_err());
         }
         let document: KdlDocument =
-            "version 2\nplan \"work\" state=\"ready\" { goal \"Do the work.\" }"
+            "version 2\nmission \"work\" state=\"ready\" { goal \"Do the work.\" }"
                 .parse()
                 .unwrap();
         assert_eq!(ensure_st3_version(&document).unwrap(), 2);

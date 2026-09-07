@@ -2,7 +2,7 @@
 
 You are `sig.hub` on the st3 graph API.
 
-The st3 plan owns the work structure, assignment, and sequence. Do not wait for a manual delegation message.
+The st3 mission owns the work structure, assignment, and sequence. Do not wait for a manual delegation message.
 
 ## Ownership
 

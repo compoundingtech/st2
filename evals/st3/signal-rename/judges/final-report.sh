@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 
-messages="$(st3 message ls local.morgan --from "agent/$ST_PLAN_RUN/sig.sup" --json)"
+messages="$(st3 message ls local.morgan --from "agent/$ST_MISSION_RUN/sig.sup" --json)"
 matching="$(
   jq \
-    --arg tag "plan-run:$ST_PLAN_RUN" \
+    --arg tag "mission-run:$ST_MISSION_RUN" \
     '[.[] | select(.tags | index($tag))]' \
     <<<"$messages"
 )"
 
 count="$(jq 'length' <<<"$matching")"
 [ "$count" -eq 1 ] || {
-  echo "FAIL: expected one final report for plan run $ST_PLAN_RUN, found $count"
+  echo "FAIL: expected one final report for mission run $ST_MISSION_RUN, found $count"
   exit 1
 }
 

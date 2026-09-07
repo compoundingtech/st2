@@ -1,6 +1,6 @@
-# st3 plan runtime verification
+# st3 mission runtime verification
 
-This report records the plan runtime design verification from 2026-09-05.
+This report records the mission runtime design verification from 2026-09-05.
 
 ## Code verification
 
@@ -10,7 +10,7 @@ The release build succeeds.
 
 The source tree passes `cargo fmt` and `git diff --check`.
 
-The tests cover plan ownership, inputs, selectors, standing runs, generations, planning, and cleanup.
+The tests cover mission ownership, inputs, selectors, standing runs, generations, planning, and cleanup.
 
 The tests also cover failed runtime starts and cancellation races.
 
@@ -20,11 +20,11 @@ All 12 model-free evals pass with the exact release binary.
 
 The run used a fresh daemon state.
 
-Plan Inputs passed with one exact text input and one exact resource claim input.
+Mission Inputs passed with one exact text input and one exact resource claim input.
 
 Run Generation Revision passed with the required generation lineage.
 
-The network evals wait for terminal plan-run cleanup and remove only their isolated PTY records.
+The network evals wait for terminal mission-run cleanup and remove only their isolated PTY records.
 
 A repeated cleanup proof found no process under either test root after both evals completed.
 
@@ -40,9 +40,9 @@ Fork in the Road used an email allow-list for an owner check.
 
 The corrected gate uses the exact Git author name. All seven retained gates pass.
 
-Plan Document Lift constructed step subjects from a plan run ID instead of its generation ID.
+Mission Document Lift constructed step subjects from a mission run ID instead of its generation ID.
 
-The corrected graph gate passes against the retained completed child plan.
+The corrected graph gate passes against the retained completed child mission.
 
 Signal Rename used the removed `ST3_WORKSPACE` variable in one shared judge helper.
 

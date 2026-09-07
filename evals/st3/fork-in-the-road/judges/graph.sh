@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 agents="$(env -u ST_AGENT st3 agents --json)"
-run="plan-run/$ST_PLAN_RUN"
-plan="$(env -u ST_AGENT st3 --json plan show "$run")"
+run="mission-run/$ST_MISSION_RUN"
+mission="$(env -u ST_AGENT st3 --json mission show "$run")"
 grouping_reason="the supervisor combines the panel recommendation"
 
 for member in fd.a fd.b fd.c; do
-  jq -e --arg subject "agent/$ST_PLAN_RUN/$member" --arg sup "agent/$ST_PLAN_RUN/fd.sup" --arg reason "$grouping_reason" '
+  jq -e --arg subject "agent/$ST_MISSION_RUN/$member" --arg sup "agent/$ST_MISSION_RUN/fd.sup" --arg reason "$grouping_reason" '
     [.[] | select(.subject == $subject)] as $agents
     | ($agents | length) == 1
       and ($agents[0].under == [{"agent":$sup,"reason":$reason}])
@@ -32,12 +32,12 @@ completed_steps=(
 for step in "${completed_steps[@]}"; do
   count="$(jq --arg run "$run" --arg step "$step" \
     '[.steps[] | select(.step == $step and .status == "completed")] | length' \
-    <<<"$plan")"
+    <<<"$mission")"
   test "$count" -eq 1
 done
 
 while read -r name kind; do
-  subject="resource/plan-run/$ST_PLAN_RUN/$name"
+  subject="resource/mission-run/$ST_MISSION_RUN/$name"
   status="$(st3 inspect "$subject" --json)"
   jq -e --arg kind "$kind" '
     .status.subjects[0].actual | (.fields // .)
@@ -58,7 +58,7 @@ final-report custom.st3.message-receipt
 PRODUCTS
 
 while read -r role name; do
-  subject="resource/plan-run/$ST_PLAN_RUN/$name"
+  subject="resource/mission-run/$ST_MISSION_RUN/$name"
   published="$(st3 inspect "$subject" --json \
     | jq -r '.status.subjects[0].actual | (.fields // .) | .sha')"
   current="$(git -C "$CATALOG/$role" rev-parse HEAD)"

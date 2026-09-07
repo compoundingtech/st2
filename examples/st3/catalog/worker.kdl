@@ -1,6 +1,6 @@
 version 2
 
-  plan "catalog/worker" state="ready" {
+  mission "catalog/worker" state="ready" {
     goal "Keep the catalog worker ready for work."
     step "start-worker" {
       agentless
@@ -11,6 +11,6 @@ version 2
             prompt "Own the assigned repository and wait for graph messages."
           }
         }
-      gate "condition-1" { exists "agent/${ST_PLAN_RUN}/catalog.worker" }
+      gate "condition-1" { exists "agent/${ST_MISSION_RUN}/catalog.worker" }
     }
   }

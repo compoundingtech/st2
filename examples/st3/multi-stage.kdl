@@ -4,9 +4,9 @@ version 2
     kind "human.review"
   }
 
-  plan "release" state="ready" {
+  mission "release" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Complete plan release."
+    goal "Complete mission release."
     step "build" timeout="20m" {
       title "The build command passes"
         exec "release-example/build" {
@@ -14,8 +14,8 @@ version 2
           command "cargo test --workspace"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/release-example/build" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/release-example/build" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/release-example/build" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/release-example/build" "is" 0 }
     }
 
     step "approval" {

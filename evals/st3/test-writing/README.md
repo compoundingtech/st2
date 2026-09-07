@@ -2,7 +2,7 @@
 
 This eval tests a Codex supervisor and developer with a mutation-scored test task.
 
-The graph stores the brief, the test plan, the revision, both reports, and verification state.
+The graph stores the brief, the test mission, the revision, both reports, and verification state.
 
 The developer can change tests only. A held-out battery requires at least 10 killed mutations from 12.
 

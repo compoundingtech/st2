@@ -53,7 +53,7 @@
   },
   "result": {
     "scope": "scope/eval/weird-git-setup/332ddd69ce034f9e1fe23088b377a4ea",
-    "plan_run": "plan-run/332ddd69ce034f9e1fe23088b377a4ea",
+    "mission_run": "mission-run/332ddd69ce034f9e1fe23088b377a4ea",
     "lifecycle": "completed",
     "phase": "terminal",
     "verdict": "pass",

@@ -17,13 +17,13 @@ fi
 for eval_dir in "${evals[@]}"; do
   name=$(basename "$eval_dir")
   echo "running $name"
-  if [ "$name" = plan-inputs ]; then
+  if [ "$name" = mission-inputs ]; then
     message=$'A "quoted" input\nand a second line.'
-    st3 claim resource/plan-inputs/source resource.observed \
+    st3 claim resource/mission-inputs/source resource.observed \
       --field state=ready >/dev/null
     st3 eval "$eval_dir" \
       --input "message=$message" \
-      --input source=resource/plan-inputs/source
+      --input source=resource/mission-inputs/source
   else
     st3 eval "$eval_dir"
   fi

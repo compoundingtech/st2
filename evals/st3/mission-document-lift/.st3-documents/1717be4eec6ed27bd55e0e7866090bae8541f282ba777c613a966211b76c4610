@@ -1,4 +1,4 @@
-# Deployment summary plan
+# Deployment summary mission
 
 Read `inventory.json` and produce `RESULT.md`.
 
@@ -22,12 +22,12 @@ Do not add a heading, list markers, or other lines.
 
 Run `bash verify.sh` after you write the result. Correct the result until the verifier passes.
 
-Before you inspect `inventory.json` or write `RESULT.md`, publish the complete execution plan to st3.
-Publish one ready plan with ID `eval/plan-document-lift/work`.
+Before you inspect `inventory.json` or write `RESULT.md`, publish the complete execution mission to st3.
+Publish one ready mission with ID `eval/mission-document-lift/work`.
 
-The KDL file must start with `version 2`. It must put the plan inside one untyped `subgraph` root.
+The KDL file must start with `version 2`. It must put the mission inside one untyped `subgraph` root.
 
-The published plan must contain these ordered steps:
+The published mission must contain these ordered steps:
 
 1. `inspect-inventory` reads and classifies the input.
 2. `write-result` depends on `inspect-inventory` and writes `RESULT.md`.
@@ -40,7 +40,7 @@ The final step must declare this graph product:
 
 ```kdl
 produces {
-  resource "${ROOT_ST_PLAN_RUN}/plan-result" {
+  resource "${ROOT_MISSION_RUN}/mission-result" {
     kind "document.result"
     state "published"
   }
@@ -50,5 +50,5 @@ produces {
 Its goal must tell the worker to run this exact command after the verifier passes:
 
 ```sh
-st3 claim resource/${ROOT_ST_PLAN_RUN}/plan-result resource.binding --field kind=document.result --field state=published
+st3 claim resource/${ROOT_MISSION_RUN}/mission-result resource.binding --field kind=document.result --field state=published
 ```

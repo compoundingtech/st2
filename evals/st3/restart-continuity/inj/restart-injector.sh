@@ -5,7 +5,7 @@ ledger="$CATALOG/worker"
 state="$CATALOG/.stev"
 stamp="$state/restart.done"
 log="$state/restart.log"
-subject="agent/${ST_PLAN_RUN}/rc.dev"
+subject="agent/${ST_MISSION_RUN}/rc.dev"
 mkdir -p "$state"
 
 actual() {
@@ -39,10 +39,10 @@ done
 duplicate_id="$(st3 message send "$subject" \
   --from "$ST3_SUBJECT" \
   --subject "Repeated pre-restart work" \
-  --tags "plan-run:$ST_PLAN_RUN,duplicate-work:process-before-restart" \
-  -m "DUPLICATE-BATCH-RC-7B9D: This repeats work assigned before the cold restart. Read the durable st3 plan, PROGRESS.md, and git history. Do not redo items 1 or 2. Continue only ready assigned work.")"
+  --tags "mission-run:$ST_MISSION_RUN,duplicate-work:process-before-restart" \
+  -m "DUPLICATE-BATCH-RC-7B9D: This repeats work assigned before the cold restart. Read the durable st3 mission, PROGRESS.md, and git history. Do not redo items 1 or 2. Continue only ready assigned work.")"
 
-st3 claim "resource/plan-run/$ST_PLAN_RUN/restart" resource.observed \
+st3 claim "resource/mission-run/$ST_MISSION_RUN/restart" resource.observed \
   --actor "$ST3_SUBJECT" \
   --field kind=custom.st3.cold-restart \
   --field state=injected \

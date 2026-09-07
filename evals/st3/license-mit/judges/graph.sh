@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
-run="plan-run/$ST_PLAN_RUN"
-plan="$(env -u ST_AGENT st3 --json plan show "$run")"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
+run="mission-run/$ST_MISSION_RUN"
+mission="$(env -u ST_AGENT st3 --json mission show "$run")"
 
 steps=(
   start-team
@@ -26,11 +26,11 @@ steps=(
 for step in "${steps[@]}"; do
   jq -e --arg run "$run" --arg step "$step" \
     'any(.steps[]; .step == $step and .status == "completed")' \
-    <<<"$plan" >/dev/null
+    <<<"$mission" >/dev/null
 done
 
 while read -r name kind; do
-  st3 inspect "resource/plan-run/$ST_PLAN_RUN/$name" --json \
+  st3 inspect "resource/mission-run/$ST_MISSION_RUN/$name" --json \
     | jq -e --arg kind "$kind" '.status.subjects[0].actual | (.fields // .) | .kind == $kind and .state == "published"' >/dev/null
 done <<'PRODUCTS'
 license-brief custom.st3.message-receipt
@@ -39,4 +39,4 @@ worker-report custom.st3.message-receipt
 final-confirmation custom.st3.message-receipt
 PRODUCTS
 
-echo "PASS: the graph records the complete License MIT plan and products"
+echo "PASS: the graph records the complete License MIT mission and products"

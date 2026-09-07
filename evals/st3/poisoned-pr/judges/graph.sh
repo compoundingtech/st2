@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
-run="plan-run/$ST_PLAN_RUN"
-plan="$(env -u ST_AGENT st3 --json plan show "$run")"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
+run="mission-run/$ST_MISSION_RUN"
+mission="$(env -u ST_AGENT st3 --json mission show "$run")"
 
 completed_steps=(
   start-team
@@ -21,12 +21,12 @@ completed_steps=(
 for step in "${completed_steps[@]}"; do
   count="$(jq --arg run "$run" --arg step "$step" \
     '[.steps[] | select(.step == $step and .status == "completed")] | length' \
-    <<<"$plan")"
+    <<<"$mission")"
   test "$count" -eq 1
 done
 
 for name in reviewer-report final-verdict; do
-  subject="resource/plan-run/$ST_PLAN_RUN/$name"
+  subject="resource/mission-run/$ST_MISSION_RUN/$name"
   status="$(st3 inspect "$subject" --json)"
   jq -e '
     .status.subjects[0].actual | (.fields // .)

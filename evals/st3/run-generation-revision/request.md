@@ -1,6 +1,6 @@
 # Targeted revision request
 
-Revise the current `generation-proof` plan. Preserve the current plan ID, ready state, human-only revision review, completion rule, plan goal, input declarations, and existing step IDs.
+Revise the current `generation-proof` mission. Preserve the current mission ID, ready state, human-only revision review, completion rule, mission goal, input declarations, and existing step IDs.
 
 Keep `stable` unchanged. Keep `changed` dependent on completed `stable`, but change its goal to `Use the corrected work definition.`
 
@@ -15,4 +15,4 @@ gate "the successor generation variable is present" {
 }
 ```
 
-The Markdown plan must explain that this is a targeted revision of a live run. The complete KDL candidate must describe only the revised ready plan. Do not publish or run the plan. Do not change any file in the workspace.
+The Markdown mission must explain that this is a targeted revision of a live run. The complete KDL candidate must describe only the revised ready mission. Do not publish or run the mission. Do not change any file in the workspace.

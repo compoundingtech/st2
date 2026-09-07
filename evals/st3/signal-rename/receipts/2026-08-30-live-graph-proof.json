@@ -17,11 +17,11 @@
   "viewer": {
     "start_and_watch": "st3 eval PATH --graph",
     "attach_to_running": "st3 graph SCOPE",
-    "source": "the eval scope and its root plan runs",
+    "source": "the eval scope and its root mission runs",
     "eval_specific_configuration": false,
     "shows": [
       "current lifecycle, phase, verdict, cleanup, and progress",
-      "root and nested plan work",
+      "root and nested mission work",
       "active assignees and blocked reasons",
       "recent semantic state transitions"
     ],

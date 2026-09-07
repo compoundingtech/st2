@@ -513,7 +513,7 @@ fn build_registry() -> Registry {
         (
             "agent",
             "agent/RUN/LOCAL_ID",
-            "A plan-run agent runtime.",
+            "A mission-run agent runtime.",
             false,
         ),
         (
@@ -532,7 +532,7 @@ fn build_registry() -> Registry {
         (
             "exec",
             "exec/RUN/LOCAL_ID",
-            "A plan-run exec runtime.",
+            "A mission-run exec runtime.",
             false,
         ),
         (
@@ -552,17 +552,22 @@ fn build_registry() -> Registry {
         (
             "observer",
             "observer/RUN/LOCAL_ID",
-            "A plan-run resource observer.",
+            "A mission-run resource observer.",
             false,
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
         (
-            "plan",
-            "plan/ID",
-            "An immutable plan revision lineage.",
+            "mission",
+            "mission/ID",
+            "An immutable mission revision lineage.",
             false,
         ),
-        ("plan-run", "plan-run/ID", "A plan execution.", false),
+        (
+            "mission-run",
+            "mission-run/ID",
+            "A mission execution.",
+            false,
+        ),
         (
             "planning-session",
             "planning-session/ID",
@@ -572,7 +577,7 @@ fn build_registry() -> Registry {
         (
             "pty",
             "pty/RUN/LOCAL_ID",
-            "A plan-run terminal runtime.",
+            "A mission-run terminal runtime.",
             false,
         ),
         (
@@ -584,19 +589,19 @@ fn build_registry() -> Registry {
         (
             "revision-proposal",
             "revision-proposal/ID",
-            "A plan revision proposal.",
+            "A mission revision proposal.",
             false,
         ),
         (
             "run-generation",
             "run-generation/ID",
-            "An immutable plan-run generation.",
+            "An immutable mission-run generation.",
             false,
         ),
         (
             "schedule",
             "schedule/RUN/LOCAL_ID",
-            "A plan-run schedule.",
+            "A mission-run schedule.",
             false,
         ),
         (
@@ -608,7 +613,7 @@ fn build_registry() -> Registry {
         (
             "subscription",
             "subscription/RUN/LOCAL_ID",
-            "A plan-run observer subscription.",
+            "A mission-run observer subscription.",
             false,
         ),
     ]
@@ -822,8 +827,8 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "host",
                 "message",
                 "observer",
-                "plan",
-                "plan-run",
+                "mission",
+                "mission-run",
                 "planning-session",
                 "pty",
                 "resource",
@@ -843,40 +848,40 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["doc"],
         ),
         (
-            "plan.published",
-            &["plan"],
+            "mission.published",
+            &["mission"],
             WritePolicy::AuthorizedRequester,
             Cardinality::Append,
-            Some("plans"),
+            Some("missions"),
             true,
-            &["plan"],
+            &["mission"],
         ),
         (
-            "plan.produced",
-            &["plan", "step-run"],
+            "mission.produced",
+            &["mission", "step-run"],
             WritePolicy::CapabilityHolder,
             Cardinality::Append,
-            Some("plan-products"),
+            Some("mission-products"),
             true,
             &["produces"],
         ),
         (
-            "plan-run.created",
-            &["plan-run"],
+            "mission-run.created",
+            &["mission-run"],
             WritePolicy::SystemOnly,
             Cardinality::Once,
-            Some("plan-runs"),
+            Some("mission-runs"),
             true,
-            &["plan-run"],
+            &["mission-run"],
         ),
         (
-            "plan-run.state",
-            &["plan-run"],
+            "mission-run.state",
+            &["mission-run"],
             WritePolicy::SystemOnly,
             Cardinality::StateTransition,
-            Some("plan-runs"),
+            Some("mission-runs"),
             true,
-            &["plan-run", "completion", "finally", "cancellation"],
+            &["mission-run", "completion", "finally", "cancellation"],
         ),
         (
             "publication.operation",
@@ -894,7 +899,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Cardinality::Once,
             Some("run-generations"),
             true,
-            &["plan-run", "revision"],
+            &["mission-run", "revision"],
         ),
         (
             "run-generation.state",
@@ -904,7 +909,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("run-generations"),
             true,
             &[
-                "plan-run",
+                "mission-run",
                 "step",
                 "completion",
                 "finally",
@@ -1022,7 +1027,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "eval.verdict",
-            &["plan-run"],
+            &["mission-run"],
             WritePolicy::SystemOnly,
             Cardinality::Once,
             Some("evals"),
@@ -1432,27 +1437,27 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("size", integer()),
             ("executable", boolean()),
         ],
-        "plan.published" => &[
+        "mission.published" => &[
             ("revision", string()),
             ("state", string()),
             ("body", object()),
         ],
-        "plan.produced" => &[
+        "mission.produced" => &[
             ("name", string()),
-            ("plan", reference()),
+            ("mission", reference()),
             ("revision", string()),
             ("step_definition", string()),
             ("attempt", integer()),
         ],
-        "plan-run.created" => &[
+        "mission-run.created" => &[
             ("status", string()),
-            ("plan", reference()),
+            ("mission", reference()),
             ("revision", string()),
             ("generation", reference()),
             ("initial_revision", string()),
             ("current_generation", reference()),
             ("root_revision", string()),
-            ("root_plan_run", reference()),
+            ("root_mission_run", reference()),
             ("workspace", string()),
             ("requester", reference()),
             ("mode", string()),
@@ -1460,7 +1465,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("parent_step_run", reference()),
             ("default_selector", object()),
         ],
-        "plan-run.state" => &[
+        "mission-run.state" => &[
             ("status", string()),
             ("phase", string()),
             ("previous_phase", string()),
@@ -1528,7 +1533,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("review_targets", array()),
             ("decisions", array()),
             ("operation", reference()),
-            ("plan_revision", string()),
+            ("mission_revision", string()),
             ("step_definition", string()),
             ("attempt", integer()),
             ("runner", string()),
@@ -1767,7 +1772,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         "message.read" => &[("status", required_enum(&["read"]))],
         "message.closed" => &[("status", required_enum(&["closed"]))],
         "planning-session.started" => &[
-            ("plan", reference()),
+            ("mission", reference()),
             ("request", reference()),
             ("workspace", string()),
             ("requester", reference()),
@@ -1781,7 +1786,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("candidate_revision", integer()),
             ("markdown", reference()),
             ("kdl", reference()),
-            ("plan_revision", string()),
+            ("mission_revision", string()),
         ],
         "planning-session.previewed" => &[
             ("variant", string()),
@@ -1790,7 +1795,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("store_index", integer()),
             ("graph", string()),
             ("diff", string()),
-            ("plan", object()),
+            ("mission", object()),
         ],
         "planning-session.revision-requested" => &[
             ("variant", string()),
@@ -1802,7 +1807,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("variant", string()),
             ("candidate_revision", integer()),
             ("preview_hash", string()),
-            ("plan_revision", string()),
+            ("mission_revision", string()),
             ("markdown", reference()),
             ("kdl", reference()),
             ("requester", reference()),
@@ -2004,10 +2009,10 @@ mod tests {
                 "gate-operation",
                 "host",
                 "message",
+                "mission",
+                "mission-run",
                 "observer",
                 "person",
-                "plan",
-                "plan-run",
                 "planning-session",
                 "pty",
                 "resource",
@@ -2061,12 +2066,12 @@ mod tests {
                 "message.delivered",
                 "message.read",
                 "message.sent",
+                "mission-run.created",
+                "mission-run.state",
+                "mission.produced",
+                "mission.published",
                 "observer.observed",
                 "observer.state",
-                "plan-run.created",
-                "plan-run.state",
-                "plan.produced",
-                "plan.published",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",
@@ -2110,6 +2115,23 @@ mod tests {
         );
         assert_eq!(registry.digest().len(), 64);
         assert_eq!(registry.digest(), registry.digest());
+    }
+
+    #[test]
+    fn registry_rejects_the_removed_plan_names() {
+        let registry = registry();
+        for subject in ["plan/example", "plan-run/example"] {
+            let error = registry
+                .validate_subject(subject)
+                .expect_err("an old subject family must fail");
+            assert_eq!(error.code, "unknown-subject-family");
+        }
+        for claim in ["plan.published", "plan.produced", "plan-run.created"] {
+            assert!(
+                registry.claim(claim).is_none(),
+                "old claim `{claim}` survived"
+            );
+        }
     }
 
     #[test]

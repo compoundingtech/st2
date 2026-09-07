@@ -31,11 +31,11 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | PTY send and peek | `st2/pty-send-peek` | `st3/pty-send-peek` |
 | Network smoke | `st2/network-smoke` | `st3/network-smoke` |
 | Network isolation | `st2/network-isolation` | `st3/network-isolation` |
-| Plan Document Lift | Not supported | `st3/plan-document-lift` |
+| Mission Document Lift | Not supported | `st3/mission-document-lift` |
 | Mixed Worker Pool | Not supported | `st3/mixed-worker-pool` |
 | Planning Mode | Not supported | `st3/planning-mode` |
 | Run Generation Revision | Not supported | `st3/run-generation-revision` |
-| Plan Inputs | Not supported | `st3/plan-inputs` |
+| Mission Inputs | Not supported | `st3/mission-inputs` |
 | Local File Refresh | Not supported | `st3/local-file-refresh` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
@@ -44,7 +44,7 @@ The Ghost bug, Signal rename, Fork in the road, Poisoned pull request, Test Writ
 
 The ten remaining pairs are model-free.
 
-Run Generation Revision, Plan Inputs, and Local File Refresh are also model-free.
+Run Generation Revision, Mission Inputs, and Local File Refresh are also model-free.
 
 The st3 corpus has 25 evals. Thirteen are model-free, and twelve use at least one model.
 
@@ -76,7 +76,7 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Weird Git Setup | Codex × 1 | None |
 | st2 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
 | st3 | Claude Skill Inheritance | Claude Sonnet × 1 | None |
-| st3 | Plan Document Lift | Codex × 1 | None |
+| st3 | Mission Document Lift | Codex × 1 | None |
 | st3 | Mixed Worker Pool | Claude Sonnet × 1, Codex × 1 | None |
 | st3 | Planning Mode | Codex × 1, created by the planning API | None |
 
@@ -127,12 +127,12 @@ st2 eval ./evals/st2/license-mit
 st3 eval ./evals/st3/license-mit
 st2 eval ./evals/st2/network-smoke
 st3 eval ./evals/st3/network-smoke
-st3 claim resource/plan-inputs/source resource.observed \
+st3 claim resource/mission-inputs/source resource.observed \
   --field kind=custom.st3.document-source \
   --field state=ready
-st3 eval ./evals/st3/plan-inputs \
+st3 eval ./evals/st3/mission-inputs \
   --input message="Input proof." \
-  --input source=resource/plan-inputs/source
+  --input source=resource/mission-inputs/source
 ```
 
 Use the matching command for the selected runtime directory.

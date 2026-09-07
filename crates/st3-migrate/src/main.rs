@@ -13,11 +13,11 @@ use walkdir::WalkDir;
 
 const WAIT_TEAM_DONE: &[u8] = include_bytes!("../assets/wait-team-done.sh");
 const ST3_CONTEXT_VARIABLES: &[&str] = &[
-    "ST_PLAN",
-    "ST_PLAN_REVISION",
-    "ST_PLAN_RUN",
+    "ST_MISSION",
+    "ST_MISSION_REVISION",
+    "ST_MISSION_RUN",
     "ST_RUN_GENERATION",
-    "ST_ROOT_PLAN_RUN",
+    "ST_ROOT_MISSION_RUN",
     "ST_SCOPE",
     "ST_WORKSPACE",
     "ST_REQUESTER",
@@ -121,7 +121,7 @@ fn migrate_file(args: FileArgs) -> Result<()> {
     let transformed = transform_declaration(&source, None)?;
     let host = "local";
     let normalized = st3::parse_intent(&transformed, host)?;
-    let runtime_subjects = st3::validate_plan_runtimes(&normalized, host)?;
+    let runtime_subjects = st3::validate_mission_runtimes(&normalized, host)?;
     write_file(&args.output, transformed.as_bytes())?;
     let report = Report {
         schema: "st3-migrate-report.v1",
@@ -194,7 +194,7 @@ fn migrate_catalog(args: TreeArgs) -> Result<()> {
         report.documents.extend(documents);
         let normalized = st3::parse_intent(&transformed, &args.host)
             .with_context(|| format!("validate transformed {}", input.display()))?;
-        let runtime_subjects = st3::validate_plan_runtimes(&normalized, &args.host)
+        let runtime_subjects = st3::validate_mission_runtimes(&normalized, &args.host)
             .with_context(|| format!("validate deferred runtimes in {}", input.display()))?;
         write_file(&output, transformed.as_bytes())?;
         report.files.push(FileReport {
@@ -243,7 +243,7 @@ fn migrate_evals(args: TreeArgs) -> Result<()> {
         report.documents.extend(documents);
         let normalized = st3::parse_intent(&transformed, &args.host)
             .with_context(|| format!("validate transformed {}", input.display()))?;
-        let runtime_subjects = st3::validate_plan_runtimes(&normalized, &args.host)
+        let runtime_subjects = st3::validate_mission_runtimes(&normalized, &args.host)
             .with_context(|| format!("validate deferred runtimes in {}", input.display()))?;
         let output = output_cell.join("eval.kdl");
         write_file(&output, transformed.as_bytes())?;
@@ -351,10 +351,11 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
             restart.entries_mut().push(KdlEntry::new("always"));
             body.nodes_mut().push(restart);
         }
-        let mut plan = KdlNode::new("plan");
-        plan.entries_mut()
+        let mut mission = KdlNode::new("mission");
+        mission
+            .entries_mut()
             .push(KdlEntry::new(format!("catalog/{bus}")));
-        plan.entries_mut().push(KdlEntry::new_prop(
+        mission.entries_mut().push(KdlEntry::new_prop(
             "state",
             if running == Some(false) {
                 "retired"
@@ -362,16 +363,16 @@ fn transform_declaration(source: &str, running: Option<bool>) -> Result<String> 
                 "ready"
             },
         ));
-        let mut plan_body = KdlDocument::new();
+        let mut mission_body = KdlDocument::new();
         let mut goal = KdlNode::new("goal");
         goal.entries_mut()
             .push(KdlEntry::new(format!("Keep agent {bus} available.")));
-        plan_body.nodes_mut().push(goal);
+        mission_body.nodes_mut().push(goal);
         if running != Some(false) {
-            plan_body.nodes_mut().push(agent);
+            mission_body.nodes_mut().push(agent);
         }
-        plan.set_children(plan_body);
-        children.nodes_mut().push(plan);
+        mission.set_children(mission_body);
+        children.nodes_mut().push(mission);
     }
     let mut output = KdlDocument::new();
     let mut version = KdlNode::new("version");
@@ -688,7 +689,7 @@ fn transform_eval(
         .file_name()
         .and_then(|value| value.to_str())
         .context("eval name is not UTF-8")?;
-    Ok((checkpoint_intent_to_plan(&legacy, name)?, documents))
+    Ok((checkpoint_intent_to_mission(&legacy, name)?, documents))
 }
 
 fn rewrite_eval_agent_references(document: &mut KdlDocument, identities: &[String]) {
@@ -702,7 +703,7 @@ fn rewrite_eval_agent_references(document: &mut KdlDocument, identities: &[Strin
                 continue;
             };
             for identity in identities {
-                let actor = format!("agent/${{ST_PLAN_RUN}}/{identity}");
+                let actor = format!("agent/${{ST_MISSION_RUN}}/{identity}");
                 *value = value.replace(identity, &actor);
                 *value = value.replace(&format!("agent/{actor}"), &actor);
             }
@@ -753,7 +754,7 @@ fn transform_eval_checkpoint(
             kick.content.clone()
         };
         team_checkpoint.push_str(&format!(
-            "        message \"kickoff/${{ST_PLAN_RUN}}\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
+            "        message \"kickoff/${{ST_MISSION_RUN}}\" {{\n          from {:?}\n          to {:?}\n          content {:?}\n        }}\n",
             eval_agent_identity(&kick.from, host),
             eval_agent_identity(&kick.to, host),
             content
@@ -948,12 +949,12 @@ fn transform_eval_checkpoint(
     output.push_str("}\n");
     let mut formatted: KdlDocument = output
         .parse()
-        .with_context(|| format!("parse migrated plan KDL:\n{output}"))?;
+        .with_context(|| format!("parse migrated mission KDL:\n{output}"))?;
     formatted.autoformat();
     Ok((formatted.to_string(), documents))
 }
 
-fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
+fn checkpoint_intent_to_mission(source: &str, name: &str) -> Result<String> {
     let document: KdlDocument = source
         .parse()
         .with_context(|| format!("parse legacy checkpoint KDL after harness rewrite:\n{source}"))?;
@@ -966,7 +967,7 @@ fn checkpoint_intent_to_plan(source: &str, name: &str) -> Result<String> {
         .children()
         .context("translated checkpoint sequence is empty")?;
     let mut output = format!(
-        "version 2\nplan {:?} state=\"ready\" {{\n  completion {{ when \"all-steps-exhausted\" }}\n  goal {:?}\n",
+        "version 2\nmission {:?} state=\"ready\" {{\n  completion {{ when \"all-steps-exhausted\" }}\n  goal {:?}\n",
         format!("eval/{name}"),
         format!("Complete the migrated {name} eval.")
     );
@@ -1162,7 +1163,7 @@ fn write_team_completion_checkpoint(
     timeout_ms: u64,
 ) {
     let mut command = format!(
-        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff/${{ST_PLAN_RUN}}",
+        "TIMEOUT_SECONDS={} bash ./.st3-migration/wait-team-done.sh {} {} kickoff/${{ST_MISSION_RUN}}",
         timeout_ms.div_ceil(1_000),
         shell(requester),
         shell(supervisor)
@@ -1553,9 +1554,9 @@ agent "worker" {
         .unwrap();
         assert!(translated.starts_with("version 2\n"));
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        let plan = &intent.plans["catalog/host-a.worker"];
-        assert_eq!(plan.state, st3::model::PlanState::Ready);
-        let graph = plan.declarations_kdl.as_deref().unwrap();
+        let mission = &intent.missions["catalog/host-a.worker"];
+        assert_eq!(mission.state, st3::model::MissionState::Ready);
+        let graph = mission.declarations_kdl.as_deref().unwrap();
         assert!(graph.contains("agent worker"));
         assert!(graph.contains("restart always"));
         assert!(graph.contains("PATH \"/bin\""));
@@ -1592,7 +1593,7 @@ agent "worker" {
         assert!(translated.contains("exec ding"));
         assert!(translated.contains("argv st3 driver ding"));
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        let runtimes = st3::validate_plan_runtimes(&intent, "local").unwrap();
+        let runtimes = st3::validate_mission_runtimes(&intent, "local").unwrap();
         assert!(runtimes.contains("agent/migration-proof/host-a.worker"));
         assert!(runtimes.contains("exec/migration-proof/host-a.worker/ding"));
     }
@@ -1678,24 +1679,24 @@ agent "worker" {
         .unwrap();
         let intent = st3::parse_intent(&translated, "local").unwrap();
         assert_eq!(
-            intent.plans["catalog/host-a.worker"].state,
-            st3::model::PlanState::Ready
+            intent.missions["catalog/host-a.worker"].state,
+            st3::model::MissionState::Ready
         );
         assert!(translated.contains("harness codex"));
         assert!(!translated.contains("harness claude"));
     }
 
     #[test]
-    fn retired_catalog_agents_become_retired_plans() {
+    fn retired_catalog_agents_become_retired_missions() {
         let translated = transform_declaration(
             r#"agent "worker" { host "host-a"; workspace "/work"; command "true" }"#,
             Some(false),
         )
         .unwrap();
         let intent = st3::parse_intent(&translated, "local").unwrap();
-        let plan = &intent.plans["catalog/host-a.worker"];
-        assert_eq!(plan.state, st3::model::PlanState::Retired);
-        assert!(plan.declarations_kdl.is_none());
+        let mission = &intent.missions["catalog/host-a.worker"];
+        assert_eq!(mission.state, st3::model::MissionState::Retired);
+        assert!(mission.declarations_kdl.is_none());
     }
 
     #[test]
@@ -1794,13 +1795,13 @@ agent "worker" {
         assert!(translated.contains("harness claude {"));
         assert!(translated.contains("harness codex {"));
         assert!(!translated.contains("command \"exec claude"));
-        let plan = intent.plans.values().next().unwrap();
-        let team = &plan.steps["00-the-eval-team-is-running"];
+        let mission = intent.missions.values().next().unwrap();
+        let team = &mission.steps["00-the-eval-team-is-running"];
         let team_graph = team.declarations_kdl.as_deref().unwrap();
         assert!(team_graph.contains("agent mix.sup"));
         assert!(team_graph.contains("agent local.judge"));
-        assert!(team_graph.contains("message \"kickoff/${ST_PLAN_RUN}\""));
-        assert!(team_graph.contains("to \"agent/${ST_PLAN_RUN}/mix.sup\""));
+        assert!(team_graph.contains("message \"kickoff/${ST_MISSION_RUN}\""));
+        assert!(team_graph.contains("to \"agent/${ST_MISSION_RUN}/mix.sup\""));
         assert!(translated.contains("model gpt-5.6-sol"));
         assert!(translated.contains("${ST_WORKSPACE}"));
         assert!(!translated.contains("${EVAL_ROOT}"));
@@ -1809,15 +1810,15 @@ agent "worker" {
             matches!(
                 gate,
                 st3::model::GateSpec::Exists { subject, .. }
-                    if subject == "agent/${ST_PLAN_RUN}/mix.sup"
+                    if subject == "agent/${ST_MISSION_RUN}/mix.sup"
             )
         }));
         assert!(translated.contains("title \"The team reported completion\""));
         assert!(translated.contains(".st3-migration/wait-team-done.sh"));
-        assert!(translated.contains("kickoff/${ST_PLAN_RUN}"));
+        assert!(translated.contains("kickoff/${ST_MISSION_RUN}"));
         assert!(!translated.contains("supervisor eval-"));
         assert!(!translated.contains("terminal-control"));
-        assert!(plan.completion.is_some());
+        assert!(mission.completion.is_some());
         assert!(
             !translated.contains("wait-team-done.sh 'requester' 'mix.sup' kickoff 'local.judge'")
         );

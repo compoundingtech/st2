@@ -6,5 +6,5 @@
 - Wall time: 4.60 seconds.
 - Model tokens: 0.
 - KDL SHA-256: `59d005987fefbdacc390f85e40088c5316ab686012d42832e4ad02d8fe932bb8`.
-- Run subject: `plan-run/9b6358d1fb9cbd7f103ecd1bf02302bc`.
+- Run subject: `mission-run/9b6358d1fb9cbd7f103ecd1bf02302bc`.
 - Observed flow: The contract tested live and dead attach behavior. The judge found no new incarnation. The cleanup emptied the run scope.

@@ -51,8 +51,8 @@ This example does not authorize a current st2 rewrite.
 The following areas need the field classification and rebuild proof:
 
 - `claims` and `events` repeat the claim kind, subject, index, and body.
-- `claims`, `desired`, `plan_revisions`, and `plan_definitions` repeat selected intent and plan data.
-- `claims`, `plan_runs`, `run_generations`, `step_runs`, and `revision_proposals` repeat run state.
+- `claims`, `desired`, `mission_revisions`, and `mission_definitions` repeat selected intent and mission data.
+- `claims`, `mission_runs`, `run_generations`, `step_runs`, and `revision_proposals` repeat run state.
 - `claims`, `planning_sessions`, `planning_candidates`, and `planning_previews` repeat planning state and document references.
 - `idempotency.response` can become a second result authority when an endpoint returns its stored response.
 - `documents` must remain a name-to-hash reference. Only `blobs` stores document bytes.

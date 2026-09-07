@@ -3,10 +3,10 @@ version 2
   resource "st3-complex-proof-review" { kind "human.review" }
   resource "st3-full-corpus-review" { kind "human.review" }
 
-  plan "build-st3" state="ready" {
+  mission "build-st3" state="ready" {
 
     completion { when "all-steps-exhausted" }
-    goal "Complete plan build-st3."
+    goal "Complete mission build-st3."
     step "automated-tests" timeout="30m" {
       title "The implementation and automated tests pass"
         exec "build-st3/automated-tests" {
@@ -14,8 +14,8 @@ version 2
           command "cargo test --workspace"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/build-st3/automated-tests" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/build-st3/automated-tests" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/build-st3/automated-tests" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/build-st3/automated-tests" "is" 0 }
     }
 
     step "translation-parity" timeout="30m" {
@@ -26,8 +26,8 @@ version 2
           command "./scripts/prepare-st3-migration && ./scripts/check-st3-migration"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/build-st3/translation-parity" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/build-st3/translation-parity" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/build-st3/translation-parity" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/build-st3/translation-parity" "is" 0 }
     }
 
     step "complex-proof-review" {
@@ -44,8 +44,8 @@ version 2
           command "st3 eval ./target/st3-migration/evals/signal-rename"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/build-st3/signal-rename-proof" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/build-st3/signal-rename-proof" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/build-st3/signal-rename-proof" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/build-st3/signal-rename-proof" "is" 0 }
     }
 
     step "full-corpus-review" {
@@ -62,7 +62,7 @@ version 2
           command "./scripts/run-all-st3-evals"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/build-st3/full-eval-corpus" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/build-st3/full-eval-corpus" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/build-st3/full-eval-corpus" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/build-st3/full-eval-corpus" "is" 0 }
     }
   }

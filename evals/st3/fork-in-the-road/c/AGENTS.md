@@ -12,7 +12,7 @@ The st3 graph owns your draft, critique, and revision stages.
 - Treat privacy, information isolation, cost, routing, and ownership as main tradeoffs.
 - Steelman each other design before you disagree with it.
 - Send direct Small Talk only when the graph assigns a critique.
-- Use `st3 work` for assigned plan progress.
+- Use `st3 work` for assigned mission progress.
 - Publish each required revision resource before you complete its step.
 
 ## Start procedure

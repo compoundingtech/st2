@@ -4,11 +4,11 @@ Date: 2026-09-06.
 
 Exactly two paid `st3 eval` invocations were made. Neither invocation was retried.
 
-## Paid invocation 1: new-plan planning
+## Paid invocation 1: new-mission planning
 
 Eval: `evals/st3/planning-mode`.
 
-Run: `plan-run/452c6da44679c54a7529cfb0f858c626`.
+Run: `mission-run/452c6da44679c54a7529cfb0f858c626`.
 
 Result: failed.
 
@@ -20,13 +20,13 @@ The implementation now derives a stable 20-hex planner suffix from the complete 
 
 Eval: `evals/st3/run-generation-revision`.
 
-Run: `plan-run/c19d0460309fbc265d85466957154039`.
+Run: `mission-run/c19d0460309fbc265d85466957154039`.
 
 Result: failed because the eval assertion was wrong.
 
 The compact planner started and submitted candidate revision 1 after 12 minutes. The candidate had no preview blocker. The preview graph contained `stable`, `changed`, and `generation-environment` in the required positions.
 
-The controller expected step detail in the one-line plan diff. The valid diff was `update plan/generation-proof`, so the controller exited with code 1. The assertion now checks the plan update. The graph assertion continues to check the step details.
+The controller expected step detail in the one-line mission diff. The valid diff was `update mission/generation-proof`, so the controller exited with code 1. The assertion now checks the mission update. The graph assertion continues to check the step details.
 
 ## Continuation of paid invocation 2
 

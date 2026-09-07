@@ -1,6 +1,6 @@
-# st3 constructed spawn environment plan
+# st3 constructed spawn environment design
 
-This document is a design plan. It does not change runtime behavior.
+This document records a design. It does not change runtime behavior.
 
 ## Outcome
 

@@ -153,7 +153,7 @@ pub struct DesiredSubject {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum PlanState {
+pub enum MissionState {
     Draft,
     Ready,
     Retired,
@@ -188,8 +188,8 @@ pub struct ProductSpec {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
-pub enum UsedPlanSpec {
-    Revision { plan: String, revision: String },
+pub enum UsedMissionSpec {
+    Revision { mission: String, revision: String },
     StepOutput { step: String },
 }
 
@@ -249,23 +249,23 @@ pub struct StepSpec {
     pub declarations_kdl: Option<String>,
     pub products: Vec<ProductSpec>,
     #[serde(default)]
-    pub produces_plan: Option<String>,
+    pub produces_mission: Option<String>,
     #[serde(default)]
-    pub uses_plan: Option<UsedPlanSpec>,
+    pub uses_mission: Option<UsedMissionSpec>,
     pub gates: Vec<GateSpec>,
-    pub nested_plan: Option<Box<PlanSpec>>,
+    pub nested_mission: Option<Box<MissionSpec>>,
     pub definition_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct PlanSpec {
+pub struct MissionSpec {
     pub id: String,
     pub subject: String,
-    pub state: PlanState,
+    pub state: MissionState,
     pub revision: String,
     #[serde(default)]
-    pub inputs: BTreeMap<String, PlanInputSpec>,
-    #[serde(default = "default_plan_run_limit")]
+    pub inputs: BTreeMap<String, MissionInputSpec>,
+    #[serde(default = "default_mission_run_limit")]
     pub max_active_runs: Option<u32>,
     #[serde(default)]
     pub revision_owners: Vec<String>,
@@ -292,26 +292,26 @@ pub struct PlanSpec {
     pub display_order: Vec<String>,
 }
 
-fn default_plan_run_limit() -> Option<u32> {
+fn default_mission_run_limit() -> Option<u32> {
     Some(1)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum PlanInputKind {
+pub enum MissionInputKind {
     Text,
     Resource,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanInputSpec {
+pub struct MissionInputSpec {
     pub name: String,
-    pub kind: PlanInputKind,
+    pub kind: MissionInputKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanRunInput {
-    pub kind: PlanInputKind,
+pub struct MissionRunInput {
+    pub kind: MissionInputKind,
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
@@ -419,9 +419,9 @@ pub struct NormalizedIntent {
     pub source_hash: String,
     pub subjects: BTreeMap<String, DesiredSubject>,
     #[serde(default)]
-    pub plans: BTreeMap<String, PlanSpec>,
+    pub missions: BTreeMap<String, MissionSpec>,
     #[serde(default)]
-    pub plan_runs: BTreeMap<String, PlanRunDeclaration>,
+    pub mission_runs: BTreeMap<String, MissionRunDeclaration>,
     #[serde(default)]
     pub planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
     #[serde(default)]
@@ -437,8 +437,8 @@ pub struct NamedCancellation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanRunCreation {
-    pub plan: String,
+pub struct MissionRunCreation {
+    pub mission: String,
     pub revision: String,
     pub workspace: String,
     pub requester: String,
@@ -448,9 +448,9 @@ pub struct PlanRunCreation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanRevisionOperation {
+pub struct MissionRevisionOperation {
     pub id: String,
-    pub plan: String,
+    pub mission: String,
     pub revision: String,
     pub from_generation: String,
     pub reason: String,
@@ -467,12 +467,12 @@ pub struct RuntimeResetOperation {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PlanRunDeclaration {
+pub struct MissionRunDeclaration {
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creation: Option<PlanRunCreation>,
+    pub creation: Option<MissionRunCreation>,
     #[serde(default)]
-    pub revisions: BTreeMap<String, PlanRevisionOperation>,
+    pub revisions: BTreeMap<String, MissionRevisionOperation>,
     #[serde(default)]
     pub resets: BTreeMap<String, RuntimeResetOperation>,
     #[serde(default)]
@@ -490,7 +490,7 @@ pub struct PlannerSpec {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanningSessionCreation {
-    pub plan: String,
+    pub mission: String,
     pub request: String,
     pub workspace: String,
     pub requester: String,
@@ -586,7 +586,7 @@ pub struct IntentInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanRequest {
+pub struct MissionRequest {
     pub intent: IntentInput,
     #[serde(default)]
     pub at_index: Option<u64>,
@@ -609,7 +609,7 @@ pub struct PlannedAction {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanResponse {
+pub struct MissionResponse {
     pub store_index: u64,
     pub source_hash: String,
     pub normalized: Value,
@@ -619,12 +619,12 @@ pub struct PlanResponse {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub subject_tokens: BTreeMap<String, Vec<String>>,
-    pub plan_revisions: BTreeMap<String, String>,
+    pub mission_revisions: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanningSessionStartRequest {
-    pub plan: String,
+    pub mission: String,
     #[serde(default)]
     pub run: Option<String>,
     pub request: Vec<u8>,
@@ -674,8 +674,8 @@ pub struct PlanningCandidateView {
     pub revision: u32,
     pub markdown: String,
     pub kdl: String,
-    pub plan: String,
-    pub plan_revision: String,
+    pub mission: String,
+    pub mission_revision: String,
     pub submitted_at_unix_ms: u128,
 }
 
@@ -687,7 +687,7 @@ pub struct PlanningPreviewView {
     pub store_index: u64,
     pub graph: String,
     pub diff: String,
-    pub plan: PlanResponse,
+    pub mission: MissionResponse,
     pub created_at_unix_ms: u128,
 }
 
@@ -695,14 +695,14 @@ pub struct PlanningPreviewView {
 pub struct PlanningSessionView {
     pub subject: String,
     pub id: String,
-    pub plan: String,
+    pub mission: String,
     pub request: String,
     pub workspace: String,
     pub requester: String,
     pub planner: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_plan_run: Option<String>,
+    pub target_mission_run: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -826,7 +826,7 @@ pub struct ClaimsPage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalStatus {
-    pub plan_run: String,
+    pub mission_run: String,
     pub lifecycle: String,
     pub phase: String,
     pub active_steps: Vec<String>,
@@ -966,8 +966,8 @@ pub struct QuickAgentRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QuickAgentResponse {
     pub subject: String,
-    pub plan: String,
-    pub plan_run: String,
+    pub mission: String,
+    pub mission_run: String,
     pub generation: String,
     pub runtime_id: String,
     pub event_cursor: u64,
@@ -1095,12 +1095,12 @@ pub struct EvalStartRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalStartResponse {
     pub event_cursor: u64,
-    pub plan_run: String,
+    pub mission_run: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanRunRequest {
-    pub plan: String,
+pub struct MissionRunRequest {
+    pub mission: String,
     #[serde(default)]
     pub revision: Option<String>,
     pub workspace: String,
@@ -1114,21 +1114,21 @@ pub struct PlanRunRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanRunView {
+pub struct MissionRunView {
     pub subject: String,
     pub id: String,
-    pub plan: String,
+    pub mission: String,
     pub generation: String,
     pub initial_revision: String,
     pub revision: String,
     pub root_revision: String,
-    pub root_plan_run: String,
+    pub root_mission_run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_step_run: Option<String>,
     pub workspace: String,
     pub requester: String,
     #[serde(default)]
-    pub inputs: BTreeMap<String, PlanRunInput>,
+    pub inputs: BTreeMap<String, MissionRunInput>,
     pub mode: String,
     pub status: String,
     pub phase: String,
@@ -1183,7 +1183,7 @@ pub struct WorkRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanRevisionRequest {
+pub struct MissionRevisionRequest {
     pub intent: IntentInput,
     pub actor: String,
     pub reason: String,
@@ -1235,7 +1235,7 @@ pub struct RevisionProposalView {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RevisionSubmissionView {
     pub status: String,
-    pub plan_run: PlanRunView,
+    pub mission_run: MissionRunView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<RevisionProposalView>,
 }
@@ -1256,7 +1256,7 @@ pub struct RevisionCancelRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanProductionRequest {
+pub struct MissionProductionRequest {
     pub intent: IntentInput,
     pub actor: String,
     #[serde(default)]
@@ -1265,9 +1265,9 @@ pub struct PlanProductionRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanOutputView {
+pub struct MissionOutputView {
     pub step: String,
-    pub plan: String,
+    pub mission: String,
     pub revision: String,
     pub claim_id: String,
 }

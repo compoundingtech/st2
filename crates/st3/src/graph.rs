@@ -6,10 +6,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::model::{
     DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec, MessageTemplate,
-    NamedCancellation, NormalizedIntent, ObserverSpec, PlanRevisionOperation, PlanRunCreation,
-    PlanRunDeclaration, PlannerSpec, PlanningFeedbackOperation, PlanningSessionCreation,
-    PlanningSessionDeclaration, ResourceRefreshOperation, RestartIntensity, RestartType,
-    RuntimeResetOperation, ScheduleSpec, St3Error, SubscriptionSpec,
+    MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
+    NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
+    PlanningSessionCreation, PlanningSessionDeclaration, ResourceRefreshOperation,
+    RestartIntensity, RestartType, RuntimeResetOperation, ScheduleSpec, St3Error, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -23,15 +23,15 @@ const ROOT_NODES: &[&str] = &[
     "observer",
     "subscription",
     "person",
-    "plan",
-    "plan-run",
+    "mission",
+    "mission-run",
     "planning-session",
     "message",
     "schedule",
     "stop",
 ];
 
-pub(crate) fn is_plan_declaration(name: &str) -> bool {
+pub(crate) fn is_mission_declaration(name: &str) -> bool {
     matches!(
         name,
         "agent"
@@ -55,7 +55,7 @@ struct ParseContext {
     document_refs: BTreeSet<String>,
     owner_run: Option<String>,
     allow_execution_root: bool,
-    plan_runs: BTreeMap<String, PlanRunDeclaration>,
+    mission_runs: BTreeMap<String, MissionRunDeclaration>,
     planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
     resource_refreshes: Vec<ResourceRefreshOperation>,
 }
@@ -85,18 +85,18 @@ pub(crate) fn parse_execution_intent(
     run_id: &str,
 ) -> Result<NormalizedIntent, St3Error> {
     let owner = format!(
-        "plan-run/{}",
-        run_id.strip_prefix("plan-run/").unwrap_or(run_id)
+        "mission-run/{}",
+        run_id.strip_prefix("mission-run/").unwrap_or(run_id)
     );
     parse_intent_with_owner(source, default_host, Some(&owner), true)
 }
 
-pub fn validate_plan_runtimes(
+pub fn validate_mission_runtimes(
     intent: &NormalizedIntent,
     default_host: &str,
 ) -> Result<BTreeSet<String>, St3Error> {
-    fn validate_plan(
-        plan: &crate::model::PlanSpec,
+    fn validate_mission(
+        mission: &crate::model::MissionSpec,
         default_host: &str,
         subjects: &mut BTreeSet<String>,
     ) -> Result<(), St3Error> {
@@ -106,18 +106,18 @@ pub fn validate_plan_runtimes(
             default_host: &str,
             subjects: &mut BTreeSet<String>,
         ) -> Result<(), St3Error> {
-            let source = crate::plan::interpolate_kdl(source, variables)?;
+            let source = crate::mission::interpolate_kdl(source, variables)?;
             let runtime = parse_execution_intent(&source, default_host, "migration-proof")?;
             subjects.extend(runtime.subjects.keys().cloned());
             Ok(())
         }
 
         let mut variables = BTreeMap::from([
-            ("ST_PLAN".into(), plan.id.clone()),
-            ("ST_PLAN_REVISION".into(), plan.revision.clone()),
-            ("ST_PLAN_RUN".into(), "migration-proof".into()),
+            ("ST_MISSION".into(), mission.id.clone()),
+            ("ST_MISSION_REVISION".into(), mission.revision.clone()),
+            ("ST_MISSION_RUN".into(), "migration-proof".into()),
             ("ST_RUN_GENERATION".into(), "migration-generation".into()),
-            ("ST_ROOT_PLAN_RUN".into(), "migration-proof".into()),
+            ("ST_ROOT_MISSION_RUN".into(), "migration-proof".into()),
             ("ST_WORKSPACE".into(), "/tmp/st3-migration-workspace".into()),
             ("ST_REQUESTER".into(), "person/migration-reviewer".into()),
             ("ST_STEP".into(), "migration-step".into()),
@@ -133,33 +133,34 @@ pub fn validate_plan_runtimes(
             ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
         ]);
         variables.extend(
-            plan.inputs
+            mission
+                .inputs
                 .keys()
                 .map(|name| (format!("input.{name}"), format!("migration-{name}"))),
         );
-        if let Some(source) = &plan.declarations_kdl {
+        if let Some(source) = &mission.declarations_kdl {
             validate_source(source, &variables, default_host, subjects)?;
         }
-        for step in plan.steps.values() {
+        for step in mission.steps.values() {
             if let Some(source) = &step.declarations_kdl {
                 validate_source(source, &variables, default_host, subjects)?;
             }
-            if let Some(nested) = &step.nested_plan {
-                validate_plan(nested, default_host, subjects)?;
+            if let Some(nested) = &step.nested_mission {
+                validate_mission(nested, default_host, subjects)?;
             }
         }
         Ok(())
     }
 
     let mut subjects = BTreeSet::new();
-    for plan in intent.plans.values() {
-        validate_plan(plan, default_host, &mut subjects)?;
+    for mission in intent.missions.values() {
+        validate_mission(mission, default_host, &mut subjects)?;
     }
     Ok(subjects)
 }
 
 fn owner_run_id(owner: &str) -> &str {
-    owner.strip_prefix("plan-run/").unwrap_or(owner)
+    owner.strip_prefix("mission-run/").unwrap_or(owner)
 }
 
 fn parse_intent_with_owner(
@@ -199,14 +200,14 @@ fn parse_intent_with_owner(
             "`subgraph` is not part of st3 KDL; publish declarations directly after `version 2`",
         ));
     }
-    let plans = crate::plan::parse_plans(&document, default_host)?;
+    let missions = crate::mission::parse_missions(&document, default_host)?;
     let mut context = ParseContext {
         default_host: default_host.to_owned(),
         subjects: BTreeMap::new(),
         document_refs: BTreeSet::new(),
         owner_run: owner_run.map(str::to_owned),
         allow_execution_root,
-        plan_runs: BTreeMap::new(),
+        mission_runs: BTreeMap::new(),
         planning_sessions: BTreeMap::new(),
         resource_refreshes: Vec::new(),
     };
@@ -229,8 +230,8 @@ fn parse_intent_with_owner(
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
-        plans,
-        plan_runs: context.plan_runs,
+        missions,
+        mission_runs: context.mission_runs,
         planning_sessions: context.planning_sessions,
         resource_refreshes: context.resource_refreshes,
         document_refs: context.document_refs,
@@ -291,13 +292,13 @@ fn parse_desired_node(
         )
     {
         return Err(St3Error::new(
-            "runtime-outside-plan",
-            format!("`{kind}` must be inside a plan or step"),
+            "runtime-outside-mission",
+            format!("`{kind}` must be inside a mission or step"),
         ));
     }
     if kind == "account" && context.owner_run.is_some() {
         return Err(St3Error::new(
-            "account-inside-plan",
+            "account-inside-mission",
             "an account declaration must be at the root",
         ));
     }
@@ -305,8 +306,8 @@ fn parse_desired_node(
         "host" => parse_host(node, context),
         "agent" => parse_agent(node, enclosing_host, context),
         "exec" | "pty" => parse_standalone_member(node, kind, enclosing_host, context),
-        "plan" => Ok(()),
-        "plan-run" => parse_plan_run_declaration(node, context),
+        "mission" => Ok(()),
+        "mission-run" => parse_mission_run_declaration(node, context),
         "planning-session" => parse_planning_session_declaration(node, context),
         "resource" => parse_resource_declaration(node, context),
         "stop" => parse_stop(node, context),
@@ -314,18 +315,24 @@ fn parse_desired_node(
     }
 }
 
-fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
+fn parse_mission_run_declaration(
+    node: &KdlNode,
+    context: &mut ParseContext,
+) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
     let id = one_string_with_children(node)?;
-    let subject = namespaced("plan-run", &id);
+    let subject = namespaced("mission-run", &id);
     validate_full_subject(&subject)?;
-    let body = node
-        .children()
-        .ok_or_else(|| St3Error::new("empty-plan-run", "a plan-run declaration needs a body"))?;
+    let body = node.children().ok_or_else(|| {
+        St3Error::new(
+            "empty-mission-run",
+            "a mission-run declaration needs a body",
+        )
+    })?;
     reject_unknown_children(
         body,
         &[
-            "plan",
+            "mission",
             "workspace",
             "requester",
             "mode",
@@ -334,31 +341,31 @@ fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Res
             "reset",
             "cancellation",
         ],
-        "plan-run",
+        "mission-run",
         &subject,
     )?;
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "plan" | "workspace" | "requester" | "mode" | "input"
+            "mission" | "workspace" | "requester" | "mode" | "input"
         )
     });
     let creation = if has_creation {
-        let plan_ref = required_child_string(body, "plan", &subject)?;
-        let (plan, revision) = exact_plan_revision(&plan_ref)?;
+        let mission_ref = required_child_string(body, "mission", &subject)?;
+        let (mission, revision) = exact_mission_revision(&mission_ref)?;
         let workspace = required_child_string(body, "workspace", &subject)?;
         if !workspace.starts_with('/') {
             return Err(St3Error::new(
-                "relative-plan-run-workspace",
-                "a published plan-run workspace must be absolute",
+                "relative-mission-run-workspace",
+                "a published mission-run workspace must be absolute",
             ));
         }
         let requester = required_child_string(body, "requester", &subject)?;
         validate_full_subject(&requester)?;
         if !matches!(requester.split('/').next(), Some("person" | "agent")) {
             return Err(St3Error::new(
-                "invalid-plan-run-requester",
-                "a plan-run requester must be a person or agent subject",
+                "invalid-mission-run-requester",
+                "a mission-run requester must be a person or agent subject",
             ));
         }
         let mode = child_string(body, "mode")?.unwrap_or_else(|| "run".into());
@@ -379,21 +386,21 @@ fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Res
             let values = positional_values(input);
             if values.len() != 2 {
                 return Err(St3Error::new(
-                    "invalid-plan-run-input",
-                    "a plan-run input needs a name and a value",
+                    "invalid-mission-run-input",
+                    "a mission-run input needs a name and a value",
                 ));
             }
             let name = value_string(values[0])?;
             let value = value_string(values[1])?;
             if inputs.insert(name.clone(), value).is_some() {
                 return Err(St3Error::new(
-                    "duplicate-plan-run-input",
-                    format!("plan run `{subject}` repeats input `{name}`"),
+                    "duplicate-mission-run-input",
+                    format!("mission run `{subject}` repeats input `{name}`"),
                 ));
             }
         }
-        Some(PlanRunCreation {
-            plan,
+        Some(MissionRunCreation {
+            mission,
             revision,
             workspace,
             requester,
@@ -403,15 +410,15 @@ fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Res
     } else {
         None
     };
-    let mut incoming = PlanRunDeclaration {
+    let mut incoming = MissionRunDeclaration {
         subject: subject.clone(),
         creation,
-        ..PlanRunDeclaration::default()
+        ..MissionRunDeclaration::default()
     };
     for child in body.nodes() {
         match child.name().value() {
             "revision" => {
-                let operation = parse_plan_revision(child)?;
+                let operation = parse_mission_revision(child)?;
                 insert_named_operation(&mut incoming.revisions, operation.id.clone(), operation)?;
             }
             "reset" => {
@@ -429,28 +436,28 @@ fn parse_plan_run_declaration(node: &KdlNode, context: &mut ParseContext) -> Res
             _ => {}
         }
     }
-    merge_plan_run_declaration(context, incoming)
+    merge_mission_run_declaration(context, incoming)
 }
 
-fn exact_plan_revision(value: &str) -> Result<(String, String), St3Error> {
-    let (plan, revision) = value.rsplit_once('@').ok_or_else(|| {
+fn exact_mission_revision(value: &str) -> Result<(String, String), St3Error> {
+    let (mission, revision) = value.rsplit_once('@').ok_or_else(|| {
         St3Error::new(
-            "unpinned-plan-run",
-            "a plan-run must name an exact plan revision as `plan/ID@REVISION`",
+            "unpinned-mission-run",
+            "a mission-run must name an exact mission revision as `mission/ID@REVISION`",
         )
     })?;
-    let plan = plan.strip_prefix("plan/").unwrap_or(plan);
-    validate_name(plan, false)?;
+    let mission = mission.strip_prefix("mission/").unwrap_or(mission);
+    validate_name(mission, false)?;
     if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(St3Error::new(
-            "invalid-plan-revision",
-            "a plan revision must be a 64-character SHA-256 hash",
+            "invalid-mission-revision",
+            "a mission revision must be a 64-character SHA-256 hash",
         ));
     }
-    Ok((plan.into(), revision.to_ascii_lowercase()))
+    Ok((mission.into(), revision.to_ascii_lowercase()))
 }
 
-fn parse_plan_revision(node: &KdlNode) -> Result<PlanRevisionOperation, St3Error> {
+fn parse_mission_revision(node: &KdlNode) -> Result<MissionRevisionOperation, St3Error> {
     ensure_no_properties(node)?;
     let id = one_string_with_children(node)?;
     validate_name(&id, false)?;
@@ -459,19 +466,20 @@ fn parse_plan_revision(node: &KdlNode) -> Result<PlanRevisionOperation, St3Error
         .ok_or_else(|| St3Error::new("empty-revision", format!("revision `{id}` needs a body")))?;
     reject_unknown_children(
         body,
-        &["plan", "from", "reason", "cancellation"],
+        &["mission", "from", "reason", "cancellation"],
         "revision",
         &id,
     )?;
-    let (plan, revision) = exact_plan_revision(&required_child_string(body, "plan", &id)?)?;
+    let (mission, revision) =
+        exact_mission_revision(&required_child_string(body, "mission", &id)?)?;
     let from_generation = namespaced("run-generation", &required_child_string(body, "from", &id)?);
     validate_full_subject(&from_generation)?;
     let cancellation = unique_child(body, "cancellation")?
         .map(parse_named_cancellation)
         .transpose()?;
-    Ok(PlanRevisionOperation {
+    Ok(MissionRevisionOperation {
         id: id.clone(),
-        plan,
+        mission,
         revision,
         from_generation,
         reason: required_nonempty_child(body, "reason", &id)?,
@@ -547,17 +555,17 @@ fn insert_named_operation<T: Eq>(
     Ok(())
 }
 
-fn merge_plan_run_declaration(
+fn merge_mission_run_declaration(
     context: &mut ParseContext,
-    incoming: PlanRunDeclaration,
+    incoming: MissionRunDeclaration,
 ) -> Result<(), St3Error> {
     let subject = incoming.subject.clone();
     let current = context
-        .plan_runs
+        .mission_runs
         .entry(subject.clone())
-        .or_insert_with(|| PlanRunDeclaration {
+        .or_insert_with(|| MissionRunDeclaration {
             subject,
-            ..PlanRunDeclaration::default()
+            ..MissionRunDeclaration::default()
         });
     if let Some(creation) = incoming.creation {
         if current
@@ -566,9 +574,9 @@ fn merge_plan_run_declaration(
             .is_some_and(|value| value != &creation)
         {
             return Err(St3Error::new(
-                "immutable-plan-run",
+                "immutable-mission-run",
                 format!(
-                    "plan run `{}` repeats with different creation fields",
+                    "mission run `{}` repeats with different creation fields",
                     current.subject
                 ),
             ));
@@ -700,7 +708,7 @@ fn parse_planning_session_declaration(
     reject_unknown_children(
         body,
         &[
-            "plan",
+            "mission",
             "request",
             "workspace",
             "requester",
@@ -716,7 +724,7 @@ fn parse_planning_session_declaration(
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "plan"
+            "mission"
                 | "request"
                 | "workspace"
                 | "requester"
@@ -726,9 +734,12 @@ fn parse_planning_session_declaration(
         )
     });
     let creation = if has_creation {
-        let plan = required_child_string(body, "plan", &subject)?;
-        let plan = plan.strip_prefix("plan/").unwrap_or(&plan).to_owned();
-        validate_name(&plan, false)?;
+        let mission = required_child_string(body, "mission", &subject)?;
+        let mission = mission
+            .strip_prefix("mission/")
+            .unwrap_or(&mission)
+            .to_owned();
+        validate_name(&mission, false)?;
         let request = required_child_string(body, "request", &subject)?;
         validate_document_ref(&request)?;
         if !request.starts_with("doc/") || !request.contains('@') {
@@ -768,7 +779,7 @@ fn parse_planning_session_declaration(
             .ok_or_else(|| St3Error::new("empty-planner", "a planner needs a body"))?;
         reject_unknown_children(planner_body, &["model", "effort"], "planner", &provider)?;
         let target_run =
-            child_string(body, "target-run")?.map(|value| namespaced("plan-run", &value));
+            child_string(body, "target-run")?.map(|value| namespaced("mission-run", &value));
         let target_generation = child_string(body, "target-generation")?
             .map(|value| namespaced("run-generation", &value));
         if target_run.is_some() != target_generation.is_some() {
@@ -784,7 +795,7 @@ fn parse_planning_session_declaration(
             validate_full_subject(target)?;
         }
         Some(PlanningSessionCreation {
-            plan,
+            mission,
             request,
             workspace,
             requester,
@@ -901,15 +912,15 @@ fn parse_planning_session_declaration(
             }
             let target_context = creation.target_run.as_ref().map_or_else(String::new, |run| {
                 format!(
-                    " Inspect the current target with `st3 --json plan show {run}` before you revise it. The target generation is `{}`.",
+                    " Inspect the current target with `st3 --json mission show {run}` before you revise it. The target generation is `{}`.",
                     creation.target_generation.as_deref().unwrap_or_default()
                 )
             });
             harness_body.nodes_mut().push(string_node(
                 "prompt",
                 &format!(
-                    "You are the durable Codex planner for planning session `{id}`. Read `{}` with `st3 doc get`.{target_context} Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{}` and its state must be ready. Submit it with `st3 planning submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay ready for feedback until approval or cancellation.",
-                    creation.request, creation.plan
+                    "You are the durable Codex planner for planning session `{id}`. Read `{}` with `st3 doc get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st3 planning submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+                    creation.request, creation.mission
                 ),
             ));
             let mut args = KdlNode::new("args");
@@ -1487,10 +1498,10 @@ fn parse_predicate_gate(child: &KdlNode, name: String) -> Result<GateSpec, St3Er
         "empty" => {
             ensure_no_properties(child)?;
             let subject = one_string(child)?;
-            if !subject.starts_with("plan-run/") {
+            if !subject.starts_with("mission-run/") {
                 return Err(St3Error::new(
                     "invalid-empty-subject",
-                    "empty requires a full plan run subject",
+                    "empty requires a full mission run subject",
                 ));
             }
             validate_full_subject(&subject)?;
@@ -2601,7 +2612,7 @@ fn validate_string_map(node: &KdlNode, environment: bool) -> Result<(), St3Error
         }
         if environment {
             validate_environment_name(name)?;
-            if crate::plan::is_reserved_context_name(name) {
+            if crate::mission::is_reserved_context_name(name) {
                 return Err(St3Error::new(
                     "reserved-context-variable",
                     format!("environment cannot override `{name}`"),
@@ -2616,7 +2627,7 @@ fn validate_string_map(node: &KdlNode, environment: bool) -> Result<(), St3Error
 pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Error> {
     if node.name().value() == "account" {
         return Err(St3Error::new(
-            "account-inside-plan",
+            "account-inside-mission",
             "an account declaration must be at the root",
         ));
     }
@@ -3479,38 +3490,62 @@ mod tests {
             let intent = parse_test_intent(&source, "eval-node")
                 .unwrap_or_else(|error| panic!("{}: {error}", eval.display()));
             let ready = intent
-                .plans
+                .missions
                 .values()
-                .filter(|plan| plan.state == crate::model::PlanState::Ready)
+                .filter(|mission| mission.state == crate::model::MissionState::Ready)
                 .count();
-            assert_eq!(ready, 1, "{} must declare one ready plan", eval.display());
+            assert_eq!(
+                ready,
+                1,
+                "{} must declare one ready mission",
+                eval.display()
+            );
             parsed += 1;
         }
         assert!(parsed >= 24, "the st3 eval corpus unexpectedly shrank");
     }
 
     #[test]
-    fn rejects_a_runtime_outside_a_plan() {
+    fn rejects_a_runtime_outside_a_mission() {
         let error = parse_intent("version 2\nagent \"worker\" { command \"true\" }", "host")
             .expect_err("an unowned runtime must fail");
-        assert_eq!(error.code, "runtime-outside-plan");
+        assert_eq!(error.code, "runtime-outside-mission");
     }
 
     #[test]
     fn rejects_the_removed_wrapper_and_accepts_direct_roots() {
         let removed = parse_intent(
-            "version 2\nsubgraph { plan \"work\" state=\"ready\" { goal \"Do the work.\" } }",
+            "version 2\nsubgraph { mission \"work\" state=\"ready\" { goal \"Do the work.\" } }",
             "node",
         )
         .unwrap_err();
         assert_eq!(removed.code, "removed-subgraph");
 
         let direct = parse_intent(
-            "version 2\nplan \"work\" state=\"ready\" { goal \"Do the work.\" }",
+            "version 2\nmission \"work\" state=\"ready\" { goal \"Do the work.\" }",
             "node",
         )
         .unwrap();
-        assert!(direct.plans.contains_key("work"));
+        assert!(direct.missions.contains_key("work"));
+    }
+
+    #[test]
+    fn rejects_the_removed_plan_vocabulary() {
+        for source in [
+            "version 2\nplan \"old\" state=\"ready\" { goal \"Do the work.\" }",
+            "version 2\nplan-run \"old\" { }",
+        ] {
+            let error = parse_intent(source, "node").expect_err("old root syntax must fail");
+            assert_eq!(error.code, "unknown-node");
+        }
+
+        for field in ["produces-plan \"work\"", "uses-plan output-of=\"compile\""] {
+            let source = format!(
+                "version 2\nmission \"work\" state=\"ready\" {{ goal \"Do the work.\"; step \"compile\" {{ {field} }} }}"
+            );
+            let error = parse_intent(&source, "node").expect_err("old step syntax must fail");
+            assert_eq!(error.code, "unknown-step-field");
+        }
     }
 
     #[test]
@@ -3529,13 +3564,13 @@ version 2
         assert!(intent.subjects.contains_key("account/claude/team-a"));
 
         let nested = parse_execution_intent(source, "node", "run-1")
-            .expect_err("a plan run cannot own an account");
-        assert_eq!(nested.code, "account-inside-plan");
+            .expect_err("a mission run cannot own an account");
+        assert_eq!(nested.code, "account-inside-mission");
 
         let deferred = r#"
 version 2
 
-  plan "bad" state="ready" {
+  mission "bad" state="ready" {
     goal "Reject nested accounts."
     step "work" {
 
@@ -3551,7 +3586,7 @@ version 2
 "#;
         assert_eq!(
             parse_intent(deferred, "node").unwrap_err().code,
-            "account-inside-plan"
+            "account-inside-mission"
         );
 
         let invalid_auth = source.replace("subscription", "session-cookie");
@@ -3690,13 +3725,13 @@ version 2
     }
 
     #[test]
-    fn parses_plan_order_and_dependencies() {
+    fn parses_mission_order_and_dependencies() {
         let intent = parse_intent(
             r#"
 version 2
 
-  plan "build" state="ready" {
-    goal "Complete plan build."
+  mission "build" state="ready" {
+    goal "Complete mission build."
     step "build" {
       title "The first step passes"
        exec "one" { command "true"; restart "never" }
@@ -3713,11 +3748,11 @@ version 2
 "#,
             "node",
         )
-        .expect("plan KDL parses");
-        let plan = &intent.plans["build"];
-        assert_eq!(plan.display_order, ["build", "review"]);
+        .expect("mission KDL parses");
+        let mission = &intent.missions["build"];
+        assert_eq!(mission.display_order, ["build", "review"]);
         assert!(matches!(
-            &plan.steps["review"].dependencies[0],
+            &mission.steps["review"].dependencies[0],
             crate::model::DependencySpec::Step { step, state }
                 if step == "build" && state == "completed"
         ));
@@ -3732,8 +3767,8 @@ version 2
                 host "local"
                 command "true"
               }
-              plan "proof" state="ready" {
-                goal "Complete plan proof."
+              mission "proof" state="ready" {
+                goal "Complete mission proof."
                 step "verify" {
                   title "The local gate passes"
                   gate "verify" {
@@ -3752,7 +3787,7 @@ version 2
             intent.subjects["exec/setup"].member.as_ref().unwrap().host,
             "node-a"
         );
-        let GateSpec::Mechanical { host, .. } = &intent.plans["proof"].steps["verify"].gates[0]
+        let GateSpec::Mechanical { host, .. } = &intent.missions["proof"].steps["verify"].gates[0]
         else {
             panic!("the test gate is not mechanical");
         };
@@ -3855,7 +3890,7 @@ version 2
 
         let store = crate::store::Store::open_memory("node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -3941,7 +3976,7 @@ version 2
     }
 
     #[test]
-    fn a_plan_can_pin_bare_document_references() {
+    fn a_mission_can_pin_bare_document_references() {
         let source = r#"
 version 2
 
@@ -3983,12 +4018,12 @@ version 2
             r#"
 version 2
 planning-session "planning/release/revise" {{
-  plan "release"
+  mission "release"
   request "doc/planning/request@{}"
   workspace "/work/release"
   requester "person/operator"
   planner "codex" {{ model "gpt-5.6-sol"; effort "medium" }}
-  target-run "plan-run/release/live"
+  target-run "mission-run/release/live"
   target-generation "run-generation/release/live/2"
 }}
 "#,
@@ -4003,7 +4038,7 @@ planning-session "planning/release/revise" {{
             "{desired}"
         );
         assert!(
-            desired.contains("st3 --json plan show plan-run/release/live"),
+            desired.contains("st3 --json mission show mission-run/release/live"),
             "{desired}"
         );
         assert!(

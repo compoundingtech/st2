@@ -4,8 +4,8 @@ set -Eeuo pipefail
 readonly EVAL_ROOT=$PWD
 readonly TARGET_WORKSPACE="$EVAL_ROOT/planner-workspace"
 readonly REQUEST="$EVAL_ROOT/request.md"
-readonly PLAN_ID=${PLANNED_PLAN:?PLANNED_PLAN is required}
-readonly PLAN_SUBJECT="plan/$PLAN_ID"
+readonly MISSION_ID=${PLANNED_MISSION:?PLANNED_MISSION is required}
+readonly MISSION_SUBJECT="mission/$MISSION_ID"
 readonly REQUESTER="person/eval-requester"
 
 trace_pid=""
@@ -31,13 +31,13 @@ workspace_digest() {
     | cut -d' ' -f1
 }
 
-assert_plan_is_unpublished() {
-  st3 --json status "$PLAN_SUBJECT" > "$EVAL_ROOT/plan-status-before.json"
+assert_mission_is_unpublished() {
+  st3 --json status "$MISSION_SUBJECT" > "$EVAL_ROOT/mission-status-before.json"
   jq -e '
     .subjects | length == 1
     and .[0].actual == null
     and (.[0].claims | length) == 0
-  ' "$EVAL_ROOT/plan-status-before.json" >/dev/null
+  ' "$EVAL_ROOT/mission-status-before.json" >/dev/null
 }
 
 wait_for_event() {
@@ -68,7 +68,7 @@ wait_for_event() {
 before_digest=$(workspace_digest)
 
 st3 --json planning start \
-  --id "$PLAN_ID" \
+  --id "$MISSION_ID" \
   "$REQUEST" \
   --workspace "$TARGET_WORKSPACE" \
   --as "$REQUESTER" \
@@ -80,12 +80,12 @@ session_id=$(jq -er '.id' "$EVAL_ROOT/started.json")
 session_subject=$(jq -er '.subject' "$EVAL_ROOT/started.json")
 planner=$(jq -er '.planner' "$EVAL_ROOT/started.json")
 
-assert_plan_is_unpublished
+assert_mission_is_unpublished
 wait_for_event \
   "$session_subject" \
   "planning-session.candidate-submitted" \
   "$EVAL_ROOT/planning-events.jsonl"
-assert_plan_is_unpublished
+assert_mission_is_unpublished
 
 variant=$(st3 --json planning show "$session_id" | jq -er '.candidate.variant')
 st3 --json planning preview "$session_id" --variant "$variant" > "$EVAL_ROOT/preview.json"
@@ -94,8 +94,8 @@ jq -e '
   .status == "review"
   and (.preview.graph | contains("inspect [root]"))
   and (.preview.graph | contains("verify [after inspect]"))
-  and (.preview.diff | contains("plan/"))
-  and (.preview.plan.blockers | length == 0)
+  and (.preview.diff | contains("mission/"))
+  and (.preview.mission.blockers | length == 0)
 ' "$EVAL_ROOT/preview.json" >/dev/null
 
 st3 --json planning approve \
@@ -107,29 +107,29 @@ st3 --json planning approve \
 jq -e --arg hash "$preview_hash" '
   .status == "approved"
   and .preview.hash == $hash
-  and .published_revision == .candidate.plan_revision
+  and .published_revision == .candidate.mission_revision
 ' "$EVAL_ROOT/approved.json" >/dev/null
 
-st3 --json status "$PLAN_SUBJECT" > "$EVAL_ROOT/plan-status-after.json"
-jq -e --arg plan "$PLAN_ID" '
+st3 --json status "$MISSION_SUBJECT" > "$EVAL_ROOT/mission-status-after.json"
+jq -e --arg mission "$MISSION_ID" '
   .subjects | length == 1
-  and .[0].actual.id == $plan
+  and .[0].actual.id == $mission
   and .[0].actual.state == "ready"
-' "$EVAL_ROOT/plan-status-after.json" >/dev/null
+' "$EVAL_ROOT/mission-status-after.json" >/dev/null
 
 st3 --json status > "$EVAL_ROOT/all-status-after.json"
-jq -e --arg plan "$PLAN_SUBJECT" '
+jq -e --arg mission "$MISSION_SUBJECT" '
   [
     .subjects[]
-    | select(.subject | startswith("plan-run/"))
-    | select((.actual.plan // "") == $plan)
+    | select(.subject | startswith("mission-run/"))
+    | select((.actual.mission // "") == $mission)
   ] | length == 0
 ' "$EVAL_ROOT/all-status-after.json" >/dev/null
 
-st3 --json inspect "$PLAN_SUBJECT" > "$EVAL_ROOT/plan-inspect.json"
+st3 --json inspect "$MISSION_SUBJECT" > "$EVAL_ROOT/mission-inspect.json"
 jq -e '
-  ([.recent_claims[] | select(.kind == "plan.published")] | length) == 1
-' "$EVAL_ROOT/plan-inspect.json" >/dev/null
+  ([.recent_claims[] | select(.kind == "mission.published")] | length) == 1
+' "$EVAL_ROOT/mission-inspect.json" >/dev/null
 st3 --json inspect "$session_subject" > "$EVAL_ROOT/planning-session-inspect.json"
 jq -e '
   ([.recent_claims[] | select(.kind == "planning-session.approved")] | length) == 1
@@ -145,10 +145,10 @@ jq -e --arg markdown "$markdown_ref" --arg kdl "$kdl_ref" '
   .candidate.markdown == $markdown
   and .candidate.kdl == $kdl
 ' "$EVAL_ROOT/approved.json" >/dev/null
-st3 doc get "$markdown_ref" --output "$EVAL_ROOT/approved-plan.md" >/dev/null
-st3 doc get "$kdl_ref" --output "$EVAL_ROOT/approved-plan.kdl" >/dev/null
-test -s "$EVAL_ROOT/approved-plan.md"
-test -s "$EVAL_ROOT/approved-plan.kdl"
+st3 doc get "$markdown_ref" --output "$EVAL_ROOT/approved-mission.md" >/dev/null
+st3 doc get "$kdl_ref" --output "$EVAL_ROOT/approved-mission.kdl" >/dev/null
+test -s "$EVAL_ROOT/approved-mission.md"
+test -s "$EVAL_ROOT/approved-mission.kdl"
 
 st3 wait "$planner" --for stopped --timeout 2m >/dev/null
 

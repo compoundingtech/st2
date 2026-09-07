@@ -25,7 +25,7 @@ st3 resource watch github.pull-request compoundingtech/st2#403 \
 
 `ST_AGENT` supplies the delivery target. A person can use `--to agent/HOST.IDENTITY`.
 
-The command returns the resource, observer, and subscription subjects. It also creates one standing watch plan run.
+The command returns the resource, observer, and subscription subjects. It also creates one standing watch mission run.
 
 The subscription key includes the provider kind, provider locator, selected fields, target, and delivery type. An exact retry returns the same subjects.
 
@@ -38,7 +38,7 @@ resource "github/compoundingtech/st2/pull/403" {
   kind "vcs.pull-request"
 }
 
-plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
+mission "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
   goal "Observe one resource and send its selected changes."
   observer "watch" {
     resource "resource/github/compoundingtech/st2/pull/403"
@@ -64,7 +64,7 @@ plan "resource-watch/github/compoundingtech/st2/pull/403/KEY" state="ready" {
 
 The resource begins unbound. The resource stores normalized external facts after its first observation.
 
-The plan run owns the observer and subscription.
+The mission run owns the observer and subscription.
 
 The returned subjects use `observer/RUN/watch` and `subscription/RUN/watch`.
 
@@ -83,7 +83,7 @@ resource "workspace/config" {
   kind "filesystem.file"
 }
 
-plan "observe-config" state="ready" {
+mission "observe-config" state="ready" {
   goal "Keep the configuration metadata current."
   observer "config" {
     resource "resource/workspace/config"
@@ -97,7 +97,7 @@ plan "observe-config" state="ready" {
 }
 ```
 
-The plan run owns the observer. Plan cancellation stops the observer.
+The mission run owns the observer. Mission cancellation stops the observer.
 
 Use this command to request an immediate observation and wait for that exact attempt:
 
@@ -133,7 +133,7 @@ A later observed field change creates one `resource.observed` claim. An unchange
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
 
-A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same plan run.
+A native harness driver can deliver that message. Another harness can use an explicit `st3 driver ding` child owned by the same mission run.
 
 A daemon restart can repeat an external request. It cannot create a duplicate observation or message.
 
@@ -145,7 +145,7 @@ The subscription becomes active when its delivery target appears.
 
 ## Lifecycle
 
-`st3 resource unwatch SUBSCRIPTION` cancels its watch plan run. It does not remove the resource or other watch runs.
+`st3 resource unwatch SUBSCRIPTION` cancels its watch mission run. It does not remove the resource or other watch runs.
 
 Cleanup stops the owned observer and subscription before the watch run becomes cancelled.
 

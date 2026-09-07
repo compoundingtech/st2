@@ -5,9 +5,9 @@ pub mod archive;
 pub mod client;
 pub mod config;
 pub mod graph;
+pub mod mission;
 pub mod model;
 pub mod peer;
-pub mod plan;
 pub mod projection;
 pub mod reconcile;
 pub mod render;
@@ -15,5 +15,5 @@ pub mod resource;
 pub mod service;
 pub mod store;
 
-pub use graph::{parse_intent, validate_plan_runtimes};
+pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};

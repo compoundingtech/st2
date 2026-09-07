@@ -1,12 +1,12 @@
 version 2
 
-  plan "eval/run-generation-revision" state="ready" {
+  mission "eval/run-generation-revision" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Prove an approved targeted planning revision creates one immutable successor generation."
     goal "Prove compatible state and automatic run environment move to the successor."
 
     step "exercise-revision" timeout="25m" {
-      title "A Codex planner revises one live plan run"
+      title "A Codex planner revises one live mission run"
         exec "eval/run-generation-revision/controller" {
           host "local"
           workspace "${ST_WORKSPACE}"
@@ -14,7 +14,7 @@ version 2
           command "bash ./controller.sh"
           restart "never"
         }
-      gate "the revision controller exits successfully" { field "exit_code" "exec/${ST_PLAN_RUN}/eval/run-generation-revision/controller" "is" 0 }
+      gate "the revision controller exits successfully" { field "exit_code" "exec/${ST_MISSION_RUN}/eval/run-generation-revision/controller" "is" 0 }
     }
 
     step "verify" timeout="2m" {

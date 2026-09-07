@@ -67,7 +67,7 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         &intent,
         r#"version 2
 
-  plan "pty-helpers" state="ready" {
+  mission "pty-helpers" state="ready" {
     goal "Keep the operator PTY available."
     step "operator" {
 
@@ -107,7 +107,7 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         .args([
             "--endpoint",
             socket.to_str().unwrap(),
-            "plan",
+            "mission",
             "start",
             "pty-helpers",
             "--id",

@@ -4,7 +4,7 @@ This version 2 eval migrates `restart-continuity` from `compoundingtech/evals` r
 
 It also absorbs the duplicate-delivery check from `inbox-hygiene` at the same revision.
 
-The st3 graph owns the complete plan before work starts. It records two assigned work phases, the cold restart, five stable products, nested item progress, verification, and cleanup.
+The st3 graph owns the complete mission before work starts. It records two assigned work phases, the cold restart, five stable products, nested item progress, verification, and cleanup.
 
 A mechanical injector restarts `rc.dev` after item 2. It sends one repeated Small Talk delivery through the st3 API after the new incarnation becomes ready.
 

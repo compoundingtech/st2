@@ -6,7 +6,7 @@ The letters `ST` in `st3` mean Small Talk.
 
 st3 is a resident, event-driven reconciler for one claims graph. It stores immutable claims, reduces them to current state, and makes bounded runtime changes. The CLI is a client of the daemon API.
 
-This document defines the system design. [plan-graph-runtime.md](./plan-graph-runtime.md) defines the complete plan language and planning workflow.
+This document defines the system design. [mission-graph-runtime.md](./mission-graph-runtime.md) defines the complete mission language and planning workflow.
 
 [schema.md](./schema.md) lists the generated public vocabulary. [data-authority.md](./data-authority.md) classifies durable authority and projections.
 
@@ -14,20 +14,20 @@ This document defines the system design. [plan-graph-runtime.md](./plan-graph-ru
 
 st3 gives a person or an agent one durable graph for these objects:
 
-- plan definitions, plan-owned runtimes, messages, and observed resources;
-- immutable documents and plan revisions;
-- plan runs, immutable run generations, revision proposals, products, gates, and reviews;
+- mission definitions, mission-owned runtimes, messages, and observed resources;
+- immutable documents and mission revisions;
+- mission runs, immutable run generations, revision proposals, products, gates, and reviews;
 - Small Talk delivery and work ownership;
 - runtime observations and operation evidence;
 - peer replication and historical reads.
 
 An intent changes only the subjects that it names. Omission never means deletion or stop.
 
-A runtime `stop` can occur only inside its owning plan. Root control cancels a complete plan run.
+A runtime `stop` can occur only inside its owning mission. Root control cancels a complete mission run.
 
-A published plan is a definition. Publication does not start a run.
+A published mission is a definition. Publication does not start a run.
 
-A plan run has one immutable initial revision and one current generation. Each generation binds to one immutable plan revision.
+A mission run has one immutable initial revision and one current generation. Each generation binds to one immutable mission revision.
 
 The daemon does not watch a catalog folder. `st3 import`, `st3 eval`, and other explicit client commands read local files and post their bytes to the API.
 
@@ -37,11 +37,11 @@ The daemon does not watch a catalog folder. `st3 import`, `st3 eval`, and other 
 
 st3 uses one graph for desired state, observations, work, and evidence.
 
-Every graph item has a stable subject such as `agent/abc/builder`, `plan/release`, `plan-run/abc`, `run-generation/def`, or `step-run/def/test`.
+Every graph item has a stable subject such as `agent/abc/builder`, `mission/release`, `mission-run/abc`, `run-generation/def`, or `step-run/def/test`.
 
-A plan run is the sole execution owner. Its runtimes use subjects such as `agent/RUN/LOCAL_ID` and `exec/RUN/LOCAL_ID`.
+A mission run is the sole execution owner. Its runtimes use subjects such as `agent/RUN/LOCAL_ID` and `exec/RUN/LOCAL_ID`.
 
-Plans and agents do not support in-place reparenting. A replacement plan run creates a new ownership boundary.
+Missions and agents do not support in-place reparenting. A replacement mission run creates a new ownership boundary.
 
 ### Immutable claims
 
@@ -70,7 +70,7 @@ SQLite provides these required properties:
 - crash recovery;
 - fixed-snapshot reads;
 - indexed status and history queries;
-- durable plan runs, run generations, revision proposals, and planning sessions.
+- durable mission runs, run generations, revision proposals, and planning sessions.
 
 Documents and other byte content use content hashes. The database stores the binding from a document name to each immutable version.
 
@@ -94,11 +94,11 @@ The data review must prove these conditions:
 
 ### Per-subject compare-and-swap
 
-`POST /v1/intent/plan` returns the current leaf claim IDs for each named subject and plan definition.
+`POST /v1/intent/mission` returns the current leaf claim IDs for each named subject and mission definition.
 
 `POST /v1/intent/apply` must return those exact tokens. A changed token causes a `stale-subject` conflict. Independent subjects do not conflict.
 
-A plan preview uses the same rule. Planning approval also names the exact preview hash. A new candidate or graph head makes an older approval stale.
+A mission preview uses the same rule. Planning approval also names the exact preview hash. A new candidate or graph head makes an older approval stale.
 
 A revision approval names the exact proposal preview hash. A proposal also names its source generation.
 
@@ -116,7 +116,7 @@ The reconciler does not scan a catalog and does not use a periodic discovery swe
 
 `gate` means a condition that can pass or fail. It covers graph predicates, mechanical commands, bounded LLM evaluation, and human review.
 
-Plans and steps use repeated `gate` nodes. Sibling gates form an AND relation.
+Missions and steps use repeated `gate` nodes. Sibling gates form an AND relation.
 
 The old `judges` block, `judge` node, `judgement` CLI, and judgement API are not part of st3.
 
@@ -127,13 +127,13 @@ The public running-gate surfaces are:
 - claims: `gate.requested` and `gate.result`;
 - environment: `ST_GATE` and operation capability fields.
 
-### Plan contracts are flat
+### Mission contracts are flat
 
-A plan or step can declare goals, baselines, products, and gates directly. st3 has no `outcome` wrapper.
+A mission or step can declare goals, baselines, products, and gates directly. st3 has no `outcome` wrapper.
 
 `baseline` describes state that must already be true before work starts. `produces` describes graph state that the work promises to create. `gate` evaluates acceptance after the promised work and products are present.
 
-Plan-level declarations apply to the full run. Step-level declarations apply to one step attempt.
+Mission-level declarations apply to the full run. Step-level declarations apply to one step attempt.
 
 ### Explicit dependencies
 
@@ -164,7 +164,7 @@ st3 supplies `ST_*` context to step members and running gates. The same values s
 
 Exact built-in names are reserved. An authored `env` block cannot replace them. Other `ST_*` names are allowed.
 
-The complete table is in [plan-graph-runtime.md](./plan-graph-runtime.md#automatic-context).
+The complete table is in [mission-graph-runtime.md](./mission-graph-runtime.md#automatic-context).
 
 ### External resource observation
 
@@ -198,7 +198,7 @@ account "claude/team-a" {
 
 The declaration creates `account/claude/team-a`. The supported authentication types are `subscription` and `api-key`.
 
-An account is not plan-owned. A plan or step cannot declare one.
+An account is not mission-owned. A mission or step cannot declare one.
 
 An agent records its selected account with an `agent.account` state transition. The agent must write its own association.
 
@@ -237,17 +237,17 @@ st3 and st2 do not share a live control loop. They can share an existing PTY reg
 
 Every st3 intent starts with `version 2`. Declarations follow the version directly.
 
-The root can contain accounts, plan definitions, durable resources, people, documents, messages, and plan-run cancellation.
+The root can contain accounts, mission definitions, durable resources, people, documents, messages, and mission-run cancellation.
 
-An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` that performs execution must occur in a plan or step.
+An `agent`, `exec`, `pty`, `observer`, `subscription`, or `schedule` that performs execution must occur in a mission or step.
 
-A runtime `stop` must occur in the same owning plan. It cannot target a runtime from another plan run.
+A runtime `stop` must occur in the same owning mission. It cannot target a runtime from another mission run.
 
 The parser is strict. Unknown fields, duplicate single fields, invalid identifiers, and invalid child types are errors.
 
-A plan occurs at the root. A nested plan occurs inside one step.
+A mission occurs at the root. A nested mission occurs inside one step.
 
-The plan runtime is the only execution model. st3 has no checkpoint, supervisor, or link node.
+The mission runtime is the only execution model. st3 has no checkpoint, supervisor, or link node.
 
 ### Workspaces and member environment
 
@@ -274,7 +274,7 @@ agent "worker" {
 }
 ```
 
-The plan run owns the DING child. The child checks the local st3 API once per second and sends one incarnation-fenced terminal line.
+The mission run owns the DING child. The child checks the local st3 API once per second and sends one incarnation-fenced terminal line.
 
 The DING child then records `message.delivered`. It does not read or write an st2 mailbox.
 
@@ -288,11 +288,11 @@ The origin names the host that accepted a claim. The actor names the person, age
 
 Per-subject writers and causal predecessor heads control graph updates. A claimed step binds work changes to one agent and runtime incarnation.
 
-Plan revision authority comes only from graph placement in the current generation.
+Mission revision authority comes only from graph placement in the current generation.
 
 - An agent declared directly in a step can revise that step subtree.
-- An agent declared directly in a plan can revise that plan.
-- An agent adjacent to direct plans can revise those plans.
+- An agent declared directly in a mission can revise that mission.
+- An agent adjacent to direct missions can revise those missions.
 
 A work selector does not grant revision authority. The candidate revision cannot grant authority to its own author.
 
@@ -305,10 +305,10 @@ A work selector does not grant revision authority. The candidate revision cannot
 One reconcile pass performs these operations in order:
 
 1. Read one fixed store snapshot.
-2. Select current desired heads and plan definitions.
+2. Select current desired heads and mission definitions.
 3. Reduce actual state and registered observations.
 4. Record gaps and warnings.
-5. Advance active plan runs.
+5. Advance active mission runs.
 6. Preflight all selected render writes as one transaction.
 7. Commit all render writes, or roll back all writes after one failure.
 8. Request required start, stop, review, or gate operations.
@@ -334,15 +334,15 @@ Installation uses a deterministic path and waits for the configured socket. A fa
 
 Service reset retains the binary, service definition, configuration, workspaces, and rendered files.
 
-## Plan execution
+## Mission execution
 
-A ready plan starts only through a published `plan-run` declaration. `st3 plan start` generates and publishes that declaration.
+A ready mission starts only through a published `mission-run` declaration. `st3 mission start` generates and publishes that declaration.
 
-A plan run records its initial revision, current generation, root revision, root run, workspace, requester, status, and phase.
+A mission run records its initial revision, current generation, root revision, root run, workspace, requester, status, and phase.
 
-A run generation records one plan revision, its predecessor, its actor, its reason, and its generation-specific step runs.
+A run generation records one mission revision, its predecessor, its actor, its reason, and its generation-specific step runs.
 
-A plan or step selects work with `assigned-to`, repeated `available-to`, or bare `agentless`.
+A mission or step selects work with `assigned-to`, repeated `available-to`, or bare `agentless`.
 
 The nearest selector wins. A local selector replaces its inherited selector.
 
@@ -352,7 +352,7 @@ An absent selector means agentless work. A missing eligible agent creates a warn
 
 Normal execution has these boundaries:
 
-1. Plan baselines must hold before root steps can start.
+1. Mission baselines must hold before root steps can start.
 2. Step dependencies must hold.
 3. Step baselines must hold before each attempt becomes ready.
 4. At least one eligible desired agent exists when the step needs an agent.
@@ -362,19 +362,19 @@ Normal execution has these boundaries:
 8. Declared step products must exist.
 9. All step gates must pass.
 10. The explicit completion frontier holds.
-11. Plan products must exist.
-12. All plan gates must pass.
+11. Mission products must exist.
+12. All mission gates must pass.
 13. Steps in the adjacent `finally` block run after success, failure, or cancellation.
 
-A false baseline blocks. It does not fail the plan or spend an attempt. A failed running gate fails its step or plan. A pending predicate gate keeps the current boundary pending.
+A false baseline blocks. It does not fail the mission or spend an attempt. A failed running gate fails its step or mission. A pending predicate gate keeps the current boundary pending.
 
 `completion { when "all-steps-exhausted" }` is the common completion shortcut. A completion block can use explicit dependencies instead.
 
-A plan without a completion block remains open. It becomes `standing` when no step can move and no failure blocks movement.
+A mission without a completion block remains open. It becomes `standing` when no step can move and no failure blocks movement.
 
-All plans use this state machine. st3 has no separate standing plan type.
+All missions use this state machine. st3 has no separate standing mission type.
 
-The quick Codex and Claude commands publish deterministic zero-step plans. Their runs become standing and continue to assert their agents.
+The quick Codex and Claude commands publish deterministic zero-step missions. Their runs become standing and continue to assert their agents.
 
 Graph cancellation revokes active claims and enters `finally`. The run then enters cleanup.
 
@@ -382,15 +382,15 @@ Cancellation cascades to descendant runs. A run becomes terminal only after all 
 
 ## Run revisions and generations
 
-A plan revision does not mutate an active generation. st3 creates one successor generation in an atomic transaction.
+A mission revision does not mutate an active generation. st3 creates one successor generation in an atomic transaction.
 
-The transaction marks the old generation as superseded. It creates new step-run subjects and moves the plan run pointer to the successor.
+The transaction marks the old generation as superseded. It creates new step-run subjects and moves the mission run pointer to the successor.
 
-Plan and step members carry their owner run and generation. After cutover, the reconciler stops members that remain only in the predecessor lineage.
+Mission and step members carry their owner run and generation. After cutover, the reconciler stops members that remain only in the predecessor lineage.
 
-A compatible runtime keeps its stable run-local subject across generations. st3 does not transfer that runtime to another plan run.
+A compatible runtime keeps its stable run-local subject across generations. st3 does not transfer that runtime to another mission run.
 
-A restart cutover cancels active descendant plan runs that started from predecessor steps. An idle cutover waits for active descendant work before it makes the same cancellation.
+A restart cutover cancels active descendant mission runs that started from predecessor steps. An idle cutover waits for active descendant work before it makes the same cancellation.
 
 Exact compatible step definitions carry their state. A changed step and every transitive dependent restart without prior completion.
 
@@ -400,27 +400,27 @@ The default cutover is `restart-active`. `revision-cutover="when-idle"` stops ne
 
 The event-driven reconciler performs an idle cutover. It does not use a polling worker or a wall-clock selection rule.
 
-A plan run accepts one pending revision proposal. Each proposal binds the source generation, candidate revision, compatible step set, reviewers, and preview hash.
+A mission run accepts one pending revision proposal. Each proposal binds the source generation, candidate revision, compatible step set, reviewers, and preview hash.
 
 All distinct affected reviewers must approve the exact preview. Cancellation returns a draining run to its normal phase.
 
 ## Planning mode
 
-Planning mode is a durable review workflow. It is not a plan run.
+Planning mode is a durable review workflow. It is not a mission run.
 
 `st3 planning start` creates one planning session, stores the request as an immutable document, starts one Codex planner, and sends the request through Small Talk.
 
-The planner can submit multiple named variants. Each variant contains one Markdown document and one complete ready KDL plan.
+The planner can submit multiple named variants. Each variant contains one Markdown document and one complete ready KDL mission.
 
 `st3 planning preview` validates one named variant, renders a dependency graph and diff, and records one preview hash.
 
-A planning session can target a current plan run. The session stores the exact source generation and rejects proposal after that generation changes.
+A planning session can target a current mission run. The session stores the exact source generation and rejects proposal after that generation changes.
 
 The requester can revise, approve, or cancel:
 
 - Revision stores feedback as an immutable document, sends it through Small Talk, and invalidates the old preview.
 - Approval requires the current preview hash and current subject tokens. Its approval claim links the Markdown and KDL documents. It never starts a run.
-- Cancellation publishes no plan.
+- Cancellation publishes no mission.
 
 The requester can compare named variants. The requester can then propose one previewed variant as a revision of the target run.
 
@@ -432,9 +432,9 @@ All JSON responses use the `st3.v1` envelope. The envelope includes a request ID
 
 Main endpoint groups are:
 
-- intent: `/v1/intent/plan`, `/v1/intent/apply`;
+- intent: `/v1/intent/mission`, `/v1/intent/apply`;
 - planning: `/v1/planning-sessions` and its session actions;
-- plans and work: `/v1/plan-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
+- missions and work: `/v1/mission-runs`, `/v1/run-generations`, `/v1/revision-proposals`, `/v1/work`, and `/v1/gate-results`;
 - graph data: `/v1/claims`, `/v1/claims/by-id/{id}`, `/v1/status`, `/v1/events`, and `/v1/resource-watches`;
 - runtime repair: `/v1/runtimes/reset/{subject}` and `/v1/resources/refresh/{resource}`;
 - schema: `/v1/schema`;
@@ -454,11 +454,11 @@ The `st3-schema` crate defines accepted subjects, resource kinds, claims, fields
 
 The daemon exports the same registry through `/v1/schema`. The CLI exposes it through `st3 schema`.
 
-Important plan and gate kinds include:
+Important mission and gate kinds include:
 
 - `agent.account`;
-- `plan.published` and `plan.produced`;
-- `plan-run.created` and `plan-run.state`;
+- `mission.published` and `mission.produced`;
+- `mission-run.created` and `mission-run.state`;
 - `run-generation.created`, `run-generation.superseded`, and `run-generation.state`;
 - `revision-proposal.created`, `revision-proposal.approved`, `revision-proposal.cancelled`, and `revision-proposal.applied`;
 - `step-run.carried`, `step-run.state`, and `step-run.retried`;
@@ -495,11 +495,11 @@ A network partition does not stop local work. Each host continues from the last 
 - Apply, revision, review, work, terminal, and gate operations use explicit authority or one-use capabilities.
 - Revision authority uses the current graph placement and cannot come from a candidate revision.
 - Human revision approval binds one source generation and one preview hash.
-- Plan work claims bind to one agent incarnation.
+- Mission work claims bind to one agent incarnation.
 - Terminal input and signals cite the expected incarnation.
 - Mechanical and LLM gates have bounded execution time. LLM gates also require a positive token budget and an explicit tool set.
 - Immutable document references use exact SHA-256 hashes.
-- A plan approval binds the exact candidate, preview, and subject heads.
+- A mission approval binds the exact candidate, preview, and subject heads.
 - Runtime stops do not target an unverified replacement process.
 
 The configured peer transport is for a trusted network. Authentication, encryption, and peer authorization remain outside the first protocol.
@@ -531,9 +531,9 @@ This sequence preserves one working control plane during migration. It does not 
 - No implicit step order.
 - No ownership or permission effect from `under`.
 - No revision authority from a work selector.
-- No implicit plan completion after step exhaustion.
-- No mutable plan revision inside a run generation.
-- No automatic plan run after planning approval.
-- No alias for removed st3 plan syntax.
+- No implicit mission completion after step exhaustion.
+- No mutable mission revision inside a run generation.
+- No automatic mission run after planning approval.
+- No alias for removed st3 mission syntax.
 - No unrestricted gate runner.
 - No conflict resolution by wall-clock time.

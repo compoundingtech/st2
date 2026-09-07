@@ -1,9 +1,9 @@
 {
-  "schema": "st3-plan-graph-proof.v1",
+  "schema": "st3-mission-graph-proof.v1",
   "date": "2026-08-27",
   "eval": "ghost-bug-codex",
-  "plan_run": "40709a48d7c3c747478e794860bc9656",
-  "plan_revision": "09cfb6bcf1587f9555cc56d299778746030d437c2500efe729fcf576dda55129",
+  "mission_run": "40709a48d7c3c747478e794860bc9656",
+  "mission_revision": "09cfb6bcf1587f9555cc56d299778746030d437c2500efe729fcf576dda55129",
   "candidate": {
     "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
     "working_tree": "dirty",

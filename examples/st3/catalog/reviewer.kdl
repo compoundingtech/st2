@@ -1,6 +1,6 @@
 version 2
 
-  plan "catalog/reviewer" state="ready" {
+  mission "catalog/reviewer" state="ready" {
     goal "Keep the catalog review agent ready for work."
     step "start-reviewer" {
       agentless
@@ -12,6 +12,6 @@ version 2
             prompt "Review work from the graph and report evidence."
           }
         }
-      gate "condition-1" { exists "agent/${ST_PLAN_RUN}/catalog.reviewer" }
+      gate "condition-1" { exists "agent/${ST_MISSION_RUN}/catalog.reviewer" }
     }
   }

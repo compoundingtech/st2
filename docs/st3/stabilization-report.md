@@ -102,7 +102,7 @@ The allowance remained at 86% after both model-backed signal attempts.
 
 ## Final verification
 
-All five example and practice KDL files plan without blockers after their documents are posted.
+All five example and practice KDL files mission without blockers after their documents are posted.
 
 Migration parity passes for 25 catalog files, 73 catalog documents, 58 eval files, and 40 eval documents.
 

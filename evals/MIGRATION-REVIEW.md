@@ -58,13 +58,13 @@ A candidate remains outside the active corpus until one baseline run proves that
 | --- | --- | --- | --- |
 | `adopt-only-migration` | Rust | `tests/reconcile.rs`, `tests/run.rs` | The Rust suite covers live adoption, absent hold, dead hold, and explicit replacement. |
 | `agent-spec-resource-bindings` | Rust | `crates/agent-spec/tests/discovery.rs`, `tests/validate.rs`, `tests/reconcile.rs` | The Rust suite covers parsing, stable projection, and no-restart resource edits. |
-| `assignment-contract-cold-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
+| `assignment-contract-cold-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 mission assignment. |
 | `assignment-contract-cold-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
 | `assignment-contract-cold-resources` | Represented | Model-free `resource-cold-start` | Test resource readiness and one delivery action without paying a model. |
-| `assignment-contract-handoff-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
+| `assignment-contract-handoff-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 mission assignment. |
 | `assignment-contract-handoff-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
 | `assignment-contract-handoff-resources` | Represented | Model-free `resource-handoff` | Test revoke-before-grant handoff without paying a model. |
-| `assignment-contract-hot-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 plan assignment. |
+| `assignment-contract-hot-assignment` | Archive | Source history | This old Assignment wrapper was an experimental control. It is not an st3 mission assignment. |
 | `assignment-contract-hot-focus` | Archive | Source history | Focus was an experimental selector control. The source project did not select it. |
 | `assignment-contract-hot-resources` | Represented | Model-free `resource-retarget` | Test retarget, removal, and idle graph states without paying a model. |
 | `context-resource-continuity` | Represented | `context-resource-continuity` | This fast eval crosses the real lifecycle boundary and checks durable state together. |
@@ -121,7 +121,7 @@ The nine assignment evals form a three-by-three experiment. The source project s
 
 The Focus and old Assignment forms remain controls. They should not become new st3 product layers.
 
-This decision does not remove plan assignment from st3. An st3 plan step still has an explicit agent assignment.
+This decision does not remove mission assignment from st3. An st3 mission step still has an explicit agent assignment.
 
 The new model-free evals should test three different events:
 
@@ -129,7 +129,7 @@ The new model-free evals should test three different events:
 - A live assignment receives a new resource target and later becomes idle.
 - One subject loses authority before another subject receives authority.
 
-The evals should inspect plans, resources, claims, and Small Talk actions directly. They should not pay models to confirm mechanical state.
+The evals should inspect missions, resources, claims, and Small Talk actions directly. They should not pay models to confirm mechanical state.
 
 ## Why the VRS pairs do not enter the active corpus
 
@@ -149,7 +149,7 @@ Each selected logical eval gets an st2 form and an st3 form.
 
 A model-free pair uses native runtime records to prove the same outcome. Its report names all tested binary versions.
 
-The st3 form must lift the work plan, step state, assignment, products, and judges into the graph.
+The st3 form must lift the work mission, step state, assignment, products, and judges into the graph.
 
 The graph must hold durable work state. Agent prose and a private todo file must not be the only state.
 
@@ -187,7 +187,7 @@ Rust-owned evals do not wait for these waves. Before source archival, run their 
 | --- | --- | --- |
 | `license-mit` | Claude team startup, delegation, threaded Small Talk, and confirmation | Claude harness, Small Talk, or delegation changes |
 | `ghost-bug` | The cheapest Codex multi-agent debugging path | Routine Codex team smoke testing |
-| `signal-rename` | A complex plan with parallel code work, products, integration, and a green review state | Plan graph, dependency, product, or multi-agent changes |
+| `signal-rename` | A complex mission with parallel code work, products, integration, and a green review state | Mission graph, dependency, product, or multi-agent changes |
 | `fork-in-the-road` | Parallel independent analysis followed by synthesis of a real tradeoff | Concurrency and synthesis milestones only |
 | `restart-continuity` | Cold restart, duplicate delivery, and durable graph progress in one scenario | Restart, redelivery, lease, or durable work-state changes |
 | `poisoned-pr` | A review-only lane with a hard security finding and request-changes verdict | Review judgement or review-only lane changes |

@@ -24,11 +24,11 @@ st3 keeps one strict language. It has no compatibility parser.
 
 The current language removes these st2 concepts:
 
-- `checkpoint`, because explicit plan steps and gates replace it;
-- `supervisor`, because plan placement and `under` metadata replace it;
-- `link`, because direct subject references and plan edges replace it;
+- `checkpoint`, because explicit mission steps and gates replace it;
+- `supervisor`, because mission placement and `under` metadata replace it;
+- `link`, because direct subject references and mission edges replace it;
 - `role` and `meta`, because the current roster does not need them;
-- `keep` and authored `lifecycle`, because plan-run ownership controls runtime life;
+- `keep` and authored `lifecycle`, because mission-run ownership controls runtime life;
 - implicit `deliver` and `ding`, because a DING sidecar is an explicit child exec;
 - nested agent resources, because resources are first-class graph subjects;
 - generic streams and events, because resources, messages, and claims cover current needs.
@@ -39,25 +39,25 @@ Unknown grammar is an error. Extensible subjects use `custom/`, extensible claim
 
 | Need | st3 design | State |
 | --- | --- | --- |
-| Start an agent | Publish and run a plan that contains the agent | Implemented |
-| Keep a chat agent available | Use an open plan with no completion frontier | Implemented |
-| Stop an agent | Publish plan-run cancellation and finish cleanup | Implemented |
-| Start nested tasks | Declare plan-owned `exec` or `pty` members | Implemented |
+| Start an agent | Publish and run a mission that contains the agent | Implemented |
+| Keep a chat agent available | Use an open mission with no completion frontier | Implemented |
+| Stop an agent | Publish mission-run cancellation and finish cleanup | Implemented |
+| Start nested tasks | Declare mission-owned `exec` or `pty` members | Implemented |
 | Recover surviving runtimes | Observe exact PTY and exec incarnations after daemon start | Implemented |
 | Recover a parked runtime | Use `st3 runtime reset SUBJECT --reason TEXT` | Implemented |
 | Inspect runtimes | Use `st3 runtime ls` | Implemented |
 | Prevent broad workspace creation | Require an existing workspace by default | Implemented |
 | Create an owned workspace | Add `create=#true` to the workspace declaration | Implemented |
-| Carry a stable identity | Use the plan-run-owned full agent subject | Implemented |
+| Carry a stable identity | Use the mission-run-owned full agent subject | Implemented |
 | Show grouping | Use repeated `under` metadata with an optional reason | Implemented |
 
-Every runtime belongs to one plan run. An agent subject has the form `agent/RUN/LOCAL_ID`.
+Every runtime belongs to one mission run. An agent subject has the form `agent/RUN/LOCAL_ID`.
 
-A plan run owns its runtime lifetime. A replacement plan run does not reparent an existing runtime.
+A mission run owns its runtime lifetime. A replacement mission run does not reparent an existing runtime.
 
 ## Environment
 
-st3 injects the plan, run, generation, step, requester, and workspace context.
+st3 injects the mission, run, generation, step, requester, and workspace context.
 
 `ST3_SUBJECT` is the current runtime subject. `ST_AGENT` is the owning agent subject.
 
@@ -83,7 +83,7 @@ Pi, OpenCode, and OMP need later provider-backed evals. Their model-free argumen
 
 The explicit DING child checks the local st3 API once per second. It writes one incarnation-fenced terminal line and records `message.delivered`.
 
-The DING child does not use an st2 filesystem bus. The plan run owns and cleans up the child.
+The DING child does not use an st2 filesystem bus. The mission run owns and cleans up the child.
 
 ## Messages and work
 
@@ -167,7 +167,7 @@ The catalog migrator performs these actions:
 - it rewrites legacy `$PATH` references to `${PATH}`;
 - it removes fields that st3 intentionally does not support;
 - it converts legacy DING intent into an explicit nested DING exec;
-- it validates all deferred plan and step runtime graphs;
+- it validates all deferred mission and step runtime graphs;
 - it reports each legacy file resource with an exact document import command;
 - it does not import history, bus state, contexts, or live runtime records.
 
@@ -192,6 +192,6 @@ These items do not block the current agent network trial:
 
 - provider-backed Pi, OpenCode, and OMP evals;
 - transport authentication beyond a trusted local port exposer;
-- a richer visual plan and agent tree;
+- a richer visual mission and agent tree;
 - more local resource providers;
 - provider-specific quota behavior for account subjects.

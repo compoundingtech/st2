@@ -11,8 +11,8 @@ use tokio::sync::{Notify, watch};
 
 use crate::model::{
     ClaimInput, DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec, MemberKind,
-    MemberLifecycle, MemberSpec, PlanRunRequest, PlanRunView, PlanSpec, PlanState,
-    RestartIntensity, RestartType, StepSpec, UsedPlanSpec, WorkSelector,
+    MemberLifecycle, MemberSpec, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    RestartIntensity, RestartType, StepSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{ObservationRequest, RegisteredResourceProvider, ResourceProvider};
 use crate::store::Store;
@@ -448,7 +448,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.reconcile_resource_observers(&desired)?;
         self.reconcile_schedules(&desired)?;
-        self.evaluate_plan_runs()?;
+        self.evaluate_mission_runs()?;
         Ok(())
     }
 
@@ -1064,8 +1064,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn evaluate_plan_runs(&self) -> Result<()> {
-        let runs = self.store.active_plan_runs()?;
+    fn evaluate_mission_runs(&self) -> Result<()> {
+        let runs = self.store.active_mission_runs()?;
         let mut changed = false;
         for run in runs {
             if run.phase == "revision-draining"
@@ -1074,17 +1074,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                 changed = true;
                 continue;
             }
-            let plan_id = run.plan.strip_prefix("plan/").unwrap_or(&run.plan);
-            let Some(plan) = self.store.plan_spec(plan_id, Some(&run.revision))? else {
-                changed |= self.store.set_plan_run_state(
+            let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+            let Some(mission) = self.store.mission_spec(mission_id, Some(&run.revision))? else {
+                changed |= self.store.set_mission_run_state(
                     &run.id,
                     "blocked",
                     &run.phase,
-                    Some("the selected plan revision is unavailable"),
+                    Some("the selected mission revision is unavailable"),
                 )?;
                 continue;
             };
-            changed |= self.evaluate_plan_run(&run, &plan)?;
+            changed |= self.evaluate_mission_run(&run, &mission)?;
         }
         if changed {
             self.signal_changed();
@@ -1092,12 +1092,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    fn evaluate_plan_run(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
+    fn evaluate_mission_run(&self, run: &MissionRunView, mission: &MissionSpec) -> Result<bool> {
         if run.phase.starts_with("cleanup-") {
-            return self.reconcile_plan_run_cleanup(run);
+            return self.reconcile_mission_run_cleanup(run);
         }
         let mut changed = false;
-        let flat = flatten_plan_steps(plan);
+        let flat = flatten_mission_steps(mission);
         let normal_paths = flat
             .iter()
             .filter(|step| !step.spec.finally)
@@ -1125,26 +1125,29 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
             });
             if !admitted {
-                let variables = crate::store::plan_run_variables(run, &run.revision);
-                for baseline in &plan.baselines {
+                let variables = crate::store::mission_run_variables(run, &run.revision);
+                for baseline in &mission.baselines {
                     for gate in &baseline.gates {
                         if !matches!(
                             self.evaluate_context_gate(
                                 run,
                                 &run.subject,
-                                &plan.id,
-                                &plan.revision,
+                                &mission.id,
+                                &mission.revision,
                                 1,
                                 gate,
                                 &variables,
                             )?,
                             GateOutcome::Pass
                         ) {
-                            changed |= self.store.set_plan_run_state(
+                            changed |= self.store.set_mission_run_state(
                                 &run.id,
                                 "blocked",
                                 "normal",
-                                Some(&format!("plan baseline `{}` does not hold", baseline.name)),
+                                Some(&format!(
+                                    "mission baseline `{}` does not hold",
+                                    baseline.name
+                                )),
                             )?;
                             return Ok(changed);
                         }
@@ -1154,7 +1157,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let blocked_by_baseline = run.status == "blocked"
                 && self
                     .store
-                    .latest_claim(&run.subject, Some("plan-run.state"))?
+                    .latest_claim(&run.subject, Some("mission-run.state"))?
                     .and_then(|claim| {
                         claim
                             .body
@@ -1162,14 +1165,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     })
-                    .is_some_and(|reason| reason.starts_with("plan baseline `"));
+                    .is_some_and(|reason| reason.starts_with("mission baseline `"));
             if blocked_by_baseline {
                 changed |= self
                     .store
-                    .set_plan_run_state(&run.id, "running", "normal", None)?;
+                    .set_mission_run_state(&run.id, "running", "normal", None)?;
             }
         }
-        changed |= self.materialize_plan_declarations(run, plan)?;
+        changed |= self.materialize_mission_declarations(run, mission)?;
         changed |= self.retire_predecessor_generation(run)?;
         let mut normal_failed = flat.iter().any(|step| {
             !step.spec.finally
@@ -1180,18 +1183,18 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         let mut normal_failure_reason = normal_failed.then(|| "a normal step failed".to_owned());
         let completion_selected =
-            run.phase == "normal" && self.plan_completion_selected(run, plan, &views)?;
+            run.phase == "normal" && self.mission_completion_selected(run, mission, &views)?;
         if completion_selected && !normal_failed {
-            let variables = crate::store::plan_run_variables(run, &run.revision);
-            if !self.products_hold_with_variables(&plan.products, &variables)? {
+            let variables = crate::store::mission_run_variables(run, &run.revision);
+            if !self.products_hold_with_variables(&mission.products, &variables)? {
                 return Ok(changed);
             }
-            for gate in &plan.gates {
+            for gate in &mission.gates {
                 match self.evaluate_context_gate(
                     run,
                     &run.subject,
-                    &plan.id,
-                    &plan.revision,
+                    &mission.id,
+                    &mission.revision,
                     1,
                     gate,
                     &variables,
@@ -1222,14 +1225,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
             if flat.iter().any(|step| step.spec.finally) {
-                changed |= self.store.set_plan_run_state(
+                changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
                     "final",
                     normal_failure_reason.as_deref(),
                 )?;
             } else {
-                changed |= self.store.set_plan_run_state(
+                changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
                     if normal_failed {
@@ -1267,11 +1270,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 } else {
                     "completed"
                 };
-                changed |= self.store.set_plan_run_state(
+                changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
                     &format!("cleanup-{terminal_status}"),
-                    (final_failed || failed).then_some("one or more plan steps failed"),
+                    (final_failed || failed).then_some("one or more mission steps failed"),
                 )?;
                 return Ok(changed);
             }
@@ -1343,7 +1346,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 for baseline in &step.spec.baselines {
                     for gate in &baseline.gates {
                         if !matches!(
-                            self.evaluate_plan_gate(run, &step, view, gate)?,
+                            self.evaluate_mission_gate(run, &step, view, gate)?,
                             GateOutcome::Pass
                         ) {
                             changed |= self.store.set_step_state(
@@ -1415,7 +1418,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if !view.agentless && !view.worker_reported {
                 continue;
             }
-            if let Some(nested) = &step.spec.nested_plan {
+            if let Some(nested) = &step.spec.nested_mission {
                 let nested_prefix = format!("{}/{}/", step.spec.path, nested.id);
                 if !views
                     .iter()
@@ -1425,16 +1428,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
-            if step.spec.produces_plan.is_some() && !self.produced_plan_holds(step.spec, view)? {
+            if step.spec.produces_mission.is_some()
+                && !self.produced_mission_holds(step.spec, view)?
+            {
                 continue;
             }
-            if step.spec.uses_plan.is_some() {
-                let (use_changed, outcome) = self.evaluate_used_plan(run, &step, view, &views)?;
+            if step.spec.uses_mission.is_some() {
+                let (use_changed, outcome) =
+                    self.evaluate_used_mission(run, &step, view, &views)?;
                 changed |= use_changed;
                 match outcome {
-                    UsedPlanOutcome::Pending => continue,
-                    UsedPlanOutcome::Completed => {}
-                    UsedPlanOutcome::Failed(reason) => {
+                    UsedMissionOutcome::Pending => continue,
+                    UsedMissionOutcome::Completed => {}
+                    UsedMissionOutcome::Failed(reason) => {
                         changed |=
                             self.store
                                 .set_step_state(&view.subject, "failed", Some(&reason))?;
@@ -1447,7 +1453,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let mut gates_pass = true;
             for gate in &step.spec.gates {
-                match self.evaluate_plan_gate(run, &step, view, gate)? {
+                match self.evaluate_mission_gate(run, &step, view, gate)? {
                     GateOutcome::Pass => {}
                     GateOutcome::Pending => {
                         gates_pass = false;
@@ -1471,8 +1477,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         if run.phase == "normal" {
             let refreshed = self
                 .store
-                .plan_run(&run.id)?
-                .context("the active plan run disappeared")?;
+                .mission_run(&run.id)?
+                .context("the active mission run disappeared")?;
             let normal = refreshed
                 .steps
                 .iter()
@@ -1490,20 +1496,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             let (status, reason) = if advancing {
                 ("running", None)
             } else if failed {
-                ("blocked", Some("the plan has no available step"))
-            } else if plan.completion.is_none() {
-                ("standing", Some("the open plan has no available step"))
+                ("blocked", Some("the mission has no available step"))
+            } else if mission.completion.is_none() {
+                ("standing", Some("the open mission has no available step"))
             } else {
                 ("running", None)
             };
             changed |= self
                 .store
-                .set_plan_run_state(&run.id, status, "normal", reason)?;
+                .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
     }
 
-    fn reconcile_plan_run_cleanup(&self, run: &PlanRunView) -> Result<bool> {
+    fn reconcile_mission_run_cleanup(&self, run: &MissionRunView) -> Result<bool> {
         let owned = self
             .store
             .desired_subjects()?
@@ -1534,7 +1540,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
             let response = self
                 .store
-                .apply_internal(&intent, &format!("cleanup-plan-run:{}", run.generation))?;
+                .apply_internal(&intent, &format!("cleanup-mission-run:{}", run.generation))?;
             return Ok(response.changed);
         }
         if !live.is_empty() {
@@ -1616,21 +1622,21 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         changed |= self
             .store
-            .set_plan_run_state(&run.id, status, "terminal", None)?;
+            .set_mission_run_state(&run.id, status, "terminal", None)?;
         Ok(changed)
     }
 
-    fn plan_completion_selected(
+    fn mission_completion_selected(
         &self,
-        run: &PlanRunView,
-        plan: &PlanSpec,
+        run: &MissionRunView,
+        mission: &MissionSpec,
         views: &HashMap<&str, &crate::model::StepRunView>,
     ) -> Result<bool> {
-        let Some(completion) = &plan.completion else {
+        let Some(completion) = &mission.completion else {
             return Ok(false);
         };
         match completion {
-            crate::model::CompletionSpec::AllStepsExhausted => Ok(flatten_plan_steps(plan)
+            crate::model::CompletionSpec::AllStepsExhausted => Ok(flatten_mission_steps(mission)
                 .into_iter()
                 .filter(|step| !step.spec.finally)
                 .all(|step| {
@@ -1641,7 +1647,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     })
                 })),
             crate::model::CompletionSpec::Dependencies { dependencies } => {
-                let variables = crate::store::plan_run_variables(run, &run.revision);
+                let variables = crate::store::mission_run_variables(run, &run.revision);
                 for dependency in dependencies {
                     let holds = match dependency {
                         DependencySpec::Step { step, state } => views
@@ -1659,8 +1665,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                             self.evaluate_context_gate(
                                 run,
                                 &run.subject,
-                                &plan.id,
-                                &plan.revision,
+                                &mission.id,
+                                &mission.revision,
                                 1,
                                 gate,
                                 &variables,
@@ -1677,101 +1683,106 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
-    fn produced_plan_holds(
+    fn produced_mission_holds(
         &self,
         step: &StepSpec,
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
-        let Some(expected) = &step.produces_plan else {
+        let Some(expected) = &step.produces_mission else {
             return Ok(true);
         };
         let Some(output) =
             self.store
-                .plan_output(&view.subject, view.attempt, &view.definition_hash)?
+                .mission_output(&view.subject, view.attempt, &view.definition_hash)?
         else {
             return Ok(false);
         };
-        if output.plan.strip_prefix("plan/").unwrap_or(&output.plan) != expected {
+        if output
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&output.mission)
+            != expected
+        {
             return Ok(false);
         }
         Ok(self
             .store
-            .plan_spec(expected, Some(&output.revision))?
-            .is_some_and(|plan| plan.state == PlanState::Ready))
+            .mission_spec(expected, Some(&output.revision))?
+            .is_some_and(|mission| mission.state == MissionState::Ready))
     }
 
-    fn evaluate_used_plan(
+    fn evaluate_used_mission(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         views: &HashMap<&str, &crate::model::StepRunView>,
-    ) -> Result<(bool, UsedPlanOutcome)> {
-        let (plan, revision) = match step
+    ) -> Result<(bool, UsedMissionOutcome)> {
+        let (mission, revision) = match step
             .spec
-            .uses_plan
+            .uses_mission
             .as_ref()
-            .expect("a used plan was checked")
+            .expect("a used mission was checked")
         {
-            UsedPlanSpec::Revision { plan, revision } => (plan.clone(), revision.clone()),
-            UsedPlanSpec::StepOutput { step: producer } => {
+            UsedMissionSpec::Revision { mission, revision } => (mission.clone(), revision.clone()),
+            UsedMissionSpec::StepOutput { step: producer } => {
                 let path = if step.dependency_prefix.is_empty() {
                     producer.clone()
                 } else {
                     format!("{}/{}", step.dependency_prefix, producer)
                 };
                 let Some(producer) = views.get(path.as_str()).copied() else {
-                    return Ok((false, UsedPlanOutcome::Pending));
+                    return Ok((false, UsedMissionOutcome::Pending));
                 };
-                let Some(output) = self.store.plan_output(
+                let Some(output) = self.store.mission_output(
                     &producer.subject,
                     producer.attempt,
                     &producer.definition_hash,
                 )?
                 else {
-                    return Ok((false, UsedPlanOutcome::Pending));
+                    return Ok((false, UsedMissionOutcome::Pending));
                 };
                 (
                     output
-                        .plan
-                        .strip_prefix("plan/")
-                        .unwrap_or(&output.plan)
+                        .mission
+                        .strip_prefix("mission/")
+                        .unwrap_or(&output.mission)
                         .to_owned(),
                     output.revision,
                 )
             }
         };
-        let Some(selected) = self.store.plan_spec(&plan, Some(&revision))? else {
+        let Some(selected) = self.store.mission_spec(&mission, Some(&revision))? else {
             return Ok((
                 false,
-                UsedPlanOutcome::Failed(format!(
-                    "the exact used plan `plan/{plan}@{revision}` is unavailable"
+                UsedMissionOutcome::Failed(format!(
+                    "the exact used mission `mission/{mission}@{revision}` is unavailable"
                 )),
             ));
         };
-        if selected.state != PlanState::Ready {
+        if selected.state != MissionState::Ready {
             return Ok((
                 false,
-                UsedPlanOutcome::Failed(format!(
-                    "the exact used plan `plan/{plan}@{revision}` is not ready"
+                UsedMissionOutcome::Failed(format!(
+                    "the exact used mission `mission/{mission}@{revision}` is not ready"
                 )),
             ));
         }
         let (child, changed) =
-            if let Some(child) = self.store.plan_run_for_parent_step(&view.subject)? {
+            if let Some(child) = self.store.mission_run_for_parent_step(&view.subject)? {
                 (child, false)
             } else {
                 let selector = step_run_selector(view);
-                let child = match self.store.create_child_plan_run(
-                    &PlanRunRequest {
-                        plan: plan.clone(),
+                let child = match self.store.create_child_mission_run(
+                    &MissionRunRequest {
+                        mission: mission.clone(),
                         revision: Some(revision.clone()),
                         workspace: run.workspace.clone(),
                         requester: Some(run.requester.clone()),
                         mode: Some(run.mode.clone()),
                         inputs: BTreeMap::new(),
                         idempotency_key: format!(
-                            "uses-plan:{}:{}:plan/{plan}@{revision}",
+                            "uses-mission:{}:{}:mission/{mission}@{revision}",
                             view.subject, view.attempt
                         ),
                     },
@@ -1780,35 +1791,35 @@ impl<R: RuntimeControl> Reconciler<R> {
                     Some(&selector),
                 ) {
                     Ok(child) => child,
-                    Err(error) if error.code == "plan-run-capacity" => {
-                        return Ok((false, UsedPlanOutcome::Pending));
+                    Err(error) if error.code == "mission-run-capacity" => {
+                        return Ok((false, UsedMissionOutcome::Pending));
                     }
                     Err(error) => return Err(error.into()),
                 };
                 (child, true)
             };
-        if child.plan != format!("plan/{plan}") || child.revision != revision {
+        if child.mission != format!("mission/{mission}") || child.revision != revision {
             return Ok((
                 changed,
-                UsedPlanOutcome::Failed(
-                    "the step already started a different exact plan revision".into(),
+                UsedMissionOutcome::Failed(
+                    "the step already started a different exact mission revision".into(),
                 ),
             ));
         }
         let outcome = match child.status.as_str() {
-            "completed" => UsedPlanOutcome::Completed,
-            "failed" | "cancelled" => UsedPlanOutcome::Failed(format!(
-                "the used plan run `{}` is {}",
+            "completed" => UsedMissionOutcome::Completed,
+            "failed" | "cancelled" => UsedMissionOutcome::Failed(format!(
+                "the used mission run `{}` is {}",
                 child.subject, child.status
             )),
-            _ => UsedPlanOutcome::Pending,
+            _ => UsedMissionOutcome::Pending,
         };
         Ok((changed, outcome))
     }
 
     fn step_dependencies_hold(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         step: &RuntimeStep<'_>,
         views: &HashMap<&str, &crate::model::StepRunView>,
     ) -> Result<bool> {
@@ -1878,7 +1889,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         updated_at_unix_ms: run.updated_at_unix_ms,
                     };
                     if !matches!(
-                        self.evaluate_plan_gate(run, step, &fake, gate)?,
+                        self.evaluate_mission_gate(run, step, &fake, gate)?,
                         GateOutcome::Pass
                     ) {
                         return Ok(false);
@@ -1891,7 +1902,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn materialize_step_declarations(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
@@ -1899,7 +1910,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(false);
         };
         let variables = run_variables(run, step, view);
-        let source = crate::plan::interpolate_kdl(source, &variables)?;
+        let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
@@ -1937,7 +1948,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(response.changed)
     }
 
-    fn retire_predecessor_generation(&self, run: &PlanRunView) -> Result<bool> {
+    fn retire_predecessor_generation(&self, run: &MissionRunView) -> Result<bool> {
         let stops = self
             .store
             .desired_subjects()?
@@ -1962,12 +1973,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(response.changed)
     }
 
-    fn materialize_plan_declarations(&self, run: &PlanRunView, plan: &PlanSpec) -> Result<bool> {
-        let Some(source) = &plan.declarations_kdl else {
+    fn materialize_mission_declarations(
+        &self,
+        run: &MissionRunView,
+        mission: &MissionSpec,
+    ) -> Result<bool> {
+        let Some(source) = &mission.declarations_kdl else {
             return Ok(false);
         };
-        let variables = crate::store::plan_run_variables(run, &plan.revision);
-        let source = crate::plan::interpolate_kdl(source, &variables)?;
+        let variables = crate::store::mission_run_variables(run, &mission.revision);
+        let source = crate::mission::interpolate_kdl(source, &variables)?;
         let mut intent = crate::graph::parse_execution_intent(&source, &self.host, &run.id)?;
         for subject in intent.subjects.values_mut() {
             subject.owner_run = Some(run.subject.clone());
@@ -2007,7 +2022,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn reject_runtime_collisions(
         &self,
         intent: &crate::model::NormalizedIntent,
-        run: &PlanRunView,
+        run: &MissionRunView,
         owner_step: Option<&str>,
     ) -> Result<()> {
         let existing = self
@@ -2032,7 +2047,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return Err(crate::model::St3Error::new(
                     "duplicate-runtime-subject",
                     format!(
-                        "plan run `{}` declares runtime `{}` in more than one plan or step",
+                        "mission run `{}` declares runtime `{}` in more than one mission or step",
                         run.subject, subject.subject
                     ),
                 )
@@ -2088,7 +2103,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn products_hold(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
     ) -> Result<bool> {
@@ -2102,7 +2117,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         variables: &BTreeMap<String, String>,
     ) -> Result<bool> {
         for product in products {
-            let subject = crate::plan::interpolate(&product.subject, variables)?;
+            let subject = crate::mission::interpolate(&product.subject, variables)?;
             let Some(actual) = self.subject_value(&subject)? else {
                 return Ok(false);
             };
@@ -2115,9 +2130,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(true)
     }
 
-    fn evaluate_plan_gate(
+    fn evaluate_mission_gate(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         step: &RuntimeStep<'_>,
         view: &crate::model::StepRunView,
         gate: &GateSpec,
@@ -2137,7 +2152,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_context_gate(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         subject: &str,
         title: &str,
         definition_hash: &str,
@@ -2154,7 +2169,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ..
         } = &gate
         {
-            return self.evaluate_plan_human_gate(
+            return self.evaluate_mission_human_gate(
                 run,
                 subject,
                 title,
@@ -2178,9 +2193,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn evaluate_plan_human_gate(
+    fn evaluate_mission_human_gate(
         &self,
-        run: &PlanRunView,
+        run: &MissionRunView,
         subject: &str,
         title: &str,
         definition_hash: &str,
@@ -2209,7 +2224,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .collect(),
                 ),
             ),
-            ("plan_revision".into(), Value::String(run.revision.clone())),
+            (
+                "mission_revision".into(),
+                Value::String(run.revision.clone()),
+            ),
             (
                 "step_definition".into(),
                 Value::String(definition_hash.to_owned()),
@@ -3448,21 +3466,21 @@ struct RuntimeStep<'a> {
     parent: Option<String>,
 }
 
-fn flatten_plan_steps(plan: &PlanSpec) -> Vec<RuntimeStep<'_>> {
+fn flatten_mission_steps(mission: &MissionSpec) -> Vec<RuntimeStep<'_>> {
     fn append<'a>(
-        plan: &'a PlanSpec,
+        mission: &'a MissionSpec,
         dependency_prefix: String,
         parent: Option<String>,
         output: &mut Vec<RuntimeStep<'a>>,
     ) {
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
             output.push(RuntimeStep {
                 spec: step,
                 dependency_prefix: dependency_prefix.clone(),
                 parent: parent.clone(),
             });
-            if let Some(nested) = &step.nested_plan {
+            if let Some(nested) = &step.nested_mission {
                 append(
                     nested,
                     format!("{}/{}", step.path, nested.id),
@@ -3473,7 +3491,7 @@ fn flatten_plan_steps(plan: &PlanSpec) -> Vec<RuntimeStep<'_>> {
         }
     }
     let mut output = Vec::new();
-    append(plan, String::new(), None, &mut output);
+    append(mission, String::new(), None, &mut output);
     output
 }
 
@@ -3492,7 +3510,7 @@ fn step_run_selector(view: &crate::model::StepRunView) -> WorkSelector {
 }
 
 fn run_variables(
-    run: &PlanRunView,
+    run: &MissionRunView,
     step: &RuntimeStep<'_>,
     view: &crate::model::StepRunView,
 ) -> BTreeMap<String, String> {
@@ -3512,11 +3530,14 @@ fn run_variables(
         .unwrap_or_default();
     let mut variables = BTreeMap::from([
         (
-            "ST_PLAN".into(),
-            run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
+            "ST_MISSION".into(),
+            run.mission
+                .strip_prefix("mission/")
+                .unwrap_or(&run.mission)
+                .into(),
         ),
-        ("ST_PLAN_REVISION".into(), run.revision.clone()),
-        ("ST_PLAN_RUN".into(), run.id.clone()),
+        ("ST_MISSION_REVISION".into(), run.revision.clone()),
+        ("ST_MISSION_RUN".into(), run.id.clone()),
         (
             "ST_RUN_GENERATION".into(),
             run.generation
@@ -3534,7 +3555,7 @@ fn run_variables(
         ),
         ("ST_REQUESTER".into(), run.requester.clone()),
         ("ST_PARENT_STEP_RUN".into(), parent_step_run),
-        ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
+        ("ST_ROOT_MISSION_RUN".into(), run.root_mission_run.clone()),
         ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
     ]);
     variables.extend(
@@ -3551,7 +3572,7 @@ fn expand_gate(
     run_workspace: &str,
 ) -> Result<()> {
     let expand = |value: &mut String| -> Result<()> {
-        *value = crate::plan::interpolate(value, variables)?;
+        *value = crate::mission::interpolate(value, variables)?;
         Ok(())
     };
     match gate {
@@ -3703,7 +3724,7 @@ enum GateOutcome {
     Fail(String),
 }
 
-enum UsedPlanOutcome {
+enum UsedMissionOutcome {
     Pending,
     Completed,
     Failed(String),
@@ -3918,8 +3939,8 @@ mod tests {
 
     fn apply_source(store: &Store, source: &str, idempotency_key: &str) {
         let intent = parse_intent(source, "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -3928,7 +3949,7 @@ mod tests {
             )
             .unwrap();
         store
-            .apply(&intent, &plan.subject_tokens, idempotency_key)
+            .apply(&intent, &mission.subject_tokens, idempotency_key)
             .unwrap();
     }
 
@@ -3948,13 +3969,13 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_run_executes_parallel_roots_and_an_all_of_join() {
+    fn a_mission_run_executes_parallel_roots_and_an_all_of_join() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  plan "dag" state="ready" {
-    goal "Complete plan dag."
+  mission "dag" state="ready" {
+    goal "Complete mission dag."
     completion { when "all-steps-exhausted" }
     step "one" { }
     step "two" { }
@@ -3969,8 +3990,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-dag");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "dag".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "dag".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -3988,18 +4009,18 @@ version 2
         for _ in 0..8 {
             reconciler.reconcile_once().unwrap();
         }
-        let run = store.plan_run(&run.id).unwrap().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.status, "completed");
         assert!(run.steps.iter().all(|step| step.status == "completed"));
     }
 
     #[test]
-    fn plan_and_step_baselines_block_before_work_and_recheck_retries() {
+    fn mission_and_step_baselines_block_before_work_and_recheck_retries() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
 
-              plan "baseline" state="ready" {
+              mission "baseline" state="ready" {
                 goal "Run only from an admitted baseline."
                 completion { when "all-steps-exhausted" }
 
@@ -4017,10 +4038,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "baseline-plan");
+        apply_source(&store, source, "baseline-mission");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "baseline".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "baseline".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4037,7 +4058,7 @@ version 2
         );
 
         reconciler.reconcile_once().unwrap();
-        let blocked = store.plan_run(&run.id).unwrap().unwrap();
+        let blocked = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.steps[0].status, "pending");
         assert!(
@@ -4068,7 +4089,7 @@ version 2
                 .unwrap();
         }
         reconciler.reconcile_once().unwrap();
-        let admitted = store.plan_run(&run.id).unwrap().unwrap();
+        let admitted = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(admitted.status, "running");
         assert_eq!(admitted.steps[0].status, "ready");
         assert!(
@@ -4107,7 +4128,7 @@ version 2
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        let retried = store.plan_run(&run.id).unwrap().unwrap();
+        let retried = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(retried.status, "running");
         assert_eq!(retried.steps[0].attempt, 2);
         assert_eq!(retried.steps[0].status, "blocked");
@@ -4121,12 +4142,12 @@ version 2
     }
 
     #[test]
-    fn plan_products_and_gates_hold_completion_and_record_evidence() {
+    fn mission_products_and_gates_hold_completion_and_record_evidence() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
 
-              plan "release" state="ready" {
+              mission "release" state="ready" {
                 goal "Publish an approved result."
                 completion { when "all-steps-exhausted" }
                 produces {
@@ -4139,10 +4160,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "release-plan");
+        apply_source(&store, source, "release-mission");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "release".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "release".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4160,7 +4181,7 @@ version 2
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        let waiting = store.plan_run(&run.id).unwrap().unwrap();
+        let waiting = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(waiting.steps[0].status, "completed");
         assert_eq!(waiting.status, "running");
 
@@ -4182,7 +4203,10 @@ version 2
             })
             .unwrap();
         reconciler.reconcile_once().unwrap();
-        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "running");
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
+        );
 
         store
             .append_claim(&ClaimInput {
@@ -4201,7 +4225,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().status,
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
         let evidence = store
@@ -4230,10 +4254,10 @@ version 2
         let source = r#"
             version 2
 
-              plan "context" state="ready" {
+              mission "context" state="ready" {
                 goal "Expose the run context."
 
-                  exec "plan-task" {
+                  exec "mission-task" {
                     command "true"
                     env { CUSTOM_PATH "/opt/st3-shims:${PATH}" }
                   }
@@ -4242,7 +4266,7 @@ version 2
 
                     exec "task" {
                       command "true"
-                      env { CUSTOM_RUN "${ST_PLAN_RUN}" }
+                      env { CUSTOM_RUN "${ST_MISSION_RUN}" }
                     }
 
                   gate "verify context" {
@@ -4255,10 +4279,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "context-plan");
+        apply_source(&store, source, "context-mission");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "context".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "context".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4286,11 +4310,11 @@ version 2
             .cloned()
             .expect("the step task did not start");
         for name in [
-            "ST_PLAN",
-            "ST_PLAN_REVISION",
-            "ST_PLAN_RUN",
+            "ST_MISSION",
+            "ST_MISSION_REVISION",
+            "ST_MISSION_RUN",
             "ST_RUN_GENERATION",
-            "ST_ROOT_PLAN_RUN",
+            "ST_ROOT_MISSION_RUN",
             "ST_WORKSPACE",
             "ST_REQUESTER",
             "ST_STEP",
@@ -4303,17 +4327,17 @@ version 2
         }
         assert!(!task.environment.contains_key("ST_AGENT"));
         assert_eq!(task.environment["CUSTOM_RUN"], run.id);
-        let plan_task = runtime
+        let mission_task = runtime
             .started_members
             .lock()
             .unwrap()
             .iter()
             .find(|member| member.environment.contains_key("CUSTOM_PATH"))
             .cloned()
-            .expect("the plan task did not start");
-        assert!(plan_task.environment["CUSTOM_PATH"].starts_with("/opt/st3-shims:"));
+            .expect("the mission task did not start");
+        assert!(mission_task.environment["CUSTOM_PATH"].starts_with("/opt/st3-shims:"));
         assert!(
-            plan_task.environment["CUSTOM_PATH"]
+            mission_task.environment["CUSTOM_PATH"]
                 .ends_with(&std::env::var("PATH").unwrap_or_default())
         );
 
@@ -4339,7 +4363,7 @@ version 2
             .cloned()
             .expect("the mechanical gate did not start");
         assert_eq!(gate.environment["ST_GATE"], "verify context");
-        assert_eq!(gate.environment["ST_PLAN_RUN"], run.id);
+        assert_eq!(gate.environment["ST_MISSION_RUN"], run.id);
         assert_eq!(gate.environment["ST_STEP"], "work");
     }
 
@@ -4349,8 +4373,8 @@ version 2
         let source = r#"
 version 2
 
-  plan "wake" state="ready" {
-    goal "Complete plan wake."
+  mission "wake" state="ready" {
+    goal "Complete mission wake."
     step "team" {
 
         agent "worker" { workspace "/tmp"; command "true"; restart "never" }
@@ -4361,8 +4385,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-wake");
         store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "wake".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "wake".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4392,8 +4416,8 @@ version 2
         let source = r#"
 version 2
 
-  plan "start-failure" state="ready" {
-    goal "Start all independent plan members."
+  mission "start-failure" state="ready" {
+    goal "Start all independent mission members."
     step "team" {
 
         agent "bad" { workspace "/tmp"; command "true"; restart "never" }
@@ -4405,8 +4429,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-start-failure");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "start-failure".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "start-failure".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4452,7 +4476,7 @@ version 2
         let publish = |source: &str, key: &str| {
             let intent = parse_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     crate::model::IntentInput {
                         kdl: source.into(),
@@ -4462,17 +4486,17 @@ version 2
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
             intent
-                .plans
+                .missions
                 .values()
                 .next()
-                .expect("the fixture has one plan")
+                .expect("the fixture has one mission")
                 .clone()
         };
         let first = publish(
             r#"
 version 2
 
-  plan "retire" state="ready" {
+  mission "retire" state="ready" {
     goal "Retire superseded generation members."
     step "team" {
       goal "Use the first team."
@@ -4486,8 +4510,8 @@ version 2
             "retire-first",
         );
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4517,11 +4541,11 @@ version 2
             Some(run.generation.as_str())
         );
 
-        let child_plan = publish(
+        let child_mission = publish(
             r#"
 version 2
 
-  plan "child" state="ready" {
+  mission "child" state="ready" {
     goal "Keep one child run active."
     step "work" { goal "Wait for child work." }
   }
@@ -4530,9 +4554,9 @@ version 2
             "retire-child",
         );
         let child = store
-            .create_child_plan_run(
-                &crate::model::PlanRunRequest {
-                    plan: child_plan.id,
+            .create_child_mission_run(
+                &crate::model::MissionRunRequest {
+                    mission: child_mission.id,
                     revision: None,
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
@@ -4545,11 +4569,11 @@ version 2
                 None,
             )
             .unwrap();
-        let grandchild_plan = publish(
+        let grandchild_mission = publish(
             r#"
 version 2
 
-  plan "grandchild" state="ready" {
+  mission "grandchild" state="ready" {
     goal "Keep one grandchild run active."
     step "work" { goal "Wait for grandchild work." }
   }
@@ -4558,9 +4582,9 @@ version 2
             "retire-grandchild",
         );
         let grandchild = store
-            .create_child_plan_run(
-                &crate::model::PlanRunRequest {
-                    plan: grandchild_plan.id,
+            .create_child_mission_run(
+                &crate::model::MissionRunRequest {
+                    mission: grandchild_mission.id,
                     revision: None,
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
@@ -4578,7 +4602,7 @@ version 2
             r#"
 version 2
 
-  plan "retire" state="ready" {
+  mission "retire" state="ready" {
     goal "Retire superseded generation members."
     step "team" { goal "Use the replacement team." }
   }
@@ -4587,11 +4611,11 @@ version 2
             "retire-second",
         );
         let revised = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "person/test",
-                "the old team is no longer part of the plan",
+                "the old team is no longer part of the mission",
                 "retire-cutover",
             )
             .unwrap();
@@ -4605,11 +4629,11 @@ version 2
         assert_eq!(stop.kind, "stop");
         assert_eq!(stop.owner_run.as_deref(), Some(revised.subject.as_str()));
         assert_eq!(
-            store.plan_run(&child.id).unwrap().unwrap().status,
+            store.mission_run(&child.id).unwrap().unwrap().status,
             "cancelled"
         );
         assert_eq!(
-            store.plan_run(&grandchild.id).unwrap().unwrap().status,
+            store.mission_run(&grandchild.id).unwrap().unwrap().status,
             "cancelled"
         );
         assert_ne!(revised.generation, run.generation);
@@ -4622,13 +4646,13 @@ version 2
 version 2
 
   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
-  plan "product" state="ready" {
-    goal "Complete plan product."
+  mission "product" state="ready" {
+    goal "Complete mission product."
     completion { when "all-steps-exhausted" }
     step "publish" {
       assigned-to "agent/worker"
       produces {
-        resource "plan-run/${ST_PLAN_RUN}/change" {
+        resource "mission-run/${ST_MISSION_RUN}/change" {
           kind "vcs.commit"
           state "published"
         }
@@ -4639,8 +4663,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-product");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "product".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "product".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4656,7 +4680,7 @@ version 2
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
-        let step = store.plan_run(&run.id).unwrap().unwrap().steps.remove(0);
+        let step = store.mission_run(&run.id).unwrap().unwrap().steps.remove(0);
         assert_eq!(step.status, "ready");
         for action in ["claim", "complete"] {
             store
@@ -4676,12 +4700,12 @@ version 2
         }
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "verifying"
         );
         store
             .append_claim(&ClaimInput {
-                subject: format!("resource/plan-run/{}/change", run.id),
+                subject: format!("resource/mission-run/{}/change", run.id),
                 kind: "resource.observed".into(),
                 actor: Some("agent/worker".into()),
                 fields: BTreeMap::from([
@@ -4697,29 +4721,29 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().status,
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
     }
 
     #[test]
-    fn a_step_uses_the_exact_plan_revision_produced_by_an_earlier_step() {
+    fn a_step_uses_the_exact_mission_revision_produced_by_an_earlier_step() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let bootstrap = r#"
 version 2
 
   agent "planner" { workspace "/tmp"; command "true"; restart "never" }
-  plan "bootstrap" state="ready" {
-    goal "Complete plan bootstrap."
+  mission "bootstrap" state="ready" {
+    goal "Complete mission bootstrap."
     completion { when "all-steps-exhausted" }
     step "compile" {
       assigned-to "agent/planner"
-      produces-plan "project/work"
+      produces-mission "project/work"
     }
     step "execute" {
       assigned-to "agent/planner"
       depends-on { step "compile" completed }
-      uses-plan output-of="compile"
+      uses-mission output-of="compile"
     }
   }
 
@@ -4727,8 +4751,8 @@ version 2
         let first_work = r#"
 version 2
 
-  plan "project/work" state="ready" {
-    goal "Complete plan project/work."
+  mission "project/work" state="ready" {
+    goal "Complete mission project/work."
     completion { when "all-steps-exhausted" }
     step "inspect" { title "Inspect the fixture" }
     step "finish" { depends-on { step "inspect" completed } }
@@ -4738,12 +4762,12 @@ version 2
         apply_source(&store, bootstrap, "publish-bootstrap");
         apply_source(&store, first_work, "publish-first-work");
         let first = store
-            .plan_spec("project/work", None)
+            .mission_spec("project/work", None)
             .unwrap()
-            .expect("first work plan");
+            .expect("first work mission");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "bootstrap".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "bootstrap".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4760,7 +4784,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         let compile = store
-            .plan_run(&run.id)
+            .mission_run(&run.id)
             .unwrap()
             .unwrap()
             .steps
@@ -4782,7 +4806,7 @@ version 2
             )
             .unwrap();
         let output = store
-            .record_plan_output(
+            .record_mission_output(
                 &compile.subject,
                 "agent/node.planner",
                 Some("test"),
@@ -4798,7 +4822,7 @@ version 2
                 &crate::model::WorkRequest {
                     actor: Some("agent/node.planner".into()),
                     incarnation: Some("test".into()),
-                    summary: Some("published the complete plan".into()),
+                    summary: Some("published the complete mission".into()),
                     reason: None,
                     evidence: vec![output.claim_id.clone()],
                     idempotency_key: "complete-compile".into(),
@@ -4809,9 +4833,9 @@ version 2
         let second_work = r#"
 version 2
 
-  plan "project/work" state="ready" {
-    goal "Complete plan project/work."
-    step "replacement" { title "A later plan revision" }
+  mission "project/work" state="ready" {
+    goal "Complete mission project/work."
+    step "replacement" { title "A later mission revision" }
   }
 
 "#;
@@ -4820,7 +4844,7 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         let execute = store
-            .plan_run(&run.id)
+            .mission_run(&run.id)
             .unwrap()
             .unwrap()
             .steps
@@ -4846,11 +4870,11 @@ version 2
         }
         reconciler.reconcile_once().unwrap();
         let child = store
-            .plan_run_for_parent_step(&execute.subject)
+            .mission_run_for_parent_step(&execute.subject)
             .unwrap()
-            .expect("the used plan run");
+            .expect("the used mission run");
         assert_eq!(child.revision, first.revision);
-        assert_eq!(child.root_plan_run, run.subject);
+        assert_eq!(child.root_mission_run, run.subject);
         assert_eq!(
             child.parent_step_run.as_deref(),
             Some(execute.subject.as_str())
@@ -4875,7 +4899,7 @@ version 2
                 reconciler.reconcile_once().unwrap();
             }
             let step = store
-                .plan_run(&child.id)
+                .mission_run(&child.id)
                 .unwrap()
                 .unwrap()
                 .steps
@@ -4904,11 +4928,11 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().status,
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
         assert_eq!(
-            store.plan_run(&child.id).unwrap().unwrap().status,
+            store.mission_run(&child.id).unwrap().unwrap().status,
             "completed"
         );
         let replica = Store::open_memory("replica").unwrap();
@@ -4916,10 +4940,10 @@ version 2
             .import_replication("node", &store.export_replication(0).unwrap())
             .unwrap();
         let replicated_child = replica
-            .plan_run(&child.id)
+            .mission_run(&child.id)
             .unwrap()
-            .expect("the replicated child plan run");
-        assert_eq!(replicated_child.root_plan_run, run.subject);
+            .expect("the replicated child mission run");
+        assert_eq!(replicated_child.root_mission_run, run.subject);
         assert_eq!(replicated_child.parent_step_run, child.parent_step_run);
         assert_eq!(replicated_child.revision, first.revision);
         assert_eq!(
@@ -4936,7 +4960,7 @@ version 2
         );
         assert!(
             replica
-                .plan_output(&compile.subject, 1, &compile.definition_hash)
+                .mission_output(&compile.subject, 1, &compile.definition_hash)
                 .unwrap()
                 .is_some()
         );
@@ -4950,17 +4974,17 @@ version 2
             r#"
 version 2
 
-  plan "assignment" state="ready" {
-    goal "Complete plan assignment."
+  mission "assignment" state="ready" {
+    goal "Complete mission assignment."
     step "work" { assigned-to "agent/worker" }
   }
 
 "#,
-            "assignment-plan",
+            "assignment-mission",
         );
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "assignment".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "assignment".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -4976,7 +5000,7 @@ version 2
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
-        let blocked = store.plan_run(&run.id).unwrap().unwrap().steps.remove(0);
+        let blocked = store.mission_run(&run.id).unwrap().unwrap().steps.remove(0);
         assert_eq!(blocked.status, "blocked");
         assert!(
             blocked
@@ -4993,7 +5017,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "blocked"
         );
 
@@ -5005,7 +5029,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
     }
@@ -5018,24 +5042,24 @@ version 2
             r#"
 version 2
 
-  plan "review" state="ready" {
-    goal "Complete plan review."
+  mission "review" state="ready" {
+    goal "Complete mission review."
     step "approval" {
       title "The candidate change"
       gate "human-review" type="human" {
         reviewer "person/nathan"
         question "Is the candidate ready?"
-        review "resource/plan-run/${ST_PLAN_RUN}/candidate"
+        review "resource/mission-run/${ST_MISSION_RUN}/candidate"
       }
     }
   }
 
 "#,
-            "review-plan",
+            "review-mission",
         );
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "review".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "review".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -5069,7 +5093,7 @@ version 2
                 .body
                 .pointer("/fields/review_targets/0")
                 .and_then(Value::as_str),
-            Some(format!("resource/plan-run/{}/candidate", run.id).as_str())
+            Some(format!("resource/mission-run/{}/candidate", run.id).as_str())
         );
         store
             .append_claim(&ClaimInput {
@@ -5087,7 +5111,7 @@ version 2
             .unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
         store
@@ -5103,7 +5127,7 @@ version 2
             .unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
         store
@@ -5122,7 +5146,7 @@ version 2
             .unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "completed"
         );
     }
@@ -5201,13 +5225,13 @@ version 2
     }
 
     #[test]
-    fn a_plan_step_waits_for_native_driver_readiness_before_starting_a_gate() {
+    fn a_mission_step_waits_for_native_driver_readiness_before_starting_a_gate() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
 
-              plan "proof" state="ready" {
-                goal "Complete plan proof."
+              mission "proof" state="ready" {
+                goal "Complete mission proof."
                 completion { when "all-steps-exhausted" }
                 step "native-ready" {
                   title "The native agent is ready"
@@ -5231,10 +5255,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "plan-native-ready");
+        apply_source(&store, source, "mission-native-ready");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "proof".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "proof".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -5315,8 +5339,8 @@ version 2
         let source = r#"
             version 2
 
-              plan "eval/simulated-codex" state="ready" {
-                goal "Complete plan eval/simulated-codex."
+              mission "eval/simulated-codex" state="ready" {
+                goal "Complete mission eval/simulated-codex."
                 step "team" {
                   title "The Codex team is ready"
 
@@ -5334,8 +5358,8 @@ version 2
                       content "Start."
                     }
 
-                  gate "condition-1" { exists "agent/${ST_PLAN_RUN}/sup" }
-                  gate "condition-2" { exists "agent/${ST_PLAN_RUN}/worker" }
+                  gate "condition-1" { exists "agent/${ST_MISSION_RUN}/sup" }
+                  gate "condition-2" { exists "agent/${ST_MISSION_RUN}/worker" }
                 }
                 step "worker-report" {
                   title "The worker report is delivered"
@@ -5387,9 +5411,9 @@ version 2
 
         "#;
         apply_source(&store, source, "simulated-codex-graph");
-        let plan_run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "eval/simulated-codex".into(),
+        let mission_run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "eval/simulated-codex".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -5423,10 +5447,10 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(runtime.started_members.lock().unwrap().len(), 2);
-        let sup_runtime = format!("{}.sup", plan_run.id);
-        let worker_runtime = format!("{}.worker", plan_run.id);
-        let sup_subject = format!("agent/{}/sup", plan_run.id);
-        let worker_subject = format!("agent/{}/worker", plan_run.id);
+        let sup_runtime = format!("{}.sup", mission_run.id);
+        let worker_runtime = format!("{}.worker", mission_run.id);
+        let sup_subject = format!("agent/{}/sup", mission_run.id);
+        let worker_subject = format!("agent/{}/worker", mission_run.id);
         runtime.ptys.lock().unwrap().extend([
             RuntimeObservation {
                 runtime_id: sup_runtime,
@@ -5548,18 +5572,16 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
 
-        let completed = store.plan_run(&plan_run.id).unwrap().unwrap();
+        let completed = store.mission_run(&mission_run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed", "{completed:?}");
         assert!(
-            store
-                .desired_subjects()
-                .unwrap()
-                .iter()
-                .all(|desired| { desired.owner_run.as_deref() != Some(plan_run.subject.as_str()) })
+            store.desired_subjects().unwrap().iter().all(|desired| {
+                desired.owner_run.as_deref() != Some(mission_run.subject.as_str())
+            })
         );
         assert_eq!(
             store
-                .latest_claim(&plan_run.subject, Some("eval.verdict"))
+                .latest_claim(&mission_run.subject, Some("eval.verdict"))
                 .unwrap()
                 .unwrap()
                 .body
@@ -5585,8 +5607,8 @@ version 2
         let source = r#"
             version 2
 
-              plan "proof" state="ready" {
-                goal "Complete plan proof."
+              mission "proof" state="ready" {
+                goal "Complete mission proof."
                 completion { when "all-steps-exhausted" }
                 step "verify" {
                   title "The command passes"
@@ -5600,10 +5622,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "plan-async-gate");
+        apply_source(&store, source, "mission-async-gate");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "proof".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "proof".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -5624,7 +5646,10 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         let runtime_id = runtime.starts.lock().unwrap()[0].clone();
-        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "running");
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "running"
+        );
         runtime.execs.lock().unwrap().insert(
             runtime_id.clone(),
             RuntimeObservation {
@@ -5641,7 +5666,7 @@ version 2
         }
 
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().status,
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
         reconciler.reconcile_once().unwrap();
@@ -5654,8 +5679,8 @@ version 2
         let source = r#"
             version 2
 
-              plan "proof" state="ready" {
-                goal "Complete plan proof."
+              mission "proof" state="ready" {
+                goal "Complete mission proof."
                 step "review" {
                   title "A held-out gate accepts the result"
                   gate "review" type="llm" {
@@ -5671,10 +5696,10 @@ version 2
               }
 
         "#;
-        apply_source(&store, source, "plan-llm-budget");
+        apply_source(&store, source, "mission-llm-budget");
         store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "proof".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "proof".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -5762,8 +5787,8 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let intent =
             parse_intent("version 2\n agent \"worker\" { command \"true\" } ", "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: "test".into(),
@@ -5771,7 +5796,9 @@ version 2
                 },
             )
             .unwrap();
-        store.apply(&intent, &plan.subject_tokens, "one").unwrap();
+        store
+            .apply(&intent, &mission.subject_tokens, "one")
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id: "node.worker".into(),
@@ -5968,8 +5995,8 @@ version 2
 
         "#;
         let intent = parse_intent(source, "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -5977,7 +6004,9 @@ version 2
                 },
             )
             .unwrap();
-        store.apply(&intent, &plan.subject_tokens, "one").unwrap();
+        store
+            .apply(&intent, &mission.subject_tokens, "one")
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -6065,8 +6094,8 @@ version 2
 
         "#;
         let intent = parse_intent(source, "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -6074,7 +6103,9 @@ version 2
                 },
             )
             .unwrap();
-        store.apply(&intent, &plan.subject_tokens, "one").unwrap();
+        store
+            .apply(&intent, &mission.subject_tokens, "one")
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -6162,8 +6193,8 @@ version 2
 
         "#;
         let running = parse_intent(running_source, "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &running,
                 crate::model::IntentInput {
                     kdl: running_source.into(),
@@ -6171,7 +6202,9 @@ version 2
                 },
             )
             .unwrap();
-        store.apply(&running, &plan.subject_tokens, "run").unwrap();
+        store
+            .apply(&running, &mission.subject_tokens, "run")
+            .unwrap();
         let runtime = Arc::new(FakeRuntime::default());
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id: "node.worker".into(),
@@ -6191,8 +6224,8 @@ version 2
         let stop_source = r#"version 2
  stop "agent/node.worker" "#;
         let stop = parse_intent(stop_source, "node").unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &stop,
                 crate::model::IntentInput {
                     kdl: stop_source.into(),
@@ -6200,7 +6233,7 @@ version 2
                 },
             )
             .unwrap();
-        store.apply(&stop, &plan.subject_tokens, "stop").unwrap();
+        store.apply(&stop, &mission.subject_tokens, "stop").unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(&*runtime.stops.lock().unwrap(), &["node.worker"]);
         assert!(runtime.kills.lock().unwrap().is_empty());
@@ -6400,13 +6433,13 @@ version 2
     }
 
     #[tokio::test]
-    async fn a_terminal_plan_failure_selects_cleanup() {
+    async fn a_terminal_mission_failure_selects_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
             version 2
 
-              plan "eval/demo" state="ready" {
-                goal "Complete plan eval/demo."
+              mission "eval/demo" state="ready" {
+                goal "Complete mission eval/demo."
                 step "result" timeout="1ms" {
                   agentless
                   title "The result appears"
@@ -6423,10 +6456,10 @@ version 2
               resource "result" { kind "human.review" }
 
         "#;
-        apply_source(&store, source, "plan-cleanup");
+        apply_source(&store, source, "mission-cleanup");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "eval/demo".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "eval/demo".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6450,7 +6483,7 @@ version 2
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let run = store.plan_run(&run.id).unwrap().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.phase, "terminal");
         assert_eq!(
@@ -6488,8 +6521,8 @@ version 2
 
               resource "approval" { kind "human.review" }
               agent "worker" { workspace "/tmp"; command "true"; restart "never" }
-              plan "release" state="ready" {
-                goal "Complete plan release."
+              mission "release" state="ready" {
+                goal "Complete mission release."
                 step "publish" {
                   assigned-to "agent/worker"
                   depends-on {
@@ -6501,8 +6534,8 @@ version 2
         "#;
         apply_source(&store, source, "latched-dependency");
         let run = store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: "release".into(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "release".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6533,7 +6566,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
 
@@ -6554,18 +6587,18 @@ version 2
 
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().steps[0].status,
+            store.mission_run(&run.id).unwrap().unwrap().steps[0].status,
             "ready"
         );
     }
 
     #[test]
-    fn an_open_plan_stands_when_it_has_no_next_step() {
+    fn an_open_mission_stands_when_it_has_no_next_step() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  plan "standing" state="ready" {
+  mission "standing" state="ready" {
     goal "Remain open without implicit completion."
     step "prepare" { agentless }
   }
@@ -6573,8 +6606,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-standing");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "standing".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "standing".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6592,18 +6625,18 @@ version 2
         for _ in 0..4 {
             reconciler.reconcile_once().unwrap();
         }
-        let run = store.plan_run(&run.id).unwrap().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.steps[0].status, "completed");
         assert_eq!(run.status, "standing");
 
         let zero_source = r#"
 version 2
- plan "zero" state="ready" { goal "Remain open with no steps." }
+ mission "zero" state="ready" { goal "Remain open with no steps." }
 "#;
         apply_source(&store, zero_source, "publish-zero");
         let zero = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "zero".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "zero".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6614,18 +6647,18 @@ version 2
             .unwrap();
         reconciler.reconcile_once().unwrap();
         assert_eq!(
-            store.plan_run(&zero.id).unwrap().unwrap().status,
+            store.mission_run(&zero.id).unwrap().unwrap().status,
             "standing"
         );
     }
 
     #[test]
-    fn a_zero_step_standing_plan_materializes_its_runtime_graph() {
+    fn a_zero_step_standing_mission_materializes_its_runtime_graph() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  plan "standing-agent" state="ready" {
+  mission "standing-agent" state="ready" {
     goal "Keep one agent available."
 
       agent "worker" {
@@ -6639,8 +6672,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-standing-agent");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "standing-agent".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "standing-agent".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6677,16 +6710,19 @@ version 2
             .map(|member| member.runtime_id.clone())
             .collect::<BTreeSet<_>>();
         assert_eq!(started.len(), 2);
-        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().status, "standing");
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
+            "standing"
+        );
     }
 
     #[test]
-    fn a_terminal_plan_stops_its_owned_runtimes() {
+    fn a_terminal_mission_stops_its_owned_runtimes() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  plan "finite" state="ready" {
+  mission "finite" state="ready" {
     goal "Complete and stop the generation assertions."
     completion { when "all-steps-exhausted" }
      agent "worker" { workspace "/tmp"; command "true"; restart "never" }
@@ -6696,8 +6732,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-finite");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "finite".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "finite".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6716,7 +6752,7 @@ version 2
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().status,
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "completed"
         );
         assert!(store.desired_subjects().unwrap().iter().any(|desired| {
@@ -6732,7 +6768,7 @@ version 2
         let source = r#"
 version 2
 
-  plan "blocked" state="ready" {
+  mission "blocked" state="ready" {
     goal "Expose an unreachable explicit completion frontier."
     completion { when "all-steps-exhausted" }
     step "failed" { agentless }
@@ -6742,8 +6778,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-blocked");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "blocked".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "blocked".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6763,7 +6799,7 @@ version 2
             Arc::new(Notify::new()),
         );
         reconciler.reconcile_once().unwrap();
-        let run = store.plan_run(&run.id).unwrap().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(run.status, "blocked");
         assert_eq!(
             run.steps
@@ -6782,7 +6818,7 @@ version 2
 version 2
 
   agent "one" { workspace "/tmp"; command "true"; restart "never" }
-  plan "pool" state="ready" {
+  mission "pool" state="ready" {
     goal "Expose two steps to one explicit pool."
     available-to "agent/node.one"
     available-to "agent/node.missing"
@@ -6810,8 +6846,8 @@ version 2
             })
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "pool".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "pool".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -6826,7 +6862,7 @@ version 2
             "node".into(),
             Arc::new(Notify::new()),
         );
-        reconciler.evaluate_plan_runs().unwrap();
+        reconciler.evaluate_mission_runs().unwrap();
         let work = store.work(Some("agent/node.one"), false).unwrap();
         assert_eq!(work.len(), 2);
         let claim = |step: &crate::model::StepRunView, key: &str| {
@@ -6845,7 +6881,7 @@ version 2
         };
         claim(&work[0], "pool-claim-a").unwrap();
         claim(&work[1], "pool-claim-b").unwrap();
-        let run = store.plan_run(&run.id).unwrap().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
         assert!(
             run.steps
                 .iter()
@@ -6887,7 +6923,7 @@ version 2
 version 2
 
   resource "source" { kind "custom.st3.document-source" }
-  plan "resource-input" state="ready" {
+  mission "resource-input" state="ready" {
     input "source" kind="resource"
     goal "Check the start snapshot."
     completion { when "all-steps-exhausted" }
@@ -6911,8 +6947,8 @@ version 2
             })
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "resource-input".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "resource-input".into(),
                 revision: None,
                 workspace: ".".into(),
                 requester: None,
@@ -6941,18 +6977,18 @@ version 2
         for _ in 0..5 {
             reconciler.reconcile_once().unwrap();
         }
-        let completed = store.plan_run(&run.id).unwrap().unwrap();
+        let completed = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.inputs["source"].claim_id, Some(first.id));
     }
 
     #[test]
-    fn one_plan_run_rejects_a_runtime_id_in_two_steps() {
+    fn one_mission_run_rejects_a_runtime_id_in_two_steps() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
 
-  plan "collision" state="ready" {
+  mission "collision" state="ready" {
     goal "Reject two owners for one runtime."
     step "one" { agentless;  exec "same" { command "true"; restart "never" }  }
     step "two" { agentless;  exec "same" { command "true"; restart "never" }  }
@@ -6961,8 +6997,8 @@ version 2
 "#;
         apply_source(&store, source, "publish-collision");
         store
-            .create_plan_run(&PlanRunRequest {
-                plan: "collision".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "collision".into(),
                 revision: None,
                 workspace: ".".into(),
                 requester: None,
@@ -6979,7 +7015,7 @@ version 2
         );
         reconciler.reconcile_once().unwrap();
         let error = reconciler.reconcile_once().unwrap_err();
-        assert!(error.to_string().contains("more than one plan or step"));
+        assert!(error.to_string().contains("more than one mission or step"));
     }
 
     impl ResourceProvider for FakeResourceProvider {

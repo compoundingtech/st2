@@ -1,9 +1,9 @@
 {
-  "schema": "st3-plan-graph-proof.v1",
+  "schema": "st3-mission-graph-proof.v1",
   "date": "2026-08-27",
   "eval": "signal-rename-codex",
-  "plan_run": "52a0a41d099a72bd825f04b5d7c726ca",
-  "plan_revision": "c29cdfbb452b0987111b964511f06610633dcf5dda79727de26a31ae72799f62",
+  "mission_run": "52a0a41d099a72bd825f04b5d7c726ca",
+  "mission_revision": "c29cdfbb452b0987111b964511f06610633dcf5dda79727de26a31ae72799f62",
   "candidate": {
     "git_head": "2a8c645b69f7f18acd76746e62b88d357a35234a",
     "working_tree": "dirty",

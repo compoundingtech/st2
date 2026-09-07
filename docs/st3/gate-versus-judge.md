@@ -2,7 +2,7 @@
 
 Status: resolved.
 
-st3 uses `gate` for plan-level and step-level acceptance conditions.
+st3 uses `gate` for mission-level and step-level acceptance conditions.
 
 Terminal input uses dedicated incarnation-bound control claims. It is not a gate.
 
@@ -16,6 +16,6 @@ The complete public vocabulary is:
 
 st3 does not accept `judges`, `judge`, `judgement`, or an `outcome` wrapper. There is no compatibility alias because st3 has no released grammar to preserve.
 
-`produces` remains a separate product contract. It names graph state that work promises to create. A gate evaluates acceptance. A step or plan must satisfy both its products and all its gates.
+`produces` remains a separate product contract. It names graph state that work promises to create. A gate evaluates acceptance. A step or mission must satisfy both its products and all its gates.
 
-See [plan-graph-runtime.md](./plan-graph-runtime.md#gates) for the full syntax and execution rules.
+See [mission-graph-runtime.md](./mission-graph-runtime.md#gates) for the full syntax and execution rules.

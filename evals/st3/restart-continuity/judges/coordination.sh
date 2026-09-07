@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ST_PLAN_RUN:?ST_PLAN_RUN must identify the judged plan run}"
+: "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 
-dev_agent="agent/$ST_PLAN_RUN/rc.dev"
-sup_agent="agent/$ST_PLAN_RUN/rc.sup"
+dev_agent="agent/$ST_MISSION_RUN/rc.dev"
+sup_agent="agent/$ST_MISSION_RUN/rc.sup"
 dev_messages="$(st3 message ls "$dev_agent" --archive --json)"
 sup_messages="$(st3 message ls "$sup_agent" --archive --json)"
 requester_messages="$(st3 message ls person/eval-requester --archive --json)"
-work_tag="plan-run:plan-run/$ST_PLAN_RUN"
-direct_tag="plan-run:$ST_PLAN_RUN"
-injector="exec/$ST_PLAN_RUN/eval/restart-continuity/inject"
+work_tag="mission-run:mission-run/$ST_MISSION_RUN"
+direct_tag="mission-run:$ST_MISSION_RUN"
+injector="exec/$ST_MISSION_RUN/eval/restart-continuity/inject"
 
 assignments="$(jq --arg tag "$work_tag" \
   '[.[] | select(.from == "daemon/runtime" and (.tags | index($tag)))]' <<<"$dev_messages")"
@@ -35,7 +35,7 @@ test "$(jq -r '.[0].status' <<<"$reports")" = closed
 test "$(jq 'length' <<<"$confirmations")" -eq 1
 
 duplicate_subject="$(jq -r '.[0].subject' <<<"$duplicates")"
-restart_subject="$(st3 inspect "resource/plan-run/$ST_PLAN_RUN/restart" --json \
+restart_subject="$(st3 inspect "resource/mission-run/$ST_MISSION_RUN/restart" --json \
   | jq -r '.status.subjects[0].actual | (.fields // .) | .duplicate_message')"
 test "$duplicate_subject" = "$restart_subject"
 

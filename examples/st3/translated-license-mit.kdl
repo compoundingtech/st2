@@ -1,8 +1,8 @@
 version 2
 
-  plan "eval/license-mit" state="ready" {
+  mission "eval/license-mit" state="ready" {
     completion { when "all-steps-exhausted" }
-    goal "Complete plan eval/license-mit."
+    goal "Complete mission eval/license-mit."
     step "team" timeout="20m" {
       agentless
       title "The eval team is running"
@@ -23,12 +23,12 @@ version 2
           }
           restart "never"
         }
-      gate "condition-1" { exists "agent/${ST_PLAN_RUN}/mix.sup" }
-      gate "condition-2" { exists "agent/${ST_PLAN_RUN}/mix.worker" }
+      gate "condition-1" { exists "agent/${ST_MISSION_RUN}/mix.sup" }
+      gate "condition-2" { exists "agent/${ST_MISSION_RUN}/mix.worker" }
     }
 
     step "change-license" timeout="20m" {
-      assigned-to "agent/${ST_PLAN_RUN}/mix.worker"
+      assigned-to "agent/${ST_MISSION_RUN}/mix.worker"
       title "The worker completes the license change"
       goal "Install the MIT license and report the commit to the supervisor."
       depends-on { step "team" completed }

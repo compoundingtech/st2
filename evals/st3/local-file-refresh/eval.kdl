@@ -4,7 +4,7 @@ version 2
     kind "filesystem.file"
   }
 
-  plan "eval/local-file-refresh" state="ready" {
+  mission "eval/local-file-refresh" state="ready" {
     completion { when "all-steps-exhausted" }
     goal "Refresh one local file observation without exposing its content."
 
@@ -26,8 +26,8 @@ version 2
           command "bash ./refresh.sh"
           restart "never"
         }
-      gate "condition-1" { field "status" "exec/${ST_PLAN_RUN}/local-file-refresh/change" "is" "exited" }
-      gate "condition-2" { field "exit_code" "exec/${ST_PLAN_RUN}/local-file-refresh/change" "is" 0 }
+      gate "condition-1" { field "status" "exec/${ST_MISSION_RUN}/local-file-refresh/change" "is" "exited" }
+      gate "condition-2" { field "exit_code" "exec/${ST_MISSION_RUN}/local-file-refresh/change" "is" 0 }
     }
 
     step "verify-refresh" timeout="1m" {

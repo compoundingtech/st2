@@ -31,16 +31,17 @@ use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, GateResultRequest,
-    MessageLifecycleRequest, MessageSendRequest, MessageView, PlanOutputView,
-    PlanProductionRequest, PlanRequest, PlanResponse, PlanRevisionRequest, PlanRunRequest,
-    PlanRunView, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
-    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicationBatch, ReplicationQuery,
-    ReplicationResponse, ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
-    SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest,
-    St3Error, StatusResponse, StepRunView, WorkRequest,
+    MessageLifecycleRequest, MessageSendRequest, MessageView, MissionOutputView,
+    MissionProductionRequest, MissionRequest, MissionResponse, MissionRevisionRequest,
+    MissionRunRequest, MissionRunView, PlanningApprovalRequest, PlanningCancelRequest,
+    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
+    ReplicationBatch, ReplicationQuery, ReplicationResponse, ResourceUnwatchRequest,
+    ResourceWatchRequest, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
+    WorkRequest,
 };
 use crate::store::Store;
 
@@ -122,9 +123,9 @@ pub fn router(state: AppState) -> Router {
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/schema", get(schema))
-        .route("/v1/intent/plan", post(plan))
+        .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
-        .route("/v1/plans/{id}", get(get_plan))
+        .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/planning-sessions/{id}", get(get_planning_session))
         .route(
             "/v1/planning-sessions/{id}/submit",
@@ -168,13 +169,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/doctor", get(doctor))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
-        .route("/v1/plan-runs", get(list_plan_runs))
-        .route("/v1/plan-runs/{run}/generations", get(list_run_generations))
+        .route("/v1/mission-runs", get(list_mission_runs))
         .route(
-            "/v1/plan-runs/{run}/revision-proposal",
+            "/v1/mission-runs/{run}/generations",
+            get(list_run_generations),
+        )
+        .route(
+            "/v1/mission-runs/{run}/revision-proposal",
             get(get_run_revision_proposal),
         )
-        .route("/v1/plan-runs/{run}", get(get_plan_run))
+        .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
         .route(
             "/v1/revision-proposals/{proposal}",
@@ -189,7 +193,7 @@ pub fn router(state: AppState) -> Router {
             post(cancel_revision_proposal),
         )
         .route("/v1/work", get(list_work))
-        .route("/v1/work/plan/{*subject}", post(publish_work_plan))
+        .route("/v1/work/mission/{*subject}", post(publish_work_mission))
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
@@ -225,8 +229,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
-        .route("/v1/plan-runs", post(start_plan_run))
-        .route("/v1/plan-runs/{run}/revision", post(revise_plan_run));
+        .route("/v1/mission-runs", post(start_mission_run))
+        .route("/v1/mission-runs/{run}/revision", post(revise_mission_run));
     app.layer(from_fn_with_state(state.clone(), response_envelope))
         .with_state(state)
 }
@@ -617,34 +621,34 @@ async fn start_planning_session(
     let target_run = request
         .run
         .as_deref()
-        .map(|run| state.store.plan_run(run))
+        .map(|run| state.store.mission_run(run))
         .transpose()
         .map_err(ApiError::internal)?
         .flatten();
     if request.run.is_some() && target_run.is_none() {
-        return Err(ApiError::not_found("the target plan run does not exist"));
+        return Err(ApiError::not_found("the target mission run does not exist"));
     }
     if let Some(run) = &target_run
         && (!matches!(run.status.as_str(), "running" | "blocked") || run.phase != "normal")
     {
         return Err(ApiError::bad(St3Error::new(
-            "plan-run-not-revisable",
+            "mission-run-not-revisable",
             format!(
-                "plan run `{}` is {} in its {} phase",
+                "mission run `{}` is {} in its {} phase",
                 run.subject, run.status, run.phase
             ),
         )));
     }
-    let plan_id = target_run
+    let mission_id = target_run
         .as_ref()
         .map(|run| {
-            run.plan
-                .strip_prefix("plan/")
-                .unwrap_or(&run.plan)
+            run.mission
+                .strip_prefix("mission/")
+                .unwrap_or(&run.mission)
                 .to_owned()
         })
-        .unwrap_or_else(|| request.plan.clone());
-    crate::plan::validate_plan_id(&plan_id).map_err(ApiError::bad)?;
+        .unwrap_or_else(|| request.mission.clone());
+    crate::mission::validate_mission_id(&mission_id).map_err(ApiError::bad)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..24].to_owned();
     let request_name = format!("doc/planning/{id}/request");
     let request_document = state
@@ -661,12 +665,12 @@ async fn start_planning_session(
     let planner_alias = format!("agent/planner.{}", &id[..10]);
     let request_reference = format!("{}@{}", request_document.name, request_document.hash);
     let context_reference = if let Some(run) = &target_run {
-        let plan = state
+        let mission = state
             .store
-            .plan_spec(&plan_id, Some(&run.revision))
+            .mission_spec(&mission_id, Some(&run.revision))
             .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::internal("the target plan revision is unavailable"))?;
-        let context = serde_json::to_vec_pretty(&json!({"plan_run": run, "plan": plan}))
+            .ok_or_else(|| ApiError::internal("the target mission revision is unavailable"))?;
+        let context = serde_json::to_vec_pretty(&json!({"mission_run": run, "mission": mission}))
             .map_err(ApiError::internal)?;
         let document = state
             .store
@@ -688,7 +692,7 @@ async fn start_planning_session(
         .into_iter()
         .collect();
     let prompt = format!(
-        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown plan and one complete version 2 KDL plan. The KDL plan ID must be `{plan_id}` and its state must be ready. You can submit named variants with `st3 planning submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the plan. Stay available for revision messages until approval or cancellation."
+        "You are the durable Codex planner for planning session {id}. Use `st3 message ls`, read and archive the native Small Talk request, and use `st3 doc get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st3 planning submit {id} --variant NAME --markdown FILE --kdl FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation."
     );
     let planner = quick_agent(
         &state,
@@ -712,7 +716,7 @@ async fn start_planning_session(
         .store
         .create_planning_session(
             &id,
-            &plan_id,
+            &mission_id,
             &request_reference,
             &request.workspace,
             &requester,
@@ -734,15 +738,15 @@ async fn start_planning_session(
     )?;
     let mut started_fields = BTreeMap::from([
         (
-            "plan".into(),
-            Value::String(format!("plan/{}", session.plan)),
+            "mission".into(),
+            Value::String(format!("mission/{}", session.mission)),
         ),
         ("request".into(), Value::String(request_reference)),
         ("planner".into(), Value::String(session.planner.clone())),
         ("workspace".into(), Value::String(session.workspace.clone())),
         ("requester".into(), Value::String(session.requester.clone())),
     ]);
-    if let Some(run) = &session.target_plan_run {
+    if let Some(run) = &session.target_mission_run {
         started_fields.insert("target_run".into(), Value::String(run.clone()));
     }
     if let Some(generation) = &session.source_generation {
@@ -817,24 +821,24 @@ async fn submit_planning_variant(
             "planning KDL must contain valid UTF-8",
         ))
     })?;
-    let (intent, _) = plan_source(&state, kdl, None)?;
+    let (intent, _) = mission_source(&state, kdl, None)?;
     if !intent.subjects.is_empty()
-        || intent.plans.len() != 1
-        || !intent.plans.contains_key(&session.plan)
+        || intent.missions.len() != 1
+        || !intent.missions.contains_key(&session.mission)
     {
         return Err(ApiError::bad(St3Error::new(
-            "wrong-planning-plan",
+            "wrong-planning-mission",
             format!(
-                "a candidate must contain only ready plan `{}` and no immediate desired state",
-                session.plan
+                "a candidate must contain only ready mission `{}` and no immediate desired state",
+                session.mission
             ),
         )));
     }
-    let plan = &intent.plans[&session.plan];
-    if plan.state != crate::model::PlanState::Ready {
+    let mission = &intent.missions[&session.mission];
+    if mission.state != crate::model::MissionState::Ready {
         return Err(ApiError::bad(St3Error::new(
-            "planning-plan-not-ready",
-            "a planning candidate must contain a ready plan",
+            "planning-mission-not-ready",
+            "a planning candidate must contain a ready mission",
         )));
     }
     let mut content_hasher = Sha256::new();
@@ -875,7 +879,7 @@ async fn submit_planning_variant(
             &variant,
             &format!("{}@{}", markdown_document.name, markdown_document.hash),
             &format!("{}@{}", kdl_document.name, kdl_document.hash),
-            &plan.revision,
+            &mission.revision,
         )
         .map_err(ApiError::bad)?;
     let candidate = response
@@ -895,8 +899,8 @@ async fn submit_planning_variant(
             ("markdown".into(), Value::String(candidate.markdown.clone())),
             ("kdl".into(), Value::String(candidate.kdl.clone())),
             (
-                "plan_revision".into(),
-                Value::String(candidate.plan_revision.clone()),
+                "mission_revision".into(),
+                Value::String(candidate.mission_revision.clone()),
             ),
         ]),
         &format!(
@@ -947,19 +951,19 @@ async fn preview_planning_variant(
             ))
         })?;
     let kdl = planning_document_text(&state, &candidate.kdl)?;
-    let (intent, plan_response) = plan_source(&state, &kdl, None)?;
-    let plan = &intent.plans[&session.plan];
-    let graph = render_planning_graph(plan);
-    let diff = render_planning_diff(&plan_response);
+    let (intent, mission_response) = mission_source(&state, &kdl, None)?;
+    let mission = &intent.missions[&session.mission];
+    let graph = render_planning_graph(mission);
+    let diff = render_planning_diff(&mission_response);
     let hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({
             "candidate_revision": candidate.revision,
             "markdown": candidate.markdown,
             "kdl": candidate.kdl,
-            "plan_revision": candidate.plan_revision,
+            "mission_revision": candidate.mission_revision,
             "graph": graph,
             "diff": diff,
-            "plan": plan_response,
+            "mission": mission_response,
         }))
         .map_err(ApiError::internal)?,
     ));
@@ -972,7 +976,7 @@ async fn preview_planning_variant(
             &hash,
             &graph,
             &diff,
-            &plan_response,
+            &mission_response,
         )
         .map_err(ApiError::bad)?;
     let preview = response
@@ -997,8 +1001,8 @@ async fn preview_planning_variant(
             ("graph".into(), Value::String(preview.graph.clone())),
             ("diff".into(), Value::String(preview.diff.clone())),
             (
-                "plan".into(),
-                serde_json::to_value(&preview.plan).map_err(ApiError::internal)?,
+                "mission".into(),
+                serde_json::to_value(&preview.mission).map_err(ApiError::internal)?,
             ),
         ]),
         &format!("planning-preview:{}:{}", response.id, preview.hash),
@@ -1042,17 +1046,17 @@ async fn propose_planning_variant(
         return Ok(Json(cached));
     }
     let session = required_planning_session(&state, &id)?;
-    let run_subject = session.target_plan_run.as_deref().ok_or_else(|| {
+    let run_subject = session.target_mission_run.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "planning-session-has-no-run",
-            "this planning session creates a new plan and cannot propose a run revision",
+            "this planning session creates a new mission and cannot propose a run revision",
         ))
     })?;
     let current = state
         .store
-        .plan_run(run_subject)
+        .mission_run(run_subject)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found("the target plan run does not exist"))?;
+        .ok_or_else(|| ApiError::not_found("the target mission run does not exist"))?;
     if session.source_generation.as_deref() != Some(current.generation.as_str()) {
         return Err(ApiError::bad(St3Error::new(
             "stale-planning-generation",
@@ -1072,33 +1076,33 @@ async fn propose_planning_variant(
             "preview the named variant before proposal",
         ))
     })?;
-    if !preview.plan.blockers.is_empty() {
+    if !preview.mission.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "planning-preview-blocked",
-            preview.plan.blockers.join("; "),
+            preview.mission.blockers.join("; "),
         )));
     }
     let intent =
-        parse_intent(&preview.plan.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
-    let plan = &intent.plans[&session.plan];
+        parse_intent(&preview.mission.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
+    let mission = &intent.missions[&session.mission];
     let old = state
         .store
-        .plan_spec(&session.plan, Some(&current.revision))
+        .mission_spec(&session.mission, Some(&current.revision))
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::internal("the current plan revision is unavailable"))?;
-    let (_, reviewers) = crate::store::analyze_plan_revision(
+        .ok_or_else(|| ApiError::internal("the current mission revision is unavailable"))?;
+    let (_, reviewers) = crate::store::analyze_mission_revision(
         &old,
-        plan,
+        mission,
         &request.actor,
         &current.requester,
-        &crate::store::plan_run_variables(&current, &plan.revision),
+        &crate::store::mission_run_variables(&current, &mission.revision),
     )
     .map_err(ApiError::bad)?;
     state
         .store
         .apply(
             &intent,
-            &preview.plan.subject_tokens,
+            &preview.mission.subject_tokens,
             &format!("{}:publish", request.idempotency_key),
         )
         .map_err(ApiError::bad)?;
@@ -1106,11 +1110,11 @@ async fn propose_planning_variant(
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
             RevisionSubmissionView {
                 status: "applied".into(),
-                plan_run: state
+                mission_run: state
                     .store
-                    .adopt_plan_revision(
+                    .adopt_mission_revision(
                         run_subject,
-                        plan,
+                        mission,
                         &request.actor,
                         &request.reason,
                         &format!("{}:cutover", request.idempotency_key),
@@ -1123,7 +1127,7 @@ async fn propose_planning_variant(
                 .store
                 .create_revision_proposal(
                     run_subject,
-                    plan,
+                    mission,
                     &request.actor,
                     &request.reason,
                     &format!("{}:proposal", request.idempotency_key),
@@ -1131,11 +1135,11 @@ async fn propose_planning_variant(
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
                 status: proposal.status.clone(),
-                plan_run: state
+                mission_run: state
                     .store
-                    .plan_run(run_subject)
+                    .mission_run(run_subject)
                     .map_err(ApiError::internal)?
-                    .expect("the target plan run exists"),
+                    .expect("the target mission run exists"),
                 proposal: Some(proposal),
             }
         };
@@ -1247,7 +1251,7 @@ async fn approve_planning_session(
         )));
     }
     if session.status == "approved" {
-        if session.published_revision.as_deref() == Some(candidate.plan_revision.as_str()) {
+        if session.published_revision.as_deref() == Some(candidate.mission_revision.as_str()) {
             let approval_key = format!("planning-approval:{}:{}", session.id, preview.hash);
             stop_planning_agent(&state, &session.planner, &approval_key)?;
             signal_changed(&state);
@@ -1258,18 +1262,18 @@ async fn approve_planning_session(
             session.id
         )));
     }
-    if !preview.plan.blockers.is_empty() {
+    if !preview.mission.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "planning-preview-blocked",
-            preview.plan.blockers.join("; "),
+            preview.mission.blockers.join("; "),
         )));
     }
-    let target = if let Some(run_subject) = session.target_plan_run.as_deref() {
+    let target = if let Some(run_subject) = session.target_mission_run.as_deref() {
         let current = state
             .store
-            .plan_run(run_subject)
+            .mission_run(run_subject)
             .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found("the target plan run does not exist"))?;
+            .ok_or_else(|| ApiError::not_found("the target mission run does not exist"))?;
         if session.source_generation.as_deref() != Some(current.generation.as_str()) {
             return Err(ApiError::bad(St3Error::new(
                 "stale-planning-generation",
@@ -1281,37 +1285,37 @@ async fn approve_planning_session(
         None
     };
     let intent =
-        parse_intent(&preview.plan.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
+        parse_intent(&preview.mission.resolved_intent.kdl, &state.node).map_err(ApiError::bad)?;
     let approval_key = format!("planning-approval:{}:{}", session.id, preview.hash);
     state
         .store
         .apply(
             &intent,
-            &preview.plan.subject_tokens,
+            &preview.mission.subject_tokens,
             &format!("{approval_key}:publish"),
         )
         .map_err(ApiError::bad)?;
     if let Some((run_subject, current)) = target {
-        let plan = &intent.plans[&session.plan];
+        let mission = &intent.missions[&session.mission];
         let old = state
             .store
-            .plan_spec(&session.plan, Some(&current.revision))
+            .mission_spec(&session.mission, Some(&current.revision))
             .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::internal("the current plan revision is unavailable"))?;
-        let (_, reviewers) = crate::store::analyze_plan_revision(
+            .ok_or_else(|| ApiError::internal("the current mission revision is unavailable"))?;
+        let (_, reviewers) = crate::store::analyze_mission_revision(
             &old,
-            plan,
+            mission,
             &request.actor,
             &current.requester,
-            &crate::store::plan_run_variables(&current, &plan.revision),
+            &crate::store::mission_run_variables(&current, &mission.revision),
         )
         .map_err(ApiError::bad)?;
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
             state
                 .store
-                .adopt_plan_revision(
+                .adopt_mission_revision(
                     &run_subject,
-                    plan,
+                    mission,
                     &request.actor,
                     "the requester approved the planning revision",
                     &format!("{approval_key}:cutover"),
@@ -1322,7 +1326,7 @@ async fn approve_planning_session(
                 .store
                 .create_revision_proposal(
                     &run_subject,
-                    plan,
+                    mission,
                     &request.actor,
                     "the requester approved the planning revision",
                     &format!("{approval_key}:proposal"),
@@ -1351,7 +1355,7 @@ async fn approve_planning_session(
             &session.id,
             &request.actor,
             "approved",
-            Some(&candidate.plan_revision),
+            Some(&candidate.mission_revision),
         )
         .map_err(ApiError::bad)?;
     record_planning_event(
@@ -1367,8 +1371,8 @@ async fn approve_planning_session(
                 Value::String(request.preview_hash.clone()),
             ),
             (
-                "plan_revision".into(),
-                Value::String(candidate.plan_revision.clone()),
+                "mission_revision".into(),
+                Value::String(candidate.mission_revision.clone()),
             ),
             ("markdown".into(), Value::String(candidate.markdown.clone())),
             ("kdl".into(), Value::String(candidate.kdl.clone())),
@@ -1493,11 +1497,11 @@ fn planning_document_text(state: &AppState, reference: &str) -> Result<String, A
     String::from_utf8(bytes).map_err(ApiError::internal)
 }
 
-fn plan_source(
+fn mission_source(
     state: &AppState,
     kdl: &str,
     at_index: Option<u64>,
-) -> Result<(crate::model::NormalizedIntent, PlanResponse), ApiError> {
+) -> Result<(crate::model::NormalizedIntent, MissionResponse), ApiError> {
     let initial = parse_intent(kdl, &state.node).map_err(ApiError::bad)?;
     let bindings = state
         .store
@@ -1507,7 +1511,7 @@ fn plan_source(
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
     let response = state
         .store
-        .plan_at(
+        .mission_at(
             &intent,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
@@ -1519,10 +1523,10 @@ fn plan_source(
     Ok((intent, response))
 }
 
-fn render_planning_graph(plan: &crate::model::PlanSpec) -> String {
-    fn append(plan: &crate::model::PlanSpec, indent: &str, lines: &mut Vec<String>) {
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
+fn render_planning_graph(mission: &crate::model::MissionSpec) -> String {
+    fn append(mission: &crate::model::MissionSpec, indent: &str, lines: &mut Vec<String>) {
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
             let dependencies = step
                 .dependencies
                 .iter()
@@ -1543,30 +1547,31 @@ fn render_planning_graph(plan: &crate::model::PlanSpec) -> String {
             for gate in &step.gates {
                 lines.push(format!("{indent}  gate {}", crate::graph::gate_name(gate)));
             }
-            if let Some(nested) = &step.nested_plan {
+            if let Some(nested) = &step.nested_mission {
                 append(nested, &format!("{indent}  "), lines);
             }
         }
     }
-    let mut lines = vec![format!("plan/{}", plan.id)];
-    for baseline in &plan.baselines {
+    let mut lines = vec![format!("mission/{}", mission.id)];
+    for baseline in &mission.baselines {
         lines.push(format!("  baseline {}", baseline.name));
     }
-    for product in &plan.products {
+    for product in &mission.products {
         lines.push(format!("  produces {}", product.subject));
     }
-    for gate in &plan.gates {
+    for gate in &mission.gates {
         lines.push(format!("  gate {}", crate::graph::gate_name(gate)));
     }
-    append(plan, "  ", &mut lines);
+    append(mission, "  ", &mut lines);
     lines.join("\n")
 }
 
-fn render_planning_diff(plan: &PlanResponse) -> String {
-    if plan.changes.is_empty() {
+fn render_planning_diff(mission: &MissionResponse) -> String {
+    if mission.changes.is_empty() {
         return "No graph changes.".into();
     }
-    plan.changes
+    mission
+        .changes
         .iter()
         .map(|change| format!("{} {}", change.change, change.subject))
         .collect::<Vec<_>>()
@@ -1616,17 +1621,17 @@ fn stop_planning_agent(state: &AppState, planner: &str, key: &str) -> Result<(),
         .strip_prefix("agent/")
         .and_then(|value| value.split_once('/').map(|(_, local)| local))
         .unwrap_or(planner);
-    let standing_plan = format!("plan/standing/{local_agent}");
+    let standing_mission = format!("mission/standing/{local_agent}");
     let cancellation = state
         .store
-        .active_plan_runs()
+        .active_mission_runs()
         .map_err(ApiError::internal)?
         .into_iter()
-        .find(|run| run.plan == standing_plan)
+        .find(|run| run.mission == standing_mission)
         .map(|run| run.subject)
         .map(|run| {
             format!(
-                "plan-run {:?} {{ cancellation \"planning-session-ended\" {{ reason \"the planning session ended\" }} }}\n",
+                "mission-run {:?} {{ cancellation \"planning-session-ended\" {{ reason \"the planning session ended\" }} }}\n",
                 run
             )
         })
@@ -1644,10 +1649,10 @@ fn stop_planning_agent(state: &AppState, planner: &str, key: &str) -> Result<(),
     Ok(())
 }
 
-async fn plan(
+async fn mission(
     State(state): State<AppState>,
-    Json(request): Json<PlanRequest>,
-) -> Result<Json<PlanResponse>, ApiError> {
+    Json(request): Json<MissionRequest>,
+) -> Result<Json<MissionResponse>, ApiError> {
     let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
     let bindings = state
         .store
@@ -1662,7 +1667,7 @@ async fn plan(
     };
     state
         .store
-        .plan_at(&intent, resolved, request.at_index)
+        .mission_at(&intent, resolved, request.at_index)
         .map(Json)
         .map_err(ApiError::bad)
 }
@@ -1692,17 +1697,17 @@ async fn apply(
     Ok(Json(response))
 }
 
-async fn get_plan(
+async fn get_mission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<crate::model::PlanSpec>, ApiError> {
-    let id = id.strip_prefix("plan/").unwrap_or(&id);
+) -> Result<Json<crate::model::MissionSpec>, ApiError> {
+    let id = id.strip_prefix("mission/").unwrap_or(&id);
     state
         .store
-        .plan_spec(id, None)
+        .mission_spec(id, None)
         .map_err(ApiError::internal)?
         .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("plan `plan/{id}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
 }
 
 async fn put_document(
@@ -1817,7 +1822,7 @@ async fn watch_resource(
     }))
     .map_err(ApiError::internal)?;
     let subscription_hash = hex::encode(Sha256::digest(stable));
-    let plan_id = format!(
+    let mission_id = format!(
         "resource-watch/{resource_name}/{}",
         &subscription_hash[..16]
     );
@@ -1831,9 +1836,9 @@ async fn watch_resource(
         .map(|field| format!("        on {}\n", quote(field)))
         .collect::<String>();
     let kdl = format!(
-        "version 2\nresource {} {{\n  kind {resource_kind:?}\n}}\nplan {} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {}\n    provider {}\n    locator {}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
+        "version 2\nresource {} {{\n  kind {resource_kind:?}\n}}\nmission {} state=\"ready\" {{\n  goal \"Observe one resource and send its selected changes.\"\n  observer \"watch\" {{\n    resource {}\n    provider {}\n    locator {}\n{observer_fields}  }}\n  subscription \"watch\" {{\n    observer \"observer/watch\"\n    to {}\n{subscription_fields}    delivery \"message\"\n  }}\n}}\n",
         quote(&resource_name),
-        quote(&plan_id),
+        quote(&mission_id),
         quote(&format!("resource/{resource_name}")),
         quote(&request.provider),
         quote(&request.locator),
@@ -1842,7 +1847,7 @@ async fn watch_resource(
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     let planned = state
         .store
-        .plan(
+        .mission(
             &intent,
             crate::model::IntentInput {
                 kdl,
@@ -1856,8 +1861,8 @@ async fn watch_resource(
         .map_err(ApiError::bad)?;
     let run = state
         .store
-        .create_plan_run(&PlanRunRequest {
-            plan: plan_id,
+        .create_mission_run(&MissionRunRequest {
+            mission: mission_id,
             revision: None,
             workspace: ".".into(),
             requester: Some(target.clone()),
@@ -1896,18 +1901,18 @@ async fn unwatch_resource(
             subscription
                 .strip_prefix("subscription/")
                 .and_then(|value| value.split('/').next())
-                .map(|run| format!("plan-run/{run}"))
+                .map(|run| format!("mission-run/{run}"))
         })
         .ok_or_else(|| {
             ApiError::not_found(format!("subscription `{subscription}` does not exist"))
         })?;
     let kdl = format!(
-        "version 2\nplan-run {run:?} {{ cancellation \"resource-watch-stopped\" {{ reason \"the resource watch stopped\" }} }}\n"
+        "version 2\nmission-run {run:?} {{ cancellation \"resource-watch-stopped\" {{ reason \"the resource watch stopped\" }} }}\n"
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     let planned = state
         .store
-        .plan(
+        .mission(
             &intent,
             crate::model::IntentInput {
                 kdl,
@@ -2259,12 +2264,14 @@ async fn post_review(
             })?;
         let run = state
             .store
-            .plan_run(&step.run)
+            .mission_run(&step.run)
             .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::internal(format!("plan run `{}` does not exist", step.run)))?;
+            .ok_or_else(|| {
+                ApiError::internal(format!("mission run `{}` does not exist", step.run))
+            })?;
         let request_is_current = review_request
             .body
-            .pointer("/fields/plan_revision")
+            .pointer("/fields/mission_revision")
             .and_then(Value::as_str)
             == Some(run.revision.as_str())
             && review_request
@@ -2742,19 +2749,19 @@ async fn quick_agent(
         driver_body.push('\n');
     }
     driver_body.push_str(&format!("prompt {prompt:?}\n"));
-    let plan_id = format!("standing/{bus_id}");
+    let mission_id = format!("standing/{bus_id}");
     let kdl = format!(
-        "version 2\nplan {plan_id:?} state=\"ready\" {{\n  goal \"Keep the agent ready for work and conversation.\"\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
+        "version 2\nmission {mission_id:?} state=\"ready\" {{\n  goal \"Keep the agent ready for work and conversation.\"\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
         request.worktree
     );
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
-    let plan =
-        intent.plans.get(&plan_id).cloned().ok_or_else(|| {
-            ApiError::internal("quick agent normalization lost its standing plan")
+    let mission =
+        intent.missions.get(&mission_id).cloned().ok_or_else(|| {
+            ApiError::internal("quick agent normalization lost its standing mission")
         })?;
     let planned = state
         .store
-        .plan(
+        .mission(
             &intent,
             crate::model::IntentInput {
                 kdl: kdl.clone(),
@@ -2768,26 +2775,26 @@ async fn quick_agent(
         .map_err(ApiError::bad)?;
     let mut active = state
         .store
-        .active_plan_runs()
+        .active_mission_runs()
         .map_err(ApiError::internal)?
         .into_iter()
-        .filter(|run| run.plan == format!("plan/{plan_id}"))
+        .filter(|run| run.mission == format!("mission/{mission_id}"))
         .collect::<Vec<_>>();
     if active.len() > 1 {
         return Err(ApiError::bad(St3Error::new(
             "conflicting-standing-runs",
-            format!("standing plan `plan/{plan_id}` has more than one active run"),
+            format!("standing mission `mission/{mission_id}` has more than one active run"),
         )));
     }
     let run = if let Some(current) = active.pop() {
-        if current.revision == plan.revision {
+        if current.revision == mission.revision {
             current
         } else {
             state
                 .store
-                .adopt_plan_revision(
+                .adopt_mission_revision(
                     &current.subject,
-                    &plan,
+                    &mission,
                     "person/requester",
                     "the quick agent configuration changed",
                     &format!("{}:standing-revision", request.idempotency_key),
@@ -2797,8 +2804,8 @@ async fn quick_agent(
     } else {
         state
             .store
-            .create_plan_run(&crate::model::PlanRunRequest {
-                plan: plan_id.clone(),
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: mission_id.clone(),
                 revision: None,
                 workspace: request.worktree.clone(),
                 requester: Some("person/requester".into()),
@@ -2832,8 +2839,8 @@ async fn quick_agent(
         });
     let response = QuickAgentResponse {
         subject: agent_subject,
-        plan: format!("plan/{plan_id}"),
-        plan_run: run.subject,
+        mission: format!("mission/{mission_id}"),
+        mission_run: run.subject,
         generation: run.generation,
         runtime_id,
         event_cursor: state.store.index().map_err(ApiError::internal)?,
@@ -2875,9 +2882,9 @@ async fn start_eval(
     let kdl = kdl.replace("${EVAL_ROOT}", &workspace.to_string_lossy());
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     stage_eval_documents(&state, &workspace, &intent).map_err(ApiError::bad)?;
-    let plan = state
+    let mission = state
         .store
-        .plan(
+        .mission(
             &intent,
             crate::model::IntentInput {
                 kdl: kdl.clone(),
@@ -2885,35 +2892,35 @@ async fn start_eval(
             },
         )
         .map_err(ApiError::bad)?;
-    if !plan.blockers.is_empty() {
+    if !mission.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "eval-blocked",
-            plan.blockers.join("; "),
+            mission.blockers.join("; "),
         )));
     }
     let applied = state
         .store
         .apply(
             &intent,
-            &plan.subject_tokens,
+            &mission.subject_tokens,
             &format!("eval:{}:{}", request.name, request.bundle_hash),
         )
         .map_err(ApiError::bad)?;
     let ready = intent
-        .plans
+        .missions
         .values()
-        .filter(|plan| plan.state == crate::model::PlanState::Ready)
+        .filter(|mission| mission.state == crate::model::MissionState::Ready)
         .collect::<Vec<_>>();
     if ready.len() != 1 {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-eval-plan-count",
-            "an eval must contain exactly one ready plan",
+            "invalid-eval-mission-count",
+            "an eval must contain exactly one ready mission",
         )));
     }
     let run = state
         .store
-        .create_plan_run(&PlanRunRequest {
-            plan: ready[0].id.clone(),
+        .create_mission_run(&MissionRunRequest {
+            mission: ready[0].id.clone(),
             revision: Some(ready[0].revision.clone()),
             workspace: workspace.to_string_lossy().into_owned(),
             requester: Some("person/eval-requester".into()),
@@ -2927,7 +2934,7 @@ async fn start_eval(
         event_cursor: applied
             .store_index
             .max(state.store.index().map_err(ApiError::internal)?),
-        plan_run: run.subject,
+        mission_run: run.subject,
     }))
 }
 
@@ -2937,9 +2944,9 @@ async fn get_eval(
 ) -> Result<Json<EvalStatus>, ApiError> {
     let run = state
         .store
-        .plan_run(&run)
+        .mission_run(&run)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("eval plan run `{run}` does not exist")))?;
+        .ok_or_else(|| ApiError::not_found(format!("eval mission run `{run}` does not exist")))?;
     let verdict_claim = state
         .store
         .latest_claim(&run.subject, Some("eval.verdict"))
@@ -2971,7 +2978,7 @@ async fn get_eval(
         .map(|step| step.step.clone())
         .collect();
     Ok(Json(EvalStatus {
-        plan_run: run.subject,
+        mission_run: run.subject,
         lifecycle: run.status,
         phase: run.phase,
         active_steps,
@@ -2981,62 +2988,62 @@ async fn get_eval(
     }))
 }
 
-async fn start_plan_run(
+async fn start_mission_run(
     State(state): State<AppState>,
-    Json(request): Json<PlanRunRequest>,
-) -> Result<Json<PlanRunView>, ApiError> {
+    Json(request): Json<MissionRunRequest>,
+) -> Result<Json<MissionRunView>, ApiError> {
     let response = state
         .store
-        .create_plan_run(&request)
+        .create_mission_run(&request)
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
 }
 
 #[derive(Deserialize)]
-struct PlanRunQuery {
+struct MissionRunQuery {
     root: Option<String>,
-    plan: Option<String>,
+    mission: Option<String>,
 }
 
-async fn list_plan_runs(
+async fn list_mission_runs(
     State(state): State<AppState>,
-    Query(query): Query<PlanRunQuery>,
-) -> Result<Json<Vec<PlanRunView>>, ApiError> {
-    match (query.root.as_deref(), query.plan.as_deref()) {
+    Query(query): Query<MissionRunQuery>,
+) -> Result<Json<Vec<MissionRunView>>, ApiError> {
+    match (query.root.as_deref(), query.mission.as_deref()) {
         (Some(root), None) => state
             .store
-            .plan_runs_for_root(root)
+            .mission_runs_for_root(root)
             .map(Json)
             .map_err(ApiError::internal),
-        (None, Some(plan)) => state
+        (None, Some(mission)) => state
             .store
-            .active_plan_runs_for_plan(plan)
+            .active_mission_runs_for_mission(mission)
             .map(Json)
             .map_err(ApiError::internal),
         _ => Err(ApiError::bad(St3Error::new(
-            "invalid-plan-run-query",
-            "select exactly one plan or root plan run",
+            "invalid-mission-run-query",
+            "select exactly one mission or root mission run",
         ))),
     }
 }
 
-async fn get_plan_run(
+async fn get_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
-) -> Result<Json<PlanRunView>, ApiError> {
+) -> Result<Json<MissionRunView>, ApiError> {
     state
         .store
-        .plan_run(&run)
+        .mission_run(&run)
         .map_err(ApiError::internal)?
         .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("plan run `{run}` does not exist")))
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
 }
 
-async fn revise_plan_run(
+async fn revise_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
-    Json(request): Json<PlanRevisionRequest>,
+    Json(request): Json<MissionRevisionRequest>,
 ) -> Result<Json<RevisionSubmissionView>, ApiError> {
     if let Some(cached) = cached_revision_submission(
         &state,
@@ -3047,20 +3054,20 @@ async fn revise_plan_run(
     }
     let current = state
         .store
-        .plan_run(&run)
+        .mission_run(&run)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("plan run `{run}` does not exist")))?;
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))?;
     let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
-    if initial.plans.len() != 1 {
+    if initial.missions.len() != 1 {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-plan-revision-intent",
-            "a run revision must contain exactly one plan",
+            "invalid-mission-revision-intent",
+            "a run revision must contain exactly one mission",
         )));
     }
     if !initial.subjects.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-plan-revision-intent",
-            "a run revision can contain only its plan",
+            "invalid-mission-revision-intent",
+            "a run revision can contain only its mission",
         )));
     }
     let bindings = state
@@ -3070,25 +3077,32 @@ async fn revise_plan_run(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
-    let replacement = intent.plans.values().next().expect("one plan was checked");
-    let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
-    if replacement.id != plan_id {
+    let replacement = intent
+        .missions
+        .values()
+        .next()
+        .expect("one mission was checked");
+    let mission_id = current
+        .mission
+        .strip_prefix("mission/")
+        .unwrap_or(&current.mission);
+    if replacement.id != mission_id {
         return Err(ApiError::bad(St3Error::new(
-            "wrong-plan-revision",
+            "wrong-mission-revision",
             format!(
-                "revision `{}` does not replace plan `{plan_id}`",
+                "revision `{}` does not replace mission `{mission_id}`",
                 replacement.id
             ),
         )));
     }
     let old = state
         .store
-        .plan_spec(plan_id, Some(&current.revision))
+        .mission_spec(mission_id, Some(&current.revision))
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
             ApiError::bad(St3Error::new(
-                "missing-plan-revision",
-                "the current plan revision is unavailable",
+                "missing-mission-revision",
+                "the current mission revision is unavailable",
             ))
         })?;
     if old.inputs != replacement.inputs {
@@ -3102,19 +3116,19 @@ async fn revise_plan_run(
     } else {
         format!("agent/{}", request.actor)
     };
-    let (_, reviewers) = crate::store::analyze_plan_revision(
+    let (_, reviewers) = crate::store::analyze_mission_revision(
         &old,
         replacement,
         &actor,
         &current.requester,
-        &crate::store::plan_run_variables(&current, &replacement.revision),
+        &crate::store::mission_run_variables(&current, &replacement.revision),
     )
     .map_err(ApiError::bad)?;
     let mut publication = intent.clone();
     publication.subjects.clear();
     let planned = state
         .store
-        .plan(
+        .mission(
             &publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
@@ -3124,7 +3138,7 @@ async fn revise_plan_run(
         .map_err(ApiError::bad)?;
     if !planned.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "plan-revision-blocked",
+            "mission-revision-blocked",
             planned.blockers.join("; "),
         )));
     }
@@ -3138,9 +3152,9 @@ async fn revise_plan_run(
         .map_err(ApiError::bad)?;
     let revised =
         if reviewers.is_empty() && matches!(old.revision_cutover, RevisionCutover::RestartActive) {
-            let plan_run = state
+            let mission_run = state
                 .store
-                .adopt_plan_revision(
+                .adopt_mission_revision(
                     &run,
                     replacement,
                     &actor,
@@ -3150,7 +3164,7 @@ async fn revise_plan_run(
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
                 status: "applied".into(),
-                plan_run,
+                mission_run,
                 proposal: None,
             }
         } else {
@@ -3166,11 +3180,11 @@ async fn revise_plan_run(
                 .map_err(ApiError::bad)?;
             RevisionSubmissionView {
                 status: proposal.status.clone(),
-                plan_run: state
+                mission_run: state
                     .store
-                    .plan_run(&run)
+                    .mission_run(&run)
                     .map_err(ApiError::internal)?
-                    .expect("the revised plan run exists"),
+                    .expect("the revised mission run exists"),
                 proposal: Some(proposal),
             }
         };
@@ -3183,14 +3197,14 @@ fn cached_revision_submission(
     direct_key: &str,
     proposal_key: &str,
 ) -> Result<Option<RevisionSubmissionView>, ApiError> {
-    if let Some(plan_run) = state
+    if let Some(mission_run) = state
         .store
-        .cached_idempotency_response::<PlanRunView>(direct_key)
+        .cached_idempotency_response::<MissionRunView>(direct_key)
         .map_err(ApiError::internal)?
     {
         return Ok(Some(RevisionSubmissionView {
             status: "applied".into(),
-            plan_run,
+            mission_run,
             proposal: None,
         }));
     }
@@ -3206,14 +3220,14 @@ fn cached_revision_submission(
         .revision_proposal(&cached.id)
         .map_err(ApiError::internal)?
         .unwrap_or(cached);
-    let plan_run = state
+    let mission_run = state
         .store
-        .plan_run(&proposal.run)
+        .mission_run(&proposal.run)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::internal("the proposal plan run is unavailable"))?;
+        .ok_or_else(|| ApiError::internal("the proposal mission run is unavailable"))?;
     Ok(Some(RevisionSubmissionView {
         status: proposal.status.clone(),
-        plan_run,
+        mission_run,
         proposal: Some(proposal),
     }))
 }
@@ -3251,7 +3265,9 @@ async fn get_run_revision_proposal(
         .map_err(ApiError::internal)?
         .map(Json)
         .ok_or_else(|| {
-            ApiError::not_found(format!("plan run `{run}` has no pending revision proposal"))
+            ApiError::not_found(format!(
+                "mission run `{run}` has no pending revision proposal"
+            ))
         })
 }
 
@@ -3350,11 +3366,11 @@ fn desired_agent_grouping(
         })
 }
 
-async fn publish_work_plan(
+async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
-    Json(request): Json<PlanProductionRequest>,
-) -> Result<Json<PlanOutputView>, ApiError> {
+    Json(request): Json<MissionProductionRequest>,
+) -> Result<Json<MissionOutputView>, ApiError> {
     let step = state
         .store
         .step_run(&subject)
@@ -3367,59 +3383,59 @@ async fn publish_work_plan(
     };
     if !state
         .store
-        .plan_output_authorized(&step.subject, &actor, request.incarnation.as_deref())
+        .mission_output_authorized(&step.subject, &actor, request.incarnation.as_deref())
         .map_err(ApiError::internal)?
     {
         return Err(ApiError::bad(St3Error::new(
             "work-not-claimed",
             format!(
-                "`{actor}` does not hold the plan-producing step `{}` or its nested work",
+                "`{actor}` does not hold the mission-producing step `{}` or its nested work",
                 step.subject
             ),
         )));
     }
     let run = state
         .store
-        .plan_run(&step.run)
+        .mission_run(&step.run)
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("plan run `{}` does not exist", step.run)))?;
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{}` does not exist", step.run)))?;
     let root = state
         .store
-        .plan_spec(
-            run.plan.strip_prefix("plan/").unwrap_or(&run.plan),
+        .mission_spec(
+            run.mission.strip_prefix("mission/").unwrap_or(&run.mission),
             Some(&run.revision),
         )
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
             ApiError::bad(St3Error::new(
-                "missing-plan-revision",
-                "the running plan revision is unavailable",
+                "missing-mission-revision",
+                "the running mission revision is unavailable",
             ))
         })?;
-    let definition = crate::plan::find_step(&root, &step.step).ok_or_else(|| {
+    let definition = crate::mission::find_step(&root, &step.step).ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "missing-step-definition",
-            format!("step `{}` is absent from its plan revision", step.step),
+            format!("step `{}` is absent from its mission revision", step.step),
         ))
     })?;
-    let expected_plan = definition.produces_plan.as_deref().ok_or_else(|| {
+    let expected_mission = definition.produces_mission.as_deref().ok_or_else(|| {
         ApiError::bad(St3Error::new(
-            "step-does-not-produce-plan",
-            format!("step `{}` does not declare produces-plan", step.step),
+            "step-does-not-produce-mission",
+            format!("step `{}` does not declare produces-mission", step.step),
         ))
     })?;
 
     let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
-    if initial.plans.len() != 1 {
+    if initial.missions.len() != 1 {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-plan-output-intent",
-            "a plan output must contain exactly one plan",
+            "invalid-mission-output-intent",
+            "a mission output must contain exactly one mission",
         )));
     }
     if !initial.subjects.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "invalid-plan-output-intent",
-            "a plan output can contain only its plan",
+            "invalid-mission-output-intent",
+            "a mission output can contain only its mission",
         )));
     }
     let bindings = state
@@ -3429,12 +3445,16 @@ async fn publish_work_plan(
     let resolved_kdl =
         resolve_document_references(&request.intent.kdl, &bindings).map_err(ApiError::bad)?;
     let intent = parse_intent(&resolved_kdl, &state.node).map_err(ApiError::bad)?;
-    let plan = intent.plans.values().next().expect("one plan was checked");
-    if plan.id != expected_plan || plan.state != crate::model::PlanState::Ready {
+    let mission = intent
+        .missions
+        .values()
+        .next()
+        .expect("one mission was checked");
+    if mission.id != expected_mission || mission.state != crate::model::MissionState::Ready {
         return Err(ApiError::bad(St3Error::new(
-            "wrong-plan-output",
+            "wrong-mission-output",
             format!(
-                "step `{}` must publish ready plan `{expected_plan}`",
+                "step `{}` must publish ready mission `{expected_mission}`",
                 step.step
             ),
         )));
@@ -3443,7 +3463,7 @@ async fn publish_work_plan(
     publication.subjects.clear();
     let planned = state
         .store
-        .plan(
+        .mission(
             &publication,
             crate::model::IntentInput {
                 kdl: resolved_kdl,
@@ -3453,7 +3473,7 @@ async fn publish_work_plan(
         .map_err(ApiError::bad)?;
     if !planned.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
-            "plan-output-blocked",
+            "mission-output-blocked",
             planned.blockers.join("; "),
         )));
     }
@@ -3467,12 +3487,12 @@ async fn publish_work_plan(
         .map_err(ApiError::bad)?;
     let output = state
         .store
-        .record_plan_output(
+        .record_mission_output(
             &step.subject,
             &actor,
             request.incarnation.as_deref(),
-            expected_plan,
-            plan,
+            expected_mission,
+            mission,
             &format!("{}:bind", request.idempotency_key),
         )
         .map_err(ApiError::bad)?;
@@ -4612,6 +4632,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_rejects_the_removed_plan_routes() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["/v1/plans/example", "/v1/plan-runs/example"] {
+            let response = router(state(root.path()))
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_reset_is_bound_to_the_selected_desire_and_incarnation() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -4911,7 +4949,7 @@ version 2
     }
 
     #[tokio::test]
-    async fn plan_resolves_a_bare_document_to_immutable_bytes() {
+    async fn mission_resolves_a_bare_document_to_immutable_bytes() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let version = state
@@ -4921,8 +4959,8 @@ version 2
         let app = router(state);
         let (status, body) = json_request(
             app.clone(),
-            "/v1/intent/plan",
-            serde_json::to_value(PlanRequest {
+            "/v1/intent/mission",
+            serde_json::to_value(MissionRequest {
                 intent: crate::model::IntentInput {
                     kdl: r#"version 2
  message "task" { to "worker"; content "doc/task" } "#
@@ -4958,9 +4996,9 @@ version 2
             app.clone(),
             "/v1/planning-sessions",
             serde_json::to_value(PlanningSessionStartRequest {
-                plan: "planned/work".into(),
+                mission: "planned/work".into(),
                 run: None,
-                request: b"Plan a two-step release without changing this workspace.".to_vec(),
+                request: b"Mission a two-step release without changing this workspace.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("nathan".into()),
                 model: Some("gpt-5.6-sol".into()),
@@ -4983,23 +5021,23 @@ version 2
                 .get_document(request_name, request_hash)
                 .unwrap()
                 .unwrap(),
-            b"Plan a two-step release without changing this workspace."
+            b"Mission a two-step release without changing this workspace."
         );
         let standing = store
-            .active_plan_runs()
+            .active_mission_runs()
             .unwrap()
             .into_iter()
             .find(|run| run.steps.is_empty() && run.status == "running")
             .unwrap();
-        let standing_plan = store
-            .plan_spec(
-                standing.plan.trim_start_matches("plan/"),
+        let standing_mission = store
+            .mission_spec(
+                standing.mission.trim_start_matches("mission/"),
                 Some(&standing.revision),
             )
             .unwrap()
             .unwrap();
         let standing_intent = crate::graph::parse_execution_intent(
-            standing_plan.declarations_kdl.as_ref().unwrap(),
+            standing_mission.declarations_kdl.as_ref().unwrap(),
             "node",
             &standing.id,
         )
@@ -5019,13 +5057,13 @@ version 2
                 if arguments.iter().any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox")
                     && arguments.iter().any(|argument| argument == "--dangerously-bypass-hook-trust")
         ));
-        assert!(store.plan_spec("planned/work", None).unwrap().is_none());
-        assert_eq!(store.active_plan_runs().unwrap().len(), 1);
+        assert!(store.mission_spec("planned/work", None).unwrap().is_none());
+        assert_eq!(store.active_mission_runs().unwrap().len(), 1);
 
         let first = br#"
 version 2
 
-  plan "planned/work" state="ready" {
+  mission "planned/work" state="ready" {
     goal "Publish the planned result."
     step "inspect" { goal "Inspect the source." }
     step "change" {
@@ -5049,7 +5087,7 @@ version 2
             &format!("/v1/planning-sessions/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
-                markdown: b"# Plan with a side effect".to_vec(),
+                markdown: b"# Mission with a side effect".to_vec(),
                 kdl: side_effect,
                 idempotency_key: "planning-candidate-side-effect".into(),
             })
@@ -5057,7 +5095,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "runtime-outside-plan");
+        assert_eq!(rejected["code"], "runtime-outside-mission");
         assert!(
             store
                 .desired_subjects()
@@ -5071,7 +5109,7 @@ version 2
             &format!("/v1/planning-sessions/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
-                markdown: b"# Plan\n\n1. Inspect.\n2. Change.\n".to_vec(),
+                markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n".to_vec(),
                 kdl: first.to_vec(),
                 idempotency_key: "planning-candidate-one".into(),
             })
@@ -5080,13 +5118,13 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{submitted}");
         assert_eq!(submitted["candidate"]["revision"], 1);
-        assert!(store.plan_spec("planned/work", None).unwrap().is_none());
+        assert!(store.mission_spec("planned/work", None).unwrap().is_none());
         let (status, resubmitted) = json_request(
             app.clone(),
             &format!("/v1/planning-sessions/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
-                markdown: b"# Plan\n\n1. Inspect.\n2. Change.\n".to_vec(),
+                markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n".to_vec(),
                 kdl: first.to_vec(),
                 idempotency_key: "planning-candidate-one-network-retry".into(),
             })
@@ -5121,7 +5159,7 @@ version 2
             previewed["preview"]["diff"]
                 .as_str()
                 .unwrap()
-                .contains("plan/planned/work")
+                .contains("mission/planned/work")
         );
 
         let (status, revised) = json_request(
@@ -5138,12 +5176,12 @@ version 2
         assert_eq!(status, StatusCode::OK, "{revised}");
         assert_eq!(revised["status"], "revision-requested");
         assert!(revised.get("preview").is_none());
-        assert!(store.plan_spec("planned/work", None).unwrap().is_none());
+        assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
         let second = br#"
 version 2
 
-  plan "planned/work" state="ready" {
+  mission "planned/work" state="ready" {
     goal "Publish the planned and verified result."
     step "inspect" { goal "Inspect the source." }
     step "change" {
@@ -5162,7 +5200,7 @@ version 2
             &format!("/v1/planning-sessions/{session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
-                markdown: b"# Plan\n\n1. Inspect.\n2. Change.\n3. Verify.\n".to_vec(),
+                markdown: b"# Mission\n\n1. Inspect.\n2. Change.\n3. Verify.\n".to_vec(),
                 kdl: second.to_vec(),
                 idempotency_key: "planning-candidate-two".into(),
             })
@@ -5195,7 +5233,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unauthorized}");
         assert_eq!(unauthorized["code"], "planning-review-not-authorized");
-        assert!(store.plan_spec("planned/work", None).unwrap().is_none());
+        assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
         let (status, stale) = json_request(
             app.clone(),
@@ -5210,7 +5248,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{stale}");
         assert_eq!(stale["code"], "stale-planning-preview");
-        assert!(store.plan_spec("planned/work", None).unwrap().is_none());
+        assert!(store.mission_spec("planned/work", None).unwrap().is_none());
 
         let (status, approved) = json_request(
             app.clone(),
@@ -5227,10 +5265,10 @@ version 2
         assert_eq!(approved["status"], "approved");
         assert_eq!(
             approved["published_revision"],
-            approved["candidate"]["plan_revision"]
+            approved["candidate"]["mission_revision"]
         );
-        assert!(store.plan_spec("planned/work", None).unwrap().is_some());
-        let active = store.active_plan_runs().unwrap();
+        assert!(store.mission_spec("planned/work", None).unwrap().is_some());
+        let active = store.active_mission_runs().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].phase, "cleanup-cancelled");
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
@@ -5242,7 +5280,7 @@ version 2
                 Some("planning-session.approved"),
             )
             .unwrap()
-            .expect("the published plan does not link its documents");
+            .expect("the published mission does not link its documents");
         for field in ["markdown", "kdl"] {
             let reference = documents
                 .body
@@ -5275,7 +5313,7 @@ version 2
         assert_eq!(approved_again["status"], "approved");
         assert_eq!(
             store
-                .claims_for("plan/planned/work", Some("plan.published"))
+                .claims_for("mission/planned/work", Some("mission.published"))
                 .unwrap()
                 .len(),
             1
@@ -5337,7 +5375,7 @@ version 2
         let request = store
             .put_document(
                 "doc/planning/direct/request",
-                b"Plan one inspection.",
+                b"Mission one inspection.",
                 &None,
                 "direct-planning-request",
             )
@@ -5346,7 +5384,7 @@ version 2
         let source = format!(
             r#"version 2
 planning-session {session:?} {{
-  plan "planned/direct"
+  mission "planned/direct"
   request {:?}
   workspace {:?}
   requester "person/operator"
@@ -5358,7 +5396,7 @@ planning-session {session:?} {{
         );
         let intent = parse_intent(&source, "node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source,
@@ -5384,7 +5422,7 @@ planning-session {session:?} {{
         let app = router(state);
         let encoded_session = urlencoding::encode(session);
         let candidate = br#"version 2
-plan "planned/direct" state="ready" {
+mission "planned/direct" state="ready" {
   goal "Inspect the release."
   step "inspect" { goal "Inspect the release input." }
 }
@@ -5394,7 +5432,7 @@ plan "planned/direct" state="ready" {
             &format!("/v1/planning-sessions/{encoded_session}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.clone(),
-                markdown: b"# Plan\n\nInspect the release input.\n".to_vec(),
+                markdown: b"# Mission\n\nInspect the release input.\n".to_vec(),
                 kdl: candidate.to_vec(),
                 idempotency_key: "direct-planning-candidate".into(),
             })
@@ -5437,14 +5475,14 @@ plan "planned/direct" state="ready" {
         let state = state(root.path());
         let store = state.store.clone();
         let initial = r#"version 2
-plan "targeted" state="ready" revisions="human-only" {
-  goal "Use the initial plan."
+mission "targeted" state="ready" revisions="human-only" {
+  goal "Use the initial mission."
   step "work" { agentless }
 }
 "#;
         let intent = parse_intent(initial, "node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: initial.into(),
@@ -5453,11 +5491,11 @@ plan "targeted" state="ready" revisions="human-only" {
             )
             .unwrap();
         store
-            .apply(&intent, &preview.subject_tokens, "targeted-plan")
+            .apply(&intent, &preview.subject_tokens, "targeted-mission")
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "targeted".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "targeted".into(),
                 revision: None,
                 workspace: workspace.display().to_string(),
                 requester: Some("person/operator".into()),
@@ -5471,7 +5509,7 @@ plan "targeted" state="ready" revisions="human-only" {
             app.clone(),
             "/v1/planning-sessions",
             serde_json::to_value(PlanningSessionStartRequest {
-                plan: "ignored".into(),
+                mission: "ignored".into(),
                 run: Some(run.subject.clone()),
                 request: b"Add the final verification.".to_vec(),
                 workspace: workspace.display().to_string(),
@@ -5487,8 +5525,8 @@ plan "targeted" state="ready" revisions="human-only" {
         let session_id = session["id"].as_str().unwrap();
         let planner = session["planner"].as_str().unwrap();
         let candidate = br#"version 2
-plan "targeted" state="ready" revisions="human-only" {
-  goal "Use the reviewed plan."
+mission "targeted" state="ready" revisions="human-only" {
+  goal "Use the reviewed mission."
   step "work" { agentless }
   step "verify" {
     agentless
@@ -5501,7 +5539,7 @@ plan "targeted" state="ready" revisions="human-only" {
             &format!("/v1/planning-sessions/{session_id}/submit"),
             serde_json::to_value(PlanningCandidateSubmitRequest {
                 actor: planner.into(),
-                markdown: b"# Targeted plan\n".to_vec(),
+                markdown: b"# Targeted mission\n".to_vec(),
                 kdl: candidate.to_vec(),
                 idempotency_key: "targeted-candidate".into(),
             })
@@ -5523,7 +5561,7 @@ plan "targeted" state="ready" revisions="human-only" {
         .await;
         assert_eq!(status, StatusCode::OK, "{approved}");
         assert_eq!(approved["status"], "approved");
-        let revised = store.plan_run(&run.id).unwrap().unwrap();
+        let revised = store.mission_run(&run.id).unwrap().unwrap();
         assert_ne!(revised.generation, run.generation);
 
         let approvals = store
@@ -5545,15 +5583,15 @@ plan "targeted" state="ready" revisions="human-only" {
         let source = r#"
 version 2
 
-  plan "variants" state="ready" {
-    goal "Use the initial plan."
+  mission "variants" state="ready" {
+    goal "Use the initial mission."
     step "work" { goal "Use the initial goal." }
   }
 
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -5562,11 +5600,11 @@ version 2
             )
             .unwrap();
         store
-            .apply(&intent, &planned.subject_tokens, "variant-initial-plan")
+            .apply(&intent, &planned.subject_tokens, "variant-initial-mission")
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "variants".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "variants".into(),
                 revision: None,
                 workspace: workspace.display().to_string(),
                 requester: Some("person/nathan".into()),
@@ -5580,9 +5618,9 @@ version 2
             app.clone(),
             "/v1/planning-sessions",
             serde_json::to_value(PlanningSessionStartRequest {
-                plan: "ignored-when-run-is-present".into(),
+                mission: "ignored-when-run-is-present".into(),
                 run: Some(run.subject.clone()),
-                request: b"Compare a compact plan with an extended plan.".to_vec(),
+                request: b"Compare a compact mission with an extended mission.".to_vec(),
                 workspace: workspace.display().to_string(),
                 requester: Some("person/nathan".into()),
                 model: None,
@@ -5593,15 +5631,15 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{started}");
-        assert_eq!(started["target_plan_run"], run.subject);
+        assert_eq!(started["target_mission_run"], run.subject);
         assert_eq!(started["source_generation"], run.generation);
         let session = started["id"].as_str().unwrap();
         let planner = started["planner"].as_str().unwrap();
         let compact = br#"
 version 2
 
-  plan "variants" state="ready" {
-    goal "Use the compact plan."
+  mission "variants" state="ready" {
+    goal "Use the compact mission."
     step "work" { goal "Use the compact goal." }
   }
 
@@ -5609,8 +5647,8 @@ version 2
         let extended = br#"
 version 2
 
-  plan "variants" state="ready" {
-    goal "Use the extended plan."
+  mission "variants" state="ready" {
+    goal "Use the extended mission."
     step "work" { goal "Use the extended goal." }
     step "verify" {
       depends-on { step "work" completed }
@@ -5631,7 +5669,7 @@ version 2
                 &format!("/v1/planning-sessions/{session}/variants/{name}/submit"),
                 serde_json::to_value(PlanningCandidateSubmitRequest {
                     actor: planner.into(),
-                    markdown: format!("# {name} plan\n").into_bytes(),
+                    markdown: format!("# {name} mission\n").into_bytes(),
                     kdl: kdl.to_vec(),
                     idempotency_key: format!("variant-submit-{name}"),
                 })
@@ -5680,7 +5718,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{proposed}");
         assert_eq!(proposed["status"], "applied");
-        assert_ne!(proposed["plan_run"]["generation"], run.generation);
+        assert_ne!(proposed["mission_run"]["generation"], run.generation);
 
         let (status, retried) = json_request(
             app.clone(),
@@ -5695,8 +5733,8 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{retried}");
         assert_eq!(
-            retried["plan_run"]["generation"],
-            proposed["plan_run"]["generation"]
+            retried["mission_run"]["generation"],
+            proposed["mission_run"]["generation"]
         );
 
         let (status, stale) = json_request(
@@ -5748,8 +5786,8 @@ version 2
                 idempotency_key: "runtime-work-message".into(),
                 from: "daemon/runtime".into(),
                 to: "agent/worker".into(),
-                content: "A durable plan step is ready.".into(),
-                title: Some("Plan step ready".into()),
+                content: "A durable mission step is ready.".into(),
+                title: Some("Mission step ready".into()),
                 in_reply_to: None,
                 tags: vec!["st3-work:step-run/run/build@1@1@incarnation".into()],
             })
@@ -5798,8 +5836,8 @@ version 2
                 r#"
 version 2
 
-  plan "eval/demo" state="ready" {{
-    goal "Complete plan eval/demo."
+  mission "eval/demo" state="ready" {{
+    goal "Complete mission eval/demo."
     baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
     step "document" {{
       agentless
@@ -5833,26 +5871,31 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body["plan_run"].as_str().unwrap().starts_with("plan-run/"));
-        let eval_run = body["plan_run"].as_str().unwrap();
+        assert!(
+            body["mission_run"]
+                .as_str()
+                .unwrap()
+                .starts_with("mission-run/")
+        );
+        let eval_run = body["mission_run"].as_str().unwrap();
         let (status, eval_status) = get_request(
             app.clone(),
             &format!("/v1/evals/{}", urlencoding::encode(eval_run)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{eval_status}");
-        assert_eq!(eval_status["plan_run"], body["plan_run"]);
+        assert_eq!(eval_status["mission_run"], body["mission_run"]);
         assert_eq!(eval_status["lifecycle"], "running");
         assert!(eval_status.get("active_checkpoint").is_none());
-        let root = body["plan_run"].as_str().unwrap();
-        let (status, plan_runs) = get_request(
+        let root = body["mission_run"].as_str().unwrap();
+        let (status, mission_runs) = get_request(
             app,
-            &format!("/v1/plan-runs?root={}", urlencoding::encode(root)),
+            &format!("/v1/mission-runs?root={}", urlencoding::encode(root)),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{plan_runs}");
-        assert_eq!(plan_runs.as_array().unwrap().len(), 1);
-        assert_eq!(plan_runs[0]["subject"], root);
+        assert_eq!(status, StatusCode::OK, "{mission_runs}");
+        assert_eq!(mission_runs.as_array().unwrap().len(), 1);
+        assert_eq!(mission_runs[0]["subject"], root);
         assert_eq!(
             store
                 .get_document("doc/evals/demo/task", &hash)
@@ -5863,14 +5906,14 @@ version 2
     }
 
     #[tokio::test]
-    async fn a_plan_revision_publishes_without_adjacent_runtime_state() {
+    async fn a_mission_revision_publishes_without_adjacent_runtime_state() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-  plan "revision" state="ready" {
-    goal "Complete plan revision."
+  mission "revision" state="ready" {
+    goal "Complete mission revision."
      agent "sup" { workspace "."; command "true" }
     step "work" { goal "First goal." }
   }
@@ -5879,7 +5922,7 @@ version 2
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
             .store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -5889,12 +5932,12 @@ version 2
             .unwrap();
         state
             .store
-            .apply(&intent, &planned.subject_tokens, "revision-plan-one")
+            .apply(&intent, &planned.subject_tokens, "revision-mission-one")
             .unwrap();
         let run = state
             .store
-            .create_plan_run(&PlanRunRequest {
-                plan: "revision".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "revision".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
@@ -5907,8 +5950,8 @@ version 2
         let replacement = r#"
 version 2
 
-  plan "revision" state="ready" {
-    goal "Complete plan revision."
+  mission "revision" state="ready" {
+    goal "Complete mission revision."
      agent "sup" { workspace "."; command "true" }
     step "work" { goal "Corrected goal." }
   }
@@ -5916,8 +5959,8 @@ version 2
 "#;
         let (status, revised) = json_request(
             app,
-            &format!("/v1/plan-runs/{}/revision", run.id),
-            serde_json::to_value(PlanRevisionRequest {
+            &format!("/v1/mission-runs/{}/revision", run.id),
+            serde_json::to_value(MissionRevisionRequest {
                 intent: crate::model::IntentInput {
                     kdl: replacement.into(),
                     source_name: None,
@@ -5931,24 +5974,24 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{revised}");
         assert_eq!(revised["status"], "applied");
-        assert_ne!(revised["plan_run"]["revision"], run.revision);
-        assert_eq!(revised["plan_run"]["root_revision"], run.root_revision);
-        assert_eq!(revised["plan_run"]["steps"][0]["status"], "pending");
+        assert_ne!(revised["mission_run"]["revision"], run.revision);
+        assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
+        assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
         assert!(state.store.desired_subjects().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_claimed_step_publishes_one_attempt_bound_ready_plan() {
+    async fn a_claimed_step_publishes_one_attempt_bound_ready_mission() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-  plan "bootstrap" state="ready" {
-    goal "Complete plan bootstrap."
+  mission "bootstrap" state="ready" {
+    goal "Complete mission bootstrap."
     step "compile" {
       assigned-to "agent/planner"
-      produces-plan "project/work"
+      produces-mission "project/work"
     }
   }
 
@@ -5956,7 +5999,7 @@ version 2
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
             .store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -5970,8 +6013,8 @@ version 2
             .unwrap();
         let run = state
             .store
-            .create_plan_run(&PlanRunRequest {
-                plan: "bootstrap".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "bootstrap".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
@@ -5988,8 +6031,8 @@ version 2
         let produced = r#"
 version 2
 
-  plan "project/work" state="ready" {
-    goal "Complete plan project/work."
+  mission "project/work" state="ready" {
+    goal "Complete mission project/work."
     step "inspect" { title "Inspect the project" }
     step "implement" { depends-on { step "inspect" completed } }
   }
@@ -5998,8 +6041,8 @@ version 2
         let app = router(state.clone());
         let (status, output) = json_request(
             app.clone(),
-            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
-            serde_json::to_value(PlanProductionRequest {
+            &format!("/v1/work/mission/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(MissionProductionRequest {
                 intent: crate::model::IntentInput {
                     kdl: produced.into(),
                     source_name: Some("generated.kdl".into()),
@@ -6031,13 +6074,13 @@ version 2
         let wrong = r#"
 version 2
 
-  plan "project/other" state="ready" { goal "Complete plan project/other."; goal "Complete plan project/other."; step "inspect" { } }
+  mission "project/other" state="ready" { goal "Complete mission project/other."; goal "Complete mission project/other."; step "inspect" { } }
 
 "#;
         let (status, output) = json_request(
             app.clone(),
-            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
-            serde_json::to_value(PlanProductionRequest {
+            &format!("/v1/work/mission/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(MissionProductionRequest {
                 intent: crate::model::IntentInput {
                     kdl: wrong.into(),
                     source_name: Some("wrong.kdl".into()),
@@ -6050,11 +6093,11 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
-        assert_eq!(output["code"], "wrong-plan-output");
+        assert_eq!(output["code"], "wrong-mission-output");
         let (status, output) = json_request(
             app,
-            &format!("/v1/work/plan/{}", urlencoding::encode(&step.subject)),
-            serde_json::to_value(PlanProductionRequest {
+            &format!("/v1/work/mission/{}", urlencoding::encode(&step.subject)),
+            serde_json::to_value(MissionProductionRequest {
                 intent: crate::model::IntentInput {
                     kdl: produced.into(),
                     source_name: Some("generated.kdl".into()),
@@ -6067,21 +6110,21 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{output}");
-        assert_eq!(output["plan"], "plan/project/work");
+        assert_eq!(output["mission"], "mission/project/work");
         let revision = output["revision"].as_str().unwrap();
         assert_eq!(revision.len(), 64);
         assert!(
             state
                 .store
-                .plan_spec("project/work", Some(revision))
+                .mission_spec("project/work", Some(revision))
                 .unwrap()
                 .is_some()
         );
         let bound = state
             .store
-            .plan_output(&step.subject, 1, &step.definition_hash)
+            .mission_output(&step.subject, 1, &step.definition_hash)
             .unwrap()
-            .expect("attempt-bound plan output");
+            .expect("attempt-bound mission output");
         assert_eq!(bound.revision, revision);
         assert_eq!(bound.claim_id, output["claim_id"]);
     }
@@ -6197,8 +6240,8 @@ version 2
         let source = r#"
 version 2
 
-  plan "review-api" state="ready" {
-    goal "Complete plan review-api."
+  mission "review-api" state="ready" {
+    goal "Complete mission review-api."
     step "approval" { gate "human-review" type="human" { reviewer "person/nathan" } }
   }
 
@@ -6206,7 +6249,7 @@ version 2
         let intent = parse_intent(source, "node").unwrap();
         let planned = state
             .store
-            .plan(
+            .mission(
                 &intent,
                 crate::model::IntentInput {
                     kdl: source.into(),
@@ -6216,12 +6259,12 @@ version 2
             .unwrap();
         state
             .store
-            .apply(&intent, &planned.subject_tokens, "review-api-plan")
+            .apply(&intent, &planned.subject_tokens, "review-api-mission")
             .unwrap();
         let run = state
             .store
-            .create_plan_run(&PlanRunRequest {
-                plan: "review-api".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "review-api".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
                 requester: Some("person/test".into()),
@@ -6240,7 +6283,10 @@ version 2
                 fields: BTreeMap::from([
                     ("owner".into(), Value::String(step.subject.clone())),
                     ("reviewer".into(), Value::String("person/nathan".into())),
-                    ("plan_revision".into(), Value::String(run.revision.clone())),
+                    (
+                        "mission_revision".into(),
+                        Value::String(run.revision.clone()),
+                    ),
                     (
                         "step_definition".into(),
                         Value::String(step.definition_hash.clone()),
@@ -6310,19 +6356,19 @@ version 2
             created["subject"],
             format!(
                 "agent/{}/node.quick",
-                created["plan_run"]
+                created["mission_run"]
                     .as_str()
                     .unwrap()
-                    .trim_start_matches("plan-run/")
+                    .trim_start_matches("mission-run/")
             )
         );
         let agent_subject = created["subject"].as_str().unwrap().to_owned();
-        assert_eq!(created["plan"], "plan/standing/node.quick");
+        assert_eq!(created["mission"], "mission/standing/node.quick");
         assert!(
-            created["plan_run"]
+            created["mission_run"]
                 .as_str()
                 .unwrap()
-                .starts_with("plan-run/")
+                .starts_with("mission-run/")
         );
         assert!(
             created["generation"]
@@ -6331,17 +6377,17 @@ version 2
                 .starts_with("run-generation/")
         );
         let standing = store
-            .active_plan_runs()
+            .active_mission_runs()
             .unwrap()
             .into_iter()
-            .find(|run| run.subject == created["plan_run"])
+            .find(|run| run.subject == created["mission_run"])
             .unwrap();
-        let plan = store
-            .plan_spec("standing/node.quick", Some(&standing.revision))
+        let mission = store
+            .mission_spec("standing/node.quick", Some(&standing.revision))
             .unwrap()
             .unwrap();
         let intent = crate::graph::parse_execution_intent(
-            plan.declarations_kdl.as_ref().unwrap(),
+            mission.declarations_kdl.as_ref().unwrap(),
             "node",
             &standing.id,
         )
@@ -6359,10 +6405,10 @@ version 2
         assert_eq!(repeated, created);
         assert_eq!(
             store
-                .active_plan_runs()
+                .active_mission_runs()
                 .unwrap()
                 .into_iter()
-                .filter(|run| run.plan == "plan/standing/node.quick")
+                .filter(|run| run.mission == "mission/standing/node.quick")
                 .count(),
             1
         );
@@ -6396,14 +6442,14 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{revised_response}");
-        assert_eq!(revised_response["plan_run"], created["plan_run"]);
+        assert_eq!(revised_response["mission_run"], created["mission_run"]);
         assert_ne!(revised_response["generation"], created["generation"]);
         assert_eq!(
             store
-                .active_plan_runs()
+                .active_mission_runs()
                 .unwrap()
                 .into_iter()
-                .filter(|run| run.plan == "plan/standing/node.quick")
+                .filter(|run| run.mission == "mission/standing/node.quick")
                 .count(),
             1
         );
@@ -6519,7 +6565,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_ne!(second["subscription"], first["subscription"]);
-        assert_eq!(store.active_plan_runs().unwrap().len(), 2);
+        assert_eq!(store.active_mission_runs().unwrap().len(), 2);
         let subscription = first["subscription"].as_str().unwrap();
         let (status, stopped) = json_request(
             app,
@@ -6538,9 +6584,9 @@ version 2
             .split('/')
             .next()
             .unwrap();
-        let run = store.plan_run(run_id).unwrap().unwrap();
+        let run = store.mission_run(run_id).unwrap().unwrap();
         assert_eq!(run.status, "running");
         assert_eq!(run.phase, "cleanup-cancelled");
-        assert_eq!(store.active_plan_runs().unwrap().len(), 2);
+        assert_eq!(store.active_mission_runs().unwrap().len(), 2);
     }
 }

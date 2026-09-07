@@ -13,14 +13,14 @@ use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
-    DocumentVersion, EventRecord, IntentInput, MessageView, NormalizedIntent, PlanInputKind,
-    PlanOutputView, PlanResponse, PlanRevisionOperation, PlanRunDeclaration, PlanRunInput,
-    PlanRunRequest, PlanRunView, PlanSpec, PlanState, PlannedAction, PlanningCandidateView,
-    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
-    ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse, ResourceObservationOutcome,
-    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
+    DocumentVersion, EventRecord, IntentInput, MessageView, MissionInputKind, MissionOutputView,
+    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
+    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
+    PlanningVariantView, ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse,
+    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
+    StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
 };
 
 const SCHEMA: &str = r#"
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
     response TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS plan_run_requests (
+CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL
 );
@@ -133,26 +133,26 @@ CREATE TABLE IF NOT EXISTS capabilities (
     used INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS plan_revisions (
-    plan_id TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS mission_revisions (
+    mission_id TEXT NOT NULL,
     revision TEXT NOT NULL,
     state TEXT NOT NULL,
     body TEXT NOT NULL,
     claim_id TEXT NOT NULL REFERENCES claims(id),
     created_index INTEGER NOT NULL,
-    PRIMARY KEY(plan_id, revision)
+    PRIMARY KEY(mission_id, revision)
 );
 
-CREATE TABLE IF NOT EXISTS plan_definitions (
-    plan_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS mission_definitions (
+    mission_id TEXT PRIMARY KEY,
     revision TEXT NOT NULL,
     state TEXT NOT NULL,
     claim_id TEXT NOT NULL REFERENCES claims(id)
 );
 
-CREATE TABLE IF NOT EXISTS plan_runs (
+CREATE TABLE IF NOT EXISTS mission_runs (
     id TEXT PRIMARY KEY,
-    plan_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
     initial_revision TEXT NOT NULL,
     current_generation_id TEXT NOT NULL,
     root_revision TEXT NOT NULL,
@@ -167,11 +167,11 @@ CREATE TABLE IF NOT EXISTS plan_runs (
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS plan_runs_plan_index ON plan_runs(plan_id, created_at_unix_ms);
+CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
 
 CREATE TABLE IF NOT EXISTS run_generations (
     id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    run_id TEXT NOT NULL REFERENCES mission_runs(id),
     revision TEXT NOT NULL,
     predecessor_id TEXT,
     status TEXT NOT NULL,
@@ -185,7 +185,7 @@ CREATE INDEX IF NOT EXISTS run_generations_run_index ON run_generations(run_id, 
 
 CREATE TABLE IF NOT EXISTS step_runs (
     subject TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    run_id TEXT NOT NULL REFERENCES mission_runs(id),
     generation_id TEXT NOT NULL REFERENCES run_generations(id),
     step_path TEXT NOT NULL,
     definition_hash TEXT NOT NULL,
@@ -212,7 +212,7 @@ CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_i
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES plan_runs(id),
+    run_id TEXT NOT NULL REFERENCES mission_runs(id),
     source_generation_id TEXT NOT NULL REFERENCES run_generations(id),
     candidate_revision TEXT NOT NULL,
     actor TEXT NOT NULL,
@@ -231,7 +231,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS revision_proposals_one_pending
 ON revision_proposals(run_id) WHERE status IN ('pending-approval','draining');
 CREATE TABLE IF NOT EXISTS planning_sessions (
     id TEXT PRIMARY KEY,
-    plan_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
     request_ref TEXT NOT NULL,
     workspace TEXT NOT NULL,
     requester TEXT NOT NULL,
@@ -249,7 +249,7 @@ CREATE TABLE IF NOT EXISTS planning_candidates (
     revision INTEGER NOT NULL,
     markdown_ref TEXT NOT NULL,
     kdl_ref TEXT NOT NULL,
-    plan_revision TEXT NOT NULL,
+    mission_revision TEXT NOT NULL,
     submitted_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant, revision)
 );
@@ -261,11 +261,11 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     store_index INTEGER NOT NULL,
     graph TEXT NOT NULL,
     diff TEXT NOT NULL,
-    plan_response TEXT NOT NULL,
+    mission_response TEXT NOT NULL,
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;
 "#;
 
 pub struct Store {
@@ -273,7 +273,7 @@ pub struct Store {
     origin: String,
 }
 
-struct ChildPlanContext {
+struct ChildMissionContext {
     root_revision: String,
     root_run_id: String,
     parent_step_run: String,
@@ -288,11 +288,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 8,
+        table_count == 0 || version == 9,
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 8,
+        version == 0 || version == 9,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -414,21 +414,25 @@ impl Store {
         Ok(())
     }
 
-    pub fn plan_spec(&self, plan_id: &str, revision: Option<&str>) -> Result<Option<PlanSpec>> {
+    pub fn mission_spec(
+        &self,
+        mission_id: &str,
+        revision: Option<&str>,
+    ) -> Result<Option<MissionSpec>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let body = if let Some(revision) = revision {
             connection
                 .query_row(
-                    "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-                    params![plan_id, revision],
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![mission_id, revision],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
         } else {
             connection
                 .query_row(
-                    "SELECT r.body FROM plan_definitions d JOIN plan_revisions r ON r.plan_id=d.plan_id AND r.revision=d.revision WHERE d.plan_id=?1",
-                    [plan_id],
+                    "SELECT r.body FROM mission_definitions d JOIN mission_revisions r ON r.mission_id=d.mission_id AND r.revision=d.revision WHERE d.mission_id=?1",
+                    [mission_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -442,7 +446,7 @@ impl Store {
     pub fn create_planning_session(
         &self,
         id: &str,
-        plan: &str,
+        mission: &str,
         request_ref: &str,
         workspace: &str,
         requester: &str,
@@ -454,9 +458,9 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT OR IGNORE INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT OR IGNORE INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
-                params![id, plan, request_ref, workspace, requester, planner, target_run.map(|run| run.strip_prefix("plan-run/").unwrap_or(run)), source_generation.map(generation_id_from_subject), now],
+                params![id, mission, request_ref, workspace, requester, planner, target_run.map(|run| run.strip_prefix("mission-run/").unwrap_or(run)), source_generation.map(generation_id_from_subject), now],
             )
             .map_err(internal)?;
         planning_session_view_tx(&connection, id)
@@ -482,7 +486,7 @@ impl Store {
         variant: &str,
         markdown_ref: &str,
         kdl_ref: &str,
-        plan_revision: &str,
+        mission_revision: &str,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
@@ -518,7 +522,7 @@ impl Store {
         }
         let current = transaction
             .query_row(
-                "SELECT markdown_ref, kdl_ref, plan_revision FROM planning_candidates
+                "SELECT markdown_ref, kdl_ref, mission_revision FROM planning_candidates
                  WHERE session_id=?1 AND variant=?2 ORDER BY revision DESC LIMIT 1",
                 params![id, variant],
                 |row| {
@@ -533,7 +537,7 @@ impl Store {
             .map_err(internal)?;
         if status == "review"
             && current.as_ref().is_some_and(|(markdown, kdl, revision)| {
-                markdown == markdown_ref && kdl == kdl_ref && revision == plan_revision
+                markdown == markdown_ref && kdl == kdl_ref && revision == mission_revision
             })
         {
             transaction.commit().map_err(internal)?;
@@ -555,9 +559,9 @@ impl Store {
         let now = now_ms().to_string();
         transaction
             .execute(
-                "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
+                "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, mission_revision, submitted_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, variant, revision, markdown_ref, kdl_ref, plan_revision, now],
+                params![id, variant, revision, markdown_ref, kdl_ref, mission_revision, now],
             )
             .map_err(internal)?;
         transaction
@@ -591,27 +595,27 @@ impl Store {
         hash: &str,
         graph: &str,
         diff: &str,
-        plan: &PlanResponse,
+        mission: &MissionResponse,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
         let now = now_ms().to_string();
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
             .execute(
-                "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
+                "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
                    store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
-                   plan_response=excluded.plan_response, created_at_unix_ms=excluded.created_at_unix_ms",
+                   mission_response=excluded.mission_response, created_at_unix_ms=excluded.created_at_unix_ms",
                 params![
                     id,
                     variant,
                     candidate_revision,
                     hash,
-                    plan.store_index,
+                    mission.store_index,
                     graph,
                     diff,
-                    serde_json::to_string(plan).map_err(internal)?,
+                    serde_json::to_string(mission).map_err(internal)?,
                     now,
                 ],
             )
@@ -727,25 +731,28 @@ impl Store {
             })
     }
 
-    pub fn create_plan_run(&self, request: &PlanRunRequest) -> Result<PlanRunView, St3Error> {
-        self.create_plan_run_inner(request, None)
+    pub fn create_mission_run(
+        &self,
+        request: &MissionRunRequest,
+    ) -> Result<MissionRunView, St3Error> {
+        self.create_mission_run_inner(request, None)
     }
 
-    pub fn create_child_plan_run(
+    pub fn create_child_mission_run(
         &self,
-        request: &PlanRunRequest,
-        parent: &PlanRunView,
+        request: &MissionRunRequest,
+        parent: &MissionRunView,
         parent_step_run: &str,
         default_selector: Option<&WorkSelector>,
-    ) -> Result<PlanRunView, St3Error> {
-        self.create_plan_run_inner(
+    ) -> Result<MissionRunView, St3Error> {
+        self.create_mission_run_inner(
             request,
-            Some(ChildPlanContext {
+            Some(ChildMissionContext {
                 root_revision: parent.root_revision.clone(),
                 root_run_id: parent
-                    .root_plan_run
-                    .strip_prefix("plan-run/")
-                    .unwrap_or(&parent.root_plan_run)
+                    .root_mission_run
+                    .strip_prefix("mission-run/")
+                    .unwrap_or(&parent.root_mission_run)
                     .to_owned(),
                 parent_step_run: normalize_step_run(parent_step_run),
                 default_selector: default_selector.cloned(),
@@ -753,28 +760,34 @@ impl Store {
         )
     }
 
-    fn create_plan_run_inner(
+    fn create_mission_run_inner(
         &self,
-        request: &PlanRunRequest,
-        child: Option<ChildPlanContext>,
-    ) -> Result<PlanRunView, St3Error> {
-        let plan_id = request.plan.strip_prefix("plan/").unwrap_or(&request.plan);
-        let plan = self
-            .plan_spec(plan_id, request.revision.as_deref())
+        request: &MissionRunRequest,
+        child: Option<ChildMissionContext>,
+    ) -> Result<MissionRunView, St3Error> {
+        let mission_id = request
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&request.mission);
+        let mission = self
+            .mission_spec(mission_id, request.revision.as_deref())
             .map_err(internal)?
             .ok_or_else(|| {
-                St3Error::new("missing-plan", format!("plan `{plan_id}` does not exist"))
+                St3Error::new(
+                    "missing-mission",
+                    format!("mission `{mission_id}` does not exist"),
+                )
             })?;
-        if plan.state != PlanState::Ready {
+        if mission.state != MissionState::Ready {
             return Err(St3Error::new(
-                "plan-not-ready",
-                format!("plan `{plan_id}` is not ready"),
+                "mission-not-ready",
+                format!("mission `{mission_id}` is not ready"),
             ));
         }
-        if child.is_some() && !plan.inputs.is_empty() {
+        if child.is_some() && !mission.inputs.is_empty() {
             return Err(St3Error::new(
-                "child-plan-inputs-unsupported",
-                "a child plan cannot declare inputs in this version",
+                "child-mission-inputs-unsupported",
+                "a child mission cannot declare inputs in this version",
             ));
         }
         let request_hash = hex::encode(Sha256::digest(
@@ -792,7 +805,7 @@ impl Store {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((response, stored_hash)) = connection
             .query_row(
-                "SELECT i.response, r.request_hash FROM idempotency i JOIN plan_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
+                "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
                 [opaque_cache_key(&request.idempotency_key)],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -802,19 +815,19 @@ impl Store {
             if stored_hash != request_hash {
                 return Err(St3Error::new(
                     "idempotency-mismatch",
-                    "the plan-run idempotency key was used with different input",
+                    "the mission-run idempotency key was used with different input",
                 ));
             }
             return serde_json::from_str(&response).map_err(internal);
         }
         let transaction = connection.transaction().map_err(internal)?;
-        let inputs = resolve_plan_run_inputs(&transaction, &plan, &request.inputs)?;
-        enforce_plan_run_capacity(&transaction, &plan)?;
+        let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
+        enforce_mission_run_capacity(&transaction, &mission)?;
         let run_id = hex::encode(Sha256::digest(
             format!("{}:{}", self.origin, request.idempotency_key).as_bytes(),
         ))[..32]
             .to_owned();
-        let subject = format!("plan-run/{run_id}");
+        let subject = format!("mission-run/{run_id}");
         let generation_id = hex::encode(Sha256::digest(
             format!("{}:{}:generation:1", self.origin, request.idempotency_key).as_bytes(),
         ))[..32]
@@ -823,12 +836,12 @@ impl Store {
         let root_revision = child
             .as_ref()
             .map(|child| child.root_revision.clone())
-            .unwrap_or_else(|| plan.revision.clone());
+            .unwrap_or_else(|| mission.revision.clone());
         let root_run_id = child
             .as_ref()
             .map(|child| child.root_run_id.clone())
             .unwrap_or_else(|| run_id.clone());
-        let root_plan_run = format!("plan-run/{root_run_id}");
+        let root_mission_run = format!("mission-run/{root_run_id}");
         let parent_step_run = child.as_ref().map(|child| child.parent_step_run.clone());
         let default_selector = child
             .as_ref()
@@ -845,12 +858,12 @@ impl Store {
             ));
         }
         let mut variables = BTreeMap::from([
-            ("ST_PLAN".into(), plan.id.clone()),
-            ("ST_PLAN_REVISION".into(), plan.revision.clone()),
-            ("ST_PLAN_RUN".into(), run_id.clone()),
+            ("ST_MISSION".into(), mission.id.clone()),
+            ("ST_MISSION_REVISION".into(), mission.revision.clone()),
+            ("ST_MISSION_RUN".into(), run_id.clone()),
             ("ST_RUN_GENERATION".into(), generation_id.clone()),
             ("ST_REQUESTER".into(), requester.clone()),
-            ("ST_ROOT_PLAN_RUN".into(), root_plan_run.clone()),
+            ("ST_ROOT_MISSION_RUN".into(), root_mission_run.clone()),
             ("ST_WORKSPACE".into(), request.workspace.clone()),
             (
                 "ST_PARENT_STEP_RUN".into(),
@@ -863,20 +876,20 @@ impl Store {
         let now = now_ms();
         transaction
             .execute(
-                "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-                params![run_id, plan.id, plan.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, now.to_string()],
+                params![run_id, mission.id, mission.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, now.to_string()],
             )
             .map_err(internal)?;
         transaction
             .execute(
                 "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
-                params![generation_id, run_id, plan.revision, requester, now.to_string()],
+                 VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial mission run', ?5, ?5)",
+                params![generation_id, run_id, mission.revision, requester, now.to_string()],
             )
             .map_err(internal)?;
         let mut flat = Vec::new();
-        flatten_steps(&plan, default_selector.clone(), &mut flat);
+        flatten_steps(&mission, default_selector.clone(), &mut flat);
         for (step, selector) in flat {
             let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
             let step_subject = format!("step-run/{generation_id}/{}", step.path);
@@ -887,7 +900,7 @@ impl Store {
             step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
                 "ST_PARENT_STEP_RUN".into(),
-                crate::plan::parent_step_path(&plan, &step.path)
+                crate::mission::parent_step_path(&mission, &step.path)
                     .map(|path| format!("step-run/{generation_id}/{path}"))
                     .or_else(|| parent_step_run.clone())
                     .unwrap_or_default(),
@@ -895,7 +908,7 @@ impl Store {
             let title = step
                 .title
                 .as_deref()
-                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .map(|value| crate::mission::interpolate(value, &step_variables))
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             transaction
@@ -909,12 +922,12 @@ impl Store {
         let body = json!({
             "fields": {
                 "status": "running",
-                "plan": plan.subject,
-                "revision": plan.revision,
-                "initial_revision": plan.revision,
+                "mission": mission.subject,
+                "revision": mission.revision,
+                "initial_revision": mission.revision,
                 "current_generation": generation_subject,
                 "root_revision": root_revision,
-                "root_plan_run": root_plan_run,
+                "root_mission_run": root_mission_run,
                 "parent_step_run": parent_step_run,
                 "default_selector": default_selector,
                 "workspace": request.workspace,
@@ -927,7 +940,7 @@ impl Store {
             &transaction,
             &self.origin,
             &subject,
-            "plan-run.created",
+            "mission-run.created",
             Some(&requester),
             &body,
             &[],
@@ -942,15 +955,15 @@ impl Store {
             Some(&requester),
             &json!({"fields": {
                 "run": subject,
-                "revision": plan.revision,
+                "revision": mission.revision,
                 "status": "running",
-                "reason": "initial plan run"
+                "reason": "initial mission run"
             }}),
             &[],
             None,
         )
         .map_err(internal)?;
-        let view = plan_run_view_tx(&transaction, &run_id).map_err(internal)?;
+        let view = mission_run_view_tx(&transaction, &run_id).map_err(internal)?;
         transaction
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -962,7 +975,7 @@ impl Store {
             .map_err(internal)?;
         transaction
             .execute(
-                "INSERT INTO plan_run_requests(operation_id, request_hash) VALUES (?1, ?2)",
+                "INSERT INTO mission_run_requests(operation_id, request_hash) VALUES (?1, ?2)",
                 params![opaque_cache_key(&request.idempotency_key), request_hash],
             )
             .map_err(internal)?;
@@ -970,15 +983,15 @@ impl Store {
         Ok(view)
     }
 
-    pub fn record_plan_output(
+    pub fn record_mission_output(
         &self,
         subject: &str,
         actor: &str,
         incarnation: Option<&str>,
-        expected_plan: &str,
-        plan: &PlanSpec,
+        expected_mission: &str,
+        mission: &MissionSpec,
         idempotency_key: &str,
-    ) -> Result<PlanOutputView, St3Error> {
+    ) -> Result<MissionOutputView, St3Error> {
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(actor, "agent");
         let now = now_ms();
@@ -1017,7 +1030,7 @@ impl Store {
                 format!("step run `{subject}` belongs to a superseded generation"),
             ));
         }
-        if !plan_output_authority(&transaction, &current, &actor, incarnation, now)
+        if !mission_output_authority(&transaction, &current, &actor, incarnation, now)
             .map_err(internal)?
         {
             return Err(St3Error::new(
@@ -1027,29 +1040,32 @@ impl Store {
                 ),
             ));
         }
-        if plan.id != expected_plan || plan.state != PlanState::Ready {
+        if mission.id != expected_mission || mission.state != MissionState::Ready {
             return Err(St3Error::new(
-                "wrong-plan-output",
-                format!("step run `{subject}` must publish ready plan `{expected_plan}`"),
+                "wrong-mission-output",
+                format!("step run `{subject}` must publish ready mission `{expected_mission}`"),
             ));
         }
         let stored = transaction
             .query_row(
-                "SELECT state FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-                params![plan.id, plan.revision],
+                "SELECT state FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                params![mission.id, mission.revision],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(internal)?;
         if stored.as_deref() != Some("ready") {
             return Err(St3Error::new(
-                "unpublished-plan-output",
-                "the exact ready plan revision is not published",
+                "unpublished-mission-output",
+                "the exact ready mission revision is not published",
             ));
         }
         let fields: BTreeMap<String, Value> = BTreeMap::from([
-            ("plan".into(), Value::String(format!("plan/{}", plan.id))),
-            ("revision".into(), Value::String(plan.revision.clone())),
+            (
+                "mission".into(),
+                Value::String(format!("mission/{}", mission.id)),
+            ),
+            ("revision".into(), Value::String(mission.revision.clone())),
             (
                 "step_definition".into(),
                 Value::String(current.definition_hash.clone()),
@@ -1061,17 +1077,17 @@ impl Store {
             &transaction,
             &self.origin,
             &subject,
-            "plan.produced",
+            "mission.produced",
             Some(&actor),
             &body,
             &[],
             None,
         )
         .map_err(internal)?;
-        let output = PlanOutputView {
+        let output = MissionOutputView {
             step: subject,
-            plan: format!("plan/{}", plan.id),
-            revision: plan.revision.clone(),
+            mission: format!("mission/{}", mission.id),
+            revision: mission.revision.clone(),
             claim_id: claim.id,
         };
         transaction
@@ -1087,7 +1103,7 @@ impl Store {
         Ok(output)
     }
 
-    pub fn plan_output_authorized(
+    pub fn mission_output_authorized(
         &self,
         subject: &str,
         actor: &str,
@@ -1110,20 +1126,26 @@ impl Store {
             .as_ref()
             .map(|current| {
                 Ok(step_generation_is_current(&connection, current)?
-                    && plan_output_authority(&connection, current, &actor, incarnation, now_ms())?)
+                    && mission_output_authority(
+                        &connection,
+                        current,
+                        &actor,
+                        incarnation,
+                        now_ms(),
+                    )?)
             })
             .transpose()
             .map(|authorized| authorized.unwrap_or(false))
     }
 
-    pub fn plan_output(
+    pub fn mission_output(
         &self,
         subject: &str,
         attempt: u32,
         definition_hash: &str,
-    ) -> Result<Option<PlanOutputView>> {
+    ) -> Result<Option<MissionOutputView>> {
         let subject = normalize_step_run(subject);
-        let Some(claim) = self.latest_claim(&subject, Some("plan.produced"))? else {
+        let Some(claim) = self.latest_claim(&subject, Some("mission.produced"))? else {
             return Ok(None);
         };
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
@@ -1132,28 +1154,28 @@ impl Store {
         {
             return Ok(None);
         }
-        let Some(plan) = fields.get("plan").and_then(Value::as_str) else {
+        let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
             return Ok(None);
         };
         let Some(revision) = fields.get("revision").and_then(Value::as_str) else {
             return Ok(None);
         };
-        Ok(Some(PlanOutputView {
+        Ok(Some(MissionOutputView {
             step: subject,
-            plan: plan.to_owned(),
+            mission: mission.to_owned(),
             revision: revision.to_owned(),
             claim_id: claim.id,
         }))
     }
 
-    pub fn plan_run(&self, run: &str) -> Result<Option<PlanRunView>> {
-        let run = run.strip_prefix("plan-run/").unwrap_or(run);
+    pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.connection.lock().expect("store mutex poisoned");
-        Ok(plan_run_view_tx(&connection, run).optional()?)
+        Ok(mission_run_view_tx(&connection, run).optional()?)
     }
 
     pub fn run_generations(&self, run: &str) -> Result<Vec<RunGenerationView>> {
-        let run = run.strip_prefix("plan-run/").unwrap_or(run);
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
@@ -1175,12 +1197,12 @@ impl Store {
     pub fn descendant_run_generations(&self, generation: &str) -> Result<Vec<String>> {
         let generation = generation_id_from_subject(generation);
         let connection = self.connection.lock().expect("store mutex poisoned");
-        descendant_plan_run_ids_tx(&connection, generation)?
+        descendant_mission_run_ids_tx(&connection, generation)?
             .into_iter()
             .map(|run| {
                 connection
                     .query_row(
-                        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                        "SELECT current_generation_id FROM mission_runs WHERE id=?1",
                         [run],
                         |row| row.get::<_, String>(0),
                     )
@@ -1191,7 +1213,7 @@ impl Store {
     }
 
     pub fn revision_proposal_for_run(&self, run: &str) -> Result<Option<RevisionProposalView>> {
-        let run = run.strip_prefix("plan-run/").unwrap_or(run);
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let id = connection
             .query_row(
@@ -1216,7 +1238,7 @@ impl Store {
     pub fn create_revision_proposal(
         &self,
         run: &str,
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         actor: &str,
         reason: &str,
         idempotency_key: &str,
@@ -1227,50 +1249,53 @@ impl Store {
         {
             return Ok(response);
         }
-        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
-        let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let current = self.mission_run(run_id).map_err(internal)?.ok_or_else(|| {
             St3Error::new(
-                "missing-plan-run",
-                format!("plan run `{run}` does not exist"),
+                "missing-mission-run",
+                format!("mission run `{run}` does not exist"),
             )
         })?;
         if !matches!(current.status.as_str(), "running" | "standing" | "blocked")
             || current.phase != "normal"
         {
             return Err(St3Error::new(
-                "plan-run-not-revisable",
+                "mission-run-not-revisable",
                 format!(
-                    "plan run `{run}` is {} in its {} phase",
+                    "mission run `{run}` is {} in its {} phase",
                     current.status, current.phase
                 ),
             ));
         }
-        let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+        let mission_id = current
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&current.mission);
         let old = self
-            .plan_spec(plan_id, Some(&current.revision))
+            .mission_spec(mission_id, Some(&current.revision))
             .map_err(internal)?
             .ok_or_else(|| {
                 St3Error::new(
-                    "missing-plan-revision",
-                    "the current plan revision is unavailable",
+                    "missing-mission-revision",
+                    "the current mission revision is unavailable",
                 )
             })?;
-        if plan.id != plan_id || plan.state != PlanState::Ready {
+        if mission.id != mission_id || mission.state != MissionState::Ready {
             return Err(St3Error::new(
-                "wrong-plan-revision",
-                format!("the proposal does not contain ready plan `{plan_id}`"),
+                "wrong-mission-revision",
+                format!("the proposal does not contain ready mission `{mission_id}`"),
             ));
         }
-        if old.inputs != plan.inputs {
+        if old.inputs != mission.inputs {
             return Err(St3Error::new(
                 "run-input-mutation",
                 "a run revision cannot change its input declarations",
             ));
         }
         let actor = normalize_actor(actor, "agent");
-        let variables = plan_run_variables(&current, &plan.revision);
+        let variables = mission_run_variables(&current, &mission.revision);
         let (compatible, reviewers) =
-            analyze_plan_revision(&old, plan, &actor, &current.requester, &variables)?;
+            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
             match &cutover {
@@ -1292,7 +1317,7 @@ impl Store {
         let preview_hash = hex::encode(Sha256::digest(
             serde_json::to_vec(&json!({
                 "source_generation": current.generation,
-                "candidate_revision": plan.revision,
+                "candidate_revision": mission.revision,
                 "compatible_steps": compatible,
                 "reviewers": reviewers,
                 "cutover": cutover,
@@ -1324,7 +1349,7 @@ impl Store {
         {
             return Err(St3Error::new(
                 "revision-proposal-already-pending",
-                "the plan run already has one pending revision proposal",
+                "the mission run already has one pending revision proposal",
             ));
         }
         let transaction = connection.transaction().map_err(internal)?;
@@ -1336,7 +1361,7 @@ impl Store {
                     proposal_id,
                     run_id,
                     generation_id_from_subject(&current.generation),
-                    plan.revision,
+                    mission.revision,
                     actor,
                     reason,
                     status,
@@ -1351,7 +1376,7 @@ impl Store {
         if status == "draining" {
             transaction
                 .execute(
-                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
                     params![run_id, now.to_string()],
                 )
                 .map_err(internal)?;
@@ -1366,7 +1391,7 @@ impl Store {
             &json!({"fields": {
                 "run": current.subject,
                 "source_generation": current.generation,
-                "candidate_revision": plan.revision,
+                "candidate_revision": mission.revision,
                 "reason": reason,
                 "status": status,
                 "cutover": revision_cutover_name(&cutover),
@@ -1422,17 +1447,17 @@ impl Store {
             && proposal.preview_hash.as_deref() == Some(preview_hash)
             && proposal.approvals.contains(&actor)
         {
-            let run = plan_run_view_tx(
+            let run = mission_run_view_tx(
                 &transaction,
                 proposal
                     .run
-                    .strip_prefix("plan-run/")
+                    .strip_prefix("mission-run/")
                     .unwrap_or(&proposal.run),
             )
             .map_err(internal)?;
             let response = RevisionSubmissionView {
                 status: "applied".into(),
-                plan_run: run,
+                mission_run: run,
                 proposal: Some(proposal),
             };
             transaction
@@ -1493,8 +1518,8 @@ impl Store {
         if status == "draining" {
             transaction
                 .execute(
-                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![proposal.run.strip_prefix("plan-run/").unwrap_or(&proposal.run), now.to_string()],
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![proposal.run.strip_prefix("mission-run/").unwrap_or(&proposal.run), now.to_string()],
                 )
                 .map_err(internal)?;
         }
@@ -1520,7 +1545,7 @@ impl Store {
                 .expect("the applied proposal exists");
             let response = RevisionSubmissionView {
                 status: "applied".into(),
-                plan_run: run,
+                mission_run: run,
                 proposal: Some(applied),
             };
             let connection = self.connection.lock().expect("store mutex poisoned");
@@ -1541,12 +1566,12 @@ impl Store {
             .map_err(internal)?
             .expect("the proposal exists");
         let run = self
-            .plan_run(&proposal.run)
+            .mission_run(&proposal.run)
             .map_err(internal)?
-            .expect("the proposal plan run exists");
+            .expect("the proposal mission run exists");
         let response = RevisionSubmissionView {
             status: proposal.status.clone(),
-            plan_run: run,
+            mission_run: run,
             proposal: Some(proposal),
         };
         let connection = self.connection.lock().expect("store mutex poisoned");
@@ -1596,11 +1621,11 @@ impl Store {
         let current = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
         let run_id = current
             .run
-            .strip_prefix("plan-run/")
+            .strip_prefix("mission-run/")
             .unwrap_or(&current.run);
         let requester: String = transaction
             .query_row(
-                "SELECT requester FROM plan_runs WHERE id=?1",
+                "SELECT requester FROM mission_runs WHERE id=?1",
                 [run_id],
                 |row| row.get(0),
             )
@@ -1626,7 +1651,7 @@ impl Store {
             .map_err(internal)?;
         transaction
             .execute(
-                "UPDATE plan_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
+                "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
                 params![run_id, now.to_string()],
             )
             .map_err(internal)?;
@@ -1659,13 +1684,13 @@ impl Store {
         &self,
         run: &str,
     ) -> Result<Option<RevisionSubmissionView>, St3Error> {
-        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
         let proposal = {
             let connection = self.connection.lock().expect("store mutex poisoned");
             let active: u32 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM step_runs
-                     WHERE generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)
+                     WHERE generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)
                        AND status IN ('claimed','working','verifying')",
                     [run_id],
                     |row| row.get(0),
@@ -1676,19 +1701,19 @@ impl Store {
             }
             let current_generation: String = connection
                 .query_row(
-                    "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                    "SELECT current_generation_id FROM mission_runs WHERE id=?1",
                     [run_id],
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
             for descendant in
-                descendant_plan_run_ids_tx(&connection, &current_generation).map_err(internal)?
+                descendant_mission_run_ids_tx(&connection, &current_generation).map_err(internal)?
             {
                 let active: u32 = connection
                     .query_row(
                         "SELECT COUNT(*) FROM step_runs
                          WHERE run_id=?1
-                           AND generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)
+                           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)
                            AND status IN ('claimed','working','verifying')",
                         [descendant],
                         |row| row.get(0),
@@ -1725,7 +1750,7 @@ impl Store {
             .expect("the applied proposal exists");
         Ok(Some(RevisionSubmissionView {
             status: "applied".into(),
-            plan_run: run,
+            mission_run: run,
             proposal: Some(proposal),
         }))
     }
@@ -1735,7 +1760,7 @@ impl Store {
         proposal_id: &str,
         actor: &str,
         idempotency_key: &str,
-    ) -> Result<PlanRunView, St3Error> {
+    ) -> Result<MissionRunView, St3Error> {
         let proposal = self
             .revision_proposal(proposal_id)
             .map_err(internal)?
@@ -1747,12 +1772,12 @@ impl Store {
             })?;
         let run_id = proposal
             .run
-            .strip_prefix("plan-run/")
+            .strip_prefix("mission-run/")
             .unwrap_or(&proposal.run);
-        let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
+        let current = self.mission_run(run_id).map_err(internal)?.ok_or_else(|| {
             St3Error::new(
-                "missing-plan-run",
-                format!("plan run `{run_id}` does not exist"),
+                "missing-mission-run",
+                format!("mission run `{run_id}` does not exist"),
             )
         })?;
         if current.generation != proposal.source_generation {
@@ -1761,19 +1786,22 @@ impl Store {
                 "the revision proposal does not target the current generation",
             ));
         }
-        let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
-        let plan = self
-            .plan_spec(plan_id, Some(&proposal.candidate_revision))
+        let mission_id = current
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&current.mission);
+        let mission = self
+            .mission_spec(mission_id, Some(&proposal.candidate_revision))
             .map_err(internal)?
             .ok_or_else(|| {
                 St3Error::new(
-                    "missing-plan-revision",
-                    "the proposed plan revision is unavailable",
+                    "missing-mission-revision",
+                    "the proposed mission revision is unavailable",
                 )
             })?;
-        self.adopt_approved_plan_revision(
+        self.adopt_approved_mission_revision(
             run_id,
-            &plan,
+            &mission,
             actor,
             &proposal.reason,
             &format!("{idempotency_key}:cutover"),
@@ -1782,47 +1810,56 @@ impl Store {
         )
     }
 
-    pub fn plan_run_for_parent_step(&self, step: &str) -> Result<Option<PlanRunView>> {
+    pub fn mission_run_for_parent_step(&self, step: &str) -> Result<Option<MissionRunView>> {
         let step = normalize_step_run(step);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let run_id = connection
             .query_row(
-                "SELECT id FROM plan_runs WHERE parent_step_run=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                "SELECT id FROM mission_runs WHERE parent_step_run=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
                 [step],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
         run_id
-            .map(|run_id| plan_run_view_tx(&connection, &run_id))
+            .map(|run_id| mission_run_view_tx(&connection, &run_id))
             .transpose()
             .map_err(Into::into)
     }
 
-    pub fn adopt_plan_revision(
+    pub fn adopt_mission_revision(
         &self,
         run: &str,
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         actor: &str,
         reason: &str,
         idempotency_key: &str,
-    ) -> Result<PlanRunView, St3Error> {
-        self.adopt_plan_revision_inner(run, plan, actor, reason, idempotency_key, None, false, None)
+    ) -> Result<MissionRunView, St3Error> {
+        self.adopt_mission_revision_inner(
+            run,
+            mission,
+            actor,
+            reason,
+            idempotency_key,
+            None,
+            false,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn adopt_approved_plan_revision(
+    fn adopt_approved_mission_revision(
         &self,
         run: &str,
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         actor: &str,
         reason: &str,
         idempotency_key: &str,
         source_generation: &str,
         proposal: &RevisionProposalView,
-    ) -> Result<PlanRunView, St3Error> {
-        self.adopt_plan_revision_inner(
+    ) -> Result<MissionRunView, St3Error> {
+        self.adopt_mission_revision_inner(
             run,
-            plan,
+            mission,
             actor,
             reason,
             idempotency_key,
@@ -1833,29 +1870,29 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn adopt_plan_revision_inner(
+    fn adopt_mission_revision_inner(
         &self,
         run: &str,
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         actor: &str,
         reason: &str,
         idempotency_key: &str,
         expected_generation: Option<&str>,
         protected_approved: bool,
         proposal: Option<&RevisionProposalView>,
-    ) -> Result<PlanRunView, St3Error> {
+    ) -> Result<MissionRunView, St3Error> {
         if let Some(response) = self
             .cached_idempotency_response(idempotency_key)
             .map_err(internal)?
         {
             return Ok(response);
         }
-        let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
         let actor = normalize_actor(actor, "agent");
-        let current = self.plan_run(run_id).map_err(internal)?.ok_or_else(|| {
+        let current = self.mission_run(run_id).map_err(internal)?.ok_or_else(|| {
             St3Error::new(
-                "missing-plan-run",
-                format!("plan run `{run}` does not exist"),
+                "missing-mission-run",
+                format!("mission run `{run}` does not exist"),
             )
         })?;
         if expected_generation.is_some_and(|expected| {
@@ -1872,52 +1909,58 @@ impl Store {
             || !phase_allows_cutover
         {
             return Err(St3Error::new(
-                "plan-run-not-revisable",
+                "mission-run-not-revisable",
                 format!(
-                    "plan run `{run}` is {} in its {} phase",
+                    "mission run `{run}` is {} in its {} phase",
                     current.status, current.phase
                 ),
             ));
         }
-        let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
-        if plan.id != plan_id {
+        let mission_id = current
+            .mission
+            .strip_prefix("mission/")
+            .unwrap_or(&current.mission);
+        if mission.id != mission_id {
             return Err(St3Error::new(
-                "wrong-plan-revision",
-                format!("revision `{}` does not replace plan `{plan_id}`", plan.id),
+                "wrong-mission-revision",
+                format!(
+                    "revision `{}` does not replace mission `{mission_id}`",
+                    mission.id
+                ),
             ));
         }
-        if plan.state != PlanState::Ready {
+        if mission.state != MissionState::Ready {
             return Err(St3Error::new(
-                "plan-revision-not-ready",
-                "a running plan can adopt only a ready revision",
+                "mission-revision-not-ready",
+                "a running mission can adopt only a ready revision",
             ));
         }
         let old = self
-            .plan_spec(plan_id, Some(&current.revision))
+            .mission_spec(mission_id, Some(&current.revision))
             .map_err(internal)?
             .ok_or_else(|| {
                 St3Error::new(
-                    "missing-plan-revision",
-                    "the current plan revision is unavailable",
+                    "missing-mission-revision",
+                    "the current mission revision is unavailable",
                 )
             })?;
-        if old.inputs != plan.inputs {
+        if old.inputs != mission.inputs {
             return Err(St3Error::new(
                 "run-input-mutation",
                 "a run revision cannot change its input declarations",
             ));
         }
 
-        let variables = plan_run_variables(&current, &plan.revision);
+        let variables = mission_run_variables(&current, &mission.revision);
         let (compatible, reviewers) = if protected_approved {
-            (compatible_step_paths(&old, plan), BTreeSet::new())
+            (compatible_step_paths(&old, mission), BTreeSet::new())
         } else {
-            analyze_plan_revision(&old, plan, &actor, &current.requester, &variables)?
+            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
         };
         if !protected_approved && matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
             return Err(St3Error::new(
                 "revision-needs-drained-cutover",
-                "the current plan revision requires a drained cutover",
+                "the current mission revision requires a drained cutover",
             ));
         }
         if !reviewers.is_empty() && !protected_approved {
@@ -1931,7 +1974,7 @@ impl Store {
         }
 
         let mut new_steps = Vec::new();
-        flatten_steps(plan, None, &mut new_steps);
+        flatten_steps(mission, None, &mut new_steps);
 
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -1960,7 +2003,7 @@ impl Store {
             .execute(
                 "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?7)",
-                params![generation_id, run_id, plan.revision, predecessor_id, actor, reason, now.to_string()],
+                params![generation_id, run_id, mission.revision, predecessor_id, actor, reason, now.to_string()],
             )
             .map_err(internal)?;
         for (step, selector) in new_steps {
@@ -1973,7 +2016,7 @@ impl Store {
             step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
             step_variables.insert(
                 "ST_PARENT_STEP_RUN".into(),
-                crate::plan::parent_step_path(plan, &step.path)
+                crate::mission::parent_step_path(mission, &step.path)
                     .map(|path| format!("step-run/{generation_id}/{path}"))
                     .or_else(|| current.parent_step_run.clone())
                     .unwrap_or_default(),
@@ -1987,7 +2030,7 @@ impl Store {
             let title = step
                 .title
                 .as_deref()
-                .map(|value| crate::plan::interpolate(value, &step_variables))
+                .map(|value| crate::mission::interpolate(value, &step_variables))
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
             let status = carried
@@ -2029,7 +2072,13 @@ impl Store {
                 .map_err(internal)?;
             }
         }
-        cancel_descendant_plan_runs_tx(&transaction, &self.origin, &predecessor_id, &actor, now)?;
+        cancel_descendant_mission_runs_tx(
+            &transaction,
+            &self.origin,
+            &predecessor_id,
+            &actor,
+            now,
+        )?;
         transaction
             .execute(
                 "UPDATE run_generations SET status='superseded', updated_at_unix_ms=?2 WHERE id=?1",
@@ -2038,7 +2087,7 @@ impl Store {
             .map_err(internal)?;
         transaction
             .execute(
-                "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+                "UPDATE mission_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
                 params![run_id, generation_id, now.to_string()],
             )
             .map_err(internal)?;
@@ -2061,7 +2110,7 @@ impl Store {
             Some(&actor),
             &json!({"fields": {
                 "run": current.subject,
-                "revision": plan.revision,
+                "revision": mission.revision,
                 "predecessor": predecessor_subject,
                 "status": "running",
                 "reason": reason,
@@ -2102,7 +2151,7 @@ impl Store {
             )
             .map_err(internal)?;
         }
-        let view = plan_run_view_tx(&transaction, run_id).map_err(internal)?;
+        let view = mission_run_view_tx(&transaction, run_id).map_err(internal)?;
         transaction
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2116,59 +2165,59 @@ impl Store {
         Ok(view)
     }
 
-    pub fn active_plan_runs(&self) -> Result<Vec<PlanRunView>> {
+    pub fn active_mission_runs(&self) -> Result<Vec<MissionRunView>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM plan_runs WHERE status IN ('running','standing','blocked') ORDER BY created_at_unix_ms",
+            "SELECT id FROM mission_runs WHERE status IN ('running','standing','blocked') ORDER BY created_at_unix_ms",
         )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
             .collect()
     }
 
-    pub fn active_plan_runs_for_plan(&self, plan: &str) -> Result<Vec<PlanRunView>> {
-        let plan = plan.strip_prefix("plan/").unwrap_or(plan);
+    pub fn active_mission_runs_for_mission(&self, mission: &str) -> Result<Vec<MissionRunView>> {
+        let mission = mission.strip_prefix("mission/").unwrap_or(mission);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM plan_runs
-             WHERE plan_id=?1 AND status IN ('running','standing','blocked')
+            "SELECT id FROM mission_runs
+             WHERE mission_id=?1 AND status IN ('running','standing','blocked')
              ORDER BY created_at_unix_ms, id",
         )?;
         let ids = statement
-            .query_map([plan], |row| row.get::<_, String>(0))?
+            .query_map([mission], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
             .collect()
     }
 
-    pub fn terminal_plan_runs(&self) -> Result<Vec<PlanRunView>> {
+    pub fn terminal_mission_runs(&self) -> Result<Vec<MissionRunView>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM plan_runs WHERE status IN ('completed','failed','cancelled') ORDER BY created_at_unix_ms",
+            "SELECT id FROM mission_runs WHERE status IN ('completed','failed','cancelled') ORDER BY created_at_unix_ms",
         )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
             .collect()
     }
 
-    pub fn plan_runs_for_root(&self, root: &str) -> Result<Vec<PlanRunView>> {
-        let root = root.strip_prefix("plan-run/").unwrap_or(root);
+    pub fn mission_runs_for_root(&self, root: &str) -> Result<Vec<MissionRunView>> {
+        let root = root.strip_prefix("mission-run/").unwrap_or(root);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM plan_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
+            "SELECT id FROM mission_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
         )?;
         let ids = statement
             .query_map([root], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
-            .map(|id| plan_run_view_tx(&connection, &id).map_err(Into::into))
+            .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
             .collect()
     }
 
@@ -2188,9 +2237,9 @@ impl Store {
                    SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1
                  ))
                )
-               AND generation_id=(SELECT current_generation_id FROM plan_runs WHERE id=step_runs.run_id)
+               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
                AND (
-                 (SELECT phase FROM plan_runs WHERE id=step_runs.run_id) != 'revision-draining'
+                 (SELECT phase FROM mission_runs WHERE id=step_runs.run_id) != 'revision-draining'
                  OR status IN ('claimed','working','verifying')
                )
                AND (?2 OR status NOT IN ('completed','failed','cancelled'))
@@ -2255,10 +2304,10 @@ impl Store {
             .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
         let current_generation: String = transaction
             .query_row(
-                "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                "SELECT current_generation_id FROM mission_runs WHERE id=?1",
                 [current
                     .run
-                    .strip_prefix("plan-run/")
+                    .strip_prefix("mission-run/")
                     .unwrap_or(&current.run)],
                 |row| row.get(0),
             )
@@ -2271,10 +2320,10 @@ impl Store {
         }
         let run_phase: String = transaction
             .query_row(
-                "SELECT phase FROM plan_runs WHERE id=?1",
+                "SELECT phase FROM mission_runs WHERE id=?1",
                 [current
                     .run
-                    .strip_prefix("plan-run/")
+                    .strip_prefix("mission-run/")
                     .unwrap_or(&current.run)],
                 |row| row.get(0),
             )
@@ -2446,9 +2495,9 @@ impl Store {
         let current: Option<(String, bool, u32)> = transaction
             .query_row(
                 "SELECT step_runs.status,
-                        step_runs.generation_id=plan_runs.current_generation_id,
+                        step_runs.generation_id=mission_runs.current_generation_id,
                         step_runs.readiness_epoch
-                 FROM step_runs JOIN plan_runs ON plan_runs.id=step_runs.run_id
+                 FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
                  WHERE step_runs.subject=?1",
                 [&subject],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2493,8 +2542,8 @@ impl Store {
         let current: Option<(String, u32, bool)> = transaction
             .query_row(
                 "SELECT step_runs.status, step_runs.attempt,
-                        step_runs.generation_id=plan_runs.current_generation_id
-                 FROM step_runs JOIN plan_runs ON plan_runs.id=step_runs.run_id
+                        step_runs.generation_id=mission_runs.current_generation_id
+                 FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
                  WHERE step_runs.subject=?1",
                 [&subject],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -2528,20 +2577,20 @@ impl Store {
         Ok(true)
     }
 
-    pub fn set_plan_run_state(
+    pub fn set_mission_run_state(
         &self,
         run: &str,
         status: &str,
         phase: &str,
         reason: Option<&str>,
     ) -> Result<bool> {
-        let run = run.strip_prefix("plan-run/").unwrap_or(run);
-        let subject = format!("plan-run/{run}");
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let subject = format!("mission-run/{run}");
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         let current: Option<(String, String)> = transaction
             .query_row(
-                "SELECT status, phase FROM plan_runs WHERE id=?1",
+                "SELECT status, phase FROM mission_runs WHERE id=?1",
                 [run],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2563,12 +2612,12 @@ impl Store {
         }
         let now = now_ms();
         transaction.execute(
-            "UPDATE plan_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
+            "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
             params![run, status, phase, now.to_string()],
         )?;
         transaction.execute(
             "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3
-             WHERE id=(SELECT current_generation_id FROM plan_runs WHERE id=?1)",
+             WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
             params![run, status, now.to_string()],
         )?;
         let body = json!({"fields": {"status": status, "phase": phase, "reason": reason}});
@@ -2576,14 +2625,14 @@ impl Store {
             &transaction,
             &self.origin,
             &subject,
-            "plan-run.state",
+            "mission-run.state",
             None,
             &body,
             &[],
             None,
         )?;
         let generation: String = transaction.query_row(
-            "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+            "SELECT current_generation_id FROM mission_runs WHERE id=?1",
             [run],
             |row| row.get(0),
         )?;
@@ -2610,30 +2659,30 @@ impl Store {
             kdl: String::new(),
             source_name: Some("st3 reconciler".into()),
         };
-        let plan = self.plan(intent, source)?;
-        if !plan.blockers.is_empty() {
+        let mission = self.mission(intent, source)?;
+        if !mission.blockers.is_empty() {
             return Err(St3Error::new(
-                "internal-plan-blocked",
-                plan.blockers.join("; "),
+                "internal-mission-blocked",
+                mission.blockers.join("; "),
             ));
         }
-        self.apply(intent, &plan.subject_tokens, key)
+        self.apply(intent, &mission.subject_tokens, key)
     }
 
-    pub fn plan(
+    pub fn mission(
         &self,
         intent: &NormalizedIntent,
         resolved_intent: IntentInput,
-    ) -> Result<PlanResponse, St3Error> {
-        self.plan_at(intent, resolved_intent, None)
+    ) -> Result<MissionResponse, St3Error> {
+        self.mission_at(intent, resolved_intent, None)
     }
 
-    pub fn plan_at(
+    pub fn mission_at(
         &self,
         intent: &NormalizedIntent,
         resolved_intent: IntentInput,
         at_index: Option<u64>,
-    ) -> Result<PlanResponse, St3Error> {
+    ) -> Result<MissionResponse, St3Error> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let current_index = current_index(&connection).map_err(internal)?;
         let store_index = selected_index(current_index, at_index)?;
@@ -2772,10 +2821,10 @@ impl Store {
                 }
             }
         }
-        for plan in intent.plans.values() {
-            let mut selectors = plan.work_selector.iter().cloned().collect::<Vec<_>>();
+        for mission in intent.missions.values() {
+            let mut selectors = mission.work_selector.iter().cloned().collect::<Vec<_>>();
             selectors.extend(
-                flatten_plan_step_specs(plan)
+                flatten_mission_step_specs(mission)
                     .into_iter()
                     .filter_map(|step| step.work_selector.clone()),
             );
@@ -2786,10 +2835,10 @@ impl Store {
                     WorkSelector::Agentless => &[],
                 };
                 for agent in agents {
-                    if !plan.revision_owners.contains(agent) && !known(agent)? {
+                    if !mission.revision_owners.contains(agent) && !known(agent)? {
                         warnings.push(format!(
-                            "plan `{}` references missing eligible agent `{agent}`",
-                            plan.subject
+                            "mission `{}` references missing eligible agent `{agent}`",
+                            mission.subject
                         ));
                     }
                 }
@@ -2865,12 +2914,12 @@ impl Store {
                 });
             }
         }
-        for plan in intent.plans.values() {
-            let subject = plan.subject.clone();
+        for mission in intent.missions.values() {
+            let subject = mission.subject.clone();
             let current: Option<(String, String)> = connection
                 .query_row(
-                    "SELECT revision, claim_id FROM plan_definitions WHERE plan_id=?1",
-                    [&plan.id],
+                    "SELECT revision, claim_id FROM mission_definitions WHERE mission_id=?1",
+                    [&mission.id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -2884,7 +2933,7 @@ impl Store {
             );
             if current
                 .as_ref()
-                .is_some_and(|(revision, _)| revision == &plan.revision)
+                .is_some_and(|(revision, _)| revision == &mission.revision)
             {
                 continue;
             }
@@ -2897,16 +2946,16 @@ impl Store {
                 }
                 .into(),
                 old_revision: current.map(|(revision, _)| revision),
-                new_revision: plan.revision.clone(),
+                new_revision: mission.revision.clone(),
             });
             actions.push(PlannedAction {
                 subject,
-                action: "publish-plan".into(),
-                reason: "the immutable plan revision is not published".into(),
+                action: "publish-mission".into(),
+                reason: "the immutable mission revision is not published".into(),
             });
         }
-        for declaration in intent.plan_runs.values() {
-            plan_plan_run_declaration(
+        for declaration in intent.mission_runs.values() {
+            prepare_mission_run_declaration(
                 &connection,
                 declaration,
                 store_index,
@@ -2917,7 +2966,7 @@ impl Store {
             )?;
         }
         for declaration in intent.planning_sessions.values() {
-            plan_planning_session_declaration(
+            prepare_planning_session_declaration(
                 &connection,
                 declaration,
                 store_index,
@@ -2970,7 +3019,7 @@ impl Store {
         warnings.sort();
         warnings.dedup();
 
-        Ok(PlanResponse {
+        Ok(MissionResponse {
             store_index,
             source_hash: intent.source_hash.clone(),
             normalized: intent.normalized.clone(),
@@ -2980,10 +3029,10 @@ impl Store {
             blockers,
             warnings,
             subject_tokens: tokens,
-            plan_revisions: intent
-                .plans
+            mission_revisions: intent
+                .missions
                 .values()
-                .map(|plan| (plan.subject.clone(), plan.revision.clone()))
+                .map(|mission| (mission.subject.clone(), mission.revision.clone()))
                 .collect(),
         })
     }
@@ -3038,30 +3087,31 @@ impl Store {
                 .with_detail("current_heads", json!(actual)));
             }
         }
-        for plan in intent.plans.values() {
-            let actual = plan_definition_token_tx(&transaction, &plan.id).map_err(internal)?;
-            let expected = expected.get(&plan.subject).ok_or_else(|| {
+        for mission in intent.missions.values() {
+            let actual =
+                mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?;
+            let expected = expected.get(&mission.subject).ok_or_else(|| {
                 St3Error::new(
                     "missing-subject-token",
-                    format!("apply omitted the subject token for `{}`", plan.subject),
+                    format!("apply omitted the subject token for `{}`", mission.subject),
                 )
-                .with_detail("subject", plan.subject.clone())
+                .with_detail("subject", mission.subject.clone())
                 .with_detail("current_heads", json!(actual.clone()))
             })?;
             if actual != *expected {
                 return Err(St3Error::new(
                     "stale-subject",
                     format!(
-                        "the published plan for `{}` changed after planning",
-                        plan.subject
+                        "the published mission for `{}` changed after planning",
+                        mission.subject
                     ),
                 )
-                .with_detail("subject", plan.subject.clone())
+                .with_detail("subject", mission.subject.clone())
                 .with_detail("expected_heads", json!(expected))
                 .with_detail("current_heads", json!(actual)));
             }
         }
-        for declaration in intent.plan_runs.values() {
+        for declaration in intent.mission_runs.values() {
             let actual = latest_claim_id_tx(&transaction, &declaration.subject)
                 .map_err(internal)?
                 .into_iter()
@@ -3078,7 +3128,10 @@ impl Store {
             if actual != *expected {
                 return Err(St3Error::new(
                     "stale-subject",
-                    format!("plan run `{}` changed after planning", declaration.subject),
+                    format!(
+                        "mission run `{}` changed after planning",
+                        declaration.subject
+                    ),
                 ));
             }
         }
@@ -3115,26 +3168,28 @@ impl Store {
                 })
                 .unwrap_or(true)
         });
-        let plans_changed = intent.plans.values().any(|plan| {
+        let missions_changed = intent.missions.values().any(|mission| {
             transaction
                 .query_row(
-                    "SELECT revision FROM plan_definitions WHERE plan_id=?1",
-                    [&plan.id],
+                    "SELECT revision FROM mission_definitions WHERE mission_id=?1",
+                    [&mission.id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
-                .map(|current| current.as_deref() != Some(plan.revision.as_str()))
+                .map(|current| current.as_deref() != Some(mission.revision.as_str()))
                 .unwrap_or(true)
         });
         let mut operations_changed = false;
-        for declaration in intent.plan_runs.values() {
+        for declaration in intent.mission_runs.values() {
             let run_id = declaration
                 .subject
-                .strip_prefix("plan-run/")
+                .strip_prefix("mission-run/")
                 .unwrap_or(&declaration.subject);
             if declaration.creation.is_some()
                 && transaction
-                    .query_row("SELECT 1 FROM plan_runs WHERE id=?1", [run_id], |_| Ok(()))
+                    .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [run_id], |_| {
+                        Ok(())
+                    })
                     .optional()
                     .map_err(internal)?
                     .is_none()
@@ -3213,7 +3268,7 @@ impl Store {
                 refresh,
             )?;
         }
-        let changed = desired_changed || plans_changed || operations_changed;
+        let changed = desired_changed || missions_changed || operations_changed;
         if !changed {
             let store_index = current_index_tx(&transaction).map_err(internal)?;
             let mut subject_tokens = intent
@@ -3225,13 +3280,13 @@ impl Store {
                         .map_err(internal)
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;
-            for plan in intent.plans.values() {
+            for mission in intent.missions.values() {
                 subject_tokens.insert(
-                    plan.subject.clone(),
-                    plan_definition_token_tx(&transaction, &plan.id).map_err(internal)?,
+                    mission.subject.clone(),
+                    mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?,
                 );
             }
-            for declaration in intent.plan_runs.values() {
+            for declaration in intent.mission_runs.values() {
                 subject_tokens.insert(
                     declaration.subject.clone(),
                     latest_claim_id_tx(&transaction, &declaration.subject)
@@ -3346,29 +3401,29 @@ impl Store {
             tokens.insert(subject.clone(), vec![claim_id]);
             reconcile_subjects.push(subject.clone());
         }
-        for plan in intent.plans.values() {
+        for mission in intent.missions.values() {
             let current: Option<String> = transaction
                 .query_row(
-                    "SELECT revision FROM plan_definitions WHERE plan_id=?1",
-                    [&plan.id],
+                    "SELECT revision FROM mission_definitions WHERE mission_id=?1",
+                    [&mission.id],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(internal)?;
-            if current.as_deref() == Some(plan.revision.as_str()) {
+            if current.as_deref() == Some(mission.revision.as_str()) {
                 tokens.insert(
-                    plan.subject.clone(),
-                    plan_definition_token_tx(&transaction, &plan.id).map_err(internal)?,
+                    mission.subject.clone(),
+                    mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?,
                 );
                 continue;
             }
             let predecessors =
-                plan_definition_token_tx(&transaction, &plan.id).map_err(internal)?;
-            let body = serde_json::to_value(plan).map_err(internal)?;
+                mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?;
+            let body = serde_json::to_value(mission).map_err(internal)?;
             let claim_id = claim_hash(
                 &batch_id,
-                &plan.subject,
-                "plan.published",
+                &mission.subject,
+                "mission.published",
                 &self.origin,
                 None,
                 &body,
@@ -3379,8 +3434,8 @@ impl Store {
                 &transaction,
                 &claim_id,
                 &batch_id,
-                &plan.subject,
-                "plan.published",
+                &mission.subject,
+                "mission.published",
                 &self.origin,
                 None,
                 &body,
@@ -3390,36 +3445,36 @@ impl Store {
             .map_err(internal)?;
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO plan_revisions(plan_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![plan.id, plan.revision, plan_state_name(&plan.state), serde_json::to_string(plan).map_err(internal)?, claim_id, store_index],
+                    "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(mission).map_err(internal)?, claim_id, store_index],
                 )
                 .map_err(internal)?;
             transaction
                 .execute(
-                    "INSERT INTO plan_definitions(plan_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(plan_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
-                    params![plan.id, plan.revision, plan_state_name(&plan.state), claim_id],
+                    "INSERT INTO mission_definitions(mission_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
+                    params![mission.id, mission.revision, mission_state_name(&mission.state), claim_id],
                 )
                 .map_err(internal)?;
             insert_event(
                 &transaction,
                 store_index,
-                "plan.published",
-                &plan.subject,
+                "mission.published",
+                &mission.subject,
                 &body,
             )
             .map_err(internal)?;
             claim_ids.push(claim_id.clone());
-            tokens.insert(plan.subject.clone(), vec![claim_id]);
+            tokens.insert(mission.subject.clone(), vec![claim_id]);
         }
-        for declaration in intent.plan_runs.values() {
+        for declaration in intent.mission_runs.values() {
             let created =
-                create_declared_plan_run_tx(&transaction, &self.origin, declaration, &batch_id)?;
+                create_declared_mission_run_tx(&transaction, &self.origin, declaration, &batch_id)?;
             if !created.is_empty() {
                 operation_receipts.push(PlannedAction {
                     subject: declaration.subject.clone(),
-                    action: "start-plan-run".into(),
-                    reason: "the named plan run was created".into(),
+                    action: "start-mission-run".into(),
+                    reason: "the named mission run was created".into(),
                 });
             }
             claim_ids.extend(created);
@@ -3433,7 +3488,7 @@ impl Store {
                 )? {
                     continue;
                 }
-                let (ids, proposed) = adopt_declared_plan_revision_tx(
+                let (ids, proposed) = adopt_declared_mission_revision_tx(
                     &transaction,
                     &self.origin,
                     declaration,
@@ -3467,7 +3522,7 @@ impl Store {
                     reason: revision.reason.clone(),
                 });
                 if !proposed && let Some(cancellation) = &revision.cancellation {
-                    let ids = cancel_plan_run_tx(
+                    let ids = cancel_mission_run_tx(
                         &transaction,
                         &self.origin,
                         &declaration.subject,
@@ -3492,7 +3547,7 @@ impl Store {
                 let runtime = runtime_subject_for_run(
                     declaration
                         .subject
-                        .strip_prefix("plan-run/")
+                        .strip_prefix("mission-run/")
                         .unwrap_or(&declaration.subject),
                     &reset.runtime,
                 );
@@ -3533,7 +3588,7 @@ impl Store {
                 )? {
                     continue;
                 }
-                let ids = cancel_plan_run_tx(
+                let ids = cancel_mission_run_tx(
                     &transaction,
                     &self.origin,
                     &declaration.subject,
@@ -4104,17 +4159,17 @@ impl Store {
     }
 
     pub fn retire_eval_owned_desired(&self, run: &str) -> Result<Vec<String>> {
-        let run = if run.starts_with("plan-run/") {
+        let run = if run.starts_with("mission-run/") {
             run.to_owned()
         } else {
-            format!("plan-run/{run}")
+            format!("mission-run/{run}")
         };
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         let mode: Option<String> = transaction
             .query_row(
-                "SELECT mode FROM plan_runs WHERE id=?1",
-                [run.strip_prefix("plan-run/").unwrap_or(&run)],
+                "SELECT mode FROM mission_runs WHERE id=?1",
+                [run.strip_prefix("mission-run/").unwrap_or(&run)],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4135,17 +4190,19 @@ impl Store {
     }
 
     pub fn eval_runtime_records(&self, run: &str) -> Result<Vec<(String, bool)>> {
-        let run = if run.starts_with("plan-run/") {
+        let run = if run.starts_with("mission-run/") {
             run.to_owned()
         } else {
-            format!("plan-run/{run}")
+            format!("mission-run/{run}")
         };
-        let run_id = run.strip_prefix("plan-run/").unwrap_or(&run);
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mode: Option<String> = connection
-            .query_row("SELECT mode FROM plan_runs WHERE id=?1", [run_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT mode FROM mission_runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
             .optional()?;
         anyhow::ensure!(
             mode.as_deref() == Some("eval"),
@@ -4169,7 +4226,7 @@ impl Store {
             }
         }
 
-        let mut gate_prefixes = vec![format!("gate-operation/plan-run.{run_id}/")];
+        let mut gate_prefixes = vec![format!("gate-operation/mission-run.{run_id}/")];
         {
             let mut statement = connection.prepare(
                 "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
@@ -5108,8 +5165,8 @@ impl Store {
                         }
                     } else if effective && claim.kind == "doc.bound" {
                         select_replicated_document(&transaction, claim, index)?;
-                    } else if effective && claim.kind == "plan.published" {
-                        select_replicated_plan(&transaction, claim, index)?;
+                    } else if effective && claim.kind == "mission.published" {
+                        select_replicated_mission(&transaction, claim, index)?;
                     }
                 }
             }
@@ -5122,7 +5179,7 @@ impl Store {
                 .map_err(internal)?;
         }
         rebuild_operations_tx(&transaction).map_err(internal)?;
-        project_replicated_plan_runs(&transaction)?;
+        project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);
@@ -5149,9 +5206,9 @@ impl Store {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_plan_run_declaration(
+fn prepare_mission_run_declaration(
     connection: &Connection,
-    declaration: &PlanRunDeclaration,
+    declaration: &MissionRunDeclaration,
     store_index: u64,
     tokens: &mut BTreeMap<String, Vec<String>>,
     actions: &mut Vec<PlannedAction>,
@@ -5160,7 +5217,7 @@ fn plan_plan_run_declaration(
 ) -> Result<(), St3Error> {
     let run_id = declaration
         .subject
-        .strip_prefix("plan-run/")
+        .strip_prefix("mission-run/")
         .unwrap_or(&declaration.subject);
     tokens.insert(
         declaration.subject.clone(),
@@ -5173,9 +5230,9 @@ fn plan_plan_run_declaration(
     );
     let current = connection
         .query_row(
-            "SELECT plan_id, initial_revision, workspace, requester, status, current_generation_id,
+            "SELECT mission_id, initial_revision, workspace, requester, status, current_generation_id,
                     inputs, mode
-             FROM plan_runs WHERE id=?1",
+             FROM mission_runs WHERE id=?1",
             [run_id],
             |row| {
                 Ok((
@@ -5193,14 +5250,14 @@ fn plan_plan_run_declaration(
         .optional()
         .map_err(internal)?;
     if let Some(creation) = &declaration.creation {
-        if let Some((plan, revision, workspace, requester, _, _, inputs, mode)) = &current {
-            let stored_inputs =
-                serde_json::from_str::<BTreeMap<String, PlanRunInput>>(inputs).map_err(internal)?;
+        if let Some((mission, revision, workspace, requester, _, _, inputs, mode)) = &current {
+            let stored_inputs = serde_json::from_str::<BTreeMap<String, MissionRunInput>>(inputs)
+                .map_err(internal)?;
             let stored_values = stored_inputs
                 .into_iter()
                 .map(|(name, input)| (name, input.value))
                 .collect::<BTreeMap<_, _>>();
-            if plan != &creation.plan
+            if mission != &creation.mission
                 || revision != &creation.revision
                 || workspace != &creation.workspace
                 || requester != &creation.requester
@@ -5208,50 +5265,54 @@ fn plan_plan_run_declaration(
                 || mode != &creation.mode
             {
                 blockers.push(format!(
-                    "plan run `{}` already exists with different creation fields",
+                    "mission run `{}` already exists with different creation fields",
                     declaration.subject
                 ));
             }
         } else {
-            let plan = connection
+            let mission = connection
                 .query_row(
-                    "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-                    params![creation.plan, creation.revision],
+                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                    params![creation.mission, creation.revision],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
                 .map_err(internal)?
-                .map(|body| serde_json::from_str::<PlanSpec>(&body))
+                .map(|body| serde_json::from_str::<MissionSpec>(&body))
                 .transpose()
                 .map_err(internal)?;
-            match plan {
+            match mission {
                 None => blockers.push(format!(
-                    "plan `plan/{}@{}` does not exist",
-                    creation.plan, creation.revision
+                    "mission `mission/{}@{}` does not exist",
+                    creation.mission, creation.revision
                 )),
-                Some(plan) if plan.state != PlanState::Ready => blockers.push(format!(
-                    "plan `plan/{}` revision `{}` is not ready",
-                    creation.plan, creation.revision
+                Some(mission) if mission.state != MissionState::Ready => blockers.push(format!(
+                    "mission `mission/{}` revision `{}` is not ready",
+                    creation.mission, creation.revision
                 )),
-                Some(plan) => {
-                    if let Err(error) = resolve_plan_run_inputs(connection, &plan, &creation.inputs)
+                Some(mission) => {
+                    if let Err(error) =
+                        resolve_mission_run_inputs(connection, &mission, &creation.inputs)
                     {
                         blockers.push(error.message);
                     }
-                    if let Err(error) = enforce_plan_run_capacity(connection, &plan) {
+                    if let Err(error) = enforce_mission_run_capacity(connection, &mission) {
                         blockers.push(error.message);
                     }
                     actions.push(PlannedAction {
                         subject: declaration.subject.clone(),
-                        action: "start-plan-run".into(),
-                        reason: "the named plan run does not exist".into(),
+                        action: "start-mission-run".into(),
+                        reason: "the named mission run does not exist".into(),
                     });
                 }
             }
         }
     }
     if current.is_none() && declaration.creation.is_none() {
-        blockers.push(format!("plan run `{}` does not exist", declaration.subject));
+        blockers.push(format!(
+            "mission run `{}` does not exist",
+            declaration.subject
+        ));
         return Ok(());
     }
     let status = current.as_ref().map(|value| value.4.as_str());
@@ -5271,8 +5332,8 @@ fn plan_plan_run_declaration(
         }
         let exists = connection
             .query_row(
-                "SELECT 1 FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-                params![revision.plan, revision.revision],
+                "SELECT 1 FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                params![revision.mission, revision.revision],
                 |_| Ok(()),
             )
             .optional()
@@ -5280,8 +5341,8 @@ fn plan_plan_run_declaration(
             .is_some();
         if !exists {
             blockers.push(format!(
-                "revision `{}` names missing plan `plan/{}@{}`",
-                revision.id, revision.plan, revision.revision
+                "revision `{}` names missing mission `mission/{}@{}`",
+                revision.id, revision.mission, revision.revision
             ));
         }
         match publication_operation_is_new(
@@ -5344,7 +5405,7 @@ fn plan_plan_run_declaration(
             continue;
         } else if matches!(status, Some("completed" | "failed" | "cancelled")) {
             warnings.push(format!(
-                "plan run `{}` is already {}",
+                "mission run `{}` is already {}",
                 declaration.subject,
                 status.unwrap_or_default()
             ));
@@ -5360,7 +5421,7 @@ fn plan_plan_run_declaration(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_planning_session_declaration(
+fn prepare_planning_session_declaration(
     connection: &Connection,
     declaration: &PlanningSessionDeclaration,
     store_index: u64,
@@ -5383,7 +5444,7 @@ fn plan_planning_session_declaration(
     );
     let current = connection
         .query_row(
-            "SELECT plan_id, request_ref, workspace, requester, planner, status,
+            "SELECT mission_id, request_ref, workspace, requester, planner, status,
                     target_run_id, source_generation_id
              FROM planning_sessions WHERE id=?1",
             [id],
@@ -5403,10 +5464,10 @@ fn plan_planning_session_declaration(
         .optional()
         .map_err(internal)?;
     if let Some(creation) = &declaration.creation {
-        if let Some((plan, request, workspace, requester, planner, _, target, generation)) =
+        if let Some((mission, request, workspace, requester, planner, _, target, generation)) =
             &current
         {
-            if plan != &creation.plan
+            if mission != &creation.mission
                 || request != &creation.request
                 || workspace != &creation.workspace
                 || requester != &creation.requester
@@ -5415,7 +5476,7 @@ fn plan_planning_session_declaration(
                     != creation
                         .target_run
                         .as_deref()
-                        .map(|value| value.strip_prefix("plan-run/").unwrap_or(value))
+                        .map(|value| value.strip_prefix("mission-run/").unwrap_or(value))
                 || generation.as_deref()
                     != creation
                         .target_generation
@@ -5431,13 +5492,13 @@ fn plan_planning_session_declaration(
             if let (Some(run), Some(generation)) =
                 (&creation.target_run, &creation.target_generation)
             {
-                let run_id = run.strip_prefix("plan-run/").unwrap_or(run);
+                let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
                 let expected_generation = generation
                     .strip_prefix("run-generation/")
                     .unwrap_or(generation);
                 let actual = connection
                     .query_row(
-                        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+                        "SELECT current_generation_id FROM mission_runs WHERE id=?1",
                         [run_id],
                         |row| row.get::<_, String>(0),
                     )
@@ -5511,10 +5572,10 @@ fn runtime_subject_for_run(run_id: &str, runtime: &str) -> String {
     }
 }
 
-fn create_declared_plan_run_tx(
+fn create_declared_mission_run_tx(
     transaction: &Transaction<'_>,
     origin: &str,
-    declaration: &PlanRunDeclaration,
+    declaration: &MissionRunDeclaration,
     batch_id: &str,
 ) -> Result<Vec<String>, St3Error> {
     let Some(creation) = &declaration.creation else {
@@ -5522,20 +5583,22 @@ fn create_declared_plan_run_tx(
     };
     let run_id = declaration
         .subject
-        .strip_prefix("plan-run/")
+        .strip_prefix("mission-run/")
         .unwrap_or(&declaration.subject);
     let exists = transaction
-        .query_row("SELECT 1 FROM plan_runs WHERE id=?1", [run_id], |_| Ok(()))
+        .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [run_id], |_| {
+            Ok(())
+        })
         .optional()
         .map_err(internal)?
         .is_some();
     if exists {
         return Ok(Vec::new());
     }
-    let plan: PlanSpec = transaction
+    let mission: MissionSpec = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![creation.plan, creation.revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![creation.mission, creation.revision],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -5545,31 +5608,31 @@ fn create_declared_plan_run_tx(
         .map_err(internal)?
         .ok_or_else(|| {
             St3Error::new(
-                "missing-plan",
+                "missing-mission",
                 format!(
-                    "plan `plan/{}@{}` does not exist",
-                    creation.plan, creation.revision
+                    "mission `mission/{}@{}` does not exist",
+                    creation.mission, creation.revision
                 ),
             )
         })?;
-    if plan.state != PlanState::Ready {
+    if mission.state != MissionState::Ready {
         return Err(St3Error::new(
-            "plan-not-ready",
-            format!("plan `plan/{}` is not ready", creation.plan),
+            "mission-not-ready",
+            format!("mission `mission/{}` is not ready", creation.mission),
         ));
     }
-    let inputs = resolve_plan_run_inputs(transaction, &plan, &creation.inputs)?;
-    enforce_plan_run_capacity(transaction, &plan)?;
+    let inputs = resolve_mission_run_inputs(transaction, &mission, &creation.inputs)?;
+    enforce_mission_run_capacity(transaction, &mission)?;
     let generation_id = Uuid::now_v7().simple().to_string();
     let generation_subject = format!("run-generation/{generation_id}");
-    let root_plan_run = declaration.subject.clone();
+    let root_mission_run = declaration.subject.clone();
     let mut variables = BTreeMap::from([
-        ("ST_PLAN".into(), plan.id.clone()),
-        ("ST_PLAN_REVISION".into(), plan.revision.clone()),
-        ("ST_PLAN_RUN".into(), run_id.to_owned()),
+        ("ST_MISSION".into(), mission.id.clone()),
+        ("ST_MISSION_REVISION".into(), mission.revision.clone()),
+        ("ST_MISSION_RUN".into(), run_id.to_owned()),
         ("ST_RUN_GENERATION".into(), generation_id.clone()),
         ("ST_REQUESTER".into(), creation.requester.clone()),
-        ("ST_ROOT_PLAN_RUN".into(), root_plan_run.clone()),
+        ("ST_ROOT_MISSION_RUN".into(), root_mission_run.clone()),
         ("ST_WORKSPACE".into(), creation.workspace.clone()),
         ("ST_PARENT_STEP_RUN".into(), String::new()),
     ]);
@@ -5579,12 +5642,12 @@ fn create_declared_plan_run_tx(
     let now = now_ms();
     transaction
         .execute(
-            "INSERT INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+            "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?3, ?1, NULL, ?5, ?6, ?7, ?8, 'running', 'normal', ?9, ?9)",
             params![
                 run_id,
-                plan.id,
-                plan.revision,
+                mission.id,
+                mission.revision,
                 generation_id,
                 creation.workspace,
                 creation.requester,
@@ -5597,18 +5660,18 @@ fn create_declared_plan_run_tx(
     transaction
         .execute(
             "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
+             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial mission run', ?5, ?5)",
             params![
                 generation_id,
                 run_id,
-                plan.revision,
+                mission.revision,
                 creation.requester,
                 now.to_string()
             ],
         )
         .map_err(internal)?;
     let mut flat = Vec::new();
-    flatten_steps(&plan, None, &mut flat);
+    flatten_steps(&mission, None, &mut flat);
     for (step, selector) in flat {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let step_subject = format!("step-run/{generation_id}/{}", step.path);
@@ -5619,14 +5682,14 @@ fn create_declared_plan_run_tx(
         step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
         step_variables.insert(
             "ST_PARENT_STEP_RUN".into(),
-            crate::plan::parent_step_path(&plan, &step.path)
+            crate::mission::parent_step_path(&mission, &step.path)
                 .map(|path| format!("step-run/{generation_id}/{path}"))
                 .unwrap_or_default(),
         );
         let title = step
             .title
             .as_deref()
-            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
@@ -5652,12 +5715,12 @@ fn create_declared_plan_run_tx(
     let body = json!({
         "fields": {
             "status": "running",
-            "plan": plan.subject,
-            "revision": plan.revision,
-            "initial_revision": plan.revision,
+            "mission": mission.subject,
+            "revision": mission.revision,
+            "initial_revision": mission.revision,
             "current_generation": generation_subject,
-            "root_revision": plan.revision,
-            "root_plan_run": root_plan_run,
+            "root_revision": mission.revision,
+            "root_mission_run": root_mission_run,
             "parent_step_run": Value::Null,
             "default_selector": Value::Null,
             "workspace": creation.workspace,
@@ -5670,7 +5733,7 @@ fn create_declared_plan_run_tx(
         transaction,
         origin,
         &declaration.subject,
-        "plan-run.created",
+        "mission-run.created",
         Some(&creation.requester),
         &body,
         &[],
@@ -5685,9 +5748,9 @@ fn create_declared_plan_run_tx(
         Some(&creation.requester),
         &json!({"fields": {
             "run": declaration.subject,
-            "revision": plan.revision,
+            "revision": mission.revision,
             "status": "running",
-            "reason": "initial plan run"
+            "reason": "initial mission run"
         }}),
         &[],
         Some(batch_id),
@@ -5696,26 +5759,26 @@ fn create_declared_plan_run_tx(
     Ok(vec![run_claim.id, generation_claim.id])
 }
 
-fn adopt_declared_plan_revision_tx(
+fn adopt_declared_mission_revision_tx(
     transaction: &Transaction<'_>,
     origin: &str,
-    declaration: &PlanRunDeclaration,
-    operation: &PlanRevisionOperation,
+    declaration: &MissionRunDeclaration,
+    operation: &MissionRevisionOperation,
     batch_id: &str,
     actor: Option<&str>,
 ) -> Result<(Vec<String>, bool), St3Error> {
     let actor = actor.ok_or_else(|| {
         St3Error::new(
             "missing-publication-actor",
-            "a plan-run revision needs `--as` or ST_AGENT",
+            "a mission-run revision needs `--as` or ST_AGENT",
         )
     })?;
     let actor = normalize_actor_for_publication(actor);
     let run_id = declaration
         .subject
-        .strip_prefix("plan-run/")
+        .strip_prefix("mission-run/")
         .unwrap_or(&declaration.subject);
-    let current = plan_run_view_tx(transaction, run_id).map_err(internal)?;
+    let current = mission_run_view_tx(transaction, run_id).map_err(internal)?;
     if generation_id_from_subject(&current.generation)
         != generation_id_from_subject(&operation.from_generation)
     {
@@ -5728,43 +5791,46 @@ fn adopt_declared_plan_revision_tx(
         || current.phase != "normal"
     {
         return Err(St3Error::new(
-            "plan-run-not-revisable",
+            "mission-run-not-revisable",
             format!(
-                "plan run `{}` is {} in its {} phase",
+                "mission run `{}` is {} in its {} phase",
                 declaration.subject, current.status, current.phase
             ),
         ));
     }
-    let current_plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
-    if operation.plan != current_plan_id {
+    let current_mission_id = current
+        .mission
+        .strip_prefix("mission/")
+        .unwrap_or(&current.mission);
+    if operation.mission != current_mission_id {
         return Err(St3Error::new(
-            "wrong-plan-revision",
+            "wrong-mission-revision",
             format!(
-                "revision `{}` targets plan `{}` instead of `{current_plan_id}`",
-                operation.id, operation.plan
+                "revision `{}` targets mission `{}` instead of `{current_mission_id}`",
+                operation.id, operation.mission
             ),
         ));
     }
-    let old: PlanSpec = transaction
+    let old: MissionSpec = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![current_plan_id, current.revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![current_mission_id, current.revision],
             |row| row.get::<_, String>(0),
         )
         .map_err(internal)
         .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
-    let next: PlanSpec = transaction
+    let next: MissionSpec = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![operation.plan, operation.revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![operation.mission, operation.revision],
             |row| row.get::<_, String>(0),
         )
         .map_err(internal)
         .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
-    if next.state != PlanState::Ready {
+    if next.state != MissionState::Ready {
         return Err(St3Error::new(
-            "plan-revision-not-ready",
-            "a running plan can adopt only a ready revision",
+            "mission-revision-not-ready",
+            "a running mission can adopt only a ready revision",
         ));
     }
     if old.inputs != next.inputs {
@@ -5773,9 +5839,9 @@ fn adopt_declared_plan_revision_tx(
             "a run revision cannot change its input declarations",
         ));
     }
-    let variables = plan_run_variables(&current, &next.revision);
+    let variables = mission_run_variables(&current, &next.revision);
     let (compatible, reviewers) =
-        analyze_plan_revision(&old, &next, &actor, &current.requester, &variables)?;
+        analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
     if !reviewers.is_empty() || matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
         if operation.cancellation.is_some() {
             return Err(St3Error::new(
@@ -5795,7 +5861,7 @@ fn adopt_declared_plan_revision_tx(
         {
             return Err(St3Error::new(
                 "revision-proposal-already-pending",
-                "the plan run already has one pending revision proposal",
+                "the mission run already has one pending revision proposal",
             ));
         }
         let proposal_id = hex::encode(Sha256::digest(format!(
@@ -5843,7 +5909,7 @@ fn adopt_declared_plan_revision_tx(
         if status == "draining" {
             transaction
                 .execute(
-                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
                     params![run_id, now.to_string()],
                 )
                 .map_err(internal)?;
@@ -5905,7 +5971,7 @@ fn adopt_declared_plan_revision_tx(
         step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
         step_variables.insert(
             "ST_PARENT_STEP_RUN".into(),
-            crate::plan::parent_step_path(&next, &step.path)
+            crate::mission::parent_step_path(&next, &step.path)
                 .map(|path| format!("step-run/{generation_id}/{path}"))
                 .or_else(|| current.parent_step_run.clone())
                 .unwrap_or_default(),
@@ -5913,7 +5979,7 @@ fn adopt_declared_plan_revision_tx(
         let title = step
             .title
             .as_deref()
-            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         let status = carried
@@ -5955,7 +6021,7 @@ fn adopt_declared_plan_revision_tx(
             claim_ids.push(claim.id);
         }
     }
-    cancel_descendant_plan_runs_tx(transaction, origin, &predecessor_id, &actor, now)?;
+    cancel_descendant_mission_runs_tx(transaction, origin, &predecessor_id, &actor, now)?;
     transaction
         .execute(
             "UPDATE run_generations SET status='superseded', updated_at_unix_ms=?2 WHERE id=?1",
@@ -5964,7 +6030,7 @@ fn adopt_declared_plan_revision_tx(
         .map_err(internal)?;
     transaction
         .execute(
-            "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+            "UPDATE mission_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
             params![run_id, generation_id, now.to_string()],
         )
         .map_err(internal)?;
@@ -6009,17 +6075,17 @@ fn adopt_declared_plan_revision_tx(
 fn reset_declared_runtime_tx(
     transaction: &Transaction<'_>,
     origin: &str,
-    declaration: &PlanRunDeclaration,
+    declaration: &MissionRunDeclaration,
     operation: &RuntimeResetOperation,
     runtime: &str,
     batch_id: &str,
 ) -> Result<ClaimRecord, St3Error> {
     let current_generation = transaction
         .query_row(
-            "SELECT current_generation_id FROM plan_runs WHERE id=?1",
+            "SELECT current_generation_id FROM mission_runs WHERE id=?1",
             [declaration
                 .subject
-                .strip_prefix("plan-run/")
+                .strip_prefix("mission-run/")
                 .unwrap_or(&declaration.subject)],
             |row| row.get::<_, String>(0),
         )
@@ -6174,16 +6240,16 @@ fn apply_planning_session_declaration_tx(
         let planner = crate::graph::planning_planner_subject(&declaration.subject);
         transaction
             .execute(
-                "INSERT INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
                 params![
                     id,
-                    creation.plan,
+                    creation.mission,
                     creation.request,
                     creation.workspace,
                     creation.requester,
                     planner,
-                    creation.target_run.as_deref().map(|value| value.strip_prefix("plan-run/").unwrap_or(value)),
+                    creation.target_run.as_deref().map(|value| value.strip_prefix("mission-run/").unwrap_or(value)),
                     creation.target_generation.as_deref().map(|value| value.strip_prefix("run-generation/").unwrap_or(value)),
                     now_ms().to_string(),
                 ],
@@ -6191,8 +6257,8 @@ fn apply_planning_session_declaration_tx(
             .map_err(internal)?;
         let mut fields = serde_json::Map::from_iter([
             (
-                "plan".into(),
-                Value::String(format!("plan/{}", creation.plan)),
+                "mission".into(),
+                Value::String(format!("mission/{}", creation.mission)),
             ),
             ("request".into(), Value::String(creation.request.clone())),
             ("planner".into(), Value::String(planner.clone())),
@@ -6428,36 +6494,36 @@ struct DesiredRow {
     owner_run: Option<String>,
 }
 
-fn resolve_plan_run_inputs(
+fn resolve_mission_run_inputs(
     transaction: &Connection,
-    plan: &PlanSpec,
+    mission: &MissionSpec,
     supplied: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, PlanRunInput>, St3Error> {
-    let declared = plan.inputs.keys().cloned().collect::<BTreeSet<_>>();
+) -> Result<BTreeMap<String, MissionRunInput>, St3Error> {
+    let declared = mission.inputs.keys().cloned().collect::<BTreeSet<_>>();
     let provided = supplied.keys().cloned().collect::<BTreeSet<_>>();
     if declared != provided {
         let missing = declared.difference(&provided).cloned().collect::<Vec<_>>();
         let extra = provided.difference(&declared).cloned().collect::<Vec<_>>();
         return Err(St3Error::new(
-            "invalid-plan-inputs",
+            "invalid-mission-inputs",
             format!(
-                "the plan inputs do not match; missing [{}]; extra [{}]",
+                "the mission inputs do not match; missing [{}]; extra [{}]",
                 missing.join(", "),
                 extra.join(", ")
             ),
         ));
     }
     let mut resolved = BTreeMap::new();
-    for (name, declaration) in &plan.inputs {
+    for (name, declaration) in &mission.inputs {
         let value = supplied.get(name).expect("the exact input set was checked");
         let input = match declaration.kind {
-            PlanInputKind::Text => PlanRunInput {
-                kind: PlanInputKind::Text,
+            MissionInputKind::Text => MissionRunInput {
+                kind: MissionInputKind::Text,
                 value: value.clone(),
                 subject: None,
                 claim_id: None,
             },
-            PlanInputKind::Resource => {
+            MissionInputKind::Resource => {
                 let (subject, requested_claim) = value
                     .rsplit_once('@')
                     .map_or((value.as_str(), None), |(subject, claim)| {
@@ -6466,7 +6532,7 @@ fn resolve_plan_run_inputs(
                 if !subject.starts_with("resource/") {
                     return Err(St3Error::new(
                         "invalid-resource-input",
-                        format!("plan input `{name}` needs a resource subject"),
+                        format!("mission input `{name}` needs a resource subject"),
                     ));
                 }
                 let claim_id = if let Some(claim_id) = requested_claim {
@@ -6482,7 +6548,7 @@ fn resolve_plan_run_inputs(
                     if !exists {
                         return Err(St3Error::new(
                             "missing-resource-input-version",
-                            format!("plan input `{name}` references an unavailable claim"),
+                            format!("mission input `{name}` references an unavailable claim"),
                         ));
                     }
                     claim_id.to_owned()
@@ -6499,13 +6565,13 @@ fn resolve_plan_run_inputs(
                             St3Error::new(
                                 "missing-resource-input",
                                 format!(
-                                    "plan input `{name}` references a resource without an observation"
+                                    "mission input `{name}` references a resource without an observation"
                                 ),
                             )
                         })?
                 };
-                PlanRunInput {
-                    kind: PlanInputKind::Resource,
+                MissionRunInput {
+                    kind: MissionInputKind::Resource,
                     value: format!("{subject}@{claim_id}"),
                     subject: Some(subject.to_owned()),
                     claim_id: Some(claim_id),
@@ -6517,18 +6583,18 @@ fn resolve_plan_run_inputs(
     Ok(resolved)
 }
 
-fn enforce_plan_run_capacity(
+fn enforce_mission_run_capacity(
     transaction: &Connection,
-    requested: &PlanSpec,
+    requested: &MissionSpec,
 ) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(
-            "SELECT plan_runs.id, run_generations.revision
-             FROM plan_runs JOIN run_generations
-               ON run_generations.id=plan_runs.current_generation_id
-             WHERE plan_runs.plan_id=?1
-               AND plan_runs.status IN ('running','standing','blocked')
-             ORDER BY plan_runs.created_at_unix_ms, plan_runs.id",
+            "SELECT mission_runs.id, run_generations.revision
+             FROM mission_runs JOIN run_generations
+               ON run_generations.id=mission_runs.current_generation_id
+             WHERE mission_runs.mission_id=?1
+               AND mission_runs.status IN ('running','standing','blocked')
+             ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
         )
         .map_err(internal)?;
     let active = statement
@@ -6542,12 +6608,12 @@ fn enforce_plan_run_capacity(
     for (_, revision) in &active {
         let body = transaction
             .query_row(
-                "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
+                "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
                 params![requested.id, revision],
                 |row| row.get::<_, String>(0),
             )
             .map_err(internal)?;
-        let revision = serde_json::from_str::<PlanSpec>(&body).map_err(internal)?;
+        let revision = serde_json::from_str::<MissionSpec>(&body).map_err(internal)?;
         limit = match (limit, revision.max_active_runs) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(value), None) | (None, Some(value)) => Some(value),
@@ -6556,13 +6622,13 @@ fn enforce_plan_run_capacity(
     }
     if limit.is_some_and(|limit| active.len() >= limit as usize) {
         return Err(St3Error::new(
-            "plan-run-capacity",
+            "mission-run-capacity",
             format!(
-                "plan `{}` reached its active run limit; active runs: {}",
+                "mission `{}` reached its active run limit; active runs: {}",
                 requested.id,
                 active
                     .iter()
-                    .map(|(id, _)| format!("plan-run/{id}"))
+                    .map(|(id, _)| format!("mission-run/{id}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -7206,20 +7272,20 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
         let accepted = claim.accepted_at_unix_ms.to_string();
         match claim.kind.as_str() {
             "planning-session.started" => {
-                let plan = text("plan")
-                    .context("planning-session.started has no plan")?
-                    .strip_prefix("plan/")
-                    .unwrap_or_else(|| text("plan").expect("the plan was checked"));
+                let mission = text("mission")
+                    .context("planning-session.started has no mission")?
+                    .strip_prefix("mission/")
+                    .unwrap_or_else(|| text("mission").expect("the mission was checked"));
                 let target_run = text("target_run")
-                    .map(|value| value.strip_prefix("plan-run/").unwrap_or(value));
+                    .map(|value| value.strip_prefix("mission-run/").unwrap_or(value));
                 let target_generation = text("target_generation")
                     .map(|value| value.strip_prefix("run-generation/").unwrap_or(value));
                 transaction.execute(
-                    "INSERT INTO planning_sessions(id, plan_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                    "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', ?7, ?8, ?9, ?9)",
                     params![
                         id,
-                        plan,
+                        mission,
                         text("request").context("planning-session.started has no request")?,
                         text("workspace").context("planning-session.started has no workspace")?,
                         text("requester").or(claim.actor.as_deref()).context("planning-session.started has no requester")?,
@@ -7238,7 +7304,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                     .and_then(Value::as_u64)
                     .context("a planning candidate has no revision")?;
                 transaction.execute(
-                    "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, plan_revision, submitted_at_unix_ms)
+                    "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, mission_revision, submitted_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         id,
@@ -7246,7 +7312,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                         revision,
                         text("markdown").context("a planning candidate has no Markdown")?,
                         text("kdl").context("a planning candidate has no KDL")?,
-                        text("plan_revision").context("a planning candidate has no plan revision")?,
+                        text("mission_revision").context("a planning candidate has no mission revision")?,
                         accepted,
                     ],
                 )?;
@@ -7265,15 +7331,15 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                     .get("candidate_revision")
                     .and_then(Value::as_u64)
                     .context("a planning preview has no candidate revision")?;
-                let plan = fields
-                    .get("plan")
-                    .context("a planning preview has no plan response")?;
+                let mission = fields
+                    .get("mission")
+                    .context("a planning preview has no mission response")?;
                 transaction.execute(
-                    "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms)
+                    "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                      ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
                        store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
-                       plan_response=excluded.plan_response, created_at_unix_ms=excluded.created_at_unix_ms",
+                       mission_response=excluded.mission_response, created_at_unix_ms=excluded.created_at_unix_ms",
                     params![
                         id,
                         variant,
@@ -7282,7 +7348,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
                         fields.get("store_index").and_then(Value::as_u64).context("a planning preview has no store index")?,
                         text("graph").context("a planning preview has no graph")?,
                         text("diff").context("a planning preview has no diff")?,
-                        serde_json::to_string(plan)?,
+                        serde_json::to_string(mission)?,
                         accepted,
                     ],
                 )?;
@@ -7297,7 +7363,7 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
             "planning-session.approved" => {
                 transaction.execute(
                     "UPDATE planning_sessions SET status='approved', published_revision=?2, updated_at_unix_ms=?3 WHERE id=?1",
-                    params![id, text("plan_revision"), accepted],
+                    params![id, text("mission_revision"), accepted],
                 )?;
             }
             "planning-session.cancelled" => {
@@ -7347,7 +7413,7 @@ fn register_operation_tx(transaction: &Transaction<'_>, claim: &ClaimRecord) -> 
 fn known_replicated_claim_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "intent.desired" | "doc.bound" | "plan.published" | "plan.produced"
+        "intent.desired" | "doc.bound" | "mission.published" | "mission.produced"
     ) || registered_client_claim_kind(kind)
 }
 
@@ -7538,11 +7604,11 @@ fn schema_fields_for_body(kind: &str, body: &Value) -> Result<BTreeMap<String, V
             ("desired".into(), desired.desired),
         ]));
     }
-    if kind == "plan.published" {
-        let plan: PlanSpec = serde_json::from_value(body.clone())?;
+    if kind == "mission.published" {
+        let mission: MissionSpec = serde_json::from_value(body.clone())?;
         return Ok(BTreeMap::from([
-            ("revision".into(), Value::String(plan.revision.clone())),
-            ("state".into(), serde_json::to_value(&plan.state)?),
+            ("revision".into(), Value::String(mission.revision.clone())),
+            ("state".into(), serde_json::to_value(&mission.state)?),
             ("body".into(), body.clone()),
         ]));
     }
@@ -7768,11 +7834,14 @@ fn intent_leaves_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Vec<
         .collect())
 }
 
-fn plan_definition_token_tx(transaction: &Transaction<'_>, plan_id: &str) -> Result<Vec<String>> {
+fn mission_definition_token_tx(
+    transaction: &Transaction<'_>,
+    mission_id: &str,
+) -> Result<Vec<String>> {
     Ok(transaction
         .query_row(
-            "SELECT claim_id FROM plan_definitions WHERE plan_id=?1",
-            [plan_id],
+            "SELECT claim_id FROM mission_definitions WHERE mission_id=?1",
+            [mission_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?
@@ -8086,12 +8155,12 @@ fn select_replicated_desired(
     Ok(())
 }
 
-fn project_replicated_plan_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
              FROM claims
-             WHERE kind IN ('plan-run.created','plan-run.state','run-generation.created','run-generation.state','run-generation.superseded',
+             WHERE kind IN ('mission-run.created','mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                             'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                             'step-run.carried','step-run.state','step-run.retried',
                             'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')
@@ -8107,58 +8176,63 @@ fn project_replicated_plan_runs(transaction: &Transaction<'_>) -> Result<(), St3
 
     for claim in claims
         .iter()
-        .filter(|claim| claim.kind == "plan-run.created")
+        .filter(|claim| claim.kind == "mission-run.created")
     {
-        project_plan_run_created(transaction, claim)?;
+        project_mission_run_created(transaction, claim)?;
     }
     for claim in claims
         .iter()
-        .filter(|claim| claim.kind != "plan-run.created")
+        .filter(|claim| claim.kind != "mission-run.created")
     {
-        project_plan_run_update(transaction, claim)?;
+        project_mission_run_update(transaction, claim)?;
     }
     Ok(())
 }
 
-fn project_plan_run_created(
+fn project_mission_run_created(
     transaction: &Transaction<'_>,
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
-    let run_id = claim.subject.strip_prefix("plan-run/").ok_or_else(|| {
+    let run_id = claim.subject.strip_prefix("mission-run/").ok_or_else(|| {
         St3Error::new(
-            "invalid-plan-run-claim",
-            format!("claim `{}` has an invalid plan run subject", claim.id),
+            "invalid-mission-run-claim",
+            format!("claim `{}` has an invalid mission run subject", claim.id),
         )
     })?;
-    let plan_subject = fields.get("plan").and_then(Value::as_str).ok_or_else(|| {
-        St3Error::new(
-            "invalid-plan-run-claim",
-            format!("claim `{}` has no plan", claim.id),
-        )
-    })?;
-    let plan_id = plan_subject.strip_prefix("plan/").unwrap_or(plan_subject);
+    let mission_subject = fields
+        .get("mission")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            St3Error::new(
+                "invalid-mission-run-claim",
+                format!("claim `{}` has no mission", claim.id),
+            )
+        })?;
+    let mission_id = mission_subject
+        .strip_prefix("mission/")
+        .unwrap_or(mission_subject);
     let revision = fields
         .get("revision")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             St3Error::new(
-                "invalid-plan-run-claim",
-                format!("claim `{}` has no plan revision", claim.id),
+                "invalid-mission-run-claim",
+                format!("claim `{}` has no mission revision", claim.id),
             )
         })?;
-    let plan_body = transaction
+    let mission_body = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![plan_id, revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission_id, revision],
             |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(internal)?;
-    let Some(plan_body) = plan_body else {
+    let Some(mission_body) = mission_body else {
         return Ok(());
     };
-    let plan = serde_json::from_str::<PlanSpec>(&plan_body).map_err(internal)?;
+    let mission = serde_json::from_str::<MissionSpec>(&mission_body).map_err(internal)?;
     let workspace = fields
         .get("workspace")
         .and_then(Value::as_str)
@@ -8170,7 +8244,7 @@ fn project_plan_run_created(
     let inputs = fields
         .get("inputs")
         .cloned()
-        .map(serde_json::from_value::<BTreeMap<String, PlanRunInput>>)
+        .map(serde_json::from_value::<BTreeMap<String, MissionRunInput>>)
         .transpose()
         .map_err(internal)?
         .unwrap_or_default();
@@ -8179,13 +8253,13 @@ fn project_plan_run_created(
         .get("root_revision")
         .and_then(Value::as_str)
         .unwrap_or(revision);
-    let root_plan_run = fields
-        .get("root_plan_run")
+    let root_mission_run = fields
+        .get("root_mission_run")
         .and_then(Value::as_str)
         .unwrap_or(&claim.subject);
-    let root_run_id = root_plan_run
-        .strip_prefix("plan-run/")
-        .unwrap_or(root_plan_run);
+    let root_run_id = root_mission_run
+        .strip_prefix("mission-run/")
+        .unwrap_or(root_mission_run);
     let parent_step_run = fields.get("parent_step_run").and_then(Value::as_str);
     let default_selector = fields
         .get("default_selector")
@@ -8199,29 +8273,29 @@ fn project_plan_run_created(
         .and_then(Value::as_str)
         .ok_or_else(|| {
             St3Error::new(
-                "invalid-plan-run-claim",
+                "invalid-mission-run-claim",
                 format!("claim `{}` has no initial generation", claim.id),
             )
         })?;
     let generation_id = generation_id_from_subject(generation_subject);
     transaction
         .execute(
-            "INSERT OR IGNORE INTO plan_runs(id, plan_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
+            "INSERT OR IGNORE INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-            params![run_id, plan_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
+            params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
     transaction
         .execute(
             "INSERT OR IGNORE INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
-             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial plan run', ?5, ?5)",
+             VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial mission run', ?5, ?5)",
             params![generation_id, run_id, revision, requester, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
-    let view = plan_run_view_tx(transaction, run_id).map_err(internal)?;
-    let variables = plan_run_variables(&view, revision);
+    let view = mission_run_view_tx(transaction, run_id).map_err(internal)?;
+    let variables = mission_run_variables(&view, revision);
     let mut steps = Vec::new();
-    flatten_steps(&plan, default_selector, &mut steps);
+    flatten_steps(&mission, default_selector, &mut steps);
     for (step, selector) in steps {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let subject = format!("step-run/{generation_id}/{}", step.path);
@@ -8232,7 +8306,7 @@ fn project_plan_run_created(
         step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
         step_variables.insert(
             "ST_PARENT_STEP_RUN".into(),
-            crate::plan::parent_step_path(&plan, &step.path)
+            crate::mission::parent_step_path(&mission, &step.path)
                 .map(|path| format!("step-run/{generation_id}/{path}"))
                 .or_else(|| parent_step_run.map(str::to_owned))
                 .unwrap_or_default(),
@@ -8240,7 +8314,7 @@ fn project_plan_run_created(
         let title = step
             .title
             .as_deref()
-            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
@@ -8254,7 +8328,7 @@ fn project_plan_run_created(
     Ok(())
 }
 
-fn project_plan_run_update(
+fn project_mission_run_update(
     transaction: &Transaction<'_>,
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
@@ -8283,8 +8357,8 @@ fn project_plan_run_update(
             .map_err(internal)?;
         return Ok(());
     }
-    if claim.kind == "plan-run.state" {
-        let Some(run_id) = claim.subject.strip_prefix("plan-run/") else {
+    if claim.kind == "mission-run.state" {
+        let Some(run_id) = claim.subject.strip_prefix("mission-run/") else {
             return Ok(());
         };
         let Some(status) = fields.get("status").and_then(Value::as_str) else {
@@ -8296,7 +8370,7 @@ fn project_plan_run_update(
             .unwrap_or("normal");
         transaction
             .execute(
-                "UPDATE plan_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
+                "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
                 params![run_id, status, phase, claim.accepted_at_unix_ms.to_string()],
             )
             .map_err(internal)?;
@@ -8420,7 +8494,7 @@ fn project_revision_proposal(
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '[]', ?11, ?12, ?12)",
                 params![
                     proposal_id,
-                    run.strip_prefix("plan-run/").unwrap_or(run),
+                    run.strip_prefix("mission-run/").unwrap_or(run),
                     generation_id_from_subject(source),
                     revision,
                     actor,
@@ -8437,8 +8511,8 @@ fn project_revision_proposal(
         if status == "draining" {
             transaction
                 .execute(
-                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![run.strip_prefix("plan-run/").unwrap_or(run), now],
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run.strip_prefix("mission-run/").unwrap_or(run), now],
                 )
                 .map_err(internal)?;
         }
@@ -8490,7 +8564,7 @@ fn project_revision_proposal(
         if draining {
             transaction
                 .execute(
-                    "UPDATE plan_runs SET phase='revision-draining', updated_at_unix_ms=?2
+                    "UPDATE mission_runs SET phase='revision-draining', updated_at_unix_ms=?2
                      WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
                     params![proposal_id, now],
                 )
@@ -8519,7 +8593,7 @@ fn project_revision_proposal(
     if status == "cancelled" {
         transaction
             .execute(
-                "UPDATE plan_runs SET phase='normal', updated_at_unix_ms=?2
+                "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2
                  WHERE id=(SELECT run_id FROM revision_proposals WHERE id=?1)",
                 params![proposal_id, now],
             )
@@ -8551,7 +8625,9 @@ fn project_run_generation_created(
     let Some(run_subject) = fields.get("run").and_then(Value::as_str) else {
         return Ok(());
     };
-    let run_id = run_subject.strip_prefix("plan-run/").unwrap_or(run_subject);
+    let run_id = run_subject
+        .strip_prefix("mission-run/")
+        .unwrap_or(run_subject);
     let Some(revision) = fields.get("revision").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -8563,16 +8639,19 @@ fn project_run_generation_created(
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("replicated generation");
-    let current = match plan_run_view_tx(transaction, run_id) {
+    let current = match mission_run_view_tx(transaction, run_id) {
         Ok(current) => current,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
         Err(error) => return Err(internal(error)),
     };
-    let plan_id = current.plan.strip_prefix("plan/").unwrap_or(&current.plan);
+    let mission_id = current
+        .mission
+        .strip_prefix("mission/")
+        .unwrap_or(&current.mission);
     let body = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![plan_id, revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission_id, revision],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -8580,8 +8659,8 @@ fn project_run_generation_created(
     let Some(body) = body else {
         return Ok(());
     };
-    let plan = serde_json::from_str::<PlanSpec>(&body).map_err(internal)?;
-    let mut variables = plan_run_variables(&current, revision);
+    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(internal)?;
+    let mut variables = mission_run_variables(&current, revision);
     variables.insert("ST_RUN_GENERATION".into(), generation_id.to_owned());
     let compatible = fields
         .get("compatible_steps")
@@ -8598,7 +8677,7 @@ fn project_run_generation_created(
         )
         .map_err(internal)?;
     let mut new_steps = Vec::new();
-    flatten_steps(&plan, None, &mut new_steps);
+    flatten_steps(&mission, None, &mut new_steps);
     for (step, selector) in new_steps {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let subject = format!("step-run/{generation_id}/{}", step.path);
@@ -8621,7 +8700,7 @@ fn project_run_generation_created(
         step_variables.insert("ST_ASSIGNEE".into(), assignee.clone().unwrap_or_default());
         step_variables.insert(
             "ST_PARENT_STEP_RUN".into(),
-            crate::plan::parent_step_path(&plan, &step.path)
+            crate::mission::parent_step_path(&mission, &step.path)
                 .map(|path| format!("step-run/{generation_id}/{path}"))
                 .or_else(|| current.parent_step_run.clone())
                 .unwrap_or_default(),
@@ -8629,7 +8708,7 @@ fn project_run_generation_created(
         let title = step
             .title
             .as_deref()
-            .map(|value| crate::plan::interpolate(value, &step_variables))
+            .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
         transaction
@@ -8642,7 +8721,7 @@ fn project_run_generation_created(
     }
     transaction
         .execute(
-            "UPDATE plan_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
+            "UPDATE mission_runs SET current_generation_id=?2, status='running', phase='normal', updated_at_unix_ms=?3 WHERE id=?1",
             params![run_id, generation_id, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
@@ -8718,50 +8797,53 @@ fn select_replicated_document(
     Ok(())
 }
 
-fn select_replicated_plan(
+fn select_replicated_mission(
     transaction: &Transaction<'_>,
     claim: &ClaimRecord,
     created_index: u64,
 ) -> Result<(), St3Error> {
-    let plan = serde_json::from_value::<PlanSpec>(claim.body.clone()).map_err(|error| {
+    let mission = serde_json::from_value::<MissionSpec>(claim.body.clone()).map_err(|error| {
         St3Error::new(
-            "invalid-plan-claim",
-            format!("replicated plan claim `{}` is invalid: {error}", claim.id),
+            "invalid-mission-claim",
+            format!(
+                "replicated mission claim `{}` is invalid: {error}",
+                claim.id
+            ),
         )
     })?;
-    if claim.subject != plan.subject || claim.subject != format!("plan/{}", plan.id) {
+    if claim.subject != mission.subject || claim.subject != format!("mission/{}", mission.id) {
         return Err(St3Error::new(
-            "invalid-plan-claim",
+            "invalid-mission-claim",
             format!(
-                "replicated plan claim `{}` has mismatched identity",
+                "replicated mission claim `{}` has mismatched identity",
                 claim.id
             ),
         ));
     }
-    let mut unhashed = plan.clone();
+    let mut unhashed = mission.clone();
     let revision = std::mem::take(&mut unhashed.revision);
     let expected = hex::encode(Sha256::digest(
         serde_json::to_vec(&unhashed).map_err(internal)?,
     ));
     if revision != expected {
         return Err(St3Error::new(
-            "invalid-plan-claim",
+            "invalid-mission-claim",
             format!(
-                "replicated plan claim `{}` has an invalid revision",
+                "replicated mission claim `{}` has an invalid revision",
                 claim.id
             ),
         ));
     }
     transaction
         .execute(
-            "INSERT OR IGNORE INTO plan_revisions(plan_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![plan.id, plan.revision, plan_state_name(&plan.state), serde_json::to_string(&plan).map_err(internal)?, claim.id, created_index],
+            "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(&mission).map_err(internal)?, claim.id, created_index],
         )
         .map_err(internal)?;
     let current: Option<(String, String)> = transaction
         .query_row(
-            "SELECT revision, claim_id FROM plan_definitions WHERE plan_id=?1",
-            [&plan.id],
+            "SELECT revision, claim_id FROM mission_definitions WHERE mission_id=?1",
+            [&mission.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
@@ -8772,7 +8854,7 @@ fn select_replicated_plan(
         } else if claim_descends_from(transaction, &current_claim, &claim.id).map_err(internal)? {
             false
         } else {
-            (plan.revision.as_str(), claim.id.as_str())
+            (mission.revision.as_str(), claim.id.as_str())
                 > (current_revision.as_str(), current_claim.as_str())
         }
     } else {
@@ -8781,20 +8863,20 @@ fn select_replicated_plan(
     if select {
         transaction
             .execute(
-                "INSERT INTO plan_definitions(plan_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(plan_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
-                params![plan.id, plan.revision, plan_state_name(&plan.state), claim.id],
+                "INSERT INTO mission_definitions(mission_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
+                params![mission.id, mission.revision, mission_state_name(&mission.state), claim.id],
             )
             .map_err(internal)?;
     }
     Ok(())
 }
 
-fn plan_state_name(state: &PlanState) -> &'static str {
+fn mission_state_name(state: &MissionState) -> &'static str {
     match state {
-        PlanState::Draft => "draft",
-        PlanState::Ready => "ready",
-        PlanState::Retired => "retired",
+        MissionState::Draft => "draft",
+        MissionState::Ready => "ready",
+        MissionState::Retired => "retired",
     }
 }
 
@@ -8815,40 +8897,40 @@ fn normalize_step_run(value: &str) -> String {
 }
 
 fn flatten_steps<'a>(
-    plan: &'a PlanSpec,
+    mission: &'a MissionSpec,
     inherited_selector: Option<WorkSelector>,
     output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector)>,
 ) {
-    let plan_selector = plan
+    let mission_selector = mission
         .work_selector
         .clone()
         .or(inherited_selector)
         .unwrap_or(WorkSelector::Agentless);
-    for id in &plan.display_order {
-        let step = &plan.steps[id];
+    for id in &mission.display_order {
+        let step = &mission.steps[id];
         let selector = step
             .work_selector
             .clone()
-            .unwrap_or_else(|| plan_selector.clone());
+            .unwrap_or_else(|| mission_selector.clone());
         output.push((step, selector.clone()));
-        if let Some(nested) = &step.nested_plan {
+        if let Some(nested) = &step.nested_mission {
             flatten_steps(nested, Some(selector), output);
         }
     }
 }
 
-fn flatten_plan_step_specs(plan: &PlanSpec) -> Vec<&crate::model::StepSpec> {
-    fn append<'a>(plan: &'a PlanSpec, output: &mut Vec<&'a crate::model::StepSpec>) {
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
+fn flatten_mission_step_specs(mission: &MissionSpec) -> Vec<&crate::model::StepSpec> {
+    fn append<'a>(mission: &'a MissionSpec, output: &mut Vec<&'a crate::model::StepSpec>) {
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
             output.push(step);
-            if let Some(nested) = &step.nested_plan {
+            if let Some(nested) = &step.nested_mission {
                 append(nested, output);
             }
         }
     }
     let mut output = Vec::new();
-    append(plan, &mut output);
+    append(mission, &mut output);
     output
 }
 
@@ -8858,14 +8940,14 @@ fn interpolate_selector(
 ) -> Result<(Option<String>, Vec<String>, bool), St3Error> {
     match selector {
         WorkSelector::Assigned { agent } => Ok((
-            Some(crate::plan::interpolate(agent, variables)?),
+            Some(crate::mission::interpolate(agent, variables)?),
             Vec::new(),
             false,
         )),
         WorkSelector::Available { agents } => {
             let mut output = agents
                 .iter()
-                .map(|agent| crate::plan::interpolate(agent, variables))
+                .map(|agent| crate::mission::interpolate(agent, variables))
                 .collect::<Result<Vec<_>, _>>()?;
             output.sort();
             output.dedup();
@@ -8875,14 +8957,20 @@ fn interpolate_selector(
     }
 }
 
-pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<String, String> {
+pub(crate) fn mission_run_variables(
+    run: &MissionRunView,
+    revision: &str,
+) -> BTreeMap<String, String> {
     let mut variables = BTreeMap::from([
         (
-            "ST_PLAN".into(),
-            run.plan.strip_prefix("plan/").unwrap_or(&run.plan).into(),
+            "ST_MISSION".into(),
+            run.mission
+                .strip_prefix("mission/")
+                .unwrap_or(&run.mission)
+                .into(),
         ),
-        ("ST_PLAN_REVISION".into(), revision.into()),
-        ("ST_PLAN_RUN".into(), run.id.clone()),
+        ("ST_MISSION_REVISION".into(), revision.into()),
+        ("ST_MISSION_RUN".into(), run.id.clone()),
         (
             "ST_RUN_GENERATION".into(),
             generation_id_from_subject(&run.generation).into(),
@@ -8894,7 +8982,7 @@ pub(crate) fn plan_run_variables(run: &PlanRunView, revision: &str) -> BTreeMap<
             "ST_PARENT_STEP_RUN".into(),
             run.parent_step_run.clone().unwrap_or_default(),
         ),
-        ("ST_ROOT_PLAN_RUN".into(), run.root_plan_run.clone()),
+        ("ST_ROOT_MISSION_RUN".into(), run.root_mission_run.clone()),
     ]);
     variables.extend(
         run.inputs
@@ -8910,14 +8998,14 @@ fn interpolate_goals(
 ) -> Result<String, St3Error> {
     let goals = goals
         .iter()
-        .map(|goal| crate::plan::interpolate(goal, variables))
+        .map(|goal| crate::mission::interpolate(goal, variables))
         .collect::<Result<Vec<_>, _>>()?;
     serde_json::to_string(&goals).map_err(internal)
 }
 
-pub(crate) fn analyze_plan_revision(
-    old: &PlanSpec,
-    new: &PlanSpec,
+pub(crate) fn analyze_mission_revision(
+    old: &MissionSpec,
+    new: &MissionSpec,
     actor: &str,
     requester: &str,
     variables: &BTreeMap<String, String>,
@@ -8930,13 +9018,13 @@ pub(crate) fn analyze_plan_revision(
         .filter(|path| old_hashes.get(*path) != new_hashes.get(*path))
         .cloned()
         .collect::<BTreeSet<_>>();
-    if plan_header_hash(old)? != plan_header_hash(new)? {
+    if mission_header_hash(old)? != mission_header_hash(new)? {
         changed.insert(String::new());
     }
     if changed.is_empty() {
         return Err(St3Error::new(
-            "unchanged-plan-revision",
-            "the proposed plan revision does not change the plan",
+            "unchanged-mission-revision",
+            "the proposed mission revision does not change the mission",
         ));
     }
 
@@ -8987,39 +9075,40 @@ struct RevisionMetadata {
 }
 
 fn revision_metadata(
-    plan: &PlanSpec,
+    mission: &MissionSpec,
     requester: &str,
     variables: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, RevisionMetadata>, St3Error> {
     fn collect(
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         requester: &str,
         variables: &BTreeMap<String, String>,
         inherited: RevisionMetadata,
         output: &mut BTreeMap<String, RevisionMetadata>,
     ) -> Result<(), St3Error> {
-        let mut plan_meta = inherited;
-        for owner in &plan.revision_owners {
-            plan_meta
+        let mut mission_meta = inherited;
+        for owner in &mission.revision_owners {
+            mission_meta
                 .owners
-                .insert(crate::plan::interpolate(owner, variables)?);
+                .insert(crate::mission::interpolate(owner, variables)?);
         }
-        if plan.revisions_human_only {
-            plan_meta.reviewers.insert(
-                plan.revision_reviewer
+        if mission.revisions_human_only {
+            mission_meta.reviewers.insert(
+                mission
+                    .revision_reviewer
                     .as_deref()
                     .unwrap_or(requester)
                     .to_owned(),
             );
         }
-        output.insert(String::new(), plan_meta.clone());
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
-            let mut step_meta = plan_meta.clone();
+        output.insert(String::new(), mission_meta.clone());
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
+            let mut step_meta = mission_meta.clone();
             for owner in &step.revision_owners {
                 step_meta
                     .owners
-                    .insert(crate::plan::interpolate(owner, variables)?);
+                    .insert(crate::mission::interpolate(owner, variables)?);
             }
             if step.revisions_human_only {
                 step_meta.reviewers.insert(
@@ -9030,7 +9119,7 @@ fn revision_metadata(
                 );
             }
             output.insert(step.path.clone(), step_meta.clone());
-            if let Some(nested) = &step.nested_plan {
+            if let Some(nested) = &step.nested_mission {
                 let mut nested_meta = BTreeMap::new();
                 collect(nested, requester, variables, step_meta, &mut nested_meta)?;
                 for (path, meta) in nested_meta {
@@ -9044,7 +9133,7 @@ fn revision_metadata(
     }
     let mut output = BTreeMap::new();
     collect(
-        plan,
+        mission,
         requester,
         variables,
         RevisionMetadata::default(),
@@ -9066,12 +9155,12 @@ fn metadata_for_changed_path<'a>(
         })
         .max_by_key(|(candidate, _)| candidate.len())
         .map(|(_, meta)| meta)
-        .expect("the plan metadata is always present")
+        .expect("the mission metadata is always present")
 }
 
-fn step_hashes(plan: &PlanSpec) -> BTreeMap<String, String> {
+fn step_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
     let mut flat = Vec::new();
-    flatten_steps(plan, None, &mut flat);
+    flatten_steps(mission, None, &mut flat);
     flat.into_iter()
         .map(|(step, selector)| {
             let bytes = serde_json::to_vec(&(step.definition_hash.as_str(), selector))
@@ -9081,30 +9170,30 @@ fn step_hashes(plan: &PlanSpec) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn plan_header_hash(plan: &PlanSpec) -> Result<String, St3Error> {
+fn mission_header_hash(mission: &MissionSpec) -> Result<String, St3Error> {
     let value = json!({
-        "id": plan.id,
-        "state": plan.state,
-        "inputs": plan.inputs,
-        "max_active_runs": plan.max_active_runs,
-        "owners": plan.revision_owners,
-        "human_only": plan.revisions_human_only,
-        "reviewer": plan.revision_reviewer,
-        "cutover": plan.revision_cutover,
-        "declarations": plan.declarations_kdl,
-        "work_selector": plan.work_selector,
-        "completion": plan.completion,
-        "goals": plan.goals,
-        "baselines": plan.baselines,
-        "products": plan.products,
-        "gates": plan.gates,
+        "id": mission.id,
+        "state": mission.state,
+        "inputs": mission.inputs,
+        "max_active_runs": mission.max_active_runs,
+        "owners": mission.revision_owners,
+        "human_only": mission.revisions_human_only,
+        "reviewer": mission.revision_reviewer,
+        "cutover": mission.revision_cutover,
+        "declarations": mission.declarations_kdl,
+        "work_selector": mission.work_selector,
+        "completion": mission.completion,
+        "goals": mission.goals,
+        "baselines": mission.baselines,
+        "products": mission.products,
+        "gates": mission.gates,
     });
     serde_json::to_vec(&value)
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
         .map_err(internal)
 }
 
-fn compatible_step_paths(old: &PlanSpec, new: &PlanSpec) -> BTreeSet<String> {
+fn compatible_step_paths(old: &MissionSpec, new: &MissionSpec) -> BTreeSet<String> {
     let old_hashes = step_hashes(old);
     let new_hashes = step_hashes(new);
     let dependencies = flattened_dependencies(new);
@@ -9136,15 +9225,15 @@ fn compatible_step_paths(old: &PlanSpec, new: &PlanSpec) -> BTreeSet<String> {
         .collect()
 }
 
-fn flattened_dependencies(plan: &PlanSpec) -> BTreeMap<String, BTreeSet<String>> {
+fn flattened_dependencies(mission: &MissionSpec) -> BTreeMap<String, BTreeSet<String>> {
     fn collect(
-        plan: &PlanSpec,
+        mission: &MissionSpec,
         prefix: &str,
         parent: Option<&str>,
         output: &mut BTreeMap<String, BTreeSet<String>>,
     ) {
-        for id in &plan.display_order {
-            let step = &plan.steps[id];
+        for id in &mission.display_order {
+            let step = &mission.steps[id];
             let mut dependencies = BTreeSet::new();
             if let Some(parent) = parent {
                 dependencies.insert(parent.into());
@@ -9159,7 +9248,7 @@ fn flattened_dependencies(plan: &PlanSpec) -> BTreeMap<String, BTreeSet<String>>
                 }
             }
             output.insert(step.path.clone(), dependencies);
-            if let Some(nested) = &step.nested_plan {
+            if let Some(nested) = &step.nested_mission {
                 collect(
                     nested,
                     &format!("{}/{}", step.path, nested.id),
@@ -9170,7 +9259,7 @@ fn flattened_dependencies(plan: &PlanSpec) -> BTreeMap<String, BTreeSet<String>>
         }
     }
     let mut output = BTreeMap::new();
-    collect(plan, "", None, &mut output);
+    collect(mission, "", None, &mut output);
     output
 }
 
@@ -9187,7 +9276,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         .unwrap_or_default();
     Ok(StepRunView {
         subject,
-        run: format!("plan-run/{}", row.get::<_, String>(1)?),
+        run: format!("mission-run/{}", row.get::<_, String>(1)?),
         generation,
         step: row.get(2)?,
         definition_hash: row.get(3)?,
@@ -9217,7 +9306,7 @@ fn planning_session_view_tx(
 ) -> Result<Option<PlanningSessionView>> {
     let row = connection
         .query_row(
-            "SELECT plan_id, request_ref, workspace, requester, planner, status, published_revision,
+            "SELECT mission_id, request_ref, workspace, requester, planner, status, published_revision,
                     target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms
              FROM planning_sessions WHERE id=?1",
             [id],
@@ -9239,7 +9328,7 @@ fn planning_session_view_tx(
         )
         .optional()?;
     let Some((
-        plan,
+        mission,
         request_ref,
         workspace,
         requester,
@@ -9256,7 +9345,7 @@ fn planning_session_view_tx(
     };
     let mut candidate_statement = connection.prepare(
         "SELECT candidate.variant, candidate.revision, candidate.markdown_ref, candidate.kdl_ref,
-                candidate.plan_revision, candidate.submitted_at_unix_ms
+                candidate.mission_revision, candidate.submitted_at_unix_ms
          FROM planning_candidates candidate
          JOIN (
            SELECT variant, MAX(revision) revision FROM planning_candidates
@@ -9273,8 +9362,8 @@ fn planning_session_view_tx(
                 revision: row.get(1)?,
                 markdown: row.get(2)?,
                 kdl: row.get(3)?,
-                plan: format!("plan/{plan}"),
-                plan_revision: row.get(4)?,
+                mission: format!("mission/{mission}"),
+                mission_revision: row.get(4)?,
                 submitted_at_unix_ms: submitted.parse().unwrap_or(0),
             })
         })?
@@ -9283,7 +9372,7 @@ fn planning_session_view_tx(
     for candidate in candidates {
         let preview = connection
             .query_row(
-                "SELECT candidate_revision, hash, store_index, graph, diff, plan_response, created_at_unix_ms
+                "SELECT candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms
                  FROM planning_previews WHERE session_id=?1 AND variant=?2",
                 params![id, candidate.variant],
                 |row| {
@@ -9295,7 +9384,7 @@ fn planning_session_view_tx(
                         store_index: row.get(2)?,
                         graph: row.get(3)?,
                         diff: row.get(4)?,
-                        plan: serde_json::from_str(&row.get::<_, String>(5)?).unwrap(),
+                        mission: serde_json::from_str(&row.get::<_, String>(5)?).unwrap(),
                         created_at_unix_ms: created.parse().unwrap_or(0),
                     })
                 },
@@ -9316,13 +9405,13 @@ fn planning_session_view_tx(
     Ok(Some(PlanningSessionView {
         subject: format!("planning-session/{id}"),
         id: id.to_owned(),
-        plan,
+        mission,
         request: request_ref,
         workspace,
         requester,
         planner,
         status,
-        target_plan_run: target_run_id.map(|id| format!("plan-run/{id}")),
+        target_mission_run: target_run_id.map(|id| format!("mission-run/{id}")),
         source_generation: source_generation_id.map(|id| format!("run-generation/{id}")),
         candidate,
         preview,
@@ -9333,7 +9422,7 @@ fn planning_session_view_tx(
     }))
 }
 
-fn plan_output_authority(
+fn mission_output_authority(
     connection: &Connection,
     current: &StepRunView,
     actor: &str,
@@ -9369,7 +9458,7 @@ fn plan_output_authority(
             params![
                 current
                     .run
-                    .strip_prefix("plan-run/")
+                    .strip_prefix("mission-run/")
                     .unwrap_or(&current.run),
                 prefix
             ],
@@ -9393,19 +9482,19 @@ fn plan_output_authority(
     }))
 }
 
-fn descendant_plan_run_ids_tx(
+fn descendant_mission_run_ids_tx(
     connection: &Connection,
     generation_id: &str,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(
         "WITH RECURSIVE descendant_runs(id) AS (
            SELECT child.id
-           FROM plan_runs child
+           FROM mission_runs child
            JOIN step_runs parent_step ON parent_step.subject=child.parent_step_run
            WHERE parent_step.generation_id=?1
            UNION
            SELECT child.id
-           FROM plan_runs child
+           FROM mission_runs child
            JOIN step_runs parent_step ON parent_step.subject=child.parent_step_run
            JOIN descendant_runs parent_run ON parent_step.run_id=parent_run.id
          )
@@ -9416,7 +9505,7 @@ fn descendant_plan_run_ids_tx(
         .collect()
 }
 
-fn cancel_plan_run_tx(
+fn cancel_mission_run_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     run_subject: &str,
@@ -9424,11 +9513,13 @@ fn cancel_plan_run_tx(
     batch_id: &str,
     now: u128,
 ) -> Result<Vec<String>, St3Error> {
-    let run_id = run_subject.strip_prefix("plan-run/").unwrap_or(run_subject);
+    let run_id = run_subject
+        .strip_prefix("mission-run/")
+        .unwrap_or(run_subject);
     let current = transaction
         .query_row(
-            "SELECT status, phase, current_generation_id, plan_id
-             FROM plan_runs WHERE id=?1",
+            "SELECT status, phase, current_generation_id, mission_id
+             FROM mission_runs WHERE id=?1",
             [run_id],
             |row| {
                 Ok((
@@ -9443,21 +9534,22 @@ fn cancel_plan_run_tx(
         .map_err(internal)?
         .ok_or_else(|| {
             St3Error::new(
-                "missing-plan-run",
-                format!("plan run `plan-run/{run_id}` does not exist"),
+                "missing-mission-run",
+                format!("mission run `mission-run/{run_id}` does not exist"),
             )
         })?;
-    let (status, phase, generation_id, plan_id) = current;
+    let (status, phase, generation_id, mission_id) = current;
     if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
         return Ok(Vec::new());
     }
-    let descendants = descendant_plan_run_ids_tx(transaction, &generation_id).map_err(internal)?;
+    let descendants =
+        descendant_mission_run_ids_tx(transaction, &generation_id).map_err(internal)?;
     let mut claim_ids = Vec::new();
     for descendant in descendants.into_iter().rev() {
-        claim_ids.extend(cancel_plan_run_tx(
+        claim_ids.extend(cancel_mission_run_tx(
             transaction,
             origin,
-            &format!("plan-run/{descendant}"),
+            &format!("mission-run/{descendant}"),
             reason,
             batch_id,
             now,
@@ -9470,15 +9562,15 @@ fn cancel_plan_run_tx(
             |row| row.get(0),
         )
         .map_err(internal)?;
-    let plan: PlanSpec = transaction
+    let mission: MissionSpec = transaction
         .query_row(
-            "SELECT body FROM plan_revisions WHERE plan_id=?1 AND revision=?2",
-            params![plan_id, revision],
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission_id, revision],
             |row| row.get::<_, String>(0),
         )
         .map_err(internal)
         .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
-    let final_paths = flatten_plan_step_specs(&plan)
+    let final_paths = flatten_mission_step_specs(&mission)
         .into_iter()
         .filter(|step| step.finally)
         .map(|step| step.path.clone())
@@ -9512,16 +9604,16 @@ fn cancel_plan_run_tx(
             append_claim_tx(
                 transaction,
                 origin,
-                &format!("message/plan-cancelled-{}", &stable[..20]),
+                &format!("message/mission-cancelled-{}", &stable[..20]),
                 "message.sent",
                 None,
                 &json!({"fields": {
                     "from": "daemon/runtime",
                     "to": claimant,
-                    "title": "Plan work cancelled",
-                    "content": format!("Plan run plan-run/{run_id} cancelled step {subject}. Stop this work. Reason: {reason}"),
+                    "title": "Mission work cancelled",
+                    "content": format!("Mission run mission-run/{run_id} cancelled step {subject}. Stop this work. Reason: {reason}"),
                     "status": "sent",
-                    "tags": [format!("plan-run:plan-run/{run_id}"), format!("step-run:{subject}")],
+                    "tags": [format!("mission-run:mission-run/{run_id}"), format!("step-run:{subject}")],
                 }}),
                 &[],
                 Some(batch_id),
@@ -9558,7 +9650,7 @@ fn cancel_plan_run_tx(
     };
     transaction
         .execute(
-            "UPDATE plan_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
+            "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
             params![run_id, next_status, next_phase, now.to_string()],
         )
         .map_err(internal)?;
@@ -9575,7 +9667,7 @@ fn cancel_plan_run_tx(
         "previous_phase": phase,
     }});
     for (subject, kind) in [
-        (format!("plan-run/{run_id}"), "plan-run.state"),
+        (format!("mission-run/{run_id}"), "mission-run.state"),
         (
             format!("run-generation/{generation_id}"),
             "run-generation.state",
@@ -9597,7 +9689,7 @@ fn cancel_plan_run_tx(
     Ok(claim_ids)
 }
 
-fn cancel_descendant_plan_runs_tx(
+fn cancel_descendant_mission_runs_tx(
     transaction: &Transaction<'_>,
     origin: &str,
     generation_id: &str,
@@ -9605,10 +9697,10 @@ fn cancel_descendant_plan_runs_tx(
     now: u128,
 ) -> Result<(), St3Error> {
     let reason = "the parent run generation was superseded";
-    for run_id in descendant_plan_run_ids_tx(transaction, generation_id).map_err(internal)? {
+    for run_id in descendant_mission_run_ids_tx(transaction, generation_id).map_err(internal)? {
         let (status, child_generation): (String, String) = transaction
             .query_row(
-                "SELECT status, current_generation_id FROM plan_runs WHERE id=?1",
+                "SELECT status, current_generation_id FROM mission_runs WHERE id=?1",
                 [&run_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -9654,7 +9746,7 @@ fn cancel_descendant_plan_runs_tx(
         }
         transaction
             .execute(
-                "UPDATE plan_runs
+                "UPDATE mission_runs
                  SET status='cancelled', phase='terminal', updated_at_unix_ms=?2
                  WHERE id=?1",
                 params![run_id, now.to_string()],
@@ -9675,8 +9767,8 @@ fn cancel_descendant_plan_runs_tx(
         append_claim_tx(
             transaction,
             origin,
-            &format!("plan-run/{run_id}"),
-            "plan-run.state",
+            &format!("mission-run/{run_id}"),
+            "mission-run.state",
             Some(actor),
             &body,
             &[],
@@ -9698,17 +9790,17 @@ fn cancel_descendant_plan_runs_tx(
     Ok(())
 }
 
-fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<PlanRunView> {
+fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<MissionRunView> {
     let mut view = connection.query_row(
-        "SELECT plan_runs.id, plan_runs.plan_id, plan_runs.initial_revision,
-                plan_runs.current_generation_id, run_generations.revision,
-                plan_runs.root_revision, plan_runs.root_run_id, plan_runs.parent_step_run,
-                plan_runs.workspace, plan_runs.requester, plan_runs.inputs, plan_runs.mode,
-                plan_runs.status, plan_runs.phase, plan_runs.created_at_unix_ms,
-                plan_runs.updated_at_unix_ms
-         FROM plan_runs JOIN run_generations
-           ON run_generations.id=plan_runs.current_generation_id
-         WHERE plan_runs.id=?1",
+        "SELECT mission_runs.id, mission_runs.mission_id, mission_runs.initial_revision,
+                mission_runs.current_generation_id, run_generations.revision,
+                mission_runs.root_revision, mission_runs.root_run_id, mission_runs.parent_step_run,
+                mission_runs.workspace, mission_runs.requester, mission_runs.inputs, mission_runs.mode,
+                mission_runs.status, mission_runs.phase, mission_runs.created_at_unix_ms,
+                mission_runs.updated_at_unix_ms
+         FROM mission_runs JOIN run_generations
+           ON run_generations.id=mission_runs.current_generation_id
+         WHERE mission_runs.id=?1",
         [run_id],
         |row| {
             let id: String = row.get(0)?;
@@ -9716,15 +9808,15 @@ fn plan_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<P
             let root_run_id: String = row.get(6)?;
             let created: String = row.get(14)?;
             let updated: String = row.get(15)?;
-            Ok(PlanRunView {
-                subject: format!("plan-run/{id}"),
+            Ok(MissionRunView {
+                subject: format!("mission-run/{id}"),
                 id,
-                plan: format!("plan/{}", row.get::<_, String>(1)?),
+                mission: format!("mission/{}", row.get::<_, String>(1)?),
                 generation: format!("run-generation/{generation_id}"),
                 initial_revision: row.get(2)?,
                 revision: row.get(4)?,
                 root_revision: row.get(5)?,
-                root_plan_run: format!("plan-run/{root_run_id}"),
+                root_mission_run: format!("mission-run/{root_run_id}"),
                 parent_step_run: row.get(7)?,
                 workspace: row.get(8)?,
                 requester: row.get(9)?,
@@ -9770,7 +9862,7 @@ fn run_generation_view_tx(
             Ok(RunGenerationView {
                 subject: format!("run-generation/{id}"),
                 id,
-                run: format!("plan-run/{run_id}"),
+                run: format!("mission-run/{run_id}"),
                 revision: row.get(2)?,
                 predecessor: predecessor.map(|id| format!("run-generation/{id}")),
                 status: row.get(4)?,
@@ -9813,7 +9905,7 @@ fn revision_proposal_view_tx(
             Ok(RevisionProposalView {
                 subject: format!("revision-proposal/{id}"),
                 id,
-                run: format!("plan-run/{run_id}"),
+                run: format!("mission-run/{run_id}"),
                 source_generation: format!("run-generation/{source}"),
                 candidate_revision: row.get(3)?,
                 actor: row.get(4)?,
@@ -9852,8 +9944,8 @@ fn step_generation_is_current(
     step: &StepRunView,
 ) -> rusqlite::Result<bool> {
     let current: String = connection.query_row(
-        "SELECT current_generation_id FROM plan_runs WHERE id=?1",
-        [step.run.strip_prefix("plan-run/").unwrap_or(&step.run)],
+        "SELECT current_generation_id FROM mission_runs WHERE id=?1",
+        [step.run.strip_prefix("mission-run/").unwrap_or(&step.run)],
         |row| row.get(0),
     )?;
     Ok(generation_id_from_subject(&step.generation) == current)
@@ -9872,25 +9964,25 @@ mod tests {
         .expect("intent")
     }
 
-    fn publish_plan(store: &Store, source: &str, key: &str) -> PlanSpec {
-        let intent = crate::graph::parse_intent(source, "node").expect("plan intent");
+    fn publish_mission(store: &Store, source: &str, key: &str) -> MissionSpec {
+        let intent = crate::graph::parse_intent(source, "node").expect("mission intent");
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source.into(),
                     source_name: None,
                 },
             )
-            .expect("plan preview");
+            .expect("mission preview");
         store
             .apply(&intent, &planned.subject_tokens, key)
-            .expect("plan publish");
+            .expect("mission publish");
         intent
-            .plans
+            .missions
             .values()
             .next()
-            .expect("published plan")
+            .expect("published mission")
             .clone()
     }
 
@@ -9898,24 +9990,24 @@ mod tests {
     fn apply_is_subject_cas_and_idempotent() {
         let store = Store::open_memory("node").expect("store");
         let intent = simple("true");
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: "test".into(),
                     source_name: None,
                 },
             )
-            .expect("plan");
+            .expect("mission");
         let first = store
-            .apply(&intent, &plan.subject_tokens, "one")
+            .apply(&intent, &mission.subject_tokens, "one")
             .expect("apply");
         let repeated = store
-            .apply(&intent, &plan.subject_tokens, "one")
+            .apply(&intent, &mission.subject_tokens, "one")
             .expect("repeat");
         assert_eq!(first.batch_id, repeated.batch_id);
-        let unchanged_plan = store
-            .plan(
+        let unchanged_mission = store
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: "test".into(),
@@ -9924,7 +10016,7 @@ mod tests {
             )
             .unwrap();
         let unchanged = store
-            .apply(&intent, &unchanged_plan.subject_tokens, "unchanged")
+            .apply(&intent, &unchanged_mission.subject_tokens, "unchanged")
             .unwrap();
         assert!(!unchanged.changed);
         assert!(unchanged.batch_id.is_none());
@@ -9932,7 +10024,7 @@ mod tests {
 
         let changed = simple("false");
         let error = store
-            .apply(&changed, &plan.subject_tokens, "two")
+            .apply(&changed, &mission.subject_tokens, "two")
             .expect_err("stale token");
         assert_eq!(error.code, "stale-subject");
         assert_eq!(error.details["subject"], "exec/work");
@@ -9944,19 +10036,19 @@ mod tests {
     fn direct_publication_is_additive_atomic_and_operation_ids_are_immutable() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let plan = publish_plan(
+        let mission = publish_mission(
             &store,
-            "version 2\nplan \"lifecycle\" state=\"ready\" { goal \"Remain open.\" }",
+            "version 2\nmission \"lifecycle\" state=\"ready\" { goal \"Remain open.\" }",
             "publish-lifecycle",
         );
         let creation = format!(
-            "version 2\nplan-run \"lifecycle/demo\" {{\n  plan {:?}\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
-            format!("plan/lifecycle@{}", plan.revision),
+            "version 2\nmission-run \"lifecycle/demo\" {{\n  mission {:?}\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
+            format!("mission/lifecycle@{}", mission.revision),
             workspace.path().display().to_string(),
         );
         let intent = crate::graph::parse_intent(&creation, "node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: creation.clone(),
@@ -9977,11 +10069,11 @@ mod tests {
             created
                 .operations
                 .iter()
-                .any(|operation| operation.action == "start-plan-run")
+                .any(|operation| operation.action == "start-mission-run")
         );
 
         let replay_preview = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: creation,
@@ -10000,10 +10092,10 @@ mod tests {
         assert!(!replay.changed);
 
         let omitted_source =
-            "version 2\nplan \"unrelated\" state=\"ready\" { goal \"Do other work.\" }\n";
+            "version 2\nmission \"unrelated\" state=\"ready\" { goal \"Do other work.\" }\n";
         let omitted = crate::graph::parse_intent(omitted_source, "node").unwrap();
         let omitted_preview = store
-            .plan(
+            .mission(
                 &omitted,
                 IntentInput {
                     kdl: omitted_source.into(),
@@ -10020,10 +10112,10 @@ mod tests {
             )
             .unwrap();
         assert!(omission.changed);
-        assert!(store.plan_run("lifecycle/demo").unwrap().is_some());
+        assert!(store.mission_run("lifecycle/demo").unwrap().is_some());
 
         let atomic_failure = r#"version 2
-plan-run "lifecycle/demo" {
+mission-run "lifecycle/demo" {
   cancellation "stop" { reason "stop the run" }
 }
 resource "missing" {
@@ -10032,7 +10124,7 @@ resource "missing" {
 "#;
         let atomic_intent = crate::graph::parse_intent(atomic_failure, "node").unwrap();
         let atomic_preview = store
-            .plan(
+            .mission(
                 &atomic_intent,
                 IntentInput {
                     kdl: atomic_failure.into(),
@@ -10051,18 +10143,18 @@ resource "missing" {
             .unwrap_err();
         assert_eq!(error.code, "resource-not-observed");
         assert_eq!(
-            store.plan_run("lifecycle/demo").unwrap().unwrap().phase,
+            store.mission_run("lifecycle/demo").unwrap().unwrap().phase,
             "normal"
         );
 
         let cancellation = r#"version 2
-plan-run "lifecycle/demo" {
+mission-run "lifecycle/demo" {
   cancellation "stop" { reason "stop the run" }
 }
 "#;
         let cancel_intent = crate::graph::parse_intent(cancellation, "node").unwrap();
         let cancel_preview = store
-            .plan(
+            .mission(
                 &cancel_intent,
                 IntentInput {
                     kdl: cancellation.into(),
@@ -10080,7 +10172,7 @@ plan-run "lifecycle/demo" {
             .unwrap();
         assert!(cancelled.changed);
         let replay_preview = store
-            .plan(
+            .mission(
                 &cancel_intent,
                 IntentInput {
                     kdl: cancellation.into(),
@@ -10099,13 +10191,13 @@ plan-run "lifecycle/demo" {
         assert!(!replay.changed);
 
         let changed_id = r#"version 2
-plan-run "lifecycle/demo" {
+mission-run "lifecycle/demo" {
   cancellation "stop" { reason "a different reason" }
 }
 "#;
         let changed_intent = crate::graph::parse_intent(changed_id, "node").unwrap();
         let changed_preview = store
-            .plan(
+            .mission(
                 &changed_intent,
                 IntentInput {
                     kdl: changed_id.into(),
@@ -10127,7 +10219,7 @@ plan-run "lifecycle/demo" {
         let request = store
             .put_document(
                 "doc/planning/release/request",
-                b"Plan the release.",
+                b"Mission the release.",
                 &None,
                 "planning-request",
             )
@@ -10135,7 +10227,7 @@ plan-run "lifecycle/demo" {
         let source = format!(
             r#"version 2
 planning-session "planning/release/one" {{
-  plan "release"
+  mission "release"
   request "{}@{}"
   workspace "/work/release"
   requester "person/operator"
@@ -10146,7 +10238,7 @@ planning-session "planning/release/one" {{
         );
         let intent = crate::graph::parse_intent(&source, "node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source.clone(),
@@ -10180,7 +10272,7 @@ planning-session "planning/release/one" {{
         assert!(store.selected_desired_token(&planner).unwrap().is_some());
 
         let replay_preview = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source,
@@ -10203,10 +10295,10 @@ planning-session "planning/release/one" {{
     fn a_declared_human_revision_creates_and_approves_one_proposal() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let initial = publish_plan(
+        let initial = publish_mission(
             &store,
             r#"version 2
-plan "reviewed" state="ready" revisions="human-only" {
+mission "reviewed" state="ready" revisions="human-only" {
   goal "Use the initial definition."
   step "work" { agentless }
 }
@@ -10214,8 +10306,8 @@ plan "reviewed" state="ready" revisions="human-only" {
             "publish-reviewed-initial",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: initial.id.clone(),
+            .create_mission_run(&MissionRunRequest {
+                mission: initial.id.clone(),
                 revision: Some(initial.revision.clone()),
                 workspace: workspace.path().display().to_string(),
                 requester: Some("person/operator".into()),
@@ -10224,10 +10316,10 @@ plan "reviewed" state="ready" revisions="human-only" {
                 idempotency_key: "run-reviewed".into(),
             })
             .unwrap();
-        let candidate = publish_plan(
+        let candidate = publish_mission(
             &store,
             r#"version 2
-plan "reviewed" state="ready" revisions="human-only" {
+mission "reviewed" state="ready" revisions="human-only" {
   goal "Use the reviewed definition."
   step "work" { agentless }
 }
@@ -10235,14 +10327,14 @@ plan "reviewed" state="ready" revisions="human-only" {
             "publish-reviewed-candidate",
         );
         let revision = format!(
-            "version 2\nplan-run {:?} {{\n  revision \"review-one\" {{\n    plan {:?}\n    from {:?}\n    reason \"the definition needs review\"\n  }}\n}}\n",
+            "version 2\nmission-run {:?} {{\n  revision \"review-one\" {{\n    mission {:?}\n    from {:?}\n    reason \"the definition needs review\"\n  }}\n}}\n",
             run.subject,
-            format!("plan/{}@{}", candidate.id, candidate.revision),
+            format!("mission/{}@{}", candidate.id, candidate.revision),
             run.generation,
         );
         let intent = crate::graph::parse_intent(&revision, "node").unwrap();
         let preview = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: revision,
@@ -10277,16 +10369,16 @@ plan "reviewed" state="ready" revisions="human-only" {
             )
             .unwrap();
         assert_eq!(approved.status, "applied");
-        assert_eq!(approved.plan_run.revision, candidate.revision);
-        assert_ne!(approved.plan_run.generation, run.generation);
+        assert_eq!(approved.mission_run.revision, candidate.revision);
+        assert_ne!(approved.mission_run.generation, run.generation);
     }
 
     #[test]
-    fn a_plan_response_reports_the_server_normalized_revision() {
+    fn a_mission_response_reports_the_server_normalized_revision() {
         let source = r#"
 version 2
 
-  plan "portable" state="ready" {
+  mission "portable" state="ready" {
     goal "Keep one worker available."
      agent "worker" { workspace "."; command "true" }
   }
@@ -10294,13 +10386,13 @@ version 2
 "#;
         let server_intent = crate::graph::parse_intent(source, "server-node").unwrap();
         let client_intent = crate::graph::parse_intent(source, "local").unwrap();
-        let server_plan = server_intent.plans.values().next().unwrap();
-        let client_plan = client_intent.plans.values().next().unwrap();
-        assert_ne!(server_plan.revision, client_plan.revision);
+        let server_mission = server_intent.missions.values().next().unwrap();
+        let client_mission = client_intent.missions.values().next().unwrap();
+        assert_ne!(server_mission.revision, client_mission.revision);
 
         let store = Store::open_memory("server-node").unwrap();
         let response = store
-            .plan(
+            .mission(
                 &server_intent,
                 IntentInput {
                     kdl: source.into(),
@@ -10309,21 +10401,21 @@ version 2
             )
             .unwrap();
         assert_eq!(
-            response.plan_revisions["plan/portable"],
-            server_plan.revision
+            response.mission_revisions["mission/portable"],
+            server_mission.revision
         );
     }
 
     #[test]
-    fn plan_inputs_are_exact_immutable_snapshots() {
+    fn mission_inputs_are_exact_immutable_snapshots() {
         let store = Store::open_memory("node").unwrap();
-        publish_plan(
+        publish_mission(
             &store,
             r#"
 version 2
 
   resource "source" { kind "custom.st3.document-source" }
-  plan "inputs" state="ready" {
+  mission "inputs" state="ready" {
     input "message" kind="text"
     input "source" kind="resource"
     goal "Use the supplied values."
@@ -10331,7 +10423,7 @@ version 2
   }
 
 "#,
-            "publish-input-plan",
+            "publish-input-mission",
         );
         let first = store
             .append_claim(&ClaimInput {
@@ -10344,8 +10436,8 @@ version 2
                 idempotency_key: Some("source-ready".into()),
             })
             .unwrap();
-        let request = PlanRunRequest {
-            plan: "inputs".into(),
+        let request = MissionRunRequest {
+            mission: "inputs".into(),
             revision: None,
             workspace: ".".into(),
             requester: Some("person/test".into()),
@@ -10354,44 +10446,44 @@ version 2
                 ("message".into(), "hello".into()),
                 ("source".into(), "resource/source".into()),
             ]),
-            idempotency_key: "run-input-plan".into(),
+            idempotency_key: "run-input-mission".into(),
         };
-        let run = store.create_plan_run(&request).unwrap();
+        let run = store.create_mission_run(&request).unwrap();
         assert_eq!(run.inputs["message"].value, "hello");
         assert_eq!(
             run.inputs["source"].value,
             format!("resource/source@{}", first.id)
         );
         assert_eq!(
-            store.create_plan_run(&request).unwrap().subject,
+            store.create_mission_run(&request).unwrap().subject,
             run.subject
         );
         let mut second_run = request.clone();
-        second_run.idempotency_key = "run-input-plan-two".into();
+        second_run.idempotency_key = "run-input-mission-two".into();
         assert_eq!(
-            store.create_plan_run(&second_run).unwrap_err().code,
-            "plan-run-capacity"
+            store.create_mission_run(&second_run).unwrap_err().code,
+            "mission-run-capacity"
         );
 
         let mut changed = request.clone();
         changed.inputs.insert("message".into(), "changed".into());
         assert_eq!(
-            store.create_plan_run(&changed).unwrap_err().code,
+            store.create_mission_run(&changed).unwrap_err().code,
             "idempotency-mismatch"
         );
         let mut missing = request.clone();
         missing.idempotency_key = "run-input-missing".into();
         missing.inputs.remove("source");
         assert_eq!(
-            store.create_plan_run(&missing).unwrap_err().code,
-            "invalid-plan-inputs"
+            store.create_mission_run(&missing).unwrap_err().code,
+            "invalid-mission-inputs"
         );
         let mut extra = request.clone();
         extra.idempotency_key = "run-input-extra".into();
         extra.inputs.insert("other".into(), "value".into());
         assert_eq!(
-            store.create_plan_run(&extra).unwrap_err().code,
-            "invalid-plan-inputs"
+            store.create_mission_run(&extra).unwrap_err().code,
+            "invalid-mission-inputs"
         );
 
         let second = store
@@ -10407,7 +10499,7 @@ version 2
             .unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().inputs["source"].claim_id,
+            store.mission_run(&run.id).unwrap().unwrap().inputs["source"].claim_id,
             Some(first.id)
         );
     }
@@ -10418,8 +10510,8 @@ version 2
         let source = r#"
 version 2
 
-  plan "parent" state="ready" { goal "Keep the parent run open." }
-  plan "child" state="ready" {
+  mission "parent" state="ready" { goal "Keep the parent run open." }
+  mission "child" state="ready" {
     input "message" kind="text"
     goal "Use the supplied message."
   }
@@ -10427,7 +10519,7 @@ version 2
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source.into(),
@@ -10439,8 +10531,8 @@ version 2
             .apply(&intent, &planned.subject_tokens, "publish-parent-child")
             .unwrap();
         let parent = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "parent".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "parent".into(),
                 revision: None,
                 workspace: ".".into(),
                 requester: None,
@@ -10450,9 +10542,9 @@ version 2
             })
             .unwrap();
         let child_error = store
-            .create_child_plan_run(
-                &PlanRunRequest {
-                    plan: "child".into(),
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "child".into(),
                     revision: None,
                     workspace: ".".into(),
                     requester: None,
@@ -10465,14 +10557,14 @@ version 2
                 None,
             )
             .unwrap_err();
-        assert_eq!(child_error.code, "child-plan-inputs-unsupported");
+        assert_eq!(child_error.code, "child-mission-inputs-unsupported");
 
-        let original = publish_plan(
+        let original = publish_mission(
             &store,
             r#"
 version 2
 
-  plan "revision-input" state="ready" {
+  mission "revision-input" state="ready" {
     input "message" kind="text"
     goal "Use the supplied message."
   }
@@ -10481,8 +10573,8 @@ version 2
             "publish-revision-input",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: original.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: original.id,
                 revision: None,
                 workspace: ".".into(),
                 requester: None,
@@ -10491,12 +10583,12 @@ version 2
                 idempotency_key: "revision-input-run".into(),
             })
             .unwrap();
-        let changed = publish_plan(
+        let changed = publish_mission(
             &store,
             r#"
 version 2
 
-  plan "revision-input" state="ready" {
+  mission "revision-input" state="ready" {
     input "source" kind="resource"
     goal "Use the supplied resource."
   }
@@ -10505,7 +10597,7 @@ version 2
             "publish-changed-revision-input",
         );
         let revision_error = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &changed,
                 "agent/node.worker",
@@ -10517,18 +10609,18 @@ version 2
     }
 
     #[test]
-    fn plan_run_capacity_uses_the_strictest_active_revision() {
+    fn mission_run_capacity_uses_the_strictest_active_revision() {
         let store = Store::open_memory("node").unwrap();
-        let first = publish_plan(
+        let first = publish_mission(
             &store,
             r#"version 2
- plan "bounded" state="ready" { concurrent-runs max=3; goal "Keep this run open." } "#,
+ mission "bounded" state="ready" { concurrent-runs max=3; goal "Keep this run open." } "#,
             "bounded-three",
         );
         for index in 1..=2 {
             store
-                .create_plan_run(&PlanRunRequest {
-                    plan: "bounded".into(),
+                .create_mission_run(&MissionRunRequest {
+                    mission: "bounded".into(),
                     revision: Some(first.revision.clone()),
                     workspace: ".".into(),
                     requester: None,
@@ -10538,16 +10630,22 @@ version 2
                 })
                 .unwrap();
         }
-        let second = publish_plan(
+        let second = publish_mission(
             &store,
             r#"version 2
- plan "bounded" state="ready" { concurrent-runs max=1; goal "Keep one run open." } "#,
+ mission "bounded" state="ready" { concurrent-runs max=1; goal "Keep one run open." } "#,
             "bounded-one",
         );
-        assert_eq!(store.active_plan_runs_for_plan("bounded").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .active_mission_runs_for_mission("bounded")
+                .unwrap()
+                .len(),
+            2
+        );
         let error = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "bounded".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "bounded".into(),
                 revision: Some(second.revision),
                 workspace: ".".into(),
                 requester: None,
@@ -10556,21 +10654,21 @@ version 2
                 idempotency_key: "bounded-run-three".into(),
             })
             .unwrap_err();
-        assert_eq!(error.code, "plan-run-capacity");
-        assert!(error.message.contains("plan-run/"));
+        assert_eq!(error.code, "mission-run-capacity");
+        assert!(error.message.contains("mission-run/"));
 
         let unlimited = Store::open_memory("node").unwrap();
-        let plan = publish_plan(
+        let mission = publish_mission(
             &unlimited,
             r#"version 2
- plan "unlimited" state="ready" { concurrent-runs; goal "Allow all runs." } "#,
-            "unlimited-plan",
+ mission "unlimited" state="ready" { concurrent-runs; goal "Allow all runs." } "#,
+            "unlimited-mission",
         );
         for index in 1..=3 {
             unlimited
-                .create_plan_run(&PlanRunRequest {
-                    plan: "unlimited".into(),
-                    revision: Some(plan.revision.clone()),
+                .create_mission_run(&MissionRunRequest {
+                    mission: "unlimited".into(),
+                    revision: Some(mission.revision.clone()),
                     workspace: ".".into(),
                     requester: None,
                     mode: None,
@@ -10639,25 +10737,25 @@ version 2
             "node",
         )
         .expect("intent");
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: "test".into(),
                     source_name: None,
                 },
             )
-            .expect("plan");
-        assert!(plan.blockers.is_empty());
-        assert_eq!(plan.warnings.len(), 1);
+            .expect("mission");
+        assert!(mission.blockers.is_empty());
+        assert_eq!(mission.warnings.len(), 1);
     }
 
     #[test]
-    fn historical_plan_and_status_use_the_selected_index() {
+    fn historical_mission_and_status_use_the_selected_index() {
         let store = Store::open_memory("node").expect("store");
         let first = simple("true");
-        let first_plan = store
-            .plan(
+        let first_mission = store
+            .mission(
                 &first,
                 IntentInput {
                     kdl: "first".into(),
@@ -10666,13 +10764,13 @@ version 2
             )
             .unwrap();
         let first_apply = store
-            .apply(&first, &first_plan.subject_tokens, "first")
+            .apply(&first, &first_mission.subject_tokens, "first")
             .unwrap();
         let first_index = first_apply.store_index;
 
         let second = simple("false");
-        let second_plan = store
-            .plan(
+        let second_mission = store
+            .mission(
                 &second,
                 IntentInput {
                     kdl: "second".into(),
@@ -10681,7 +10779,7 @@ version 2
             )
             .unwrap();
         store
-            .apply(&second, &second_plan.subject_tokens, "second")
+            .apply(&second, &second_mission.subject_tokens, "second")
             .unwrap();
 
         let historical = store
@@ -10692,8 +10790,8 @@ version 2
             historical.subjects[0].desired_token,
             first_apply.subject_tokens["exec/work"].first().cloned()
         );
-        let historical_plan = store
-            .plan_at(
+        let historical_mission = store
+            .mission_at(
                 &second,
                 IntentInput {
                     kdl: "historical".into(),
@@ -10703,10 +10801,10 @@ version 2
             )
             .unwrap();
         assert_eq!(
-            historical_plan.subject_tokens["exec/work"],
+            historical_mission.subject_tokens["exec/work"],
             first_apply.subject_tokens["exec/work"]
         );
-        assert_eq!(historical_plan.changes.len(), 1);
+        assert_eq!(historical_mission.changes.len(), 1);
     }
 
     #[test]
@@ -10728,13 +10826,13 @@ version 2
     }
 
     #[test]
-    fn replication_carries_runnable_plan_definitions() {
+    fn replication_carries_runnable_mission_definitions() {
         let source = Store::open_memory("source").unwrap();
         let kdl = r#"version 2
- plan "remote" state="ready" { goal "Run remote work."; step "work" { } } "#;
+ mission "remote" state="ready" { goal "Run remote work."; step "work" { } } "#;
         let intent = parse_intent(kdl, "source").unwrap();
         let planned = source
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: kdl.into(),
@@ -10743,18 +10841,18 @@ version 2
             )
             .unwrap();
         source
-            .apply(&intent, &planned.subject_tokens, "remote-plan")
+            .apply(&intent, &planned.subject_tokens, "remote-mission")
             .unwrap();
 
         let target = Store::open_memory("target").unwrap();
         target
             .import_replication("source", &source.export_replication(0).unwrap())
             .unwrap();
-        let replicated = target.plan_spec("remote", None).unwrap().unwrap();
-        assert_eq!(replicated.state, PlanState::Ready);
+        let replicated = target.mission_spec("remote", None).unwrap().unwrap();
+        assert_eq!(replicated.state, MissionState::Ready);
         let run = target
-            .create_plan_run(&PlanRunRequest {
-                plan: "remote".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "remote".into(),
                 revision: Some(replicated.revision),
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -10767,20 +10865,20 @@ version 2
     }
 
     #[test]
-    fn replication_carries_plan_runs_and_remote_work_updates() {
+    fn replication_carries_mission_runs_and_remote_work_updates() {
         let controller = Store::open_memory("controller").unwrap();
         let kdl = r#"
 version 2
 
-  plan "remote-work" state="ready" {
-    goal "Complete plan remote-work."
+  mission "remote-work" state="ready" {
+    goal "Complete mission remote-work."
     step "work" { assigned-to "agent/worker.one" }
   }
 
 "#;
         let intent = parse_intent(kdl, "controller").unwrap();
         let planned = controller
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: kdl.into(),
@@ -10789,11 +10887,11 @@ version 2
             )
             .unwrap();
         controller
-            .apply(&intent, &planned.subject_tokens, "remote-work-plan")
+            .apply(&intent, &planned.subject_tokens, "remote-work-mission")
             .unwrap();
         let run = controller
-            .create_plan_run(&PlanRunRequest {
-                plan: "remote-work".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "remote-work".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -10809,7 +10907,7 @@ version 2
         worker
             .import_replication("controller", &controller.export_replication(0).unwrap())
             .unwrap();
-        let remote = worker.plan_run(&run.id).unwrap().unwrap();
+        let remote = worker.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(remote.steps[0].status, "ready");
         for action in ["claim", "complete"] {
             worker
@@ -10851,7 +10949,7 @@ version 2
 version 2
 
   agent "owner" {{ workspace "."; command "true" }}
-  plan "lineage" state="ready" {{
+  mission "lineage" state="ready" {{
     goal "Replicate generation lineage."
     step "work" {{
       title "Work ${{ST_STEP}} in ${{ST_RUN_GENERATION}}"
@@ -10864,7 +10962,7 @@ version 2
             );
             let intent = parse_intent(&kdl, "source").unwrap();
             let planned = source
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl,
@@ -10873,12 +10971,12 @@ version 2
                 )
                 .unwrap();
             source.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["lineage"].clone()
+            intent.missions["lineage"].clone()
         };
         let first = publish("Use the first goal for ${ST_STEP_RUN}.", "lineage-one");
         let run = source
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -10893,7 +10991,7 @@ version 2
             .unwrap();
         let second = publish("Use the second goal for ${ST_STEP_RUN}.", "lineage-two");
         let revised = source
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "agent/source.owner",
@@ -10906,7 +11004,7 @@ version 2
         target
             .import_replication("source", &source.export_replication(0).unwrap())
             .unwrap();
-        let replicated = target.plan_run(&run.id).unwrap().unwrap();
+        let replicated = target.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(replicated.generation, revised.generation);
         assert_eq!(replicated.revision, second.revision);
         assert_eq!(target.run_generations(&run.id).unwrap().len(), 2);
@@ -10958,7 +11056,7 @@ version 2
 version 2
 
   agent "owner" {{ workspace "."; command "true" }}
-  plan "proposal" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
+  mission "proposal" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
     goal "Replicate a revision proposal."
     step "work" {{ goal {goal:?} }}
   }}
@@ -10967,7 +11065,7 @@ version 2
             );
             let intent = parse_intent(&kdl, "source").unwrap();
             let planned = source
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl,
@@ -10976,12 +11074,12 @@ version 2
                 )
                 .unwrap();
             source.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["proposal"].clone()
+            intent.missions["proposal"].clone()
         };
         let first = publish("Use the first goal.", "proposal-one");
         let run = source
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
@@ -11034,7 +11132,7 @@ version 2
         assert!(replicated.approvals.contains(&"person/reviewer".into()));
         assert_eq!(
             replicated.successor_generation,
-            Some(target.plan_run(&run.id).unwrap().unwrap().generation)
+            Some(target.mission_run(&run.id).unwrap().unwrap().generation)
         );
     }
 
@@ -11181,8 +11279,8 @@ version 2
     fn a_later_publish_cites_and_resolves_all_concurrent_intent_heads() {
         let left = Store::open_memory("left").unwrap();
         let initial = simple("true");
-        let plan = left
-            .plan(
+        let mission = left
+            .mission(
                 &initial,
                 IntentInput {
                     kdl: "initial".into(),
@@ -11190,7 +11288,7 @@ version 2
                 },
             )
             .unwrap();
-        left.apply(&initial, &plan.subject_tokens, "initial")
+        left.apply(&initial, &mission.subject_tokens, "initial")
             .unwrap();
 
         let right = Store::open_memory("right").unwrap();
@@ -11199,8 +11297,8 @@ version 2
             .unwrap();
         let left_change = simple("false");
         let right_change = simple("printf right");
-        let left_plan = left
-            .plan(
+        let left_mission = left
+            .mission(
                 &left_change,
                 IntentInput {
                     kdl: "left".into(),
@@ -11208,8 +11306,8 @@ version 2
                 },
             )
             .unwrap();
-        let right_plan = right
-            .plan(
+        let right_mission = right
+            .mission(
                 &right_change,
                 IntentInput {
                     kdl: "right".into(),
@@ -11217,10 +11315,10 @@ version 2
                 },
             )
             .unwrap();
-        left.apply(&left_change, &left_plan.subject_tokens, "left")
+        left.apply(&left_change, &left_mission.subject_tokens, "left")
             .unwrap();
         right
-            .apply(&right_change, &right_plan.subject_tokens, "right")
+            .apply(&right_change, &right_mission.subject_tokens, "right")
             .unwrap();
 
         let left_heads = left.replica_heads().unwrap();
@@ -11250,8 +11348,8 @@ version 2
         );
 
         let resolved = simple("printf resolved");
-        let resolution_plan = left
-            .plan(
+        let resolution_mission = left
+            .mission(
                 &resolved,
                 IntentInput {
                     kdl: "resolved".into(),
@@ -11259,8 +11357,8 @@ version 2
                 },
             )
             .unwrap();
-        assert_eq!(resolution_plan.subject_tokens["exec/work"].len(), 2);
-        left.apply(&resolved, &resolution_plan.subject_tokens, "resolved")
+        assert_eq!(resolution_mission.subject_tokens["exec/work"].len(), 2);
+        left.apply(&resolved, &resolution_mission.subject_tokens, "resolved")
             .unwrap();
         let right_heads = right.replica_heads().unwrap();
         right
@@ -11363,8 +11461,8 @@ version 2
             "local",
         )
         .unwrap();
-        let plan = store
-            .plan(
+        let mission = store
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: "message".into(),
@@ -11373,7 +11471,7 @@ version 2
             )
             .unwrap();
         store
-            .apply(&intent, &plan.subject_tokens, "message")
+            .apply(&intent, &mission.subject_tokens, "message")
             .unwrap();
 
         let messages = store.messages(Some("agent/mix.sup"), true).unwrap();
@@ -11395,6 +11493,23 @@ version 2
         let error = Store::open(&path, "node")
             .err()
             .expect("the old schema must be rejected");
+        assert!(error.to_string().contains("unsupported st3 schema"));
+    }
+
+    #[test]
+    fn schema_version_eight_requires_fresh_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("CREATE TABLE marker(value TEXT)", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 8).unwrap();
+        drop(connection);
+
+        let error = Store::open(&path, "node")
+            .err()
+            .expect("schema version 8 must be rejected");
         assert!(error.to_string().contains("unsupported st3 schema"));
     }
 
@@ -11467,8 +11582,8 @@ version 2
             r#"
 version 2
 
-  plan "lease" state="ready" {
-    goal "Complete plan lease."
+  mission "lease" state="ready" {
+    goal "Complete mission lease."
     step "work" { assigned-to "agent/worker" }
   }
 
@@ -11477,7 +11592,7 @@ version 2
         )
         .unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: "lease".into(),
@@ -11486,11 +11601,11 @@ version 2
             )
             .unwrap();
         store
-            .apply(&intent, &planned.subject_tokens, "lease-plan")
+            .apply(&intent, &planned.subject_tokens, "lease-mission")
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "lease".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "lease".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11552,12 +11667,12 @@ version 2
     }
 
     #[test]
-    fn an_active_nested_lease_can_publish_its_parent_plan_output() {
+    fn an_active_nested_lease_can_publish_its_parent_mission_output() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source.into(),
@@ -11570,12 +11685,12 @@ version 2
         publish(
             r#"version 2
 
-  plan "bootstrap" state="ready" {
-    goal "Complete plan bootstrap."
+  mission "bootstrap" state="ready" {
+    goal "Complete mission bootstrap."
     step "compile" {
       assigned-to "agent/planner"
-      produces-plan "project/work"
-      plan "work" { goal "Complete plan work."; step "publish" { } }
+      produces-mission "project/work"
+      mission "work" { goal "Complete mission work."; step "publish" { } }
     }
   }
 "#,
@@ -11583,13 +11698,13 @@ version 2
         );
         publish(
             r#"version 2
- plan "project/work" state="ready" { goal "Run project work."; step "work" { } } "#,
-            "nested-output-plan",
+ mission "project/work" state="ready" { goal "Run project work."; step "work" { } } "#,
+            "nested-output-mission",
         );
-        let plan = store.plan_spec("project/work", None).unwrap().unwrap();
+        let mission = store.mission_spec("project/work", None).unwrap().unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "bootstrap".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "bootstrap".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11632,25 +11747,25 @@ version 2
 
         assert!(
             store
-                .plan_output_authorized(&parent.subject, "agent/node.planner", Some("current"))
+                .mission_output_authorized(&parent.subject, "agent/node.planner", Some("current"))
                 .unwrap()
         );
         assert!(
             !store
-                .plan_output_authorized(&parent.subject, "agent/node.planner", Some("stale"))
+                .mission_output_authorized(&parent.subject, "agent/node.planner", Some("stale"))
                 .unwrap()
         );
         let output = store
-            .record_plan_output(
+            .record_mission_output(
                 &parent.subject,
                 "agent/node.planner",
                 Some("current"),
                 "project/work",
-                &plan,
+                &mission,
                 "bind-nested-output",
             )
             .unwrap();
-        assert_eq!(output.revision, plan.revision);
+        assert_eq!(output.revision, mission.revision);
     }
 
     #[test]
@@ -11659,7 +11774,7 @@ version 2
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source.into(),
@@ -11671,12 +11786,12 @@ version 2
         };
         publish(
             r#"version 2
- plan "retry" state="ready" { goal "Run retry work."; step "work" { } } "#,
-            "retry-plan",
+ mission "retry" state="ready" { goal "Run retry work."; step "work" { } } "#,
+            "retry-mission",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "retry".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "retry".into(),
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11702,7 +11817,7 @@ version 2
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source.into(),
@@ -11711,15 +11826,15 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["revision"].clone()
+            intent.missions["revision"].clone()
         };
         let first = publish(
             r#"
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "revision" state="ready" {
-    goal "Complete plan revision."
+  mission "revision" state="ready" {
+    goal "Complete mission revision."
     step "owned" { assigned-to "agent/worker"; goal "First goal." }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
@@ -11729,8 +11844,8 @@ version 2
             "revision-one",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11749,8 +11864,8 @@ version 2
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "revision" state="ready" {
-    goal "Complete plan revision."
+  mission "revision" state="ready" {
+    goal "Complete mission revision."
     step "owned" { assigned-to "agent/worker"; goal "A corrected goal." }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
@@ -11760,7 +11875,7 @@ version 2
             "revision-two",
         );
         let revised = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "agent/node.worker",
@@ -11786,7 +11901,7 @@ version 2
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source.into(),
@@ -11795,14 +11910,14 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["generation"].clone()
+            intent.missions["generation"].clone()
         };
         let first = publish(
             r#"
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "generation" state="ready" {
+  mission "generation" state="ready" {
     goal "Test immutable generations."
     step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
@@ -11817,8 +11932,8 @@ version 2
             "generation-one",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11863,7 +11978,7 @@ version 2
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "generation" state="ready" {
+  mission "generation" state="ready" {
     goal "Test immutable generations."
     step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
@@ -11878,7 +11993,7 @@ version 2
             "generation-two",
         );
         let revised = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "agent/node.worker",
@@ -11928,7 +12043,7 @@ version 2
         assert!(!store.set_step_state(&active, "completed", None).unwrap());
         assert_eq!(store.step_run(&active).unwrap().unwrap().status, "working");
         let retried = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "agent/node.worker",
@@ -11945,7 +12060,7 @@ version 2
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source.into(),
@@ -11954,13 +12069,13 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["authority"].clone()
+            intent.missions["authority"].clone()
         };
         let first = publish(
             r#"
 version 2
 
-  plan "authority" state="ready" {
+  mission "authority" state="ready" {
     goal "Keep revision authority structural."
     step "work" { assigned-to "agent/node.worker"; goal "Use the first goal." }
   }
@@ -11969,8 +12084,8 @@ version 2
             "authority-one",
         );
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -11983,7 +12098,7 @@ version 2
             r#"
 version 2
 
-  plan "authority" state="ready" {
+  mission "authority" state="ready" {
     goal "Keep revision authority structural."
     step "work" {
       assigned-to "agent/node.worker"
@@ -11996,7 +12111,7 @@ version 2
             "authority-two",
         );
         let error = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &escalated,
                 "agent/node.worker",
@@ -12008,14 +12123,14 @@ version 2
     }
 
     #[test]
-    fn a_plan_selector_or_completion_change_restarts_carried_work() {
+    fn a_mission_selector_or_completion_change_restarts_carried_work() {
         let parse = |selector: &str, completion: &str| {
             let source = format!(
                 r#"
 version 2
 
-  plan "contract" state="ready" {{
-    goal "Use the current plan contract."
+  mission "contract" state="ready" {{
+    goal "Use the current mission contract."
     {selector}
     {completion}
     step "work" {{ }}
@@ -12023,7 +12138,7 @@ version 2
 
 "#
             );
-            parse_intent(&source, "node").unwrap().plans["contract"].clone()
+            parse_intent(&source, "node").unwrap().missions["contract"].clone()
         };
         let old = parse(
             "assigned-to \"agent/node.one\"",
@@ -12036,7 +12151,7 @@ version 2
         let completion_changed = parse("assigned-to \"agent/node.one\"", "");
         let variables = BTreeMap::new();
         for candidate in [&selector_changed, &completion_changed] {
-            let (compatible, _) = analyze_plan_revision(
+            let (compatible, _) = analyze_mission_revision(
                 &old,
                 candidate,
                 "person/requester",
@@ -12060,7 +12175,7 @@ version 2
                 r#"
 version 2
 
-  plan "protected" state="ready" revisions="human-only" revision-reviewer="person/plan-reviewer" {{
+  mission "protected" state="ready" revisions="human-only" revision-reviewer="person/mission-reviewer" {{
     goal "Test protected revision."
      agent "worker" {{ workspace "."; command "true" }}
     step "work" revisions="human-only" revision-reviewer="person/step-reviewer" {{
@@ -12073,7 +12188,7 @@ version 2
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source,
@@ -12082,12 +12197,12 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["protected"].clone()
+            intent.missions["protected"].clone()
         };
         let first = publish("Use the first goal.", "protected-one");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
@@ -12109,12 +12224,12 @@ version 2
         assert_eq!(proposal.status, "pending-approval");
         assert_eq!(
             proposal.reviewers,
-            vec!["person/plan-reviewer", "person/step-reviewer"]
+            vec!["person/mission-reviewer", "person/step-reviewer"]
         );
         let error = store
             .approve_revision_proposal(
                 &proposal.id,
-                "person/plan-reviewer",
+                "person/mission-reviewer",
                 "wrong-preview",
                 "protected-wrong-preview",
             )
@@ -12123,13 +12238,13 @@ version 2
         let first_approval = store
             .approve_revision_proposal(
                 &proposal.id,
-                "person/plan-reviewer",
+                "person/mission-reviewer",
                 proposal.preview_hash.as_deref().unwrap(),
                 "protected-first-approval",
             )
             .unwrap();
         assert_eq!(first_approval.status, "pending-approval");
-        assert_eq!(first_approval.plan_run.generation, run.generation);
+        assert_eq!(first_approval.mission_run.generation, run.generation);
         let applied = store
             .approve_revision_proposal(
                 &proposal.id,
@@ -12139,7 +12254,7 @@ version 2
             )
             .unwrap();
         assert_eq!(applied.status, "applied");
-        assert_ne!(applied.plan_run.generation, run.generation);
+        assert_ne!(applied.mission_run.generation, run.generation);
         assert_eq!(
             applied
                 .proposal
@@ -12147,7 +12262,7 @@ version 2
                 .unwrap()
                 .successor_generation
                 .as_deref(),
-            Some(applied.plan_run.generation.as_str())
+            Some(applied.mission_run.generation.as_str())
         );
         let retried = store
             .approve_revision_proposal(
@@ -12157,7 +12272,10 @@ version 2
                 "protected-final-approval-retry",
             )
             .unwrap();
-        assert_eq!(retried.plan_run.generation, applied.plan_run.generation);
+        assert_eq!(
+            retried.mission_run.generation,
+            applied.mission_run.generation
+        );
     }
 
     #[test]
@@ -12168,7 +12286,7 @@ version 2
                 r#"
 version 2
 
-  plan "protected" state="ready" revisions="human-only" {{
+  mission "protected" state="ready" revisions="human-only" {{
     goal "Test revision cancellation."
     step "work" {{ goal {goal:?} }}
   }}
@@ -12177,7 +12295,7 @@ version 2
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source,
@@ -12186,12 +12304,12 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["protected"].clone()
+            intent.missions["protected"].clone()
         };
         let first = publish("Use the first goal.", "cancel-one");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/requester".into()),
@@ -12240,7 +12358,7 @@ version 2
             )
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");
-        assert_eq!(store.plan_run(&run.id).unwrap().unwrap().phase, "normal");
+        assert_eq!(store.mission_run(&run.id).unwrap().unwrap().phase, "normal");
         assert_eq!(store.run_generations(&run.id).unwrap().len(), 1);
 
         let replacement = store
@@ -12268,7 +12386,7 @@ version 2
 version 2
 
   agent "worker" {{ workspace "."; command "true" }}
-  plan "drain" state="ready"{cutover} {{
+  mission "drain" state="ready"{cutover} {{
     goal "Test a drained cutover."
     step "active" {{ assigned-to "agent/worker"; goal "Keep active work." }}
     step "waiting" {{ assigned-to "agent/worker"; goal {goal:?} }}
@@ -12278,7 +12396,7 @@ version 2
             );
             let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
             let planned = store
-                .plan(
+                .mission(
                     &intent,
                     IntentInput {
                         kdl: source,
@@ -12287,12 +12405,12 @@ version 2
                 )
                 .unwrap();
             store.apply(&intent, &planned.subject_tokens, key).unwrap();
-            intent.plans["drain"].clone()
+            intent.missions["drain"].clone()
         };
         let first = publish(Some("when-idle"), "Use the first goal.", "drain-one");
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: first.id,
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
                 revision: None,
                 workspace: "/tmp".into(),
                 requester: Some("person/test".into()),
@@ -12325,7 +12443,7 @@ version 2
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "drain-child" state="ready" {
+  mission "drain-child" state="ready" {
     goal "Keep descendant work in the idle boundary."
     step "active" { assigned-to "agent/worker" }
   }
@@ -12333,7 +12451,7 @@ version 2
 "#;
         let child_intent = crate::graph::parse_test_intent(child_source, "node").unwrap();
         let child_planned = store
-            .plan(
+            .mission(
                 &child_intent,
                 IntentInput {
                     kdl: child_source.into(),
@@ -12345,9 +12463,9 @@ version 2
             .apply(&child_intent, &child_planned.subject_tokens, "drain-child")
             .unwrap();
         let child = store
-            .create_child_plan_run(
-                &PlanRunRequest {
-                    plan: "drain-child".into(),
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "drain-child".into(),
                     revision: None,
                     workspace: "/tmp".into(),
                     requester: Some("person/test".into()),
@@ -12386,7 +12504,7 @@ version 2
             .unwrap();
         let second = publish(Some("restart-active"), "Use the second goal.", "drain-two");
         let error = store
-            .adopt_plan_revision(
+            .adopt_mission_revision(
                 &run.id,
                 &second,
                 "agent/node.worker",
@@ -12407,7 +12525,7 @@ version 2
         assert_eq!(proposal.status, "draining");
         assert_eq!(proposal.cutover, RevisionCutover::WhenIdle);
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().phase,
+            store.mission_run(&run.id).unwrap().unwrap().phase,
             "revision-draining"
         );
         assert_eq!(store.work(None, false).unwrap().len(), 2);
@@ -12439,8 +12557,8 @@ version 2
             .unwrap()
             .expect("the completion event permits cutover");
         assert_eq!(applied.status, "applied");
-        assert_eq!(applied.plan_run.phase, "normal");
-        assert_ne!(applied.plan_run.generation, run.generation);
+        assert_eq!(applied.mission_run.phase, "normal");
+        assert_ne!(applied.mission_run.generation, run.generation);
     }
 
     #[test]
@@ -12450,8 +12568,8 @@ version 2
 version 2
 
   agent "worker" { workspace "."; command "true" }
-  plan "cancel" state="ready" {
-    goal "Cancel this plan through the graph."
+  mission "cancel" state="ready" {
+    goal "Cancel this mission through the graph."
     completion { when "all-steps-exhausted" }
     step "work" { assigned-to "agent/node.worker" }
     finally { step "cleanup" { agentless } }
@@ -12460,7 +12578,7 @@ version 2
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source.into(),
@@ -12469,17 +12587,17 @@ version 2
             )
             .unwrap();
         store
-            .apply(&intent, &planned.subject_tokens, "publish-cancel-plan")
+            .apply(&intent, &planned.subject_tokens, "publish-cancel-mission")
             .unwrap();
         let run = store
-            .create_plan_run(&PlanRunRequest {
-                plan: "cancel".into(),
+            .create_mission_run(&MissionRunRequest {
+                mission: "cancel".into(),
                 revision: None,
                 workspace: ".".into(),
                 requester: Some("person/test".into()),
                 mode: None,
                 inputs: BTreeMap::new(),
-                idempotency_key: "run-cancel-plan".into(),
+                idempotency_key: "run-cancel-mission".into(),
             })
             .unwrap();
         store
@@ -12531,7 +12649,7 @@ version 2
         let child_source = r#"
 version 2
 
-  plan "cancel-child" state="ready" {
+  mission "cancel-child" state="ready" {
     goal "Cancel with the parent run."
     step "child-work" { agentless }
   }
@@ -12539,7 +12657,7 @@ version 2
 "#;
         let child_intent = parse_intent(child_source, "node").unwrap();
         let child_planned = store
-            .plan(
+            .mission(
                 &child_intent,
                 IntentInput {
                     kdl: child_source.into(),
@@ -12555,9 +12673,9 @@ version 2
             )
             .unwrap();
         let child = store
-            .create_child_plan_run(
-                &PlanRunRequest {
-                    plan: "cancel-child".into(),
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "cancel-child".into(),
                     revision: None,
                     workspace: ".".into(),
                     requester: Some("person/test".into()),
@@ -12571,12 +12689,12 @@ version 2
             )
             .unwrap();
         let cancellation = format!(
-            "version 2\n plan-run {:?} {{ cancellation \"operator\" {{ reason \"the test cancelled the run\" }} }} \n",
+            "version 2\n mission-run {:?} {{ cancellation \"operator\" {{ reason \"the test cancelled the run\" }} }} \n",
             run.subject
         );
         let intent = parse_intent(&cancellation, "node").unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: cancellation,
@@ -12585,22 +12703,22 @@ version 2
             )
             .unwrap();
         let first = store
-            .apply(&intent, &planned.subject_tokens, "cancel-plan-run")
+            .apply(&intent, &planned.subject_tokens, "cancel-mission-run")
             .unwrap();
         let repeated = store
-            .apply(&intent, &planned.subject_tokens, "cancel-plan-run")
+            .apply(&intent, &planned.subject_tokens, "cancel-mission-run")
             .unwrap();
         assert_eq!(first.batch_id, repeated.batch_id);
-        let cancelled = store.plan_run(&run.id).unwrap().unwrap();
+        let cancelled = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(cancelled.status, "running");
         assert_eq!(cancelled.phase, "final-cancelled");
         assert_eq!(
-            store.plan_run(&child.id).unwrap().unwrap().phase,
+            store.mission_run(&child.id).unwrap().unwrap().phase,
             "cleanup-cancelled"
         );
         assert!(
             !store
-                .set_plan_run_state(
+                .set_mission_run_state(
                     &child.id,
                     "standing",
                     "normal",
@@ -12609,12 +12727,12 @@ version 2
                 .unwrap()
         );
         assert_eq!(
-            store.plan_run(&child.id).unwrap().unwrap().phase,
+            store.mission_run(&child.id).unwrap().unwrap().phase,
             "cleanup-cancelled"
         );
         assert!(
             !store
-                .set_plan_run_state(
+                .set_mission_run_state(
                     &run.id,
                     "standing",
                     "normal",
@@ -12623,7 +12741,7 @@ version 2
                 .unwrap()
         );
         assert_eq!(
-            store.plan_run(&run.id).unwrap().unwrap().phase,
+            store.mission_run(&run.id).unwrap().unwrap().phase,
             "final-cancelled"
         );
         assert_eq!(
@@ -12648,7 +12766,7 @@ version 2
             .messages(None, true)
             .unwrap()
             .into_iter()
-            .find(|message| message.title.as_deref() == Some("Plan work cancelled"))
+            .find(|message| message.title.as_deref() == Some("Mission work cancelled"))
             .expect("the claimant receives a cancellation message");
         assert_eq!(cancellation_message.from, "daemon/runtime");
         assert_eq!(cancellation_message.to, "agent/node.worker");
@@ -12693,7 +12811,7 @@ version 2
 "#;
         let intent = parse_intent(source, "node").unwrap();
         let planned = store
-            .plan(
+            .mission(
                 &intent,
                 IntentInput {
                     kdl: source.into(),
@@ -12832,8 +12950,8 @@ version 2
         assert_eq!(store.messages(None, true).unwrap().len(), 2);
         let stop_source = "version 2\n subscription \"one\" { stop } \n";
         let stop_intent = parse_intent(stop_source, "node").unwrap();
-        let stop_plan = store
-            .plan(
+        let stop_mission = store
+            .mission(
                 &stop_intent,
                 IntentInput {
                     kdl: stop_source.into(),
@@ -12844,7 +12962,7 @@ version 2
         store
             .apply(
                 &stop_intent,
-                &stop_plan.subject_tokens,
+                &stop_mission.subject_tokens,
                 "stop-one-subscription",
             )
             .unwrap();
@@ -13028,8 +13146,8 @@ version 2
     fn once_cardinality_rejects_a_second_local_claim() {
         let store = Store::open_memory("node").unwrap();
         let request = ClaimInput {
-            subject: "plan-run/one".into(),
-            kind: "plan-run.created".into(),
+            subject: "mission-run/one".into(),
+            kind: "mission-run.created".into(),
             actor: None,
             fields: BTreeMap::new(),
             evidence: Vec::new(),
@@ -13050,7 +13168,7 @@ version 2
         for (store, verdict) in [(&left, "pass"), (&right, "fail")] {
             store
                 .append_claim(&ClaimInput {
-                    subject: "plan-run/shared-eval".into(),
+                    subject: "mission-run/shared-eval".into(),
                     kind: "eval.verdict".into(),
                     actor: None,
                     fields: BTreeMap::from([("verdict".into(), Value::String(verdict.into()))]),
@@ -13070,7 +13188,7 @@ version 2
             .unwrap();
         assert_eq!(
             target
-                .claims_for("plan-run/shared-eval", Some("eval.verdict"))
+                .claims_for("mission-run/shared-eval", Some("eval.verdict"))
                 .unwrap()
                 .len(),
             2

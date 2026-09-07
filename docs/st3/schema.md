@@ -3,34 +3,34 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `cb049668883646dbf73742cbebc8453caf5374156a5d7110284f7fa6b4ff8106`
+Digest: `472d850313d13491b4c95fc6c1cc787dc99d1c71576c25c5e23fbe679ee74fe4`
 
 ## Subject families
 
 | Family | Pattern | Client writable | Description |
 |---|---|---:|---|
 | `account` | `account/NAME` | no | An external provider account identity. |
-| `agent` | `agent/RUN/LOCAL_ID` | no | A plan-run agent runtime. |
+| `agent` | `agent/RUN/LOCAL_ID` | no | A mission-run agent runtime. |
 | `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
-| `exec` | `exec/RUN/LOCAL_ID` | no | A plan-run exec runtime. |
+| `exec` | `exec/RUN/LOCAL_ID` | no | A mission-run exec runtime. |
 | `file` | `file/HOST:/ABSOLUTE_PATH` | no | A read-only file gate target. |
 | `gate-operation` | `gate-operation/IDENTITY` | no | One gate evaluation attempt. |
 | `host` | `host/NAME` | no | A graph host. |
 | `message` | `message/ID` | yes | A Small Talk message. |
-| `observer` | `observer/RUN/LOCAL_ID` | no | A plan-run resource observer. |
+| `mission` | `mission/ID` | no | An immutable mission revision lineage. |
+| `mission-run` | `mission-run/ID` | no | A mission execution. |
+| `observer` | `observer/RUN/LOCAL_ID` | no | A mission-run resource observer. |
 | `person` | `person/IDENTITY` | no | A human actor. |
-| `plan` | `plan/ID` | no | An immutable plan revision lineage. |
-| `plan-run` | `plan-run/ID` | no | A plan execution. |
 | `planning-session` | `planning-session/ID` | no | A durable planning session. |
-| `pty` | `pty/RUN/LOCAL_ID` | no | A plan-run terminal runtime. |
+| `pty` | `pty/RUN/LOCAL_ID` | no | A mission-run terminal runtime. |
 | `resource` | `resource/NAME` | yes | An observed external or durable fact bag. |
-| `revision-proposal` | `revision-proposal/ID` | no | A plan revision proposal. |
-| `run-generation` | `run-generation/ID` | no | An immutable plan-run generation. |
-| `schedule` | `schedule/RUN/LOCAL_ID` | no | A plan-run schedule. |
+| `revision-proposal` | `revision-proposal/ID` | no | A mission revision proposal. |
+| `run-generation` | `run-generation/ID` | no | An immutable mission-run generation. |
+| `schedule` | `schedule/RUN/LOCAL_ID` | no | A mission-run schedule. |
 | `step-run` | `step-run/GENERATION/PATH` | no | One step attempt lineage. |
-| `subscription` | `subscription/RUN/LOCAL_ID` | no | A plan-run observer subscription. |
+| `subscription` | `subscription/RUN/LOCAL_ID` | no | A mission-run observer subscription. |
 
 Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE.NAME`.
 
@@ -57,32 +57,32 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
 | `daemon.started` | `daemon` | `system-only` | `append` | `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
 | `doc.bound` | `doc` | `authorized-requester` | `append` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |
-| `eval.verdict` | `plan-run` | `system-only` | `once` | `reason:string`, `residue:array`, `verdict!:string` |  |
+| `eval.verdict` | `mission-run` | `system-only` | `once` | `reason:string`, `residue:array`, `verdict!:string` |  |
 | `file.observed` | `file` | `system-only` | `append` | `blob_hash:string`, `content:string`, `content_hash:string`, `mode:integer`, `path!:string`, `reason:string`, `status!:string` | `gate` |
-| `gate.requested` | `gate-operation` | `system-only` | `once` | `attempt:integer`, `baseline:boolean`, `capability_expires_at:string`, `capability_hash:string`, `decisions:array`, `gate:string`, `model:string`, `operation:subject-reference`, `owner:subject-reference`, `plan_revision:string`, `question:string`, `review_targets:array`, `reviewer:subject-reference`, `runner:string`, `status:string`, `step_definition:string`, `token_budget:integer`, `tools:array` | `gate` |
+| `gate.requested` | `gate-operation` | `system-only` | `once` | `attempt:integer`, `baseline:boolean`, `capability_expires_at:string`, `capability_hash:string`, `decisions:array`, `gate:string`, `mission_revision:string`, `model:string`, `operation:subject-reference`, `owner:subject-reference`, `question:string`, `review_targets:array`, `reviewer:subject-reference`, `runner:string`, `status:string`, `step_definition:string`, `token_budget:integer`, `tools:array` | `gate` |
 | `gate.result` | `gate-operation` | `capability-holder` | `append` | `baseline:boolean`, `field:string`, `gate:string`, `operation:subject-reference`, `reason:string`, `request:string`, `stage:string`, `token_usage:integer`, `value:any`, `verdict!:string` | `gate` |
 | `harness.context-clear.requested` | `agent` | `authorized-requester` | `append` | `context_epoch:string`, `incarnation_id:string`, `operation_status:string`, `runtime_id:string` |  |
 | `harness.context-clear.result` | `agent` | `system-only` | `once` | `context_epoch:string`, `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string` |  |
 | `harness.diagnostic` | `agent` | `same-subject-actor` | `append` | `code:string`, `incarnation_id:string`, `reason:string`, `severity:string`, `status:string` |  |
 | `harness.observed` | `agent` | `same-subject-actor` | `append` | `ask:string`, `blocked_on:string`, `driver:string`, `exit:string`, `incarnation_id:string`, `input_buffer:string`, `reason:string`, `state!:string`, `transport:string` |  |
 | `harness.usage` | `agent` | `same-subject-actor` | `append` | `incarnation_id:string`, `input_tokens:integer`, `model:string`, `output_tokens:integer`, `total_tokens:integer` |  |
-| `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `plan`, `plan-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
+| `intent.desired` | `*` | `authorized-requester` | `state-transition` | `desired:object`, `kind:string`, `revision:string` | `account`, `agent`, `doc`, `exec`, `host`, `message`, `observer`, `mission`, `mission-run`, `planning-session`, `pty`, `resource`, `schedule`, `step`, `stop`, `subscription` |
 | `message.closed` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `message.read` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
+| `mission-run.created` | `mission-run` | `system-only` | `once` | `current_generation:subject-reference`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `workspace:string` | `mission-run` |
+| `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
+| `mission.produced` | `mission`, `step-run` | `capability-holder` | `append` | `attempt:integer`, `mission:subject-reference`, `name:string`, `revision:string`, `step_definition:string` | `produces` |
+| `mission.published` | `mission` | `authorized-requester` | `append` | `body:object`, `revision:string`, `state:string` | `mission` |
 | `observer.observed` | `observer` | `system-only` | `append` | `attempt:string`, `changed:boolean`, `changed_fields:array`, `cursor:string`, `locator:string`, `next_check_unix_ms:string`, `observation:subject-reference`, `provider:string`, `resource:subject-reference`, `revision:string`, `status:string` | `observer` |
 | `observer.state` | `observer` | `system-only` | `state-transition` | `attempt:string`, `next_check_unix_ms:string`, `reason:string`, `revision:string`, `state!:string` | `observer`, `refresh` |
-| `plan-run.created` | `plan-run` | `system-only` | `once` | `current_generation:subject-reference`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mode:string`, `parent_step_run:subject-reference`, `plan:subject-reference`, `requester:subject-reference`, `revision:string`, `root_plan_run:subject-reference`, `root_revision:string`, `status:string`, `workspace:string` | `plan-run` |
-| `plan-run.state` | `plan-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `plan-run`, `completion`, `finally`, `cancellation` |
-| `plan.produced` | `plan`, `step-run` | `capability-holder` | `append` | `attempt:integer`, `name:string`, `plan:subject-reference`, `revision:string`, `step_definition:string` | `produces` |
-| `plan.published` | `plan` | `authorized-requester` | `append` | `body:object`, `revision:string`, `state:string` | `plan` |
-| `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `plan_revision:string`, `preview_hash:string`, `requester:subject-reference`, `variant:string` |  |
+| `planning-session.approved` | `planning-session` | `authorized-requester` | `once` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `preview_hash:string`, `requester:subject-reference`, `variant:string` |  |
 | `planning-session.cancelled` | `planning-session` | `authorized-requester` | `once` | `reason:string`, `requester:subject-reference` | `cancellation` |
-| `planning-session.candidate-submitted` | `planning-session` | `authorized-participant` | `append` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `plan_revision:string`, `revision:integer`, `variant:string` |  |
-| `planning-session.previewed` | `planning-session` | `system-only` | `append` | `candidate_revision:integer`, `diff:string`, `graph:string`, `plan:object`, `preview_hash:string`, `store_index:integer`, `variant:string` |  |
+| `planning-session.candidate-submitted` | `planning-session` | `authorized-participant` | `append` | `candidate_revision:integer`, `kdl:subject-reference`, `markdown:subject-reference`, `mission_revision:string`, `revision:integer`, `variant:string` |  |
+| `planning-session.previewed` | `planning-session` | `system-only` | `append` | `candidate_revision:integer`, `diff:string`, `graph:string`, `mission:object`, `preview_hash:string`, `store_index:integer`, `variant:string` |  |
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
-| `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `plan:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
+| `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |
 | `resource.observed` | `resource` | `ordinary-client` | `append` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
@@ -90,8 +90,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `revision-proposal.approved` | `revision-proposal` | `authorized-requester` | `once-per-actor` | `all_approved:boolean`, `preview_hash:string`, `reviewer:subject-reference` |  |
 | `revision-proposal.cancelled` | `revision-proposal` | `authorized-requester` | `once` | `reason:string`, `status:string` |  |
 | `revision-proposal.created` | `revision-proposal` | `authorized-requester` | `once` | `candidate_revision:string`, `compatible_steps:array`, `cutover:string`, `preview_hash:string`, `reason:string`, `reviewers:array`, `run:subject-reference`, `source_generation:subject-reference`, `status:string` |  |
-| `run-generation.created` | `run-generation` | `system-only` | `once` | `compatible_steps:array`, `predecessor:subject-reference`, `reason:string`, `revision:string`, `run:subject-reference`, `status:string` | `plan-run`, `revision` |
-| `run-generation.state` | `run-generation` | `system-only` | `state-transition` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `plan-run`, `step`, `completion`, `finally`, `revision`, `cancellation` |
+| `run-generation.created` | `run-generation` | `system-only` | `once` | `compatible_steps:array`, `predecessor:subject-reference`, `reason:string`, `revision:string`, `run:subject-reference`, `status:string` | `mission-run`, `revision` |
+| `run-generation.state` | `run-generation` | `system-only` | `state-transition` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `mission-run`, `step`, `completion`, `finally`, `revision`, `cancellation` |
 | `run-generation.superseded` | `run-generation` | `system-only` | `once` | `phase:string`, `previous_phase:string`, `reason:string`, `status:string`, `successor:subject-reference` | `revision` |
 | `runtime.action.deadline-reached` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
 | `runtime.action.failed` | `agent`, `exec`, `pty`, `gate-operation` | `system-only` | `append` | `action:string`, `deadline_key:string`, `desired_token:string`, `incarnation_id:string`, `operation:string`, `operation_status:string`, `reason:string`, `runtime_id:string`, `signal:string`, `terminal:boolean` | `stop`, `gate` |
