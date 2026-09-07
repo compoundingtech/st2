@@ -588,6 +588,46 @@ impl Publisher {
     }
 }
 
+/// What one observation — a Claude hook event, a pi-family typed turn result — proves about the
+/// seat's provider credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAuthEdge {
+    Rejected,
+    Accepted,
+}
+
+/// Record one credential edge on the seat's native-driver diagnostic.
+///
+/// A fresh publisher per edge on purpose, and every producer of these edges is short-lived: each
+/// Claude hook invocation is its own process, so the publisher's stage set starts empty and its
+/// on-disk fallback is what lets a later `Stop` clear a rejection an earlier `StopFailure` wrote
+/// from a different process; a channel that restarted mid-session inherits the predecessor's
+/// record the same way rather than silently starting clean. Fail-open like every other
+/// observation: the publisher only warns on a write it cannot land, and neither delivery nor
+/// launch depends on it.
+pub(crate) fn publish_provider_auth(agent_dir: &Path, driver: Driver, edge: ProviderAuthEdge) {
+    let mut publisher = Publisher::new(
+        agent_dir,
+        driver,
+        // No producer version and no support verdict is knowable at either edge. A Claude hook
+        // payload carries no version — the common hook input is session id, transcript path, cwd,
+        // prompt id, permission mode, agent identity and effort, and nothing else (2.1.259) — and
+        // st2 gates no Claude version at all. On the pi family the WRAPPER, not the channel, owns
+        // the version gate and refuses the launch on an unadmitted MINOR (OMP-R05), so a running
+        // channel has no version fact of its own to publish and no verdict to restate.
+        None,
+        Support::Unknown,
+    );
+    match edge {
+        ProviderAuthEdge::Rejected => publisher.publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        ),
+        ProviderAuthEdge::Accepted => publisher.clear(Stage::ProviderAuth),
+    }
+}
+
 fn emit(
     driver: Driver,
     stage: Stage,

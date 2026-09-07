@@ -37,7 +37,9 @@ use crate::driver_diagnostic::{
     Source as DiagnosticSource, Stage as DiagnosticStage, Support as DiagnosticSupport,
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
-use crate::provider_session::{PROVIDER_POLL, STOP, describe_exit, install_signal_handler};
+use crate::provider_session::{
+    PROVIDER_POLL, STOP, completed_provider, describe_exit, install_signal_handler,
+};
 use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
 /// OpenCode MINORS whose `/event`, `/session`, and `prompt_async` surfaces were verified
@@ -251,7 +253,7 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
         match child.try_wait() {
             Ok(Some(exit)) => {
                 let _ = session.writer.ended(describe_exit(exit));
-                break completed(exit);
+                break completed_provider("opencode", exit);
             }
             Ok(None) => {}
             Err(error) => {
@@ -427,11 +429,6 @@ fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
     command
         .spawn()
         .with_context(|| format!("starting opencode provider {program}"))
-}
-
-fn completed(exit: ExitStatus) -> Result<()> {
-    anyhow::ensure!(exit.success(), "opencode provider exited with {exit}");
-    Ok(())
 }
 
 fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {

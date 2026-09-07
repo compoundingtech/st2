@@ -288,7 +288,7 @@ pub(crate) fn run_provider_observed(
     }
 }
 
-fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
+pub(crate) fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()> {
     anyhow::ensure!(exit.success(), "{provider} provider exited with {exit}");
     Ok(())
 }

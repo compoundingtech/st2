@@ -39,6 +39,8 @@ pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
+/// The stdio framing shared by the native channels; crate-internal.
+mod native_channel;
 pub mod omp_session;
 pub mod metrics;
 pub mod migrations;

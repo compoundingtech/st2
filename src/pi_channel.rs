@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
+use crate::driver_diagnostic::ProviderAuthEdge;
+use crate::native_channel::{channel_content, write_json};
 use crate::{context, driver_diagnostic, harness_context, harness_state, message};
 
 const POLL: Duration = Duration::from_millis(250);
@@ -63,13 +65,6 @@ const PRE_COMPACT_ERROR_REASON: &str = "pre-compact context recovery failed";
 /// therefore bounded by a single tool call's duration, not by the length of the job. What is not
 /// guaranteed is that displaced work resumes: the model chose to continue, once, on one model.
 const DELIVER_AS: &str = "steer";
-
-fn channel_content(subject: Option<&str>, body: &str) -> String {
-    match subject.filter(|value| !value.is_empty()) {
-        Some(subject) => format!("Subject: {subject}\n\n{body}"),
-        None => body.to_owned(),
-    }
-}
 
 /// The harness-specific facts the shared channel loop needs: which env names carry the wrapper's
 /// exported ownership triple, what label goes on records and errors, and which native-driver
@@ -268,7 +263,7 @@ fn channel_loop(
                 if let Some(driver) = kind.diagnostic_driver
                     && let Some(edge) = turn.as_ref().and_then(provider_auth_edge)
                 {
-                    publish_provider_auth(agent_dir, driver, edge);
+                    driver_diagnostic::publish_provider_auth(agent_dir, driver, edge);
                 }
                 // The numeric axis. There is deliberately no cadence here and no heartbeat timer:
                 // a producer holding no fresh reading must write nothing at all, so the record
@@ -459,13 +454,6 @@ fn turn_observation(result: &TurnResult<'_>) -> Option<harness_state::Observatio
     })
 }
 
-/// What one typed turn result proves about the seat's provider credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderAuthEdge {
-    Rejected,
-    Accepted,
-}
-
 /// The credential edge, or `None` when the turn proves nothing about it — which must leave a
 /// standing rejection alone rather than clearing it. A provider error of any other class is
 /// exactly that case: a rate limit says nothing about whether the credential is still good.
@@ -475,37 +463,6 @@ fn provider_auth_edge(result: &TurnResult<'_>) -> Option<ProviderAuthEdge> {
         TurnResult::ProviderError { classification, .. } => {
             provider_credential_rejected(*classification).then_some(ProviderAuthEdge::Rejected)
         }
-    }
-}
-
-/// Record one credential edge on the seat's native-driver diagnostic.
-///
-/// A fresh publisher per edge, like the Claude hook's: the on-disk fallback is what lets an
-/// ordinary turn end clear a rejection, and a channel that restarted mid-session inherits the
-/// predecessor's record rather than silently starting clean. Fail-open like every other
-/// observation in this loop — the publisher only warns on a write it cannot land, and delivery
-/// never depends on it.
-fn publish_provider_auth(
-    agent_dir: &Path,
-    driver: driver_diagnostic::Driver,
-    edge: ProviderAuthEdge,
-) {
-    let mut publisher = driver_diagnostic::Publisher::new(
-        agent_dir,
-        driver,
-        // The wrapper — not the channel — owns the version gate, and it refuses the launch on an
-        // unadmitted MINOR (OMP-R05), so a running channel has no version fact of its own to
-        // publish and no support verdict to restate.
-        None,
-        driver_diagnostic::Support::Unknown,
-    );
-    match edge {
-        ProviderAuthEdge::Rejected => publisher.publish(
-            driver_diagnostic::Stage::ProviderAuth,
-            driver_diagnostic::Reason::ProviderAuthRejected,
-            driver_diagnostic::Source::TurnResult,
-        ),
-        ProviderAuthEdge::Accepted => publisher.clear(driver_diagnostic::Stage::ProviderAuth),
     }
 }
 
@@ -687,12 +644,6 @@ fn message_frame(msg: message::Message, identity: &str) -> Value {
         "threadFilename": msg.in_reply_to.unwrap_or_else(|| msg.filename.clone()),
         "identity": identity
     }})
-}
-
-fn write_json(out: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *out, value)?;
-    out.write_all(b"\n")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1235,16 +1186,6 @@ mod tests {
             flake.contains(&pin),
             "flake.nix must pin the pi release the harness-context fixture measured ({pin})"
         );
-    }
-
-    #[test]
-    fn channel_content_reuses_the_claude_channel_envelope() {
-        assert_eq!(
-            channel_content(Some("subject"), "body"),
-            "Subject: subject\n\nbody"
-        );
-        assert_eq!(channel_content(None, "body"), "body");
-        assert_eq!(channel_content(Some(""), "body"), "body");
     }
 
     /// A restarting pi agent has to be told the same three things the Codex and Claude session-start
