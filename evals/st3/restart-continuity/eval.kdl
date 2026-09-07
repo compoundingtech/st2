@@ -11,7 +11,6 @@ version 2
             model "claude-sonnet-5"
             effort "medium"
             dev-channels #true
-            prompt #"You cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Claim only assigned graph work. Verify the ledger without editing it. Send person/eval-requester one final confirmation after verification. End the turn when no message remains."#
             args "--permission-mode" "bypassPermissions"
           }
           restart "never"
@@ -27,7 +26,6 @@ version 2
             model "claude-sonnet-5"
             effort "medium"
             dev-channels #true
-            prompt #"You cold-started in a hermetic st3 eval. Read CLAUDE.md. Use only st3 Small Talk. Never use Claude cross-session messaging, SendMessage, teams, or subagents. Drain and archive every message. Claim only assigned graph work. After you claim an outer step, use st3 work ls and complete every nested ready step before you complete the outer step. Follow each nested step in order. Use the graph, PROGRESS.md, and git as durable state. Never repeat a completed stable item ID. End the turn when no message remains."#
             args "--permission-mode" "auto"
           }
           restart "always"

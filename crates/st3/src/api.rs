@@ -2738,9 +2738,6 @@ async fn quick_agent(
     if driver == "claude" {
         driver_body.push_str("dev-channels #true\n");
     }
-    let prompt = request.prompt.as_deref().unwrap_or(
-        "Assist the user in this worktree. Use st3 message ls, read, reply, and archive for Small Talk messages.",
-    );
     if !request.arguments.is_empty() {
         driver_body.push_str("args");
         for argument in &request.arguments {
@@ -2748,7 +2745,9 @@ async fn quick_agent(
         }
         driver_body.push('\n');
     }
-    driver_body.push_str(&format!("prompt {prompt:?}\n"));
+    if let Some(prompt) = &request.prompt {
+        driver_body.push_str(&format!("prompt {prompt:?}\n"));
+    }
     let mission_id = format!("standing/{bus_id}");
     let kdl = format!(
         "version 2\nmission {mission_id:?} state=\"ready\" {{\n  goal \"Keep the agent ready for work and conversation.\"\n  agent {bus_id:?} {{\n    identity {bus_id:?}\n    workspace {:?}\n    harness {driver:?} {{\n{driver_body}    }}\n  }}\n}}\n",
@@ -2829,7 +2828,7 @@ async fn quick_agent(
         )));
     }
     signal_changed(state);
-    let runtime_id = format!("{}.{}", run.id, bus_id.replace('/', "."));
+    let runtime_id = format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', "."));
     let ready = state
         .store
         .latest_claim(&agent_subject, Some("harness.observed"))
@@ -6425,6 +6424,11 @@ version 2
             &member.launch,
             crate::model::LaunchSpec::Argv(argv)
                 if argv.windows(2).any(|pair| pair == ["driver", "claude"])
+        ));
+        assert!(matches!(
+            &member.launch,
+            crate::model::LaunchSpec::Argv(argv)
+                if argv.last().map(String::as_str) == Some(crate::boot::BOOT_PROMPT)
         ));
 
         let mut revised = request.clone();

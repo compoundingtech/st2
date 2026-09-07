@@ -107,7 +107,7 @@ The hold checks these facts:
 
 - the service runs the exact binary digest;
 - existing member process identities remain unchanged;
-- the supervisor adopts every expected local member;
+- the daemon adopts every expected local member;
 - new launches remain possible;
 - socket-owner and orphan counts do not increase;
 - the bus and PTY remain usable;

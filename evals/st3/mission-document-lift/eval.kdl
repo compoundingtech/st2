@@ -14,7 +14,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. Use only st3 message for Small Talk. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Do not perform inherited nested work before you claim that nested step. Follow inherited child steps through st3 work. After each child step, list assigned work and continue the same parent mission. During mission lifting, do not inspect inventory.json or create RESULT.md before the complete ready mission is published. Claim publish-ready-graph-mission before you run st3 work publish-mission. Use st3 work publish-mission exactly as assigned. Do not poll or publish routine progress. End only after the assigned parent step is complete and no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"

@@ -163,6 +163,7 @@ fn parse_mission(
     }
     let input_names = inputs.keys().cloned().collect::<BTreeSet<_>>();
     let mut goals = Vec::new();
+    let mut constraints = Vec::new();
     let mut baselines = Vec::new();
     let mut products = Vec::new();
     let mut gates = Vec::new();
@@ -182,6 +183,7 @@ fn parse_mission(
     for child in children.nodes() {
         match child.name().value() {
             "goal" => goals.push(plain_string(child)?),
+            "constraint" => push_constraint(&mut constraints, child, &format!("mission `{id}`"))?,
             "input" => {}
             "concurrent-runs" => {
                 if concurrent_runs_seen {
@@ -361,6 +363,7 @@ fn parse_mission(
         work_selector,
         completion,
         goals,
+        constraints,
         baselines,
         products,
         gates,
@@ -398,6 +401,7 @@ fn parse_step(
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let mut title = None;
     let mut goals = Vec::new();
+    let mut constraints = Vec::new();
     let mut assigned_to = None;
     let mut available_to = Vec::new();
     let mut agentless = false;
@@ -420,7 +424,13 @@ fn parse_step(
             let name = child.name().value();
             if !matches!(
                 name,
-                "goal" | "baseline" | "gate" | "depends-on" | "document" | "available-to"
+                "goal"
+                    | "constraint"
+                    | "baseline"
+                    | "gate"
+                    | "depends-on"
+                    | "document"
+                    | "available-to"
             ) && !crate::graph::is_mission_declaration(name)
                 && !names.insert(name.to_owned())
             {
@@ -432,6 +442,9 @@ fn parse_step(
             match name {
                 "title" => title = Some(first_string(child)?),
                 "goal" => goals.push(plain_string(child)?),
+                "constraint" => {
+                    push_constraint(&mut constraints, child, &format!("step `{path}`"))?
+                }
                 "baseline" => {
                     let baseline = parse_baseline(child)?;
                     if !baseline_names.insert(baseline.name.clone()) {
@@ -526,6 +539,7 @@ fn parse_step(
         path,
         title,
         goals,
+        constraints,
         timeout_ms,
         retry,
         finally,
@@ -785,6 +799,28 @@ fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Resul
             ),
         ));
     }
+    Ok(())
+}
+
+fn push_constraint(
+    constraints: &mut Vec<String>,
+    node: &KdlNode,
+    context: &str,
+) -> Result<(), St3Error> {
+    let constraint = plain_string(node)?;
+    if constraint.is_empty() || constraint.len() > 1_000 {
+        return Err(St3Error::new(
+            "invalid-constraint",
+            format!("a constraint in {context} must contain 1 through 1,000 bytes"),
+        ));
+    }
+    if constraints.contains(&constraint) {
+        return Err(St3Error::new(
+            "duplicate-constraint",
+            format!("{context} repeats constraint `{constraint}`"),
+        ));
+    }
+    constraints.push(constraint);
     Ok(())
 }
 
@@ -1825,6 +1861,65 @@ version 2
         )
         .unwrap_err();
         assert_eq!(duplicate_field.code, "duplicate-product-field");
+    }
+
+    #[test]
+    fn constraints_repeat_at_each_level_and_reject_empty_or_duplicate_text() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "safe" state="ready" {
+   goal "Do the work."
+   constraint "Do not push."
+   constraint "Keep private data outside Git."
+   step "inspect" {
+     constraint "Do not edit files."
+     constraint "Report only sanitized findings."
+   }
+ }"#,
+            "node",
+        )
+        .unwrap();
+        assert_eq!(
+            intent.missions["safe"].constraints,
+            ["Do not push.", "Keep private data outside Git."]
+        );
+        assert_eq!(
+            intent.missions["safe"].steps["inspect"].constraints,
+            ["Do not edit files.", "Report only sanitized findings."]
+        );
+
+        for (source, code) in [
+            (
+                r#"version 2
+ mission "empty" state="ready" { goal "Reject empty text."; constraint "" }"#,
+                "invalid-constraint",
+            ),
+            (
+                r#"version 2
+ mission "duplicate" state="ready" {
+   goal "Reject duplicate text."
+   constraint "Do not push."
+   constraint "Do not push."
+ }"#,
+                "duplicate-constraint",
+            ),
+            (
+                r#"version 2
+ mission "duplicate-step" state="ready" {
+   goal "Reject duplicate step text."
+   step "work" {
+     constraint "Do not push."
+     constraint "Do not push."
+   }
+ }"#,
+                "duplicate-constraint",
+            ),
+        ] {
+            assert_eq!(
+                crate::graph::parse_intent(source, "node").unwrap_err().code,
+                code
+            );
+        }
     }
 
     #[test]

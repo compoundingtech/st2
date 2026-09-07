@@ -10,7 +10,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. Use only st3 message for Small Talk. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Follow inherited child steps through st3 work. After each child step, list assigned work and continue the same parent mission. Never edit the worker repository. Do not poll or publish routine progress. Send only the planned delegation and final confirmation. End only after the assigned parent step is complete and no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -21,7 +20,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. Use only st3 message for Small Talk. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive every message. Claim only assigned graph work. Follow inherited child steps through st3 work. After each child step, list assigned work and continue the same parent mission. Work only in this repository. Do not poll or publish routine progress. Send only the planned final report. End only after the assigned parent step is complete and no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"

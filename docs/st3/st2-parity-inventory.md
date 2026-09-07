@@ -50,6 +50,7 @@ Unknown grammar is an error. Extensible subjects use `custom/`, extensible claim
 | Create an owned workspace | Add `create=#true` to the workspace declaration | Implemented |
 | Carry a stable identity | Use the mission-run-owned full agent subject | Implemented |
 | Show grouping | Use repeated `under` metadata with an optional reason | Implemented |
+| Keep continuous work active | Use one open mission, finite nested cycles, and a recurring schedule | Implemented and evaluated |
 
 Every runtime belongs to one mission run. An agent subject has the form `agent/RUN/LOCAL_ID`.
 
@@ -66,6 +67,12 @@ A nested task gets its parent agent in `ST_AGENT`. An agentless runtime has no `
 `${PATH}` expands from the daemon path. Native services use a deterministic path that includes common user and system binary directories.
 
 This behavior supports shipped `git` and `gh` shims without baking the installer shell path into the service.
+
+Every native harness workspace receives the canonical `.st3/boot.md` in the shared render transaction.
+
+The native driver appends the exact boot instruction once. An authored harness prompt is optional.
+
+Mission and step constraints travel with graph work. They do not replace universal boot guidance.
 
 ## Harnesses and delivery
 
@@ -84,6 +91,8 @@ Pi, OpenCode, and OMP need later provider-backed evals. Their model-free argumen
 The explicit DING child checks the local st3 API once per second. It writes one incarnation-fenced terminal line and records `message.delivered`.
 
 The DING child does not use an st2 filesystem bus. The mission run owns and cleans up the child.
+
+Runtime faults use `harness.diagnostic`. st3 does not need a supervisor, root, or chief-of-staff agent for host control.
 
 ## Messages and work
 
@@ -118,6 +127,8 @@ The roster has no role selector. An agent can inspect or filter the stable full 
 | Harness session file | `harness.session-file` | Registered |
 | Harness usage | `harness.usage` | Registered |
 | Custom resource | `custom.*` kind | Implemented |
+
+Host declarations can name exact immutable host documents. An absent document blocks publication before a runtime starts.
 
 `local.file` returns status, path, hash, size, mode, and an optional reason. It never publishes file content.
 
@@ -185,6 +196,8 @@ The branch is ready for a fleet trial when these checks are green:
 6. A macOS build passes the launchd unit contract before the Silber trial.
 
 The live fleet cutover remains a separate operation. It must move one agent at a time and must not change st2 history.
+
+[agent-migration.md](./agent-migration.md) gives the isolated rehearsal and one-agent cutover sequence.
 
 ## Deliberate later work
 

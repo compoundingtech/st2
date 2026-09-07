@@ -29,7 +29,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Use messages only for blockers and the required final report. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -44,7 +43,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -59,7 +57,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"
@@ -74,7 +71,6 @@ version 2
           harness "codex" {
             model "gpt-5.6-sol"
             effort "medium"
-            prompt "Read AGENTS.md. st3 sends each assigned parent mission as a Small Talk message. Drain, read, and archive each message. Follow inherited nested steps through st3 work. Use plain CLI output. Do not use --json, request help, or publish routine progress. Do not start unassigned work. End the turn when no message remains."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
           restart "never"

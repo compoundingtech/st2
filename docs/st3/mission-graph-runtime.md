@@ -48,7 +48,6 @@ mission "release" state="ready" revisions="human-only" revision-reviewer="person
         harness "codex" {
           model "gpt-5.6-sol"
           effort "medium"
-          prompt "Claim assigned st3 work and publish the release decision."
         }
     }
     agent "release.test" {
@@ -57,7 +56,6 @@ mission "release" state="ready" revisions="human-only" revision-reviewer="person
         harness "codex" {
           model "gpt-5.6-sol"
           effort "medium"
-          prompt "Claim assigned st3 work and publish the test evidence."
         }
     }
 
@@ -136,6 +134,7 @@ mission "MISSION_ID"
   goal "One measurable mission goal."
   goal "An optional second goal."
   goal "An optional third goal."
+  constraint "A mission-specific rule for this work."
 
   input "message" kind="text"
   input "source" kind="resource"
@@ -164,7 +163,7 @@ Mission IDs can contain path separators. Step IDs cannot. IDs cannot be empty, c
 
 Mission goal order is preserved. Each mission must have one, two, or three goals.
 
-A mission can repeat baselines and gates. Their names must be unique within that mission. A mission has at most one `produces` block.
+A mission can repeat constraints, baselines, and gates. Gate and baseline names must be unique within that mission. A mission has at most one `produces` block.
 
 A mission can repeat `input`. Each input name is unique and uses `kind="text"` or `kind="resource"`.
 
@@ -229,6 +228,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   goal "One optional goal."
   goal "A second optional goal."
   goal "A third optional goal."
+  constraint "A step-specific rule for this work."
   available-to "agent/${ST_MISSION_RUN}/worker-a"
   available-to "agent/${ST_MISSION_RUN}/worker-b"
   document "doc/project/request@SHA256"
@@ -250,7 +250,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 
 `title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, and `uses-mission` are single fields.
 
-`available-to`, `goal`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
+`available-to`, `goal`, `constraint`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
 
 `timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
 
@@ -269,6 +269,20 @@ A goal is a concise, falsifiable statement about the result.
 Use one `goal` node for one statement. Use up to three nodes when the mission or step has separate required outcomes.
 
 Do not use source order or bullet syntax inside one string to create hidden execution structure. Steps and `depends-on` own execution structure.
+
+## Mission constraints
+
+A constraint states a rule that is specific to one mission or step.
+
+A mission and a step can repeat `constraint`. An exact duplicate in one block is an error.
+
+The effective order is each outer mission, its parent step, each nested mission, and the leaf step.
+
+st3 shows the effective list when an agent shows or claims work.
+
+Do not repeat universal st3 behavior as a mission constraint. The generated boot file defines that behavior.
+
+Do not disable harness features to make an eval pass. A mission constraint must describe a real mission requirement.
 
 ## Mission inputs
 
@@ -576,6 +590,24 @@ An agentless `exec` or `pty` receives `ST3_SUBJECT` and no `ST_AGENT`.
 
 An unknown variable or a variable that is not available in the current phase is an error.
 
+## Agent boot contract
+
+An agent harness prompt is optional.
+
+st3 appends this exact text once to every agent launch:
+
+```text
+Read @.st3/boot.md completely. Then list and claim your current st3 work.
+```
+
+The shared render transaction writes the canonical `.st3/boot.md` before a native harness starts.
+
+The file explains graph work, Small Talk, wait behavior, and diagnostics. It does not contain a mission goal.
+
+An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
+
+A tracked file at `.st3/boot.md` causes the complete render transaction to fail before any runtime starts.
+
 ## Workspace existence
 
 st3 requires every member workspace to exist before the member starts.
@@ -607,6 +639,10 @@ The nested exec receives the agent subject through `ST_AGENT`. It checks the loc
 
 The mission run owns and cleans up both runtimes. No implicit `ding` field exists in st3 KDL.
 
+A provider or runtime fault creates a `harness.diagnostic` claim. The roster and mission views show the fault.
+
+The runtime can also send one fault message for a new diagnostic epoch. st3 does not require a special supervisor, root, or chief-of-staff agent.
+
 ## Agent grouping
 
 `under` is repeatable agent metadata.
@@ -627,6 +663,22 @@ The relation is visible in `st3 agents --json`, status, and assigned work. It is
 The relation does not create permission, lifecycle, scheduling, or mandatory reporting behavior.
 
 Missing targets, self-relations, and cycles create warnings during preview. They do not block publication or another agent.
+
+## Host documents
+
+A root host declaration can repeat exact document references:
+
+```kdl
+host "local" {
+  document "doc/hosts/local@SHA256"
+}
+```
+
+The host document gives stable host facts to agents on that host. It must not contain current work.
+
+Publication fails with `missing-document` until the exact document bytes exist in the local store.
+
+A bare document name is invalid in a host declaration. A later version needs a new hash and a new declaration.
 
 ## Work selection
 
@@ -728,6 +780,18 @@ An exact repeated cancellation is idempotent. The old run and its immutable gene
 
 st3 sends a cancellation message to each active claimant. The message tells the agent to stop that step.
 
+## Continuous missions
+
+A continuous mission stays open after its current steps are exhausted. It does not need a separate mission type.
+
+A recurring schedule can send a wake message. The message tells an agent to inspect its available work.
+
+Each finite cycle can be a nested mission. The parent mission keeps the stable agent and the cycle history.
+
+Use `catch-up "latest"` when a restart must create at most one missed wake occurrence.
+
+The schedule does not assign work. It only creates a new graph event and message.
+
 ## Mission revisions
 
 Revision authority comes from agent placement in the current generation.
@@ -816,6 +880,10 @@ st3 doc list doc/project/request
 ```
 
 Bare document names can appear in an intent before preview. The preview resolves them to the current exact hash. Apply validates the bytes and binds that exact version.
+
+Do not store credentials or raw private measurements in Git or shared st3 documents.
+
+Store a summary, a redacted sample, or a hash when later work needs durable evidence. Keep raw private data in a restricted external store.
 
 ## Preview, publish, and start
 

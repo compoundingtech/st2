@@ -2,7 +2,7 @@
 set -euo pipefail
 
 declare -a daemons=()
-root="$(mktemp -d "${TMPDIR:-/tmp}/st3-network-isolation.XXXXXX")"
+root="$(mktemp -d "${TMPDIR:-/tmp}/s3ni.XXXXXX")"
 wait_for_terminal_cleanup() {
   local socket="$1" run_id="$2" phase=""
   for _ in $(seq 1 200); do
@@ -34,7 +34,7 @@ cleanup() {
         failed=1
       fi
     fi
-    remove_test_ptys "$root/$name/state/pty"
+    remove_test_ptys "$root/$name/pty"
   done
   for daemon in "${daemons[@]:-}"; do kill -TERM "$daemon" 2>/dev/null || true; wait "$daemon" 2>/dev/null || true; done
   rm -rf "$root"
@@ -46,14 +46,20 @@ for name in a b; do
   mkdir -p "$root/$name"
   socket="$root/$name/st3.sock"
   state="$root/$name/state"
-  st3 up --node "net-$name" --state-dir "$state" --socket "$socket" >"$name/daemon.log" 2>&1 &
+  st3 up --node "net-$name" --state-dir "$state" --socket "$socket" --pty-root "$root/$name/pty" >"$name/daemon.log" 2>&1 &
   daemons+=("$!")
   for _ in $(seq 1 100); do st3 --endpoint "$socket" doctor >/dev/null 2>&1 && break; sleep 0.05; done
   cat >"$name/network.kdl" <<KDL
 version 2
 mission "fixture/network-$name" state="ready" {
   goal "Keep one isolated message target and PTY available."
-  agent "net.$name" { workspace "$PWD"; command "sleep 300"; restart "never"; env { ST3_MESSAGE_ROOT "$state/messages" } }
+  agent "net.$name" {
+    workspace "$PWD"
+    command "sleep 300"
+    restart "never"
+    env { ST3_MESSAGE_ROOT "$state/messages" }
+    exec "ding" { argv "st3" "driver" "ding" }
+  }
   pty "session-$name" { workspace "$PWD"; command "bash -c 'echo ${name^^}-READY; sleep 300'"; restart "never" }
 }
 KDL
@@ -67,8 +73,8 @@ agent_a="agent/$run_a/net.a"
 agent_b="agent/$run_b/net.b"
 pty_a="pty/$run_a/session-a"
 pty_b="pty/$run_b/session-b"
-ida="$(st3 --endpoint "$root/a/st3.sock" message send "$agent_a" --from source -m NETA-SECRET)"
-idb="$(st3 --endpoint "$root/b/st3.sock" message send "$agent_b" --from source -m NETB-SECRET)"
+ida="$(st3 --endpoint "$root/a/st3.sock" message send "$agent_a" --from person/source -m NETA-SECRET)"
+idb="$(st3 --endpoint "$root/b/st3.sock" message send "$agent_b" --from person/source -m NETB-SECRET)"
 st3 --endpoint "$root/a/st3.sock" pty ls --json >a/pty.json
 st3 --endpoint "$root/b/st3.sock" pty ls --json >b/pty.json
 st3 --endpoint "$root/a/st3.sock" message ls "$agent_a" --json >a/messages.json

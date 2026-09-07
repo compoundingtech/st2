@@ -87,7 +87,7 @@ enum Command {
     Wait(WaitArgs),
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
-    /// Manage the Linux st3 user service.
+    /// Manage the Linux or macOS st3 user service.
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -1548,7 +1548,7 @@ async fn start_mission_run(
 async fn follow_mission_run(
     client: &Client,
     mut run: MissionRunView,
-    mut cursor: u64,
+    _cursor: u64,
     json_output: bool,
 ) -> Result<()> {
     let mut prior = String::new();
@@ -1571,15 +1571,7 @@ async fn follow_mission_run(
             }
             _ => {}
         }
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}&owner_run={}&wait=true&timeout_ms=30000",
-                urlencoding::encode(&run.subject)
-            ))
-            .await?;
-        if let Some(last) = events.last() {
-            cursor = last.store_index;
-        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
         run = client
             .get(&format!(
                 "/v1/mission-runs/{}",
@@ -1991,6 +1983,24 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
             if event.kind == "runtime.action.failed" {
                 anyhow::bail!("{} failed: {}", subject, event.body);
             }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_message_view(client: &Client, subject: &str, mut cursor: u64) -> Result<()> {
+    loop {
+        if read_message(client, subject).await.is_ok() {
+            return Ok(());
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&subject={}&wait=false",
+                urlencoding::encode(subject)
+            ))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -3638,6 +3648,9 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 for goal in step.goals {
                     println!("Goal: {goal}");
                 }
+                for constraint in step.constraints {
+                    println!("Constraint: {constraint}");
+                }
                 for grouping in step.under {
                     match grouping.reason {
                         Some(reason) => println!("Under: {} ({reason})", grouping.agent),
@@ -3893,6 +3906,9 @@ async fn post_work(
             for goal in response.goals {
                 println!("Goal: {goal}");
             }
+            for constraint in response.constraints {
+                println!("Constraint: {constraint}");
+            }
         }
         Ok(())
     }
@@ -4079,11 +4095,13 @@ async fn run_message(client: &Client, command: MessageCommand, json_output: bool
 async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<MessageView>> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let mission_id = format!("message/{id}");
+    let from = normalize_message_subject(&args.from);
+    let to = normalize_message_subject(&args.to);
     let kdl = message_mission_intent(
         &mission_id,
         &id,
-        &args.from,
-        &args.to,
+        &from,
+        &to,
         &args.body,
         args.subject.as_deref(),
         args.in_reply_to.as_deref(),
@@ -4093,7 +4111,7 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
         print!("{kdl}");
         return Ok(None);
     }
-    let actor = normalize_message_subject(&args.from);
+    let actor = from;
     let parsed = st3::parse_intent(&kdl, "local")?;
     let revision = parsed.missions[&mission_id].revision.clone();
     publish_text(
@@ -4116,7 +4134,7 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
     let applied =
         publish_text(client, run_kdl, format!("st3 message send {id} run"), actor).await?;
     let subject = format!("message/{id}");
-    wait_for_actual(client, &subject, applied.store_index).await?;
+    wait_for_message_view(client, &subject, applied.store_index).await?;
     read_message(client, &subject).await.map(Some)
 }
 
@@ -4944,7 +4962,7 @@ async fn run_quick(
         mission: format!("mission/{mission_id}"),
         mission_run: run.subject,
         generation: run.generation,
-        runtime_id: format!("{}.{}", run.id, bus_id.replace('/', ".")),
+        runtime_id: format!("{}.{}", run.id.replace('/', "."), bus_id.replace('/', ".")),
         event_cursor: cursor,
         incarnation_id: None,
         ready,
@@ -5017,10 +5035,6 @@ fn quick_agent_intent(
         development.entries_mut().push(KdlEntry::new(true));
         harness_body.nodes_mut().push(development);
     }
-    harness_body.nodes_mut().push(kdl_node(
-        "prompt",
-        ["Assist the user in this worktree. Use st3 message ls, read, reply, and archive for Small Talk messages."],
-    ));
     let mut harness = KdlNode::new("harness");
     harness.entries_mut().push(KdlEntry::new(driver));
     harness.set_children(harness_body);
@@ -5957,36 +5971,10 @@ fn work_message_request(
 }
 
 fn work_notification(step: &StepRunView) -> String {
-    let goals = if step.goals.is_empty() {
-        "Follow the step definition and publish its required graph products.".into()
-    } else {
-        step.goals
-            .iter()
-            .map(|goal| format!("- {goal}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let under = if step.under.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nGrouping: {}",
-            step.under
-                .iter()
-                .map(|grouping| match &grouping.reason {
-                    Some(reason) => format!("{} ({reason})", grouping.agent),
-                    None => grouping.agent.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
     format!(
-        "A durable st3 mission step is ready. This Small Talk message contains the full assignment. Run `st3 work claim {0}` with plain output. Do not use `--json` or run help. A parent claim exposes its inherited nested steps. Those steps do not send separate Small Talk messages. Use plain `st3 work ls` to find, claim, and complete each ready nested step. The claim prints the step goals. Use `st3 work progress {0}` only for a material update. Finish with `st3 work complete {0}` or `st3 work fail {0}`. The `--evidence` option accepts stored claim IDs only.\n\nTitle: {1}\nGoals:\n{2}{3}",
+        "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
-        goals,
-        under,
     )
 }
 
@@ -6795,6 +6783,7 @@ mod tests {
             agentless: false,
             title: Some("Build the change".into()),
             goals: vec!["Implement and test the requested change.".into()],
+            constraints: Vec::new(),
             under: Vec::new(),
             worker_reported: false,
             claimant: None,
@@ -6826,17 +6815,11 @@ mod tests {
                 "mission-run:mission-run/run-1"
             ]
         );
-        assert!(
-            request
-                .content
-                .contains("st3 work claim step-run/run-1/build")
+        assert_eq!(
+            request.content,
+            "A mission step is ready: step-run/run-1/build. Run `st3 work claim step-run/run-1/build` to read and claim it.\n\nTitle: Build the change"
         );
-        assert!(
-            request
-                .content
-                .contains("Implement and test the requested change.")
-        );
-        assert!(request.content.contains("Do not use `--json`"));
+        assert!(!request.content.contains(&step.goals[0]));
 
         let message = MessageView {
             subject: "message/work".into(),
@@ -6899,6 +6882,7 @@ mod tests {
             agentless: false,
             title: None,
             goals: Vec::new(),
+            constraints: Vec::new(),
             under: Vec::new(),
             worker_reported: false,
             claimant: None,
@@ -7085,6 +7069,7 @@ mod tests {
                 _ => step.into(),
             }),
             goals: Vec::new(),
+            constraints: Vec::new(),
             under: Vec::new(),
             worker_reported: false,
             claimant: None,

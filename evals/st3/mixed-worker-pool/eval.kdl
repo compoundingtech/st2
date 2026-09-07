@@ -10,7 +10,6 @@ version 2
         agent "pool.codex" {
           workspace "${ST_WORKSPACE}"
           harness "codex" {
-            prompt "Use only st3 Small Talk. Read and archive each message. Run st3 work ls after a work notice. Claim one ready pool step. If another agent wins it, claim the other ready step. Follow its goal, complete it, and claim no second step."
             args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
           }
         }
@@ -20,7 +19,6 @@ version 2
           harness "claude" {
             dev-channels #true
             model "claude-sonnet-5"
-            prompt "Use only st3 Small Talk. Read and archive each message. Run st3 work ls after a work notice. Claim one ready pool step. If another agent wins it, claim the other ready step. Follow its goal, complete it, and claim no second step."
             args "--permission-mode" "bypassPermissions"
           }
         }

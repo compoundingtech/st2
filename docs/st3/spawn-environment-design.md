@@ -6,7 +6,7 @@ This document records a design. It does not change runtime behavior.
 
 Every new member receives one constructed environment.
 
-The runtime never copies the supervisor environment into a member.
+The runtime never copies the daemon environment into a member.
 
 The same contract applies to exec members, PTY members, native drivers, and manual PTY restarts.
 
@@ -20,7 +20,7 @@ The current PTY runtime passes repeated `--env` values. The `pty` launcher and m
 
 The st2 launcher has the same inheritance. It removes only `NO_COLOR` from managed agents.
 
-Declaration expansion also falls back to the supervisor environment for an unresolved variable.
+Declaration expansion also falls back to the daemon environment for an unresolved variable.
 
 These paths let an unrelated `PATH` entry or provider marker enter every child process.
 
@@ -38,13 +38,13 @@ account base
   = final member environment
 ```
 
-The supervisor process environment is not a fifth layer.
+The daemon process environment is not a fifth layer.
 
 Later layers replace earlier values. Runtime-owned values replace every conflicting authored value.
 
 Variable expansion reads only values from completed lower layers. An unknown variable is an error.
 
-This rule keeps `PATH "/workspace/bin:$PATH"` useful without reading the supervisor's `PATH`.
+This rule keeps `PATH "/workspace/bin:$PATH"` useful without reading the daemon's `PATH`.
 
 ### Account base
 
@@ -53,7 +53,7 @@ The account base contains only account facts that the runtime derives from the o
 | Name | Source | Rule |
 | --- | --- | --- |
 | `HOME` | The effective user account | The path must be absolute and owned by the effective user. |
-| `USER` | The effective user account | The value never comes from the supervisor environment. |
+| `USER` | The effective user account | The value never comes from the daemon environment. |
 | `LOGNAME` | The effective user account | The value equals `USER`. |
 | `SHELL` | The effective user account | The path must be absolute. |
 
@@ -153,7 +153,7 @@ The st2 PTY adapter and the st3 PTY runtime must both require replace mode.
 
 ## PTY capability proof
 
-The supervisor must prove replace mode by behavior before it launches a managed PTY.
+The daemon must prove replace mode by behavior before it launches a managed PTY.
 
 A version string or a successful exit is not sufficient. An old binary can ignore an unknown option.
 

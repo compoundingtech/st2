@@ -1877,6 +1877,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         agentless: true,
                         title: None,
                         goals: Vec::new(),
+                        constraints: Vec::new(),
                         under: Vec::new(),
                         worker_reported: false,
                         claimant: None,
@@ -2582,8 +2583,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .filter(|claim| claim.kind == "observer.state")
                 .filter(|claim| {
                     claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
-                        && claim.body.pointer("/fields/reason").and_then(Value::as_str)
-                            == Some("manual refresh")
                 })
                 .and_then(|claim| {
                     claim
@@ -5159,15 +5158,20 @@ version 2
     #[test]
     fn a_started_member_gets_its_graph_identity() {
         let store = Arc::new(Store::open_memory("node").unwrap());
-        let source = r#"
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"
             version 2
 
-              agent "worker" {
+              agent "worker" {{
+                workspace {:?}
                 command "true"
-              }
+              }}
 
-        "#;
-        apply_source(&store, source, "member-identity");
+        "#,
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "member-identity");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store,
@@ -5195,15 +5199,20 @@ version 2
     #[test]
     fn a_native_driver_uses_the_running_st3_executable() {
         let store = Arc::new(Store::open_memory("node").unwrap());
-        let source = r#"
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"
             version 2
 
-              agent "worker" {
-                harness "codex" { prompt "Wait for work." }
-              }
+              agent "worker" {{
+                workspace {:?}
+                harness "codex" {{ prompt "Wait for work." }}
+              }}
 
-        "#;
-        apply_source(&store, source, "native-driver-executable");
+        "#,
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "native-driver-executable");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store,
@@ -5222,6 +5231,44 @@ version 2
             argv.first().map(Path::new),
             Some(std::env::current_exe().unwrap().as_path())
         );
+    }
+
+    #[test]
+    fn a_boot_render_refusal_prevents_the_agent_start() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(workspace.path().join(".st3")).unwrap();
+        std::fs::write(
+            workspace.path().join(".st3/boot.md"),
+            "repository-owned boot text\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".st3/boot.md"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        apply_source(&store, &source, "boot-render-refusal");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        let error = reconciler.reconcile_once().unwrap_err();
+        assert!(error.to_string().contains("tracked file"));
+        assert!(runtime.starts.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -6337,6 +6384,92 @@ version 2
                 .count(),
             1,
             "{schedule_claims:#?}"
+        );
+        assert_eq!(store.messages(None, true).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recurring_schedule_sends_distinct_ordered_occurrences() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let anchor = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let source = format!(
+            r#"version 2
+ schedule "cycle" {{
+   every "60ms"
+   anchor "{anchor}"
+   catch-up "latest"
+   message {{ to "worker"; content "Inspect current work." }}
+ }}"#
+        );
+        apply_source(&store, &source, "recurring-schedule");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(65)).await;
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let reached = store
+            .claims_for("schedule/cycle", Some("schedule.occurrence-reached"))
+            .unwrap();
+        let occurrences = reached
+            .iter()
+            .map(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/occurrence")
+                    .and_then(Value::as_u64)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(occurrences, [0, 1]);
+        assert_eq!(store.messages(None, true).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn latest_catch_up_sends_only_the_current_missed_occurrence() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let anchor = (Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let source = format!(
+            r#"version 2
+ schedule "cycle" {{
+   every "1s"
+   anchor "{anchor}"
+   catch-up "latest"
+   message {{ to "worker"; content "Inspect current work." }}
+ }}"#
+        );
+        apply_source(&store, &source, "latest-catch-up");
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let reached = store
+            .claims_for("schedule/cycle", Some("schedule.occurrence-reached"))
+            .unwrap();
+        assert_eq!(reached.len(), 1);
+        assert!(
+            reached[0]
+                .body
+                .pointer("/fields/occurrence")
+                .and_then(Value::as_u64)
+                .unwrap()
+                >= 9
         );
         assert_eq!(store.messages(None, true).unwrap().len(), 1);
     }

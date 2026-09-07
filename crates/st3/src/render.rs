@@ -226,17 +226,34 @@ pub fn apply_all(
         let Some(member) = subject.member.as_ref().filter(|member| member.host == host) else {
             continue;
         };
-        let Some(render) = children(&subject.desired)
+        let native_harness = subject.kind == "agent"
+            && children(&subject.desired)
+                .iter()
+                .any(|child| name(child) == Some("harness"));
+        let render = children(&subject.desired)
             .iter()
-            .find(|child| name(child) == Some("render"))
-        else {
+            .find(|child| name(child) == Some("render"));
+        if render.is_none() && !native_harness {
             continue;
-        };
+        }
         let workspace = Path::new(&member.workspace);
         if !workspace.exists() && !member.workspace_create {
             anyhow::bail!("workspace {} does not exist", workspace.display());
         }
-        let (writes, warnings) = prepare_render(store, render, workspace)?;
+        let (mut writes, warnings) = match render {
+            Some(render) => prepare_render(store, render, workspace)?,
+            None => (Vec::new(), Vec::new()),
+        };
+        if native_harness {
+            let destination = destination(workspace, ".st3/boot.md")?;
+            let bytes = crate::boot::BOOT_DOCUMENT.as_bytes().to_vec();
+            ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+            writes.push(PlannedWrite {
+                destination,
+                bytes,
+                mode: 0o644,
+            });
+        }
         let receipts = writes
             .iter()
             .map(|write| RenderReceipt {
@@ -556,6 +573,86 @@ mod tests {
         let error = apply_all(&store, &desired, "node").unwrap_err();
         assert!(error.to_string().contains("disagree"));
         assert!(!workspace.path().join("shared").exists());
+    }
+
+    #[test]
+    fn every_native_harness_agent_gets_one_shared_boot_document() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+
+  agent "one" {{ workspace {:?}; harness "codex" {{}} }}
+  agent "two" {{ workspace {:?}; harness "claude" {{}} }}
+"#,
+            workspace.path().display().to_string(),
+            workspace.path().display().to_string(),
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+
+        let result = apply_all(&store, &desired, "node").unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.values().all(|value| value.receipts.len() == 1));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap(),
+            crate::boot::BOOT_DOCUMENT
+        );
+        assert_eq!(
+            fs::metadata(workspace.path().join(".st3/boot.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn a_raw_command_agent_does_not_get_a_harness_boot_document() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"one\" {{ workspace {:?}; command \"true\" }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+
+        let result = apply_all(&store, &desired, "node").unwrap();
+        assert!(result.is_empty());
+        assert!(!workspace.path().join(".st3/boot.md").exists());
+    }
+
+    #[test]
+    fn the_boot_document_does_not_replace_a_conflicting_tracked_file() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        fs::create_dir_all(workspace.path().join(".st3")).unwrap();
+        fs::write(workspace.path().join(".st3/boot.md"), "repository policy\n").unwrap();
+        Command::new("git")
+            .args(["add", ".st3/boot.md"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let source = format!(
+            "version 2\nagent \"one\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+
+        let error = apply_all(&store, &desired, "node").unwrap_err();
+        assert!(error.to_string().contains("tracked file"));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap(),
+            "repository policy\n"
+        );
     }
 
     #[test]

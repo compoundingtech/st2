@@ -1,8 +1,8 @@
 # st3 data authority
 
-This document classifies each SQLite table in schema version 9.
+This document classifies each SQLite table in schema version 10.
 
-Schema version 9 does not migrate an earlier database. Start the renamed system with a new state directory.
+Schema version 10 does not migrate an earlier database. Start the renamed system with a new state directory.
 
 The claim log and immutable blobs are the durable graph authority.
 

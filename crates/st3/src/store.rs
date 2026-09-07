@@ -206,6 +206,7 @@ CREATE TABLE IF NOT EXISTS step_runs (
     readiness_epoch INTEGER NOT NULL DEFAULT 0,
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL,
+    constraints TEXT NOT NULL DEFAULT '[]',
     UNIQUE(generation_id, step_path)
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
@@ -265,7 +266,7 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;
 "#;
 
 pub struct Store {
@@ -288,11 +289,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 9,
+        table_count == 0 || version == 10,
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 9,
+        version == 0 || version == 10,
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -889,8 +890,8 @@ impl Store {
             )
             .map_err(internal)?;
         let mut flat = Vec::new();
-        flatten_steps(&mission, default_selector.clone(), &mut flat);
-        for (step, selector) in flat {
+        flatten_steps(&mission, default_selector.clone(), &[], &mut flat);
+        for (step, selector, constraints) in flat {
             let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
             let step_subject = format!("step-run/{generation_id}/{}", step.path);
             let mut step_variables = variables.clone();
@@ -911,11 +912,12 @@ impl Store {
                 .map(|value| crate::mission::interpolate(value, &step_variables))
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
+            let constraints = interpolate_goals(&constraints, &step_variables)?;
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-                    params![step_subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, now.to_string()],
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms, constraints)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
+                    params![step_subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, now.to_string(), constraints],
                 )
                 .map_err(internal)?;
         }
@@ -1011,7 +1013,7 @@ impl Store {
         let current = transaction
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                  FROM step_runs WHERE subject=?1",
                 [&subject],
                 step_run_from_row,
@@ -1115,7 +1117,7 @@ impl Store {
         let current = connection
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                  FROM step_runs WHERE subject=?1",
                 [&subject],
                 step_run_from_row,
@@ -1974,7 +1976,7 @@ impl Store {
         }
 
         let mut new_steps = Vec::new();
-        flatten_steps(mission, None, &mut new_steps);
+        flatten_steps(mission, None, &[], &mut new_steps);
 
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some(response) = connection
@@ -2006,7 +2008,7 @@ impl Store {
                 params![generation_id, run_id, mission.revision, predecessor_id, actor, reason, now.to_string()],
             )
             .map_err(internal)?;
-        for (step, selector) in new_steps {
+        for (step, selector, constraints) in new_steps {
             let (assignee, available_to, agentless) =
                 interpolate_selector(&selector, &successor_variables)?;
             let subject = format!("step-run/{generation_id}/{}", step.path);
@@ -2033,6 +2035,7 @@ impl Store {
                 .map(|value| crate::mission::interpolate(value, &step_variables))
                 .transpose()?;
             let goals = interpolate_goals(&step.goals, &step_variables)?;
+            let constraints = interpolate_goals(&constraints, &step_variables)?;
             let status = carried
                 .map(|old| match old.status.as_str() {
                     "claimed" | "working" | "verifying" => "ready",
@@ -2047,9 +2050,9 @@ impl Store {
                 .map(|value| value.to_string());
             transaction
                 .execute(
-                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
-                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string()],
+                    "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
+                    params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
                 )
                 .map_err(internal)?;
             if let Some(old) = carried {
@@ -2226,7 +2229,7 @@ impl Store {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
              WHERE agentless=0
                AND (
@@ -2255,7 +2258,7 @@ impl Store {
         connection
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                  FROM step_runs WHERE subject=?1",
                 [subject],
                 step_run_from_row,
@@ -2294,7 +2297,7 @@ impl Store {
         let current = transaction
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                  FROM step_runs WHERE subject=?1",
                 [&subject],
                 step_run_from_row,
@@ -2468,7 +2471,7 @@ impl Store {
         .map_err(internal)?;
         let view = transaction.query_row(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
         transaction
             .execute(
@@ -5671,8 +5674,8 @@ fn create_declared_mission_run_tx(
         )
         .map_err(internal)?;
     let mut flat = Vec::new();
-    flatten_steps(&mission, None, &mut flat);
-    for (step, selector) in flat {
+    flatten_steps(&mission, None, &[], &mut flat);
+    for (step, selector, constraints) in flat {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let step_subject = format!("step-run/{generation_id}/{}", step.path);
         let mut step_variables = variables.clone();
@@ -5692,10 +5695,11 @@ fn create_declared_mission_run_tx(
             .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
+        let constraints = interpolate_goals(&constraints, &step_variables)?;
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms, constraints)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
                 params![
                     step_subject,
                     run_id,
@@ -5707,7 +5711,8 @@ fn create_declared_mission_run_tx(
                     agentless,
                     title,
                     goals,
-                    now.to_string()
+                    now.to_string(),
+                    constraints
                 ],
             )
             .map_err(internal)?;
@@ -5954,9 +5959,9 @@ fn adopt_declared_mission_revision_tx(
     let mut variables = variables;
     variables.insert("ST_RUN_GENERATION".into(), generation_id.clone());
     let mut flat = Vec::new();
-    flatten_steps(&next, None, &mut flat);
+    flatten_steps(&next, None, &[], &mut flat);
     let mut claim_ids = Vec::new();
-    for (step, selector) in flat {
+    for (step, selector, constraints) in flat {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let subject = format!("step-run/{generation_id}/{}", step.path);
         let carried = compatible
@@ -5982,6 +5987,7 @@ fn adopt_declared_mission_revision_tx(
             .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
+        let constraints = interpolate_goals(&constraints, &step_variables)?;
         let status = carried
             .map(|old| match old.status.as_str() {
                 "claimed" | "working" | "verifying" => "ready",
@@ -5995,9 +6001,9 @@ fn adopt_declared_mission_revision_tx(
             .map(|value| value.to_string());
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string()],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, blocked_reason, not_before, carried.map(|old| old.readiness_epoch).unwrap_or(0), now.to_string(), constraints],
             )
             .map_err(internal)?;
         if let Some(old) = carried {
@@ -6202,7 +6208,7 @@ fn request_declared_resource_refresh_tx(
                 "reason": "published refresh",
                 "revision": revision,
                 "attempt": attempt,
-                "next_check_unix_ms": now,
+                "next_check_unix_ms": now.to_string(),
             }}),
             &[],
             Some(batch_id),
@@ -8295,8 +8301,8 @@ fn project_mission_run_created(
     let view = mission_run_view_tx(transaction, run_id).map_err(internal)?;
     let variables = mission_run_variables(&view, revision);
     let mut steps = Vec::new();
-    flatten_steps(&mission, default_selector, &mut steps);
-    for (step, selector) in steps {
+    flatten_steps(&mission, default_selector, &[], &mut steps);
+    for (step, selector, constraints) in steps {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let subject = format!("step-run/{generation_id}/{}", step.path);
         let mut step_variables = variables.clone();
@@ -8317,11 +8323,12 @@ fn project_mission_run_created(
             .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
+        let constraints = interpolate_goals(&constraints, &step_variables)?;
         transaction
             .execute(
-                "INSERT OR IGNORE INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, claim.accepted_at_unix_ms.to_string()],
+                "INSERT OR IGNORE INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms, constraints)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, claim.accepted_at_unix_ms.to_string(), constraints],
             )
             .map_err(internal)?;
     }
@@ -8677,8 +8684,8 @@ fn project_run_generation_created(
         )
         .map_err(internal)?;
     let mut new_steps = Vec::new();
-    flatten_steps(&mission, None, &mut new_steps);
-    for (step, selector) in new_steps {
+    flatten_steps(&mission, None, &[], &mut new_steps);
+    for (step, selector, constraints) in new_steps {
         let (assignee, available_to, agentless) = interpolate_selector(&selector, &variables)?;
         let subject = format!("step-run/{generation_id}/{}", step.path);
         let carried = compatible
@@ -8711,11 +8718,12 @@ fn project_run_generation_created(
             .map(|value| crate::mission::interpolate(value, &step_variables))
             .transpose()?;
         let goals = interpolate_goals(&step.goals, &step_variables)?;
+        let constraints = interpolate_goals(&constraints, &step_variables)?;
         transaction
             .execute(
-                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, carried.and_then(|old| old.blocked_reason.as_deref()), carried.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string()],
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported, blocked_reason, not_before_unix_ms, readiness_epoch, created_at_unix_ms, updated_at_unix_ms, constraints)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17, ?18)",
+                params![subject, run_id, generation_id, step.path, step.definition_hash, status, attempt, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, worker_reported, carried.and_then(|old| old.blocked_reason.as_deref()), carried.and_then(|old| old.not_before_unix_ms).map(|value| value.to_string()), carried.map(|old| old.readiness_epoch).unwrap_or(0), claim.accepted_at_unix_ms.to_string(), constraints],
             )
             .map_err(internal)?;
     }
@@ -8899,8 +8907,11 @@ fn normalize_step_run(value: &str) -> String {
 fn flatten_steps<'a>(
     mission: &'a MissionSpec,
     inherited_selector: Option<WorkSelector>,
-    output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector)>,
+    inherited_constraints: &[String],
+    output: &mut Vec<(&'a crate::model::StepSpec, WorkSelector, Vec<String>)>,
 ) {
+    let mut mission_constraints = inherited_constraints.to_vec();
+    mission_constraints.extend(mission.constraints.clone());
     let mission_selector = mission
         .work_selector
         .clone()
@@ -8912,9 +8923,11 @@ fn flatten_steps<'a>(
             .work_selector
             .clone()
             .unwrap_or_else(|| mission_selector.clone());
-        output.push((step, selector.clone()));
+        let mut constraints = mission_constraints.clone();
+        constraints.extend(step.constraints.clone());
+        output.push((step, selector.clone(), constraints.clone()));
         if let Some(nested) = &step.nested_mission {
-            flatten_steps(nested, Some(selector), output);
+            flatten_steps(nested, Some(selector), &constraints, output);
         }
     }
 }
@@ -9160,10 +9173,10 @@ fn metadata_for_changed_path<'a>(
 
 fn step_hashes(mission: &MissionSpec) -> BTreeMap<String, String> {
     let mut flat = Vec::new();
-    flatten_steps(mission, None, &mut flat);
+    flatten_steps(mission, None, &[], &mut flat);
     flat.into_iter()
-        .map(|(step, selector)| {
-            let bytes = serde_json::to_vec(&(step.definition_hash.as_str(), selector))
+        .map(|(step, selector, constraints)| {
+            let bytes = serde_json::to_vec(&(step.definition_hash.as_str(), selector, constraints))
                 .expect("a step compatibility value serializes");
             (step.path.clone(), hex::encode(Sha256::digest(bytes)))
         })
@@ -9184,6 +9197,7 @@ fn mission_header_hash(mission: &MissionSpec) -> Result<String, St3Error> {
         "work_selector": mission.work_selector,
         "completion": mission.completion,
         "goals": mission.goals,
+        "constraints": mission.constraints,
         "baselines": mission.baselines,
         "products": mission.products,
         "gates": mission.gates,
@@ -9287,6 +9301,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         agentless: row.get(8)?,
         title: row.get(9)?,
         goals: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+        constraints: serde_json::from_str(&row.get::<_, String>(20)?).unwrap_or_default(),
         under: Vec::new(),
         worker_reported: row.get::<_, bool>(11)?,
         claimant: row.get(12)?,
@@ -9832,7 +9847,7 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
     )?;
     let mut statement = connection.prepare(
         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
          FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
     )?;
     view.steps = statement
@@ -9876,7 +9891,7 @@ fn run_generation_view_tx(
     )?;
     let mut statement = connection.prepare(
         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
          FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
     )?;
     view.steps = statement
@@ -9984,6 +9999,121 @@ mod tests {
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn a_declarative_resource_refresh_emits_schema_valid_observer_state() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+resource "refresh/file" { kind "filesystem.file" }
+observer "refresh/file" {
+  resource "resource/refresh/file"
+  provider "local.file"
+  locator "/tmp/st3-refresh-test"
+  field "status"
+}
+"#;
+        let intent = crate::graph::parse_execution_intent(source, "node", "refresh-run").unwrap();
+        let observer = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "observer")
+            .unwrap()
+            .subject
+            .clone();
+        store
+            .apply_internal(&intent, "declare-refresh-observer")
+            .unwrap();
+
+        let refresh = r#"version 2
+resource "refresh/file" {
+  refresh "manual" { timeout "1s" }
+}
+"#;
+        let intent = crate::graph::parse_intent(refresh, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: refresh.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(
+                &intent,
+                &planned.subject_tokens,
+                "request-resource-refresh",
+                Some("person/operator"),
+            )
+            .unwrap();
+
+        let state = store
+            .latest_claim(&observer, Some("observer.state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.body["fields"]["next_check_unix_ms"]
+                .as_str()
+                .is_some()
+        );
+        assert!(state.body["fields"]["attempt"].as_str().is_some());
+    }
+
+    #[test]
+    fn work_views_include_ordered_inherited_constraints() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mission = publish_mission(
+            &store,
+            r#"version 2
+mission "guarded" state="ready" {
+  goal "Complete guarded work."
+  input "lane" kind="text"
+  constraint "Use the ${input.lane} lane."
+  step "parent" {
+    agentless
+    constraint "Do not push."
+    mission "child" {
+      goal "Inspect the child workspace."
+      constraint "Keep the workspace clean."
+      step "inspect" {
+        constraint "Do not edit files."
+      }
+    }
+  }
+}
+"#,
+            "publish-guarded",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: mission.id,
+                revision: Some(mission.revision),
+                workspace: workspace.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::from([("lane".into(), "review".into())]),
+                idempotency_key: "run-guarded".into(),
+            })
+            .unwrap();
+        let parent = run.steps.iter().find(|step| step.step == "parent").unwrap();
+        assert_eq!(parent.constraints, ["Use the review lane.", "Do not push."]);
+        let child = run
+            .steps
+            .iter()
+            .find(|step| step.step.ends_with("child/inspect"))
+            .unwrap();
+        assert_eq!(
+            child.constraints,
+            [
+                "Use the review lane.",
+                "Do not push.",
+                "Keep the workspace clean.",
+                "Do not edit files."
+            ]
+        );
     }
 
     #[test]
@@ -10826,6 +10956,44 @@ version 2
     }
 
     #[test]
+    fn a_host_document_must_exist_before_its_declaration_is_applied() {
+        let store = Store::open_memory("node").unwrap();
+        let bytes = b"host facts\n";
+        let hash = hex::encode(sha2::Sha256::digest(bytes));
+        let source = format!("version 2\nhost \"node\" {{ document \"doc/hosts/node@{hash}\" }}\n");
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let error = store
+            .apply(&intent, &preview.subject_tokens, "missing-host-document")
+            .unwrap_err();
+        assert_eq!(error.code, "missing-document");
+
+        store
+            .put_document("doc/hosts/node", bytes, &None, "host-document")
+            .unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "apply-host-document")
+            .unwrap();
+    }
+
+    #[test]
     fn replication_carries_runnable_mission_definitions() {
         let source = Store::open_memory("source").unwrap();
         let kdl = r#"version 2
@@ -11497,19 +11665,19 @@ version 2
     }
 
     #[test]
-    fn schema_version_eight_requires_fresh_state() {
+    fn schema_version_nine_requires_fresh_state_for_version_ten() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute("CREATE TABLE marker(value TEXT)", [])
             .unwrap();
-        connection.pragma_update(None, "user_version", 8).unwrap();
+        connection.pragma_update(None, "user_version", 9).unwrap();
         drop(connection);
 
         let error = Store::open(&path, "node")
             .err()
-            .expect("schema version 8 must be rejected");
+            .expect("schema version 9 must be rejected");
         assert!(error.to_string().contains("unsupported st3 schema"));
     }
 
@@ -11812,7 +11980,7 @@ version 2
     }
 
     #[test]
-    fn an_authorized_revision_preserves_unrelated_work_and_resets_dependents() {
+    fn a_constraint_revision_preserves_unrelated_work_and_resets_dependents() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
@@ -11866,7 +12034,11 @@ version 2
   agent "worker" { workspace "."; command "true" }
   mission "revision" state="ready" {
     goal "Complete mission revision."
-    step "owned" { assigned-to "agent/worker"; goal "A corrected goal." }
+    step "owned" {
+      assigned-to "agent/worker"
+      goal "First goal."
+      constraint "Do not push."
+    }
     step "unrelated" { }
     step "join" { depends-on { step "owned" completed; step "unrelated" completed } }
   }
@@ -11879,7 +12051,7 @@ version 2
                 &run.id,
                 &second,
                 "agent/node.worker",
-                "the first goal was incomplete",
+                "the work needs a new constraint",
                 "adopt-revision-two",
             )
             .unwrap();
@@ -11891,6 +12063,15 @@ version 2
         assert_eq!(states["owned"], "pending");
         assert_eq!(states["join"], "pending");
         assert_eq!(states["unrelated"], "completed");
+        assert_eq!(
+            revised
+                .steps
+                .iter()
+                .find(|step| step.step == "owned")
+                .unwrap()
+                .constraints,
+            ["Do not push."]
+        );
         assert_eq!(revised.root_revision, run.root_revision);
         assert_eq!(revised.revision, second.revision);
     }

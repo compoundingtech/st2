@@ -970,13 +970,27 @@ fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error
     )?;
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            if !matches!(child.name().value(), "agent" | "exec" | "pty") {
+            if child.name().value() == "document" {
+                ensure_no_properties(child)?;
+                ensure_no_children(child)?;
+                let reference = one_string(child)?;
+                validate_document_ref(&reference)?;
+                if !reference.starts_with("doc/") || !reference.contains('@') {
+                    return Err(St3Error::new(
+                        "unpinned-host-document",
+                        "a host document must name an exact doc/NAME@HASH version",
+                    ));
+                }
+                continue;
+            }
+            if matches!(child.name().value(), "agent" | "exec" | "pty") {
+                parse_desired_node(child, Some(&name), context)?;
+            } else {
                 return Err(St3Error::new(
                     "invalid-host-child",
                     format!("host `{name}` cannot contain `{}`", child.name().value()),
                 ));
             }
-            parse_desired_node(child, Some(&name), context)?;
         }
     }
     Ok(())
@@ -1013,7 +1027,13 @@ fn parse_agent(
     );
     let runtime_id = context.owner_run.as_ref().map_or_else(
         || bus_id.clone(),
-        |run| format!("{}.{}", owner_run_id(run), identity.replace('/', ".")),
+        |run| {
+            format!(
+                "{}.{}",
+                owner_run_id(run).replace('/', "."),
+                identity.replace('/', ".")
+            )
+        },
     );
     let (workspace, workspace_create) =
         parse_workspace(children)?.unwrap_or_else(|| (".".into(), false));
@@ -1405,7 +1425,9 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
                     && !party.starts_with("person/")
                 {
                     let local = party.strip_prefix("agent/").unwrap_or(&party);
-                    if !local.starts_with(&format!("{run}/"))
+                    let is_exact_agent_subject = party.starts_with("agent/") && local.contains('/');
+                    if !is_exact_agent_subject
+                        && !local.starts_with(&format!("{run}/"))
                         && let Some(value) = values
                             .get_mut("arguments")
                             .and_then(Value::as_array_mut)
@@ -1749,7 +1771,7 @@ fn driver_member(
             format!("harness `{name}` has no body"),
         )
     })?;
-    let prompt = required_child_string(children, "prompt", &name)?;
+    let prompt = crate::boot::compose_prompt(child_string(children, "prompt")?.as_deref());
     let model = child_string(children, "model")?;
     let effort = child_string(children, "effort")?;
     let extra = child_strings(children, "args")?.unwrap_or_default();
@@ -2190,7 +2212,6 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
     for child in allowed {
         unique_child(body, child)?;
     }
-    required_child_string(body, "prompt", &provider)?;
     if let Some(node) = unique_child(body, "dev-channels")? {
         one_bool(node)?;
     }
@@ -3645,6 +3666,49 @@ version 2
     }
 
     #[test]
+    fn a_named_mission_run_produces_a_valid_agent_runtime_id() {
+        let intent = parse_execution_intent(
+            r#"version 2
+agent "worker" { command "true" }
+"#,
+            "node",
+            "fixture/network-a/run-one",
+        )
+        .unwrap();
+        let member = intent.subjects["agent/fixture/network-a/run-one/worker"]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(member.runtime_id, "fixture.network-a.run-one.worker");
+    }
+
+    #[test]
+    fn a_run_keeps_an_exact_external_agent_party() {
+        let intent = parse_execution_intent(
+            r#"version 2
+agent "worker" { command "true" }
+message "local" { from "requester"; to "worker"; content "Local." }
+message "external" {
+  from "requester"
+  to "agent/other/run/peer"
+  content "External."
+}
+"#,
+            "node",
+            "message/run",
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_child_value(&intent.subjects["message/local"].desired, "to"),
+            Some(&Value::String("agent/message/run/worker".into()))
+        );
+        assert_eq!(
+            canonical_child_value(&intent.subjects["message/external"].desired, "to"),
+            Some(&Value::String("agent/other/run/peer".into()))
+        );
+    }
+
+    #[test]
     fn claude_uses_the_approved_st3_channel_identity() {
         let intent = parse_test_intent(
             r#"
@@ -3683,17 +3747,13 @@ version 2
 
     #[test]
     fn model_free_provider_contracts_build_exact_native_argv() {
-        for (provider, extra, expected) in [
-            (
-                "pi",
-                "effort \"high\"",
-                vec!["pi", "--thinking", "high", "Do the work."],
-            ),
-            ("opencode", "", vec!["opencode", "--prompt", "Do the work."]),
+        for (provider, extra, prefix) in [
+            ("pi", "effort \"high\"", vec!["pi", "--thinking", "high"]),
+            ("opencode", "", vec!["opencode", "--prompt"]),
             (
                 "omp",
                 "effort \"medium\"",
-                vec!["omp", "--thinking", "medium", "Do the work."],
+                vec!["omp", "--thinking", "medium"],
             ),
         ] {
             let source = format!(
@@ -3716,9 +3776,37 @@ version 2
             let LaunchSpec::Argv(argv) = &member.launch else {
                 panic!("the typed provider did not build argv");
             };
+            let expected_prompt = crate::boot::compose_prompt(Some("Do the work."));
+            let mut expected = prefix;
+            expected.push(&expected_prompt);
             assert!(
                 argv.windows(expected.len())
                     .any(|window| window == expected),
+                "{provider}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_harness_without_an_authored_prompt_uses_the_boot_prompt() {
+        for provider in ["claude", "codex", "pi", "omp", "opencode"] {
+            let intent = parse_test_intent(
+                &format!(
+                    "version 2\nagent \"worker\" {{ workspace \"/work\"; harness {provider:?} {{}} }}\n"
+                ),
+                "node",
+            )
+            .unwrap();
+            let member = intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap();
+            let LaunchSpec::Argv(argv) = &member.launch else {
+                panic!("the {provider} driver did not build argv");
+            };
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some(crate::boot::BOOT_PROMPT),
                 "{provider}: {argv:?}"
             );
         }
@@ -3911,6 +3999,46 @@ version 2
                 .iter()
                 .any(|warning| warning.contains("contains a cycle"))
         );
+    }
+
+    #[test]
+    fn a_host_can_reference_exact_documents() {
+        let hash = "a".repeat(64);
+        let source = format!(
+            r#"version 2
+host "node" {{
+  document "doc/hosts/node@{hash}"
+  agent "worker" {{ workspace "/work"; harness "codex" {{}} }}
+}}
+"#
+        );
+        let intent = parse_test_intent(&source, "node").unwrap();
+        assert!(
+            intent
+                .document_refs
+                .contains(&format!("doc/hosts/node@{hash}"))
+        );
+        let host = &intent.subjects["host/node"].desired;
+        let document = host["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["name"] == "document")
+            .unwrap();
+        assert_eq!(
+            document["arguments"]
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_str),
+            Some(format!("doc/hosts/node@{hash}").as_str())
+        );
+
+        let unpinned = parse_test_intent(
+            "version 2\nhost \"node\" { document \"doc/hosts/node\" }\n",
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(unpinned.code, "unpinned-host-document");
     }
 
     #[test]

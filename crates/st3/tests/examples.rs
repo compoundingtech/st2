@@ -16,15 +16,21 @@ fn authored_harness_counts(source: &str, source_name: &str) -> (usize, usize) {
         for node in document.nodes() {
             if node.name().value() == "agent" {
                 let children = node.children().expect("an agent must have children");
-                assert!(
-                    children.get("command").is_none(),
-                    "{source_name} has a model agent with a raw command"
-                );
                 let harnesses = children
                     .nodes()
                     .iter()
                     .filter(|child| child.name().value() == "harness")
                     .collect::<Vec<_>>();
+                if children.get("command").is_some() {
+                    assert!(
+                        harnesses.is_empty(),
+                        "{source_name} command agents must not declare a harness"
+                    );
+                    if let Some(children) = node.children() {
+                        visit(children, source_name, counts);
+                    }
+                    continue;
+                }
                 assert_eq!(
                     harnesses.len(),
                     1,
@@ -160,11 +166,91 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
 }
 
 #[test]
-fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
+fn eval_agents_use_the_runtime_boot_contract_without_authored_prompts() {
+    fn inspect(document: &kdl::KdlDocument, file: &std::path::Path) {
+        for node in document.nodes() {
+            if node.name().value() == "agent" {
+                let body = node.children().expect("an agent needs a body");
+                for harness in body
+                    .nodes()
+                    .iter()
+                    .filter(|child| child.name().value() == "harness")
+                {
+                    assert!(
+                        harness
+                            .children()
+                            .is_none_or(|body| body.get("prompt").is_none()),
+                        "{} authors an eval-specific harness prompt",
+                        file.display()
+                    );
+                }
+            }
+            if let Some(children) = node.children() {
+                inspect(children, file);
+            }
+        }
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3");
+    for entry in walkdir::WalkDir::new(root)
+        .max_depth(2)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() == "eval.kdl")
+    {
+        let source = fs::read_to_string(entry.path()).unwrap();
+        let document = source.parse::<kdl::KdlDocument>().unwrap();
+        inspect(&document, entry.path());
+    }
+}
+
+#[test]
+fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/continuous-stewardship/eval.kdl");
+    let source = fs::read_to_string(&file).unwrap();
+    let intent = st3::parse_intent(&source, "local").unwrap();
+    let mission = &intent.missions["eval/continuous-stewardship"];
+    assert!(source.contains("catch-up \"latest\""));
+    assert!(mission.steps["cycle-one"].nested_mission.is_some());
+    assert!(mission.steps["cycle-two"].nested_mission.is_some());
+    assert!(mission.steps["restart-steward"].declarations_kdl.is_some());
+    assert_eq!(
+        mission.display_order,
+        [
+            "cycle-one",
+            "restart-steward",
+            "cycle-two",
+            "held-out-gates",
+            "cleanup-steward",
+        ]
+    );
+}
+
+#[test]
+fn migration_rehearsal_uses_an_exact_host_document_and_no_custom_prompt() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/agent-migration-rehearsal/eval.kdl");
+    let source = fs::read_to_string(&file).unwrap();
+    let intent = st3::parse_intent(&source, "local").unwrap();
+    assert!(intent.document_refs.contains(
+        "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
+    ));
+    assert!(!source.contains("prompt "));
+}
+
+#[test]
+fn st3_eval_inventory_has_thirteen_model_free_and_fifteen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
     let model_free = [
+        "constraint-inheritance",
         "context-resource-continuity",
         "crash-escalation",
         "local-file-refresh",
@@ -177,10 +263,11 @@ fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
         "resource-cold-start",
         "resource-handoff",
         "resource-retarget",
-        "run-generation-revision",
     ];
     let model_backed = [
+        "agent-migration-rehearsal",
         "claude-skill-inheritance",
+        "continuous-stewardship",
         "fork-in-the-road",
         "ghost-bug",
         "license-mit",
@@ -189,6 +276,7 @@ fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
         "planning-mode",
         "poisoned-pr",
         "restart-continuity",
+        "run-generation-revision",
         "signal-rename",
         "test-writing",
         "weird-git-setup",
@@ -217,8 +305,12 @@ fn st3_eval_inventory_has_thirteen_model_free_and_twelve_model_backed_evals() {
         let source = fs::read_to_string(root.join(name).join("eval.kdl")).unwrap();
         let has_authored_model = authored_harness_counts(&source, name) != (0, 0)
             || !authored_model_gates(&source).is_empty();
+        let has_dynamic_planner = matches!(name, "planning-mode" | "run-generation-revision")
+            && fs::read_to_string(root.join(name).join("controller.sh"))
+                .unwrap()
+                .contains("planning start");
         assert!(
-            has_authored_model || name == "planning-mode",
+            has_authored_model || has_dynamic_planner,
             "{name} must use a model"
         );
     }

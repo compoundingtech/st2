@@ -166,6 +166,30 @@ Exact built-in names are reserved. An authored `env` block cannot replace them. 
 
 The complete table is in [mission-graph-runtime.md](./mission-graph-runtime.md#automatic-context).
 
+### One generated boot contract
+
+An agent harness prompt is optional.
+
+st3 appends one exact instruction that tells the agent to read `.st3/boot.md` and claim current work.
+
+The shared render transaction writes the canonical boot file before any native harness starts.
+
+The boot file contains universal graph, work, message, wait, and diagnostic guidance. Mission goals do not belong in it.
+
+### Mission-specific constraints
+
+A mission or step can repeat `constraint`. st3 presents the effective inherited list with assigned work.
+
+Constraints record real mission rules. They do not repeat universal boot behavior or disable harness features to help an eval.
+
+### Host context documents
+
+A host declaration can repeat exact `doc/NAME@SHA256` references.
+
+The referenced documents contain stable host facts. They do not contain current work or raw private measurements.
+
+Publication fails until the local store contains every exact document version.
+
 ### External resource observation
 
 An external resource watch contains a resource, one observer, and zero or more delivery subscriptions.
@@ -221,7 +245,7 @@ st3 has these components:
 3. The claims store appends immutable batches and serves snapshot queries.
 4. Reducers derive desired state, actual state, gaps, work, and warnings.
 5. The reconciler requests bounded runtime changes.
-6. Native drivers supervise Codex, Claude, and other supported harnesses.
+6. Native drivers run Codex, Claude, and other supported harnesses.
 7. Process and PTY adapters observe runtime state.
 8. Small Talk maps durable message claims to native harness delivery or an explicit DING child.
 9. Gate runners execute bounded mechanical or LLM checks.
@@ -277,6 +301,10 @@ agent "worker" {
 The mission run owns the DING child. The child checks the local st3 API once per second and sends one incarnation-fenced terminal line.
 
 The DING child then records `message.delivered`. It does not read or write an st2 mailbox.
+
+A provider or runtime fault creates `harness.diagnostic`. The roster and mission views show the current fault.
+
+st3 does not require a special supervisor, root, or chief-of-staff agent. The runtime handles supervision and graph recovery.
 
 ## Identity and authority
 
@@ -501,6 +529,8 @@ A network partition does not stop local work. Each host continues from the last 
 - Immutable document references use exact SHA-256 hashes.
 - A mission approval binds the exact candidate, preview, and subject heads.
 - Runtime stops do not target an unverified replacement process.
+- Git repositories and shared st3 documents do not store credentials or raw private measurements.
+- Durable evidence uses summaries, redacted samples, hashes, or restricted external storage.
 
 The configured peer transport is for a trusted network. Authentication, encryption, and peer authorization remain outside the first protocol.
 

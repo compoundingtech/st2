@@ -37,6 +37,9 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Run Generation Revision | Not supported | `st3/run-generation-revision` |
 | Mission Inputs | Not supported | `st3/mission-inputs` |
 | Local File Refresh | Not supported | `st3/local-file-refresh` |
+| Constraint Inheritance | Not supported | `st3/constraint-inheritance` |
+| Continuous Stewardship | Not supported | `st3/continuous-stewardship` |
+| Agent Migration Rehearsal | Not supported | `st3/agent-migration-rehearsal` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -44,9 +47,11 @@ The Ghost bug, Signal rename, Fork in the road, Poisoned pull request, Test Writ
 
 The ten remaining pairs are model-free.
 
-Run Generation Revision, Mission Inputs, and Local File Refresh are also model-free.
+Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-free.
 
-The st3 corpus has 25 evals. Thirteen are model-free, and twelve use at least one model.
+Run Generation Revision starts one Codex planner through the planning API.
+
+The st3 corpus has 28 evals. Thirteen are model-free, and fifteen use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -79,8 +84,11 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Mission Document Lift | Codex × 1 | None |
 | st3 | Mixed Worker Pool | Claude Sonnet × 1, Codex × 1 | None |
 | st3 | Planning Mode | Codex × 1, created by the planning API | None |
+| st3 | Run Generation Revision | Codex × 1, created by the planning API | None |
+| st3 | Continuous Stewardship | Codex × 1 | None |
+| st3 | Agent Migration Rehearsal | Codex × 1 | None |
 
-The paired and st3-only corpus has 11 Claude seats and 34 Codex seats. It also has three Codex LLM judges.
+The paired and st3-only corpus has 11 Claude seats and 37 Codex seats. It also has three Codex LLM judges.
 
 The thirteen model-free st3 evals add no model seats and no LLM judges.
 
@@ -95,6 +103,12 @@ An eval can use a Claude judge for a specific reason. Record the choice in this 
 ## Small Talk message discipline
 
 The graph owns planned work, assignment, dependencies, progress, products, and judgement state.
+
+An eval does not author a harness prompt. st3 supplies the normal boot contract.
+
+Put mission work in goals and steps. Keep only stable repository facts in `AGENTS.md`, `CLAUDE.md`, or a persona file.
+
+Do not disable harness features or reveal held-out gate criteria in agent instructions.
 
 st3 sends one durable Small Talk message when an assigned parent becomes ready.
 

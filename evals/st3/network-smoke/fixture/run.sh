@@ -74,7 +74,7 @@ run_id="$(st3 --endpoint "$socket" --json mission start fixture/network-smoke --
 agent="agent/$run_id/net.dev"
 for _ in $(seq 1 100); do st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null 2>&1 && break; sleep 0.05; done
 st3 --endpoint "$socket" agents --json | jq -e --arg agent "$agent" '.[] | select(.subject == $agent and .actual.status == "running")' >/dev/null
-id="$(st3 --endpoint "$socket" message send "$agent" --from tester -m NETWORK-SMOKE-ROUNDTRIP)"
+id="$(st3 --endpoint "$socket" message send "$agent" --from person/tester -m NETWORK-SMOKE-ROUNDTRIP)"
 for _ in $(seq 1 100); do
   st3 --endpoint "$socket" inspect "message/$id" --json | jq -e '.recent_claims | map(.kind) | index("message.delivered") != null' >/dev/null 2>&1 && break
   sleep 0.05

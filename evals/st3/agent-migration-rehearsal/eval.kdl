@@ -1,0 +1,51 @@
+version 2
+
+host "local" {
+  document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
+}
+
+mission "eval/agent-migration-rehearsal" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Start one isolated agent with the normal st3 boot contract and complete one assigned mission."
+
+  agent "pilot" {
+    workspace "${ST_WORKSPACE}/agent"
+    harness "codex" {
+      model "gpt-5.6-sol"
+      effort "medium"
+      args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"
+    }
+    restart "always"
+  }
+
+  step "write-report" timeout="10m" {
+    assigned-to "agent/${ST_MISSION_RUN}/pilot"
+    title "The migrated agent completes normal graph work"
+    goal "Read INPUT.md and doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665. Write MIGRATION.md with the host boundary and your completed work."
+    document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
+  }
+
+  step "held-out-gates" timeout="2m" {
+    agentless
+    depends-on { step "write-report" completed }
+    gate "the runtime rendered the canonical boot file" {
+      exec "test -s .st3/boot.md && grep -Fqx 'The st3 graph is the authority for current work. This file contains stable runtime guidance only.' .st3/boot.md"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+    gate "the isolated mission produced its report" {
+      exec "test -s MIGRATION.md && grep -Fq 'isolated st3 migration rehearsal' MIGRATION.md"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+  }
+
+  finally {
+    step "cleanup-agent" timeout="2m" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/pilot"
+    }
+  }
+}

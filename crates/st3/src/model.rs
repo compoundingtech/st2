@@ -230,6 +230,8 @@ pub struct StepSpec {
     pub title: Option<String>,
     #[serde(default)]
     pub goals: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
     pub timeout_ms: Option<u64>,
     pub retry: RetrySpec,
     pub finally: bool,
@@ -282,6 +284,8 @@ pub struct MissionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<CompletionSpec>,
     pub goals: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
     #[serde(default)]
     pub baselines: Vec<BaselineSpec>,
     #[serde(default)]
@@ -1154,6 +1158,8 @@ pub struct StepRunView {
     pub title: Option<String>,
     #[serde(default)]
     pub goals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub under: Vec<UnderSpec>,
     pub worker_reported: bool,

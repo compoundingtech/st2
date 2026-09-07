@@ -32,9 +32,7 @@ mission "release" state="ready" {
 
   agent "builder" {
     workspace "${ST_WORKSPACE}/builder" create=#true
-    harness "codex" {
-      prompt "Claim the available release work and complete it."
-    }
+    harness "codex" {}
   }
 
   step "build" {
@@ -45,6 +43,48 @@ mission "release" state="ready" {
 ```
 
 Direct runtime declarations in a mission belong to each run of that mission. Direct declarations in a step become desired when that step activates. They stop being desired when their owner run ends or a successor generation removes them.
+
+Before a native harness starts, st3 renders `.st3/boot.md` into its workspace. The native driver always appends this exact launch text once:
+
+```text
+Read @.st3/boot.md completely. Then list and claim your current st3 work.
+```
+
+A harness `prompt` is optional. An authored prompt supplies stable repository context only. Mission goals and constraints remain in the graph.
+
+st3 refuses to replace a tracked `.st3/boot.md` with different bytes. The complete render transaction fails, and the agent does not start.
+
+## Mission constraints
+
+`constraint "TEXT"` can repeat on a mission or step. A step receives constraints from every ancestor mission and step, followed by its local constraints.
+
+A constraint states a mission-specific invariant. It must not repeat universal st3 behavior or disable harness features merely to make an eval pass.
+
+```kdl
+mission "review" state="ready" {
+  goal "Review the proposed release."
+  constraint "Do not publish or deploy the release."
+
+  step "inspect" {
+    goal "Inspect the exact proposed revision."
+    constraint "Do not change repository files."
+  }
+}
+```
+
+The work show and claim responses include the complete ordered constraint list.
+
+## Host documents
+
+A host can name repeatable immutable documents. Each reference must include its SHA-256 hash.
+
+```kdl
+host "build-node" {
+  document "doc/hosts/build-node@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+Publish the document bytes before this declaration. A missing version rejects the publication.
 
 ## Starting a mission run
 

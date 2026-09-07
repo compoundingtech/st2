@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod archive;
+pub mod boot;
 pub mod client;
 pub mod config;
 pub mod graph;

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-test "$(wc -l <events.tsv)" -eq 2
+test "$(wc -l <events.tsv)" -eq 1
 resource="$(awk -F '\t' 'NR == 1 { print $3 }' events.tsv)"
-message="$(awk -F '\t' 'NR == 2 { print $3 }' events.tsv)"
+message="message/resource-cold-start-${ST_MISSION_RUN}"
 st3 resource read "$resource" --json | jq -e '.actual.status == "active" and .actual.url == "work://eval/cold-start"' >/dev/null
-st3 inspect "$message" --json | jq -e '.recent_claims | map(.kind) | index("message.sent") != null' >/dev/null
-test "$(st3 message ls rc.worker --json | jq '[.[] | select(.content == "work://eval/cold-start is ready")] | length')" -eq 1
+resource_index="$(st3 inspect "$resource" --json | jq '[.recent_claims[] | select(.kind == "resource.observed")][0].store_index')"
+message_index="$(st3 inspect "$message" --json | jq '[.recent_claims[] | select(.kind == "message.delivered")][0].store_index')"
+test "$resource_index" -lt "$message_index"
+test "$(st3 message ls "agent/${ST_MISSION_RUN}/worker" --json | jq --arg message "$message" '[.[] | select(.subject == $message and .status == "delivered" and .content == "work://eval/cold-start is ready")] | length')" -eq 1
