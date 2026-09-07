@@ -345,12 +345,7 @@ fn resolve_stream(
             let every_subject = discovered
                 .specs
                 .iter()
-                .map(|spec| crate::identity::AddressBookEntry {
-                    id: spec.effective_id(this_host),
-                    bus_identity: spec.bus_id(this_host),
-                    host: spec.resolved_host(this_host).to_owned(),
-                    address: spec.effective_address().to_owned(),
-                })
+                .map(|spec| crate::identity::AddressBookEntry::of(spec, this_host))
                 .collect::<Vec<_>>();
             crate::identity::resolve_local_first(&every_subject, recipient, this_host)
                 .map(|entry| (entry.id.clone(), entry.bus_identity.clone()))

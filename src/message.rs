@@ -1247,12 +1247,7 @@ fn select_spec<'a>(
         specs,
         selector,
         this_host,
-        |spec| crate::identity::AddressBookEntry {
-            id: spec.effective_id(this_host),
-            bus_identity: spec.bus_id(this_host),
-            host: spec.resolved_host(this_host).to_owned(),
-            address: spec.effective_address().to_owned(),
-        },
+        |spec| crate::identity::AddressBookEntry::of(spec, this_host),
         |spec| spec.desired_state.is_retired(),
     )?;
     Ok(&specs[index])

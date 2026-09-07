@@ -25,6 +25,12 @@ fn root_requirement_ids_are_unique() {
     }
 }
 
+/// Four decision numbers were each recorded twice before the collision was noticed. The numbers
+/// are historical IDs — 26 inbound references across `docs/`, `src/` and `tests/` cite them — so
+/// they are not renumbered; this test ratchets the set instead. A new number falling into a
+/// collision fails, a third file joining an existing collision fails, and repairing one fails
+/// loudly so the allow-list is updated deliberately. Titles are deliberately not pinned: a
+/// retitled decision is not a ledger property.
 #[test]
 fn root_decision_number_duplicates_match_recorded_history() {
     let decision_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/vrs/.decisions");
@@ -49,51 +55,18 @@ fn root_decision_number_duplicates_match_recorded_history() {
     let duplicates = by_number
         .into_iter()
         .filter(|(_, stems)| stems.len() > 1)
+        .map(|(number, stems)| (number, stems.len()))
         .collect::<BTreeMap<_, _>>();
-    let expected = [
-        (
-            "0005",
-            [
-                "0005-pi-delivers-natively-through-an-injected-extension",
-                "0005-streams-are-agent-nested-and-stream-named",
-            ]
-            .as_slice(),
-        ),
-        (
-            "0007",
-            [
-                "0007-child-output-capture-is-bounded-and-tail-preserving",
-                "0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate",
-            ]
-            .as_slice(),
-        ),
-        (
-            "0014",
-            [
-                "0014-harness-context-is-a-sibling-numeric-record",
-                "0014-resource-profiles-are-state-first-read-and-observe-capabilities",
-            ]
-            .as_slice(),
-        ),
-        (
-            "0015",
-            [
-                "0015-catalog-commits-and-direct-edits-use-independent-wake-channels",
-                "0015-immutable-agent-id-and-mutable-address",
-            ]
-            .as_slice(),
-        ),
-    ]
-    .into_iter()
-    .map(|(number, stems)| {
-        (
-            number.to_owned(),
-            stems.iter().map(|stem| (*stem).to_owned()).collect(),
-        )
-    })
-    .collect::<BTreeMap<_, _>>();
+    let expected = ["0005", "0007", "0014", "0015"]
+        .into_iter()
+        .map(|number| (number.to_owned(), 2usize))
+        .collect::<BTreeMap<_, _>>();
 
-    assert_eq!(duplicates, expected);
+    assert_eq!(
+        duplicates, expected,
+        "decision-number collisions changed; each is recorded history, so update this \
+         allow-list deliberately rather than renumbering a decision"
+    );
 }
 
 #[test]
