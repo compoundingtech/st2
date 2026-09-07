@@ -53,5 +53,5 @@ mechanism.
 Root requirement R40 now requires prompt catalog convergence for cooperative
 transactions and authorized direct atomic publication. The root specification
 defines the two watcher instances, accepted paths, serialized coalescing, and
-timer fallback. Decision 0015 records the rejected public-request and
+timer fallback. Decision 0015-catalog-commits-and-direct-edits-use-independent-wake-channels records the rejected public-request and
 single-channel alternatives.

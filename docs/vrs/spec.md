@@ -1321,9 +1321,10 @@ distinguishable from those cases and propagate durably under R17.
 
 Executable acceptance in `tests/claude_hooks.rs` covers the model-visible
 stdout envelope, empty stderr, missing and stale context, missing dependencies,
-and context larger than a platform argument limit without truncation. The open
-verification delta is recorded in
-[DELTA-001](./.delta/DELTA-001-session-start-hook-evidence.md).
+and context larger than a platform argument limit without truncation. That
+target is gated: it is in `checks.st2`'s `cargoTestFlags` and the derivation
+supplies its `bash` and `jq`, so a regression fails CI. Durable failure
+propagation under R17 is a separate axis and stays open as DQ5.
 
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)

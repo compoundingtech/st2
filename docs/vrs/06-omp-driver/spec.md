@@ -47,7 +47,7 @@ Shape of `pi_session.rs`:
   a freshly minted session token.
 - Version gate first: runs `<omp> --version`, parses a strict `MAJOR.MINOR.PATCH` release, and
   admits only a MINOR already measured (`SUPPORTED_OMP_MINORS`); outside that set the launch
-  fails loudly with the measured-checks message, per OMP-R05 and decision 0007. Admission is per
+  fails loudly with the measured-checks message, per OMP-R05 and decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate. Admission is per
   minor: a patch inside an admitted minor launches without new evidence, and a later *minor*
   stays rejected until the checks are repeated against it. The parse is what keeps "per minor"
   from decaying into "starts with 18" — minors are compared numerically (`18.10` is not `18.1`),
@@ -128,7 +128,7 @@ there and the same loop publishes no credential verdict for it.
 
 ## Admission evidence required for a new minor
 
-Per OMP-R05 and decision 0007, admitting a new omp MINOR requires re-running: extension-load
+Per OMP-R05 and decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate, admitting a new omp MINOR requires re-running: extension-load
 probe, lifecycle event inventory, idle-edge sampling, approval-event capture, live delivery
 loop — updating the `.experiments/` capture and `SUPPORTED_OMP_MINORS` together. Each probe must
 record measured output; a minor that was not measured is not admitted, so the admitted set is

@@ -1845,7 +1845,7 @@ fn one_selector(
 /// The one subject a typed selector names, in both namespaces its consumers accept.
 ///
 /// These are two different strings once a subject declares an explicit `address`, and handing the
-/// wrong one onward is exactly the ID-through-a-mutable-address hop decision 0015 forbids:
+/// wrong one onward is exactly the ID-through-a-mutable-address hop decision 0015-immutable-agent-id-and-mutable-address forbids:
 /// declaration-selecting commands match the positional key and never look at `address`, while
 /// reference resolution for inboxes, status, context, and recipients answers on the address.
 struct SelectedAgent {
