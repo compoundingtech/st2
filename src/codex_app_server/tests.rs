@@ -664,7 +664,7 @@ fn codex_context_recomputes_the_captured_reading_and_pins_its_verified_version()
     assert_eq!(CODEX_CONTEXT_VERIFIED_VERSION, "0.151.0");
     assert_eq!(CODEX_BASELINE_TOKENS, 12_000);
 
-    let frames = include_str!("../tests/fixtures/codex_token_usage_inbound.jsonl")
+    let frames = include_str!("../../tests/fixtures/codex_token_usage_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
@@ -973,7 +973,7 @@ fn one_compaction_is_counted_once_across_every_spelling_of_its_edge() {
 /// reading from a turn boundary would break exactly the HC-R03 rule the record exists for.
 #[test]
 fn captured_delivery_frames_carrying_no_token_count_publish_no_record() {
-    let frames = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+    let frames = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
@@ -1382,7 +1382,7 @@ fn captured_usage_limit_boundary_allows_next_native_delivery() {
     // observer never reads. The second capture has the same method sequence. The recorder
     // stops at turn completion, so this test pins the boundary state only. The provider
     // source establishes that no later idle notification follows the system error.
-    let frames = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+    let frames = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
@@ -1433,11 +1433,11 @@ fn captured_usage_limit_boundary_allows_next_native_delivery() {
 /// `systemError` with no diagnostic at all.
 #[test]
 fn a_rejected_codex_credential_reads_provider_auth_while_a_quota_failure_does_not() {
-    let rejected = include_str!("../tests/fixtures/codex_provider_auth_inbound.jsonl")
+    let rejected = include_str!("../../tests/fixtures/codex_provider_auth_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
-    let quota = include_str!("../tests/fixtures/codex_usage_limit_inbound.jsonl")
+    let quota = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
