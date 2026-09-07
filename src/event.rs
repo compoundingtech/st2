@@ -17,6 +17,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::flock::{self, FileLock};
 use crate::identity::AgentSelector;
 use crate::message;
 
@@ -1204,29 +1205,19 @@ fn write_record(path: &Path, record: &StreamRecord) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct StreamLock(File);
+/// The per-`(stream, recipient)` state lock. Read only by `Drop`: the guard's job is to outlive
+/// the read-modify-publish cycle, and closing the descriptor is what releases it.
+struct StreamLock {
+    _held: FileLock,
+}
 
 impl StreamLock {
     fn exclusive(state_dir: &Path) -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(state_dir.join(".lock"))?;
-        anyhow::ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "locking stream state failed"
-        );
-        Ok(Self(file))
-    }
-}
-
-impl Drop for StreamLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let file = flock::open(&state_dir.join(".lock"), flock::Open::Create)?;
+        Ok(Self {
+            _held: FileLock::hold_blocking(file, flock::Mode::Exclusive)
+                .context("locking stream state failed")?,
+        })
     }
 }
 

@@ -15,7 +15,6 @@ use std::io::{Read as _, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -2955,24 +2954,25 @@ fn secure_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn acquire_owner_lock(state_dir: &Path) -> Result<File> {
+fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
     let path = state_dir.join("owner.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&path)
+    let file = crate::flock::open(&path, crate::flock::Open::Create)
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
-    // SAFETY: `file` owns this descriptor until the returned guard is dropped. `flock` does not
-    // access Rust memory, and closing the descriptor releases the process-scoped lock after crash.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("Codex runtime already has an owner at {}", path.display()));
+    // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
+    // claim for the next runtime to trip over.
+    match crate::flock::FileLock::hold(
+        file,
+        crate::flock::Mode::Exclusive,
+        crate::flock::Wait::Now,
+    ) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(anyhow::anyhow!(
+            "Codex runtime already has an owner at {}",
+            path.display()
+        )),
+        Err(error) => Err(error)
+            .with_context(|| format!("Codex runtime already has an owner at {}", path.display())),
     }
-    Ok(file)
 }
 
 /// Stage-and-rename this runtime's own state files, deliberately NOT through the shared

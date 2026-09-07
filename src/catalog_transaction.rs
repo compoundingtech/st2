@@ -1328,7 +1328,7 @@ pub fn bootstrap(request: BootstrapRequest) -> Result<BootstrapResult> {
         .file_name()
         .context("bootstrap stage has no name")?
         .to_os_string();
-    let staged_lock = match (|| -> Result<File> {
+    let staged_lock = match (|| -> Result<crate::flock::FileLock> {
         materialize_projection(&desired, &stage)?;
         let staged = project(&stage, ProjectionSource::Prepared, &catalog)?;
         anyhow::ensure!(
@@ -1436,26 +1436,18 @@ fn inspect_existing_bootstrap(
     })
 }
 
-fn initialize_bootstrap_control(stage: &Path) -> Result<File> {
+fn initialize_bootstrap_control(stage: &Path) -> Result<crate::flock::FileLock> {
     let control = stage.join(CONTROL_DIR);
     fs::create_dir(&control)
         .with_context(|| format!("create bootstrap control directory {}", control.display()))?;
     fs::set_permissions(&control, fs::Permissions::from_mode(0o700))?;
     let control_file = File::open(&control)?;
     let lock_path = control.join(crate::catalog_lock::LOCK_FILE);
-    let lock = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&lock_path)
+    let lock = crate::flock::open(&lock_path, crate::flock::Open::CreateNew)
         .with_context(|| format!("create bootstrap authoring lock {}", lock_path.display()))?;
-    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("lock staged bootstrap catalog");
-    }
-    lock.sync_all()?;
+    let lock = crate::flock::FileLock::hold_blocking(lock, crate::flock::Mode::Exclusive)
+        .context("lock staged bootstrap catalog")?;
+    lock.file().sync_all()?;
     let generation_path = control.join(crate::catalog_lock::GENERATION_FILE);
     let mut generation = OpenOptions::new()
         .create_new(true)

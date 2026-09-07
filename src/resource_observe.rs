@@ -7,7 +7,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -607,7 +606,7 @@ fn prune_request_temp_files(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lock_request_scope(request_dir: &Path) -> anyhow::Result<fs::File> {
+fn lock_request_scope(request_dir: &Path) -> anyhow::Result<crate::flock::FileLock> {
     let scope_root = request_dir.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "observe request directory {} has no scope root",
@@ -616,21 +615,14 @@ fn lock_request_scope(request_dir: &Path) -> anyhow::Result<fs::File> {
     })?;
     ensure_private_directory(scope_root)?;
     let lock_path = scope_root.join(".observe.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(RECORD_MODE)
-        .open(&lock_path)
+    let lock = crate::flock::open(&lock_path, crate::flock::Open::Create)
         .with_context(|| format!("open observe scope lock {}", lock_path.display()))?;
+    // The transport only sets the mode at creation, so a lock file an older build left `0644`
+    // stays `0644` without this.
     lock.set_permissions(fs::Permissions::from_mode(RECORD_MODE))
         .with_context(|| format!("set private permissions on {}", lock_path.display()))?;
-    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("lock observe scope {}", scope_root.display()));
-    }
-    Ok(lock)
+    crate::flock::FileLock::hold_blocking(lock, crate::flock::Mode::Exclusive)
+        .with_context(|| format!("lock observe scope {}", scope_root.display()))
 }
 
 fn finish_wait_at_timeout(
@@ -935,5 +927,55 @@ mod tests {
     fn unknown_control_fields_are_rejected() {
         let raw = br#"{"schema":"st2.resource-observe-request.v1","requestId":"one","recipient":"h.a","binding":"x","requestedAt":"now","extra":true}"#;
         assert!(serde_json::from_slice::<ObserveRequest>(raw).is_err());
+    }
+
+    /// The transport hardened this lock file with `O_NOFOLLOW`; this module had no lock test
+    /// before, and the scope lock is what serializes durable observe-request admission.
+    #[test]
+    fn a_symlinked_scope_lock_is_refused_instead_of_locking_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope_root = tmp.path().join("scope");
+        let request_dir = scope_root.join("requests");
+        fs::create_dir_all(&request_dir).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, scope_root.join(".observe.lock")).unwrap();
+
+        let error = lock_request_scope(&request_dir).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ELOOP),
+            "a symlinked scope lock must be refused, got {error:#}"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn the_scope_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request_dir = tmp.path().join("scope/requests");
+        fs::create_dir_all(&request_dir).unwrap();
+        let lock_path = tmp.path().join("scope/.observe.lock");
+        let held = lock_request_scope(&request_dir).unwrap();
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            RECORD_MODE
+        );
+        // `flock` locks the open file description, so a second open in this process contends.
+        let probe = || {
+            let file = crate::flock::open(&lock_path, crate::flock::Open::Existing).unwrap();
+            crate::flock::FileLock::hold(
+                file,
+                crate::flock::Mode::Exclusive,
+                crate::flock::Wait::Now,
+            )
+            .unwrap()
+            .is_some()
+        };
+        assert!(!probe(), "a live scope-lock holder must exclude a second writer");
+        drop(held);
+        assert!(probe(), "dropping the guard must release the scope lock");
     }
 }
