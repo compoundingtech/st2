@@ -758,10 +758,6 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
-    /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
-    /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
-    /// expansion actually emits.
-    #[test]
     #[test]
     fn omp_launch_classification_is_exact() {
         let root = Path::new("/catalog");
@@ -807,6 +803,9 @@ mod tests {
         assert!(!argv_invokes_omp(&["/opt/bin/omph".into()], root));
     }
 
+    /// The gate that holds a pi launch until the set is verified keys on this predicate, so a
+    /// fencepost here silently ungates every pi agent. The `driver pi-session` shape is the one
+    /// expansion actually emits.
     #[test]
     fn pi_launch_classification_is_exact() {
         let root = Path::new("/catalog");

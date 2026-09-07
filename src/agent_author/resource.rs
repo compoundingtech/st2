@@ -40,30 +40,6 @@ pub struct ResourceRenameReceipt {
 /// st2 preserves the binding for readers; it resolves nothing and grants nothing. `uri` is the
 /// exact absolute identity and is stored byte for byte with no normalization.
 #[allow(clippy::too_many_arguments)]
-pub fn add_resource(
-    catalog_root: &Path,
-    selector: &str,
-    this_host: &str,
-    actor: Option<&str>,
-    name: &str,
-    uri: &str,
-    reason: &str,
-    inactive_reason: Option<&str>,
-) -> Result<ResourceAddReceipt, AuthorError> {
-    add_resource_with_selector(
-        catalog_root,
-        selector,
-        this_host,
-        actor,
-        name,
-        uri,
-        reason,
-        inactive_reason,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn add_resource_with_selector(
     catalog_root: &Path,
     selector: &str,

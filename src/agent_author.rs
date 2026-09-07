@@ -1263,7 +1263,7 @@ mod tests {
             &declaration("worker", "h", None, "catalog"),
         );
 
-        let added = add_resource(
+        let added = add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1272,13 +1272,14 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(added.result, AuthorOutcome::Changed);
         assert_eq!(added.identity, "h.worker");
         assert_eq!(added.inactive_reason, None);
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1287,13 +1288,14 @@ mod tests {
             "worktree://github.com/example/project/change",
             "primary checkout",
             None,
+            None,
         )
         .unwrap();
         let two_bindings = fs::read_to_string(&path).unwrap();
 
         // An identical request proves the binding rather than rewriting the declaration.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -1301,6 +1303,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/123",
                 "release work item",
+                None,
                 None,
             )
             .unwrap()
@@ -1311,7 +1314,7 @@ mod tests {
 
         // Re-declaring an existing name updates it in place, keeping its position and siblings.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -1320,6 +1323,7 @@ mod tests {
                 "github-issue://example/project/456",
                 "follow-up work item",
                 Some("superseded by the follow-up"),
+                None,
             )
             .unwrap()
             .result,
@@ -1345,7 +1349,7 @@ mod tests {
 
         // The request declares the complete binding, so an omitted inactive-reason clears it.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -1353,6 +1357,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/456",
                 "follow-up work item",
+                None,
                 None,
             )
             .unwrap()
@@ -1379,7 +1384,7 @@ mod tests {
 
         // Hand-authored property order and spacing are proven, not re-rendered.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -1387,6 +1392,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/123",
                 "release work item",
+                None,
                 None,
             )
             .unwrap()
@@ -1405,7 +1411,7 @@ mod tests {
             "h/worker/agent.kdl",
             &declaration("worker", "h", None, "catalog"),
         );
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1414,9 +1420,10 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             None,
+            None,
         )
         .unwrap();
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1424,6 +1431,7 @@ mod tests {
             "source",
             "worktree://github.com/example/project/change",
             "primary checkout",
+            None,
             None,
         )
         .unwrap();
@@ -1461,7 +1469,7 @@ mod tests {
             "h/worker/agent.kdl",
             &declaration("worker", "h", None, "catalog"),
         );
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1470,9 +1478,10 @@ mod tests {
             "github-issue://example/project/123",
             "release work item",
             Some("merged and retained for traceability"),
+            None,
         )
         .unwrap();
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1480,6 +1489,7 @@ mod tests {
             "source",
             "worktree://github.com/example/project/change",
             "primary checkout",
+            None,
             None,
         )
         .unwrap();
@@ -1561,7 +1571,7 @@ mod tests {
         );
         let untouched = fs::read_to_string(&nix_owned).unwrap();
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.child",
             "h",
@@ -1570,11 +1580,12 @@ mod tests {
             "github-issue://example/project/1",
             "supervised work item",
             None,
+            None,
         )
         .unwrap();
 
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.sibling",
                 "h",
@@ -1582,6 +1593,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/1",
                 "reaching across the fleet",
+                None,
                 None,
             )
             .unwrap_err()
@@ -1595,7 +1607,7 @@ mod tests {
             "resource-not-authorized"
         );
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.nix",
                 "h",
@@ -1603,6 +1615,7 @@ mod tests {
                 "work",
                 "github-issue://example/project/1",
                 "Nix owns this declaration",
+                None,
                 None,
             )
             .unwrap_err()
@@ -1625,7 +1638,7 @@ mod tests {
                 Some(""),
             ),
         ] {
-            let error = add_resource(
+            let error = add_resource_with_selector(
                 root,
                 "h.child",
                 "h",
@@ -1634,6 +1647,7 @@ mod tests {
                 uri,
                 reason,
                 inactive_reason,
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code(), "invalid-resource", "{name}: {error}");
@@ -1647,7 +1661,7 @@ mod tests {
         );
 
         // #345 widened the envelope: a catalog-relative carrier path is a valid binding uri.
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.child",
             "h",
@@ -1655,6 +1669,7 @@ mod tests {
             "carrier",
             "carriers/goal.md",
             "Catalog-relative carrier.",
+            None,
             None,
         )
         .expect("a catalog-relative carrier path is admitted");
@@ -1672,7 +1687,7 @@ mod tests {
         );
         let exact = "vendor+Thing://Authority.Example/Exact%20Identity?Query=A%2Fb#Frag%20Ment";
 
-        add_resource(
+        add_resource_with_selector(
             root,
             "h.worker",
             "h",
@@ -1680,6 +1695,7 @@ mod tests {
             "subject",
             exact,
             "exact vendor identity",
+            None,
             None,
         )
         .unwrap();
@@ -1691,7 +1707,7 @@ mod tests {
 
         // A byte-identical re-declaration is a proven no-op, not a rewrite.
         assert_eq!(
-            add_resource(
+            add_resource_with_selector(
                 root,
                 "h.worker",
                 "h",
@@ -1699,6 +1715,7 @@ mod tests {
                 "carried",
                 exact,
                 "exact vendor identity",
+                None,
                 None,
             )
             .unwrap()

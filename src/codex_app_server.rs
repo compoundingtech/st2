@@ -234,7 +234,7 @@ pub enum CodexObservedState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum CodexHoldReason {
+pub(crate) enum CodexHoldReason {
     ActiveWithoutTurn,
     ConflictingTurn,
     Review,
@@ -249,7 +249,7 @@ pub enum CodexHoldReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum CodexTerminalError {
+pub(crate) enum CodexTerminalError {
     SystemError,
     ProviderAuthRejected,
 }
@@ -3002,7 +3002,8 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     result
 }
 
-pub fn load_current_binding(
+#[cfg(test)]
+fn load_current_binding(
     path: &Path,
     runtime: &CodexRuntime,
 ) -> Result<Option<CodexThreadBinding>> {
@@ -3025,7 +3026,8 @@ pub fn load_current_binding(
     Ok(Some(binding))
 }
 
-pub fn load_current_control_state(
+#[cfg(test)]
+fn load_current_control_state(
     path: &Path,
     runtime: &CodexRuntime,
     binding: &CodexThreadBinding,
