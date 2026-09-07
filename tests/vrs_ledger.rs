@@ -146,22 +146,26 @@ fn collided_decision_numbers_are_never_cited_bare() {
             let source = fs::read_to_string(&path).expect("citation source must be readable");
             for (number, line) in source.lines().enumerate() {
                 for collided in COLLIDED {
+                    // A line that names the stem anywhere — including as a Markdown link target
+                    // behind a bare label — has already said which file it means.
+                    let stem_named = line.contains(&format!("{collided}-"));
                     let mut rest = line;
                     while let Some(at) = rest.find(collided) {
                         let after = &rest[at + collided.len()..];
-                        let before_is_word = rest[..at]
+                        let inside_longer_token = after
                             .chars()
-                            .next_back()
-                            .is_some_and(|character| character.is_alphanumeric());
-                        // A stem (`0015-…`) is the qualified form; a longer number is not a
-                        // citation at all.
-                        let qualified = after.starts_with('-')
-                            || after.chars().next().is_some_and(char::is_numeric)
-                            || before_is_word;
-                        if !qualified {
+                            .next()
+                            .is_some_and(|character| character.is_numeric())
+                            || rest[..at]
+                                .chars()
+                                .next_back()
+                                .is_some_and(|character| character.is_alphanumeric());
+                        if !stem_named && !after.starts_with('-') && !inside_longer_token {
                             bare.push(format!("{relative}:{}: {}", number + 1, line.trim()));
                         }
-                        checked += 1;
+                        if !inside_longer_token {
+                            checked += 1;
+                        }
                         rest = after;
                     }
                 }
