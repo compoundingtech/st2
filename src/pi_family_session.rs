@@ -20,12 +20,12 @@
 //! omp, its version gate.
 
 use std::path::Path;
-use std::process::ExitStatus;
 
 use anyhow::{Context as _, Result};
 
 use crate::provider_session::{
-    PROVIDER_POLL, ProviderOutcome, STOP, install_signal_handler, run_provider_observed,
+    PROVIDER_POLL, ProviderOutcome, STOP, describe_exit, install_signal_handler,
+    run_provider_observed,
 };
 use crate::{harness_state, hooks, message, status};
 
@@ -199,7 +199,9 @@ fn record_session_end(
     kind: &HarnessKind,
 ) {
     let label = match outcome {
-        ProviderOutcome::Exited(exit) | ProviderOutcome::Stopped(Some(exit)) => exit_label(*exit),
+        ProviderOutcome::Exited(exit) | ProviderOutcome::Stopped(Some(exit)) => {
+            describe_exit(*exit)
+        }
         ProviderOutcome::Stopped(None) => "stopped".to_string(),
     };
     let mut writer = harness_state::Writer::new(
@@ -214,15 +216,6 @@ fn record_session_end(
             "st2 {} driver: recording session end failed: {error}",
             kind.label
         );
-    }
-}
-
-fn exit_label(exit: ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (exit.code(), exit.signal()) {
-        (Some(code), _) => format!("exit {code}"),
-        (None, Some(signal)) => format!("signal {signal}"),
-        (None, None) => "exited".to_string(),
     }
 }
 
