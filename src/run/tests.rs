@@ -1,4 +1,6 @@
 use super::*;
+use std::os::fd::AsRawFd as _;
+use std::process::ChildStdin;
 use agent_spec::spec::{
     AgentSpec, Driver, JobType, OmpDriver, Task, TaskKind, TaskLifecycle,
 };
