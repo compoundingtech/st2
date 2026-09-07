@@ -95,18 +95,20 @@ pub(crate) fn replace(
 ) -> io::Result<()> {
     let parent = parent_of(path)?;
     let staged = prepare(parent, &staging)?;
-    let landed = (|| -> io::Result<()> {
-        let mut file = create_staging(&staged)?;
+    // A refused creation returns BEFORE the cleanup scope: the thing occupying a
+    // `{prefix}.tmp-{pid}-{counter}` path is not ours, and refusing to follow it must not turn
+    // into unlinking it.
+    let mut file = create_staging(&staged)?;
+    let staged_bytes = (|| -> io::Result<()> {
         file.write_all(bytes)?;
         if durability == Durability::FsyncFileAndDir {
             file.sync_all()?;
         }
-        drop(file);
-        fs::rename(&staged, path)
+        Ok(())
     })();
-    if let Err(error) = landed {
-        // Best-effort: the staging name is unique per write, so a leftover is inert rather than a
-        // path a later write could collide with.
+    drop(file);
+    if let Err(error) = staged_bytes.and_then(|()| fs::rename(&staged, path)) {
+        // Best-effort, and only for the file this call created.
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
@@ -127,15 +129,18 @@ pub(crate) fn create_once(path: &Path, bytes: &[u8], staging: Staging<'_>) -> io
     let parent = parent_of(path)?;
     let staged = prepare(parent, &staging)?;
     let mut file = create_staging(&staged)?;
-    let written = file.write_all(bytes);
+    let staged_bytes = file.write_all(bytes);
     drop(file);
-    let created = match written.and_then(|()| fs::hard_link(&staged, path)) {
+    // A failed staged write is never a duplicate: `Ok(false)` claims somebody else published
+    // these bytes, and bytes that were never written are nobody's publication. Only the hardlink
+    // may answer that question.
+    let created = staged_bytes.and_then(|()| match fs::hard_link(&staged, path) {
         Ok(()) => Ok(true),
         // `hard_link` reports `AlreadyExists` for a taken name, but a target that is already a
         // regular file is the same answer whatever the error says.
         Err(_) if path.is_file() => Ok(false),
         Err(error) => Err(error),
-    };
+    });
     let _ = fs::remove_file(&staged);
     created
 }

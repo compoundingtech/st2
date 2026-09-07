@@ -2033,7 +2033,7 @@ fn collect_bundle_files(
                 | ".harness-state.seq"
                 | ".harness-state.lock"
                 | ".harness-context.lock"
-        ) || name_text.starts_with(".status.tmp-");
+        ) || name_text.starts_with(crate::status::TMP_STAGING_PREFIX);
         if first.is_some() && relative_to_bundle.components().count() == 1 && state {
             if source == ProjectionSource::Prepared {
                 anyhow::bail!(
@@ -2244,7 +2244,7 @@ fn reject_state_children(identity_path: &Path) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_str().context("identity path is not UTF-8")?;
         if matches!(name, "resources" | "archive" | "inbox" | "status")
-            || name.starts_with(".status.tmp-")
+            || name.starts_with(crate::status::TMP_STAGING_PREFIX)
         {
             anyhow::bail!(
                 "prepared catalog contains state-plane path: {}",
@@ -2934,7 +2934,7 @@ fn validate_declaration_leaf_path(path: &str) -> Result<()> {
             !matches!(
                 components[3],
                 ".workspace" | "resources" | "archive" | "inbox" | "status"
-            ) && !components[3].starts_with(".status.tmp-"),
+            ) && !components[3].starts_with(crate::status::TMP_STAGING_PREFIX),
             "catalog apply marker contains a workspace or state-plane path"
         );
     }

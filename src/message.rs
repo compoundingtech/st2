@@ -399,9 +399,13 @@ pub fn materialize_message_once(
     result
 }
 
-/// The staging-name prefix for everything this module stages. Four sent-record and inbox walkers
-/// match `.message.tmp-` by prefix, so the name is a contract with them, not a local detail.
+/// The staging-name prefix for everything this module stages.
 const TMP_PREFIX: &str = ".message";
+
+/// The full staged-name prefix four inbox and sent-record walkers skip by prefix, spelled ONCE so
+/// a walker cannot drift from the writer. Tied to [`TMP_PREFIX`] by
+/// `the_staging_prefix_is_the_one_the_inbox_walkers_skip`.
+const TMP_STAGING_PREFIX: &str = ".message.tmp-";
 
 fn tmp_name() -> String {
     crate::fsatomic::staging_name(TMP_PREFIX)
@@ -711,7 +715,7 @@ fn read_sent_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent record filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         anyhow::ensure!(name.ends_with(".json"), "unexpected sent record entry");
@@ -744,7 +748,7 @@ fn read_pending_records(directory: &Path) -> anyhow::Result<Vec<SentRecord>> {
         let Some(name) = name.to_str() else {
             anyhow::bail!("pending sent record filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -804,7 +808,7 @@ fn read_sent_commits(directory: &Path) -> anyhow::Result<BTreeMap<String, SentCo
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent commit filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -845,7 +849,7 @@ fn read_sent_keys(directory: &Path) -> anyhow::Result<BTreeMap<String, SentKey>>
         let Some(name) = name.to_str() else {
             anyhow::bail!("sent key filename is not UTF-8");
         };
-        if name.starts_with(".message.tmp-") {
+        if name.starts_with(TMP_STAGING_PREFIX) {
             continue;
         }
         let digest = name
@@ -2561,6 +2565,18 @@ fn remove_inbox_duplicate(source: &Path, filename: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// The staged name is a contract with four walkers that skip it by prefix (`inbox_dir` and the
+    /// three sent-record scans), all of which now match [`TMP_STAGING_PREFIX`] so none can drift
+    /// from the writer. What a shared const cannot catch is both sides being renamed together,
+    /// which would leave every already-staged file on the fleet unrecognized — hence the value
+    /// assertion.
+    #[test]
+    fn the_staging_prefix_is_the_one_the_inbox_walkers_skip() {
+        assert_eq!(TMP_PREFIX, ".message");
+        assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
+        assert!(!is_message_filename(&tmp_name()), "a staged name must never look like a message");
+    }
+
     /// [`atomic_create_file`]'s create-once contract. It is a hardlink, not a rename, and that is
     /// the whole point: the first publication wins, a second reports `false` instead of replacing
     /// the winner's bytes, and neither leaves a staged sibling behind for the four `.message.tmp-`
@@ -2588,7 +2604,7 @@ mod tests {
         let residue = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".message.tmp-"))
+            .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
         assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
     }
@@ -2606,7 +2622,7 @@ mod tests {
         let residue = fs::read_dir(tmp.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".message.tmp-"))
+            .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
         assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
     }
@@ -2764,23 +2780,29 @@ mod tests {
         fs::create_dir_all(&inbox).unwrap();
         let victim = tmp.path().join("victim");
         fs::write(&victim, "must remain unchanged").unwrap();
-        // The counter now lives in `fsatomic`, so the next names are predicted from a probe
-        // rather than read off a module-local static: one call consumes `start`, so the writes
-        // this test blocks are the 4096 after it.
-        let probe = tmp_name();
-        let start = probe
-            .rsplit_once('-')
-            .and_then(|(_, counter)| counter.parse::<u64>().ok())
-            .expect("the staging grammar ends in the counter");
-        for counter in start + 1..start + 1 + 4096 {
-            symlink(
-                &victim,
-                inbox.join(format!(
-                    "{TMP_PREFIX}.tmp-{}-{counter}",
-                    std::process::id()
-                )),
-            )
-            .unwrap();
+        // The counter lives in `fsatomic` and is shared with every other staging site, so a
+        // sibling test running in parallel advances it too. Plant a window, then PROBE again: the
+        // loop only exits once the very next name is one this test has already blocked, so the
+        // assertion below cannot become "the call happened to pick a free name".
+        let counter_of = |name: &str| {
+            name.rsplit_once('-')
+                .and_then(|(_, counter)| counter.parse::<u64>().ok())
+                .expect("the staging grammar ends in the counter")
+        };
+        let mut planted_through = 0;
+        loop {
+            let probe = counter_of(&tmp_name());
+            if probe < planted_through {
+                break;
+            }
+            for counter in probe + 1..=probe + 512 {
+                symlink(
+                    &victim,
+                    inbox.join(format!("{TMP_PREFIX}.tmp-{}-{counter}", std::process::id())),
+                )
+                .unwrap();
+            }
+            planted_through = probe + 512;
         }
 
         let error = materialize_message_once(&inbox, "1784649988123-symlnk.md", "must not escape")

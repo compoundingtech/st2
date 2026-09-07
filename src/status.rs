@@ -284,6 +284,14 @@ fn write_record(path: &Path, state: State, written_at_ms: u64) -> anyhow::Result
     )
 }
 
+/// The staging-name prefix this module hands [`crate::fsatomic`].
+const TMP_PREFIX: &str = ".status";
+
+/// The full staged-name prefix six catalog and publication walkers match, spelled ONCE here so a
+/// walker can never drift from the writer. Tied to [`TMP_PREFIX`] by
+/// `the_staging_prefix_is_the_one_the_catalog_walkers_match`.
+pub(crate) const TMP_STAGING_PREFIX: &str = ".status.tmp-";
+
 /// Atomic write: a staged sibling + rename, so a concurrent reader sees either the old bytes or
 /// the new bytes, never a partial file.
 ///
@@ -294,7 +302,7 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     crate::fsatomic::replace(
         path,
         content.as_bytes(),
-        crate::fsatomic::Staging::new(".status"),
+        crate::fsatomic::Staging::new(TMP_PREFIX),
         crate::fsatomic::Durability::Rename,
     )?;
     Ok(())
@@ -304,6 +312,18 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::time::{Duration as Dur, SystemTime};
+
+    /// The staged name is a contract with six walkers that skip it by prefix, in three other
+    /// modules: `catalog.rs`, `catalog_transaction.rs` and `agent_publish.rs` all match
+    /// [`TMP_STAGING_PREFIX`], so a changed writer prefix cannot desynchronize them. What a const
+    /// cannot catch is the prefix being renamed on BOTH sides at once — a staged status file would
+    /// then still be skipped locally, but the fleet's existing records and any other reader of the
+    /// old name would not. That is what this assertion is for.
+    #[test]
+    fn the_staging_prefix_is_the_one_the_catalog_walkers_match() {
+        assert_eq!(TMP_PREFIX, ".status");
+        assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
+    }
 
     /// [`write_atomic`]'s publication contract: the target ends up carrying the complete new
     /// bytes, no staged sibling survives, and the record is owner-only.

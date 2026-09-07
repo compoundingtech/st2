@@ -676,7 +676,7 @@ fn copy_filtered_catalog(
                     name_text.as_ref(),
                     "resources" | "archive" | "inbox" | "status"
                 )
-                || declaration_parent && name_text.starts_with(".status.tmp-"))
+                || declaration_parent && name_text.starts_with(crate::status::TMP_STAGING_PREFIX))
         {
             continue;
         }
