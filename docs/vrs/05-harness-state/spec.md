@@ -233,6 +233,64 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
 | `Held { UnknownStatus }` | *withhold* | — | — | an unrecognized future status is not a terminal `systemError` and cannot authorize delivery |
 
+### The turn-failure axis (the `error` notification)
+
+Three of the rows above are reached only by a turn that ENDS. `error` is the
+notification that says a turn failed, and it is the only frame that carries a
+cause: `ErrorNotification` requires `error`, `threadId`, `turnId` and
+`willRetry`, and its `error.codexErrorInfo` is Codex's own closed error
+vocabulary. A driver that reads only the thread status and the turn lifecycle
+reports an unexplained `ended` at best and a plain `active` at worst — the
+second is what a seat reads while Codex retries, because a retried turn emits
+no completion and moves no status.
+
+So the driver reads it, on an axis of its own beside the credential axis. It
+does not touch `CodexObservedState`: `Held` stays exactly the complement of
+steerable (decision 0001), so a failing seat stays reachable. Two records
+change.
+
+The **native-driver diagnostic** gains a `turn` stage, published from
+`Source::TurnError`, with `codexErrorInfo` classified by what a person does
+about it:
+
+| `codexErrorInfo` | reason |
+| --- | --- |
+| `usageLimitExceeded`, `rateLimitExceeded`, `sessionBudgetExceeded` | `turnUsageLimit` |
+| `serverOverloaded` | `turnServerOverloaded` |
+| `contextWindowExceeded` | `turnContextWindow` |
+| `httpConnectionFailed`, `responseStreamConnectionFailed`, `responseStreamDisconnected`, `responseTooManyFailedAttempts` | `turnConnection` |
+| `cyberPolicy` | `turnPolicy` |
+| `badRequest`, `activeTurnNotSteerable` | `turnRejected` |
+| `internalServerError`, `threadRollbackFailed`, `sandboxError` | `turnInternal` |
+| Codex's own `other`, and any word this build does not know | `turnUnclassified` |
+| `unauthorized` | *not here* — the `providerAuth` stage owns it, from `turn/completed` |
+
+`turnUnclassified` is deliberately distinct from a reader's `unknown`: it is a
+word st2 WROTE, meaning a real failure whose cause this version cannot name.
+Codex's own word travels beside it in the wrapper log, so an operator learns
+the exact cause even where the classification could not.
+
+The **observed record's `reason`** names the same cause, because that is the
+field a reader checks. The rule is that the cause outranks the activity: a bare
+`active`, the word `systemError`, and every hold reason say what kind of work
+the thread believes it is doing, while the turn error says why none of it is
+progressing. Two reasons are left alone — a human ask (`blockedOn: human`),
+which is stronger and more actionable, and `providerAuth`, which names the same
+failure's more specific cause from a stage of its own. The other axes do not
+move: `state` stays whatever Codex reports, and `blockedOn` stays `none`,
+because nothing is asking a human anything and `human` would be a second false
+statement in the field consumers filter on. What a reader gets instead is the
+cause, plus two independent ages for it — the record's own `sinceMs` and the
+diagnostic's `evidenceAgeMs`, neither of which a repeated identical failure
+refreshes.
+
+A standing turn failure clears only on POSITIVE proof that the turn recovered:
+the failed turn reaching `turn/completed` with status `completed`, a thread
+status of `idle`, or a different turn starting. Never on silence, and never on
+a `turn/completed` that itself reports `failed` — a failure is not its own
+recovery. The asymmetry is the point: a stuck seat produces quiet, so quiet
+must not clear the evidence that it is stuck.
+
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass
 with every row mapped to `unknown` is not an oracle (#268 §B). The wrapper
@@ -448,6 +506,7 @@ The closed stage/reason/source matrix is:
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
 | `providerAuth` | `providerAuthRejected` | `turnResult` |
+| `turn` | `turnUsageLimit`, `turnServerOverloaded`, `turnContextWindow`, `turnConnection`, `turnPolicy`, `turnRejected`, `turnInternal`, `turnUnclassified` | `turnError` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
@@ -475,13 +534,16 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude, Codex, and omp publish exactly one of those stages — `providerAuth` —
-from their own typed turn-failure signal, and nothing else: every earlier
-boundary is already fail-closed at admission for them (an incompatible Codex
-protocol refuses the launch rather than degrading into an observation, an
-unadmitted omp MINOR refuses it too under OMP-R05, and st2 gates no Claude
-version at all). Every edge comes from the signal that ends a turn, so no
-driver reads provider prose to decide this:
+Claude and omp publish exactly one of those stages — `providerAuth` — from
+their own typed turn-failure signal, and nothing else: every earlier boundary is
+already fail-closed at admission for them (an unadmitted omp MINOR refuses the
+launch under OMP-R05, and st2 gates no Claude version at all). **Codex publishes
+two**, `providerAuth` and `turn`: its protocol gate refuses an incompatible
+launch rather than degrading into an observation, so the boundaries left are the
+two a running seat can meet — the credential, and the turn itself. The
+credential edges come from the signal that ends a turn; the turn edges come from
+the `error` notification described under the Codex producer above. No driver
+reads provider prose to decide any of it:
 
 | Driver | Rejection | Recovery | `producerVersion` / `support` |
 | --- | --- | --- | --- |
@@ -504,7 +566,10 @@ such gate because its flags are separate bits that cannot merge, but it does
 need the `Class` bit checked, because an unclassified `errorId` is a bare HTTP
 status. Because these three publish only on rejection, an absent record is their
 healthy steady state and Doctor advises nothing for it; OpenCode, which resolves
-its version gate on every launch, still advises on absence.
+its version gate on every launch, still advises on absence. That is exactly why
+the `turn` stage matters: for a seat whose healthy reading is `absent`, a
+failure nobody publishes is indistinguishable from health, and the one that went
+unpublished for a whole night was a provider refusing every turn.
 
 The roster projection always has one fixed shape. `failure` fills every
 evidence field; `absent` and `indeterminate` preserve the same keys with null
@@ -583,6 +648,19 @@ each only once a real test proves it (per `CLAUDE.md`):
   and bounded telemetry labels are proved by focused unit/integration tests in
   `src/driver_diagnostic.rs`, `src/opencode_session.rs`, `src/agents.rs`,
   `src/metrics.rs`, and `tests/doctor.rs`.
+- **A refused turn names its cause on both records** — the `error` notification
+  is read, classified into the closed `turn` vocabulary, and cleared only by
+  positive recovery; the credential stage still outranks it and a human ask
+  still keeps its own reason. Proved in `src/codex_app_server/tests.rs`
+  (`a_retried_provider_failure_names_itself_while_codex_still_reports_a_live_turn`,
+  `only_positive_recovery_clears_a_standing_turn_failure`,
+  `a_completed_turn_and_a_later_turn_each_clear_the_failure_they_supersede`,
+  `each_codex_error_class_lands_on_its_own_reason_and_the_credential_word_stays_out`,
+  `a_rejected_credential_outranks_a_standing_turn_failure_on_the_same_seat`,
+  `a_human_ask_keeps_its_reason_while_a_turn_failure_stands`,
+  `the_captured_usage_limit_stall_now_names_its_cause_on_both_records`,
+  `a_malformed_error_frame_neither_publishes_nor_clears`) and
+  `src/driver_diagnostic.rs::a_turn_failure_is_evidence_only_from_the_producers_error_notification`.
 
 ## Open design questions
 
