@@ -260,6 +260,7 @@ about it:
 | `contextWindowExceeded` | `turnContextWindow` |
 | `httpConnectionFailed`, `responseStreamConnectionFailed`, `responseStreamDisconnected`, `responseTooManyFailedAttempts` | `turnConnection` |
 | `cyberPolicy` | `turnPolicy` |
+| *(no Codex word; Claude's `account_on_hold` and `billing_error`)* | `turnAccount` |
 | `badRequest`, `activeTurnNotSteerable` | `turnRejected` |
 | `internalServerError`, `threadRollbackFailed`, `sandboxError` | `turnInternal` |
 | Codex's own `other`, and any word this build does not know | `turnUnclassified` |
@@ -318,8 +319,19 @@ Two cooperating writers. The hook side classifies turn lifecycle: a submitted
 prompt or tool activity writes `active`; `Stop` writes `idle`; `StopFailure`
 — which Claude fires *instead of* `Stop` when an API error ended the turn —
 also writes `idle`, because the turn is over at the same lifecycle point, with
-reason `providerAuth` for the credential class and `apiError` for every other
-word in that closed vocabulary. It is deliberately not `ended`: the TUI is
+reason `providerAuth` for the credential class and, for every other word in that
+closed vocabulary, the same turn-failure class the Codex producer publishes:
+`rate_limit` is `usageLimit`, `overloaded` is `serverOverloaded`,
+`max_output_tokens` is `contextWindow`, `oauth_org_not_allowed` is `policy`,
+`account_on_hold` and `billing_error` are `account`, `invalid_request` and
+`model_not_found` are `rejected`, `server_error` is `internal`, and Claude's own
+`unknown` — with every word added after this build — is `unclassified`. The same
+class publishes the `turn` stage on the native-driver diagnostic, from
+`Source::TurnError`, cleared by the next `Stop`. Until this landed all ten words
+arrived as the single reason `apiError` on a record that also read `idle` and
+`blockedOn: none`, with no diagnostic at all — which is what a seat waiting for
+work looks like, so an account on hold and a finished turn read the same. It is
+deliberately not `ended`: the TUI is
 still live, a human can re-login and carry on, and the wrapper owns this seat's
 terminal record (OHS-T04). The event carries a second registered command, the
 pre-existing wedge reporter, so both jobs run on one edge;
@@ -506,12 +518,19 @@ The closed stage/reason/source matrix is:
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
 | `providerAuth` | `providerAuthRejected` | `turnResult` |
-| `turn` | `turnUsageLimit`, `turnServerOverloaded`, `turnContextWindow`, `turnConnection`, `turnPolicy`, `turnRejected`, `turnInternal`, `turnUnclassified` | `turnError` |
+| `turn` | `turnUsageLimit`, `turnServerOverloaded`, `turnContextWindow`, `turnConnection`, `turnPolicy`, `turnAccount`, `turnRejected`, `turnInternal`, `turnUnclassified` | `turnError` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
-One in-process publisher retains at most one current failure per stage and
-persists the earliest stage in the table's execution order. Re-publishing the
+One publisher retains at most one current failure per stage and
+persists the earliest stage in the table's execution order. It seeds that set
+from the record already on disk for its own driver, so stage priority survives a
+process boundary: every Claude hook invocation is its own process, and without
+the seeding a later boundary would overwrite an earlier one and stop telling an
+operator the real cause. One residual, stated: the record holds ONE failure, so
+a stage cleared from a fresh process cannot reveal an outstanding failure it
+never read. No producer reaches it today — Claude and Codex both clear their two
+stages on the same edge, a turn that reached its ordinary end. Re-publishing the
 same tuple is a no-op; it does not refresh `observedAt` or increment telemetry.
 A stage success clears only that stage and atomically reveals the next
 outstanding failure. Clearing the final failure removes the record. At a new
@@ -534,16 +553,17 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude and omp publish exactly one of those stages — `providerAuth` — from
-their own typed turn-failure signal, and nothing else: every earlier boundary is
-already fail-closed at admission for them (an unadmitted omp MINOR refuses the
-launch under OMP-R05, and st2 gates no Claude version at all). **Codex publishes
-two**, `providerAuth` and `turn`: its protocol gate refuses an incompatible
-launch rather than degrading into an observation, so the boundaries left are the
-two a running seat can meet — the credential, and the turn itself. The
-credential edges come from the signal that ends a turn; the turn edges come from
-the `error` notification described under the Codex producer above. No driver
-reads provider prose to decide any of it:
+omp publishes exactly one of those stages — `providerAuth` — from its own typed
+turn-failure signal, and nothing else: every earlier boundary is already
+fail-closed at admission for it (an unadmitted MINOR refuses the launch under
+OMP-R05). **Claude and Codex publish two**, `providerAuth` and `turn`: st2 gates
+no Claude version at all, and Codex's protocol gate refuses an incompatible
+launch rather than degrading into an observation, so the boundaries left for
+both are the two a running seat can meet — the credential, and the turn itself.
+The credential edges come from the signal that ends a turn; the turn edges come
+from the signal that says a turn FAILED — Codex's `error` notification, Claude's
+`StopFailure` word — which is the only one carrying a cause. No driver reads
+provider prose to decide any of it:
 
 | Driver | Rejection | Recovery | `producerVersion` / `support` |
 | --- | --- | --- | --- |
@@ -555,10 +575,14 @@ No driver borrows the word for a neighbouring class: Claude's `rate_limit`,
 `overloaded`, `oauth_org_not_allowed`, `account_on_hold` and `billing_error`,
 Codex's `usageLimitExceeded` and `rateLimitExceeded`, and omp's `UsageLimit`,
 `AccountPolicy` and `Transient` flags are capacity, policy, or account state
-that a re-login cannot fix. Claude's `StopFailure` still writes `idle` with
-reason `apiError` for them — the turn did end — Codex keeps its `systemError`
-terminal, and omp's frame still writes `active` with omp's own bounded prose,
-which is the only place a reader learns that a 403 was about credits. The Codex
+that a re-login cannot fix. Claude's `StopFailure` still writes `idle` for them
+— the turn did end — and names the class on both records instead of borrowing
+the credential's word; Codex keeps its `systemError` terminal and names the
+class beside it; omp's frame still writes `active` with omp's own bounded prose,
+which is the only place a reader learns that a 403 was about credits. **omp is
+the one driver that still has nowhere to put a non-credential turn failure**,
+and its prose is not a machine-readable axis: it is the remaining instance of
+this gap. The Codex
 startup gate pins `unauthorized` and both quota words present in
 `CodexErrorInfo`, so a release that merged them refuses the launch instead of
 letting st2 report an exhausted allowance as a rejected credential; omp needs no

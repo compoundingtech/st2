@@ -138,6 +138,7 @@ pub enum Reason {
     TurnContextWindow,
     TurnConnection,
     TurnPolicy,
+    TurnAccount,
     TurnRejected,
     TurnInternal,
     TurnUnclassified,
@@ -146,7 +147,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -172,6 +173,7 @@ impl Reason {
         Self::TurnContextWindow,
         Self::TurnConnection,
         Self::TurnPolicy,
+        Self::TurnAccount,
         Self::TurnRejected,
         Self::TurnInternal,
         Self::TurnUnclassified,
@@ -204,6 +206,7 @@ impl Reason {
             Self::TurnContextWindow => "turnContextWindow",
             Self::TurnConnection => "turnConnection",
             Self::TurnPolicy => "turnPolicy",
+            Self::TurnAccount => "turnAccount",
             Self::TurnRejected => "turnRejected",
             Self::TurnInternal => "turnInternal",
             // The producer named a cause this build does not classify. Distinct from
@@ -233,6 +236,7 @@ impl Reason {
             | Self::TurnContextWindow
             | Self::TurnConnection
             | Self::TurnPolicy
+            | Self::TurnAccount
             | Self::TurnRejected
             | Self::TurnInternal
             | Self::TurnUnclassified => Stage::Turn,
@@ -271,6 +275,7 @@ impl Reason {
             | Self::TurnContextWindow
             | Self::TurnConnection
             | Self::TurnPolicy
+            | Self::TurnAccount
             | Self::TurnRejected
             | Self::TurnInternal
             | Self::TurnUnclassified => matches!(source, Source::TurnError),
@@ -326,6 +331,11 @@ impl Source {
             Self::QuestionSnapshot => "questionSnapshot",
             Self::PromptTransport => "promptTransport",
             Self::MessageReadBack => "messageReadBack",
+            // The two turn sources are different signals, not spellings of one. `turnResult` is
+            // the producer's statement about how a turn ENDED, and it carries BOTH edges of the
+            // credential axis — Codex's `turn/completed`, Claude's `Stop`/`StopFailure` pair.
+            // `turnError` is the producer's statement that a turn FAILED, and it is the only one
+            // that carries a cause: Codex's `error` notification, Claude's `StopFailure` word.
             Self::TurnResult => "turnResult",
             Self::TurnError => "turnError",
             Self::Unknown => "unknown",
@@ -555,12 +565,30 @@ impl Publisher {
                 "st2 driver diagnostic malformed predecessor cleanup failed: {error}"
             );
         }
+        // Seed the stage set from whatever readable record this seat already carries for THIS
+        // driver. Without it, a short-lived publisher — every Claude hook invocation is its own
+        // process — would persist its own stage over a predecessor's EARLIER one, and stage
+        // priority would hold only inside a process. Nothing is resurrected that was not already
+        // on disk: `persist` writes the earliest stage it holds, and this only decides which of
+        // two live failures a reader sees.
+        let mut failures: [Option<Record>; 8] = array::from_fn(|_| None);
+        if let Ok(raw) = fs::read(&path)
+            && let Ok(record) = serde_json::from_slice::<Record>(&raw)
+            && record.schema == SCHEMA
+            && record.recovery == RECOVERY
+            && record.driver == driver
+            && record.reason.stage() == record.stage
+            && record.reason.accepts_source(record.source)
+            && let Some(index) = record.stage.index()
+        {
+            failures[index] = Some(record);
+        }
         Self {
             path,
             driver,
             producer_version,
             support,
-            failures: array::from_fn(|_| None),
+            failures,
         }
     }
 
@@ -685,6 +713,32 @@ pub(crate) fn publish_provider_auth(agent_dir: &Path, driver: Driver, edge: Prov
             Source::TurnResult,
         ),
         ProviderAuthEdge::Accepted => publisher.clear(Stage::ProviderAuth),
+    }
+}
+
+/// What one observation proves about the seat's current turn, beside the credential axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnFailureEdge {
+    /// The producer said this turn failed, and named a cause this build classified.
+    Failed(Reason),
+    /// A turn reached its ordinary end. Positive proof, and the only thing that clears a standing
+    /// failure — silence never does, because silence is what a stuck seat produces.
+    Recovered,
+}
+
+/// Record one turn edge on the seat's native-driver diagnostic.
+///
+/// A fresh publisher per edge, exactly like [`publish_provider_auth`] and for the same reason: the
+/// producers of these edges are short-lived. The publisher seeds itself from the record on disk,
+/// so a turn failure published from one hook process cannot hide a credential rejection published
+/// from another.
+pub(crate) fn publish_turn_failure(agent_dir: &Path, driver: Driver, edge: TurnFailureEdge) {
+    let mut publisher = Publisher::new(agent_dir, driver, None, Support::Unknown);
+    match edge {
+        TurnFailureEdge::Failed(reason) => {
+            publisher.publish(Stage::Turn, reason, Source::TurnError)
+        }
+        TurnFailureEdge::Recovered => publisher.clear(Stage::Turn),
     }
 }
 
@@ -864,6 +918,71 @@ mod tests {
             };
             assert_eq!(other.driver, driver);
         }
+    }
+
+    /// Stage priority has to hold ACROSS processes, not only inside one. Every Claude hook
+    /// invocation is its own process, so a publisher that started with an empty stage set would
+    /// persist its own boundary over an earlier one somebody else published — and an operator
+    /// would stop being told the real cause the moment a later symptom appeared.
+    #[test]
+    fn a_fresh_publisher_inherits_the_record_it_finds_so_stage_priority_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = path(tmp.path());
+        Publisher::new(tmp.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
+
+        // A later process publishes a LATER boundary. The earlier one must still be projected.
+        Publisher::new(tmp.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&record) else {
+            panic!("the earlier boundary must still be the projected failure")
+        };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+
+        // Seeding is scoped to this driver's own records: another driver's record is not this
+        // publisher's history and must not be inherited.
+        let foreign = tempfile::tempdir().unwrap();
+        Publisher::new(foreign.path(), Driver::OpenCode, None, Support::Unknown).publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
+        Publisher::new(foreign.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&path(foreign.path())) else {
+            panic!("this driver's own failure must be readable")
+        };
+        assert_eq!(failure.stage, Stage::Turn);
+        assert_eq!(failure.driver, Driver::Claude);
+
+        // And a record this reader cannot trust seeds nothing — inheriting a wrongly paired
+        // record would launder it into evidence.
+        let damaged = tempfile::tempdir().unwrap();
+        fs::write(
+            path(damaged.path()),
+            br#"{"schema":"st2.driver-diagnostic.v1","driver":"claude","stage":"providerAuth",
+                "reason":"notDurable","source":"turnResult","support":"unknown",
+                "observedAt":1,"recovery":"clearsOnStageRecovery"}"#,
+        )
+        .unwrap();
+        Publisher::new(damaged.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&path(damaged.path())) else {
+            panic!("the real failure must be readable")
+        };
+        assert_eq!(failure.stage, Stage::Turn);
     }
 
     /// The turn boundary is the one a RUNNING seat meets, so it is the one whose absence is most
