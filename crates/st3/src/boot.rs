@@ -1,5 +1,5 @@
 pub const BOOT_PROMPT: &str =
-    "Read @.st3/boot.md completely. Then list and claim your current st3 work.";
+    "Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3 work.";
 
 pub const BOOT_DOCUMENT: &str = r#"# st3 boot
 
@@ -11,7 +11,9 @@ Read each Small Talk message before you act on it. Archive the message after you
 
 A notification does not create work. Repeated delivery does not authorize repeated work.
 
-Run `st3 work ls` to list work that is available to you. Claim a step before you do its work.
+Run `st3 work ls` to list work that is available to you. Claim one eligible step.
+
+Do its work and finish the step in the same turn when possible.
 
 The claim output contains the step goals and all effective constraints. A parent claim can expose nested mission steps.
 
@@ -52,5 +54,12 @@ mod tests {
             ))),
             format!("Do the task.\n\n{BOOT_PROMPT}")
         );
+        assert!(BOOT_PROMPT.contains("claim, do, and finish"));
+    }
+
+    #[test]
+    fn the_boot_document_continues_after_a_claim() {
+        assert!(BOOT_DOCUMENT
+            .contains("Do its work and finish the step in the same turn when possible."));
     }
 }
