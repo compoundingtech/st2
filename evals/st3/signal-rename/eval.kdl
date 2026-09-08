@@ -108,7 +108,7 @@ version 2
         }
         step "publish-base-compatibility" {
           title "The base compatibility revision is published"
-          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/base-compatibility resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only change. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/base-compatibility resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-base-compatibility" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/base-compatibility" {
@@ -151,7 +151,7 @@ version 2
         }
         step "publish-relay-revision" {
           title "The relay revision is published"
-          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/relay-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the relay-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/relay-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.relay --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-relay" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/relay-revision" {
@@ -194,7 +194,7 @@ version 2
         }
         step "publish-hub-revision" {
           title "The hub revision is published"
-          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/hub-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the hub-only change. Resolve a concurrent push without editing another lane. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/hub-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.hub --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-hub" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/hub-revision" {
@@ -230,7 +230,7 @@ version 2
         }
         step "publish-config-revision" {
           title "The root and config revision is published"
-          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/config-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the supervisor-owned change. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/config-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "rename-root-and-config" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/config-revision" {
@@ -268,7 +268,7 @@ version 2
         }
         step "publish-final-base-revision" {
           title "The alias-free base revision is published"
-          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/base-final-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Commit and push the base-only cleanup. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/base-final-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.base --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "test-final-base" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/base-final-revision" {
@@ -306,7 +306,7 @@ version 2
         }
         step "publish-integrated-revision" {
           title "The integrated revision is published"
-          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/integrated-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
+          goal "Confirm a clean worktree. Let SHA be git rev-parse HEAD. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/integrated-revision resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=vcs.commit --field state=published --field sha=SHA. Then complete the step without --evidence."
           depends-on { step "verify-clean-product-cutover" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/integrated-revision" {
@@ -370,7 +370,7 @@ version 2
 
     step "publish-final-report" timeout="10m" {
       title "The supervisor publishes one final report"
-      goal "Send local.morgan exactly one final message after every held-out gate passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
+      goal "Send the base owner exactly one final message after every held-out gate passes. Explain the graph-owned decomposition, the base-first compatibility sequence, both concurrent consumer lanes, the compatibility closure, the integrated revision, tests, and any problems."
       assigned-to "agent/${ST_MISSION_RUN}/sig.sup"
       depends-on { step "held-out-gates" completed }
 
@@ -379,24 +379,24 @@ version 2
         completion { when "all-steps-exhausted" }
         goal "Complete mission work."
         step "send-final-report" {
-          title "Morgan receives the final result"
-          goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); st3 message send local.morgan --from sig.sup --subject='Signal rename complete' --tags=mission-run:$ST_MISSION_RUN -m=\"Mission $ST_MISSION_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
+          title "The base owner receives the final result"
+          goal "Send exactly one Small Talk message with: SHA=$(git rev-parse HEAD); \"$ST3_BIN\" message send sig.base --from sig.sup --subject='Signal rename complete' --tags=mission-run:$ST_MISSION_RUN -m=\"Mission $ST_MISSION_RUN completed the Beacon rename. The graph sequenced base compatibility, concurrent relay and hub lanes, root configuration, compatibility closure, and integration. All tests passed. Integrated revision: $SHA\". Save the printed message ID. Do not send an acknowledgement or an interim message."
         }
         step "publish-report-receipt" {
           title "The final report receipt is published"
-          goal "Let ID be the short ID printed by the final st3 message send command. Run: st3 claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/local.morgan --field message=message/ID. Then complete the step without --evidence."
+          goal "Let ID be the short ID printed by the final st3 message send command. Run: \"$ST3_BIN\" claim resource/mission-run/$ST_MISSION_RUN/final-report resource.observed --actor agent/${ST_MISSION_RUN}/sig.sup --field kind=custom.st3.coordination-report --field state=published --field recipient=agent/${ST_MISSION_RUN}/sig.base --field message=message/ID. Then complete the step without --evidence."
           depends-on { step "send-final-report" completed }
           produces {
             resource "mission-run/${ST_MISSION_RUN}/final-report" {
               kind "custom.st3.coordination-report"
               state "published"
-              recipient "agent/local.morgan"
+              recipient "agent/${ST_MISSION_RUN}/sig.base"
             }
           }
         }
       }
 
-      gate "Morgan received exactly one final supervisor report" {
+      gate "The base owner received exactly one final supervisor report" {
         exec "bash ./judges/final-report.sh"
         host "local"
         workspace "${ST_WORKSPACE}"

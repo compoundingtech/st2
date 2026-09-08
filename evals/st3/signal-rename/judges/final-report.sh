@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 
-messages="$(st3 message ls local.morgan --from "agent/$ST_MISSION_RUN/sig.sup" --json)"
+messages="$("$ST3_BIN" message ls "agent/$ST_MISSION_RUN/sig.base" --from "agent/$ST_MISSION_RUN/sig.sup" --json)"
 matching="$(
   jq \
     --arg tag "mission-run:$ST_MISSION_RUN" \
@@ -22,4 +22,4 @@ grep -qi 'beacon' <<<"$body"
 grep -qiE 'commit|revision' <<<"$body"
 grep -qiE 'test|green|pass' <<<"$body"
 
-echo "PASS: Morgan received one tagged final report with revision and test evidence"
+echo "PASS: the base owner received one tagged final report with revision and test evidence"

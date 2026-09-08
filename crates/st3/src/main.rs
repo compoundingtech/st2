@@ -3463,10 +3463,19 @@ fn cancellation_intent(run: &str, operation: &str, reason: &str) -> String {
 }
 
 fn normalize_message_subject(value: &str) -> String {
+    let mission_run = std::env::var("ST_MISSION_RUN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    normalize_message_subject_in_run(value, mission_run.as_deref())
+}
+
+fn normalize_message_subject_in_run(value: &str, mission_run: Option<&str>) -> String {
     if value == "requester" {
         "person/requester".into()
     } else if value.contains('/') {
         value.into()
+    } else if let Some(mission_run) = mission_run {
+        format!("agent/{mission_run}/{value}")
     } else {
         format!("agent/{value}")
     }
@@ -6483,6 +6492,22 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, changed);
         assert!(first.len() <= 512);
+    }
+
+    #[test]
+    fn a_short_message_party_resolves_to_its_current_mission_run() {
+        assert_eq!(
+            normalize_message_subject_in_run("worker", Some("run-id")),
+            "agent/run-id/worker"
+        );
+        assert_eq!(
+            normalize_message_subject_in_run("agent/global.worker", Some("run-id")),
+            "agent/global.worker"
+        );
+        assert_eq!(
+            normalize_message_subject_in_run("worker", None),
+            "agent/worker"
+        );
     }
 
     #[test]

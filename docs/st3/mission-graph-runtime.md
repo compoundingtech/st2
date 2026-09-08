@@ -579,10 +579,11 @@ st3 supplies these exact context names:
 | `ST_GATE` | Gate name in a running gate context. |
 | `ST3_SUBJECT` | Full subject of the current runtime member. |
 | `ST_AGENT` | Full owning agent subject. It is absent for agentless runtimes. |
+| `ST3_BIN` | Absolute path to the exact st3 executable that started the runtime. |
 
 The mission and step values are available for `${NAME}` KDL interpolation when the current context defines them. Step members and running gates receive those values as environment variables.
 
-`ST3_SUBJECT` and `ST_AGENT` are runtime-only values because their values depend on the materialized member.
+`ST3_SUBJECT`, `ST_AGENT`, and `ST3_BIN` are runtime-only values because they depend on the materialized member.
 
 For example, use `${ST_MISSION_RUN}` directly. Do not write a manual mapping such as `env { MISSION_RUN "${ST_MISSION_RUN}" }` only to rename the built-in value.
 

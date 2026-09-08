@@ -4,11 +4,11 @@ set -euo pipefail
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 
 printf '\n### mission run claim\n'
-st3 inspect "mission-run/$ST_MISSION_RUN" --json \
+"$ST3_BIN" inspect "mission-run/$ST_MISSION_RUN" --json \
   | jq -c '{status: (.status.subjects[0].actual.fields.status // .status.subjects[0].actual.status)}'
 
 printf '\n### durable work state\n'
-env -u ST_AGENT st3 work ls --all --json \
+env -u ST_AGENT "$ST3_BIN" work ls --all --json \
   | jq -c --arg run "mission-run/$ST_MISSION_RUN" \
       '[.[] | select(.run == $run) | {step, status, assigned_to, available_to, claimant, updated_at_unix_ms}]'
 
@@ -21,7 +21,7 @@ for product in \
   integrated-revision
 do
   printf '\n### product: %s\n' "$product"
-  st3 inspect "resource/mission-run/$ST_MISSION_RUN/$product" --json \
+  "$ST3_BIN" inspect "resource/mission-run/$ST_MISSION_RUN/$product" --json \
     | jq -c '[.recent_claims[] | select(.kind == "resource.observed")][0] | {store_index, actor, fields: (.body.fields // .body)}'
 done
 
