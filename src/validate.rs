@@ -110,26 +110,56 @@ impl Report {
     }
 }
 
+/// Where the supervisor will bind session sockets for the catalog being validated.
+///
+/// The validated tree is not always the tree that will run. Publication admits a candidate through
+/// a disposable projection, and catalog transactions validate captures and stages; none of those
+/// trees has a `pty` directory any session is ever bound at, and a retained live catalog is named
+/// through a file-descriptor path whose length is unrelated to the real one. A socket-path bound is
+/// therefore a host-local runtime fact that travels with the caller who knows it, never something
+/// read off the tree under inspection.
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeRoot<'a> {
+    /// The catalog that will actually run. Its resolved pty root bounds every session socket.
+    Catalog(&'a Path),
+    /// No runtime context is available, so host-local socket-path checking is deliberately
+    /// omitted. Structural checks are unaffected.
+    Unknown,
+}
+
 /// Validate a catalog. Returns every issue found, in a stable order (files sorted by discovery).
 pub fn validate(root: &Path) -> Report {
-    validate_scoped(root, None, false)
+    validate_scoped(root, None, false, RuntimeRoot::Unknown)
 }
 
 /// Validate a whole catalog while checking host-local filesystem facts only for `this_host`.
 ///
 /// Structural checks remain fleet-wide. This scope only prevents a synced multi-host catalog from
-/// warning that another machine's external workspace or task cwd is absent locally.
+/// warning that another machine's external workspace or task cwd is absent locally. `root` is both
+/// the tree under inspection and the runtime root, which is the ordinary case: a real catalog in
+/// the place it will run from.
 pub fn validate_for_host(root: &Path, this_host: &str) -> Report {
-    validate_scoped(root, Some(this_host), false)
+    validate_scoped(root, Some(this_host), false, RuntimeRoot::Catalog(root))
+}
+
+/// [`validate_for_host`] for a tree that is not the one that will run: a publication projection, a
+/// capture, or a stage. The caller supplies the catalog whose resolved pty root bounds sockets.
+pub fn validate_for_host_at(root: &Path, this_host: &str, runtime: RuntimeRoot<'_>) -> Report {
+    validate_scoped(root, Some(this_host), false, runtime)
 }
 
 /// Validate a catalog from fail-closed discovery. Unreadable entries and directory traversal
 /// failures become attributed issues instead of silently narrowing the validation universe.
 pub fn validate_strict_for_host(root: &Path, this_host: &str) -> Report {
-    validate_scoped(root, Some(this_host), true)
+    validate_scoped(root, Some(this_host), true, RuntimeRoot::Catalog(root))
 }
 
-fn validate_scoped(root: &Path, this_host: Option<&str>, strict_discovery: bool) -> Report {
+fn validate_scoped(
+    root: &Path,
+    this_host: Option<&str>,
+    strict_discovery: bool,
+    runtime: RuntimeRoot<'_>,
+) -> Report {
     // Canonicalize so `$CATALOG`-rooted paths expand to absolute paths (a relative root would make
     // every `$CATALOG/...` look relative). Falls back to the given root if it does not exist yet.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -138,7 +168,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>, strict_discovery: bool)
     } else {
         discover(root)
     };
-    validate_discovered(root, this_host, &discovered)
+    validate_discovered(root, this_host, runtime, &discovered)
 }
 
 /// Validate one caller-held immutable discovery result. Catalog graph readers use this to keep
@@ -146,6 +176,7 @@ fn validate_scoped(root: &Path, this_host: Option<&str>, strict_discovery: bool)
 pub(crate) fn validate_discovered(
     root: &Path,
     this_host: Option<&str>,
+    runtime: RuntimeRoot<'_>,
     d: &Discovered,
 ) -> Report {
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -444,12 +475,18 @@ pub(crate) fn validate_discovered(
         // A pty task whose session socket path exceeds the portable `sun_path` bound can never
         // spawn: `pty` refuses the bind, so the failure repeats on every reconcile pass forever
         // and makes the pass result useless as a health signal. Admission is the only place where
-        // it is cheap, attributable, and fixable by the author. Host-scoped, because the bound
-        // comes from the pty root resolved on the host that would run the task.
-        if let (Some(host), Some(Ok(compiled))) = (this_host, &compiled)
+        // it is cheap, attributable, and fixable by the author.
+        //
+        // The bound comes from the RUNTIME root, never from the tree under inspection. Publication
+        // validates a disposable projection nested inside the catalog, so measuring the inspected
+        // tree charged every identity for the projection's own depth and rejected declarations
+        // whose real socket is bindable. Host-scoped for the same reason it is runtime-scoped: the
+        // bound belongs to the host that would run the task.
+        if let (Some(host), Some(Ok(compiled)), RuntimeRoot::Catalog(runtime_catalog)) =
+            (this_host, &compiled, runtime)
             && runs_on_selected_host
         {
-            let pty_root = crate::run::effective_pty_root(root);
+            let pty_root = crate::run::effective_pty_root(runtime_catalog);
             let bus_id = compiled.bus_id(host);
             for task in &compiled.tasks {
                 if task.kind != agent_spec::spec::TaskKind::Pty {

@@ -149,7 +149,13 @@ pub fn snapshot(root: &Path, this_host: &str) -> Result<CatalogGraph> {
     let _lock = crate::CatalogLock::shared(&root)
         .context("acquire shared catalog-authoring lock for catalog graph")?;
     let found = crate::discover_strict(&root);
-    let report = crate::validate::validate_discovered(&root, Some(this_host), &found);
+    // The graph reads the live catalog in place, so the tree under inspection is the runtime root.
+    let report = crate::validate::validate_discovered(
+        &root,
+        Some(this_host),
+        crate::validate::RuntimeRoot::Catalog(&root),
+        &found,
+    );
 
     let mut runtime_by_path: BTreeMap<PathBuf, Vec<crate::agents::AgentRow>> = BTreeMap::new();
     for row in crate::agents::roster_from_discovered(&found, &root, this_host) {

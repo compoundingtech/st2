@@ -494,8 +494,12 @@ fn verify_published_spec(
         observed_sha256 == expected_sha256 && observed == expected_bytes,
         "published Agent Spec readback mismatch: expected sha256 {expected_sha256}, found {observed_sha256}"
     );
-    crate::catalog_transaction::validate_full_catalog(catalog)
-        .context("published catalog fails locked core/catalog re-admission")?;
+    // The live catalog is validated in place, so it is its own runtime root.
+    crate::catalog_transaction::validate_full_catalog(
+        catalog,
+        crate::validate::RuntimeRoot::Catalog(catalog),
+    )
+    .context("published catalog fails locked core/catalog re-admission")?;
     Ok(observed_sha256)
 }
 
@@ -576,8 +580,13 @@ fn read_regular_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 
 fn validate_overlay(catalog: &Path, control: &Path, candidate: &Candidate) -> Result<()> {
     let shadow = build_overlay(catalog, control, candidate)?;
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    // The shadow is a disposable projection nested under the catalog; sockets will be bound from
+    // the real catalog, so that is the runtime root the candidate must satisfy.
+    crate::catalog_transaction::validate_full_catalog(
+        shadow.path(),
+        crate::validate::RuntimeRoot::Catalog(catalog),
+    )
+    .context("candidate fails full-catalog validation")
 }
 
 fn build_overlay(
@@ -653,8 +662,12 @@ pub(crate) fn admit_declaration_rewrite(
             .with_context(|| format!("create validation overlay {}", parent.display()))?;
     }
     fs::write(&target, bytes).context("write candidate into validation shadow")?;
-    crate::catalog_transaction::validate_full_catalog(shadow.path())
-        .context("candidate fails full-catalog validation")
+    // Another disposable projection: judge the candidate against the catalog that will run.
+    crate::catalog_transaction::validate_full_catalog(
+        shadow.path(),
+        crate::validate::RuntimeRoot::Catalog(&catalog),
+    )
+    .context("candidate fails full-catalog validation")
 }
 
 fn copy_filtered_catalog(
