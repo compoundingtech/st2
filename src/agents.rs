@@ -12,7 +12,7 @@ use crate::message;
 use crate::status::{self, State};
 use crate::{
     AgentSpec, Discovered, Resource, SessionDriver, codex_app_server, delivery_ledger,
-    driver_diagnostic, harness_context, harness_state, opencode_session,
+    driver_diagnostic, harness_context, harness_state, opencode_session, pi_channel,
 };
 
 /// Native delivery ownership, independent of presence and harness activity.
@@ -173,8 +173,10 @@ fn delivery_state(spec: &AgentSpec, catalog_root: &Path, this_host: &str) -> Opt
     let identity = spec.bus_id(this_host);
     let observed = match spec.effective_session_driver()? {
         SessionDriver::Codex => codex_app_server::observe_delivery(catalog_root, &identity),
+        SessionDriver::Pi => pi_channel::observe_pi_delivery(catalog_root, &identity),
         SessionDriver::OpenCode => opencode_session::observe_delivery(catalog_root, &identity),
-        SessionDriver::Claude | SessionDriver::Pi | SessionDriver::Omp => return None,
+        SessionDriver::Omp => pi_channel::observe_omp_delivery(catalog_root, &identity),
+        SessionDriver::Claude => return None,
     };
     Some(match observed {
         Ok(delivery_ledger::Observation::Absent) => Delivery::Absent,
@@ -197,7 +199,10 @@ fn delivery_state(spec: &AgentSpec, catalog_root: &Path, this_host: &str) -> Opt
             let delivery_ledger::Retention::Hold(reason) = head.retention else {
                 unreachable!("the FIFO head was selected from held attempts")
             };
-            let recovery = (head.token.is_some() && head.negative.is_none()).then(|| {
+            let recovery = (!spec.desired_state.is_retired()
+                && head.token.is_some()
+                && head.negative.is_none())
+            .then(|| {
                 format!(
                     "st2 message delivery-negative {} {} --attempt-token {} --ledger-sha256 {} --reason '<why-message-is-absent>'",
                     identity,

@@ -64,6 +64,7 @@ pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 /// Permanent on purpose: a lock file's only content is its inode, and removing it would split the
 /// lock domain while a live process still holds the old inode open.
 pub(crate) const LEDGER_LOCK: &str = "delivery-ledger.lock";
+pub(crate) const LEDGER_STAGING_PREFIX: &str = ".delivery-ledger.tmp-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
@@ -85,8 +86,8 @@ impl Harness {
         }
     }
 
-    /// Parse a harness name. Accepts every one of the five identities, including the three whose
-    /// ledger adoption is still separate work — see [`Harness::keeps_ledger`].
+    /// Parse one of the five harness names. Ledger adoption is a separate capability reported by
+    /// [`Harness::keeps_ledger`].
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "claude" => Ok(Self::Claude),
@@ -112,11 +113,10 @@ impl Harness {
 
     /// Whether a shipped driver for this harness keeps a delivery ledger today.
     ///
-    /// Codex and OpenCode do. Claude, pi, and omp have honest `AttemptOnly` profiles but their
-    /// adoption is separate work, so a reader must not report their missing ledger as a fault —
-    /// and it must not have to know that by matching on the enum itself.
+    /// Claude remains the one attempt-only harness whose adoption is separate work, so a reader
+    /// must not report its missing ledger as a fault.
     pub const fn keeps_ledger(self) -> bool {
-        matches!(self, Self::Codex | Self::OpenCode)
+        matches!(self, Self::Codex | Self::Pi | Self::OpenCode | Self::Omp)
     }
 }
 
@@ -645,6 +645,8 @@ pub enum OperatorOutcome {
     AlreadySettled(Attempt),
     /// An absence is already recorded, so re-stating it would only rewrite the audit.
     AlreadyRefused(Attempt),
+    /// The recipient's canonical archive receipt settled the message before this assertion.
+    ArchiveSettled { filename: String },
 }
 
 /// The exact identity of one attempt: binding, filename, correlation, and token.
@@ -923,9 +925,8 @@ const MARKER_TAG: &str = "st2-delivery";
 /// for the same attempt, and a harness that echoed it would spill the recipient's inbox contents
 /// into its own transcript.
 ///
-/// NOT WIRED. No harness renders or reads this yet; the Claude, pi, and omp adoptions are
-/// separate work. It lives here because the fence it names is this module's, and a renderer built
-/// beside its consumer would derive the identity a second time.
+/// Pi and OMP prepend this marker through their production channel assets. Claude adoption remains
+/// separate work.
 pub fn marker(filename: &str, token: AttemptToken) -> Result<String> {
     anyhow::ensure!(
         message::is_message_filename(filename),
@@ -2688,7 +2689,10 @@ mod tests {
             assert_eq!(Harness::parse(harness.as_str()).unwrap(), harness);
             assert_eq!(
                 harness.keeps_ledger(),
-                matches!(harness, Harness::Codex | Harness::OpenCode),
+                matches!(
+                    harness,
+                    Harness::Codex | Harness::Pi | Harness::OpenCode | Harness::Omp
+                ),
                 "only the adopted drivers keep a ledger today"
             );
         }

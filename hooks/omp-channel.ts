@@ -42,10 +42,9 @@ type Frame = {
 /**
  * Process-wide channel state.
  *
- * Both halves must outlive an extension instance: omp re-instantiates extensions on session
+ * Both halves must outlive an extension instance. omp re-instantiates extensions on session
  * replacement, so an instance-local `current` would leave the previous session's channel running
- * beside the new one, each with its own delivered set — the duplicate-delivery shape this
- * extension exists to avoid.
+ * beside the new one and let stale observational frames cross the replacement boundary.
  */
 type Stash = {
   bin?: string;
@@ -286,10 +285,6 @@ export default function (pi: ExtensionAPI) {
       });
       child.on("exit", () => settle(""));
 
-      const send = (frame: Record<string, unknown>) => {
-        if (child.stdin.destroyed) return;
-        child.stdin.write(JSON.stringify(frame) + "\n");
-      };
 
       const handle = async (line: string) => {
         let frame: Frame;
@@ -325,9 +320,9 @@ export default function (pi: ExtensionAPI) {
           } else {
             await pi.sendUserMessage(frame.content, { deliverAs: frame.deliverAs ?? "steer" });
           }
-          send({ type: "delivered", meta: frame.meta });
-        } catch (error) {
-          send({ type: "failed", meta: frame.meta, error: String(error) });
+        } catch {
+          // `sendUserMessage` exposes no receipt. A return or throw can follow a side effect, so
+          // both outcomes stay at the durable `Attempted` claim until archive or operator evidence.
         }
       };
 

@@ -1,7 +1,7 @@
-// Runtime smoke of the shipped pi extension: drives the channel-open path far enough that a
-// use-before-declaration (TDZ), a broken import, or a top-level throw fails the check — the
-// classes a type-only gate is provably blind to. The channel binary is `true`, so the open
-// times out its hello and resolves empty; any thrown error fails the smoke.
+// Runtime smoke of the shipped pi extension: drives the channel-open and message paths far enough
+// that use-before-declaration, a broken import, a top-level throw, or a misleading outcome frame
+// fails the check. A controlled recorder speaks the Rust channel wire and captures extension
+// output.
 import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,8 +13,8 @@ import path from "node:path";
 // producer that silently writes nothing is indistinguishable from the pre-producer state, where
 // every declaration's context reads null. That is the failure this file has to be able to see.
 //
-// It speaks the two things the extension needs: a protocol-1 hello so `open()` settles without
-// waiting out its timeout, and an append of every frame line to a file this smoke reads back.
+// It sends a protocol-1 hello and one durably permitted message, then appends every frame from the
+// extension to a file this smoke reads back.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st2-pi-smoke-"));
 const framesPath = path.join(dir, "frames.jsonl");
 const recorder = path.join(dir, "recorder");
@@ -23,6 +23,11 @@ fs.writeFileSync(
   `#!${process.execPath}
 import fs from "node:fs";
 process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "message",
+  deliverAs: "steer",
+  content: "[st2-delivery filename=1787042542238-xex2t4.md attempt=00000000000000000000000000000001]\\nSubject: smoke\\n\\nDeliver once."
+}) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
 `,
@@ -45,8 +50,10 @@ const mod = await import("./smoke-out/pi-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
 const handlers = new Map();
+const deliveries = [];
 const pi = {
   on: (name, handler) => handlers.set(name, handler),
+  sendUserMessage: (content, options) => deliveries.push({ content, options }),
 };
 mod.default(pi);
 for (const name of ["session_start", "session_shutdown", "agent_start", "agent_settled"]) {
@@ -131,6 +138,19 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
 // Give the recorder a moment to drain what was written to its stdin, then assert the wire.
 await new Promise((resolve) => setTimeout(resolve, 500));
 const frames = readFrames();
+assert.ok(deliveries.length > 0, "the production asset must call sendUserMessage");
+for (const delivery of deliveries) {
+  assert.ok(
+    delivery.content.startsWith(
+      "[st2-delivery filename=1787042542238-xex2t4.md attempt=00000000000000000000000000000001]\n",
+    ),
+    "the exact attempt marker remains the first provider-visible line",
+  );
+}
+assert.ok(
+  frames.every((frame) => frame.type !== "delivered" && frame.type !== "failed"),
+  "sendUserMessage outcomes are ambiguous and must not emit receipt frames",
+);
 const context = frames.filter((frame) => frame.type === "context");
 assert.ok(context.length > 0, "the producer must emit context frames, not merely load");
 

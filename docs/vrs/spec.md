@@ -1139,9 +1139,9 @@ does not branch on provider identity when it grades evidence. A synthetic
 identity-policy pairing proves that separation without adding a provider
 registry or another core branch.
 
-The current production adopters are Codex and OpenCode. Claude, pi, and OMP
-map to attempt-only policy, but their drivers do not own delivery through this
-ledger until their process-local suppression is replaced.
+The current production adopters are Codex, pi, OpenCode, and OMP. Claude maps
+to attempt-only policy, but its driver does not own delivery through this
+ledger until its process-local suppression is replaced.
 
 ### Transaction boundary
 
@@ -1155,6 +1155,11 @@ lock → re-read exact bytes → validate → compare attempt/precondition
      → decide one transition → fsync staged bytes → rename → fsync directory
      → return result → unlock
 ```
+
+The pi-family ledger, lock, and staged replacement siblings live at the
+declaration root as runtime state. Current catalog projections exclude them,
+prepared catalogs reject them, and catalog apply therefore cannot snapshot,
+replace, or remove live delivery ownership.
 
 The in-process object is configuration, not authority. A cached observation
 never authorizes transport. A transaction that cannot prove whether its commit
@@ -1464,9 +1469,8 @@ delivers to pi through a channel that runs inside the session rather than
 through the terminal.
 
 ```text
-inbox --> st2 driver pi-channel --NDJSON--> pi-channel.ts --> pi.sendUserMessage()
-                   ^                              |
-                   `-------- delivered/failed ----'
+inbox --> transactional claim --> st2 driver pi-channel --NDJSON-->
+          pi-channel.ts --> pi.sendUserMessage()
 ```
 
 `st2 driver pi-session` owns the launch. It resolves `pi-channel.ts` from this
@@ -1481,12 +1485,17 @@ terms as the Claude wrapper.
 
 The channel is newline-delimited JSON in both directions. It opens with
 `{"type":"hello","protocol":1,"identity":...}`; an extension that does not
-understand the protocol number closes the channel rather than guessing. Each
-unread inbox entry becomes one `{"type":"message","deliverAs":...,"content":
-...,"meta":{...}}` frame carrying the same subject-and-body envelope the Claude
-channel uses. The inbox remains the durable source of truth: the channel holds
-only an ephemeral set of filenames delivered in its current lifetime, and a
-restart rescans. EOF on stdin is the session boundary.
+understand the protocol number closes the channel rather than guessing. The
+wrapper's stable runtime/task ID is the delivery binding. For the FIFO head,
+the Rust channel durably claims `Attempted`, prepends the exact attempt marker,
+and only then writes one `{"type":"message","deliverAs":...,"content":
+...,"meta":{...}}` frame. The production asset calls `sendUserMessage` but
+emits no outcome frame: its void return and any exception are ambiguous.
+Restart therefore holds an unarchived attempt. Only the exact canonical
+archive receipt settles it; disappearance from one inbox observation does not.
+Archive settlement advances the FIFO. Exact operator absence permits a fresh
+claim token, including after a settled binding change. EOF on stdin remains
+the session boundary.
 
 pi has no session-start hook, so the `hello` frame also carries
 `sessionContext`: the same restored working state, boot ritual, and

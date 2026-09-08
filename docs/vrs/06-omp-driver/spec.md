@@ -70,9 +70,9 @@ Shape of `pi_session.rs`:
 
 ## Channel (`hooks/omp-channel.ts`)
 
-Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON, hello /
-message / delivered / failed / state / context frames, PROTOCOL constant). Differences:
-
+Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON,
+hello / message / state / context frames, PROTOCOL constant) and the shared
+transactional attempt-only ledger. Differences:
 - **Idle and terminal edges:** `agent_start` emits active. On a terminal `agent_end`, poll
   `ctx.isIdle()` every ~100 ms with a bounded window and emit idle at the first true sample.
   Every poll captures a monotonically increasing generation; a newer settle attempt, new

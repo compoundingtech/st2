@@ -479,6 +479,35 @@ fn roster_exposes_a_codex_held_attempt_as_actionable_delivery_state() {
         String::from_utf8(human.stdout).unwrap(),
         "h.worker\toffline\tobs:-\tctx:-\tdelivery:held(ambiguousAttempt)\t\t\n"
     );
+    write(
+        &root,
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  identity "worker"
+  host "h"
+  type "service"
+  session-driver "codex"
+  argv "codex"
+  retired #true
+}
+"#,
+    );
+    let retired = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&root)
+        .args(["--host", "h", "--json"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&retired.stdout).unwrap();
+    assert_eq!(rows[0]["delivery"]["state"], "held");
+    assert_eq!(rows[0]["delivery"]["recovery"], serde_json::Value::Null);
+    assert_eq!(rows[0]["busAddress"], serde_json::Value::Null);
 }
 
 #[test]

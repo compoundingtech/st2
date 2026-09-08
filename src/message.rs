@@ -495,6 +495,32 @@ pub fn archive_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join("archive")
 }
 
+/// Whether the recipient has durably archived this exact canonical message.
+///
+/// A non-regular entry fails closed. Following a symlink here would let an unrelated file assert
+/// settlement for an ambiguous native delivery attempt.
+pub fn archive_receipt_exists(agent_dir: &Path, filename: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        is_message_filename(filename),
+        "invalid message filename {filename:?}"
+    );
+    let receipt = archive_dir(agent_dir).join(filename);
+    match fs::symlink_metadata(&receipt) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "archive receipt is not a real regular file: {}",
+                receipt.display()
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading archive receipt {}", receipt.display()))
+        }
+    }
+}
+
 fn sent_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("resources").join(SENT_DIR)
 }
@@ -2155,7 +2181,10 @@ fn deliver_record(recipient: &DeliveryEndpoint, record: &SentRecord) -> anyhow::
         };
         if !same {
             crate::metrics::record_message_delivery(true);
-            anyhow::bail!("archived message differs from pending send {}", record.filename);
+            anyhow::bail!(
+                "archived message differs from pending send {}",
+                record.filename
+            );
         }
         crate::metrics::record_message_delivery(false);
         return Ok(());
@@ -2570,7 +2599,10 @@ mod tests {
     fn the_staging_prefix_is_the_one_the_inbox_walkers_skip() {
         assert_eq!(TMP_PREFIX, ".message");
         assert_eq!(TMP_STAGING_PREFIX, format!("{TMP_PREFIX}.tmp-"));
-        assert!(!is_message_filename(&tmp_name()), "a staged name must never look like a message");
+        assert!(
+            !is_message_filename(&tmp_name()),
+            "a staged name must never look like a message"
+        );
     }
 
     /// [`atomic_create_file`]'s create-once contract. It is a hardlink, not a rename, and that is
@@ -2602,7 +2634,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     /// [`atomic_replace_file`]'s contract, pinned for the same fold: replacement is unconditional
@@ -2620,7 +2655,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(TMP_STAGING_PREFIX))
             .collect::<Vec<_>>();
-        assert!(residue.is_empty(), "staging residue left behind: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "staging residue left behind: {residue:?}"
+        );
     }
 
     #[test]
@@ -2863,9 +2901,7 @@ mod tests {
     fn transition_addressability_ignores_and_preserves_exact_legacy_staging_files() {
         let root = tempfile::tempdir().unwrap();
         addressable_catalog(root.path());
-        let legacy = root
-            .path()
-            .join("agents/host/.harness-context.tmp-123-456");
+        let legacy = root.path().join("agents/host/.harness-context.tmp-123-456");
         fs::write(&legacy, b"stale legacy staging bytes").unwrap();
         let transition = crate::catalog_transaction::CatalogTransition {
             original_agents: BTreeSet::new(),
@@ -2916,7 +2952,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn external_inbox_rejects_unsafe_or_nested_identities() {
