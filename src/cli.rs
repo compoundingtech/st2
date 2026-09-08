@@ -716,8 +716,14 @@ pub(crate) struct PresentationArgs {
 
 impl PresentationArgs {
     /// The selected subject and the requested value, where `None` is the cleared representation.
-    pub(crate) fn selection(self) -> Result<(st2::identity::AgentSelector, Option<String>, bool, Option<String>)>
-    {
+    pub(crate) fn selection(
+        self,
+    ) -> Result<(
+        st2::identity::AgentSelector,
+        Option<String>,
+        bool,
+        Option<String>,
+    )> {
         let (selector, value) = match self.agent_id {
             Some(id) => (st2::identity::AgentSelector::Id(id), self.first),
             None => (
@@ -1104,6 +1110,30 @@ pub(crate) enum MessageCmd {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+    /// Record exact operator-observed absence for one native delivery attempt. Never transports.
+    DeliveryNegative {
+        /// Either the message filename, or an identity followed by a filename.
+        first: String,
+        /// The canonical inbox message filename (when `first` is an identity).
+        second: Option<String>,
+        /// Agent by exact immutable ID (R24); `first` is then the filename.
+        #[arg(long = "id", conflicts_with = "second")]
+        agent_id: Option<String>,
+        /// Exact token visible in provider history for the attempted delivery.
+        #[arg(long = "attempt-token")]
+        attempt_token: String,
+        /// SHA-256 of the exact ledger bytes the operator inspected.
+        #[arg(long = "ledger-sha256")]
+        ledger_sha256: String,
+        /// Non-empty reason for the operator observation.
+        #[arg(long)]
+        reason: String,
+        /// Machine-readable evidence receipt.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        ctx: MsgCtx,
+    },
     /// Show a message's thread — the message + everything replying to it (transitively), across the
     /// catalog. `--tree` indents by reply depth; otherwise flat chronological.
     Thread {
@@ -1124,7 +1154,10 @@ pub(crate) enum EventCmd {
     /// Emit one producer-identified event into a declared agent stream.
     Emit {
         /// Owning agent: a bus address (`<host>.<address>`) or a bare local address.
-        #[arg(required_unless_present = "recipient_id", conflicts_with = "recipient_id")]
+        #[arg(
+            required_unless_present = "recipient_id",
+            conflicts_with = "recipient_id"
+        )]
         recipient: Option<String>,
         /// Owning agent by exact immutable agent ID (R24).
         #[arg(long = "recipient-id")]

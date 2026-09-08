@@ -579,6 +579,80 @@ fn missing_delivery_is_advisory_while_an_invalid_delivery_is_a_catalog_problem()
 }
 
 #[test]
+fn doctor_reports_delta_007_tokenless_rows_without_backfilling_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; codex { prompt "go" } }"#,
+    )
+    .unwrap();
+    fs::write(declaration.parent().unwrap().join("status"), "available\n").unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let previous_state = std::env::var_os("XDG_STATE_HOME");
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    let ledger_path = st2::codex_app_server::delivery_ledger_path(&catalog, "h.worker");
+    match previous_state {
+        Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+    }
+    let owner = "h.worker".to_owned();
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &ledger_path,
+        st2::delivery_ledger::Harness::Codex.profile(),
+        "h.worker",
+        "runtime-a",
+        move |binding, filename| {
+            st2::codex_app_server::delivery_correlation(&owner, binding, filename)
+        },
+    );
+    let filename = "1786380000000-aaa111.md";
+    let correlation =
+        st2::codex_app_server::delivery_correlation("h.worker", "thread-main", filename);
+    assert!(matches!(
+        ledger
+            .claim(st2::delivery_ledger::Claimant {
+                filename: filename.to_owned(),
+                binding: "thread-main".to_owned(),
+                correlation: st2::delivery_ledger::Correlation::native(correlation),
+                incarnation: Some("runtime-a".to_owned()),
+            })
+            .unwrap(),
+        st2::delivery_ledger::Claim::Permitted(_)
+    ));
+    let mut carried: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    carried["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("attemptToken");
+    fs::write(&ledger_path, serde_json::to_vec_pretty(&carried).unwrap()).unwrap();
+    let before = fs::read(&ledger_path).unwrap();
+
+    let output = doctor(&catalog, &bin, &state);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("h.worker tokenless delivery ledger (DELTA-007) — tokenlessEntries=1"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read(&ledger_path).unwrap(),
+        before,
+        "Doctor must observe tokenless migration state without repairing it"
+    );
+}
+
+#[test]
 fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     use st2::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
 
@@ -714,7 +788,10 @@ fn native_driver_diagnostic_roster_and_doctor_agree_and_recovery_clears() {
     let recovered = doctor(&catalog, &bin, &tmp.path().join("state"));
     let stdout = String::from_utf8_lossy(&recovered.stdout);
     assert!(recovered.status.success(), "{stdout}");
-    assert!(stdout.contains("native driver diagnostic absent"), "{stdout}");
+    assert!(
+        stdout.contains("native driver diagnostic absent"),
+        "{stdout}"
+    );
     assert!(!stdout.contains("seed/unknownStatus"), "{stdout}");
 
     fs::write(st2::driver_diagnostic::path(agent_dir), b"{bad").unwrap();
@@ -866,8 +943,14 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let warned = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&warned.stdout);
     assert!(warned.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context at 80%"), "{stdout}");
-    assert!(stdout.starts_with("  ⚠") || stdout.contains("⚠ h.worker harness context"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context at 80%"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.starts_with("  ⚠") || stdout.contains("⚠ h.worker harness context"),
+        "{stdout}"
+    );
     assert!(stdout.contains("all checks passed"), "{stdout}");
 
     // Above the window is carried raw into the advisory rather than clamped away.
@@ -875,13 +958,15 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let overrun = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&overrun.stdout);
     assert!(overrun.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context at 104%"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context at 104%"),
+        "{stdout}"
+    );
 
     // A stale record beside a running desired state warns on its own axis, still advisory. Backdate
     // the reading past the horizon exactly as the passage of time would.
     let path = harness_context_path(&agent_dir);
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let aged = st2::message::now_ms()
         - u64::try_from(st2::harness_context::HARNESS_CONTEXT_STALE.as_millis()).unwrap()
         - 60_000;
@@ -892,7 +977,10 @@ fn harness_context_doctor_lines_are_advisory_and_never_change_the_exit_status() 
     let stale = doctor(&catalog, &bin, &state);
     let stdout = String::from_utf8_lossy(&stale.stdout);
     assert!(stale.status.success(), "{stdout}");
-    assert!(stdout.contains("h.worker harness context stale"), "{stdout}");
+    assert!(
+        stdout.contains("h.worker harness context stale"),
+        "{stdout}"
+    );
     assert!(
         !stdout.contains("harness context at"),
         "a low stale reading warns about its age, not its level: {stdout}"

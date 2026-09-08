@@ -33,9 +33,15 @@ accepted.
 - **T03 Forward-only attempt-only adoption:** After Claude, pi, or OMP writes
   its first durable attempt-only delivery record, st2 does not support rollback
   to a release that cannot interpret that record. Recovery rolls forward. st2
-  retains no legacy delivery path, downgrade reader, dual write, translation
-  bridge, or compatibility fence. Preserving the existing Codex and OpenCode
-  ledger format avoids a migration; it is not a compatibility layer.
+  retains no legacy attempt-only delivery path, downgrade reader, dual write,
+  translation bridge, or compatibility fence.
+- **T04 Bounded canonical token backfill:** A tokenless canonical
+  `st2.delivery-ledger.v1` Codex or OpenCode entry is read only to derive and
+  durably add its exact attempt token under the R43 transaction lock before any
+  other mutation or transport. st2 never dual-writes the entry. The temporary
+  reader remains explicit and countable until fleet evidence proves that no
+  tokenless canonical entry can return; then st2 deletes it. After a
+  token-bearing claim, rollback to a writer that drops the token is unsupported.
 
 ## Requirements
 

@@ -287,7 +287,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     );
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "h.live\tavailable\tobs:-\tctx:-\t\t\nh.retired\tbusy\tobs:-\tctx:-\t\t\t[retired]\n"
+        "h.live\tavailable\tobs:-\tctx:-\tdelivery:-\t\t\nh.retired\tbusy\tobs:-\tctx:-\tdelivery:-\t\t\t[retired]\n"
     );
 }
 
@@ -306,9 +306,7 @@ fn roster_json_appends_agent_id_address_and_nullable_bus_address() {
         "h/migrated/agent.kdl",
         &agent_kdl("migrated", "h").replace(
             "  type \"service\"\n",
-            &format!(
-                "  type \"service\"\n  id \"{EXPLICIT_ID}\"\n  address \"delivery-lead\"\n"
-            ),
+            &format!("  type \"service\"\n  id \"{EXPLICIT_ID}\"\n  address \"delivery-lead\"\n"),
         ),
     );
     write(
@@ -381,6 +379,106 @@ fn roster_json_appends_agent_id_address_and_nullable_bus_address() {
             "retired row lost `{field}`: {retired}"
         );
     }
+}
+#[test]
+fn roster_exposes_a_codex_held_attempt_as_actionable_delivery_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let identity = "h.worker";
+    let filename = "1786380000000-aaa111.md";
+    write(
+        &root,
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  identity "worker"
+  host "h"
+  type "service"
+  session-driver "codex"
+  argv "codex"
+}
+"#,
+    );
+
+    let previous_state = std::env::var_os("XDG_STATE_HOME");
+    unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+    let ledger_path = st2::codex_app_server::delivery_ledger_path(&root, identity);
+    match previous_state {
+        Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+    }
+    let owner = identity.to_owned();
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &ledger_path,
+        st2::delivery_ledger::Harness::Codex.profile(),
+        identity,
+        "runtime-a",
+        move |binding, filename| {
+            st2::codex_app_server::delivery_correlation(&owner, binding, filename)
+        },
+    );
+    let correlation =
+        st2::codex_app_server::delivery_correlation(identity, "thread-main", filename);
+    let permit = match ledger
+        .claim(st2::delivery_ledger::Claimant {
+            filename: filename.to_owned(),
+            binding: "thread-main".to_owned(),
+            correlation: st2::delivery_ledger::Correlation::native(correlation),
+            incarnation: Some("runtime-a".to_owned()),
+        })
+        .unwrap()
+    {
+        st2::delivery_ledger::Claim::Permitted(permit) => permit,
+        st2::delivery_ledger::Claim::Held(reason) => {
+            panic!("fresh attempt unexpectedly held: {reason:?}")
+        }
+    };
+
+    let json = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&root)
+        .args(["--host", "h", "--json"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let delivery = &rows[0]["delivery"];
+    assert_eq!(delivery["state"], "held");
+    assert_eq!(delivery["reason"], "ambiguousAttempt");
+    assert_eq!(delivery["filename"], filename);
+    assert_eq!(delivery["attemptToken"], permit.token().hex());
+    assert!(
+        delivery["ledgerSha256"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 64)
+    );
+    assert!(
+        delivery["recovery"]
+            .as_str()
+            .is_some_and(|command| command.contains(&permit.token().hex()))
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(&root)
+        .args(["--host", "h"])
+        .env("XDG_STATE_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "h.worker\toffline\tobs:-\tctx:-\tdelivery:held(ambiguousAttempt)\t\t\n"
+    );
 }
 
 #[test]
@@ -630,12 +728,16 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
             .args(["--host", "hetz"])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap()
     };
     assert_eq!(
         human(root),
-        "hetz.filling\tbusy\tobs:-\tctx:92% rate-limited \u{27f3}1\t\t\n"
+        "hetz.filling\tbusy\tobs:-\tctx:92% rate-limited \u{27f3}1\tdelivery:-\t\t\n"
     );
 
     // A record whose percent the harness withheld — Claude before its first API response — must
@@ -649,11 +751,17 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         .unwrap();
     let row = &roster(root, "hetz")[0];
     assert!(row.context.as_ref().unwrap().used_percent.is_none());
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n");
+    assert_eq!(
+        human(root),
+        "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\tdelivery:-\t\t\n"
+    );
 
     // …and no record at all still reads `-`.
     fs::remove_file(st2::harness_context::harness_context_path(&agent_dir)).unwrap();
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:-\t\t\n");
+    assert_eq!(
+        human(root),
+        "hetz.filling\tbusy\tobs:-\tctx:-\tdelivery:-\t\t\n"
+    );
 }
 
 #[test]

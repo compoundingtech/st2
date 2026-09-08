@@ -143,8 +143,12 @@ pub fn run(
     let mut session = {
         let session = harness_state::session_token();
         let seq = harness_state::claim(&agent_dir, identity.clone(), "opencode", &session)?;
-        let mut diagnostics =
-            DiagnosticPublisher::new(&agent_dir, DiagnosticDriver::OpenCode, producer_version, support);
+        let mut diagnostics = DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            producer_version,
+            support,
+        );
         if let Some(reason) = version_failure {
             diagnostics.publish(
                 DiagnosticStage::VersionGate,
@@ -369,11 +373,8 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
             );
         }
         if sse_connected && !evidence && Instant::now() >= next_seed_attempt {
-            evidence = seed_with_diagnostics(
-                &session.client,
-                &mut machine,
-                &mut session.diagnostics,
-            );
+            evidence =
+                seed_with_diagnostics(&session.client, &mut machine, &mut session.diagnostics);
         }
         if evidence && let Some(observation) = machine.observation() {
             let _ = session.writer.observe(observation);
@@ -764,7 +765,9 @@ fn seed_from_server(
             DiagnosticSource::QuestionSnapshot,
         ),
     ] {
-        let pending = client.get_json(endpoint).map_err(|_| (unavailable, source))?;
+        let pending = client
+            .get_json(endpoint)
+            .map_err(|_| (unavailable, source))?;
         let items = pending.as_array().ok_or((malformed, source))?;
         for item in items {
             // An unreadable id could never be released by its id-matched exit.
@@ -1323,7 +1326,7 @@ impl Delivery {
         identity: &str,
         runtime_id: &str,
     ) -> Self {
-        let ledger_path = state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE);
+        let ledger_path = delivery_ledger_path(catalog_root, identity);
         Self::with_state_path(
             catalog_root,
             agent_dir,
@@ -1342,15 +1345,15 @@ impl Delivery {
         runtime_id: &str,
         ledger_path: PathBuf,
     ) -> Self {
-        let owner = identity.to_string();
-        // The same derivation the transport uses, so a record whose messageID does not match its
-        // own session and filename is provably not this agent's and fails closed.
+        // The same derivation `observe_delivery` binds, so the live pump and every read-only
+        // reader agree on what makes a record this agent's: a messageID that does not match its
+        // own session and filename is provably not ours and fails closed.
         let ledger = delivery_ledger::Ledger::open(
             &ledger_path,
             delivery_ledger::Harness::OpenCode.profile(),
             identity,
             runtime_id,
-            |session, filename| stable_message_id(&owner, session, filename),
+            delivery_correlate(identity),
         );
         Self {
             catalog_root: catalog_root.to_path_buf(),
@@ -1393,10 +1396,45 @@ impl Delivery {
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         let unread = message::list_inbox(&self.inbox)?;
+        // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
+        // refused to start: a driver that will not start delivers nothing at all. The
+        // operator-visible surface is the existing typed boundary — the transport is unavailable —
+        // and the raw reason stays in tracing, so no unbounded prose reaches the record.
+        let snapshot = match self.ledger.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!("st2 opencode-session: delivery ledger is unreadable: {error:#}");
+                if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                    diagnostics.publish(
+                        DiagnosticStage::Delivery,
+                        DiagnosticReason::DeliveryUnavailable,
+                        DiagnosticSource::PromptTransport,
+                    );
+                }
+                return Ok(());
+            }
+        };
         // Archive is the recipient agent's act and the only settlement authority. An entry whose
-        // file left the inbox releases ownership here; this pump never moves a file itself.
-        self.ledger
-            .prune(|filename| unread.iter().any(|entry| entry.filename == filename))?;
+        // file left the inbox releases ownership here; this pump never moves a file itself. Only
+        // attempts THIS listing saw are candidates, each named by its exact token, so a listing
+        // that raced a newer claim for the same filename cannot delete it.
+        let settled: Vec<delivery_ledger::Fence> = snapshot
+            .attempts()
+            .iter()
+            .filter(|attempt| {
+                !unread
+                    .iter()
+                    .any(|entry| entry.filename == attempt.filename)
+            })
+            .map(delivery_ledger::Attempt::fence)
+            .collect();
+        // Re-snapshot only if that actually mutated: every later decision must be made against
+        // the ledger as it is now, never against the view the mutation invalidated.
+        let snapshot = if self.ledger.prune(&settled)? > 0 {
+            self.ledger.snapshot()?
+        } else {
+            snapshot
+        };
         if status::read_state(&self.status_path) == status::State::Dnd {
             return Ok(());
         }
@@ -1421,67 +1459,51 @@ impl Delivery {
                 recovered
             }
         };
-        // A newly selected session is a different delivery binding (the Codex thread rule): the
-        // old binding's receipt may neither suppress nor acknowledge delivery to this one.
-        if self.ledger.binding().is_some_and(|binding| binding != target) {
-            self.ledger.rebind(&target)?;
+        // An attempt this pump already owns is reconciled FIRST, against its OWN binding —
+        // whether or not that is still the target. Retargeting before reconciling was a real
+        // defect: `retarget` drops a foreign-binding row that carries a negative receipt, so a
+        // stale snapshot could then hand a 404 taken on the OLD session to a resend on the old
+        // session. Nothing may move the binding until this attempt is settled or provably absent.
+        if let Some(attempt) = snapshot.attempt(&head.filename).cloned() {
+            return self.reconcile_or_retry(client, &attempt, &head, &target, diagnostics);
         }
-        // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
-        // refused to start: a driver that will not start delivers nothing at all. The
-        // operator-visible surface is the existing typed boundary — the transport is unavailable —
-        // and the raw reason stays in tracing, so no unbounded prose reaches the record.
-        if let Some(reason) = self.ledger.quarantined() {
-            tracing::warn!("st2 opencode-session: delivery ledger is quarantined: {reason}");
-            if let Some(diagnostics) = diagnostics.as_deref_mut() {
-                diagnostics.publish(
-                    DiagnosticStage::Delivery,
-                    DiagnosticReason::DeliveryUnavailable,
-                    DiagnosticSource::PromptTransport,
-                );
-            }
-            return Ok(());
-        }
-        if let Some(entry) = self.ledger.entry(&head.filename).cloned() {
-            // Storage is a receipt, not consumption: it stops the POST loop and holds the inbox
-            // entry, and only prompt admission would release ownership.
-            if entry.phase >= delivery_ledger::Phase::Persisted {
-                if let Some(diagnostics) = diagnostics.as_deref_mut() {
-                    diagnostics.clear(DiagnosticStage::Delivery);
-                    diagnostics.clear(DiagnosticStage::ReadBack);
-                }
-                return Ok(());
-            }
-            return self.reconcile_or_retry(client, entry, diagnostics);
-        }
-        if !self.ledger.entries().is_empty() {
-            return Ok(()); // The bound message is behind the head; archive precedence resolves it.
-        }
-
-        let message_id = stable_message_id(&self.identity, &target, &head.filename);
-        let entry = self.ledger.begin(delivery_ledger::Begin {
-            filename: head.filename.clone(),
-            binding: target.clone(),
-            correlation: delivery_ledger::Correlation::native(message_id.clone()),
-            // Read-back is a durable query, not a live frame, so a pre-crash attempt is
-            // reconcilable without an incarnation token.
-            incarnation: None,
-        })?;
-        let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &entry, &text, diagnostics)
+        self.claim_and_send(client, &head, &target, diagnostics)
     }
 
+    /// Reconcile an attempt this pump already owns, and re-POST only on an authoritative absence.
     fn reconcile_or_retry(
         &mut self,
         client: &Client,
-        entry: delivery_ledger::Entry,
+        attempt: &delivery_ledger::Attempt,
+        head: &message::Message,
+        target: &str,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
-        let read_back = self.read_back(client, &entry);
+        // Storage is a receipt, not consumption: it stops the POST loop and holds the inbox
+        // entry, and only prompt admission would release ownership. True on the old binding too —
+        // a message the server stored is stored regardless of which session we now watch.
+        if attempt.phase >= delivery_ledger::Phase::Persisted {
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.clear(DiagnosticStage::Delivery);
+                diagnostics.clear(DiagnosticStage::ReadBack);
+            }
+            return Ok(());
+        }
+        // An operator refusal is already the authoritative absence this reconciliation seeks.
+        // Consulting the provider first would make an unavailable read-back veto the durable
+        // operator decision and leave the attempt stuck forever.
+        if attempt.negative.is_some() {
+            return self.claim_and_send(client, head, target, diagnostics);
+        }
+        let fence = attempt.fence();
+        // Read back against the attempt's own session and correlation — the only place its
+        // absence or presence can honestly be observed.
+        let read_back = self.read_back(client, &fence);
         report_read_back(read_back, &mut diagnostics);
         match read_back {
             ReadBack::Durable => {
                 self.ledger
-                    .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+                    .record(&fence, delivery_ledger::Evidence::Persisted)?;
                 return Ok(());
             }
             // Measured on 1.18.19: a second POST with the same messageID appends its parts again
@@ -1489,42 +1511,70 @@ impl Delivery {
             // the read-back itself is retried on a later pass.
             ReadBack::Indeterminate => return Ok(()),
             // A 404 for the exact client message is an authoritative absence: the only receipt
-            // that may authorize another POST of the same identity.
+            // that may authorize another POST, and the only thing that makes the attempt
+            // droppable by a binding change.
             ReadBack::Absent => {
                 self.ledger
-                    .negative(&entry.filename, delivery_ledger::NegativeReceipt::Absent)?;
+                    .negative(&fence, delivery_ledger::NegativeReceipt::Absent)?;
             }
         }
-        if self.ledger.retry(&entry.filename) != delivery_ledger::RetryDecision::Retry {
-            return Ok(());
-        }
+        self.claim_and_send(client, head, target, diagnostics)
+    }
+
+    /// Point the ledger at the current target and open one fresh attempt there.
+    ///
+    /// Reached either with no attempt for this filename, or with one the read-back just proved
+    /// absent. Both cases deliver to the CURRENT session with a correlation derived for that
+    /// session, never the old one's: a `messageID` belongs to the session it was derived for.
+    fn claim_and_send(
+        &mut self,
+        client: &Client,
+        head: &message::Message,
+        target: &str,
+        diagnostics: Option<&mut DiagnosticPublisher>,
+    ) -> Result<()> {
+        // Backoff is SCHEDULING, never authorization: it can only delay a claim, and the ledger
+        // is the sole thing that says a transport may happen at all.
         if Instant::now() < self.next_attempt {
             return Ok(());
         }
-        let unread = message::list_inbox(&self.inbox)?;
-        let Some(head) = unread
-            .into_iter()
-            .find(|message| message.filename == entry.filename)
-        else {
-            return Ok(());
+        // Safe here and only here: every foreign-binding row this drops is settled or carries an
+        // authoritative absence, and an ambiguous one is retained and holds the claim below.
+        self.ledger.retarget(target)?;
+        let permit = match self.ledger.claim(delivery_ledger::Claimant {
+            filename: head.filename.clone(),
+            binding: target.to_owned(),
+            correlation: delivery_ledger::Correlation::native(stable_message_id(
+                &self.identity,
+                target,
+                &head.filename,
+            )),
+            // Read-back is a durable query, not a live frame, so a pre-crash attempt is
+            // reconcilable without an incarnation token.
+            incarnation: None,
+        })? {
+            delivery_ledger::Claim::Permitted(permit) => permit,
+            // FIFO one-at-a-time discipline and the ambiguous/foreign-binding holds all live in
+            // the ledger core: a hold is simply not this pass's turn.
+            delivery_ledger::Claim::Held(_) => return Ok(()),
         };
-        let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, &head);
-        self.send(client, &entry, &text, diagnostics)
+        let text = ding::poke_text(&self.catalog_root, &self.this_host, &self.identity, head);
+        self.send(client, &permit.fence(), &text, diagnostics)
     }
 
     fn send(
         &mut self,
         client: &Client,
-        entry: &delivery_ledger::Entry,
+        fence: &delivery_ledger::Fence,
         text: &str,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
         self.next_attempt = Instant::now() + DELIVERY_RETRY;
         let payload = json!({
-            "messageID": entry.correlation.value,
+            "messageID": fence.correlation.value,
             "parts": [{ "type": "text", "text": text }],
         });
-        let path = format!("/session/{}/prompt_async", entry.binding);
+        let path = format!("/session/{}/prompt_async", fence.binding);
         let status = match client.post_json(&path, &payload) {
             Ok(status) => status,
             Err(error) => {
@@ -1551,24 +1601,24 @@ impl Delivery {
         // The transport call succeeded. That is a fact about the call, not about the server's
         // state, so it grades no higher than `transportAccepted`.
         self.ledger
-            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
+            .record(fence, delivery_ledger::Evidence::TransportAccepted)?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
-        let read_back = self.read_back(client, entry);
+        let read_back = self.read_back(client, fence);
         report_read_back(read_back, &mut diagnostics);
         if matches!(read_back, ReadBack::Durable) {
             self.ledger
-                .record(&entry.filename, delivery_ledger::Evidence::Persisted)?;
+                .record(fence, delivery_ledger::Evidence::Persisted)?;
         }
         Ok(())
     }
 
     /// The only receipt this transport accepts: the exact client message read back durably.
-    fn read_back(&self, client: &Client, entry: &delivery_ledger::Entry) -> ReadBack {
+    fn read_back(&self, client: &Client, fence: &delivery_ledger::Fence) -> ReadBack {
         let path = format!(
             "/session/{}/message/{}",
-            entry.binding, entry.correlation.value
+            fence.binding, fence.correlation.value
         );
         match client.status_of_get(&path) {
             Ok(200) => ReadBack::Durable,
@@ -1579,10 +1629,7 @@ impl Delivery {
     }
 }
 
-fn report_read_back(
-    read_back: ReadBack,
-    diagnostics: &mut Option<&mut DiagnosticPublisher>,
-) {
+fn report_read_back(read_back: ReadBack, diagnostics: &mut Option<&mut DiagnosticPublisher>) {
     let Some(diagnostics) = diagnostics.as_deref_mut() else {
         return;
     };
@@ -1634,6 +1681,68 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
     }
     let digest = format!("{:x}", hash.finalize());
     base.join("st2").join("opencode").join(&digest[..24])
+}
+
+// ---- delivery observation ---------------------------------------------------------------------
+//
+// The OpenCode half of the provider seam, shaped exactly like the Codex one. Everything a
+// joining reader — the roster, the operator CLI — needs about this driver's delivery state is
+// reachable from a catalog root and an identity, and NOTHING out there derives `messageID`
+// itself: a second derivation of a correlation is a second answer to "is this record ours", and
+// the ledger fails closed on the wrong one.
+
+/// This seat's canonical delivery ledger.
+pub fn delivery_ledger_path(catalog_root: &Path, identity: &str) -> PathBuf {
+    state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE)
+}
+
+/// The exact correlation the OpenCode transport uses for one delivery: its `messageID`.
+///
+/// Public so a joining reader or a test fixture never reimplements the derivation. Reimplementing
+/// it is not a style question: the ledger validates every row against this function, so a second
+/// spelling produces a record the driver itself refuses.
+pub fn delivery_correlation(identity: &str, session_id: &str, filename: &str) -> String {
+    stable_message_id(identity, session_id, filename)
+}
+
+/// The exact correlation derivation the OpenCode transport uses, bound to one recipient.
+fn delivery_correlate(identity: &str) -> impl Fn(&str, &str) -> String + Send + Sync + 'static {
+    let owner = identity.to_string();
+    move |session, filename| stable_message_id(&owner, session, filename)
+}
+
+/// Read this seat's delivery state without recovering, backfilling, or writing anything.
+pub fn observe_delivery(
+    catalog_root: &Path,
+    identity: &str,
+) -> Result<delivery_ledger::Observation> {
+    delivery_ledger::observe(
+        &delivery_ledger_path(catalog_root, identity),
+        delivery_ledger::Harness::OpenCode.profile(),
+        identity,
+        &delivery_correlate(identity),
+    )
+}
+
+/// Record correlated absence for one attempt on this seat, on an operator's authority.
+///
+/// It transports nothing, starts no driver, and — via `Ledger::for_operator` rather than
+/// `Ledger::open` — runs NO transaction on construction. `open` would recover the legacy record
+/// and perform the Q35 backfill before the operator's digest precondition was ever checked, which
+/// would rewrite the exact bytes that precondition names. Everything this path touches is inside
+/// `operator_refuse`'s own strictly ordered lock.
+pub fn operator_refuse(
+    catalog_root: &Path,
+    identity: &str,
+    refusal: &delivery_ledger::OperatorRefusal,
+) -> Result<delivery_ledger::OperatorOutcome> {
+    delivery_ledger::Ledger::for_operator(
+        &delivery_ledger_path(catalog_root, identity),
+        delivery_ledger::Harness::OpenCode.profile(),
+        identity,
+        delivery_correlate(identity),
+    )
+    .operator_refuse(refusal)
 }
 
 #[cfg(test)]
@@ -2111,6 +2220,53 @@ mod tests {
     }
 
     #[test]
+    fn operator_absence_bypasses_unavailable_read_back_and_opens_one_fresh_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump(&client);
+        let first = ledger_snapshot(&state_path)
+            .attempt(&filename)
+            .unwrap()
+            .clone();
+        let refusal = delivery_ledger::OperatorRefusal {
+            fence: first.fence(),
+            audit: delivery_ledger::OperatorAudit::new(
+                delivery_ledger::OperatorSource::Operator,
+                unsafe { libc::geteuid() },
+                None,
+                None,
+                "provider read-back remained unavailable",
+                ledger_snapshot(&state_path).digest(),
+                1_786_380_000_000,
+            )
+            .unwrap(),
+        };
+        assert!(matches!(
+            delivery.ledger.operator_refuse(&refusal).unwrap(),
+            delivery_ledger::OperatorOutcome::Applied(_)
+        ));
+
+        delivery.next_attempt = Instant::now();
+        delivery.pump(&client);
+        let second = ledger_snapshot(&state_path)
+            .attempt(&filename)
+            .unwrap()
+            .clone();
+        assert_ne!(second.token, first.token, "the retry needs a fresh fence");
+        assert!(second.negative.is_none());
+        assert_eq!(
+            server.posts.lock().unwrap().len(),
+            2,
+            "the operator refusal authorizes exactly one new POST"
+        );
+    }
+
+    #[test]
     fn delivery_and_read_back_boundaries_publish_and_clear_diagnostics_without_changing_retry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
@@ -2256,14 +2412,18 @@ mod tests {
             delivery_ledger::Harness::OpenCode.profile(),
             "h.worker",
             "h.worker",
-            |session, file| stable_message_id("h.worker", session, file),
+            delivery_correlate("h.worker"),
         )
     }
 
+    fn ledger_snapshot(ledger_path: &Path) -> delivery_ledger::Snapshot {
+        reopen_ledger(ledger_path).snapshot().unwrap()
+    }
+
     fn ledger_phase(ledger_path: &Path, filename: &str) -> Option<delivery_ledger::Phase> {
-        reopen_ledger(ledger_path)
-            .entry(filename)
-            .map(|entry| entry.phase)
+        ledger_snapshot(ledger_path)
+            .attempt(filename)
+            .map(|attempt| attempt.phase)
     }
 
     #[test]
@@ -2281,11 +2441,12 @@ mod tests {
             [expected_id.clone()]
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
-        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
-        assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
-        assert_eq!(entry.correlation.value, expected_id);
+        let snapshot = ledger_snapshot(&state_path);
+        let attempt = snapshot.attempt(&filename).unwrap();
+        assert_eq!(attempt.phase, delivery_ledger::Phase::Persisted);
+        assert_eq!(attempt.correlation.value, expected_id);
         assert_eq!(
-            reopen_ledger(&state_path).retention(&filename),
+            snapshot.retention(&filename),
             delivery_ledger::Retention::Hold(delivery_ledger::HoldReason::UnreadReceipt),
             "storage is not admission: ownership is retained until the scheduler proves it, and \
              only the recipient's own archive settles the message"
@@ -2302,8 +2463,6 @@ mod tests {
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
-
-
 
     #[test]
     fn a_failed_transport_retries_the_same_identity_never_a_second_one() {
@@ -2334,6 +2493,68 @@ mod tests {
             ledger_phase(&state_path, &filename),
             Some(delivery_ledger::Phase::Persisted)
         );
+    }
+
+    /// The defect this shape exists to prevent: an attempt made to a session we are no longer
+    /// bound to must be reconciled against ITS OWN session first, and only its authoritative
+    /// absence there may move the binding. Retargeting first would drop the refused row and let a
+    /// 404 taken on the old session authorize a resend on the old session — and the retry would
+    /// carry a `messageID` derived for a session nobody is watching.
+    #[test]
+    fn an_absence_on_a_stale_session_retries_on_the_current_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = spawn_fake_server();
+        // The first POST is refused, so the attempt stays ambiguous on `ses_target`.
+        server.accept_posts.store(false, Ordering::SeqCst);
+        let client = Client::new(server.port, "pw");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, filename) = delivery_fixture(tmp.path(), state_path.clone());
+
+        delivery.pump(&client);
+        let stale_id = stable_message_id("h.worker", "ses_target", &filename);
+        assert_eq!(server.posts.lock().unwrap().as_slice(), [stale_id.clone()]);
+        let attempt = ledger_snapshot(&state_path)
+            .attempt(&filename)
+            .cloned()
+            .unwrap();
+        assert_eq!(attempt.binding, "ses_target");
+        assert_eq!(attempt.phase, delivery_ledger::Phase::Attempted);
+
+        // The session the pump watches moves on, and the transport recovers.
+        delivery.saw_session("ses_new");
+        server.accept_posts.store(true, Ordering::SeqCst);
+        delivery.next_attempt = Instant::now();
+        delivery.pump(&client);
+
+        // The read-back was taken on the OLD session's message id — that is where its absence is
+        // observable — and the resend went to the CURRENT session with a correlation derived for
+        // it, never the stale one.
+        let fresh_id = stable_message_id("h.worker", "ses_new", &filename);
+        assert_ne!(fresh_id, stale_id);
+        assert_eq!(
+            server.posts.lock().unwrap().as_slice(),
+            [stale_id, fresh_id.clone()],
+            "exactly one resend, on the current binding"
+        );
+        let snapshot = ledger_snapshot(&state_path);
+        let retried = snapshot.attempt(&filename).unwrap();
+        assert_eq!(retried.binding, "ses_new");
+        assert_eq!(retried.correlation.value, fresh_id);
+        assert_ne!(
+            retried.token, attempt.token,
+            "a resend is a fresh fenced attempt, never a second send on the old fence"
+        );
+        assert_eq!(retried.phase, delivery_ledger::Phase::Persisted);
+        assert_eq!(
+            snapshot.attempts().len(),
+            1,
+            "the refused old-binding row is droppable once absent, and was dropped"
+        );
+
+        // And a further pass sends nothing: storage is terminal for the POST loop.
+        delivery.next_attempt = Instant::now();
+        delivery.pump(&client);
+        assert_eq!(server.posts.lock().unwrap().len(), 2);
     }
 
     #[test]

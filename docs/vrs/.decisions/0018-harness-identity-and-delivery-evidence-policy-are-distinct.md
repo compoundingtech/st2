@@ -81,3 +81,24 @@ boundary; this decision does not claim those later steps are implemented.
   implementation changes under R43.
 - `INVARIANTS.md` names Codex and OpenCode ownership until the later driver
   adoption proofs pass.
+
+## Amendment 1 — 2026-09-08 (Q35)
+
+Johannes approved one bounded exception to the no-compatibility consequence
+above. R43 requires a fresh durable attempt token, but the canonical
+`st2.delivery-ledger.v1` entry predates that field. Codex and OpenCode already
+hold live durable evidence in this format. Rejecting those bytes would preserve
+implementation purity by discarding the safety property this work exists to
+provide.
+
+A tokenless canonical Codex or OpenCode entry is therefore read only inside the
+same locked transaction that owns every mutation. st2 derives a deterministic
+128-bit token from the exact immutable entry bytes and persists the token before
+any other mutation or transport. All later operations require the exact token.
+The reader never dual-writes, never accepts an attempt-only legacy record, and
+never makes a pre-token writer a supported rollback target.
+
+This is temporary implementation state under T04. Its remaining inputs stay
+countable, and a named deletion signal owns removal of the reader. T03 remains
+unchanged for Claude, pi, and OMP: no tokenless attempt-only record has shipped,
+so their adoption stays a clean forward-only boundary.

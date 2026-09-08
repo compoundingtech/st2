@@ -10,7 +10,28 @@ use serde::Serialize;
 
 use crate::message;
 use crate::status::{self, State};
-use crate::{AgentSpec, Discovered, Resource, driver_diagnostic, harness_context, harness_state};
+use crate::{
+    AgentSpec, Discovered, Resource, SessionDriver, codex_app_server, delivery_ledger,
+    driver_diagnostic, harness_context, harness_state, opencode_session,
+};
+
+/// Native delivery ownership, independent of presence and harness activity.
+#[derive(Debug, Clone)]
+pub enum Delivery {
+    Absent,
+    Idle,
+    Held {
+        filename: String,
+        reason: delivery_ledger::HoldReason,
+        attempt_token: Option<delivery_ledger::AttemptToken>,
+        ledger_sha256: delivery_ledger::LedgerDigest,
+        recovery: Option<String>,
+    },
+    Indeterminate {
+        reason: &'static str,
+        ledger_sha256: Option<delivery_ledger::LedgerDigest>,
+    },
+}
 
 /// One roster row: everything `st2 agents [--enrich]` can report about an agent.
 #[derive(Debug, Clone)]
@@ -51,6 +72,9 @@ pub struct AgentRow {
     /// three. `None` means no record exists; a record past its horizon is still reported, marked
     /// stale and carrying its age, so it survives every `observedState: unknown` derivation.
     pub context: Option<harness_context::Observed>,
+    /// Native delivery ownership for current ledger adopters. `None` means the declared harness
+    /// has not adopted the ledger; absence, idle, held, and indeterminate are distinct values.
+    pub delivery: Option<Delivery>,
     /// The immutable catalog-global agent ID (R24) — the declaration's explicit `id`, else the
     /// legacy `<host>.<identity>` bus identity that migration freezes as this subject's ID.
     /// `identity` above stays the positional declaration key and legacy address fallback;
@@ -113,11 +137,11 @@ pub fn roster_from_discovered(
                 // Read independently of the state record above: the wedge case this exists for is
                 // an agent whose state has gone indeterminate at 190k of a 200k window.
                 context: harness_context::read(&harness_context::harness_context_path(agent_dir)),
+                delivery: delivery_state(s, catalog_root, this_host),
                 id: s.effective_id(this_host),
                 address: s.effective_address().to_owned(),
                 // A retired subject does not resolve and does not occupy the address namespace.
-                bus_address: (!s.desired_state.is_retired())
-                    .then(|| s.bus_address(this_host)),
+                bus_address: (!s.desired_state.is_retired()).then(|| s.bus_address(this_host)),
             })
         })
         .collect();
@@ -141,6 +165,56 @@ fn observed_state(
     } else {
         harness_state::read(&path, None)
     }
+}
+fn delivery_state(spec: &AgentSpec, catalog_root: &Path, this_host: &str) -> Option<Delivery> {
+    if spec.resolved_host(this_host) != this_host {
+        return None;
+    }
+    let identity = spec.bus_id(this_host);
+    let observed = match spec.effective_session_driver()? {
+        SessionDriver::Codex => codex_app_server::observe_delivery(catalog_root, &identity),
+        SessionDriver::OpenCode => opencode_session::observe_delivery(catalog_root, &identity),
+        SessionDriver::Claude | SessionDriver::Pi | SessionDriver::Omp => return None,
+    };
+    Some(match observed {
+        Ok(delivery_ledger::Observation::Absent) => Delivery::Absent,
+        Ok(delivery_ledger::Observation::Indeterminate { digest, .. }) => Delivery::Indeterminate {
+            reason: "invalid",
+            ledger_sha256: Some(digest),
+        },
+        Err(_) => Delivery::Indeterminate {
+            reason: "unreadable",
+            ledger_sha256: None,
+        },
+        Ok(delivery_ledger::Observation::Held(sighting)) => {
+            let Some(head) = sighting
+                .attempts
+                .iter()
+                .find(|attempt| matches!(attempt.retention, delivery_ledger::Retention::Hold(_)))
+            else {
+                return Some(Delivery::Idle);
+            };
+            let delivery_ledger::Retention::Hold(reason) = head.retention else {
+                unreachable!("the FIFO head was selected from held attempts")
+            };
+            let recovery = (head.token.is_some() && head.negative.is_none()).then(|| {
+                format!(
+                    "st2 message delivery-negative {} {} --attempt-token {} --ledger-sha256 {} --reason '<why-message-is-absent>'",
+                    identity,
+                    head.filename,
+                    head.token.expect("checked above"),
+                    sighting.digest,
+                )
+            });
+            Delivery::Held {
+                filename: head.filename.clone(),
+                reason,
+                attempt_token: head.token,
+                ledger_sha256: sighting.digest,
+                recovery,
+            }
+        }
+    })
 }
 
 /// The pty registry root the probe reads: exactly the runner's own resolution, so the reader and
@@ -293,6 +367,64 @@ impl<'a> ContextJson<'a> {
         })
     }
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryJson<'a> {
+    state: &'static str,
+    reason: Option<&'a str>,
+    filename: Option<&'a str>,
+    attempt_token: Option<String>,
+    ledger_sha256: Option<String>,
+    recovery: Option<&'a str>,
+}
+
+impl<'a> DeliveryJson<'a> {
+    fn from_row(delivery: Option<&'a Delivery>) -> Option<Self> {
+        delivery.map(|delivery| match delivery {
+            Delivery::Absent => Self {
+                state: "absent",
+                reason: None,
+                filename: None,
+                attempt_token: None,
+                ledger_sha256: None,
+                recovery: None,
+            },
+            Delivery::Idle => Self {
+                state: "idle",
+                reason: None,
+                filename: None,
+                attempt_token: None,
+                ledger_sha256: None,
+                recovery: None,
+            },
+            Delivery::Held {
+                filename,
+                reason,
+                attempt_token,
+                ledger_sha256,
+                recovery,
+            } => Self {
+                state: "held",
+                reason: Some(reason.as_str()),
+                filename: Some(filename),
+                attempt_token: attempt_token.map(|token| token.hex()),
+                ledger_sha256: Some(ledger_sha256.hex()),
+                recovery: recovery.as_deref(),
+            },
+            Delivery::Indeterminate {
+                reason,
+                ledger_sha256,
+            } => Self {
+                state: "indeterminate",
+                reason: Some(reason),
+                filename: None,
+                attempt_token: None,
+                ledger_sha256: ledger_sha256.map(|digest| digest.hex()),
+                recovery: None,
+            },
+        })
+    }
+}
 
 #[derive(Serialize)]
 struct ResourceJson<'a> {
@@ -347,6 +479,7 @@ struct SummaryJson<'a> {
     /// Appended (R24): `<host>.<address>`; `null` for a retired, non-routable subject.
     #[serde(rename = "busAddress")]
     bus_address: Option<&'a str>,
+    delivery: Option<DeliveryJson<'a>>,
 }
 
 /// `st2 agents --json --enrich` row (adds `lastActivity` and `inbox`).
@@ -378,6 +511,7 @@ struct EnrichedJson<'a> {
     /// Appended (R24): `<host>.<address>`; `null` for a retired, non-routable subject.
     #[serde(rename = "busAddress")]
     bus_address: Option<&'a str>,
+    delivery: Option<DeliveryJson<'a>>,
 }
 
 /// Serialize a roster to the stable JSON emitted by `st2 agents --json [--enrich]`.
@@ -402,6 +536,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 id: &r.id,
                 address: &r.address,
                 bus_address: r.bus_address.as_deref(),
+                delivery: DeliveryJson::from_row(r.delivery.as_ref()),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -423,6 +558,7 @@ pub fn to_json(rows: &[AgentRow], enrich: bool) -> String {
                 id: &r.id,
                 address: &r.address,
                 bus_address: r.bus_address.as_deref(),
+                delivery: DeliveryJson::from_row(r.delivery.as_ref()),
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
@@ -438,6 +574,7 @@ pub(crate) fn graph_runtime_value(row: &AgentRow) -> serde_json::Value {
         "observedState": ObservedJson::from_row(row.observed.as_ref()),
         "driverDiagnostic": DriverDiagnosticJson::from_row(&row.driver_diagnostic),
         "context": ContextJson::from_row(row.context.as_ref()),
+        "delivery": DeliveryJson::from_row(row.delivery.as_ref()),
     })
 }
 
@@ -506,6 +643,7 @@ mod tests {
             context: None,
             // A legacy declaration: the frozen ID is its bus identity, the effective address is
             // its positional identity, and a retired subject releases its bus address.
+            delivery: None,
             id: identity.to_string(),
             address: identity
                 .split_once('.')
@@ -532,14 +670,49 @@ mod tests {
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude","delivery":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null,"delivery":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude","delivery":null},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null,"delivery":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
+    }
+    #[test]
+    fn held_delivery_is_a_separate_actionable_roster_axis() {
+        let mut held = row("hetz.worker", State::Busy, None, false, None, 1);
+        let token =
+            delivery_ledger::AttemptToken::parse("00112233445566778899aabbccddeeff").unwrap();
+        let digest = delivery_ledger::LedgerDigest::parse(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        let recovery = format!(
+            "st2 message delivery-negative hetz.worker 1786380000000-aaa111.md --attempt-token {token} --ledger-sha256 {digest} --reason '<why-message-is-absent>'"
+        );
+        held.delivery = Some(Delivery::Held {
+            filename: "1786380000000-aaa111.md".to_owned(),
+            reason: delivery_ledger::HoldReason::AmbiguousAttempt,
+            attempt_token: Some(token),
+            ledger_sha256: digest,
+            recovery: Some(recovery.clone()),
+        });
+
+        let wire: serde_json::Value = serde_json::from_str(&to_json(&[held], false)).unwrap();
+        assert_eq!(wire[0]["status"], "busy");
+        assert_eq!(wire[0]["observedState"], serde_json::Value::Null);
+        assert_eq!(
+            wire[0]["delivery"],
+            serde_json::json!({
+                "state": "held",
+                "reason": "ambiguousAttempt",
+                "filename": "1786380000000-aaa111.md",
+                "attemptToken": token.hex(),
+                "ledgerSha256": digest.hex(),
+                "recovery": recovery,
+            })
+        );
     }
 
     #[test]
@@ -559,7 +732,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","delivery":null}]"#
         );
     }
 
@@ -589,11 +762,11 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","delivery":null}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","delivery":null}]"#
         );
 
         let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
@@ -609,7 +782,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker","delivery":null}]"#
         );
     }
 

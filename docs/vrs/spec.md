@@ -1139,13 +1139,111 @@ does not branch on provider identity when it grades evidence. A synthetic
 identity-policy pairing proves that separation without adding a provider
 registry or another core branch.
 
-This section specifies the complete R43 target. At this stage, only Codex and
-OpenCode own delivery through the ledger. Claude, pi, and OMP have the
-attempt-only policy, but their drivers adopt durable ownership in separate
-changes. Transactional mutation, exact attempt tokens, FIFO enforcement,
-provider-visible correlation, and operator-negative evidence are also separate
-implementation steps. `INVARIANTS.md` names only the subset proved by the
+The current production adopters are Codex and OpenCode. Claude, pi, and OMP
+map to attempt-only policy, but their drivers do not own delivery through this
+ledger until their process-local suppression is replaced.
+
+### Transaction boundary
+
+Each per-agent, per-harness ledger has one permanent sibling lock file. st2
+opens the lock without following symlinks, holds an exclusive local kernel lock,
+and never removes or renames the lock file. Initial recovery and every mutation
+run as one transaction:
+
+```text
+lock → re-read exact bytes → validate → compare attempt/precondition
+     → decide one transition → fsync staged bytes → rename → fsync directory
+     → return result → unlock
+```
+
+The in-process object is configuration, not authority. A cached observation
+never authorizes transport. A transaction that cannot prove whether its commit
+landed returns no transport permit; a later transaction re-reads the durable
+result.
+
+`claim` is the only transport authorization. It combines the former retry
+decision and attempt write. Under the lock it admits only the canonical FIFO
+head, requires no outstanding attempt or exact negative evidence for that
+head's current token, generates a fresh opaque 128-bit attempt token, persists
+`Attempted`, and only then returns one token-bearing permit. A later filename
+cannot overtake an outstanding head. A binding change cannot discard an
+ambiguous attempt.
+
+Positive evidence, provider negative evidence, archive pruning, binding
+changes, and operator evidence compare the complete attempt identity:
+`(binding, filename, provider correlation, attempt token)`. Stale evidence is a
+typed refusal and writes nothing. Positive phases remain monotone. Exact
+negative evidence is retained as evidence for its token; one later `claim`
+consumes it by persisting a new token before another transport can start.
+Archive settlement removes only the exact token captured by the reconciling
+snapshot, so a stale unread snapshot cannot delete a replacement attempt.
+
+### Canonical token backfill
+
+The pre-token and token-bearing records share the canonical
+`st2.delivery-ledger.v1` schema. Under T04, a tokenless Codex or OpenCode entry
+is a temporary read case, not a second writer format. The transaction derives a
+deterministic 128-bit token from the exact immutable entry bytes and durably
+adds it before any other mutation or transport. New claims always use
+fail-closed operating-system randomness. The implementation counts remaining
+tokenless inputs and deletes this reader only after its recorded fleet signal
+stays clear. A pre-token writer is not a supported rollback target after a
+token-bearing claim.
+
+### Attempt-only correlation and operator evidence
+
+An attempt-only transport places this exact first line in provider-visible
+content:
+
+```text
+[st2-delivery filename=<canonical-message-filename> attempt=<attempt-token>]
+```
+
+The marker contains no path, agent identity, binding, provider correlation,
+reason, or delivery claim. It identifies only the exact durable attempt that an
+operator can seek in provider history. The marker renderer validates the
+canonical filename and token and has no provider branch.
+
+The same-UID operator command records absence; it does not transport:
+
+```text
+st2 message delivery-negative <agent> <filename> \
+  --attempt-token <token> \
+  --ledger-sha256 <exact-observed-ledger-digest> \
+  --reason <non-empty-reason>
+```
+
+The transaction verifies unchanged ledger bytes, harness and agent ownership,
+the exact attempt tuple, an unsettled state, and the absence of an archive
+receipt. It persists source `operator`, OS uid, optional non-authoritative
+process and `ST_AGENT` provenance, reason, binding, filename, provider
+correlation, attempt token, ledger precondition, and observation time before
+returning a receipt. A changed digest, stale token, settled entry, malformed
+ledger, or foreign ledger refuses without rewriting bytes. A later pump must
+perform a separate `claim`.
+
+### Operator visibility
+
+Read-only delivery observation never invokes recovery or token backfill.
+`st2 agents` joins a ledger adopter to one typed `delivery` value:
+
+- `absent` when the provider has no ledger file;
+- `idle` when a readable ledger has no unsettled entry;
+- `held` with the closed hold reason, filename, exact ledger digest, and the
+  attempt token and recovery command when actionable. The token and recovery
+  command are null for a DELTA-007 tokenless row; the recovery command is also
+  null after exact negative evidence; or
+- `indeterminate` when existing bytes cannot be validated.
+
+The normal roster omits private state paths, bindings, and provider-native
+correlation. Human output renders the same fact as
+`delivery:held(<reason>)`. This field is independent of presence, observed
+harness state, native-driver diagnostics, context, and inbox count.
+`INVARIANTS.md` names only the harness adopters and proof set present in the
 current implementation.
+
+`st2 doctor` reports the count of observed DELTA-007 tokenless rows without
+backfilling them. The diagnostic is advisory and byte-preserving.
 
 ## Message lifecycle
 
