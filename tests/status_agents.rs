@@ -511,6 +511,66 @@ fn roster_exposes_a_codex_held_attempt_as_actionable_delivery_state() {
 }
 
 #[test]
+fn roster_observes_claude_attempts_in_the_declaration_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let identity = "h.worker";
+    let filename = "1786380000000-aaa111.md";
+    write(
+        root,
+        "h/worker/agent.kdl",
+        r#"agent "worker" {
+  identity "worker"
+  host "h"
+  type "service"
+  session-driver "claude"
+  argv "claude"
+}
+"#,
+    );
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &root.join("h/worker/delivery-ledger.json"),
+        st2::delivery_ledger::Harness::Claude.profile(),
+        identity,
+        identity,
+        st2::native_channel::delivery_correlation,
+    );
+    let permit = match ledger
+        .claim(st2::delivery_ledger::Claimant {
+            filename: filename.to_owned(),
+            binding: identity.to_owned(),
+            correlation: st2::delivery_ledger::Correlation::native(
+                st2::native_channel::delivery_correlation(identity, filename),
+            ),
+            incarnation: None,
+        })
+        .unwrap()
+    {
+        st2::delivery_ledger::Claim::Permitted(permit) => permit,
+        st2::delivery_ledger::Claim::Held(reason) => {
+            panic!("fresh Claude attempt unexpectedly held: {reason:?}")
+        }
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+        .arg("agents")
+        .arg(root)
+        .args(["--host", "h", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["delivery"]["state"], "held");
+    assert_eq!(rows[0]["delivery"]["reason"], "ambiguousAttempt");
+    assert_eq!(rows[0]["delivery"]["filename"], filename);
+    assert_eq!(rows[0]["delivery"]["attemptToken"], permit.token().hex());
+}
+
+#[test]
 fn exact_identity_rejects_duplicates_before_status_filtering() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

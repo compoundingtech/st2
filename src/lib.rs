@@ -42,11 +42,11 @@ pub mod identity;
 pub mod isolate;
 pub mod materialize;
 pub mod message;
-/// The stdio framing shared by the native channels; crate-internal.
-mod native_channel;
-pub mod omp_session;
 pub mod metrics;
 pub mod migrations;
+/// Provider-neutral delivery correlation; framing and pumps remain crate-internal.
+pub mod native_channel;
+pub mod omp_session;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;

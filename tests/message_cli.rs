@@ -123,14 +123,14 @@ fn attempt_only_delivery_fixture(
         harness.profile(),
         IDENTITY,
         IDENTITY,
-        st2::pi_channel::delivery_correlation,
+        st2::native_channel::delivery_correlation,
     );
     let permit = match ledger
         .claim(st2::delivery_ledger::Claimant {
             filename: FILENAME.to_owned(),
             binding: IDENTITY.to_owned(),
             correlation: st2::delivery_ledger::Correlation::native(
-                st2::pi_channel::delivery_correlation(IDENTITY, FILENAME),
+                st2::native_channel::delivery_correlation(IDENTITY, FILENAME),
             ),
             incarnation: None,
         })
@@ -1684,8 +1684,9 @@ fn delivery_negative_records_audited_absence_by_address_and_exact_id_without_tra
 }
 
 #[test]
-fn delivery_negative_dispatches_to_pi_and_omp_declaration_ledgers() {
+fn delivery_negative_dispatches_to_all_attempt_only_declaration_ledgers() {
     for (harness, driver) in [
+        (st2::delivery_ledger::Harness::Claude, "claude"),
         (st2::delivery_ledger::Harness::Pi, "pi"),
         (st2::delivery_ledger::Harness::Omp, "omp"),
     ] {
@@ -1720,28 +1721,34 @@ fn delivery_negative_dispatches_to_pi_and_omp_declaration_ledgers() {
 }
 
 #[test]
-fn delivery_negative_refuses_a_pi_attempt_settled_by_archive() {
-    let fixture = attempt_only_delivery_fixture(st2::delivery_ledger::Harness::Pi, "pi");
-    let archive = fixture.root.join("h/worker/resources/archive");
-    fs::create_dir_all(&archive).unwrap();
-    fs::write(archive.join(fixture.filename), b"recipient receipt").unwrap();
-    let before = fs::read(&fixture.ledger_path).unwrap();
+fn delivery_negative_refuses_attempts_settled_by_archive() {
+    for (harness, driver) in [
+        (st2::delivery_ledger::Harness::Claude, "claude"),
+        (st2::delivery_ledger::Harness::Pi, "pi"),
+        (st2::delivery_ledger::Harness::Omp, "omp"),
+    ] {
+        let fixture = attempt_only_delivery_fixture(harness, driver);
+        let archive = fixture.root.join("h/worker/resources/archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join(fixture.filename), b"recipient receipt").unwrap();
+        let before = fs::read(&fixture.ledger_path).unwrap();
 
-    let output = delivery_negative(
-        &fixture,
-        &["worker", fixture.filename],
-        &fixture.token.hex(),
-        &fixture.digest.hex(),
-        Some("provider history looked empty"),
-    );
+        let output = delivery_negative(
+            &fixture,
+            &["worker", fixture.filename],
+            &fixture.token.hex(),
+            &fixture.digest.hex(),
+            Some("provider history looked empty"),
+        );
 
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("settled by its archive receipt"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(fs::read(&fixture.ledger_path).unwrap(), before);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("settled by its archive receipt"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&fixture.ledger_path).unwrap(), before);
+    }
 }
 
 #[test]
@@ -1847,7 +1854,7 @@ fn delivery_negative_fails_closed_on_missing_or_stale_evidence() {
 }
 
 #[test]
-fn delivery_negative_refuses_absent_symlinked_and_unadopted_ledgers() {
+fn delivery_negative_refuses_absent_and_symlinked_ledgers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("catalog");
     let state = tmp.path().join("state");
@@ -1897,11 +1904,15 @@ fn delivery_negative_refuses_absent_symlinked_and_unadopted_ledgers() {
     assert!(!ledger_path.exists());
     assert!(!ledger_path.with_file_name("delivery-ledger.lock").exists());
 
-    let unadopted = invoke("claude");
-    assert!(!unadopted.status.success());
+    let claude_absent = invoke("claude");
+    assert!(!claude_absent.status.success());
+    assert!(String::from_utf8_lossy(&claude_absent.stderr).contains("has no delivery ledger"));
+    let claude_ledger_path = claude_dir.join("delivery-ledger.json");
+    assert!(!claude_ledger_path.exists());
     assert!(
-        String::from_utf8_lossy(&unadopted.stderr)
-            .contains("claude has not adopted the delivery ledger")
+        !claude_ledger_path
+            .with_file_name("delivery-ledger.lock")
+            .exists()
     );
 
     #[cfg(unix)]

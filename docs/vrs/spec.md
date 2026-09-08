@@ -1139,9 +1139,7 @@ does not branch on provider identity when it grades evidence. A synthetic
 identity-policy pairing proves that separation without adding a provider
 registry or another core branch.
 
-The current production adopters are Codex, pi, OpenCode, and OMP. Claude maps
-to attempt-only policy, but its driver does not own delivery through this
-ledger until its process-local suppression is replaced.
+All five native delivery drivers own delivery through this ledger.
 
 ### Transaction boundary
 
@@ -1156,7 +1154,7 @@ lock → re-read exact bytes → validate → compare attempt/precondition
      → return result → unlock
 ```
 
-The pi-family ledger, lock, and staged replacement siblings live at the
+The attempt-only ledgers, locks, and staged replacement siblings live at the
 declaration root as runtime state. Current catalog projections exclude them,
 prepared catalogs reject them, and catalog apply therefore cannot snapshot,
 replace, or remove live delivery ownership.
@@ -1208,6 +1206,13 @@ The marker contains no path, agent identity, binding, provider correlation,
 reason, or delivery claim. It identifies only the exact durable attempt that an
 operator can seek in provider history. The marker renderer validates the
 canonical filename and token and has no provider branch.
+
+Claude uses its canonical bus identity as the stable non-session binding. Its
+MCP channel claims durably before writing
+`notifications/claude/channel`, with the marker as the first content line.
+Notification write and flush outcomes are ambiguous and produce no positive
+ledger evidence. Restart holds the attempt until the canonical archive receipt
+settles it or exact operator absence permits a fresh-token retry.
 
 The same-UID operator command records absence; it does not transport:
 

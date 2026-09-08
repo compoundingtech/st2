@@ -86,8 +86,7 @@ impl Harness {
         }
     }
 
-    /// Parse one of the five harness names. Ledger adoption is a separate capability reported by
-    /// [`Harness::keeps_ledger`].
+    /// Parse one of the five harness names.
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "claude" => Ok(Self::Claude),
@@ -109,14 +108,6 @@ impl Harness {
 
     pub const fn profile(self) -> Profile {
         Profile::new(self, self.policy())
-    }
-
-    /// Whether a shipped driver for this harness keeps a delivery ledger today.
-    ///
-    /// Claude remains the one attempt-only harness whose adoption is separate work, so a reader
-    /// must not report its missing ledger as a fault.
-    pub const fn keeps_ledger(self) -> bool {
-        matches!(self, Self::Codex | Self::Pi | Self::OpenCode | Self::Omp)
     }
 }
 
@@ -925,8 +916,7 @@ const MARKER_TAG: &str = "st2-delivery";
 /// for the same attempt, and a harness that echoed it would spill the recipient's inbox contents
 /// into its own transcript.
 ///
-/// Pi and OMP prepend this marker through their production channel assets. Claude adoption remains
-/// separate work.
+/// Claude, Pi, and OMP prepend this marker through their production native channels.
 pub fn marker(filename: &str, token: AttemptToken) -> Result<String> {
     anyhow::ensure!(
         message::is_message_filename(filename),
@@ -2687,14 +2677,6 @@ mod tests {
             Harness::Omp,
         ] {
             assert_eq!(Harness::parse(harness.as_str()).unwrap(), harness);
-            assert_eq!(
-                harness.keeps_ledger(),
-                matches!(
-                    harness,
-                    Harness::Codex | Harness::Pi | Harness::OpenCode | Harness::Omp
-                ),
-                "only the adopted drivers keep a ledger today"
-            );
         }
     }
 
