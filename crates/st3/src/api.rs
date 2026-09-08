@@ -1777,6 +1777,29 @@ async fn watch_resource(
                 "vcs.pull-request",
             )
         }
+        "github.repository" => {
+            for field in &request.fields {
+                if !matches!(field.as_str(), "pull_requests" | "issues") {
+                    return Err(ApiError::bad(St3Error::new(
+                        "invalid-subscription-field",
+                        format!("GitHub repository provider does not support field `{field}`"),
+                    )));
+                }
+            }
+            let (owner, repository) = request.locator.split_once('/').ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "invalid-resource-locator",
+                    "a GitHub repository locator needs OWNER/REPO",
+                ))
+            })?;
+            if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+                return Err(ApiError::bad(St3Error::new(
+                    "invalid-resource-locator",
+                    "a GitHub repository locator needs OWNER/REPO",
+                )));
+            }
+            (format!("github/{owner}/{repository}"), "vcs.repository")
+        }
         "local.file" => {
             let path = std::path::Path::new(&request.locator);
             if !path.is_absolute() {

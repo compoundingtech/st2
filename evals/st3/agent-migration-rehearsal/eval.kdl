@@ -21,7 +21,7 @@ mission "eval/agent-migration-rehearsal" state="ready" {
   step "write-report" timeout="10m" {
     assigned-to "agent/${ST_MISSION_RUN}/pilot"
     title "The migrated agent completes normal graph work"
-    goal "Read INPUT.md and doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665. Write MIGRATION.md with the host boundary and your completed work."
+    goal "Read INPUT.md and .st3/host/migration-rehearsal.md. Write MIGRATION.md with the host boundary and your completed work."
     document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
   }
 
@@ -36,6 +36,12 @@ mission "eval/agent-migration-rehearsal" state="ready" {
     }
     gate "the isolated mission produced its report" {
       exec "test -s MIGRATION.md && grep -Fq 'isolated st3 migration rehearsal' MIGRATION.md"
+      host "local"
+      workspace "${ST_WORKSPACE}/agent"
+      time-limit "1m"
+    }
+    gate "the runtime rendered and linked the exact host document" {
+      exec "test -s .st3/host/migration-rehearsal.md && grep -Fq '.st3/host/migration-rehearsal.md' .st3/boot.md"
       host "local"
       workspace "${ST_WORKSPACE}/agent"
       time-limit "1m"

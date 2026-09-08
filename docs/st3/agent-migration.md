@@ -86,6 +86,10 @@ The rehearsal proves these facts:
 
 ## Start one st3 run
 
+Do not start the live st3 mission while st2 still owns the same agent workspace.
+
+Stop the authorized st2 agent first. Remove only the st2-generated files that conflict with the st3 render.
+
 Use a readable run ID for the first trial:
 
 ```sh
@@ -96,7 +100,7 @@ st3 mission start agents/example \
   --follow
 ```
 
-Verify the exact mission run, agent subject, runtime incarnation, generated boot file, and work queue.
+Verify the exact mission run, agent subject, runtime incarnation, generated boot file, host document, and work queue.
 
 The new agent subject has the form `agent/agents/example/pilot/example`.
 

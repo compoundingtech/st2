@@ -3385,6 +3385,22 @@ fn resource_watch_intent(
                 "vcs.pull-request",
             )
         }
+        "github.repository" => {
+            for field in fields {
+                anyhow::ensure!(
+                    matches!(field.as_str(), "pull_requests" | "issues"),
+                    "GitHub repository provider does not support field `{field}`"
+                );
+            }
+            let (owner, repository) = locator
+                .split_once('/')
+                .context("a GitHub repository locator needs OWNER/REPO")?;
+            anyhow::ensure!(
+                !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
+                "a GitHub repository locator needs OWNER/REPO"
+            );
+            (format!("github/{owner}/{repository}"), "vcs.repository")
+        }
         "local.file" => {
             anyhow::ensure!(
                 Path::new(locator).is_absolute(),

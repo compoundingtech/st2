@@ -42,11 +42,151 @@ impl ResourceProvider for RegisteredResourceProvider {
         Box::pin(async move {
             match request.provider.as_str() {
                 "github.pull-request" => observe_github_pull_request(request).await,
+                "github.repository" => observe_github_repository(request).await,
                 "local.file" => observe_local_file(request),
                 provider => bail!("resource provider `{provider}` is not registered"),
             }
         })
     }
+}
+
+async fn observe_github_repository(request: ObservationRequest) -> Result<ProviderObservation> {
+    let (owner, repository) = request
+        .locator
+        .split_once('/')
+        .context("a GitHub repository locator needs OWNER/REPO")?;
+    anyhow::ensure!(
+        !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
+        "a GitHub repository locator needs OWNER/REPO"
+    );
+    let client = reqwest::Client::builder()
+        .user_agent("st3-resource-observer/0.1")
+        .build()?;
+    let token = github_token().await;
+    let request_json = |url: String| {
+        let request = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(token) = &token {
+            request.bearer_auth(token)
+        } else {
+            request
+        }
+    };
+    let base = format!("https://api.github.com/repos/{owner}/{repository}");
+    let pulls: Vec<Value> = request_json(format!("{base}/pulls?state=open&per_page=100"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let issues: Vec<Value> = request_json(format!("{base}/issues?state=open&per_page=100"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let facts = normalize_github_repository(
+        request.previous_facts.as_ref(),
+        &pulls,
+        &issues,
+        &request.fields,
+    );
+    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(ProviderObservation {
+        facts,
+        cursor,
+        next_check_unix_ms: now.saturating_add(60_000),
+    })
+}
+
+async fn github_token() -> Option<String> {
+    if let Some(token) = std::env::var("GH_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    {
+        return Some(token);
+    }
+    let output = tokio::process::Command::new("gh")
+        .args(["auth", "token"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn normalize_github_repository(
+    previous: Option<&Value>,
+    pulls: &[Value],
+    issues: &[Value],
+    fields: &BTreeSet<String>,
+) -> Value {
+    let mut facts = serde_json::Map::new();
+    if fields.contains("pull_requests") {
+        let mut values = previous
+            .and_then(|value| value.get("pull_requests"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for pull in pulls
+            .iter()
+            .filter(|pull| pull.get("draft").and_then(Value::as_bool) == Some(false))
+        {
+            let value = json!({
+                "number": pull.get("number").cloned().unwrap_or(Value::Null),
+                "url": pull.get("html_url").cloned().unwrap_or(Value::Null),
+                "title": pull.get("title").cloned().unwrap_or(Value::Null),
+                "head": pull.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+            });
+            let number = value.get("number");
+            if !values.iter().any(|old| old.get("number") == number) {
+                values.push(value);
+            }
+        }
+        values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
+        facts.insert("pull_requests".into(), Value::Array(values));
+    }
+    if fields.contains("issues") {
+        let mut values = previous
+            .and_then(|value| value.get("issues"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for issue in issues
+            .iter()
+            .filter(|issue| issue.get("pull_request").is_none())
+        {
+            let value = json!({
+                "number": issue.get("number").cloned().unwrap_or(Value::Null),
+                "url": issue.get("html_url").cloned().unwrap_or(Value::Null),
+                "title": issue.get("title").cloned().unwrap_or(Value::Null),
+            });
+            let number = value.get("number");
+            if !values.iter().any(|old| old.get("number") == number) {
+                values.push(value);
+            }
+        }
+        values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
+        facts.insert("issues".into(), Value::Array(values));
+    }
+    Value::Object(facts)
 }
 
 fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation> {
@@ -108,14 +248,7 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     let client = reqwest::Client::builder()
         .user_agent("st3-resource-observer/0.1")
         .build()?;
-    let token = std::env::var("GH_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("GITHUB_TOKEN")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
+    let token = github_token().await;
     let request_json = |url: String| {
         let request = client
             .get(url)
@@ -287,5 +420,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observation.facts["status"], "missing");
+    }
+
+    #[test]
+    fn repository_discovery_filters_drafts_and_pull_requests_from_issues() {
+        let fields = BTreeSet::from(["pull_requests".into(), "issues".into()]);
+        let facts = normalize_github_repository(
+            None,
+            &[
+                json!({"number": 1, "draft": true, "title": "draft"}),
+                json!({"number": 2, "draft": false, "title": "ready", "head": {"sha": "abc"}}),
+            ],
+            &[
+                json!({"number": 2, "title": "PR", "pull_request": {}}),
+                json!({"number": 3, "title": "Issue"}),
+            ],
+            &fields,
+        );
+        assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 1);
+        assert_eq!(facts["pull_requests"][0]["number"], 2);
+        assert_eq!(facts["issues"].as_array().unwrap().len(), 1);
+        assert_eq!(facts["issues"][0]["number"], 3);
+    }
+
+    #[test]
+    fn repository_discovery_retains_old_items_and_adds_a_ready_draft_once() {
+        let fields = BTreeSet::from(["pull_requests".into()]);
+        let previous = json!({"pull_requests": [{"number": 1, "title": "old"}]});
+        let facts = normalize_github_repository(
+            Some(&previous),
+            &[json!({"number": 2, "draft": false, "title": "now ready"})],
+            &[],
+            &fields,
+        );
+        assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
+        let repeated = normalize_github_repository(Some(&facts), &[], &[], &fields);
+        assert_eq!(repeated, facts);
     }
 }

@@ -676,6 +676,10 @@ host "local" {
 
 The host document gives stable host facts to agents on that host. It must not contain current work.
 
+st3 renders each exact document under `.st3/host/` for every native harness on that host.
+
+The generated `.st3/boot.md` lists each exact reference and rendered path. A missing document, invalid text, or path collision refuses the render transaction.
+
 Publication fails with `missing-document` until the exact document bytes exist in the local store.
 
 A bare document name is invalid in a host declaration. A later version needs a new hash and a new declaration.
@@ -784,13 +788,30 @@ st3 sends a cancellation message to each active claimant. The message tells the 
 
 A continuous mission stays open after its current steps are exhausted. It does not need a separate mission type.
 
-A recurring schedule can send a wake message. The message tells an agent to inspect its available work.
+A recurring schedule creates a durable request for one exact finite mission revision.
+
+```kdl
+schedule "cycle" {
+  host "local"
+  every "6h"
+  anchor "2026-01-01T00:00:00Z"
+  catch-up "latest"
+  work {
+    mission "fabric/cycle@REVISION"
+    workspace "/work/fabric-cycles"
+  }
+}
+```
+
+The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
+
+The mission steps are normal claimable work. A schedule does not start another occurrence while its prior mission run remains active.
 
 Each finite cycle can be a nested mission. The parent mission keeps the stable agent and the cycle history.
 
 Use `catch-up "latest"` when a restart must create at most one missed wake occurrence.
 
-The schedule does not assign work. It only creates a new graph event and message.
+The schedule does not assign work. The referenced mission defines its work selectors.
 
 ## Mission revisions
 

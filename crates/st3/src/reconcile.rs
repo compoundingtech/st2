@@ -448,6 +448,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         self.reconcile_resource_observers(&desired)?;
         self.reconcile_schedules(&desired)?;
+        self.reconcile_scheduled_work(&desired)?;
+        self.reconcile_subscription_missions(&desired)?;
         self.evaluate_mission_runs()?;
         Ok(())
     }
@@ -2316,6 +2318,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             if spec.stopped || spec.host != self.host {
                 continue;
             }
+            if self.schedule_has_open_work(&schedule.subject)? {
+                continue;
+            }
             let Some(revision) = self.store.selected_desired_revision(&schedule.subject)? else {
                 continue;
             };
@@ -2422,7 +2427,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             })?;
             self.event_notify
                 .send_modify(|generation| *generation = generation.saturating_add(1));
-            let template = spec.message.clone();
+            let work = spec.work.clone();
             let store = self.store.clone();
             let notify = self.notify.clone();
             let event_notify = self.event_notify.clone();
@@ -2478,24 +2483,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                         expected_subject: None,
                         idempotency_key: Some(format!("clock-reached:{operation}")),
                     });
-                    if let (Ok(reached), Some(template)) = (reached, template) {
-                        let message_hash = hex::encode(sha2::Sha256::digest(operation.as_bytes()));
-                        let message_subject = format!("message/schedule-{}", &message_hash[..20]);
-                        let from = canonical_message_party(&template.from);
-                        let to = canonical_message_party(&template.to);
+                    if let (Ok(reached), Some(work)) = (reached, work) {
                         let _ = store.append_claim(&ClaimInput {
-                            subject: message_subject,
-                            kind: "message.sent".into(),
+                            subject: schedule_subject.clone(),
+                            kind: "schedule.work-requested".into(),
                             actor: None,
                             fields: BTreeMap::from([
-                                ("from".into(), Value::String(from)),
-                                ("to".into(), Value::String(to)),
-                                ("content".into(), Value::String(template.content)),
-                                ("status".into(), Value::String("sent".into())),
+                                ("revision".into(), Value::String(revision.clone())),
+                                ("occurrence".into(), Value::from(occurrence)),
+                                (
+                                    "mission".into(),
+                                    Value::String(format!("mission/{}", work.mission)),
+                                ),
+                                ("mission_revision".into(), Value::String(work.revision)),
+                                ("workspace".into(), Value::String(work.workspace)),
+                                (
+                                    "inputs".into(),
+                                    serde_json::to_value(work.inputs).unwrap_or_default(),
+                                ),
                             ]),
                             evidence: vec![reached.id],
                             expected_subject: None,
-                            idempotency_key: Some(format!("schedule-message:{operation}")),
+                            idempotency_key: Some(format!("schedule-work-request:{operation}")),
                         });
                     }
                     armed
@@ -2509,6 +2518,247 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .lock()
                     .expect("schedule mutex poisoned")
                     .remove(&operation);
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_has_open_work(&self, schedule: &str) -> Result<bool> {
+        let requests = self
+            .store
+            .claims_for(schedule, Some("schedule.work-requested"))?;
+        let starts = self
+            .store
+            .claims_for(schedule, Some("schedule.work-started"))?;
+        let Some(request) = requests.into_iter().next_back() else {
+            return Ok(false);
+        };
+        let started = starts.iter().find(|claim| {
+            claim
+                .body
+                .pointer("/fields/request")
+                .and_then(Value::as_str)
+                == Some(request.id.as_str())
+        });
+        let Some(started) = started else {
+            return Ok(true);
+        };
+        let Some(run) = started
+            .body
+            .pointer("/fields/mission_run")
+            .and_then(Value::as_str)
+        else {
+            return Ok(true);
+        };
+        Ok(self.store.mission_run(run)?.is_some_and(|view| {
+            !matches!(view.status.as_str(), "completed" | "cancelled" | "failed")
+        }))
+    }
+
+    fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
+        for schedule in desired.iter().filter(|item| item.kind == "schedule") {
+            let requests = self
+                .store
+                .claims_for(&schedule.subject, Some("schedule.work-requested"))?;
+            let starts = self
+                .store
+                .claims_for(&schedule.subject, Some("schedule.work-started"))?;
+            for request in requests {
+                if starts.iter().any(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/request")
+                        .and_then(Value::as_str)
+                        == Some(request.id.as_str())
+                }) {
+                    continue;
+                }
+                if starts
+                    .iter()
+                    .filter_map(|claim| {
+                        claim
+                            .body
+                            .pointer("/fields/mission_run")
+                            .and_then(Value::as_str)
+                    })
+                    .any(|run| {
+                        self.store
+                            .mission_run(run)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|view| {
+                                !matches!(
+                                    view.status.as_str(),
+                                    "completed" | "cancelled" | "failed"
+                                )
+                            })
+                    })
+                {
+                    continue;
+                }
+                let Some(mission) = request
+                    .body
+                    .pointer("/fields/mission")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(revision) = request
+                    .body
+                    .pointer("/fields/mission_revision")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(root) = request
+                    .body
+                    .pointer("/fields/workspace")
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+                let inputs = serde_json::from_value(
+                    request
+                        .body
+                        .pointer("/fields/inputs")
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default();
+                let request_value = MissionRunRequest {
+                    mission: mission.into(),
+                    revision: Some(revision.into()),
+                    workspace,
+                    requester: Some(format!("daemon/{}", self.host)),
+                    mode: None,
+                    inputs,
+                    idempotency_key: format!("schedule-work:{}", request.id),
+                };
+                let created = schedule
+                    .owner_run
+                    .as_deref()
+                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
+                    .map_or_else(
+                        || self.store.create_mission_run(&request_value),
+                        |parent| {
+                            self.store.create_child_mission_run(
+                                &request_value,
+                                &parent,
+                                &schedule.subject,
+                                None,
+                            )
+                        },
+                    );
+                let run = match created {
+                    Ok(run) => run,
+                    Err(error) if error.code == "mission-run-capacity" => continue,
+                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+                };
+                self.store.append_claim(&ClaimInput {
+                    subject: schedule.subject.clone(),
+                    kind: "schedule.work-started".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.id.clone())),
+                        ("mission_run".into(), Value::String(run.subject)),
+                    ]),
+                    evidence: vec![request.id],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_subscription_missions(&self, desired: &[DesiredSubject]) -> Result<()> {
+        for item in desired.iter().filter(|item| item.kind == "subscription") {
+            let Some(spec) = crate::graph::subscription_spec(&item.desired) else {
+                continue;
+            };
+            if spec.stopped || spec.delivery != "mission" {
+                continue;
+            }
+            let requests = self
+                .store
+                .claims_for(&item.subject, Some("subscription.mission-requested"))?;
+            let starts = self
+                .store
+                .claims_for(&item.subject, Some("subscription.mission-started"))?;
+            for request in requests {
+                if starts.iter().any(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/request")
+                        .and_then(Value::as_str)
+                        == Some(request.id.as_str())
+                }) {
+                    continue;
+                }
+                let fields = request.body.get("fields").unwrap_or(&request.body);
+                let Some(mission) = fields.get("mission").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(revision) = fields.get("mission_revision").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(resource) = fields.get("resource").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(discovery) = fields.get("discovery").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(input) = fields.get("resource_input").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(root) = fields.get("workspace").and_then(Value::as_str) else {
+                    continue;
+                };
+                let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
+                let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+                let request_value = MissionRunRequest {
+                    mission: mission.into(),
+                    revision: Some(revision.into()),
+                    workspace,
+                    requester: Some(format!("daemon/{}", self.host)),
+                    mode: None,
+                    inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
+                    idempotency_key: format!("subscription-mission:{}", request.id),
+                };
+                let created = item
+                    .owner_run
+                    .as_deref()
+                    .and_then(|owner| self.store.mission_run(owner).ok().flatten())
+                    .map_or_else(
+                        || self.store.create_mission_run(&request_value),
+                        |parent| {
+                            self.store.create_child_mission_run(
+                                &request_value,
+                                &parent,
+                                &item.subject,
+                                None,
+                            )
+                        },
+                    );
+                let run = match created {
+                    Ok(run) => run,
+                    Err(error) if error.code == "mission-run-capacity" => continue,
+                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+                };
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(),
+                    kind: "subscription.mission-started".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.id.clone())),
+                        ("mission_run".into(), Value::String(run.subject)),
+                    ]),
+                    evidence: vec![request.id],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
+                })?;
             }
         }
         Ok(())
@@ -3812,16 +4062,6 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn canonical_message_party(value: &str) -> String {
-    if value == "requester" {
-        "person/requester".into()
-    } else if value.contains('/') {
-        value.into()
-    } else {
-        format!("agent/{value}")
-    }
 }
 
 fn prepend_executable_dir(
@@ -6344,9 +6584,28 @@ version 2
         assert!(runtime.kills.lock().unwrap().is_empty());
     }
 
+    fn scheduled_mission_revision(store: &Arc<Store>) -> String {
+        apply_source(
+            store,
+            r#"version 2
+mission "scheduled-cycle" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Complete one scheduled cycle."
+  step "done" { agentless }
+}"#,
+            "scheduled-cycle",
+        );
+        store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap()
+            .revision
+    }
+
     #[tokio::test]
-    async fn one_time_schedule_sends_exactly_one_message() {
+    async fn one_time_schedule_starts_exactly_one_mission() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
         let at = (Utc::now() + chrono::Duration::milliseconds(50))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let source = format!(
@@ -6355,9 +6614,9 @@ version 2
 
                   schedule "reminder" {{
                     at "{at}"
-                    message {{
-                      to "worker"
-                      content "Run the check."
+                    work {{
+                      mission "scheduled-cycle@{revision}"
+                      workspace "/tmp/st3-schedule-test"
                     }}
                   }}
 
@@ -6385,12 +6644,19 @@ version 2
             1,
             "{schedule_claims:#?}"
         );
-        assert_eq!(store.messages(None, true).unwrap().len(), 1);
+        assert_eq!(
+            schedule_claims
+                .iter()
+                .filter(|claim| claim.kind == "schedule.work-started")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn a_recurring_schedule_sends_distinct_ordered_occurrences() {
+    async fn a_recurring_schedule_starts_distinct_ordered_occurrences() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
         let anchor = (Utc::now() + chrono::Duration::milliseconds(40))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let source = format!(
@@ -6399,7 +6665,7 @@ version 2
    every "60ms"
    anchor "{anchor}"
    catch-up "latest"
-   message {{ to "worker"; content "Inspect current work." }}
+   work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-schedule-test" }}
  }}"#
         );
         apply_source(&store, &source, "recurring-schedule");
@@ -6414,8 +6680,12 @@ version 2
         tokio::time::sleep(Duration::from_millis(55)).await;
         reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(65)).await;
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
         reconciler.reconcile_once().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let reached = store
             .claims_for("schedule/cycle", Some("schedule.occurrence-reached"))
@@ -6431,12 +6701,19 @@ version 2
             })
             .collect::<Vec<_>>();
         assert_eq!(occurrences, [0, 1]);
-        assert_eq!(store.messages(None, true).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
-    async fn latest_catch_up_sends_only_the_current_missed_occurrence() {
+    async fn latest_catch_up_starts_only_the_current_missed_occurrence() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
         let anchor = (Utc::now() - chrono::Duration::seconds(10))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let source = format!(
@@ -6445,7 +6722,7 @@ version 2
    every "1s"
    anchor "{anchor}"
    catch-up "latest"
-   message {{ to "worker"; content "Inspect current work." }}
+   work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-schedule-test" }}
  }}"#
         );
         apply_source(&store, &source, "latest-catch-up");
@@ -6471,12 +6748,20 @@ version 2
                 .unwrap()
                 >= 9
         );
-        assert_eq!(store.messages(None, true).unwrap().len(), 1);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn a_new_schedule_revision_cancels_the_armed_wake() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
         let at = (Utc::now() + chrono::Duration::milliseconds(100))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let source = format!(
@@ -6485,9 +6770,9 @@ version 2
 
                   schedule "reminder" {{
                     at "{at}"
-                    message {{
-                      to "worker"
-                      content "Run the check."
+                    work {{
+                      mission "scheduled-cycle@{revision}"
+                      workspace "/tmp/st3-schedule-test"
                     }}
                   }}
 
@@ -6523,7 +6808,12 @@ version 2
                 .len(),
             1
         );
-        assert!(store.messages(None, true).unwrap().is_empty());
+        assert!(
+            store
+                .claims_for("schedule/reminder", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7048,6 +7338,147 @@ version 2
     }
 
     struct FakeResourceProvider;
+
+    #[test]
+    fn a_changed_subscription_starts_one_exact_resource_input_mission() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  concurrent-runs max=1
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one discovered item."
+  step "review" { agentless }
+}"#,
+            "review-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let source = format!(
+            r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "owner/repo"; field "pull_requests" }}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "pull_requests"
+  delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "/tmp/st3-review" }}
+}}"#
+        );
+        apply_source(&store, &source, "repository-watch");
+        let desired = store.desired_subjects().unwrap();
+        let subscription = desired
+            .iter()
+            .find(|item| item.kind == "subscription")
+            .unwrap();
+        let spec = crate::graph::subscription_spec(&subscription.desired).unwrap();
+        let subscriptions = vec![(subscription.subject.clone(), spec)];
+        let baseline = store
+            .record_resource_observation(
+                "observer/repo",
+                &store
+                    .selected_desired_revision("observer/repo")
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "resource/repo",
+                Some("one"),
+                &serde_json::json!({"pull_requests": []}),
+                now_ms() + 60_000,
+                &subscriptions,
+            )
+            .unwrap();
+        let baseline_claim = baseline
+            .observation_claim
+            .expect("the baseline creates a resource claim");
+        let occupied = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "review".into(),
+                revision: Some(revision.clone()),
+                workspace: "/tmp/st3-review/occupied".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::from([(
+                    "source".into(),
+                    format!("resource/repo@{baseline_claim}"),
+                )]),
+                idempotency_key: "occupied-review".into(),
+            })
+            .unwrap();
+        let changed = store
+            .record_resource_observation(
+                "observer/repo",
+                &store
+                    .selected_desired_revision("observer/repo")
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "resource/repo",
+                Some("two"),
+                &serde_json::json!({"pull_requests": [{"number": 7}]}),
+                now_ms() + 60_000,
+                &subscriptions,
+            )
+            .unwrap();
+        let changed_claim = changed
+            .observation_claim
+            .expect("the changed observation creates a resource claim");
+        let item_claim = store
+            .claims_for("resource/repo/pull-request/7", Some("resource.observed"))
+            .unwrap()
+            .pop()
+            .expect("the repository discovery creates one pull request resource")
+            .id;
+        assert_ne!(item_claim, changed_claim);
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert!(
+            store
+                .claims_for("subscription/reviews", Some("subscription.mission-started"))
+                .unwrap()
+                .is_empty(),
+            "capacity must leave the event pending"
+        );
+        for _ in 0..5 {
+            reconciler.evaluate_mission_runs().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&occupied.id).unwrap().unwrap().status,
+            "completed"
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let runs = store.active_mission_runs_for_mission("review").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].revision, revision);
+        assert_eq!(
+            runs[0].inputs["source"].subject.as_deref(),
+            Some("resource/repo/pull-request/7")
+        );
+        assert_eq!(runs[0].inputs["source"].claim_id, Some(item_claim));
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn a_resource_input_gate_reads_its_exact_start_claim() {

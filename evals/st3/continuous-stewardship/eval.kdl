@@ -1,5 +1,13 @@
 version 2
 
+mission "eval/continuous-stewardship/cycle" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Record one durable scheduled cycle."
+  step "record-occurrence" {
+    agentless
+  }
+}
+
 mission "eval/continuous-stewardship" state="ready" {
   completion { when "all-steps-exhausted" }
   goal "Complete two finite stewardship cycles with one long-lived agent and a recurring wake schedule."
@@ -19,9 +27,9 @@ mission "eval/continuous-stewardship" state="ready" {
     every "2s"
     anchor "2026-01-01T00:00:00Z"
     catch-up "latest"
-    message {
-      to "fabric.steward"
-      content "A stewardship interval is ready. Inspect your current st3 work."
+    work {
+      mission "eval/continuous-stewardship/cycle@5fdeff49ce2d0d0fdbbdff53bab46136d816b94273c1b7ee81c659b8be6ef3f4"
+      workspace "${ST_WORKSPACE}/scheduled-cycles"
     }
   }
 

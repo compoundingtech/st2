@@ -299,6 +299,60 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn discovered_collection_items(
+    repository: &str,
+    field: &str,
+    previous: Option<&Value>,
+    current: &Value,
+) -> Vec<(String, String, Value)> {
+    let Some(previous_items) = previous
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let prior_numbers = previous_items
+        .iter()
+        .filter_map(|item| item.get("number").and_then(Value::as_u64))
+        .collect::<BTreeSet<_>>();
+    let Some(current_items) = current.get(field).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    current_items
+        .iter()
+        .filter_map(|item| {
+            let number = item.get("number")?.as_u64()?;
+            if prior_numbers.contains(&number) {
+                return None;
+            }
+            let (segment, kind) = match field {
+                "pull_requests" => ("pull-request", "vcs.pull-request"),
+                "issues" => ("issue", "vcs.issue"),
+                _ => return None,
+            };
+            let mut facts = serde_json::Map::from_iter([
+                ("repository".into(), Value::String(repository.into())),
+                ("number".into(), Value::from(number)),
+                ("state".into(), Value::String("open".into())),
+            ]);
+            for name in ["url", "title"] {
+                if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
+                    facts.insert(name.into(), value.clone());
+                }
+            }
+            if field == "pull_requests" {
+                facts.insert("draft".into(), Value::Bool(false));
+                facts.insert("merged".into(), Value::Bool(false));
+            }
+            Some((
+                format!("{repository}/{segment}/{number}"),
+                kind.into(),
+                Value::Object(facts),
+            ))
+        })
+        .collect()
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -783,12 +837,6 @@ impl Store {
             return Err(St3Error::new(
                 "mission-not-ready",
                 format!("mission `{mission_id}` is not ready"),
-            ));
-        }
-        if child.is_some() && !mission.inputs.is_empty() {
-            return Err(St3Error::new(
-                "child-mission-inputs-unsupported",
-                "a child mission cannot declare inputs in this version",
             ));
         }
         let request_hash = hex::encode(Sha256::digest(
@@ -2780,22 +2828,6 @@ impl Store {
                     ));
                 }
             }
-            if desired.kind == "schedule"
-                && let Some(schedule) = crate::graph::schedule_spec(&desired.desired, &self.origin)
-                && let Some(message) = schedule.message
-            {
-                let recipient = if message.to == "requester" || message.to.contains('/') {
-                    message.to
-                } else {
-                    format!("agent/{}", message.to)
-                };
-                if recipient != "requester" && !known(&recipient)? {
-                    blockers.push(format!(
-                        "schedule `{}` references undeclared recipient `{recipient}`",
-                        desired.subject
-                    ));
-                }
-            }
             if desired.kind == "observer"
                 && let Some(observer) = crate::graph::observer_spec(&desired.desired)
                 && !observer.stopped
@@ -2816,7 +2848,7 @@ impl Store {
                         desired.subject, subscription.observer
                     ));
                 }
-                if !known(&subscription.to)? {
+                if subscription.delivery == "message" && !known(&subscription.to)? {
                     warnings.push(format!(
                         "subscription `{}` has missing delivery target `{}`",
                         desired.subject, subscription.to
@@ -2838,7 +2870,19 @@ impl Store {
                     WorkSelector::Agentless => &[],
                 };
                 for agent in agents {
-                    if !mission.revision_owners.contains(agent) && !known(agent)? {
+                    let owned_runtime =
+                        agent
+                            .strip_prefix("agent/${ST_MISSION_RUN}/")
+                            .is_some_and(|local| {
+                                mission.revision_owners.iter().any(|owner| {
+                                    owner == &format!("agent/{local}")
+                                        || owner
+                                            .rsplit_once('.')
+                                            .is_some_and(|(_, name)| name == local)
+                                })
+                            });
+                    if !owned_runtime && !mission.revision_owners.contains(agent) && !known(agent)?
+                    {
                         warnings.push(format!(
                             "mission `{}` references missing eligible agent `{agent}`",
                             mission.subject
@@ -4619,17 +4663,59 @@ impl Store {
         } else {
             None
         };
+        let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
+        if !baseline {
+            for field in ["pull_requests", "issues"] {
+                for (subject, kind, item_facts) in
+                    discovered_collection_items(resource, field, previous.as_ref(), facts)
+                {
+                    let predecessors = latest_claim_id_tx(&transaction, &subject)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let evidence = observation_claim
+                        .as_ref()
+                        .map(|claim| vec![claim.id.clone()])
+                        .unwrap_or_default();
+                    let claim = append_claim_tx(
+                        &transaction,
+                        &self.origin,
+                        &subject,
+                        "resource.observed",
+                        None,
+                        &json!({"fields": {
+                            "kind": kind,
+                            "facts": item_facts,
+                            "observer": observer,
+                            "baseline": false,
+                            "changed_fields": [field],
+                        }, "evidence": evidence}),
+                        &predecessors,
+                        Some(&batch_id),
+                    )
+                    .map_err(internal)?;
+                    collection_discoveries
+                        .entry(field.into())
+                        .or_default()
+                        .push((subject, claim.id));
+                }
+            }
+        }
         let mut available_subscriptions = BTreeSet::new();
         for (subscription_subject, subscription) in &active_subscriptions {
-            let target_exists = transaction
-                .query_row(
-                    "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
-                    [&subscription.to],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(internal)?
-                .is_some();
+            let target_exists = if subscription.delivery == "message" {
+                transaction
+                    .query_row(
+                        "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
+                        [&subscription.to],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .is_some()
+            } else {
+                true
+            };
             let status = if target_exists { "active" } else { "pending" };
             let current_status = latest_actual(&transaction, subscription_subject)
                 .map_err(internal)?
@@ -4686,6 +4772,61 @@ impl Store {
                     subscription_subject,
                 ))
                 .map_err(internal)?;
+                if subscription.delivery == "mission" {
+                    let Some(mission) = subscription.mission.as_deref() else {
+                        continue;
+                    };
+                    let Some(revision) = subscription.revision.as_deref() else {
+                        continue;
+                    };
+                    let Some(resource_input) = subscription.resource_input.as_deref() else {
+                        continue;
+                    };
+                    let Some(workspace) = subscription.workspace.as_deref() else {
+                        continue;
+                    };
+                    let uses_collection = selected
+                        .iter()
+                        .any(|field| matches!(field.as_str(), "pull_requests" | "issues"));
+                    let discoveries = if uses_collection {
+                        selected
+                            .iter()
+                            .flat_map(|field| {
+                                collection_discoveries
+                                    .get(field)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned()
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        observation_claim
+                            .as_ref()
+                            .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
+                            .unwrap_or_default()
+                    };
+                    for (delivery_resource, discovery) in discoveries {
+                        append_claim_tx(
+                            &transaction,
+                            &self.origin,
+                            subscription_subject,
+                            "subscription.mission-requested",
+                            None,
+                            &json!({"fields": {
+                                "mission": format!("mission/{mission}"),
+                                "mission_revision": revision,
+                                "resource": delivery_resource,
+                                "resource_input": resource_input,
+                                "workspace": workspace,
+                                "discovery": discovery,
+                            }, "evidence": evidence}),
+                            &[],
+                            Some(&batch_id),
+                        )
+                        .map_err(claim_append_error)?;
+                    }
+                    continue;
+                }
                 let message_subject = format!("message/resource-{}", &stable[..20]);
                 let content = serde_json::to_string(&json!({
                     "resource": resource,
@@ -10635,7 +10776,7 @@ version 2
     }
 
     #[test]
-    fn child_runs_reject_inputs_and_revisions_cannot_change_them() {
+    fn child_runs_accept_inputs_and_revisions_cannot_change_them() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
@@ -10671,7 +10812,7 @@ version 2
                 idempotency_key: "parent-run".into(),
             })
             .unwrap();
-        let child_error = store
+        let child = store
             .create_child_mission_run(
                 &MissionRunRequest {
                     mission: "child".into(),
@@ -10686,8 +10827,9 @@ version 2
                 "step-run/test/child",
                 None,
             )
-            .unwrap_err();
-        assert_eq!(child_error.code, "child-mission-inputs-unsupported");
+            .unwrap();
+        assert_eq!(child.inputs["message"].value, "hello");
+        assert_eq!(child.root_mission_run, parent.subject);
 
         let original = publish_mission(
             &store,
@@ -12951,6 +13093,72 @@ version 2
             .expect("the claimant receives a cancellation message");
         assert_eq!(cancellation_message.from, "daemon/runtime");
         assert_eq!(cancellation_message.to, "agent/node.worker");
+    }
+
+    #[test]
+    fn preview_recognizes_a_run_scoped_selector_for_a_declared_agent() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+mission "work" state="ready" {
+  goal "Complete the available work."
+  agent "worker" {
+    identity "fleet.worker"
+    workspace "."
+    command "true"
+  }
+  step "do-work" {
+    assigned-to "agent/${ST_MISSION_RUN}/fleet.worker"
+  }
+}"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            planned
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("missing eligible agent")),
+            "{:?}",
+            planned.warnings
+        );
+    }
+
+    #[test]
+    fn repository_collections_create_one_typed_resource_for_each_new_item() {
+        let previous = json!({"pull_requests": [], "issues": []});
+        let current = json!({
+            "pull_requests": [{"number": 7, "url": "https://example.test/pull/7", "title": "Ready"}],
+            "issues": [{"number": 8, "url": "https://example.test/issues/8", "title": "Bug"}],
+        });
+        let pulls = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&previous),
+            &current,
+        );
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(pulls[0].0, "resource/github/acme/demo/pull-request/7");
+        assert_eq!(pulls[0].1, "vcs.pull-request");
+        assert_eq!(pulls[0].2["repository"], "resource/github/acme/demo");
+        assert_eq!(pulls[0].2["draft"], false);
+
+        let issues = discovered_collection_items(
+            "resource/github/acme/demo",
+            "issues",
+            Some(&previous),
+            &current,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
+        assert_eq!(issues[0].1, "vcs.issue");
+        assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
     }
 
     #[test]

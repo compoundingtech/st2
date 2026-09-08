@@ -220,6 +220,16 @@ pub fn apply_all(
     desired: &[&DesiredSubject],
     host: &str,
 ) -> Result<BTreeMap<String, RenderResult>> {
+    let host_documents = desired
+        .iter()
+        .filter(|subject| subject.kind == "host")
+        .map(|subject| {
+            (
+                subject.subject.trim_start_matches("host/").to_owned(),
+                host_document_refs(&subject.desired),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut owners = BTreeMap::<PathBuf, (String, PlannedWrite)>::new();
     let mut results = BTreeMap::new();
     for subject in desired {
@@ -245,8 +255,65 @@ pub fn apply_all(
             None => (Vec::new(), Vec::new()),
         };
         if native_harness {
+            let documents = host_documents
+                .get(&member.host)
+                .cloned()
+                .unwrap_or_default();
+            let mut links = Vec::new();
+            for reference in documents {
+                let (name, hash) = reference
+                    .rsplit_once('@')
+                    .with_context(|| format!("host document `{reference}` has no hash"))?;
+                let bytes = store
+                    .get_document(name, hash)?
+                    .with_context(|| format!("host document `{reference}` is missing"))?;
+                std::str::from_utf8(&bytes)
+                    .with_context(|| format!("host document `{reference}` is not UTF-8 text"))?;
+                let leaf = name.rsplit('/').next().unwrap_or("host");
+                let leaf = leaf
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                        {
+                            character
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>();
+                let filename = if leaf.contains('.') {
+                    leaf
+                } else {
+                    format!("{leaf}.md")
+                };
+                let relative = format!(".st3/host/{filename}");
+                let destination = destination(workspace, &relative)?;
+                if let Some(existing) = writes.iter().find(|write| write.destination == destination)
+                {
+                    anyhow::ensure!(
+                        existing.bytes == bytes,
+                        "host documents disagree about {}",
+                        destination.display()
+                    );
+                } else {
+                    ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+                    writes.push(PlannedWrite {
+                        destination,
+                        bytes,
+                        mode: 0o644,
+                    });
+                }
+                links.push((reference, relative));
+            }
             let destination = destination(workspace, ".st3/boot.md")?;
-            let bytes = crate::boot::BOOT_DOCUMENT.as_bytes().to_vec();
+            let mut boot = crate::boot::BOOT_DOCUMENT.to_owned();
+            if !links.is_empty() {
+                boot.push_str("\n## Host documents\n\n");
+                for (reference, path) in links {
+                    boot.push_str(&format!("- `{reference}` is rendered at `{path}`.\n"));
+                }
+            }
+            let bytes = boot.into_bytes();
             ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
             writes.push(PlannedWrite {
                 destination,
@@ -282,6 +349,19 @@ pub fn apply_all(
         .collect::<Vec<_>>();
     commit_transaction(&writes)?;
     Ok(results)
+}
+
+fn host_document_refs(desired: &Value) -> Vec<String> {
+    children(desired)
+        .iter()
+        .filter(|child| name(child) == Some("document"))
+        .filter_map(|child| {
+            arguments(child)
+                .first()
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn ensure_tracked_file_is_unchanged(
@@ -605,6 +685,91 @@ mod tests {
                 .mode()
                 & 0o777,
             0o644
+        );
+    }
+
+    #[test]
+    fn a_native_harness_receives_exact_host_documents_and_boot_links() {
+        let store = Store::open_memory("node").unwrap();
+        let document = store
+            .put_document("doc/hosts/node", b"Host facts.\n", &None, "host-doc")
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+host "node" {{
+  document "doc/hosts/node@{}"
+  agent "one" {{ workspace {:?}; harness "codex" {{}} }}
+}}"#,
+            document.hash,
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+
+        apply_all(&store, &desired, "node").unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".st3/host/node.md")).unwrap(),
+            "Host facts.\n"
+        );
+        let boot = fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap();
+        assert!(boot.contains(&format!(
+            "`doc/hosts/node@{}` is rendered at `.st3/host/node.md`",
+            document.hash
+        )));
+    }
+
+    #[test]
+    fn host_document_pipeline_rejects_missing_non_text_and_colliding_content() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+host "node" {{
+  document "doc/hosts/missing@{}"
+  agent "one" {{ workspace {:?}; harness "codex" {{}} }}
+}}"#,
+            "a".repeat(64),
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+        assert!(
+            apply_all(&store, &desired, "node")
+                .unwrap_err()
+                .to_string()
+                .contains("is missing")
+        );
+
+        let error = store
+            .put_document("doc/hosts/binary", b"\xff", &None, "binary")
+            .unwrap_err();
+        assert_eq!(error.code, "document-not-text");
+
+        let first = store
+            .put_document("doc/hosts/a/facts", b"one\n", &None, "first")
+            .unwrap();
+        let second = store
+            .put_document("doc/hosts/b/facts", b"two\n", &None, "second")
+            .unwrap();
+        let source = format!(
+            r#"version 2
+host "node" {{
+  document "doc/hosts/a/facts@{}"
+  document "doc/hosts/b/facts@{}"
+  agent "one" {{ workspace {:?}; harness "codex" {{}} }}
+}}"#,
+            first.hash,
+            second.hash,
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+        assert!(
+            apply_all(&store, &desired, "node")
+                .unwrap_err()
+                .to_string()
+                .contains("disagree")
         );
     }
 

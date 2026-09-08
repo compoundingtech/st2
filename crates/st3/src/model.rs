@@ -331,13 +331,6 @@ pub struct GateContext {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MessageTemplate {
-    pub from: String,
-    pub to: String,
-    pub content: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UnderSpec {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,7 +346,16 @@ pub struct ScheduleSpec {
     pub anchor_unix_ms: Option<i64>,
     pub catch_up: String,
     pub max_catch_up: Option<u32>,
-    pub message: Option<MessageTemplate>,
+    pub work: Option<ScheduledWork>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduledWork {
+    pub mission: String,
+    pub revision: String,
+    pub workspace: String,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -542,9 +544,18 @@ pub struct ObserverSpec {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SubscriptionSpec {
     pub observer: String,
+    #[serde(default)]
     pub to: String,
     pub fields: Vec<String>,
     pub delivery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     pub stopped: bool,
 }
 

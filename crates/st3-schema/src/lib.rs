@@ -654,6 +654,8 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("default_ref", reference()),
                 ("head", reference()),
                 ("state", string()),
+                ("pull_requests", array()),
+                ("issues", array()),
             ],
         ),
     );
@@ -710,6 +712,24 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("updated_at", string()),
                 ("checks", array()),
                 ("reviews", array()),
+            ],
+        ),
+    );
+    resources.insert(
+        "vcs.issue".into(),
+        resource(
+            "vcs.issue",
+            "A version control issue.",
+            &[
+                ("repository", reference()),
+                ("number", integer()),
+                ("url", string()),
+                ("title", string()),
+                ("author", string()),
+                ("state", string()),
+                ("created_at", string()),
+                ("updated_at", string()),
+                ("labels", array()),
             ],
         ),
     );
@@ -1395,6 +1415,42 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["schedule"],
         ),
         (
+            "schedule.work-requested",
+            &["schedule"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("schedules"),
+            true,
+            &["schedule"],
+        ),
+        (
+            "schedule.work-started",
+            &["schedule"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("schedules"),
+            true,
+            &["schedule"],
+        ),
+        (
+            "subscription.mission-requested",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
+            "subscription.mission-started",
+            &["subscription"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("subscriptions"),
+            true,
+            &["subscription"],
+        ),
+        (
             "transport.observed",
             &["host"],
             WritePolicy::SystemOnly,
@@ -1853,6 +1909,30 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("reason", string()),
         ],
+        "schedule.work-requested" => &[
+            ("revision", required_string()),
+            ("occurrence", required_integer()),
+            ("mission", required_reference_to(&["mission"])),
+            ("mission_revision", required_string()),
+            ("workspace", required_string()),
+            ("inputs", required_object()),
+        ],
+        "schedule.work-started" => &[
+            ("request", required_string()),
+            ("mission_run", required_reference_to(&["mission-run"])),
+        ],
+        "subscription.mission-requested" => &[
+            ("mission", required_reference_to(&["mission"])),
+            ("mission_revision", required_string()),
+            ("resource", required_reference_to(&["resource"])),
+            ("resource_input", required_string()),
+            ("workspace", required_string()),
+            ("discovery", required_string()),
+        ],
+        "subscription.mission-started" => &[
+            ("request", required_string()),
+            ("mission_run", required_reference_to(&["mission-run"])),
+        ],
         "resource.observed" => &[
             ("kind", string()),
             ("state", any()),
@@ -1902,6 +1982,20 @@ fn required_string() -> FieldSpec {
     FieldSpec {
         required: true,
         ..string()
+    }
+}
+
+fn required_integer() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..integer()
+    }
+}
+
+fn required_object() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..object()
     }
 }
 fn reference() -> FieldSpec {
@@ -2035,6 +2129,7 @@ mod tests {
                 "harness.session-file",
                 "human.review",
                 "vcs.commit",
+                "vcs.issue",
                 "vcs.pull-request",
                 "vcs.ref",
                 "vcs.repository",
@@ -2098,9 +2193,13 @@ mod tests {
                 "schedule.occurrence-cancelled",
                 "schedule.occurrence-reached",
                 "schedule.occurrence-scheduled",
+                "schedule.work-requested",
+                "schedule.work-started",
                 "step-run.carried",
                 "step-run.retried",
                 "step-run.state",
+                "subscription.mission-requested",
+                "subscription.mission-started",
                 "subscription.state",
                 "terminal.input.requested",
                 "terminal.input.result",

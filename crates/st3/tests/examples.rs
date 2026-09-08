@@ -208,6 +208,44 @@ fn eval_agents_use_the_runtime_boot_contract_without_authored_prompts() {
 }
 
 #[test]
+fn eval_personas_do_not_duplicate_runtime_work_instructions() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3");
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
+        {
+            continue;
+        }
+        if !entry
+            .path()
+            .components()
+            .any(|part| part.as_os_str() == "personas")
+        {
+            continue;
+        }
+        let source = fs::read_to_string(entry.path()).unwrap();
+        for forbidden in [
+            "## Boot ritual",
+            "st3 work claim",
+            "st3 message ls",
+            "st3 work progress",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} duplicates runtime instruction `{forbidden}`",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+#[test]
 fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -215,6 +253,12 @@ fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
     let source = fs::read_to_string(&file).unwrap();
     let intent = st3::parse_intent(&source, "local").unwrap();
     let mission = &intent.missions["eval/continuous-stewardship"];
+    let cycle = &intent.missions["eval/continuous-stewardship/cycle"];
+    assert!(
+        source.contains(&format!("cycle@{}", cycle.revision)),
+        "{}",
+        cycle.revision
+    );
     assert!(source.contains("catch-up \"latest\""));
     assert!(mission.steps["cycle-one"].nested_mission.is_some());
     assert!(mission.steps["cycle-two"].nested_mission.is_some());
@@ -232,6 +276,17 @@ fn continuous_stewardship_has_two_serial_cycles_and_a_latest_only_wake() {
 }
 
 #[test]
+fn automatic_intake_pins_its_review_mission() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("evals/st3/automatic-github-intake/eval.kdl");
+    let source = fs::read_to_string(&file).unwrap();
+    let intent = st3::parse_intent(&source, "local").unwrap();
+    let revision = &intent.missions["eval/automatic-github-intake/review"].revision;
+    assert!(source.contains(&format!("review@{revision}")), "{revision}");
+}
+
+#[test]
 fn migration_rehearsal_uses_an_exact_host_document_and_no_custom_prompt() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -245,7 +300,7 @@ fn migration_rehearsal_uses_an_exact_host_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_thirteen_model_free_and_fifteen_model_backed_evals() {
+fn st3_eval_inventory_has_thirteen_model_free_and_sixteen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -266,6 +321,7 @@ fn st3_eval_inventory_has_thirteen_model_free_and_fifteen_model_backed_evals() {
     ];
     let model_backed = [
         "agent-migration-rehearsal",
+        "automatic-github-intake",
         "claude-skill-inheritance",
         "continuous-stewardship",
         "fork-in-the-road",

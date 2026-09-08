@@ -40,6 +40,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Constraint Inheritance | Not supported | `st3/constraint-inheritance` |
 | Continuous Stewardship | Not supported | `st3/continuous-stewardship` |
 | Agent Migration Rehearsal | Not supported | `st3/agent-migration-rehearsal` |
+| Automatic GitHub Intake | Not supported | `st3/automatic-github-intake` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -51,7 +52,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the planning API.
 
-The st3 corpus has 28 evals. Thirteen are model-free, and fifteen use at least one model.
+The st3 corpus has 29 evals. Thirteen are model-free, and sixteen use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -87,8 +88,9 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Run Generation Revision | Codex × 1, created by the planning API | None |
 | st3 | Continuous Stewardship | Codex × 1 | None |
 | st3 | Agent Migration Rehearsal | Codex × 1 | None |
+| st3 | Automatic GitHub Intake | Codex × 1 | None |
 
-The paired and st3-only corpus has 11 Claude seats and 37 Codex seats. It also has three Codex LLM judges.
+The paired and st3-only corpus has 11 Claude seats and 38 Codex seats. It also has three Codex LLM judges.
 
 The thirteen model-free st3 evals add no model seats and no LLM judges.
 

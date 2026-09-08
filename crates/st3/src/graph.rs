@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec, MessageTemplate,
+    DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
     MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
     NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
     PlanningSessionCreation, PlanningSessionDeclaration, ResourceRefreshOperation,
@@ -2406,9 +2406,7 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
             "a subscription observer must use an `observer/` subject",
         ));
     }
-    let target = required_child_string(body, "to", "subscription")?;
-    validate_full_subject(&target)?;
-    required_child_string(body, "delivery", "subscription")?;
+    unique_child(body, "delivery")?;
     let fields = repeated_child_strings(body, "on")?;
     if fields.is_empty() {
         return Err(St3Error::new(
@@ -2422,11 +2420,59 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
             "a subscription field repeats",
         ));
     }
-    if required_child_string(body, "delivery", "subscription")? != "message" {
-        return Err(St3Error::new(
-            "unsupported-subscription-delivery",
-            "a subscription delivery must be `message`",
-        ));
+    let delivery = unique_child(body, "delivery")?.ok_or_else(|| {
+        St3Error::new(
+            "missing-subscription-delivery",
+            "a subscription needs delivery",
+        )
+    })?;
+    let kind = first_string(delivery)?;
+    match kind.as_str() {
+        "message" => {
+            ensure_no_children(delivery)?;
+            let target = required_child_string(body, "to", "subscription")?;
+            validate_full_subject(&target)?;
+        }
+        "mission" => {
+            if child_string(body, "to")?.is_some() {
+                return Err(St3Error::new(
+                    "invalid-subscription-target",
+                    "a mission delivery cannot contain `to`",
+                ));
+            }
+            let delivery_body = delivery.children().ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-delivery",
+                    "a mission delivery needs a body",
+                )
+            })?;
+            reject_unknown_children(
+                delivery_body,
+                &["mission", "resource", "workspace"],
+                "mission delivery",
+                "delivery",
+            )?;
+            for name in ["mission", "resource", "workspace"] {
+                unique_child(delivery_body, name)?;
+            }
+            let reference = required_child_string(delivery_body, "mission", "mission delivery")?;
+            validate_exact_mission_reference(&reference)?;
+            let input = required_child_string(delivery_body, "resource", "mission delivery")?;
+            validate_name(&input, false)?;
+            let workspace = required_child_string(delivery_body, "workspace", "mission delivery")?;
+            if workspace.trim().is_empty() {
+                return Err(St3Error::new(
+                    "invalid-mission-delivery-workspace",
+                    "a mission delivery workspace cannot be empty",
+                ));
+            }
+        }
+        _ => {
+            return Err(St3Error::new(
+                "unsupported-subscription-delivery",
+                "a subscription delivery must be `message` or `mission`",
+            ));
+        }
     }
     Ok(())
 }
@@ -2497,7 +2543,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
             "anchor",
             "catch-up",
             "max-catch-up",
-            "message",
+            "work",
         ],
         "schedule",
         "schedule",
@@ -2509,7 +2555,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
         "anchor",
         "catch-up",
         "max-catch-up",
-        "message",
+        "work",
     ] {
         unique_child(body, child)?;
     }
@@ -2569,29 +2615,69 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
             "max-catch-up must be a positive u32",
         ));
     }
-    let message = unique_child(body, "message")?.ok_or_else(|| {
+    let work = unique_child(body, "work")?.ok_or_else(|| {
+        St3Error::new("missing-schedule-work", "a schedule needs a work template")
+    })?;
+    ensure_bare(work)?;
+    let work_body = work
+        .children()
+        .ok_or_else(|| St3Error::new("missing-schedule-work", "schedule work is empty"))?;
+    reject_unknown_children(
+        work_body,
+        &["mission", "workspace", "input"],
+        "schedule work",
+        "work",
+    )?;
+    unique_child(work_body, "mission")?;
+    unique_child(work_body, "workspace")?;
+    let reference = required_child_string(work_body, "mission", "schedule work")?;
+    validate_exact_mission_reference(&reference)?;
+    let workspace = required_child_string(work_body, "workspace", "schedule work")?;
+    if workspace.trim().is_empty() {
+        return Err(St3Error::new(
+            "invalid-schedule-workspace",
+            "schedule work needs a workspace",
+        ));
+    }
+    let mut inputs = BTreeSet::new();
+    for input in work_body
+        .nodes()
+        .iter()
+        .filter(|node| node.name().value() == "input")
+    {
+        ensure_no_properties(input)?;
+        ensure_no_children(input)?;
+        let values = positional_strings(input)?;
+        if values.len() != 2 {
+            return Err(St3Error::new(
+                "invalid-schedule-input",
+                "a schedule input needs a name and value",
+            ));
+        }
+        validate_name(&values[0], false)?;
+        if !inputs.insert(values[0].clone()) {
+            return Err(St3Error::new(
+                "duplicate-schedule-input",
+                "a schedule input repeats",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_mission_reference(reference: &str) -> Result<(), St3Error> {
+    let reference = reference.strip_prefix("mission/").unwrap_or(reference);
+    let (mission, revision) = reference.rsplit_once('@').ok_or_else(|| {
         St3Error::new(
-            "missing-schedule-message",
-            "a schedule needs a message template",
+            "unpinned-mission-reference",
+            "a mission delivery needs an exact MISSION@REVISION reference",
         )
     })?;
-    ensure_bare(message)?;
-    let message_body = message
-        .children()
-        .ok_or_else(|| St3Error::new("missing-schedule-message", "a schedule message is empty"))?;
-    reject_unknown_children(
-        message_body,
-        &["from", "to", "content"],
-        "schedule message",
-        "message",
-    )?;
-    child_string(message_body, "from")?;
-    required_child_string(message_body, "to", "schedule message")?;
-    let content = required_child_string(message_body, "content", "schedule message")?;
-    if content.trim().is_empty() {
+    crate::mission::validate_mission_id(mission)?;
+    if revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(St3Error::new(
-            "empty-message",
-            "a schedule message needs nonempty content",
+            "invalid-mission-revision",
+            "a mission revision must be a 64-character hexadecimal hash",
         ));
     }
     Ok(())
@@ -2726,7 +2812,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
             anchor_unix_ms: None,
             catch_up: "latest".into(),
             max_catch_up: None,
-            message: None,
+            work: None,
         });
     }
     let host = canonical_child_value(value, "host")
@@ -2750,21 +2836,25 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     let max_catch_up = canonical_child_value(value, "max-catch-up")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
-    let message_node = children
+    let work_node = children
         .iter()
-        .find(|child| child.get("name").and_then(Value::as_str) == Some("message"))?;
-    let message = MessageTemplate {
-        from: canonical_child_value(message_node, "from")
-            .and_then(Value::as_str)
-            .unwrap_or("requester")
-            .to_owned(),
-        to: canonical_child_value(message_node, "to")?
-            .as_str()?
-            .to_owned(),
-        content: canonical_child_value(message_node, "content")?
-            .as_str()?
-            .to_owned(),
-    };
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("work"))?;
+    let reference = canonical_child_value(work_node, "mission")?.as_str()?;
+    let reference = reference.strip_prefix("mission/").unwrap_or(reference);
+    let (mission, revision) = reference.rsplit_once('@')?;
+    let mut inputs = BTreeMap::new();
+    for input in work_node
+        .get("children")?
+        .as_array()?
+        .iter()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some("input"))
+    {
+        let values = input.get("arguments")?.as_array()?;
+        inputs.insert(
+            values.first()?.as_str()?.to_owned(),
+            values.get(1)?.as_str()?.to_owned(),
+        );
+    }
     Some(ScheduleSpec {
         stopped: false,
         host,
@@ -2773,7 +2863,14 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         anchor_unix_ms,
         catch_up,
         max_catch_up,
-        message: Some(message),
+        work: Some(crate::model::ScheduledWork {
+            mission: mission.to_owned(),
+            revision: revision.to_owned(),
+            workspace: canonical_child_value(work_node, "workspace")?
+                .as_str()?
+                .to_owned(),
+            inputs,
+        }),
     })
 }
 
@@ -2811,18 +2908,51 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             to: String::new(),
             fields: Vec::new(),
             delivery: String::new(),
+            mission: None,
+            revision: None,
+            resource_input: None,
+            workspace: None,
             stopped: true,
         });
     }
+    let delivery_node = children
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("delivery"))?;
+    let delivery = delivery_node
+        .get("arguments")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_owned();
+    let mission_reference = canonical_child_value(delivery_node, "mission").and_then(Value::as_str);
+    let (mission, revision) = mission_reference
+        .and_then(|value| {
+            value
+                .strip_prefix("mission/")
+                .unwrap_or(value)
+                .rsplit_once('@')
+        })
+        .map_or((None, None), |(mission, revision)| {
+            (Some(mission.to_owned()), Some(revision.to_owned()))
+        });
     Some(SubscriptionSpec {
         observer: canonical_child_value(value, "observer")?
             .as_str()?
             .to_owned(),
-        to: canonical_child_value(value, "to")?.as_str()?.to_owned(),
-        fields: canonical_child_values(value, "on"),
-        delivery: canonical_child_value(value, "delivery")?
-            .as_str()?
+        to: canonical_child_value(value, "to")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
             .to_owned(),
+        fields: canonical_child_values(value, "on"),
+        delivery,
+        mission,
+        revision,
+        resource_input: canonical_child_value(delivery_node, "resource")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        workspace: canonical_child_value(delivery_node, "workspace")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         stopped: false,
     })
 }
@@ -3510,15 +3640,13 @@ mod tests {
             let source = std::fs::read_to_string(&eval).unwrap();
             let intent = parse_test_intent(&source, "eval-node")
                 .unwrap_or_else(|error| panic!("{}: {error}", eval.display()));
-            let ready = intent
-                .missions
-                .values()
-                .filter(|mission| mission.state == crate::model::MissionState::Ready)
-                .count();
-            assert_eq!(
-                ready,
-                1,
-                "{} must declare one ready mission",
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                intent.missions.iter().any(|(id, mission)| {
+                    id.starts_with(&format!("eval/{name}"))
+                        && mission.state == crate::model::MissionState::Ready
+                }),
+                "{} must declare its ready root mission",
                 eval.display()
             );
             parsed += 1;
@@ -4173,5 +4301,35 @@ planning-session "planning/release/revise" {{
             desired.contains("run-generation/release/live/2"),
             "{desired}"
         );
+    }
+
+    #[test]
+    fn a_subscription_can_open_an_exact_mission_with_a_resource_input() {
+        let revision = "a".repeat(64);
+        let source = format!(
+            r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "github" {{ resource "resource/repo"; provider "github.repository"; locator "owner/repo"; field "pull_requests" }}
+subscription "reviews" {{
+    observer "observer/github"
+    on "pull_requests"
+    delivery "mission" {{
+      mission "review@{revision}"
+      resource "pull-request"
+      workspace "/work/reviews"
+    }}
+}}"#
+        );
+        let intent = parse_test_intent(&source, "node").unwrap();
+        let subscription = intent
+            .subjects
+            .values()
+            .find(|item| item.kind == "subscription")
+            .unwrap();
+        let spec = subscription_spec(&subscription.desired).unwrap();
+        assert_eq!(spec.delivery, "mission");
+        assert_eq!(spec.mission.as_deref(), Some("review"));
+        assert_eq!(spec.revision.as_deref(), Some(revision.as_str()));
+        assert_eq!(spec.resource_input.as_deref(), Some("pull-request"));
     }
 }

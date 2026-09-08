@@ -4,13 +4,17 @@ Status: current design.
 
 ## Outcome
 
-An agent or a person can request a message when selected facts about an external resource change.
+An agent or a person can request a message or mission when selected external facts change.
 
 The request is durable graph state. A supervised observer checks the external resource without using an agent turn.
 
-The first provider observes a GitHub pull request. The second provider observes one local file.
+The providers observe one GitHub pull request, one GitHub repository, or one local file.
 
 The GitHub provider supports `head`, `state`, `review`, and `checks`.
+
+The repository provider supports `pull_requests` and `issues`. It retains discoveries and filters draft pull requests.
+
+Each newly ready pull request becomes one `vcs.pull-request` resource. Each new issue becomes one `vcs.issue` resource.
 
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
@@ -72,7 +76,9 @@ The subscription stores the selected changes and delivery intent. The agent decl
 
 A provider locator is an opaque provider value. st3 does not assign meaning to it outside the registered provider.
 
-The GitHub provider reads `GH_TOKEN` first and `GITHUB_TOKEN` second. It uses public API access when both values are absent.
+The GitHub providers read `GH_TOKEN` first and `GITHUB_TOKEN` second. They then try `gh auth token`.
+
+It uses public API access when no authenticated token is available.
 
 ## Observation without delivery
 
@@ -127,7 +133,29 @@ st3 does not fetch once for each target. A subscription update can expand or red
 
 ## Change and delivery rules
 
-The first successful observation establishes the baseline. It sends no update message.
+The first successful observation establishes the baseline. It sends no update message and starts no mission.
+
+A mission delivery starts one exact mission revision with the observed resource as a run input.
+
+```kdl
+subscription "new-ready-pull-requests" {
+  observer "observer/repository"
+  on "pull_requests"
+  delivery "mission" {
+    mission "review/pull-request@REVISION"
+    resource "pull-request"
+    workspace "/work/pull-request-reviews"
+  }
+}
+```
+
+The repository provider creates one mission request for each newly discovered item. The run input pins that item's exact discovery claim.
+
+A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
+
+The GitHub issues endpoint also returns pull requests. The provider removes those records from the issue collection.
+
+The delivery cites the discovery claim. A retry uses the same run. A capacity limit leaves the request pending.
 
 A later observed field change creates one `resource.observed` claim. An unchanged observation creates no resource claim.
 
@@ -158,7 +186,10 @@ A later version can add an `until` predicate or one deadline. This option is not
 - An exact command retry creates no duplicate graph subject.
 - The first observation creates a baseline and no message.
 - An unchanged provider result creates no claim and no message.
-- A selected field change creates one observation claim and one message.
+- A selected scalar field change creates one observation claim and one message.
+- Each new repository collection item creates one resource and one mission request.
+- A draft-to-ready transition creates one pull request resource and one mission request.
+- Pull requests from the GitHub issues endpoint do not create issue resources.
 - An unselected field change creates an observation claim and no message for that subscription.
 - A daemon restart creates no duplicate message.
 - Two subscriptions share one observer and receive separate messages.

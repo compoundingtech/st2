@@ -121,6 +121,7 @@ The roster has no role selector. An agent can inspect or filter the stable full 
 | Git repository | `vcs.repository` | Registered |
 | Git commit | `vcs.commit` | Registered |
 | Pull request | `vcs.pull-request` | Registered |
+| Issue | `vcs.issue` | Registered |
 | CI run | `ci.run` | Registered |
 | Human review | `human.review` | Registered |
 | Local file metadata | `filesystem.file` with `local.file` | Implemented |
@@ -129,6 +130,8 @@ The roster has no role selector. An agent can inspect or filter the stable full 
 | Custom resource | `custom.*` kind | Implemented |
 
 Host declarations can name exact immutable host documents. An absent document blocks publication before a runtime starts.
+
+The `github.repository` observer discovers ready pull requests and issues. Each new item can start one isolated, capacity-limited mission run.
 
 `local.file` returns status, path, hash, size, mode, and an optional reason. It never publishes file content.
 
