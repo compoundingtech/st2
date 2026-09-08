@@ -160,7 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews/{*subject}", post(post_review))
-        .route("/v1/messages", get(list_messages))
+        .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/close/{*subject}", post(close_message))
         .route("/v1/messages/read/{*subject}", get(read_message))
@@ -225,7 +225,6 @@ pub fn router(state: AppState) -> Router {
             post(unwatch_resource),
         )
         .route("/v1/resources/refresh/{*resource}", post(refresh_resource))
-        .route("/v1/messages", post(send_message))
         .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
