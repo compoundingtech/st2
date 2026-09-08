@@ -2723,13 +2723,6 @@ impl Store {
         intent: &NormalizedIntent,
         key: &str,
     ) -> Result<ApplyResponse, St3Error> {
-        if let Some(mut response) = self
-            .cached_idempotency_response::<ApplyResponse>(key)
-            .map_err(internal)?
-        {
-            response.changed = false;
-            return Ok(response);
-        }
         let source = IntentInput {
             kdl: String::new(),
             source_name: Some("st3 reconciler".into()),
@@ -2741,7 +2734,17 @@ impl Store {
                 mission.blockers.join("; "),
             ));
         }
-        self.apply(intent, &mission.subject_tokens, key)
+        let materialization = serde_json::to_vec(&(
+            key,
+            &mission.normalized,
+            &mission.subject_tokens,
+        ))
+        .map_err(internal)?;
+        let key = format!(
+            "internal:{key}:{}",
+            hex::encode(Sha256::digest(materialization))
+        );
+        self.apply(intent, &mission.subject_tokens, &key)
     }
 
     pub fn mission(
@@ -10328,7 +10331,7 @@ mission "guarded" state="ready" {
     }
 
     #[test]
-    fn an_internal_apply_replay_does_not_report_a_new_change() {
+    fn an_internal_apply_replays_after_desired_state_drifts() {
         let store = Store::open_memory("node").unwrap();
         let intent = simple("true");
         let first = store.apply_internal(&intent, "materialize:test").unwrap();
@@ -10337,7 +10340,18 @@ mission "guarded" state="ready" {
         assert!(first.changed);
         assert!(!replay.changed);
         assert_eq!(replay.store_index, first.store_index);
-        assert_eq!(replay.batch_id, first.batch_id);
+        assert!(replay.batch_id.is_none());
+
+        let stop = crate::graph::parse_test_intent(
+            "version 2\nstop \"exec/work\"\n",
+            "node",
+        )
+        .unwrap();
+        assert!(store.apply_internal(&stop, "stop:test").unwrap().changed);
+
+        let restored = store.apply_internal(&intent, "materialize:test").unwrap();
+        assert!(restored.changed);
+        assert_eq!(store.selected_desired_kind("exec/work").unwrap(), Some("exec".into()));
     }
 
     #[test]
