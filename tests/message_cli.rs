@@ -2,10 +2,126 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
+
+static STATE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct DeliveryFixture {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    state: PathBuf,
+    ledger_path: PathBuf,
+    filename: &'static str,
+    token: st2::delivery_ledger::AttemptToken,
+    digest: st2::delivery_ledger::LedgerDigest,
+    fence: st2::delivery_ledger::Fence,
+}
+
+fn state_scoped_codex_ledger_path(root: &Path, state: &Path, identity: &str) -> PathBuf {
+    let _guard = STATE_ENV_LOCK.lock();
+    let previous = std::env::var_os("XDG_STATE_HOME");
+    unsafe { std::env::set_var("XDG_STATE_HOME", state) };
+    let path = st2::codex_app_server::delivery_ledger_path(root, identity);
+    match previous {
+        Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+    }
+    path
+}
+
+fn delivery_fixture() -> DeliveryFixture {
+    const AGENT_ID: &str = "0193b8f2-7c31-7a4e-9f11-4c2d6b8a35e7";
+    const IDENTITY: &str = "h.worker";
+    const FILENAME: &str = "1786380000000-aaa111.md";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let agent_dir = root.join("h/worker");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("agent.kdl"),
+        format!(
+            "agent \"worker\" {{\n  identity \"worker\"\n  id \"{AGENT_ID}\"\n  address \"worker\"\n  host \"h\"\n  type \"service\"\n  session-driver \"codex\"\n  argv \"codex\"\n}}\n"
+        ),
+    )
+    .unwrap();
+    let inbox = agent_dir.join("resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(inbox.join(FILENAME), "operator-visible payload\n").unwrap();
+
+    let ledger_path = state_scoped_codex_ledger_path(&root, &state, IDENTITY);
+    let owner = IDENTITY.to_owned();
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &ledger_path,
+        st2::delivery_ledger::Harness::Codex.profile(),
+        IDENTITY,
+        "runtime-a",
+        move |binding, filename| {
+            st2::codex_app_server::delivery_correlation(&owner, binding, filename)
+        },
+    );
+    let correlation =
+        st2::codex_app_server::delivery_correlation(IDENTITY, "thread-main", FILENAME);
+    let permit = match ledger
+        .claim(st2::delivery_ledger::Claimant {
+            filename: FILENAME.to_owned(),
+            binding: "thread-main".to_owned(),
+            correlation: st2::delivery_ledger::Correlation::native(correlation),
+            incarnation: Some("runtime-a".to_owned()),
+        })
+        .unwrap()
+    {
+        st2::delivery_ledger::Claim::Permitted(permit) => permit,
+        st2::delivery_ledger::Claim::Held(reason) => {
+            panic!("fresh delivery fixture unexpectedly held: {reason:?}")
+        }
+    };
+    let digest = ledger.snapshot().unwrap().digest();
+
+    DeliveryFixture {
+        _tmp: tmp,
+        root,
+        state,
+        ledger_path,
+        filename: FILENAME,
+        token: permit.token(),
+        digest,
+        fence: permit.fence(),
+    }
+}
+
+fn delivery_negative(
+    fixture: &DeliveryFixture,
+    selector: &[&str],
+    token: &str,
+    digest: &str,
+    reason: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_st2"));
+    command
+        .args(["message", "delivery-negative"])
+        .args(selector)
+        .args([
+            "--attempt-token",
+            token,
+            "--ledger-sha256",
+            digest,
+            "--json",
+            "--root",
+        ])
+        .arg(&fixture.root)
+        .args(["--host", "h"])
+        .env("XDG_STATE_HOME", &fixture.state)
+        .env("ST_AGENT", "h.operator");
+    if let Some(reason) = reason {
+        command.args(["--reason", reason]);
+    }
+    command.output().unwrap()
+}
 
 fn json_digest(value: &serde_json::Value) -> String {
     bytes_digest(&serde_json::to_vec(value).unwrap())
@@ -1420,5 +1536,261 @@ fn malformed_catalog_declarations_disable_implicit_flat_fallback() {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("no agent 'missing' found in catalog")
         );
+    }
+}
+
+#[test]
+fn delivery_negative_records_audited_absence_by_address_and_exact_id_without_transporting() {
+    const AGENT_ID: &str = "0193b8f2-7c31-7a4e-9f11-4c2d6b8a35e7";
+    for exact_id in [false, true] {
+        let fixture = delivery_fixture();
+        let token = fixture.token.hex();
+        let digest = fixture.digest.hex();
+        let selector = if exact_id {
+            vec![fixture.filename, "--id", AGENT_ID]
+        } else {
+            vec!["worker", fixture.filename]
+        };
+        let inbox_path = fixture
+            .root
+            .join("h/worker/resources/inbox")
+            .join(fixture.filename);
+        let inbox_before = fs::read(&inbox_path).unwrap();
+
+        let output = delivery_negative(
+            &fixture,
+            &selector,
+            &token,
+            &digest,
+            Some("  verified absent in provider history  "),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["schema"], "st2.delivery-negative.v1");
+        assert_eq!(receipt["outcome"], "applied");
+        assert_eq!(receipt["agent"], "h.worker");
+        assert_eq!(receipt["harness"], "codex");
+        assert_eq!(receipt["filename"], fixture.filename);
+        assert_eq!(receipt["attemptToken"], token);
+        assert_eq!(receipt["ledgerSha256"], digest);
+        assert_eq!(receipt["phase"], "attempted");
+        assert_eq!(receipt["stAgent"], "h.operator");
+        assert_eq!(receipt["reason"], "verified absent in provider history");
+        assert!(receipt["uid"].as_u64().is_some());
+        assert!(receipt["pid"].as_u64().is_some());
+        assert!(receipt["observedAtMs"].as_u64().is_some());
+
+        assert_eq!(fs::read(&inbox_path).unwrap(), inbox_before);
+        assert!(!fixture.root.join("h/worker/resources/archive").exists());
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.ledger_path).unwrap()).unwrap();
+        let attempt = &ledger["entries"][0];
+        assert_eq!(attempt["negative"], "absent");
+        assert_eq!(attempt["operatorAudit"]["source"], "operator");
+        assert_eq!(attempt["operatorAudit"]["stAgent"], "h.operator");
+        assert_eq!(
+            attempt["operatorAudit"]["reason"],
+            "verified absent in provider history"
+        );
+        assert_eq!(attempt["operatorAudit"]["digest"], digest);
+        assert_eq!(attempt["operatorAudit"]["uid"], receipt["uid"]);
+        assert_eq!(attempt["operatorAudit"]["pid"], receipt["pid"]);
+        assert_eq!(
+            attempt["operatorAudit"]["observedAtMs"],
+            receipt["observedAtMs"]
+        );
+
+        let after = fs::read(&fixture.ledger_path).unwrap();
+        let after_digest = st2::delivery_ledger::LedgerDigest::of(&after).hex();
+        let repeated = delivery_negative(
+            &fixture,
+            &selector,
+            &token,
+            &after_digest,
+            Some("a different assertion must not rewrite the audit"),
+        );
+        assert!(!repeated.status.success());
+        assert!(
+            String::from_utf8_lossy(&repeated.stderr)
+                .contains("already has exact negative evidence")
+        );
+        assert_eq!(fs::read(&fixture.ledger_path).unwrap(), after);
+    }
+}
+
+#[test]
+fn delivery_negative_fails_closed_on_missing_or_stale_evidence() {
+    let cases = [
+        (
+            "ffffffffffffffffffffffffffffffff",
+            None,
+            Some("operator saw no provider record"),
+            "token or correlation is stale",
+        ),
+        (
+            "",
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            Some("operator saw no provider record"),
+            "delivery ledger changed",
+        ),
+        (
+            "not-a-token",
+            None,
+            Some("operator saw no provider record"),
+            "attempt token",
+        ),
+        ("", None, Some(" \t "), "must state a reason"),
+        ("", None, None, "--reason <REASON>"),
+    ];
+    for (token_override, digest_override, reason, expected) in cases {
+        let fixture = delivery_fixture();
+        let before = fs::read(&fixture.ledger_path).unwrap();
+        let token = if token_override.is_empty() {
+            fixture.token.hex()
+        } else {
+            token_override.to_owned()
+        };
+        let digest = digest_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| fixture.digest.hex());
+        let output = delivery_negative(
+            &fixture,
+            &["worker", fixture.filename],
+            &token,
+            &digest,
+            reason,
+        );
+        assert!(
+            !output.status.success(),
+            "case {expected} unexpectedly succeeded"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "expected {expected:?}, got {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&fixture.ledger_path).unwrap(),
+            before,
+            "failed operator action rewrote the ledger"
+        );
+    }
+
+    let fixture = delivery_fixture();
+    let before = fs::read(&fixture.ledger_path).unwrap();
+    let unknown = delivery_negative(
+        &fixture,
+        &["worker", "1786380000001-bbb222.md"],
+        &fixture.token.hex(),
+        &fixture.digest.hex(),
+        Some("operator saw no provider record"),
+    );
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("has no attempt"));
+    assert_eq!(fs::read(&fixture.ledger_path).unwrap(), before);
+
+    let fixture = delivery_fixture();
+    let owner = "h.worker".to_owned();
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &fixture.ledger_path,
+        st2::delivery_ledger::Harness::Codex.profile(),
+        "h.worker",
+        "runtime-a",
+        move |binding, filename| {
+            st2::codex_app_server::delivery_correlation(&owner, binding, filename)
+        },
+    );
+    assert_eq!(
+        ledger
+            .record(&fixture.fence, st2::delivery_ledger::Evidence::Consumed)
+            .unwrap(),
+        st2::delivery_ledger::Landed::Recorded(st2::delivery_ledger::Phase::Consumed)
+    );
+    let settled_before = fs::read(&fixture.ledger_path).unwrap();
+    let settled_digest = st2::delivery_ledger::LedgerDigest::of(&settled_before).hex();
+    let settled = delivery_negative(
+        &fixture,
+        &["worker", fixture.filename],
+        &fixture.token.hex(),
+        &settled_digest,
+        Some("operator saw no provider record"),
+    );
+    assert!(!settled.status.success());
+    assert!(String::from_utf8_lossy(&settled.stderr).contains("already settled"));
+    assert_eq!(fs::read(&fixture.ledger_path).unwrap(), settled_before);
+}
+
+#[test]
+fn delivery_negative_refuses_absent_symlinked_and_unadopted_ledgers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let codex_dir = root.join("h/codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("agent.kdl"),
+        "agent \"codex\" {\n  identity \"codex\"\n  host \"h\"\n  type \"service\"\n  session-driver \"codex\"\n  argv \"codex\"\n}\n",
+    )
+    .unwrap();
+    let claude_dir = root.join("h/claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("agent.kdl"),
+        "agent \"claude\" {\n  identity \"claude\"\n  host \"h\"\n  type \"service\"\n  session-driver \"claude\"\n  argv \"claude\"\n}\n",
+    )
+    .unwrap();
+
+    let invoke = |agent: &str| {
+        Command::new(env!("CARGO_BIN_EXE_st2"))
+            .args([
+                "message",
+                "delivery-negative",
+                agent,
+                "1786380000000-aaa111.md",
+            ])
+            .args([
+                "--attempt-token",
+                "00112233445566778899aabbccddeeff",
+                "--ledger-sha256",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                "--reason",
+                "operator saw no provider record",
+                "--root",
+            ])
+            .arg(&root)
+            .args(["--host", "h"])
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .unwrap()
+    };
+
+    let absent = invoke("codex");
+    assert!(!absent.status.success());
+    assert!(String::from_utf8_lossy(&absent.stderr).contains("has no delivery ledger"));
+    let ledger_path = state_scoped_codex_ledger_path(&root, &state, "h.codex");
+    assert!(!ledger_path.exists());
+    assert!(!ledger_path.with_file_name("delivery-ledger.lock").exists());
+
+    let unadopted = invoke("claude");
+    assert!(!unadopted.status.success());
+    assert!(
+        String::from_utf8_lossy(&unadopted.stderr)
+            .contains("claude has not adopted the delivery ledger")
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let target = tmp.path().join("outside-ledger.json");
+        fs::write(&target, b"do not follow\n").unwrap();
+        fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        symlink(&target, &ledger_path).unwrap();
+        let symlinked = invoke("codex");
+        assert!(!symlinked.status.success());
+        assert_eq!(fs::read(&target).unwrap(), b"do not follow\n");
     }
 }

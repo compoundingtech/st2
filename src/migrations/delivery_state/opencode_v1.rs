@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use super::{Adopting, Version};
-use crate::delivery_ledger::{self, Correlation, Entry, Phase};
+use crate::delivery_ledger::{self, Carried, Correlation, Phase};
 use crate::message;
 
 pub(super) const SCHEMA: &str = "st2.opencode-delivery-state.v1";
@@ -50,7 +50,7 @@ impl Version for Record {
     }
 }
 
-impl TryFrom<Adopting<'_, Record>> for Entry {
+impl TryFrom<Adopting<'_, Record>> for Carried {
     type Error = anyhow::Error;
 
     fn try_from(adopting: Adopting<'_, Record>) -> Result<Self> {

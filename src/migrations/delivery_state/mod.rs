@@ -1,5 +1,5 @@
 //! Translation of the per-driver `delivery-state.json` records into
-//! [`crate::delivery_ledger::Entry`].
+//! [`crate::delivery_ledger::Carried`] entries.
 //!
 //! Before `st2.delivery-ledger.v1`, each native transport kept its own single-binding record at
 //! `<state-dir>/delivery-state.json` holding one `{binding, filename, correlation, phase in
@@ -10,7 +10,7 @@
 //! the filename, and the schema strings — lives here and nowhere else.
 //!
 //! One file per legacy version: [`codex_v1`], [`opencode_v1`]. Each owns its wire struct, the
-//! meaning of its labels, and a `TryFrom<Adopting<Record>> for Entry`. A future
+//! meaning of its labels, and a `TryFrom<Adopting<Record>> for Carried`. A future
 //! `delivery-state.v2` would be one more file plus one match arm in [`recover`].
 //!
 //! Two properties make this safe to translate rather than migrate in place:
@@ -20,24 +20,27 @@
 //! * **Phase, not label.** Every entry this module produces is graded no higher than the
 //!   evidence the old record actually carried, and no harness
 //!   [`Profile`](crate::delivery_ledger::Profile) proves `Attempted`, so a carried-forward
-//!   attempt suppresses a duplicate and authorizes no transport.
-//!   [`Ledger::seed`](crate::delivery_ledger::Ledger::seed) re-checks that against the profile
-//!   and fails closed, so the safety argument is enforced by the canonical validator, not by
-//!   care taken here.
+//!   attempt suppresses a duplicate and authorizes no transport. The canonical transaction
+//!   loader re-checks that against the profile and fails closed, so the safety argument is
+//!   enforced by the canonical validator, not by care taken here.
 //!   [`crate::delivery_ledger::asserted`] additionally marks each entry
 //!   [`crate::delivery_ledger::Attestation::Asserted`], which changes no decision and exists to
 //!   make the leftover countable — see the trigger below.
+//! * **Tokenless by construction.** A [`crate::delivery_ledger::Carried`] entry carries no
+//!   attempt token. Minting one here would mean this module choosing a fence for an attempt it
+//!   never watched; the canonical loader derives it deterministically from the row's own bytes
+//!   under the transaction lock instead (Q35).
 //!
 //! # Deletion trigger
 //!
 //! `docs/vrs/.delta/DELTA-006-delivery-state-v1-arm.md`, whose Resolution Signal is produced by
 //! [`resolution_signal`] and printed per seat by `st2 doctor`: no `delivery-state.json` beside a
 //! ledger and no ledger entry still carrying an asserted phase, on every admitted host, for
-//! seven days. Deleting this arm is this directory, the one seam statement in
-//! [`crate::delivery_ledger::Ledger::open`], and the attestation instrumentation the trigger
-//! needed. The local half of the trigger is
-//! [`tests::deletion_trigger_absent_old_record_makes_this_module_a_no_op`]; the signal itself is
-//! pinned by [`tests::the_resolution_signal_counts_each_clause_without_consuming_it`].
+//! seven days. Deleting this arm is this directory, the one seam statement in the canonical
+//! transaction loader, and the attestation instrumentation the trigger needed. The local half of
+//! the trigger is [`tests::deletion_trigger_absent_old_record_makes_this_module_a_no_op`]; the
+//! signal itself is pinned by
+//! [`tests::the_resolution_signal_counts_each_clause_without_consuming_it`].
 
 mod codex_v1;
 mod opencode_v1;
@@ -47,7 +50,7 @@ use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::delivery_ledger::{Entry, EvidencePolicy, Harness, LEDGER_FILE};
+use crate::delivery_ledger::{Carried, EvidencePolicy, Harness, LEDGER_FILE};
 
 /// The filename every pre-ledger release wrote. Named here only.
 const LEGACY_FILE: &str = "delivery-state.json";
@@ -70,21 +73,19 @@ pub(super) trait Version: DeserializeOwned {
     fn agent(&self) -> &str;
 }
 
-/// Translate the legacy record in `state_dir`, if any, into canonical entries.
+/// Translate the legacy record in `state_dir`, if any, into carried-forward entries.
 ///
-/// The canonical caller invokes this exactly once — when no ledger file exists — and makes the
-/// result durable, so the ledger file's existence is what stops the translation happening twice.
-/// Called with the ledger absent and no legacy record present it returns no entries, which is
-/// byte-for-byte the behaviour of this module not existing.
-pub(crate) fn recover<F>(
+/// The canonical caller invokes this inside its transaction — when no ledger file exists — and
+/// makes the result durable under the same lock, so the ledger file's existence is what stops the
+/// translation happening twice and no second reader can translate concurrently. Called with the
+/// ledger absent and no legacy record present it returns no entries, which is byte-for-byte the
+/// behaviour of this module not existing.
+pub(crate) fn recover(
     state_dir: &Path,
     harness: Harness,
     agent: &str,
-    correlate: &F,
-) -> Result<Vec<Entry>>
-where
-    F: Fn(&str, &str) -> String,
-{
+    correlate: &dyn Fn(&str, &str) -> String,
+) -> Result<Vec<Carried>> {
     if harness.policy() == EvidencePolicy::AttemptOnly {
         return Ok(Vec::new());
     }
@@ -97,7 +98,6 @@ where
                 .with_context(|| format!("reading legacy delivery state {}", path.display()));
         }
     };
-    let correlate: &dyn Fn(&str, &str) -> String = correlate;
     match harness {
         Harness::Codex => translate::<codex_v1::Record>(&bytes, agent, correlate),
         Harness::OpenCode => translate::<opencode_v1::Record>(&bytes, agent, correlate),
@@ -109,10 +109,14 @@ where
 ///
 /// Clause 1 is a pre-ledger record still sitting beside a per-harness state dir; clause 2 is a
 /// ledger entry whose phase this fleet asserted rather than observed. Both must read zero, on
-/// every admitted host, before this directory and the seam in
-/// [`crate::delivery_ledger::Ledger::open`] can go — and a trigger nothing produces resolves on
-/// someone remembering, which is a date in disguise. `st2 doctor` prints this per seat so the
-/// observation exists.
+/// every admitted host, before this directory and the seam in the canonical transaction loader
+/// can go — and a trigger nothing produces resolves on someone remembering, which is a date in
+/// disguise. `st2 doctor` prints this per seat so the observation exists.
+///
+/// Two clauses, deliberately: DELTA-007's tokenless-entry count is NOT here. This module is
+/// DELTA-006's and has to stay deletable while a tokenless canonical row may still exist
+/// somewhere, and a signal that gated its own deletion on a later delta's clause could never
+/// resolve. `crate::delivery_ledger::tokenless_entries` is that independent source.
 ///
 /// Read-only: it opens no ledger and translates nothing, so running the diagnostic cannot make
 /// the record it is counting disappear.
@@ -163,10 +167,10 @@ fn translate<V>(
     bytes: &[u8],
     agent: &str,
     correlate: &dyn Fn(&str, &str) -> String,
-) -> Result<Vec<Entry>>
+) -> Result<Vec<Carried>>
 where
     V: Version,
-    for<'a> Entry: TryFrom<Adopting<'a, V>, Error = anyhow::Error>,
+    for<'a> Carried: TryFrom<Adopting<'a, V>, Error = anyhow::Error>,
 {
     let Ok(record) = serde_json::from_slice::<V>(bytes) else {
         return Ok(Vec::new());
@@ -174,7 +178,7 @@ where
     if record.schema() != V::SCHEMA || record.agent() != agent {
         return Ok(Vec::new());
     }
-    Ok(vec![Entry::try_from(Adopting { record, correlate })?])
+    Ok(vec![Carried::try_from(Adopting { record, correlate })?])
 }
 
 /// Legacy records in the exact shape a pre-ledger release wrote them, for tests that need to
@@ -244,7 +248,8 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
     use crate::delivery_ledger::{
-        Attestation, HoldReason, LEDGER_SCHEMA, Ledger, Phase, Retention, RetryDecision,
+        Attempt, Attestation, Authorization, HoldReason, LEDGER_LOCK, LEDGER_SCHEMA, Ledger, Phase,
+        Retention,
     };
 
     const FILE_A: &str = "1786380000000-aaa111.md";
@@ -264,8 +269,12 @@ mod tests {
     }
 
     /// The local half of the deletion trigger: with no legacy record present this module produces
-    /// nothing and causes no write, so removing it cannot change observable behaviour. The fleet
-    /// half is the live query in the delta record named in the module doc.
+    /// nothing and leaves no delivery record behind, so removing it cannot change observable
+    /// behaviour. The fleet half is the live query in the delta record named in the module doc.
+    ///
+    /// The transaction lock is the one file a first open does create — recovery is serialized, so
+    /// the lock has to exist before the decision to recover is made. It carries no state: the
+    /// assertion is that no RECORD was written.
     #[test]
     fn deletion_trigger_absent_old_record_makes_this_module_a_no_op() {
         for harness in [Harness::Codex, Harness::OpenCode] {
@@ -276,12 +285,17 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
-            let ledger = open(&state_dir, harness);
+            let mut ledger = open(&state_dir, harness);
             assert!(ledger.quarantined().is_none());
-            assert!(ledger.entries().is_empty());
+            assert!(ledger.snapshot().unwrap().attempts().is_empty());
+            let residue: Vec<String> = fs::read_dir(&state_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name != LEDGER_LOCK)
+                .collect();
             assert!(
-                !state_dir.exists(),
-                "a driver that never delivered leaves no record behind"
+                residue.is_empty(),
+                "a driver that never delivered leaves no record behind: {residue:?}"
             );
         }
     }
@@ -317,9 +331,14 @@ mod tests {
 
         // Opening translates: the old record stays (clause 1) and the carried-forward phase is
         // now visible as asserted (clause 2).
-        let ledger = open(&state_dir, Harness::Codex);
+        let mut ledger = open(&state_dir, Harness::Codex);
         assert_eq!(
-            ledger.entry(FILE_A).unwrap().attestation,
+            ledger
+                .snapshot()
+                .unwrap()
+                .attempt(FILE_A)
+                .unwrap()
+                .attestation,
             Attestation::Asserted
         );
         let signal = resolution_signal(&dirs).unwrap();
@@ -350,9 +369,9 @@ mod tests {
         );
         record["phase"] = "accepted".into();
         fixture::place(&codex_dir, &record);
-        let ledger = open(&codex_dir, Harness::Codex);
-        assert_eq!(ledger.entry(FILE_A).unwrap().phase, Phase::Consumed);
-        assert_eq!(ledger.retention(FILE_A), Retention::Release);
+        let snapshot = open(&codex_dir, Harness::Codex).snapshot().unwrap();
+        assert_eq!(snapshot.attempt(FILE_A).unwrap().phase, Phase::Consumed);
+        assert_eq!(snapshot.retention(FILE_A), Retention::Release);
 
         // OpenCode wrote it from a storage read-back. Mapping that to consumption would make the
         // stored-but-never-admitted class permanently unretryable, so it adopts as `persisted`
@@ -368,10 +387,10 @@ mod tests {
         );
         record["phase"] = "accepted".into();
         fixture::place(&opencode_dir, &record);
-        let ledger = open(&opencode_dir, Harness::OpenCode);
-        assert_eq!(ledger.entry(FILE_A).unwrap().phase, Phase::Persisted);
+        let snapshot = open(&opencode_dir, Harness::OpenCode).snapshot().unwrap();
+        assert_eq!(snapshot.attempt(FILE_A).unwrap().phase, Phase::Persisted);
         assert_eq!(
-            ledger.retention(FILE_A),
+            snapshot.retention(FILE_A),
             Retention::Hold(HoldReason::UnreadReceipt)
         );
     }
@@ -391,18 +410,18 @@ mod tests {
                 &correlate("thread-main", FILE_A),
             ),
         );
-        let ledger = open(&state_dir, Harness::Codex);
-        let entry = ledger.entry(FILE_A).unwrap();
-        assert_eq!(entry.attestation, Attestation::Asserted);
-        assert_eq!(entry.phase, Phase::Attempted);
+        let snapshot = open(&state_dir, Harness::Codex).snapshot().unwrap();
+        let attempt = snapshot.attempt(FILE_A).unwrap();
+        assert_eq!(attempt.attestation, Attestation::Asserted);
+        assert_eq!(attempt.phase, Phase::Attempted);
         assert_eq!(
-            entry.incarnation.as_deref(),
+            attempt.incarnation.as_deref(),
             Some("incarnation-0"),
             "the attempt keeps the incarnation that made it, so no live frame can settle it"
         );
         assert_eq!(
-            ledger.retry(FILE_A),
-            RetryDecision::Hold(HoldReason::AmbiguousAttempt),
+            snapshot.authorization("thread-main", FILE_A),
+            Authorization::Held(HoldReason::AmbiguousAttempt),
             "a drifted runtime id is carried forward and held, not ignored into a second delivery"
         );
     }
@@ -422,17 +441,19 @@ mod tests {
             ),
         );
         let mut ledger = open(&state_dir, Harness::OpenCode);
-        assert_eq!(ledger.entries().len(), 1);
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.attempts().len(), 1);
         // The recipient archives the message; ownership is released and the entry is gone.
-        ledger.prune(|_| false).unwrap();
+        let settled: Vec<_> = snapshot.attempts().iter().map(Attempt::fence).collect();
+        assert_eq!(ledger.prune(&settled).unwrap(), 1);
 
         // The legacy record is still on disk, and it is NOT translated a second time: the ledger
         // file's existence is the once-only fence.
         assert!(fixture::path(&state_dir).is_file());
-        let reopened = open(&state_dir, Harness::OpenCode);
+        let mut reopened = open(&state_dir, Harness::OpenCode);
         assert!(reopened.quarantined().is_none());
         assert!(
-            reopened.entries().is_empty(),
+            reopened.snapshot().unwrap().attempts().is_empty(),
             "a settled delivery is not resurrected by the record it was translated from"
         );
     }
@@ -484,15 +505,16 @@ mod tests {
         );
 
         // Rolling forward: the ledger file is present, so the seam does not fire.
-        let rolled_forward = open(&state_dir, Harness::Codex);
+        let mut rolled_forward = open(&state_dir, Harness::Codex);
         assert!(rolled_forward.quarantined().is_none());
+        let snapshot = rolled_forward.snapshot().unwrap();
         assert!(
-            rolled_forward.entry(FILE_A).is_none(),
+            snapshot.attempt(FILE_A).is_none(),
             "known limit: the once-only fence is the ledger file, not per-filename coverage"
         );
         assert_eq!(
-            rolled_forward.retry(FILE_A),
-            RetryDecision::Retry,
+            snapshot.authorization("thread-main", FILE_A),
+            Authorization::Permitted,
             "and so the attempt the old binary made is not held"
         );
     }
@@ -513,7 +535,13 @@ mod tests {
                 &correlate("thread-main", FILE_A),
             ),
         );
-        assert!(open(&other_dir, Harness::Codex).entries().is_empty());
+        assert!(
+            open(&other_dir, Harness::Codex)
+                .snapshot()
+                .unwrap()
+                .attempts()
+                .is_empty()
+        );
 
         let crossed = tempfile::tempdir().unwrap();
         let crossed_dir = crossed.path().join("state");
@@ -527,10 +555,10 @@ mod tests {
                 &correlate("ses_target", FILE_A),
             ),
         );
-        let ledger = open(&crossed_dir, Harness::Codex);
+        let mut ledger = open(&crossed_dir, Harness::Codex);
         assert!(ledger.quarantined().is_none());
         assert!(
-            ledger.entries().is_empty(),
+            ledger.snapshot().unwrap().attempts().is_empty(),
             "an OpenCode record is not a Codex delivery"
         );
 
@@ -572,9 +600,9 @@ mod tests {
             let state_dir = tmp.path().join("state");
             fs::create_dir_all(&state_dir).unwrap();
             fs::write(state_dir.join(LEGACY_FILE), &body).unwrap();
-            let ledger = open(&state_dir, Harness::Codex);
+            let mut ledger = open(&state_dir, Harness::Codex);
             assert!(ledger.quarantined().is_none());
-            assert!(ledger.entries().is_empty());
+            assert!(ledger.snapshot().unwrap().attempts().is_empty());
         }
     }
 }

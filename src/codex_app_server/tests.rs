@@ -13,6 +13,133 @@ fn stop_flag_tests() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
+/// The operator command path must refuse a tokenless Q35 entry without recovering, backfilling,
+/// or rewriting a byte — proved through the PUBLIC WRAPPER, because the wrapper is what picks the
+/// constructor. Building the ledger with `Ledger::open` there would run the ordinary transaction,
+/// whose loader backfills before any operation, and the rewrite would land on exactly the bytes
+/// the operator's digest precondition names. Only a wrapper-level test can see that mistake.
+#[test]
+fn the_operator_wrapper_refuses_a_tokenless_entry_without_touching_the_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let identity = "h.worker";
+    let binding = "thread-main";
+    let filename = "1786380000000-aaa111.md";
+
+    // A canonical v1 record a pre-token release left behind, at the exact path the wrapper
+    // resolves — plus its lock, which a driver that had ever run would have created.
+    let path = delivery_ledger_path(root, identity);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let correlation = delivery_correlation(identity, binding, filename);
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema": delivery_ledger::LEDGER_SCHEMA,
+            "harness": "codex",
+            "agent": identity,
+            "runtimeId": identity,
+            "entries": [{
+                "filename": filename,
+                "binding": binding,
+                "correlation": { "value": correlation },
+                "phase": "attempted",
+                "attestation": "asserted",
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(path.with_file_name(delivery_ledger::LEDGER_LOCK), b"").unwrap();
+
+    let before = fs::read(&path).unwrap();
+    assert_eq!(delivery_ledger::tokenless_entries(&path).unwrap(), 1);
+
+    let refusal = delivery_ledger::OperatorRefusal {
+        fence: delivery_ledger::Fence {
+            filename: filename.to_owned(),
+            binding: binding.to_owned(),
+            correlation: delivery_ledger::Correlation::native(correlation),
+            // The operator cannot know a token that was never minted, and must not be able to
+            // guess one into existence.
+            token: delivery_ledger::AttemptToken::mint().unwrap(),
+        },
+        audit: delivery_ledger::OperatorAudit::new(
+            delivery_ledger::OperatorSource::Operator,
+            unsafe { libc::geteuid() },
+            None,
+            None,
+            "tokenless",
+            delivery_ledger::LedgerDigest::of(&before),
+            1_786_380_000_000,
+        )
+        .unwrap(),
+    };
+    assert_eq!(
+        operator_refuse(root, identity, &refusal).unwrap(),
+        delivery_ledger::OperatorOutcome::UnknownAttempt
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the operator wrapper neither recovered nor backfilled"
+    );
+    assert_eq!(
+        delivery_ledger::tokenless_entries(&path).unwrap(),
+        1,
+        "the Q35 row is still tokenless after an operator refusal"
+    );
+
+    // And the difference really is the constructor: an ordinary provider open DOES tokenize it.
+    let _driver = delivery_ledger::Ledger::open(
+        &path,
+        delivery_ledger::Harness::Codex.profile(),
+        identity,
+        identity,
+        |thread, file| delivery_correlation("h.worker", thread, file),
+    );
+    assert_eq!(delivery_ledger::tokenless_entries(&path).unwrap(), 0);
+    assert_ne!(fs::read(&path).unwrap(), before);
+}
+
+/// The operator path creates nothing: a seat that never delivered has no ledger and no lock, and
+/// an operator command must fail rather than bring either into existence.
+#[test]
+fn the_operator_wrapper_never_initializes_a_seat_that_never_delivered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let identity = "h.worker";
+    let filename = "1786380000000-aaa111.md";
+    let binding = "thread-main";
+    let path = delivery_ledger_path(root, identity);
+
+    let refusal = delivery_ledger::OperatorRefusal {
+        fence: delivery_ledger::Fence {
+            filename: filename.to_owned(),
+            binding: binding.to_owned(),
+            correlation: delivery_ledger::Correlation::native(delivery_correlation(
+                identity, binding, filename,
+            )),
+            token: delivery_ledger::AttemptToken::mint().unwrap(),
+        },
+        audit: delivery_ledger::OperatorAudit::new(
+            delivery_ledger::OperatorSource::Operator,
+            unsafe { libc::geteuid() },
+            None,
+            None,
+            "nothing here",
+            delivery_ledger::LedgerDigest::of(b""),
+            1_786_380_000_000,
+        )
+        .unwrap(),
+    };
+    assert!(operator_refuse(root, identity, &refusal).is_err());
+    assert!(!path.exists(), "no ledger was created");
+    assert!(
+        !path.with_file_name(delivery_ledger::LEDGER_LOCK).exists(),
+        "no lock was created"
+    );
+}
+
 #[test]
 fn a_stop_during_the_websocket_handshake_ends_startup_gracefully() {
     let _stop_exclusive = stop_flag_tests();
@@ -1022,7 +1149,7 @@ fn inbox_delivery(root: &Path, config: CodexDeliveryConfig) -> CodexInboxDeliver
 
 /// Read the ledger back through its own loader and the real correlation derivation: a test
 /// that read the bytes directly would not notice a record the pump itself would refuse.
-fn ledger_entry(root: &Path, filename: &str) -> Option<delivery_ledger::Entry> {
+fn ledger_attempt(root: &Path, filename: &str) -> Option<delivery_ledger::Attempt> {
     delivery_ledger::Ledger::open(
         &root.join("state").join(delivery_ledger::LEDGER_FILE),
         delivery_ledger::Harness::Codex.profile(),
@@ -1030,8 +1157,23 @@ fn ledger_entry(root: &Path, filename: &str) -> Option<delivery_ledger::Entry> {
         "h.worker",
         |thread, file| stable_client_user_message_id("h.worker", thread, file),
     )
-    .entry(filename)
+    .snapshot()
+    .unwrap()
+    .attempt(filename)
     .cloned()
+}
+
+/// The pump's own view of one attempt, through the same transaction boundary it uses.
+fn own_attempt(
+    delivery: &mut CodexInboxDelivery,
+    filename: &str,
+) -> Option<delivery_ledger::Attempt> {
+    delivery
+        .ledger
+        .snapshot()
+        .unwrap()
+        .attempt(filename)
+        .cloned()
 }
 
 fn acknowledge_tui_thread_loaded(events: &Receiver<ControlEvent>) {
@@ -1268,8 +1410,7 @@ fn evidence_loss_marks_the_stream_discontinuous_for_a_restated_state() {
 
 #[test]
 fn delivery_client_id_is_stable_and_binds_every_identity_component() {
-    let id =
-        stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
+    let id = stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
     assert_eq!(
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md")
@@ -1294,8 +1435,7 @@ fn review_compaction_and_dnd_hold_the_unread_fifo_head() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [CodexHoldReason::Review, CodexHoldReason::Compaction] {
         let state = subscribed_state(CodexObservedState::Held {
@@ -1605,12 +1745,14 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
             )
             .unwrap()
     );
-    assert!(delivery
-        .accept_response(
-            &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
-            active.observed(),
-        )
-        .unwrap());
+    assert!(
+        delivery
+            .accept_response(
+                &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
+                active.observed(),
+            )
+            .unwrap()
+    );
     assert_eq!(delivery.maybe_request(&active).unwrap(), None);
     assert!(config.inbox.join(&filename).is_file());
 
@@ -1621,6 +1763,77 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
     assert_eq!(retry["method"], "turn/start");
     assert_eq!(retry["params"]["clientUserMessageId"], client_id);
     assert!(config.inbox.join(&filename).is_file());
+}
+
+#[test]
+fn operator_absence_stales_a_lost_pending_response_and_opens_one_fresh_attempt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let filename =
+        message::send_to_inbox(&config.inbox, "h.sender", Some("retry"), None, &[], "body")
+            .unwrap();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let idle = subscribed_state(CodexObservedState::Idle);
+    let first_request = delivery.maybe_request(&idle).unwrap().unwrap();
+    let first = own_attempt(&mut delivery, &filename).unwrap();
+    let refusal = delivery_ledger::OperatorRefusal {
+        fence: first.fence(),
+        audit: delivery_ledger::OperatorAudit::new(
+            delivery_ledger::OperatorSource::Operator,
+            unsafe { libc::geteuid() },
+            None,
+            None,
+            "JSON-RPC response was lost",
+            delivery.ledger.snapshot().unwrap().digest(),
+            1_786_380_000_000,
+        )
+        .unwrap(),
+    };
+    assert!(matches!(
+        delivery.ledger.operator_refuse(&refusal).unwrap(),
+        delivery_ledger::OperatorOutcome::Applied(_)
+    ));
+
+    let retry = delivery.maybe_request(&idle).unwrap().unwrap();
+    let second = own_attempt(&mut delivery, &filename).unwrap();
+    assert_ne!(second.token, first.token, "the retry needs a fresh fence");
+    assert_ne!(retry["id"], first_request["id"]);
+    assert_eq!(
+        retry["params"]["clientUserMessageId"],
+        first_request["params"]["clientUserMessageId"]
+    );
+}
+
+#[test]
+fn successful_ledger_read_clears_a_prior_delivery_unavailable_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    delivery.refresh_if_due().unwrap();
+    delivery._watcher = None;
+    while delivery.wake.try_recv().is_ok() {}
+    delivery.next_inbox_refresh = Instant::now() + INBOX_REFRESH_FALLBACK;
+    let ledger_path = tmp.path().join("state").join(delivery_ledger::LEDGER_FILE);
+    std::fs::write(&ledger_path, "not json").unwrap();
+    let idle = subscribed_state(CodexObservedState::Idle);
+
+    assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
+    let driver_diagnostic::Observed::Failure(failure) =
+        driver_diagnostic::read(&driver_diagnostic::path(&config.agent_dir))
+    else {
+        panic!("an unreadable ledger must publish delivery unavailable")
+    };
+    assert_eq!(
+        failure.reason,
+        driver_diagnostic::Reason::DeliveryUnavailable
+    );
+
+    std::fs::remove_file(&ledger_path).unwrap();
+    assert_eq!(delivery.maybe_request(&idle).unwrap(), None);
+    assert_eq!(
+        driver_diagnostic::read(&driver_diagnostic::path(&config.agent_dir)),
+        driver_diagnostic::Observed::Absent
+    );
 }
 
 #[test]
@@ -1640,7 +1853,7 @@ fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
     let idle = subscribed_state(CodexObservedState::Idle);
     let request = delivery.maybe_request(&idle).unwrap().unwrap();
     assert_eq!(
-        delivery.ledger.entry(&filename).unwrap().phase,
+        own_attempt(&mut delivery, &filename).unwrap().phase,
         delivery_ledger::Phase::Attempted,
         "submission ownership is durable before transport"
     );
@@ -1653,7 +1866,7 @@ fn a_success_response_is_only_an_attempt_and_does_not_archive_the_message() {
             .unwrap()
     );
     assert_eq!(
-        delivery.ledger.entry(&filename).unwrap().phase,
+        own_attempt(&mut delivery, &filename).unwrap().phase,
         delivery_ledger::Phase::TransportAccepted,
         "a well-formed JSON result is transport, never typed acceptance"
     );
@@ -1732,7 +1945,7 @@ fn only_a_completed_matching_user_message_persists_acceptance() {
             .unwrap()
     );
     assert_eq!(
-        ledger_entry(tmp.path(), &filename).unwrap().phase,
+        ledger_attempt(tmp.path(), &filename).unwrap().phase,
         delivery_ledger::Phase::Consumed
     );
     assert!(config.inbox.join(&filename).is_file());
@@ -1754,7 +1967,7 @@ fn only_a_completed_matching_user_message_persists_acceptance() {
     replacement.next_inbox_refresh = Instant::now();
     assert_eq!(replacement.maybe_request(&idle).unwrap(), None);
     assert!(
-        ledger_entry(tmp.path(), &filename).is_none(),
+        ledger_attempt(tmp.path(), &filename).is_none(),
         "archive precedence — the recipient agent's own act — releases the ledger entry"
     );
 }
@@ -1806,7 +2019,7 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
         )
         .unwrap();
     assert_eq!(
-        recovered.ledger.entry(&filename).unwrap().phase,
+        own_attempt(&mut recovered, &filename).unwrap().phase,
         delivery_ledger::Phase::Consumed,
         "a resumed history carrying the client ID is the same typed receipt, found late"
     );
@@ -1828,11 +2041,11 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
     )
     .unwrap();
     let mut attempted = inbox_delivery(absent_tmp.path(), absent_config.clone());
-    let absent_client_id = attempted.maybe_request(&idle).unwrap().unwrap()
-        ["params"]["clientUserMessageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let absent_client_id =
+        attempted.maybe_request(&idle).unwrap().unwrap()["params"]["clientUserMessageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
     drop(attempted);
 
     let mut replacement = inbox_delivery(absent_tmp.path(), absent_config);
@@ -1851,9 +2064,7 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
         )
         .unwrap();
     assert_eq!(
-        replacement
-            .ledger
-            .entry(&absent_filename)
+        own_attempt(&mut replacement, &absent_filename)
             .unwrap()
             .negative,
         Some(delivery_ledger::NegativeReceipt::Absent),
@@ -1862,7 +2073,6 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
     let retry = replacement.maybe_request(&idle).unwrap().unwrap();
     assert_eq!(retry["params"]["clientUserMessageId"], absent_client_id);
 }
-
 
 #[test]
 fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
@@ -1987,7 +2197,7 @@ fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
     pump.join().unwrap();
     assert!(delivery_config(tmp.path()).inbox.join(&filename).is_file());
     assert_eq!(
-        ledger_entry(tmp.path(), &filename).unwrap().phase,
+        ledger_attempt(tmp.path(), &filename).unwrap().phase,
         delivery_ledger::Phase::Consumed
     );
 }
@@ -2036,8 +2246,7 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
         // pump's read of the frame just written. Bounded, so a pump that stopped handing
         // frames to the producer fails this test instead of hanging it.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while harness_context::read(&harness_context::harness_context_path(&agent_dir))
-            .is_none()
+        while harness_context::read(&harness_context::harness_context_path(&agent_dir)).is_none()
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
@@ -2074,14 +2283,13 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
 
-    let observed = context_record(&tmp.path().join("agents/h/worker"))
-        .expect("the pump published nothing");
+    let observed =
+        context_record(&tmp.path().join("agents/h/worker")).expect("the pump published nothing");
     assert_eq!(observed.harness, harness_context::Harness::Codex);
     assert_eq!(observed.used_tokens, Some(92_283));
     assert_eq!(observed.window_tokens, Some(258_400));
     assert_eq!(observed.used_percent, Some(33.0));
 }
-
 
 #[test]
 fn control_initializes_before_recording_the_first_thread_only() {
@@ -2184,10 +2392,9 @@ fn control_initializes_before_recording_the_first_thread_only() {
         .unwrap()
         .unwrap();
     assert_eq!(binding.thread_id(), "thread-main");
-    let state =
-        load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
-            .unwrap()
-            .unwrap();
+    let state = load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         state.observed(),
         &CodexObservedState::Active {
@@ -2633,8 +2840,7 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
     assert_eq!(
-        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap())
-            .unwrap(),
+        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap()).unwrap(),
         prior_binding
     );
     assert!(!control_state_path.exists());
@@ -2932,8 +3138,7 @@ fn exiting_review_mode_mid_turn_restores_the_steerable_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
 
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3383,8 +3588,7 @@ fn persisted_control_state_is_bound_to_the_exact_runtime_incarnation() {
 
     let replacement = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let replacement_binding = CodexThreadBinding::new(&replacement, "thread-main".into());
-    let error =
-        load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
+    let error = load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
     assert!(error.to_string().contains("different runtime binding"));
 }
 
@@ -3570,11 +3774,8 @@ fn hook_preflight_uses_the_explicit_controlled_workspace() {
         fs::canonicalize(explicit).unwrap()
     );
     assert!(
-        authored_bypasses_hook_trust(&[
-            "--dangerously-bypass-hook-trust".into(),
-            "boot".into()
-        ])
-        .unwrap()
+        authored_bypasses_hook_trust(&["--dangerously-bypass-hook-trust".into(), "boot".into()])
+            .unwrap()
     );
     assert!(
         !authored_bypasses_hook_trust(&["--".into(), "--dangerously-bypass-hook-trust".into()])
@@ -3844,8 +4045,7 @@ fn a_killed_wrapper_reaps_its_app_server_and_the_next_launch_recovers_its_socket
 
 #[test]
 fn app_server_configuration_extraction_fails_closed_at_ambiguous_boundaries() {
-    let missing =
-        controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
+    let missing = controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
     assert!(missing.to_string().contains("has no value"));
 
     let unknown = controlled_app_server_args(
@@ -4170,8 +4370,7 @@ fn waiting_on_a_human_holds_the_exact_turn_and_releases_it_when_the_flag_clears(
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
-            .unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [
         CodexHoldReason::WaitingOnApproval,

@@ -3,7 +3,7 @@
 //! milestones; this is the smoke test that discovery works end to end against a real folder.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -219,9 +219,8 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 Some(_) => (None, first),
                 None => (first, second),
             };
-            let state = state.context(
-                "a desired state is required: `running`, `suspended`, or `retired`",
-            )?;
+            let state = state
+                .context("a desired state is required: `running`, `suspended`, or `retired`")?;
             anyhow::ensure!(
                 matches!(state.as_str(), "running" | "suspended" | "retired"),
                 "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
@@ -1017,6 +1016,36 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 &format!("{error:#}"),
             ),
         }
+        let delivery_provider = match spec.effective_session_driver() {
+            Some(st2::SessionDriver::Codex) => Some(LedgerProvider::Codex),
+            Some(st2::SessionDriver::OpenCode) => Some(LedgerProvider::OpenCode),
+            _ => None,
+        };
+        if let Some(provider) = delivery_provider {
+            match provider.observe(&catalog, &bus_id) {
+                Ok(st2::delivery_ledger::Observation::Absent) => {}
+                Ok(st2::delivery_ledger::Observation::Held(sighting))
+                    if sighting.tokenless == 0 => {}
+                Ok(st2::delivery_ledger::Observation::Held(sighting)) => report_advisory(
+                    &format!("{bus_id} tokenless delivery ledger (DELTA-007)"),
+                    &format!("tokenlessEntries={}", sighting.tokenless),
+                ),
+                Ok(st2::delivery_ledger::Observation::Indeterminate { reason, .. }) => {
+                    report_check(
+                        &mut problems,
+                        false,
+                        &format!("{bus_id} tokenless delivery ledger readable"),
+                        &reason,
+                    )
+                }
+                Err(error) => report_check(
+                    &mut problems,
+                    false,
+                    &format!("{bus_id} tokenless delivery ledger readable"),
+                    &format!("{error:#}"),
+                ),
+            }
+        }
         if spec.desired_state.is_retired() {
             let still_present = spec
                 .tasks
@@ -1644,11 +1673,12 @@ fn agents_cmd(
                 )
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}{}",
                 r.identity,
                 r.status.as_str(),
                 observed_column(r.observed.as_ref()),
                 context_column(r.context.as_ref()),
+                delivery_column(r.delivery.as_ref()),
                 r.name.as_deref().unwrap_or(""),
                 r.description.as_deref().unwrap_or(""),
                 lifecycle,
@@ -1704,6 +1734,19 @@ fn context_column(context: Option<&st2::harness_context::Observed>) -> String {
         column.push_str(" stale");
     }
     format!("ctx:{column}")
+}
+fn delivery_column(delivery: Option<&st2::agents::Delivery>) -> String {
+    match delivery {
+        None => "delivery:-".to_owned(),
+        Some(st2::agents::Delivery::Absent) => "delivery:absent".to_owned(),
+        Some(st2::agents::Delivery::Idle) => "delivery:idle".to_owned(),
+        Some(st2::agents::Delivery::Held { reason, .. }) => {
+            format!("delivery:held({})", reason.as_str())
+        }
+        Some(st2::agents::Delivery::Indeterminate { reason, .. }) => {
+            format!("delivery:indeterminate({reason})")
+        }
+    }
 }
 
 fn ding_cmd(
@@ -1985,6 +2028,220 @@ fn box_target(
     }
 }
 
+#[derive(Clone, Copy)]
+enum LedgerProvider {
+    Codex,
+    OpenCode,
+}
+
+impl LedgerProvider {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    fn observe(self, root: &Path, identity: &str) -> Result<st2::delivery_ledger::Observation> {
+        match self {
+            Self::Codex => st2::codex_app_server::observe_delivery(root, identity),
+            Self::OpenCode => st2::opencode_session::observe_delivery(root, identity),
+        }
+    }
+
+    fn refuse(
+        self,
+        root: &Path,
+        identity: &str,
+        refusal: &st2::delivery_ledger::OperatorRefusal,
+    ) -> Result<st2::delivery_ledger::OperatorOutcome> {
+        match self {
+            Self::Codex => st2::codex_app_server::operator_refuse(root, identity, refusal),
+            Self::OpenCode => st2::opencode_session::operator_refuse(root, identity, refusal),
+        }
+    }
+}
+
+fn delivery_target(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+) -> Result<(String, LedgerProvider)> {
+    let found = st2::discover_strict(root);
+    if !found.errors.is_empty() {
+        let errors = found
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path.display(), error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "cannot select a delivery ledger while catalog discovery has {} error(s): {errors}",
+            found.errors.len()
+        );
+    }
+    let entries = st2::identity::address_book(&found.specs, host);
+    let selected = st2::identity::resolve_local_first(&entries, &selector, host)?;
+    let spec = found
+        .specs
+        .iter()
+        .find(|spec| spec.effective_id(host) == selected.id)
+        .context("the selected delivery target left the discovery snapshot")?;
+    anyhow::ensure!(
+        spec.resolved_host(host) == host,
+        "delivery ledger for '{}' belongs to host '{}', not this host",
+        spec.bus_id(host),
+        spec.resolved_host(host)
+    );
+    let provider = match spec.effective_session_driver() {
+        Some(st2::SessionDriver::Codex) => LedgerProvider::Codex,
+        Some(st2::SessionDriver::OpenCode) => LedgerProvider::OpenCode,
+        Some(driver) => anyhow::bail!("{} has not adopted the delivery ledger", driver.as_str()),
+        None => anyhow::bail!("agent '{}' has no native session driver", spec.bus_id(host)),
+    };
+    Ok((spec.bus_id(host), provider))
+}
+
+const DELIVERY_NEGATIVE_SCHEMA: &str = "st2.delivery-negative.v1";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryNegativeReceipt<'a> {
+    schema: &'static str,
+    outcome: &'static str,
+    agent: &'a str,
+    harness: &'static str,
+    filename: &'a str,
+    attempt_token: String,
+    ledger_sha256: String,
+    phase: &'static str,
+    uid: u32,
+    pid: u32,
+    st_agent: Option<&'a str>,
+    reason: &'a str,
+    observed_at_ms: u64,
+}
+
+fn delivery_phase(phase: st2::delivery_ledger::Phase) -> &'static str {
+    match phase {
+        st2::delivery_ledger::Phase::Attempted => "attempted",
+        st2::delivery_ledger::Phase::TransportAccepted => "transportAccepted",
+        st2::delivery_ledger::Phase::Persisted => "persisted",
+        st2::delivery_ledger::Phase::Consumed => "consumed",
+    }
+}
+
+fn delivery_negative_cmd(
+    root: &Path,
+    host: &str,
+    selector: st2::identity::AgentSelector,
+    filename: &str,
+    attempt_token: &str,
+    ledger_sha256: &str,
+    reason: &str,
+    json: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        message::is_message_filename(filename),
+        "delivery-negative requires a canonical inbox message filename"
+    );
+    let token = st2::delivery_ledger::AttemptToken::parse(attempt_token)?;
+    let digest = st2::delivery_ledger::LedgerDigest::parse(ledger_sha256)?;
+    let (identity, provider) = delivery_target(root, host, selector)?;
+    let sighting = match provider.observe(root, &identity)? {
+        st2::delivery_ledger::Observation::Absent => {
+            anyhow::bail!("agent '{identity}' has no delivery ledger")
+        }
+        st2::delivery_ledger::Observation::Indeterminate { .. } => {
+            anyhow::bail!("agent '{identity}' has an indeterminate delivery ledger")
+        }
+        st2::delivery_ledger::Observation::Held(sighting) => sighting,
+    };
+    let attempt = sighting
+        .attempts
+        .iter()
+        .find(|attempt| attempt.filename == filename)
+        .with_context(|| {
+            format!("delivery ledger for '{identity}' has no attempt for '{filename}'")
+        })?;
+    anyhow::ensure!(
+        attempt.token.is_some(),
+        "delivery attempt '{filename}' is tokenless; run the owning provider to complete the bounded backfill"
+    );
+    let uid = unsafe { libc::geteuid() };
+    let pid = std::process::id();
+    let st_agent = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("system time does not fit in u64 milliseconds")?;
+    let audit = st2::delivery_ledger::OperatorAudit::new(
+        st2::delivery_ledger::OperatorSource::Operator,
+        uid,
+        Some(pid),
+        st_agent.clone(),
+        reason,
+        digest,
+        observed_at_ms,
+    )?;
+    let refusal = st2::delivery_ledger::OperatorRefusal {
+        fence: st2::delivery_ledger::Fence {
+            filename: filename.to_owned(),
+            binding: attempt.binding.clone(),
+            correlation: attempt.correlation.clone(),
+            token,
+        },
+        audit,
+    };
+    let applied = match provider.refuse(root, &identity, &refusal)? {
+        st2::delivery_ledger::OperatorOutcome::Applied(attempt) => attempt,
+        st2::delivery_ledger::OperatorOutcome::StaleDigest { observed } => {
+            anyhow::bail!("delivery ledger changed: expected {digest}, observed {observed}")
+        }
+        st2::delivery_ledger::OperatorOutcome::UnknownAttempt => {
+            anyhow::bail!("delivery attempt token or correlation is stale")
+        }
+        st2::delivery_ledger::OperatorOutcome::AlreadySettled(_) => {
+            anyhow::bail!("delivery attempt is already settled")
+        }
+        st2::delivery_ledger::OperatorOutcome::AlreadyRefused(_) => {
+            anyhow::bail!("delivery attempt already has exact negative evidence")
+        }
+    };
+    let receipt = DeliveryNegativeReceipt {
+        schema: DELIVERY_NEGATIVE_SCHEMA,
+        outcome: "applied",
+        agent: &identity,
+        harness: provider.name(),
+        filename,
+        attempt_token: applied.token.hex(),
+        ledger_sha256: digest.hex(),
+        phase: delivery_phase(applied.phase),
+        uid,
+        pid,
+        st_agent: st_agent.as_deref(),
+        reason: applied
+            .audit
+            .as_ref()
+            .map(|audit| audit.reason.as_str())
+            .unwrap_or(reason.trim()),
+        observed_at_ms,
+    };
+    if json {
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else {
+        println!(
+            "recorded operator absence for {} {} (attempt {})",
+            identity, filename, receipt.attempt_token
+        );
+    }
+    Ok(())
+}
+
 fn message_cmd(cmd: MessageCmd) -> Result<()> {
     match cmd {
         MessageCmd::Send {
@@ -2071,10 +2328,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_route(&root, &host, &ctx)?,
             };
-            let mut view =
-                message::with_resolved_agent_dir(&root, &route_selector(&id), &host, |agent_dir| {
-                message::list_sent(agent_dir, include_body)
-            })?;
+            let mut view = message::with_resolved_agent_dir(
+                &root,
+                &route_selector(&id),
+                &host,
+                |agent_dir| message::list_sent(agent_dir, include_body),
+            )?;
             if let Some(recipient) = &to {
                 view.messages.retain(|message| message.to == *recipient);
             }
@@ -2226,6 +2485,37 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
             println!("archived");
             Ok(())
         }
+        MessageCmd::DeliveryNegative {
+            first,
+            second,
+            agent_id,
+            attempt_token,
+            ledger_sha256,
+            reason,
+            json,
+            ctx,
+        } => {
+            let (root, host) = resolve_ctx(&ctx)?;
+            let (selector, filename) = match agent_id {
+                Some(id) => (st2::identity::AgentSelector::Id(id), first),
+                None => (
+                    st2::identity::AgentSelector::Address(first),
+                    second.context(
+                        "delivery-negative requires an agent reference and message filename",
+                    )?,
+                ),
+            };
+            delivery_negative_cmd(
+                &root,
+                &host,
+                selector,
+                &filename,
+                &attempt_token,
+                &ledger_sha256,
+                &reason,
+                json,
+            )
+        }
         MessageCmd::Thread {
             first,
             second,
@@ -2304,8 +2594,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let recipient =
-                resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
+            let recipient = resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,

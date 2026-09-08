@@ -478,10 +478,15 @@ enum CodexDeliveryMethod {
     Steer { turn_id: String },
 }
 
+/// One outstanding transport, and the exact ledger attempt it is allowed to settle.
+///
+/// The fence is carried rather than re-derived: a response that arrived after the attempt was
+/// pruned, retargeted, or re-claimed must land on nothing, and only the token the permit returned
+/// can say that.
 #[derive(Debug, Clone)]
 struct PendingCodexDelivery {
     request_id: u64,
-    filename: String,
+    fence: delivery_ledger::Fence,
     method: CodexDeliveryMethod,
 }
 
@@ -564,13 +569,14 @@ impl CodexInboxDelivery {
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs(&config.agent_dir, wake_tx);
-        let identity = config.identity.clone();
+        // The same derivation `observe_delivery` binds, so the live pump and every read-only
+        // reader agree on what makes a record this agent's.
         let ledger = delivery_ledger::Ledger::open(
             &ledger_path,
             delivery_ledger::Harness::Codex.profile(),
             &config.identity,
             runtime.runtime_id(),
-            |thread, filename| stable_client_user_message_id(&identity, thread, filename),
+            delivery_correlate(&config.identity),
         );
         // The pty session whose liveness vouches for the record is the wrapper's task: the
         // runtime ID names the pty registry entry, and only aliases the identity on
@@ -729,9 +735,24 @@ impl CodexInboxDelivery {
     /// Reconcile the ledger to what the recipient still has unread. Archive precedence is the
     /// recipient agent's act and the only settlement authority: an entry whose file left the inbox
     /// releases ownership, and this pump never moves a file.
+    ///
+    /// Only attempts THIS listing saw are candidates, and each is named by its exact token, so a
+    /// listing that raced a newer claim for the same filename cannot delete it.
     fn reconcile_inbox(&mut self, unread: &[message::Message]) -> Result<()> {
-        self.ledger
-            .prune(|filename| unread.iter().any(|message| message.filename == filename))
+        let settled: Vec<delivery_ledger::Fence> = self
+            .ledger
+            .snapshot()?
+            .attempts()
+            .iter()
+            .filter(|attempt| {
+                !unread
+                    .iter()
+                    .any(|message| message.filename == attempt.filename)
+            })
+            .map(delivery_ledger::Attempt::fence)
+            .collect();
+        self.ledger.prune(&settled)?;
+        Ok(())
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -776,7 +797,7 @@ impl CodexInboxDelivery {
 
     fn maybe_request(&mut self, state: &CodexControlState) -> Result<Option<Value>> {
         self.refresh_if_due()?;
-        if self.pending.is_some() || !state.subscribed || self.suppressed {
+        if !state.subscribed || self.suppressed {
             return Ok(None);
         }
         // Fail closed: an unreadable ledger holds and surfaces rather than guessing. It never
@@ -784,23 +805,49 @@ impl CodexInboxDelivery {
         // The operator-visible surface is the existing typed boundary — the transport is
         // unavailable — and the raw reason stays in tracing, so no unbounded prose reaches the
         // record. Restating it is coalesced by the publisher, so a held pass costs no write.
-        if let Some(reason) = self.ledger.quarantined().map(str::to_string) {
-            tracing::warn!("st2 codex: delivery ledger is quarantined: {reason}");
-            self.diagnostics.publish(
-                driver_diagnostic::Stage::Delivery,
-                driver_diagnostic::Reason::DeliveryUnavailable,
-                driver_diagnostic::Source::PromptTransport,
-            );
-            return Ok(None);
+        //
+        // The verdict comes from a real transaction: the bytes are re-read under the lock on
+        // every pass, so a record repaired out of band recovers by itself and a broken one keeps
+        // refusing.
+        let snapshot = match self.ledger.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!("st2 codex: delivery ledger is unreadable: {error:#}");
+                self.diagnostics.publish(
+                    driver_diagnostic::Stage::Delivery,
+                    driver_diagnostic::Reason::DeliveryUnavailable,
+                    driver_diagnostic::Source::PromptTransport,
+                );
+                return Ok(None);
+            }
+        };
+        self.diagnostics.clear(driver_diagnostic::Stage::Delivery);
+        if let Some(pending) = self.pending.as_ref() {
+            let still_waiting = snapshot
+                .attempt(&pending.fence.filename)
+                .is_some_and(|attempt| {
+                    attempt.fence() == pending.fence
+                        && attempt.negative.is_none()
+                        && snapshot.retention(&pending.fence.filename)
+                            != delivery_ledger::Retention::Release
+                });
+            if still_waiting {
+                return Ok(None);
+            }
+            // A negative receipt, settlement, prune, or newer token makes this in-memory request
+            // stale. The ledger is authoritative; keeping the stale request pending would prevent
+            // the fresh claim that an operator refusal deliberately authorizes.
+            self.pending = None;
         }
         // A newly selected thread is a different delivery binding. An old binding's receipt must
-        // neither suppress nor acknowledge delivery to this thread.
-        if self
-            .ledger
+        // neither suppress nor acknowledge delivery to this thread — but an ambiguous attempt on
+        // the old thread MAY have landed, so retargeting keeps it and the claim below holds
+        // rather than delivering the same message twice.
+        if snapshot
             .binding()
             .is_some_and(|binding| binding != state.thread_id())
         {
-            self.ledger.rebind(state.thread_id())?;
+            self.ledger.retarget(state.thread_id())?;
         }
         let Some(head) = self.head.clone() else {
             return Ok(None);
@@ -808,18 +855,6 @@ impl CodexInboxDelivery {
         if self.rejected.as_ref().is_some_and(|rejected| {
             rejected.filename == head.filename && rejected.observed == state.observed
         }) {
-            return Ok(None);
-        }
-        // Exactly one delivery is outstanding at a time on this transport: an entry bound to some
-        // other file holds the pump until archive precedence resolves it, so a message arriving
-        // out of filename order can never open a second concurrent delivery.
-        if !self.ledger.entries().is_empty() && self.ledger.entry(&head.filename).is_none() {
-            return Ok(None);
-        }
-        // An attempt this pump already owns is held until evidence settles or refuses it. Only an
-        // authoritative "no" — a rejected request, or resumed history proving the client ID never
-        // landed — authorizes sending the same identity again.
-        if self.ledger.retry(&head.filename) != delivery_ledger::RetryDecision::Retry {
             return Ok(None);
         }
         let method = match &state.observed {
@@ -833,14 +868,28 @@ impl CodexInboxDelivery {
                 return Ok(None);
             }
         };
+        let client_id =
+            stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
+        // ONE act authorizes and durably opens the attempt. FIFO one-at-a-time discipline, the
+        // ambiguous-attempt hold, and the foreign-binding hold all live in the ledger core now:
+        // this pump asks once and either receives a permit or is told why not.
+        let permit = match self.ledger.claim(delivery_ledger::Claimant {
+            filename: head.filename.clone(),
+            binding: state.thread_id().to_string(),
+            correlation: delivery_ledger::Correlation::native(client_id.clone()),
+            // Codex's typed receipt is a live frame, so an attempt is acknowledged only by the
+            // incarnation that made it; an older one is settled by the resume sweep instead.
+            incarnation: Some(self.runtime.incarnation().to_string()),
+        })? {
+            delivery_ledger::Claim::Permitted(permit) => permit,
+            delivery_ledger::Claim::Held(_) => return Ok(None),
+        };
+        // The request id is allocated only once the attempt exists, so a held pass burns none.
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
             .checked_add(1)
             .context("Codex delivery request ID overflow")?;
-        let client_id =
-            stable_client_user_message_id(&self.config.identity, state.thread_id(), &head.filename);
-        let filename = head.filename.clone();
         let text = ding::poke_text(
             &self.config.catalog_root,
             &self.config.this_host,
@@ -849,18 +898,9 @@ impl CodexInboxDelivery {
         );
         let request =
             codex_delivery_request(request_id, state.thread_id(), &client_id, &text, &method);
-        // Durable ownership lands before transport.
-        self.ledger.begin(delivery_ledger::Begin {
-            filename: filename.clone(),
-            binding: state.thread_id().to_string(),
-            correlation: delivery_ledger::Correlation::native(client_id.clone()),
-            // Codex's typed receipt is a live frame, so an attempt is acknowledged only by the
-            // incarnation that made it; an older one is settled by the resume sweep instead.
-            incarnation: Some(self.runtime.incarnation().to_string()),
-        })?;
         self.pending = Some(PendingCodexDelivery {
             request_id,
-            filename,
+            fence: permit.fence(),
             method,
         });
         Ok(Some(request))
@@ -882,13 +922,13 @@ impl CodexInboxDelivery {
         if message.get("error").is_some() {
             // The request itself was refused: an authoritative negative acknowledgement about
             // this attempt, and the only thing that re-authorizes the same client ID here. A
-            // delivery that already reached its ceiling cannot be un-settled by a late error.
-            self.ledger.negative(
-                &pending.filename,
-                delivery_ledger::NegativeReceipt::Rejected,
-            )?;
+            // delivery that already reached its ceiling cannot be un-settled by a late error,
+            // and a `Stale` return means the attempt this response describes is already gone —
+            // in which case there is nothing to refuse.
+            self.ledger
+                .negative(&pending.fence, delivery_ledger::NegativeReceipt::Rejected)?;
             self.rejected = Some(RejectedCodexDelivery {
-                filename: pending.filename,
+                filename: pending.fence.filename,
                 observed: observed.clone(),
             });
             return Ok(true);
@@ -907,10 +947,8 @@ impl CodexInboxDelivery {
         }
         // The request returned a well-formed result. That is a fact about the call, never about
         // the model, so it grades no higher than `transportAccepted`.
-        self.ledger.record(
-            &pending.filename,
-            delivery_ledger::Evidence::TransportAccepted,
-        )?;
+        self.ledger
+            .record(&pending.fence, delivery_ledger::Evidence::TransportAccepted)?;
         self.rejected = None;
         Ok(true)
     }
@@ -932,25 +970,26 @@ impl CodexInboxDelivery {
         {
             return Ok(false);
         }
-        // One correlation may carry several inbox files, so one typed receipt settles every entry
-        // it delivered — each on its own monotone entry.
-        let settled: Vec<String> = self
+        // One correlation may carry several inbox files, so one typed receipt settles every
+        // attempt it delivered — each on its own monotone entry, each named by its exact token so
+        // a receipt cannot settle an attempt that was re-claimed while the frame was in flight.
+        let settled: Vec<delivery_ledger::Fence> = self
             .ledger
+            .snapshot()?
             .correlated(client_id)
             .into_iter()
-            .filter(|filename| {
-                self.ledger.entry(filename).is_some_and(|entry| {
-                    entry.binding == state.thread_id()
-                        && entry.incarnation.as_deref() == Some(self.runtime.incarnation())
-                })
+            .filter(|attempt| {
+                attempt.binding == state.thread_id()
+                    && attempt.incarnation.as_deref() == Some(self.runtime.incarnation())
             })
+            .map(delivery_ledger::Attempt::fence)
             .collect();
         if settled.is_empty() {
             return Ok(false);
         }
-        for filename in &settled {
+        for fence in &settled {
             self.ledger
-                .record(filename, delivery_ledger::Evidence::Consumed)?;
+                .record(fence, delivery_ledger::Evidence::Consumed)?;
         }
         Ok(true)
     }
@@ -961,15 +1000,16 @@ impl CodexInboxDelivery {
         if message.get("error").is_some() {
             return Ok(());
         }
-        let unsettled: Vec<(String, String)> = self
+        let unsettled: Vec<delivery_ledger::Fence> = self
             .ledger
-            .entries()
+            .snapshot()?
+            .attempts()
             .iter()
-            .filter(|entry| {
-                entry.binding == state.thread_id()
-                    && entry.phase < delivery_ledger::Phase::Consumed
+            .filter(|attempt| {
+                attempt.binding == state.thread_id()
+                    && attempt.phase < delivery_ledger::Phase::Consumed
             })
-            .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
+            .map(delivery_ledger::Attempt::fence)
             .collect();
         if unsettled.is_empty() {
             return Ok(());
@@ -980,7 +1020,7 @@ impl CodexInboxDelivery {
             .context(
                 "Codex thread/resume response has no typed turn history for delivery recovery",
             )?;
-        for (filename, client_id) in unsettled {
+        for fence in unsettled {
             let accepted = turns.iter().any(|turn| {
                 turn.get("items")
                     .and_then(Value::as_array)
@@ -988,19 +1028,19 @@ impl CodexInboxDelivery {
                         items.iter().any(|item| {
                             item.get("type").and_then(Value::as_str) == Some("userMessage")
                                 && item.get("clientId").and_then(Value::as_str)
-                                    == Some(client_id.as_str())
+                                    == Some(fence.correlation.value.as_str())
                         })
                     })
             });
             if accepted {
                 self.ledger
-                    .record(&filename, delivery_ledger::Evidence::Consumed)?;
+                    .record(&fence, delivery_ledger::Evidence::Consumed)?;
             } else {
                 // An authoritative resumed history without the client ID proves the pre-crash
                 // attempt never landed. That absence is the receipt — retained, not erased —
                 // and only it may authorize sending the same stable ID again.
                 self.ledger
-                    .negative(&filename, delivery_ledger::NegativeReceipt::Absent)?;
+                    .negative(&fence, delivery_ledger::NegativeReceipt::Absent)?;
             }
         }
         Ok(())
@@ -2530,8 +2570,7 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_ledger_path =
-            control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
+        let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
@@ -2915,6 +2954,68 @@ fn state_dir_in(base: &Path, catalog_root: &Path, identity: &str) -> PathBuf {
         .join(runtime_key(catalog_root, identity))
 }
 
+// ---- delivery observation ---------------------------------------------------------------------
+//
+// The Codex half of the provider seam. Everything a joining reader — the roster, the operator CLI
+// — needs about this driver's delivery state is reachable from a catalog root and an identity,
+// and NOTHING out there derives `clientUserMessageId` itself: a second derivation of a
+// correlation is a second answer to "is this record ours", and the ledger fails closed on the
+// wrong one.
+
+/// This seat's canonical delivery ledger: a sibling of the Codex control state.
+pub fn delivery_ledger_path(catalog_root: &Path, identity: &str) -> PathBuf {
+    state_dir(catalog_root, identity).join(delivery_ledger::LEDGER_FILE)
+}
+
+/// The exact correlation the Codex transport uses for one delivery: its `clientUserMessageId`.
+///
+/// Public so a joining reader or a test fixture never reimplements the derivation. Reimplementing
+/// it is not a style question: the ledger validates every row against this function, so a second
+/// spelling produces a record the driver itself refuses.
+pub fn delivery_correlation(identity: &str, thread_id: &str, filename: &str) -> String {
+    stable_client_user_message_id(identity, thread_id, filename)
+}
+
+/// The exact correlation derivation the Codex transport uses, bound to one recipient.
+fn delivery_correlate(identity: &str) -> impl Fn(&str, &str) -> String + Send + Sync + 'static {
+    let owner = identity.to_string();
+    move |thread, filename| stable_client_user_message_id(&owner, thread, filename)
+}
+
+/// Read this seat's delivery state without recovering, backfilling, or writing anything.
+pub fn observe_delivery(
+    catalog_root: &Path,
+    identity: &str,
+) -> Result<delivery_ledger::Observation> {
+    delivery_ledger::observe(
+        &delivery_ledger_path(catalog_root, identity),
+        delivery_ledger::Harness::Codex.profile(),
+        identity,
+        &delivery_correlate(identity),
+    )
+}
+
+/// Record correlated absence for one attempt on this seat, on an operator's authority.
+///
+/// It transports nothing, starts no driver, and — via `Ledger::for_operator` rather than
+/// `Ledger::open` — runs NO transaction on construction. `open` would recover the legacy record
+/// and perform the Q35 backfill before the operator's digest precondition was ever checked, which
+/// would rewrite the exact bytes that precondition names. Everything this path touches is inside
+/// `operator_refuse`'s own strictly ordered lock.
+pub fn operator_refuse(
+    catalog_root: &Path,
+    identity: &str,
+    refusal: &delivery_ledger::OperatorRefusal,
+) -> Result<delivery_ledger::OperatorOutcome> {
+    delivery_ledger::Ledger::for_operator(
+        &delivery_ledger_path(catalog_root, identity),
+        delivery_ledger::Harness::Codex.profile(),
+        identity,
+        delivery_correlate(identity),
+    )
+    .operator_refuse(refusal)
+}
+
 fn socket_path(catalog_root: &Path, identity: &str) -> Result<PathBuf> {
     let key = runtime_key(catalog_root, identity);
     let preferred = std::env::var_os("XDG_RUNTIME_DIR")
@@ -2960,11 +3061,8 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
     // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
     // claim for the next runtime to trip over.
-    match crate::flock::FileLock::hold(
-        file,
-        crate::flock::Mode::Exclusive,
-        crate::flock::Wait::Now,
-    ) {
+    match crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)
+    {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(anyhow::anyhow!(
             "Codex runtime already has an owner at {}",
@@ -3012,10 +3110,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 #[cfg(test)]
-fn load_current_binding(
-    path: &Path,
-    runtime: &CodexRuntime,
-) -> Result<Option<CodexThreadBinding>> {
+fn load_current_binding(path: &Path, runtime: &CodexRuntime) -> Result<Option<CodexThreadBinding>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
