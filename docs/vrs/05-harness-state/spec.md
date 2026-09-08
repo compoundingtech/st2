@@ -233,6 +233,42 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
 | `Held { UnknownStatus }` | *withhold* | — | — | an unrecognized future status is not a terminal `systemError` and cannot authorize delivery |
 
+### Cold start, and what the thread binding is actually for
+
+st2 owns a persistent Codex thread binding — `st2.codex-thread-binding.v1`, one
+per (catalog root, identity) — **because the thread IS the delivery address**:
+native delivery cannot infer a thread from cwd, process, PTY or `thread/list`,
+so st2 has to know which thread belongs to a seat in order to put a message in
+front of it. Reopening that thread on every relaunch was a side effect of
+needing a stable target, not a decision anybody made about context.
+
+The side effect is visible: after one machine restart, seven Claude seats came
+back at 8-15% context and three Codex seats came back at 68, 79 and 18, holding
+the previous day's conversation. Every seat had been told its session was ending
+and to write durable notes. For three of them it did not end, and an agent that
+remembers can act on a rule it remembers rather than the corrected file it was
+told to read.
+
+**So cold start is the default, and `resume #true` in the `codex {}` block is
+the opt-in.** Clearing the context never means forgetting the binding — that
+would leave the seat unaddressable. It means not REOPENING the thread the
+binding names: with no thread selected the wrapper binds whatever thread the TUI
+starts and rewrites the binding to name it. That is not a new code path. It is
+the path every seat has always taken on its first launch, and delivery is
+unaffected either way because it addresses whatever thread the binding names
+now.
+
+**One consequence belongs to whoever opts in.** A resume that fails is fatal to
+the launch, with no fallback to a fresh thread: an unreadable or foreign
+`binding.json` fails before the app-server starts, a rejected `thread/resume`
+fails as `rejected control thread/resume`, and a resume whose rollout Codex no
+longer holds fails as `saved Codex resume binding has no persisted rollout`
+(`missing_saved_rollout_fails_without_rebinding_the_incarnation`). That is
+fail-closed at admission, consistent with the protocol gate, and it means a seat
+that opted in cannot start once its thread ages out of Codex's storage. Whether
+a failed resume should instead fall back to a fresh thread with a loud
+diagnostic is a policy question this change deliberately does not answer.
+
 ### The turn-failure axis (the `error` notification)
 
 Three of the rows above are reached only by a turn that ENDS. `error` is the
@@ -672,6 +708,13 @@ each only once a real test proves it (per `CLAUDE.md`):
   and bounded telemetry labels are proved by focused unit/integration tests in
   `src/driver_diagnostic.rs`, `src/opencode_session.rs`, `src/agents.rs`,
   `src/metrics.rs`, and `tests/doctor.rs`.
+- **Codex cold starts unless it asked to resume** — `resume` defaults off,
+  renders the wrapper flag only when declared, is refused on every other
+  provider, and never disturbs the binding either way. Proved in
+  `src/codex_app_server/tests.rs::a_seat_that_did_not_ask_to_resume_reopens_nothing_and_still_keeps_its_binding`,
+  `src/driver.rs::codex_renders_the_resume_flag_only_when_the_seat_asked_for_it`,
+  and `crates/agent-spec/tests/discovery.rs::typed_driver_blocks_lower_with_kdl_toml_and_json_parity`
+  plus its unsupported-field sibling.
 - **A refused turn names its cause on both records** — the `error` notification
   is read, classified into the closed `turn` vocabulary, and cleared only by
   positive recovery; the credential stage still outranks it and a human ask

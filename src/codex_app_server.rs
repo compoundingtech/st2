@@ -1664,6 +1664,7 @@ pub fn run_controlled(
     catalog_root: &Path,
     identity: String,
     runtime_id: String,
+    resume: bool,
     codex_argv: Vec<String>,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -1692,6 +1693,7 @@ pub fn run_controlled(
         &state_dir,
         identity,
         runtime_id,
+        resume,
         codex_argv,
         delivery,
         &mut diagnostics,
@@ -1720,6 +1722,7 @@ fn run_controlled_owned(
     state_dir: &Path,
     identity: String,
     runtime_id: String,
+    resume: bool,
     codex_argv: Vec<String>,
     delivery: CodexDeliveryConfig,
     diagnostics: &mut WrapperDiagnostics,
@@ -1730,7 +1733,13 @@ fn run_controlled_owned(
     // resets the flag, so this must also run exactly once per launch.)
     crate::provider_session::install_signal_handler();
     let binding_path = state_dir.join("binding.json");
-    let resume_thread = load_resume_thread(&binding_path, &identity, &runtime_id)?;
+    // Cold start is the default, and it is the SAME path this seat took on its very first launch:
+    // with no thread selected the wrapper binds whatever thread the TUI starts and writes the
+    // binding for it. The binding is never forgotten — it is the delivery address, and native
+    // delivery cannot infer a thread from cwd, process, PTY or `thread/list` — it is simply
+    // rewritten to name the new thread. Reading it back is what carried yesterday's conversation
+    // into today's session, and that is the only thing `resume` now controls.
+    let resume_thread = selected_resume_thread(resume, &binding_path, &identity, &runtime_id)?;
 
     let socket_path = socket_path(catalog_root, &identity)?;
     let socket_dir = socket_path
@@ -1747,6 +1756,7 @@ fn run_controlled_owned(
         "runtimePublished",
         json!({
             "runtimeIncarnation": runtime.incarnation(),
+            "resumeDeclared": resume,
             "resumeSelected": resume_thread.is_some(),
         }),
     )?;
@@ -3283,6 +3293,30 @@ fn load_current_control_state(
         "Codex control state belongs to a different runtime binding"
     );
     Ok(Some(state))
+}
+
+/// Which thread this launch reopens, if any.
+///
+/// Cold start is the default and is the SAME path this seat took on its very first launch: with no
+/// thread selected the wrapper binds whatever thread the TUI starts and writes the binding for it.
+/// The binding is never forgotten — it is the delivery address, because native delivery cannot
+/// infer a thread from cwd, process, PTY or `thread/list` — it is rewritten to name the new thread.
+/// Reading it back is what carried yesterday's conversation into today's session, and it is the
+/// only thing `resume` controls.
+///
+/// Not reading it also means not FAILING on it. A binding this build cannot use is fatal to a
+/// launch that wants to resume, and irrelevant to one that does not, so a seat that opted out
+/// starts normally over a binding left by an older schema or a renamed runtime.
+fn selected_resume_thread(
+    resume: bool,
+    binding_path: &Path,
+    identity: &str,
+    runtime_id: &str,
+) -> Result<Option<String>> {
+    if !resume {
+        return Ok(None);
+    }
+    load_resume_thread(binding_path, identity, runtime_id)
 }
 
 fn load_resume_thread(path: &Path, agent: &str, runtime_id: &str) -> Result<Option<String>> {

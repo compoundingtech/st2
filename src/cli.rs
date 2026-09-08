@@ -339,6 +339,9 @@ pub(crate) enum DriverCmd {
         identity: String,
         #[arg(long)]
         runtime_id: String,
+        /// Reopen the thread this seat was last bound to instead of starting a new one.
+        #[arg(long)]
+        resume: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },

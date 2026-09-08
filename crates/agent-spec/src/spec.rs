@@ -253,11 +253,23 @@ pub struct PiDriver {
 }
 
 /// Typed fields accepted by a `codex {}` driver block.
+///
+/// `resume` is the one axis no other provider has, and it defaults to OFF. st2 owns a persistent
+/// Codex thread binding because native delivery cannot infer a thread from cwd, process, PTY or
+/// `thread/list` — the thread IS the delivery address — and resuming that thread on every relaunch
+/// was a side effect of needing a stable one. The side effect is that a Codex seat comes back
+/// holding yesterday's conversation while every Claude seat comes back cold, so it can act on a
+/// rule it remembers instead of the corrected file it was told to read. Off, the wrapper binds a
+/// NEW thread at launch and writes the binding for it; delivery is unaffected either way, because
+/// it addresses whatever thread the binding names now.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct CodexDriver {
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Reopen the thread this seat was last bound to, instead of starting a new one.
+    #[serde(default)]
+    pub resume: bool,
     pub prompt: String,
     #[serde(default)]
     pub args: Vec<String>,

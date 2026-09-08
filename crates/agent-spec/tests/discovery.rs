@@ -1021,6 +1021,8 @@ args = ["--agent", "build"]
     let codex = Driver::Codex(CodexDriver {
         model: Some("gpt-5.6-sol".into()),
         effort: Some("xhigh".into()),
+        // Undeclared, so a Codex seat cold starts like every other harness.
+        resume: false,
         prompt: "Start the assigned work.".into(),
         args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
     });
@@ -1028,6 +1030,46 @@ args = ["--agent", "build"]
         let spec = find(&found.specs, identity);
         assert_eq!(spec.driver.as_ref(), Some(&codex));
         assert!(!spec.is_runnable());
+    }
+    // `resume` is Codex's alone and defaults off, so the three blocks above lower to a cold start
+    // without saying anything. Declaring it is what turns it on, in all three source formats.
+    for (identity, source, body) in [
+        (
+            "codex-resume-kdl",
+            "agent.kdl",
+            "agent \"codex-resume-kdl\" { codex { resume #true; prompt \"go\" } }".to_string(),
+        ),
+        (
+            "codex-resume-toml",
+            "agent.toml",
+            "identity = \"codex-resume-toml\"\n\n[codex]\nresume = true\nprompt = \"go\"\n"
+                .to_string(),
+        ),
+        (
+            "codex-resume-json",
+            "agent.json",
+            concat!(
+                "{ \"identity\": \"codex-resume-json\", ",
+                "\"codex\": { \"resume\": true, \"prompt\": \"go\" } }"
+            )
+            .to_string(),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), &format!("agents/h/{identity}/{source}"), &body);
+        let found = discover(tmp.path());
+        assert!(found.errors.is_empty(), "{identity}: {:?}", found.errors);
+        assert_eq!(
+            find(&found.specs, identity).driver.as_ref(),
+            Some(&Driver::Codex(CodexDriver {
+                model: None,
+                effort: None,
+                resume: true,
+                prompt: "go".into(),
+                args: Vec::new(),
+            })),
+            "{identity}"
+        );
     }
     let pi = Driver::Pi(PiDriver {
         model: Some("anthropic/claude-opus-5".into()),
@@ -1086,6 +1128,16 @@ fn driver_blocks_reject_ambiguous_providers_and_untyped_fields() {
             r#"opencode { dev-channels #true; prompt "go" }"#,
         ),
         ("opencode-missing-prompt", r#"opencode { model "x/y" }"#),
+        // `resume` is Codex's alone: no other provider keeps a thread binding to reopen.
+        ("claude-resume", r#"claude { resume #true; prompt "go" }"#),
+        ("pi-resume", r#"pi { resume #true; prompt "go" }"#),
+        ("omp-resume", r#"omp { resume #true; prompt "go" }"#),
+        ("opencode-resume", r#"opencode { resume #true; prompt "go" }"#),
+        ("codex-resume-word", r#"codex { resume "yes"; prompt "go" }"#),
+        (
+            "codex-resume-twice",
+            r#"codex { resume #true; resume #false; prompt "go" }"#,
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         write(

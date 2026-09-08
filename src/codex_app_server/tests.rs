@@ -562,6 +562,7 @@ fn protocol_rejection_reaches_the_declared_supervisor_once() {
             tmp.path(),
             "h.worker".into(),
             "h.worker".into(),
+            false,
             argv.clone(),
         )
         .unwrap_err();
@@ -4744,4 +4745,67 @@ fn a_malformed_error_frame_neither_publishes_nor_clears() {
         turn_diagnostic(&agent_dir),
         driver_diagnostic::Observed::Failure(_)
     ));
+}
+
+/// Cold start is the default, and the binding survives it.
+///
+/// The binding is the delivery address — native delivery cannot infer a thread from cwd, process,
+/// PTY or `thread/list` — so "clear the context" can never mean forgetting it. It means not
+/// REOPENING the thread it names. The file is left exactly as it was; the pump rewrites it to name
+/// whichever thread the TUI starts.
+#[test]
+fn a_seat_that_did_not_ask_to_resume_reopens_nothing_and_still_keeps_its_binding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binding_path = tmp.path().join("binding.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let binding = CodexThreadBinding::new(&runtime, "thread-yesterday".into());
+    atomic_json(&binding_path, &binding).unwrap();
+    let before = fs::read(&binding_path).unwrap();
+
+    assert_eq!(
+        selected_resume_thread(false, &binding_path, "h.worker", "h.worker").unwrap(),
+        None,
+        "a seat that did not ask to resume must reopen nothing"
+    );
+    assert_eq!(
+        selected_resume_thread(true, &binding_path, "h.worker", "h.worker").unwrap(),
+        Some("thread-yesterday".to_string()),
+        "and one that did must reopen exactly the thread it was bound to"
+    );
+    assert_eq!(
+        fs::read(&binding_path).unwrap(),
+        before,
+        "neither answer may disturb the delivery address"
+    );
+
+    // Not reading the binding also means not failing on it. A binding this build cannot use is
+    // fatal to a launch that wants to resume and irrelevant to one that does not, so an older
+    // schema or a renamed runtime must not stop a cold start.
+    let foreign = tmp.path().join("foreign.json");
+    atomic_json(
+        &foreign,
+        &CodexThreadBinding::new(
+            &CodexRuntime::fresh("h.somebody-else".into(), "h.somebody-else".into()).unwrap(),
+            "thread-theirs".into(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        selected_resume_thread(false, &foreign, "h.worker", "h.worker").unwrap(),
+        None
+    );
+    assert!(
+        selected_resume_thread(true, &foreign, "h.worker", "h.worker")
+            .unwrap_err()
+            .to_string()
+            .contains("belongs to a different agent runtime")
+    );
+
+    // A seat with no binding at all is the case cold start makes universal, and it already worked:
+    // this is the path every agent's first launch has always taken.
+    assert_eq!(
+        selected_resume_thread(true, &tmp.path().join("absent.json"), "h.worker", "h.worker")
+            .unwrap(),
+        None
+    );
 }
