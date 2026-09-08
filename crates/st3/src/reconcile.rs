@@ -762,14 +762,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         if let Err(error) = self.runtime.start(&launch_member) {
+            let reason = error.to_string();
             self.record_once(
                 &subject.subject,
                 "runtime.action.failed",
                 BTreeMap::from([
                     ("action".into(), Value::String("start".into())),
                     ("operation".into(), Value::String(operation)),
-                    ("reason".into(), Value::String(error.to_string())),
+                    ("reason".into(), Value::String(reason)),
                 ]),
+            )?;
+            self.record_once(
+                &subject.subject,
+                "runtime.observed",
+                member_fields(member, "absent", None, false),
             )?;
             return Ok(());
         }
@@ -1528,11 +1534,25 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_mission_run_cleanup(&self, run: &MissionRunView) -> Result<bool> {
+        let owner_runs = if run.mode == "eval" {
+            self.store
+                .mission_runs_for_root(&run.id)?
+                .into_iter()
+                .map(|owned_run| owned_run.subject)
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::from([run.subject.clone()])
+        };
         let owned = self
             .store
             .desired_subjects()?
             .into_iter()
-            .filter(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
+            .filter(|subject| {
+                subject
+                    .owner_run
+                    .as_ref()
+                    .is_some_and(|owner| owner_runs.contains(owner))
+            })
             .filter(|subject| subject.member.is_some() || subject.kind == "stop")
             .collect::<Vec<_>>();
         let mut live = Vec::new();
@@ -4898,6 +4918,76 @@ version 2
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn an_eval_cleanup_converges_after_a_runtime_start_failure() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+mission "eval/start-failure" state="ready" {
+  goal "Clean an eval runtime after its start fails."
+  agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+}
+"#;
+        apply_source(&store, source, "publish-eval-start-failure");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "eval/start-failure".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-eval-start-failure".into(),
+            })
+            .unwrap();
+        let runtime_id = format!("{}.worker", run.id);
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .failed_starts
+            .lock()
+            .unwrap()
+            .insert(runtime_id.clone());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let subject = format!("agent/{}/worker", run.id);
+        assert_eq!(
+            store
+                .latest_actual_value(&subject)
+                .unwrap()
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "status"))
+                .and_then(Value::as_str),
+            Some("absent")
+        );
+
+        store
+            .set_mission_run_state(&run.id, "running", "cleanup-cancelled", None)
+            .unwrap();
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(current.status, "cancelled");
+        assert_eq!(current.phase, "terminal");
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
+        );
+        assert_eq!(&*runtime.removes.lock().unwrap(), &[runtime_id]);
     }
 
     #[test]

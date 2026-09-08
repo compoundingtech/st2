@@ -4247,12 +4247,13 @@ impl Store {
         } else {
             format!("mission-run/{run}")
         };
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         let mode: Option<String> = transaction
             .query_row(
                 "SELECT mode FROM mission_runs WHERE id=?1",
-                [run.strip_prefix("mission-run/").unwrap_or(&run)],
+                [run_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4260,12 +4261,24 @@ impl Store {
             mode.as_deref() == Some("eval"),
             "only eval runs can retire their desired graph"
         );
-        transaction.execute("DELETE FROM desired WHERE owner_run=?1", [&run])?;
+        transaction.execute(
+            "DELETE FROM desired
+             WHERE owner_run IN (
+               SELECT 'mission-run/' || id FROM mission_runs WHERE root_run_id=?1
+             )",
+            [run_id],
+        )?;
         let residue = {
-            let mut statement = transaction
-                .prepare("SELECT subject FROM desired WHERE owner_run=?1 ORDER BY subject")?;
+            let mut statement = transaction.prepare(
+                "SELECT desired.subject
+                 FROM desired
+                 JOIN mission_runs
+                   ON desired.owner_run='mission-run/' || mission_runs.id
+                 WHERE mission_runs.root_run_id=?1
+                 ORDER BY desired.subject",
+            )?;
             statement
-                .query_map([&run], |row| row.get::<_, String>(0))?
+                .query_map([run_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         transaction.commit()?;
@@ -4292,6 +4305,17 @@ impl Store {
             "only eval runs have disposable runtime records"
         );
 
+        let run_subjects = {
+            let mut statement = connection.prepare(
+                "SELECT id FROM mission_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
+            )?;
+            statement
+                .query_map([run_id], |row| {
+                    row.get::<_, String>(0)
+                        .map(|id| format!("mission-run/{id}"))
+                })?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
         let mut records = BTreeMap::new();
         {
             let mut statement = connection.prepare(
@@ -4300,7 +4324,11 @@ impl Store {
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
                 let desired: DesiredSubject = serde_json::from_str(&row?)?;
-                if desired.owner_run.as_deref() != Some(run.as_str()) {
+                if !desired
+                    .owner_run
+                    .as_ref()
+                    .is_some_and(|owner| run_subjects.contains(owner))
+                {
                     continue;
                 }
                 if let Some(member) = desired.member {
@@ -4309,10 +4337,18 @@ impl Store {
             }
         }
 
-        let mut gate_prefixes = vec![format!("gate-operation/mission-run.{run_id}/")];
+        let mut gate_prefixes = run_subjects
+            .iter()
+            .filter_map(|subject| subject.strip_prefix("mission-run/"))
+            .map(|id| format!("gate-operation/mission-run.{id}/"))
+            .collect::<Vec<_>>();
         {
             let mut statement = connection.prepare(
-                "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
+                "SELECT run_generations.id
+                 FROM run_generations
+                 JOIN mission_runs ON run_generations.run_id=mission_runs.id
+                 WHERE mission_runs.root_run_id=?1
+                 ORDER BY run_generations.created_at_unix_ms, run_generations.id",
             )?;
             let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
             for row in rows {
@@ -10208,6 +10244,84 @@ mod tests {
             .next()
             .expect("published mission")
             .clone()
+    }
+
+    #[test]
+    fn eval_cleanup_includes_descendant_mission_runtimes() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+
+mission "eval/root" state="ready" {
+  goal "Own one isolated eval tree."
+}
+
+mission "eval/child" state="ready" {
+  goal "Run one child agent."
+}
+"#;
+        publish_mission(&store, source, "publish-eval-tree");
+        let root = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "eval/root".into(),
+                revision: None,
+                workspace: "/eval".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "eval-tree-root".into(),
+            })
+            .unwrap();
+        let child = store
+            .create_child_mission_run(
+                &MissionRunRequest {
+                    mission: "eval/child".into(),
+                    revision: None,
+                    workspace: "/eval/child".into(),
+                    requester: Some("daemon/test".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "eval-tree-child".into(),
+                },
+                &root,
+                "step-run/subscription/root/reviews",
+                None,
+            )
+            .unwrap();
+        let declaration = crate::graph::parse_execution_intent(
+            r#"version 2
+agent "worker" { workspace "/eval/child"; command "true"; restart "never" }
+"#,
+            "node",
+            &child.id,
+        )
+        .unwrap();
+        store
+            .apply_internal(&declaration, "declare-eval-child-worker")
+            .unwrap();
+
+        assert_eq!(
+            store.eval_runtime_records(&root.subject).unwrap(),
+            vec![(format!("{}.worker", child.id), true)]
+        );
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(|desired| desired.owner_run.as_deref() == Some(child.subject.as_str()))
+        );
+
+        assert!(
+            store
+                .retire_eval_owned_desired(&root.subject)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.desired_subjects().unwrap().iter().all(|desired| {
+            desired.owner_run.as_deref() != Some(root.subject.as_str())
+                && desired.owner_run.as_deref() != Some(child.subject.as_str())
+        }));
     }
 
     #[test]
