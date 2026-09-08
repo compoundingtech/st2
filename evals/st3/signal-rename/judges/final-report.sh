@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${ST_MISSION_RUN:?ST_MISSION_RUN must identify the judged mission run}"
 
-messages="$("$ST3_BIN" message ls "agent/$ST_MISSION_RUN/sig.base" --from "agent/$ST_MISSION_RUN/sig.sup" --json)"
+messages="$("$ST3_BIN" message ls "agent/$ST_MISSION_RUN/sig.base" --archive --from "agent/$ST_MISSION_RUN/sig.sup" --json)"
 matching="$(
   jq \
     --arg tag "mission-run:$ST_MISSION_RUN" \

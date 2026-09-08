@@ -2165,7 +2165,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return Ok(false);
             };
             for (field, expected) in &product.fields {
-                if actual_field(&actual, field) != Some(expected) {
+                let expected = match expected {
+                    Value::String(value) => {
+                        Value::String(crate::mission::interpolate(value, variables)?)
+                    }
+                    value => value.clone(),
+                };
+                if actual_field(&actual, field) != Some(&expected) {
                     return Ok(false);
                 }
             }
@@ -5174,12 +5180,13 @@ version 2
     completion { when "all-steps-exhausted" }
     step "publish" {
       assigned-to "agent/worker"
-      produces {
-        resource "mission-run/${ST_MISSION_RUN}/change" {
-          kind "vcs.commit"
-          state "published"
+        produces {
+          resource "mission-run/${ST_MISSION_RUN}/change" {
+            kind "custom.st3.product-test"
+            state "published"
+            recipient "agent/${ST_MISSION_RUN}/worker"
+          }
         }
-      }
     }
   }
 
@@ -5232,8 +5239,16 @@ version 2
                 kind: "resource.observed".into(),
                 actor: Some("agent/worker".into()),
                 fields: BTreeMap::from([
-                    ("kind".into(), Value::String("vcs.commit".into())),
+                    (
+                        "kind".into(),
+                        Value::String("custom.st3.product-test".into()),
+                    ),
                     ("state".into(), Value::String("published".into())),
+                    (
+                        "recipient".into(),
+                        Value::String(format!("agent/{}/worker", run.id)),
+                    ),
+                    ("message".into(), Value::String("extra-field".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
