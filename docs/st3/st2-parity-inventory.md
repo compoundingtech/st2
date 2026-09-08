@@ -169,6 +169,10 @@ Linux uses a systemd user service. macOS uses a launchd agent with restart, log,
 
 Service installation waits for the configured socket. A failed installation restores the previous native service definition.
 
+The service path includes each supported harness program that exists during installation.
+
+It excludes unrelated entries from the installer's shell path.
+
 `st3 service reset` is intentionally destructive. It needs three interactive confirmations before it erases st3 state.
 
 The reset stops the service and owned runtimes. It retains the binary, service definition, configuration, workspaces, and rendered files.

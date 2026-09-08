@@ -1,8 +1,12 @@
 //! Install the st3 daemon as a native user service.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
@@ -18,6 +22,7 @@ use crate::config::Config;
 const SERVICE_NAME: &str = "st3.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
+const PROVIDER_PROGRAMS: &[&str] = &["codex", "claude", "pi", "opencode", "omp"];
 
 #[derive(Clone, Debug)]
 pub struct ServiceSpec {
@@ -186,26 +191,66 @@ pub fn uninstall() -> Result<()> {
 }
 
 fn service_path(exe: &Path) -> Result<String> {
+    service_path_from(
+        exe,
+        env::var_os("HOME").as_deref().map(Path::new),
+        env::var_os("PATH").as_deref(),
+    )
+}
+
+fn service_path_from(exe: &Path, home: Option<&Path>, ambient: Option<&OsStr>) -> Result<String> {
     let mut entries = Vec::new();
     if let Some(parent) = exe.parent() {
-        entries.push(parent.to_path_buf());
+        push_unique(&mut entries, parent.to_path_buf());
     }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        entries.push(home.join(".local/bin"));
-        entries.push(home.join(".cargo/bin"));
+    if let Some(home) = home {
+        push_unique(&mut entries, home.join(".local/bin"));
+        push_unique(&mut entries, home.join(".cargo/bin"));
     }
-    entries.extend([
+    for program in PROVIDER_PROGRAMS {
+        if let Some(directory) = program_directory(program, ambient) {
+            push_unique(&mut entries, directory);
+        }
+    }
+    for directory in [
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
         PathBuf::from("/bin"),
         PathBuf::from("/usr/sbin"),
         PathBuf::from("/sbin"),
-    ]);
-    entries.dedup();
+    ] {
+        push_unique(&mut entries, directory);
+    }
     env::join_paths(entries)
         .context("the service PATH contains an unsupported byte")
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn program_directory(program: &str, ambient: Option<&OsStr>) -> Option<PathBuf> {
+    env::split_paths(ambient.unwrap_or_default()).find(|directory| {
+        let candidate = directory.join(program);
+        let Ok(metadata) = fs::metadata(candidate) else {
+            return false;
+        };
+        metadata.is_file() && is_executable(&metadata)
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn push_unique(entries: &mut Vec<PathBuf>, directory: PathBuf) {
+    if !entries.contains(&directory) {
+        entries.push(directory);
+    }
 }
 
 fn validate_reset_target(config: &Config) -> Result<()> {
@@ -696,6 +741,39 @@ fn systemd_quote_arg(argument: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::PeerConfig;
+
+    #[cfg(unix)]
+    #[test]
+    fn service_path_adds_only_discovered_provider_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let provider = root.path().join("provider/bin");
+        let unrelated = root.path().join("unrelated/bin");
+        fs::create_dir_all(&provider)?;
+        fs::create_dir_all(&unrelated)?;
+        let codex = provider.join("codex");
+        fs::write(&codex, b"#!/bin/sh\n")?;
+        let mut permissions = fs::metadata(&codex)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex, permissions)?;
+        fs::write(unrelated.join("not-a-provider"), b"ignored")?;
+        let ambient = env::join_paths([&unrelated, &provider, &provider])?;
+
+        let path = service_path_from(
+            Path::new("/opt/st3/bin/st3"),
+            Some(Path::new("/home/test")),
+            Some(&ambient),
+        )?;
+        let entries = env::split_paths(OsStr::new(&path)).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries.iter().filter(|entry| *entry == &provider).count(),
+            1
+        );
+        assert!(!entries.contains(&unrelated));
+        assert!(entries.contains(&PathBuf::from("/home/test/.local/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+        Ok(())
+    }
 
     #[test]
     fn unit_bakes_the_effective_config_and_limit() -> Result<()> {

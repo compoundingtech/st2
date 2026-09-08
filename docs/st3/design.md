@@ -281,7 +281,13 @@ st3 supplies `ST3_SUBJECT` with the current runtime subject. It supplies `ST_AGE
 
 A nested agent task receives its owning agent subject in `ST_AGENT`. An agentless runtime has no `ST_AGENT` value.
 
-`${PATH}` expands from the deterministic service path. It never reads the shell path of the person who installed the service.
+`${PATH}` expands from the service path recorded at installation.
+
+The installer includes the st3 directory, common user directories, and common system directories.
+
+It also resolves each supported harness program and includes only those program directories.
+
+It does not copy unrelated entries from the installer's shell path.
 
 ### Explicit DING delivery
 
