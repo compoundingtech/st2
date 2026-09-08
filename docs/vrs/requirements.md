@@ -30,6 +30,12 @@ accepted.
   declare a matching native session driver and non-secret delivery readiness is
   rejected rather than routed through generic terminal injection. Ding remains
   available only for opaque non-harness PTYs.
+- **T03 Forward-only attempt-only adoption:** After Claude, pi, or OMP writes
+  its first durable attempt-only delivery record, st2 does not support rollback
+  to a release that cannot interpret that record. Recovery rolls forward. st2
+  retains no legacy delivery path, downgrade reader, dual write, translation
+  bridge, or compatibility fence. Preserving the existing Codex and OpenCode
+  ledger format avoids a migration; it is not a compatibility layer.
 
 ## Requirements
 
@@ -123,6 +129,20 @@ accepted.
   suppression, and restart recovery are deterministic and tested. DING may
   interrupt agent work, but it must not alter or submit a human's active draft;
   an unknown interaction state defers delivery.
+- **R43 Transactional native delivery ownership:** Every managed native harness
+  owns delivery through one durable per-agent, per-harness ledger and one FIFO
+  head. Five stable harness identities remain distinct from three closed
+  evidence policies. Initial recovery and every ledger mutation serialize
+  under one stable local kernel lock, re-read and validate current bytes after
+  lock acquisition, compare an exact attempt token, and persist `Attempted`
+  before returning at most one transport permit. A later transport is
+  authorized only by exact negative evidence for that attempt; time, process
+  liveness, local write success, and adapter result names are not evidence.
+  Recipient/archive evidence settles the message. Attempt-only transports
+  expose the exact message and attempt correlation in provider history. A
+  same-UID filesystem operator may record audited correlated absence with a
+  required reason and exact ledger precondition; evidence recording never
+  performs transport.
 - **R06 Restartable launch definitions:** A restarted PTY or exec receives the
   complete effective launch definition, including environment and supported
   launch fields.
