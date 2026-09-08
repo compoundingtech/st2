@@ -3916,13 +3916,8 @@ impl Store {
     }
 
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
-        validate_claim_kind(&input.kind)?;
-        validate_claim_subject(&input.subject)?;
-        if let Some(actor) = &input.actor {
-            validate_actor(actor)?;
-        }
-        validate_claim_fields(input)?;
-        let operation = claim_operation(input).map_err(internal)?;
+        self.validate_claim_input(input)?;
+        let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         if let Some((operation_id, request_digest)) = &operation
             && let Some((stored_digest, canonical_claim, state)) =
@@ -4006,6 +4001,17 @@ impl Store {
         }
         transaction.commit().map_err(internal)?;
         Ok(record)
+    }
+
+    pub fn validate_claim_input(&self, input: &ClaimInput) -> Result<(), St3Error> {
+        validate_claim_kind(&input.kind)?;
+        validate_claim_subject(&input.subject)?;
+        if let Some(actor) = &input.actor {
+            validate_actor(actor)?;
+        }
+        validate_claim_fields(input)?;
+        claim_operation(input)?;
+        Ok(())
     }
 
     pub fn append_client_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
@@ -7351,13 +7357,14 @@ fn append_publication_operation_tx<T: Serialize>(
     Ok(claim)
 }
 
-fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>> {
+fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>, St3Error> {
     let Some(key) = input.idempotency_key.as_deref() else {
         return Ok(None);
     };
     if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
-        return Err(anyhow::anyhow!(
-            "an idempotency key must contain 1 through 512 non-control characters"
+        return Err(St3Error::new(
+            "invalid-idempotency-key",
+            "an idempotency key must contain 1 through 512 non-control characters",
         ));
     }
     let operation_id = operation_id_for_key(key);
@@ -7372,7 +7379,8 @@ fn claim_operation(input: &ClaimInput) -> Result<Option<(String, String)>> {
         &input.fields,
         evidence,
         &input.expected_subject,
-    ))?;
+    ))
+    .map_err(internal)?;
     Ok(Some((operation_id, request_digest)))
 }
 

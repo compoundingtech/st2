@@ -4242,6 +4242,65 @@ async fn post_gate_result(
     }
     let capability = state
         .store
+        .capability(&request.operation_capability, "gate-result")
+        .map_err(ApiError::bad)?;
+    if capability.used {
+        let prior = state
+            .store
+            .latest_claim(&capability.subject, Some("gate.result"))
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::bad(St3Error::new(
+                    "used-capability",
+                    "the gate-result capability was already consumed",
+                ))
+            })?;
+        let same = prior
+            .body
+            .pointer("/fields/verdict")
+            .and_then(Value::as_str)
+            == Some(request.verdict.as_str())
+            && prior.body.pointer("/fields/reason").and_then(Value::as_str)
+                == Some(request.reason.as_str());
+        if same {
+            return Ok(Json(prior));
+        }
+        return Err(ApiError::bad(St3Error::new(
+            "used-capability",
+            "the gate-result capability was already used for another verdict",
+        )));
+    }
+    let input = ClaimInput {
+        subject: capability.subject.clone(),
+        kind: "gate.result".into(),
+        actor: None,
+        fields: BTreeMap::from([
+            ("verdict".into(), Value::String(request.verdict.clone())),
+            ("reason".into(), Value::String(request.reason.clone())),
+        ]),
+        evidence: request.evidence.clone(),
+        expected_subject: None,
+        idempotency_key: Some(request.idempotency_key.clone()),
+    };
+    state
+        .store
+        .validate_claim_input(&input)
+        .map_err(ApiError::bad)?;
+    for evidence in &input.evidence {
+        if state
+            .store
+            .claim_by_id(evidence)
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::bad(St3Error::new(
+                "missing-evidence",
+                format!("evidence claim `{evidence}` is not stored"),
+            )));
+        }
+    }
+    let capability = state
+        .store
         .consume_capability(&request.operation_capability, "gate-result")
         .map_err(ApiError::bad)?;
     if capability.used {
@@ -4270,21 +4329,7 @@ async fn post_gate_result(
             "the gate-result capability was already used for another verdict",
         )));
     }
-    let response = state
-        .store
-        .append_claim(&ClaimInput {
-            subject: capability.subject,
-            kind: "gate.result".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                ("verdict".into(), Value::String(request.verdict)),
-                ("reason".into(), Value::String(request.reason)),
-            ]),
-            evidence: request.evidence,
-            expected_subject: None,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+    let response = state.store.append_claim(&input).map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -6312,6 +6357,40 @@ version 2
             json_request(app, "/v1/claims", serde_json::to_value(changed).unwrap()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mismatch}");
         assert_eq!(mismatch["code"], "idempotency-mismatch");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_gate_result_does_not_consume_its_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let subject = "gate-operation/test/result";
+        let (capability, _) = store
+            .issue_capability("gate-result", subject, None, 60_000)
+            .unwrap();
+        let app = router(state);
+        let request = |idempotency_key: String| {
+            serde_json::to_value(GateResultRequest {
+                operation_capability: capability.clone(),
+                verdict: "pass".into(),
+                reason: "the evidence passes".into(),
+                evidence: Vec::new(),
+                idempotency_key,
+            })
+            .unwrap()
+        };
+
+        let (status, invalid) =
+            json_request(app.clone(), "/v1/gate-results", request("x".repeat(513))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "invalid-idempotency-key");
+        assert!(!store.capability(&capability, "gate-result").unwrap().used);
+
+        let (status, accepted) =
+            json_request(app, "/v1/gate-results", request("valid-gate-result".into())).await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["body"]["fields"]["verdict"], "pass");
+        assert!(store.capability(&capability, "gate-result").unwrap().used);
     }
 
     #[tokio::test]

@@ -4338,14 +4338,17 @@ fn thread_root<'a>(message: &'a MessageView, all: &'a [MessageView]) -> &'a Mess
 }
 
 async fn run_gate_result(client: &Client, args: GateResultArgs, json_output: bool) -> Result<()> {
+    let idempotency_key = gate_result_idempotency_key(
+        &args.operation_capability,
+        &args.verdict,
+        &args.reason,
+        &args.evidence,
+    );
     let response: ClaimRecord = client
         .post(
             "/v1/gate-results",
             &GateResultRequest {
-                idempotency_key: format!(
-                    "gate-result:{}:{}:{}",
-                    args.operation_capability, args.verdict, args.reason
-                ),
+                idempotency_key,
                 operation_capability: args.operation_capability,
                 verdict: args.verdict,
                 reason: args.reason,
@@ -4354,6 +4357,17 @@ async fn run_gate_result(client: &Client, args: GateResultArgs, json_output: boo
         )
         .await?;
     print_value(&response, json_output)
+}
+
+fn gate_result_idempotency_key(
+    operation_capability: &str,
+    verdict: &str,
+    reason: &str,
+    evidence: &[String],
+) -> String {
+    let request_bytes = serde_json::to_vec(&(operation_capability, verdict, reason, evidence))
+        .expect("a gate result request is JSON serializable");
+    format!("gate-result:{}", hex::encode(Sha256::digest(request_bytes)))
 }
 
 async fn run_eval(client: &Client, args: EvalArgs, json_output: bool) -> Result<()> {
@@ -6458,6 +6472,18 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gate_result_uses_a_bounded_content_key() {
+        let reason = "evidence ".repeat(100);
+        let first = gate_result_idempotency_key("capability", "pass", &reason, &[]);
+        let retry = gate_result_idempotency_key("capability", "pass", &reason, &[]);
+        let changed = gate_result_idempotency_key("capability", "fail", &reason, &[]);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, changed);
+        assert!(first.len() <= 512);
+    }
 
     #[test]
     fn mission_start_accepts_an_explicit_run_id() {
