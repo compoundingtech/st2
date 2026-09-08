@@ -72,8 +72,8 @@ pub struct AgentRow {
     /// three. `None` means no record exists; a record past its horizon is still reported, marked
     /// stale and carrying its age, so it survives every `observedState: unknown` derivation.
     pub context: Option<harness_context::Observed>,
-    /// Native delivery ownership for current ledger adopters. `None` means the declared harness
-    /// has not adopted the ledger; absence, idle, held, and indeterminate are distinct values.
+    /// Native delivery ownership for local agents with a native session driver. `None` means the
+    /// agent is remote or has no native session driver; all five native drivers keep a ledger.
     pub delivery: Option<Delivery>,
     /// The immutable catalog-global agent ID (R24) — the declaration's explicit `id`, else the
     /// legacy `<host>.<identity>` bus identity that migration freezes as this subject's ID.
@@ -176,7 +176,7 @@ fn delivery_state(spec: &AgentSpec, catalog_root: &Path, this_host: &str) -> Opt
         SessionDriver::Pi => pi_channel::observe_pi_delivery(catalog_root, &identity),
         SessionDriver::OpenCode => opencode_session::observe_delivery(catalog_root, &identity),
         SessionDriver::Omp => pi_channel::observe_omp_delivery(catalog_root, &identity),
-        SessionDriver::Claude => return None,
+        SessionDriver::Claude => crate::claude_mcp::observe_delivery(catalog_root, &identity),
     };
     Some(match observed {
         Ok(delivery_ledger::Observation::Absent) => Delivery::Absent,

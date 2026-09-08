@@ -653,6 +653,39 @@ fn doctor_reports_delta_007_tokenless_rows_without_backfilling_them() {
 }
 
 #[test]
+fn doctor_checks_claude_declaration_delivery_ledgers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = tmp.path().join("catalog");
+    let declaration = catalog.join("agents/h/worker/agent.kdl");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &declaration,
+        r#"agent "worker" { host "h"; claude { prompt "go" } }"#,
+    )
+    .unwrap();
+    fs::write(declaration.parent().unwrap().join("status"), "available\n").unwrap();
+    fs::write(
+        declaration.parent().unwrap().join("delivery-ledger.json"),
+        b"not json",
+    )
+    .unwrap();
+    executable(
+        &bin.join("pty"),
+        "#!/bin/sh\nif [ \"$1\" = list ]; then printf '[{\"name\":\"h.worker\",\"status\":\"running\"}]\\n'; fi\n",
+    );
+
+    let output = doctor(&catalog, &bin, &tmp.path().join("state"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("h.worker tokenless delivery ledger readable"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn observed_harness_state_arms_are_advisory_except_a_fresh_live_record() {
     use st2::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
 

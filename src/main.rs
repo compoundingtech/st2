@@ -1016,11 +1016,13 @@ fn doctor_cmd(root: &Path, host: Option<String>, require_supervisor: bool) -> Re
                 &format!("{error:#}"),
             ),
         }
-        let delivery_provider = match spec.effective_session_driver() {
-            Some(st2::SessionDriver::Codex) => Some(LedgerProvider::Codex),
-            Some(st2::SessionDriver::OpenCode) => Some(LedgerProvider::OpenCode),
-            _ => None,
-        };
+        let delivery_provider = spec.effective_session_driver().map(|driver| match driver {
+            st2::SessionDriver::Claude => LedgerProvider::Claude,
+            st2::SessionDriver::Codex => LedgerProvider::Codex,
+            st2::SessionDriver::Pi => LedgerProvider::Pi,
+            st2::SessionDriver::OpenCode => LedgerProvider::OpenCode,
+            st2::SessionDriver::Omp => LedgerProvider::Omp,
+        });
         if let Some(provider) = delivery_provider {
             match provider.observe(&catalog, &bus_id) {
                 Ok(st2::delivery_ledger::Observation::Absent) => {}
@@ -2030,6 +2032,7 @@ fn box_target(
 
 #[derive(Clone, Copy)]
 enum LedgerProvider {
+    Claude,
     Codex,
     Pi,
     OpenCode,
@@ -2039,6 +2042,7 @@ enum LedgerProvider {
 impl LedgerProvider {
     fn name(self) -> &'static str {
         match self {
+            Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Pi => "pi",
             Self::OpenCode => "opencode",
@@ -2048,6 +2052,7 @@ impl LedgerProvider {
 
     fn observe(self, root: &Path, identity: &str) -> Result<st2::delivery_ledger::Observation> {
         match self {
+            Self::Claude => st2::claude_mcp::observe_delivery(root, identity),
             Self::Codex => st2::codex_app_server::observe_delivery(root, identity),
             Self::Pi => st2::pi_channel::observe_pi_delivery(root, identity),
             Self::OpenCode => st2::opencode_session::observe_delivery(root, identity),
@@ -2062,6 +2067,7 @@ impl LedgerProvider {
         refusal: &st2::delivery_ledger::OperatorRefusal,
     ) -> Result<st2::delivery_ledger::OperatorOutcome> {
         match self {
+            Self::Claude => st2::claude_mcp::operator_refuse(root, identity, refusal),
             Self::Codex => st2::codex_app_server::operator_refuse(root, identity, refusal),
             Self::Pi => st2::pi_channel::operator_refuse_pi(root, identity, refusal),
             Self::OpenCode => st2::opencode_session::operator_refuse(root, identity, refusal),
@@ -2106,9 +2112,7 @@ fn delivery_target(
         Some(st2::SessionDriver::Pi) => LedgerProvider::Pi,
         Some(st2::SessionDriver::OpenCode) => LedgerProvider::OpenCode,
         Some(st2::SessionDriver::Omp) => LedgerProvider::Omp,
-        Some(st2::SessionDriver::Claude) => {
-            anyhow::bail!("claude has not adopted the delivery ledger")
-        }
+        Some(st2::SessionDriver::Claude) => LedgerProvider::Claude,
         None => anyhow::bail!("agent '{}' has no native session driver", spec.bus_id(host)),
     };
     Ok((spec.bus_id(host), provider))

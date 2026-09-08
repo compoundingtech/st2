@@ -10,17 +10,16 @@
 //! that policy is a Rust change, not a redeploy of a TypeScript asset.
 
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::driver_diagnostic::ProviderAuthEdge;
-use crate::native_channel::{channel_content, write_json};
+use crate::native_channel::{DeliveryPump, channel_content, delivery_correlation, write_json};
 use crate::{context, delivery_ledger, driver_diagnostic, harness_context, harness_state, message};
 
 const POLL: Duration = Duration::from_millis(250);
@@ -105,98 +104,6 @@ const OMP_KIND: ChannelKind = ChannelKind {
     seq_env: crate::omp_session::CHANNEL_SEQ,
 };
 
-/// The ledger lives with the declaration-owned runtime records. Its harness field keeps a changed
-/// driver from interpreting a predecessor's state as its own.
-fn delivery_ledger_path_in(agent_dir: &Path) -> PathBuf {
-    agent_dir.join(delivery_ledger::LEDGER_FILE)
-}
-
-/// Stable provider-neutral correlation for a pi-family delivery binding and inbox filename.
-///
-/// The attempt token, not this value, distinguishes retries. Length-prefixing keeps the derivation
-/// unambiguous without depending on runtime paths or provider-session identifiers.
-pub fn delivery_correlation(binding: &str, filename: &str) -> String {
-    let mut hash = Sha256::new();
-    for value in [binding.as_bytes(), filename.as_bytes()] {
-        hash.update((value.len() as u64).to_be_bytes());
-        hash.update(value);
-    }
-    format!("{:x}", hash.finalize())
-}
-
-fn delivery_correlate() -> impl Fn(&str, &str) -> String + Send + Sync + 'static {
-    delivery_correlation
-}
-
-struct DeliveryPump {
-    ledger: delivery_ledger::Ledger,
-    binding: String,
-    agent_dir: PathBuf,
-}
-
-impl DeliveryPump {
-    fn open(agent_dir: &Path, identity: &str, runtime_id: &str, kind: &ChannelKind) -> Self {
-        Self {
-            ledger: delivery_ledger::Ledger::open(
-                &delivery_ledger_path_in(agent_dir),
-                kind.delivery_harness.profile(),
-                identity,
-                runtime_id,
-                delivery_correlate(),
-            ),
-            binding: runtime_id.to_owned(),
-            agent_dir: agent_dir.to_owned(),
-        }
-    }
-
-    /// Reconcile archive settlement, then claim and transport at most the FIFO head.
-    fn pump(
-        &mut self,
-        out: &mut impl Write,
-        unread: Vec<message::Message>,
-        identity: &str,
-    ) -> Result<()> {
-        let snapshot = self.ledger.snapshot()?;
-        let mut settled = Vec::new();
-        for attempt in snapshot.attempts() {
-            if message::archive_receipt_exists(&self.agent_dir, &attempt.filename)? {
-                settled.push(attempt.fence());
-            }
-        }
-        self.ledger.prune(&settled)?;
-
-        let head = unread
-            .into_iter()
-            .find_map(|message| {
-                match message::archive_receipt_exists(&self.agent_dir, &message.filename) {
-                    Ok(false) => Some(Ok(message)),
-                    Ok(true) => None,
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .transpose()?;
-        let Some(head) = head else {
-            return Ok(());
-        };
-        self.ledger.retarget(&self.binding)?;
-        let permit = match self.ledger.claim(delivery_ledger::Claimant {
-            filename: head.filename.clone(),
-            binding: self.binding.clone(),
-            correlation: delivery_ledger::Correlation::native(delivery_correlation(
-                &self.binding,
-                &head.filename,
-            )),
-            // The attempt-only transports expose no incarnation-scoped receipt to correlate.
-            incarnation: None,
-        })? {
-            delivery_ledger::Claim::Permitted(permit) => permit,
-            delivery_ledger::Claim::Held(_) => return Ok(()),
-        };
-        write_json(out, &message_frame(head, identity, &permit)?)?;
-        Ok(())
-    }
-}
-
 fn observe_delivery_for(
     catalog_root: &Path,
     identity: &str,
@@ -206,10 +113,10 @@ fn observe_delivery_for(
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("delivery ledger agent '{identity}' is not declared"))?;
     delivery_ledger::observe(
-        &delivery_ledger_path_in(&agent_dir),
+        &agent_dir.join(delivery_ledger::LEDGER_FILE),
         harness.profile(),
         identity,
-        &delivery_correlate(),
+        &delivery_correlation,
     )
 }
 
@@ -242,10 +149,10 @@ fn operator_refuse_for(
         });
     }
     delivery_ledger::Ledger::for_operator(
-        &delivery_ledger_path_in(&agent_dir),
+        &agent_dir.join(delivery_ledger::LEDGER_FILE),
         harness.profile(),
         identity,
-        delivery_correlate(),
+        delivery_correlation,
     )
     .operator_refuse(refusal)
 }
@@ -341,7 +248,13 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let context_session = wrapper_session
         .clone()
         .unwrap_or_else(harness_state::session_token);
-    let mut delivery = DeliveryPump::open(&agent_dir, identity, &pty_session, kind);
+    let mut delivery = DeliveryPump::open(
+        &agent_dir,
+        identity,
+        &pty_session,
+        kind.delivery_harness,
+        message_frame,
+    );
     let mut writer =
         harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session.clone()));
     if let Some(session) = wrapper_session {
@@ -835,7 +748,13 @@ mod tests {
     use super::*;
 
     fn delivery(agent_dir: &Path, kind: &ChannelKind) -> DeliveryPump {
-        DeliveryPump::open(agent_dir, "h.worker", "h.worker", kind)
+        DeliveryPump::open(
+            agent_dir,
+            "h.worker",
+            "h.worker",
+            kind.delivery_harness,
+            message_frame,
+        )
     }
 
     fn test_message(filename: &str) -> message::Message {
@@ -1556,8 +1475,13 @@ mod tests {
             delivery_ledger::OperatorOutcome::Applied(_)
         ));
 
-        let mut retry_process =
-            DeliveryPump::open(agent_dir, "h.worker", "h.worker.replaced", kind);
+        let mut retry_process = DeliveryPump::open(
+            agent_dir,
+            "h.worker",
+            "h.worker.replaced",
+            kind.delivery_harness,
+            message_frame,
+        );
         let mut retry_out = Vec::new();
         retry_process
             .pump(&mut retry_out, vec![test_message(SECOND)], "h.worker")
