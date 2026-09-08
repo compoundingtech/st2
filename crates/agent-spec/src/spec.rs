@@ -1543,7 +1543,7 @@ fn reject_explicit_null<T>(field: &str, value: Option<Option<T>>) -> anyhow::Res
     }
 }
 
-fn lower_desired_state(
+pub(crate) fn lower_desired_state(
     retired: Option<bool>,
     state: Option<&str>,
     reason: Option<String>,

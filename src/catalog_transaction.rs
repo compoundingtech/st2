@@ -464,7 +464,10 @@ fn render_input_paths(
     specs: &BTreeMap<AgentKey, agent_spec::AgentSpec>,
 ) -> Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
-    for spec in specs.values() {
+    for spec in specs
+        .values()
+        .filter(|spec| spec.desired_state.is_running())
+    {
         let host = spec
             .host
             .as_deref()
@@ -1196,7 +1199,6 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 
     let _lock = CatalogLock::shared(&catalog)?;
     let projection = if request.raw_preimage {
-
         let projection = project_raw_current(&catalog)?;
         validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
         projection
@@ -1749,6 +1751,73 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
     })
 }
 
+/// Stable identities for all core validation errors across structural and per-host passes.
+///
+/// Lifecycle authoring compares these rather than diagnostic prose because projection paths make
+/// messages unstable. The coverage matches [`validate_full_catalog`], including its runtime root.
+pub(crate) struct FullCatalogErrors {
+    pub identities: BTreeMap<(&'static str, String, Option<String>), usize>,
+    issues: Vec<crate::validate::Issue>,
+}
+
+pub(crate) fn collect_full_catalog_errors(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+) -> Result<FullCatalogErrors> {
+    collect_full_catalog_errors_with_host_policy(root, runtime, false)
+}
+
+fn collect_full_catalog_errors_with_host_policy(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+    require_explicit_host: bool,
+) -> Result<FullCatalogErrors> {
+    let found = crate::discover(root);
+    let mut hosts = BTreeSet::new();
+    for spec in &found.specs {
+        let host = match spec.host.as_deref() {
+            Some(host) => host,
+            None if require_explicit_host => {
+                anyhow::bail!("canonical declaration is missing explicit host")
+            }
+            None => spec.resolved_host(""),
+        };
+        hosts.insert(host.to_owned());
+    }
+    let mut identities = BTreeMap::new();
+    let mut issues = Vec::new();
+    collect_error_identities(
+        &mut identities,
+        &mut issues,
+        crate::validate::validate(root),
+    );
+    for host in hosts {
+        collect_error_identities(
+            &mut identities,
+            &mut issues,
+            crate::validate::validate_for_host_at(root, &host, runtime),
+        );
+    }
+    Ok(FullCatalogErrors { identities, issues })
+}
+
+fn collect_error_identities(
+    identities: &mut BTreeMap<(&'static str, String, Option<String>), usize>,
+    errors: &mut Vec<crate::validate::Issue>,
+    report: crate::validate::Report,
+) {
+    for issue in report
+        .issues
+        .into_iter()
+        .filter(|issue| issue.severity == crate::validate::Severity::Error)
+    {
+        *identities
+            .entry((issue.code, issue.path.clone(), issue.agent.clone()))
+            .or_default() += 1;
+        errors.push(issue);
+    }
+}
+
 /// Full structural and host-scoped validation for a complete prospective catalog.
 ///
 /// `runtime` names the catalog whose resolved pty root bounds session sockets. It is a separate
@@ -1756,39 +1825,22 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
 /// validates a capture, bootstrap validates a stage, and a retained live catalog is addressed
 /// through a file-descriptor path. Reading the bound off `root` charged declarations for the depth
 /// of whichever temporary tree happened to be under inspection.
-pub(crate) fn validate_full_catalog(root: &Path, runtime: crate::validate::RuntimeRoot<'_>) -> Result<()> {
-    let found = crate::discover(root);
-    let mut hosts = BTreeSet::new();
-    for spec in &found.specs {
-        let host = spec
-            .host
-            .as_deref()
-            .context("canonical declaration is missing explicit host")?;
-        hosts.insert(host.to_string());
-    }
-    let mut errors = BTreeSet::new();
-    let report = crate::validate::validate(root);
-    errors.extend(
-        report
+pub(crate) fn validate_full_catalog(
+    root: &Path,
+    runtime: crate::validate::RuntimeRoot<'_>,
+) -> Result<()> {
+    let errors = collect_full_catalog_errors_with_host_policy(root, runtime, true)?;
+    anyhow::ensure!(
+        errors.issues.is_empty(),
+        "catalog fails full validation:\n{}",
+        errors
             .issues
             .iter()
-            .filter(|issue| issue.severity == crate::validate::Severity::Error)
-            .map(format_issue),
-    );
-    for host in hosts {
-        let report = crate::validate::validate_for_host_at(root, &host, runtime);
-        errors.extend(
-            report
-                .issues
-                .iter()
-                .filter(|issue| issue.severity == crate::validate::Severity::Error)
-                .map(format_issue),
-        );
-    }
-    anyhow::ensure!(
-        errors.is_empty(),
-        "catalog fails full validation:\n{}",
-        errors.into_iter().collect::<Vec<_>>().join("\n")
+            .map(format_issue)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     Ok(())
 }
@@ -1908,7 +1960,9 @@ fn project_excluding(
     }
     collect_templates(root, source, &mut files)?;
 
-    for spec in &specs {
+    // Render-input existence is a running launch-readiness fact. Inactive declarations remain
+    // structurally projected without resolving their ambient copy sources.
+    for spec in specs.iter().filter(|spec| spec.desired_state.is_running()) {
         let host = spec.host.as_deref().context("explicit host disappeared")?;
         for input in crate::materialize::catalog_owned_render_inputs(root, spec, host)? {
             let relative = normalized_relative(root, &input)?;
@@ -3535,5 +3589,4 @@ mod tests {
             );
         }
     }
-
 }

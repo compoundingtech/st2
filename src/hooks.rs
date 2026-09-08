@@ -282,7 +282,8 @@ pub fn required_by_codex_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(
             spec.driver.as_ref(),
             Some(agent_spec::spec::Driver::Codex(_))
@@ -317,7 +318,8 @@ pub fn required_by_pi_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Pi(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -358,7 +360,8 @@ pub fn required_by_omp_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Omp(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -915,6 +918,52 @@ mod tests {
             ],
             root
         ));
+    }
+
+    #[test]
+    fn hook_demand_is_running_only_across_every_lifecycle_spelling() {
+        for (name, lifecycle, expected) in [
+            ("running", "", true),
+            (
+                "suspended",
+                r#"desired-state "suspended" reason="Waiting""#,
+                false,
+            ),
+            (
+                "canonical-retired",
+                r#"desired-state "retired" reason="Finished""#,
+                false,
+            ),
+            ("legacy-retired", "retired #true", false),
+        ] {
+            for provider in ["codex", "pi", "omp"] {
+                let root = tempfile::tempdir().unwrap();
+                let identity = format!("{name}-{provider}");
+                let path = root.path().join(format!("agents/h/{identity}/agent.kdl"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(
+                    path,
+                    format!(
+                        r#"agent "{identity}" {{
+  host "h"
+  {lifecycle}
+  command "{provider}"
+}}"#
+                    ),
+                )
+                .unwrap();
+                let found = crate::discover(root.path());
+                assert!(found.errors.is_empty(), "{identity}: {:?}", found.errors);
+                let spec = &found.specs[0];
+                let demanded = match provider {
+                    "codex" => required_by_codex_agent(spec, "h", root.path()),
+                    "pi" => required_by_pi_agent(spec, "h", root.path()),
+                    "omp" => required_by_omp_agent(spec, "h", root.path()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(demanded, expected, "{identity}");
+            }
+        }
     }
 
     #[test]

@@ -341,11 +341,12 @@ Agent Spec envelope in
 retained no-follow file descriptors and returns its authoritative digest.
 `st2 agent publish --catalog ROOT (--spec FILE | --bundle DIR)
 --input-sha256 HEX (--expect-absent | --expect-sha256 HEX)
-[--managed-by MARKER] --json` binds
-publication to that exact capture. It accepts exactly one canonical KDL `agent`
-node with an explicit ID plus path-safe host and identity. st2 no longer
-exposes an intent compiler: external renderers own the transformation from
-human intent to exact Agent Spec bytes or a create-only publication bundle.
+[--managed-by MARKER] --json` binds publication to that exact capture.
+`--expect-sha256` is the target Agent Spec leaf CAS. Publication accepts exactly
+one canonical KDL `agent` node with an explicit ID plus path-safe host and identity.
+st2 no longer exposes an intent compiler: external
+renderers own the transformation from human intent to exact Agent Spec bytes or
+a create-only publication bundle.
 
 The persistent `<catalog>/.st2/catalog-authoring.lock` defines one cooperative
 read/write transaction domain:
@@ -393,10 +394,6 @@ only `agent.kdl` for a hash-authorized update, and preserves all sibling runtime
 state. A bundle is create-only and is renamed from a hidden same-filesystem
 stage; retry reports `unchanged` only when every projected bundle file already
 matches. `--expect-absent` is idempotent for identical input.
-`--input-sha256` rejects a caller/source swap and `--expect-sha256` rejects a
-stale declaration writer. Full-catalog admission rejects any
-structural validation error before publication. The typed result is
-`published` or `unchanged`.
 
 A hash-authorized update also passes the ownership boundary the lifecycle verb
 applies, because it rewrites the same declaration wholesale. `--managed-by
@@ -414,9 +411,19 @@ reports `managedBy` only for a marker the incumbent confirmed. Incumbent bytes
 that are not readable as a declaration carry no ownership claim, so repairing
 them stays possible for a writer who could already replace the file directly.
 
-Host-scoped validation rejects a pty task whose session socket path would exceed the
+Admission separates declaration structure from ambient launch readiness. Parsing, identity and
+topology checks, path expansion and authority, render grammar and workspace-relative destination
+safety, and delivery shape/coherence are lifecycle-independent. Running and suspended subjects
+occupy their effective host-local address; retired subjects do not. Only a running subject requires
+resolved paths and copy sources to exist, a service to have runnable work, provider overlays and
+hook sets to be available, delivery readiness to be present, and its prospective PTY socket to fit
+the host's portable bind limit. Suspended and retired subjects do not resolve Resource bindings or
+Resource Profiles and do not project render-input existence as an ambient fact. Transitioning one
+of those declarations to running restores every readiness check before materialization or launch.
+
+Host-scoped validation rejects a running pty task whose session socket path would exceed the
 portable `sun_path` bound. `pty` binds `<PTY_ROOT>/<session-id>.sock` and refuses a
-bind over the limit, so such a task can never spawn and fails identically on every
+bind over the limit, so such a running task can never spawn and fails identically on every
 reconcile pass, which also makes the pass result useless as a health signal for that
 host. The bound is derived from the pty root resolved for the RUNTIME catalog — the
 one the supervisor will bind sockets from — and never from the tree under inspection,
@@ -431,20 +438,21 @@ never a fixed maximum identity length either: the usable identity length is what
 remains of the limit after the runtime root. The portable 104-byte bound applies so a
 declaration admitted on Linux does not fail on Darwin, and the diagnostic states the
 resolved path and the byte overage so the author can shorten the identity rather than
-discover the failure as a spawn error later.
+discover the failure as a spawn error later. Suspended and retired PTY declarations
+bind nothing and are accepted regardless of prospective socket length; activation
+re-runs the bound before launch.
 
 A park notice whose cause is structurally unrecoverable says so instead of offering
 `st2 unpark`, which would relaunch into the identical failure. The test is the same
 predicate admission uses, not the wording of a spawn error.
 
-Before returning success, publication reads the exact live declaration back
-under the catalog lock, verifies its digest and bytes, and re-admits the live
-catalog. `st2 validate --json` emits `st2.validate.v2`; successful JSON
-publication emits `st2.agent-publish.v2`. Both identify the
-`st2.core+catalog.v1` policy profile and the same `agentSpecRevision`. A clean
-hermetic build uses the complete 40-hex source revision; dirty or revisionless
-local builds use explicit identities that cannot compare equal to a clean
-hermetic receipt. The byte-only `st2 agent digest --json` contract remains
+Before returning success, publication reads the exact live declaration back under the catalog
+lock, verifies its digest and bytes, and re-admits the live catalog. `st2 validate --candidate
+FILE --json` emits the ordinary `st2.validate.v2` Report semantics. Successful JSON publication
+emits `st2.agent-publish.v2`. Both identify the `st2.core+catalog.v1` policy profile and the same
+`agentSpecRevision`. A clean hermetic build uses the complete 40-hex source revision; dirty or
+revisionless local builds use explicit identities that cannot compare equal to a clean hermetic
+receipt. The byte-only `st2 agent digest --json` contract remains
 `st2.agent-source-digest.v1` because it makes no parser or policy claim.
 
 `st2 catalog snapshot --catalog ROOT --output DIR --json` holds SH while it
@@ -536,7 +544,8 @@ modified path has both sides. Each present side classifies the fact as
 File content remains private and only the existing aggregate declaration roots
 are hashed in the receipt.
 `render` means a catalog-owned bundle file consumed by a normalized render
-operation, while `_templates` remains `template` even when referenced.
+operation of a running declaration, while `_templates` remains `template` even when referenced.
+An inactive declaration's existing bundle input remains `static`; its missing input is not resolved.
 
 Agent fields lower through the shared Agent Spec model and ordered render-plan
 parser. This is model-field normalization, not resolved effect normalization:
@@ -976,11 +985,19 @@ validate ──► materialize ──► host-local st2 scheduler/reconciler
   source cannot express: the source change being projected is the seat's
   removal, so "edit the generated source instead" names an edit the operator
   already made. A marker-matched edit therefore stands in for the
-  compare-and-swap `agent publish` a projection would otherwise perform, and
-  carries that path's admission: the complete prospective catalog must validate
-  before anything is committed, so a retirement leaving an active agent
-  descended from a retired root refuses rather than landing. The receipt records
-  the confirmed marker. Presentation, address, stream, and Resource authoring
+  compare-and-swap `agent publish` a projection would otherwise perform.
+  Independently of marker authority, every desired-state mutation builds one
+  prospective shadow while holding the catalog-authoring lock. Admission
+  compares incumbent and prospective core `ERROR` identities as stable
+  `(code, catalog-relative path, agent)` multisets and refuses only positive
+  deltas; diagnostic messages are excluded because shadow paths make them
+  unstable. Thus retirement leaving an active agent descended from a retired
+  root refuses, entering running activates launch-readiness and address checks,
+  and entering suspended reacquires address and topology checks without
+  activating readiness. An unrelated pre-existing catalog error remains
+  admissible and can be repaired or torn down incrementally. The receipt records
+  the confirmed marker when marker authority was used. Presentation, address,
+  stream, and Resource authoring
   keep the unconditional refusal: none of them projects a source the generator
   cannot itself rewrite.
 

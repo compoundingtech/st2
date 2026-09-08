@@ -2,15 +2,16 @@
 //! Read-only; changes nothing.
 //!
 //! Two severities, graded by the CoS principle:
-//! - **ERROR** — the agent will fail to run, or run and silently do the wrong thing (parse failure,
-//!   no identity, unknown `type`, a task silently dropped, an unrendered service, a duplicate id, a
-//!   relative path, or a missing **catalog-rooted** path — the renderer's own output). Exits non-zero.
-//! - **WARN** — advisory; the run still works (a partially explicit identity/host placement that
-//!   mismatches its path-derived default; a dangling supervisor — crash-dings just route nowhere; a
-//!   missing **external** path for an agent assigned to the selected validation host; an overlay
-//!   `@import` that does not resolve — a *render* concern, not st2 law, since a valid spec may carry
-//!   no persona). `--strict` promotes every WARN to a failure so a renderer's CI can demand
-//!   spotless.
+//! - **ERROR** — a declaration is structurally invalid, or a running agent will fail to run or
+//!   silently do the wrong thing (parse failure, no identity, unknown `type`, a task silently
+//!   dropped, an unrendered running service, a duplicate id, a relative path, or a missing
+//!   **catalog-rooted** running path — the renderer's own output). Exits non-zero.
+//! - **WARN** — advisory for a running declaration (a partially explicit identity/host placement
+//!   that mismatches its path-derived default; a dangling supervisor — crash-dings just route
+//!   nowhere; a missing **external** path for an agent assigned to the selected validation host; an
+//!   overlay `@import` that does not resolve — a *render* concern, not st2 law, since a valid spec
+//!   may carry no persona). `--strict` promotes every WARN to a failure so a renderer's CI can
+//!   demand spotless.
 //!
 //! st2 stays render-agnostic: render-only fields (`harness`, `model`, `persona`,
 //! `permissions`, …) are never required — their absence is never an issue.
@@ -400,7 +401,8 @@ pub(crate) fn validate_discovered(
                 ag.clone(),
                 "delivery-readiness requires an explicit native session driver".to_string(),
             )),
-            (None, Some(driver)) => issues.push(Issue::error(
+            (None, Some(driver)) if s.desired_state.is_running() => {
+                issues.push(Issue::error(
                 "delivery-readiness-missing",
                 rp.clone(),
                 ag.clone(),
@@ -408,7 +410,8 @@ pub(crate) fn validate_discovered(
                     "native session driver '{}' requires an explicit non-secret delivery-readiness declaration",
                     driver.as_str()
                 ),
-            )),
+                ));
+            }
             (
                 Some(agent_spec::DeliveryReadiness::Anonymous { harness, .. }),
                 Some(driver),
@@ -460,6 +463,7 @@ pub(crate) fn validate_discovered(
         // A rendered service agent must be runnable. Batch jobs legitimately carry no pty/exec tasks
         // (their work is in stages/run) — never flag them here.
         if let Some(Ok(compiled)) = &compiled
+            && s.desired_state.is_running()
             && s.job_type == JobType::Service
             && !compiled.is_runnable()
         {
@@ -481,9 +485,10 @@ pub(crate) fn validate_discovered(
         // validates a disposable projection nested inside the catalog, so measuring the inspected
         // tree charged every identity for the projection's own depth and rejected declarations
         // whose real socket is bindable. Host-scoped for the same reason it is runtime-scoped: the
-        // bound belongs to the host that would run the task.
+        // bound belongs to the host that would run the task. Inactive declarations bind no socket.
         if let (Some(host), Some(Ok(compiled)), RuntimeRoot::Catalog(runtime_catalog)) =
             (this_host, &compiled, runtime)
+            && s.desired_state.is_running()
             && runs_on_selected_host
         {
             let pty_root = crate::run::effective_pty_root(runtime_catalog);
@@ -512,7 +517,8 @@ pub(crate) fn validate_discovered(
             }
         }
 
-        // Path fields must be absolute, $CATALOG-rooted, or the one canonical relative workspace.
+        // Path syntax and authority are declaration facts in every lifecycle state. Filesystem
+        // presence is launch readiness and therefore belongs only to running declarations.
         for (field, raw) in path_fields(s) {
             if let Some(issue) = check_path(
                 root,
@@ -521,7 +527,8 @@ pub(crate) fn validate_discovered(
                 &ag,
                 &field,
                 &raw,
-                runs_on_selected_host,
+                s.desired_state.is_running(),
+                s.desired_state.is_running() && runs_on_selected_host,
             ) {
                 issues.push(issue);
             }
@@ -561,7 +568,9 @@ pub(crate) fn validate_discovered(
             // headed by a tombstone (#402).
             Ok(chain)
                 if !s.desired_state.is_retired()
-                    && chain.last().is_some_and(|root| root.desired_state.is_retired()) =>
+                    && chain
+                        .last()
+                        .is_some_and(|root| root.desired_state.is_retired()) =>
             {
                 issues.push(Issue::error(
                     "retired-root",
@@ -577,16 +586,19 @@ pub(crate) fn validate_discovered(
             Ok(_) => {}
         }
 
-        // Overlay lint: render's persona overlay `@import`s must resolve (WARN — render concern).
-        if runs_on_selected_host {
+        // Overlay availability is launch readiness, not declaration shape.
+        if s.desired_state.is_running() && runs_on_selected_host {
             issues.extend(overlay_lint(&rp, &ag, s));
         }
 
-        // Declarative render is a pre-boot gate: malformed directives, unsafe destinations, or a
-        // missing catalog-owned copy source would prevent this agent from booting.
-        if let Err(error) =
+        // Render grammar and destination safety apply to every declaration. Copy-source presence
+        // is ambient launch readiness and is required only while the agent is running.
+        let render_validation = if s.desired_state.is_running() {
             crate::materialize::validate_agent(root, s, s.host.as_deref().unwrap_or(""))
-        {
+        } else {
+            crate::materialize::validate_agent_structure(root, s, s.host.as_deref().unwrap_or(""))
+        };
+        if let Err(error) = render_validation {
             issues.push(Issue::error("render-error", rp, ag, format!("{error:#}")));
         }
     }
@@ -656,10 +668,9 @@ fn path_fields(s: &AgentSpec) -> Vec<(String, String)> {
     v
 }
 
-/// Check one path field through the shared launch-equivalent resolver. Absolute paths remain valid;
-/// a relative path must normalize to the declaring bundle's `.workspace`, and an unresolved
-/// variable fails closed. Catalog-owned paths must always exist; external paths are checked only
-/// for an agent assigned to the selected host.
+/// Check one path field through the shared launch-equivalent resolver. Resolution and authority are
+/// structural for every lifecycle state. Catalog filesystem presence is running readiness on every
+/// validation host; external presence is running readiness only on the selected host.
 fn check_path(
     root: &Path,
     spec_dir: &Path,
@@ -667,6 +678,7 @@ fn check_path(
     ag: &Option<String>,
     field: &str,
     raw: &str,
+    check_catalog_presence: bool,
     check_external_presence: bool,
 ) -> Option<Issue> {
     let resolved = match crate::expand::resolve_spec_path(raw, root, spec_dir) {
@@ -683,16 +695,14 @@ fn check_path(
     let p = &resolved;
     if !p.exists() {
         // A **catalog-rooted** path is the renderer's own output — its absence is a real render bug
-        // (ERROR). An **external** absolute path is checked only for the selected run host; its
-        // absence there is advisory (WARN), not a structural catalog failure.
-        return if p.starts_with(root) {
+        return if p.starts_with(root) && check_catalog_presence {
             Some(Issue::error(
                 "bad-path",
                 rp.to_string(),
                 ag.clone(),
                 format!("{field} '{raw}' does not exist"),
             ))
-        } else if check_external_presence {
+        } else if !p.starts_with(root) && check_external_presence {
             Some(Issue::warn(
                 "bad-path",
                 rp.to_string(),
