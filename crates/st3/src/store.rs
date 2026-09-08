@@ -2723,6 +2723,13 @@ impl Store {
         intent: &NormalizedIntent,
         key: &str,
     ) -> Result<ApplyResponse, St3Error> {
+        if let Some(mut response) = self
+            .cached_idempotency_response::<ApplyResponse>(key)
+            .map_err(internal)?
+        {
+            response.changed = false;
+            return Ok(response);
+        }
         let source = IntentInput {
             kdl: String::new(),
             source_name: Some("st3 reconciler".into()),
@@ -10318,6 +10325,19 @@ mission "guarded" state="ready" {
         assert_eq!(error.details["subject"], "exec/work");
         assert_eq!(error.details["expected_heads"], json!([]));
         assert_eq!(error.details["current_heads"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_internal_apply_replay_does_not_report_a_new_change() {
+        let store = Store::open_memory("node").unwrap();
+        let intent = simple("true");
+        let first = store.apply_internal(&intent, "materialize:test").unwrap();
+        let replay = store.apply_internal(&intent, "materialize:test").unwrap();
+
+        assert!(first.changed);
+        assert!(!replay.changed);
+        assert_eq!(replay.store_index, first.store_index);
+        assert_eq!(replay.batch_id, first.batch_id);
     }
 
     #[test]
