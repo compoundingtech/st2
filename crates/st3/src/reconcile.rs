@@ -1471,6 +1471,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             }
             changed |= self.materialize_step_declarations(run, &step, view)?;
+            if let Some(reason) = self.step_declaration_failure(&view.subject)? {
+                changed |= self
+                    .store
+                    .set_step_state(&view.subject, "failed", Some(&reason))?;
+                continue;
+            }
             if self.step_timed_out(view, &step)? {
                 changed |= self.store.set_step_state(
                     &view.subject,
@@ -2192,6 +2198,90 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         Ok(true)
+    }
+
+    /// Return the first produced native driver that cannot still satisfy this step.
+    ///
+    /// A driver with no restart policy has no path from a terminal runtime back to readiness. A
+    /// restartable driver remains pending until its policy either succeeds or publishes an
+    /// explicit `raise` decision. Without this check, a dead `restart "never"` agent leaves its
+    /// producing step parked until the step timeout, hiding an immediate failure for minutes.
+    fn step_declaration_failure(&self, step_subject: &str) -> Result<Option<String>> {
+        for subject in self
+            .store
+            .desired_subjects()?
+            .into_iter()
+            .filter(|subject| subject.owner_step.as_deref() == Some(step_subject))
+        {
+            let Some(member) = subject
+                .member
+                .as_ref()
+                .filter(|member| member.driver.is_some())
+            else {
+                continue;
+            };
+            let actual = self.store.latest_actual_value(&subject.subject)?;
+            let status = actual
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "status"))
+                .and_then(Value::as_str);
+            let harness_state = actual
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "state"))
+                .and_then(Value::as_str);
+            if matches!(harness_state, Some("ready" | "working" | "idle")) {
+                continue;
+            }
+
+            let raised = self
+                .store
+                .latest_claim(&subject.subject, Some("runtime.reconcile-decision"))?
+                .filter(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/decision")
+                        .and_then(Value::as_str)
+                        == Some("raise")
+                });
+            let terminal_without_restart = member.restart == RestartType::Never
+                && (matches!(status, Some("absent" | "exited" | "vanished" | "stopped"))
+                    || harness_state == Some("ended"));
+            if !terminal_without_restart && raised.is_none() {
+                continue;
+            }
+
+            let action_failure = self
+                .store
+                .latest_claim(&subject.subject, Some("runtime.action.failed"))?
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            let raised_reason = raised.and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            let exit = actual
+                .as_ref()
+                .and_then(|actual| actual_field(actual, "exit_code"))
+                .and_then(Value::as_i64)
+                .map(|code| format!(" with exit code {code}"))
+                .unwrap_or_default();
+            let detail = action_failure.or(raised_reason).unwrap_or_else(|| {
+                format!("runtime status was {}{exit}", status.unwrap_or("ended"))
+            });
+            return Ok(Some(format!(
+                "required driver `{}` could not become ready: {detail}",
+                subject.subject
+            )));
+        }
+        Ok(None)
     }
 
     fn products_hold(
@@ -5967,6 +6057,73 @@ version 2
         let starts = runtime.starts.lock().unwrap();
         assert_eq!(starts.len(), 2);
         assert!(starts[1].starts_with("gate-operation."));
+    }
+
+    #[test]
+    fn a_mission_step_fails_when_its_non_restarting_driver_exits_before_readiness() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+
+              mission "driver-start-failure" state="ready" {
+                goal "Expose a driver that cannot become ready."
+                completion { when "all-steps-exhausted" }
+                step "start-agent" timeout="10m" {
+                  title "The native agent is ready"
+                  agent "worker" {
+                    harness "codex" { prompt "Do the work." }
+                    restart "never"
+                  }
+                }
+              }
+
+        "#;
+        apply_source(&store, source, "driver-start-failure");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "driver-start-failure".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-driver-start-failure".into(),
+            })
+            .unwrap();
+        let runtime_id = format!("{}.worker", run.id);
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id,
+            terminal: true,
+            status: "exited".into(),
+            exit_code: Some(2),
+            incarnation_id: Some("failed-start".into()),
+        });
+        reconciler.reconcile_once().unwrap();
+
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        let step = run
+            .steps
+            .iter()
+            .find(|step| step.step == "start-agent")
+            .unwrap();
+        assert_eq!(step.status, "failed");
+        assert!(
+            step.blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("could not become ready: runtime status was exited with exit code 2")
+        );
     }
 
     #[test]

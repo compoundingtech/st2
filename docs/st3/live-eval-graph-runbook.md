@@ -41,6 +41,8 @@ The timeout is an absolute mission-run deadline owned by the daemon. The client 
 
 Use shorter step timeouts where a local failure should be diagnosed sooner. The mission timeout is the final containment bound for the whole eval.
 
+A required `restart "never"` harness that terminates before readiness fails its producing step immediately. A broken startup should therefore report the driver subject and terminal condition instead of consuming the step timeout. Restartable harnesses keep following their declared recovery policy until it succeeds or raises an unrecoverable decision.
+
 ## Prerequisites
 
 Use a Linux host with an interactive terminal.

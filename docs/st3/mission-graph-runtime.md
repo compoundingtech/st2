@@ -269,6 +269,8 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 
 `timeout` applies to the complete step attempt. A step cannot use a deadline gate because its timeout is the one step deadline.
 
+If a step produces a native harness driver, the step waits for a ready, working, or idle harness observation. A driver declared with `restart "never"` that exits, vanishes, or fails to start before that observation fails the step immediately. A restartable driver remains pending while its restart policy can still recover it and fails the step when that policy raises an unrecoverable decision. The step timeout is a containment bound, not a reason to hide an already terminal driver for the rest of the interval.
+
 `finally {}` contains final-phase steps. Final steps run after normal success, failure, or cancellation.
 
 A mission can have one `finally` block. Final steps can depend on other final steps.
