@@ -2903,6 +2903,27 @@ async fn start_eval(
         .map_err(|error| ApiError::internal(format!("read {}: {error}", eval_file.display())))?;
     let kdl = kdl.replace("${EVAL_ROOT}", &workspace.to_string_lossy());
     let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
+    let ready = intent
+        .missions
+        .values()
+        .filter(|mission| mission.state == crate::model::MissionState::Ready)
+        .collect::<Vec<_>>();
+    let named_entry = format!("eval/{}", request.name);
+    let entry = ready
+        .iter()
+        .copied()
+        .find(|mission| mission.id == named_entry)
+        .or_else(|| (ready.len() == 1).then_some(ready[0]))
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "invalid-eval-mission-count",
+                format!(
+                    "an eval with helper missions needs one ready entry mission named `{named_entry}`"
+                ),
+            ))
+        })?;
+    let entry_id = entry.id.clone();
+    let entry_revision = entry.revision.clone();
     stage_eval_documents(&state, &workspace, &intent).map_err(ApiError::bad)?;
     let mission = state
         .store
@@ -2928,22 +2949,11 @@ async fn start_eval(
             &format!("eval:{}:{}", request.name, request.bundle_hash),
         )
         .map_err(ApiError::bad)?;
-    let ready = intent
-        .missions
-        .values()
-        .filter(|mission| mission.state == crate::model::MissionState::Ready)
-        .collect::<Vec<_>>();
-    if ready.len() != 1 {
-        return Err(ApiError::bad(St3Error::new(
-            "invalid-eval-mission-count",
-            "an eval must contain exactly one ready mission",
-        )));
-    }
     let run = state
         .store
         .create_mission_run(&MissionRunRequest {
-            mission: ready[0].id.clone(),
-            revision: Some(ready[0].revision.clone()),
+            mission: entry_id,
+            revision: Some(entry_revision),
             workspace: workspace.to_string_lossy().into_owned(),
             requester: Some("person/eval-requester".into()),
             mode: Some("eval".into()),
@@ -5925,6 +5935,56 @@ version 2
                 .unwrap(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn an_eval_can_publish_ready_helper_missions() {
+        let root = tempfile::tempdir().unwrap();
+        let eval_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            eval_dir.path().join("eval.kdl"),
+            r#"
+version 2
+
+mission "eval/demo/helper" state="ready" {
+  goal "Supply one helper mission."
+  completion { when "all-steps-exhausted" }
+  step "done" { agentless }
+}
+
+mission "eval/demo" state="ready" {
+  goal "Run the eval entry mission."
+  completion { when "all-steps-exhausted" }
+  step "done" { agentless }
+}
+"#,
+        )
+        .unwrap();
+        let bundle = crate::archive::archive_eval(eval_dir.path()).unwrap();
+        let bundle_hash = hex::encode(Sha256::digest(&bundle));
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+
+        let (status, body) = json_request(
+            app,
+            "/v1/evals",
+            serde_json::to_value(EvalStartRequest {
+                name: "demo".into(),
+                bundle_hash,
+                bundle,
+                inputs: BTreeMap::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let run = store
+            .mission_run(body["mission_run"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.mission, "mission/eval/demo");
     }
 
     #[tokio::test]
