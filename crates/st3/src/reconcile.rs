@@ -728,6 +728,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member.environment.remove("ST_AGENT");
         }
         let executable = std::env::current_exe()?;
+        launch_member
+            .environment
+            .insert("ST3_BIN".into(), executable.to_string_lossy().into_owned());
         prepend_executable_dir(&mut launch_member.environment, &executable)?;
         if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
             && argv.first().map(String::as_str) == Some("st3")
@@ -3496,7 +3499,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             ]),
         )?;
         let instruction = format!(
-            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  st3 gate-result pass --reason 'REASON'\n  st3 gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
+            "{prompt}\n\nYou are a held-out st3 gate. Inspect only the declared workspace and tools. When you decide, run exactly one of these commands:\n  \"$ST3_BIN\" gate-result pass --reason 'REASON'\n  \"$ST3_BIN\" gate-result fail --reason 'REASON'\nDo not finish without posting a gate-result."
         );
         let argv = if model.starts_with("claude") {
             vec![
@@ -6291,6 +6294,17 @@ version 2
                 .iter()
                 .find(|member| member.driver.as_deref() == Some("llm-gate"))
                 .unwrap();
+            assert_eq!(
+                gate.environment.get("ST3_BIN").map(Path::new),
+                Some(std::env::current_exe().unwrap().as_path())
+            );
+            let LaunchSpec::Argv(argv) = &gate.launch else {
+                panic!("the LLM gate launch is not argv");
+            };
+            assert!(
+                argv.last()
+                    .is_some_and(|prompt| prompt.contains("\"$ST3_BIN\" gate-result pass"))
+            );
             (
                 gate.runtime_id.clone(),
                 gate.environment["ST_GATE_SUBJECT"].clone(),
