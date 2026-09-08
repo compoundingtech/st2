@@ -17,6 +17,11 @@ fs.writeFileSync(
   `#!${process.execPath}
 import fs from "node:fs";
 process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "message",
+  deliverAs: "steer",
+  content: "[st2-delivery filename=1787042542238-xex2t4.md attempt=00000000000000000000000000000001]\\nSubject: smoke\\n\\nDeliver once."
+}) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
 `,
@@ -39,8 +44,10 @@ const mod = await import("./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
 
 const handlers = new Map();
+const deliveries = [];
 const pi = {
   on: (name, handler) => handlers.set(name, handler),
+  sendUserMessage: (content, options) => deliveries.push({ content, options }),
 };
 mod.default(pi);
 for (const name of [
@@ -250,6 +257,19 @@ assert.strictEqual(
 // Give the recorder a moment to drain, then assert the wire the Rust decoder reads.
 await new Promise((resolve) => setTimeout(resolve, 500));
 const frames = readFrames();
+assert.ok(deliveries.length > 0, "the production asset must call sendUserMessage");
+for (const delivery of deliveries) {
+  assert.ok(
+    delivery.content.startsWith(
+      "[st2-delivery filename=1787042542238-xex2t4.md attempt=00000000000000000000000000000001]\n",
+    ),
+    "the exact attempt marker remains the first provider-visible line",
+  );
+}
+assert.ok(
+  frames.every((frame) => frame.type !== "delivered" && frame.type !== "failed"),
+  "sendUserMessage outcomes are ambiguous and must not emit receipt frames",
+);
 assert.ok(
   frames.some((frame) => frame.type === "pre_compact"),
   "session_before_compact must emit the Rust-owned recovery edge",

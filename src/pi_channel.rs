@@ -1,27 +1,27 @@
-//! Minimal pi channel watcher.
+//! Transactional pi-family native message channel.
 //!
-//! The inbox is the durable source of truth. This process keeps only an ephemeral set of filenames
-//! delivered during its current lifetime; a restart scans the inbox again. It is spawned by the
-//! shipped pi extension and owned by it over stdio, so EOF on stdin is the session-lifetime
-//! boundary. The outer pi session wrapper owns presence, because pi can outlive a failed extension.
+//! The inbox is the durable source of truth and archive is settlement. Before this process writes
+//! one message frame, the shared delivery ledger durably claims the FIFO head. Pi and OMP cannot
+//! observe evidence above `Attempted`, so a restart holds that attempt until the recipient archives
+//! it or an operator records exact correlated absence.
 //!
 //! The wire is newline-delimited JSON in both directions. st2 — not the extension — decides how a
-//! delivered message is handed to the agent, so the delivery mode travels on the frame: changing
+//! permitted message is handed to the agent, so the delivery mode travels on the frame: changing
 //! that policy is a Rust change, not a redeploy of a TypeScript asset.
 
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::driver_diagnostic::ProviderAuthEdge;
 use crate::native_channel::{channel_content, write_json};
-use crate::{context, driver_diagnostic, harness_context, harness_state, message};
+use crate::{context, delivery_ledger, driver_diagnostic, harness_context, harness_state, message};
 
 const POLL: Duration = Duration::from_millis(250);
 
@@ -66,11 +66,11 @@ const PRE_COMPACT_ERROR_REASON: &str = "pre-compact context recovery failed";
 /// guaranteed is that displaced work resumes: the model chose to continue, once, on one model.
 const DELIVER_AS: &str = "steer";
 
-/// The harness-specific facts the shared channel loop needs: which env names carry the wrapper's
-/// exported ownership triple, what label goes on records and errors, and which native-driver
-/// diagnostic word — if any — this channel publishes under.
+/// The harness-specific facts the shared channel loop needs: delivery identity, exported ownership
+/// variables, the labels carried by records and errors, and the native-driver diagnostic word.
 pub struct ChannelKind {
     pub label: &'static str,
+    pub delivery_harness: delivery_ledger::Harness,
     /// Which producer row of the harness-context table these numbers come from. It is the record's
     /// only discriminator, and the two kinds genuinely differ: pi's `tokens` is the last assistant
     /// message's `totalTokens`, omp's is its prompt-only `input`. A reader that knows the harness
@@ -87,6 +87,7 @@ pub struct ChannelKind {
 
 const PI_KIND: ChannelKind = ChannelKind {
     label: "pi",
+    delivery_harness: delivery_ledger::Harness::Pi,
     harness: harness_context::Harness::Pi,
     diagnostic_driver: None,
     runtime_id_env: crate::pi_session::CHANNEL_RUNTIME_ID,
@@ -96,12 +97,184 @@ const PI_KIND: ChannelKind = ChannelKind {
 
 const OMP_KIND: ChannelKind = ChannelKind {
     label: "omp",
+    delivery_harness: delivery_ledger::Harness::Omp,
     harness: harness_context::Harness::Omp,
     diagnostic_driver: Some(driver_diagnostic::Driver::Omp),
     runtime_id_env: crate::omp_session::CHANNEL_RUNTIME_ID,
     session_env: crate::omp_session::CHANNEL_SESSION,
     seq_env: crate::omp_session::CHANNEL_SEQ,
 };
+
+/// The ledger lives with the declaration-owned runtime records. Its harness field keeps a changed
+/// driver from interpreting a predecessor's state as its own.
+fn delivery_ledger_path_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(delivery_ledger::LEDGER_FILE)
+}
+
+/// Stable provider-neutral correlation for a pi-family delivery binding and inbox filename.
+///
+/// The attempt token, not this value, distinguishes retries. Length-prefixing keeps the derivation
+/// unambiguous without depending on runtime paths or provider-session identifiers.
+pub fn delivery_correlation(binding: &str, filename: &str) -> String {
+    let mut hash = Sha256::new();
+    for value in [binding.as_bytes(), filename.as_bytes()] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn delivery_correlate() -> impl Fn(&str, &str) -> String + Send + Sync + 'static {
+    delivery_correlation
+}
+
+struct DeliveryPump {
+    ledger: delivery_ledger::Ledger,
+    binding: String,
+    agent_dir: PathBuf,
+}
+
+impl DeliveryPump {
+    fn open(agent_dir: &Path, identity: &str, runtime_id: &str, kind: &ChannelKind) -> Self {
+        Self {
+            ledger: delivery_ledger::Ledger::open(
+                &delivery_ledger_path_in(agent_dir),
+                kind.delivery_harness.profile(),
+                identity,
+                runtime_id,
+                delivery_correlate(),
+            ),
+            binding: runtime_id.to_owned(),
+            agent_dir: agent_dir.to_owned(),
+        }
+    }
+
+    /// Reconcile archive settlement, then claim and transport at most the FIFO head.
+    fn pump(
+        &mut self,
+        out: &mut impl Write,
+        unread: Vec<message::Message>,
+        identity: &str,
+    ) -> Result<()> {
+        let snapshot = self.ledger.snapshot()?;
+        let mut settled = Vec::new();
+        for attempt in snapshot.attempts() {
+            if message::archive_receipt_exists(&self.agent_dir, &attempt.filename)? {
+                settled.push(attempt.fence());
+            }
+        }
+        self.ledger.prune(&settled)?;
+
+        let head = unread
+            .into_iter()
+            .find_map(|message| {
+                match message::archive_receipt_exists(&self.agent_dir, &message.filename) {
+                    Ok(false) => Some(Ok(message)),
+                    Ok(true) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?;
+        let Some(head) = head else {
+            return Ok(());
+        };
+        self.ledger.retarget(&self.binding)?;
+        let permit = match self.ledger.claim(delivery_ledger::Claimant {
+            filename: head.filename.clone(),
+            binding: self.binding.clone(),
+            correlation: delivery_ledger::Correlation::native(delivery_correlation(
+                &self.binding,
+                &head.filename,
+            )),
+            // The attempt-only transports expose no incarnation-scoped receipt to correlate.
+            incarnation: None,
+        })? {
+            delivery_ledger::Claim::Permitted(permit) => permit,
+            delivery_ledger::Claim::Held(_) => return Ok(()),
+        };
+        write_json(out, &message_frame(head, identity, &permit)?)?;
+        Ok(())
+    }
+}
+
+fn observe_delivery_for(
+    catalog_root: &Path,
+    identity: &str,
+    harness: delivery_ledger::Harness,
+) -> Result<delivery_ledger::Observation> {
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| format!("delivery ledger agent '{identity}' is not declared"))?;
+    delivery_ledger::observe(
+        &delivery_ledger_path_in(&agent_dir),
+        harness.profile(),
+        identity,
+        &delivery_correlate(),
+    )
+}
+
+pub fn observe_pi_delivery(
+    catalog_root: &Path,
+    identity: &str,
+) -> Result<delivery_ledger::Observation> {
+    observe_delivery_for(catalog_root, identity, delivery_ledger::Harness::Pi)
+}
+
+pub fn observe_omp_delivery(
+    catalog_root: &Path,
+    identity: &str,
+) -> Result<delivery_ledger::Observation> {
+    observe_delivery_for(catalog_root, identity, delivery_ledger::Harness::Omp)
+}
+
+fn operator_refuse_for(
+    catalog_root: &Path,
+    identity: &str,
+    harness: delivery_ledger::Harness,
+    refusal: &delivery_ledger::OperatorRefusal,
+) -> Result<delivery_ledger::OperatorOutcome> {
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| format!("delivery ledger agent '{identity}' is not declared"))?;
+    if message::archive_receipt_exists(&agent_dir, &refusal.fence.filename)? {
+        return Ok(delivery_ledger::OperatorOutcome::ArchiveSettled {
+            filename: refusal.fence.filename.clone(),
+        });
+    }
+    delivery_ledger::Ledger::for_operator(
+        &delivery_ledger_path_in(&agent_dir),
+        harness.profile(),
+        identity,
+        delivery_correlate(),
+    )
+    .operator_refuse(refusal)
+}
+
+pub fn operator_refuse_pi(
+    catalog_root: &Path,
+    identity: &str,
+    refusal: &delivery_ledger::OperatorRefusal,
+) -> Result<delivery_ledger::OperatorOutcome> {
+    operator_refuse_for(
+        catalog_root,
+        identity,
+        delivery_ledger::Harness::Pi,
+        refusal,
+    )
+}
+
+pub fn operator_refuse_omp(
+    catalog_root: &Path,
+    identity: &str,
+    refusal: &delivery_ledger::OperatorRefusal,
+) -> Result<delivery_ledger::OperatorOutcome> {
+    operator_refuse_for(
+        catalog_root,
+        identity,
+        delivery_ledger::Harness::Omp,
+        refusal,
+    )
+}
 
 /// Run the pi native message channel over stdio.
 pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
@@ -114,8 +287,11 @@ pub fn run_omp(catalog_root: &Path, identity: &str) -> Result<()> {
 }
 
 fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()> {
-    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
-        .with_context(|| format!("{} channel agent '{identity}' is not declared", kind.label))?;
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| {
+                format!("{} channel agent '{identity}' is not declared", kind.label)
+            })?;
     let inbox = message::inbox_dir(&agent_dir);
     // Composed here rather than in the extension: what a restarted agent is told is st2's contract,
     // not the asset's, and the Codex and Claude hooks compose the same three blocks in bash.
@@ -165,8 +341,9 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let context_session = wrapper_session
         .clone()
         .unwrap_or_else(harness_state::session_token);
+    let mut delivery = DeliveryPump::open(&agent_dir, identity, &pty_session, kind);
     let mut writer =
-        harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session));
+        harness_state::Writer::new(&agent_dir, identity, kind.label, Some(pty_session.clone()));
     if let Some(session) = wrapper_session {
         // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
         // token a direction, so a straggler channel from a superseded session is refused.
@@ -204,6 +381,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         &inbox,
         &agent_dir,
         &mut writer,
+        &mut delivery,
         context_writer.as_mut(),
         identity,
         kind,
@@ -222,13 +400,13 @@ fn channel_loop(
     inbox: &Path,
     agent_dir: &Path,
     writer: &mut harness_state::Writer,
+    delivery: &mut DeliveryPump,
     mut context_writer: Option<&mut harness_context::Writer>,
     identity: &str,
     kind: &ChannelKind,
     poll: Duration,
     heartbeat_every: Duration,
 ) -> Result<()> {
-    let mut delivered = HashSet::new();
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -310,11 +488,7 @@ fn channel_loop(
             }
             next_heartbeat = now + heartbeat_every;
         }
-        for msg in message::list_inbox(inbox)? {
-            if delivered.insert(msg.filename.clone()) {
-                write_json(out, &message_frame(msg, identity))?;
-            }
-        }
+        delivery.pump(out, message::list_inbox(inbox)?, identity)?;
         out.flush()?;
         thread::sleep(poll);
     }
@@ -632,23 +806,61 @@ fn session_context(agent_dir: &Path, identity: &str) -> String {
     blocks.join("\n\n")
 }
 
-/// One inbox entry as the frame the extension hands to pi.
+/// One durably permitted inbox entry as the frame the extension hands to the harness.
 ///
-/// The envelope matches the Claude channel's exactly, so a persona written against one native
-/// harness reads the same on the other.
-fn message_frame(msg: message::Message, identity: &str) -> Value {
-    let content = channel_content(msg.subject.as_deref(), &msg.body);
-    json!({"type":"message","deliverAs":DELIVER_AS,"content":content,"meta":{
-        "from": msg.from,
-        "messageFilename": msg.filename,
-        "threadFilename": msg.in_reply_to.unwrap_or_else(|| msg.filename.clone()),
-        "identity": identity
-    }})
+/// The exact attempt marker is the first provider-visible line. The extension does not grade the
+/// call's return or exception; archive or exact operator absence are the only later authorities.
+fn message_frame(
+    msg: message::Message,
+    identity: &str,
+    permit: &delivery_ledger::Permit,
+) -> Result<Value> {
+    let marker = delivery_ledger::marker(&msg.filename, permit.token())?;
+    let content = format!(
+        "{marker}\n{}",
+        channel_content(msg.subject.as_deref(), &msg.body)
+    );
+    Ok(
+        json!({"type":"message","deliverAs":DELIVER_AS,"content":content,"meta":{
+            "from": msg.from,
+            "messageFilename": msg.filename,
+            "threadFilename": msg.in_reply_to.unwrap_or_else(|| msg.filename.clone()),
+            "identity": identity
+        }}),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delivery(agent_dir: &Path, kind: &ChannelKind) -> DeliveryPump {
+        DeliveryPump::open(agent_dir, "h.worker", "h.worker", kind)
+    }
+
+    fn test_message(filename: &str) -> message::Message {
+        message::Message {
+            filename: filename.into(),
+            ts_ms: filename[..13].parse().unwrap(),
+            from: Some("h.supervisor".into()),
+            subject: Some("deploy check".into()),
+            in_reply_to: None,
+            tags: Vec::new(),
+            priority: None,
+            idempotency_key: None,
+            stream: None,
+            event_id: None,
+            event_key: None,
+            body: "Please verify the staging deploy.".into(),
+        }
+    }
+
+    fn output_frames(out: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 
     /// Only the two words pi's own turn boundaries can vouch for become observations. Everything
     /// else — other frame types, unknown state words, missing fields — is dropped, so a newer
@@ -699,10 +911,7 @@ mod tests {
         .unwrap();
         assert_eq!(question.blocked_on, harness_state::BlockedOn::Human);
         assert_eq!(question.ask, harness_state::Ask::Question);
-        assert_eq!(
-            question.reason.as_deref(),
-            Some("Which deployment target?")
-        );
+        assert_eq!(question.reason.as_deref(), Some("Which deployment target?"));
 
         let unknown_ask = state_observation(&json!({
             "type":"state","state":"active","blockedOn":"human",
@@ -731,6 +940,7 @@ mod tests {
         let run_frame = || {
             let mut writer =
                 harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut delivery = delivery(agent_dir, &OMP_KIND);
             let (tx, rx) = mpsc::channel();
             tx.send(Ok(r#"{"type":"pre_compact"}"#.to_string()))
                 .unwrap();
@@ -741,6 +951,7 @@ mod tests {
                 &inbox,
                 agent_dir,
                 &mut writer,
+                &mut delivery,
                 None,
                 "h.worker",
                 &OMP_KIND,
@@ -793,6 +1004,7 @@ mod tests {
         let record = harness_state::harness_state_path(agent_dir);
         let mut writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let mut delivery = delivery(agent_dir, &PI_KIND);
         let (tx, rx) = mpsc::channel();
 
         tx.send(Ok(r#"{"type":"state","state":"active"}"#.to_string()))
@@ -808,6 +1020,7 @@ mod tests {
             &message::inbox_dir(agent_dir),
             agent_dir,
             &mut writer,
+            &mut delivery,
             None,
             "h.worker",
             &PI_KIND,
@@ -850,6 +1063,7 @@ mod tests {
         let mut wrapper_writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()))
                 .with_session(session);
+        let mut delivery = delivery(agent_dir, &PI_KIND);
         wrapper_writer.ended("signal 9").unwrap();
         let terminal = std::fs::read(&record).unwrap();
 
@@ -864,6 +1078,7 @@ mod tests {
             &message::inbox_dir(agent_dir),
             agent_dir,
             &mut channel_writer,
+            &mut delivery,
             None,
             "h.worker",
             &PI_KIND,
@@ -1243,40 +1458,142 @@ mod tests {
         assert!(!restored.contains("st2 inbox"), "{restored}");
     }
 
-    /// The extension is not allowed to choose how a message lands, so the mode has to be on the
-    /// frame st2 writes. Pinning it here is what makes #277 a one-place change.
-    #[test]
-    fn st2_owns_the_delivery_mode_on_the_wire() {
-        let frame = message_frame(
-            message::Message {
-                filename: "1787042542238-xex2t4.md".into(),
-                ts_ms: 1_787_042_542_238,
-                from: Some("h.supervisor".into()),
-                subject: Some("deploy check".into()),
-                in_reply_to: None,
-                tags: Vec::new(),
-                priority: None,
-                idempotency_key: None,
-                stream: None,
-                event_id: None,
-                event_key: None,
-                body: "Please verify the staging deploy.".into(),
-            },
-            "h.worker",
+    fn assert_attempt_only_delivery(kind: &ChannelKind) {
+        const FIRST: &str = "1787042542238-xex2t4.md";
+        const SECOND: &str = "1787042542239-abc123.md";
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path();
+        let unread = vec![test_message(FIRST), test_message(SECOND)];
+
+        let mut first_process = delivery(agent_dir, kind);
+        let mut first_out = Vec::new();
+        first_process
+            .pump(&mut first_out, unread.clone(), "h.worker")
+            .unwrap();
+        let first_snapshot = first_process.ledger.snapshot().unwrap();
+        let first_attempt = first_snapshot.attempt(FIRST).unwrap().clone();
+        assert_eq!(
+            first_snapshot.attempts().len(),
+            1,
+            "only the FIFO head is claimed"
+        );
+        assert_eq!(first_attempt.phase, delivery_ledger::Phase::Attempted);
+        assert_eq!(first_attempt.binding, "h.worker");
+        let frames = output_frames(&first_out);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "message");
+        assert_eq!(frames[0]["deliverAs"], "steer");
+        assert_eq!(
+            frames[0]["content"],
+            format!(
+                "{}\nSubject: deploy check\n\nPlease verify the staging deploy.",
+                delivery_ledger::marker(FIRST, first_attempt.token).unwrap()
+            )
         );
 
-        assert_eq!(frame["type"], "message");
-        assert_eq!(frame["deliverAs"], "steer");
-        assert_eq!(
-            frame["content"],
-            "Subject: deploy check\n\nPlease verify the staging deploy."
+        let mut restarted = delivery(agent_dir, kind);
+        let mut restart_out = Vec::new();
+        restarted
+            .pump(&mut restart_out, unread.clone(), "h.worker")
+            .unwrap();
+        assert!(
+            restart_out.is_empty(),
+            "an ambiguous attempt must hold across channel restart"
         );
-        assert_eq!(frame["meta"]["identity"], "h.worker");
-        // An unthreaded message threads on itself, matching the Claude channel.
-        assert_eq!(
-            frame["meta"]["threadFilename"],
-            frame["meta"]["messageFilename"]
+
+        let mut missing_out = Vec::new();
+        restarted
+            .pump(&mut missing_out, vec![test_message(SECOND)], "h.worker")
+            .unwrap();
+        let missing_snapshot = restarted.ledger.snapshot().unwrap();
+        assert!(missing_out.is_empty());
+        assert!(
+            missing_snapshot.attempt(FIRST).is_some(),
+            "inbox absence alone is not settlement"
         );
+        assert!(missing_snapshot.attempt(SECOND).is_none());
+
+        let mut restored_out = Vec::new();
+        restarted
+            .pump(&mut restored_out, unread.clone(), "h.worker")
+            .unwrap();
+        assert!(
+            restored_out.is_empty(),
+            "a restored inbox replica must not duplicate an ambiguous attempt"
+        );
+
+        let archive = message::archive_dir(agent_dir);
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(archive.join(FIRST), b"durable recipient receipt").unwrap();
+        let stale_unread = unread.clone();
+        let mut after_archive = Vec::new();
+        restarted
+            .pump(&mut after_archive, stale_unread, "h.worker")
+            .unwrap();
+        let second_snapshot = restarted.ledger.snapshot().unwrap();
+        assert!(second_snapshot.attempt(FIRST).is_none());
+        let second_attempt = second_snapshot.attempt(SECOND).unwrap().clone();
+        assert_eq!(output_frames(&after_archive).len(), 1);
+
+        let audit = delivery_ledger::OperatorAudit::new(
+            delivery_ledger::OperatorSource::Operator,
+            unsafe { libc::geteuid() },
+            None,
+            None,
+            "marker absent from provider history",
+            second_snapshot.digest(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            restarted
+                .ledger
+                .operator_refuse(&delivery_ledger::OperatorRefusal {
+                    fence: second_attempt.fence(),
+                    audit,
+                })
+                .unwrap(),
+            delivery_ledger::OperatorOutcome::Applied(_)
+        ));
+
+        let mut retry_process =
+            DeliveryPump::open(agent_dir, "h.worker", "h.worker.replaced", kind);
+        let mut retry_out = Vec::new();
+        retry_process
+            .pump(&mut retry_out, vec![test_message(SECOND)], "h.worker")
+            .unwrap();
+        let replacement = retry_process
+            .ledger
+            .snapshot()
+            .unwrap()
+            .attempt(SECOND)
+            .unwrap()
+            .clone();
+        assert_ne!(replacement.token, second_attempt.token);
+        assert_eq!(replacement.binding, "h.worker.replaced");
+        assert_eq!(output_frames(&retry_out).len(), 1);
+        retry_process
+            .pump(&mut retry_out, vec![test_message(SECOND)], "h.worker")
+            .unwrap();
+        assert_eq!(
+            output_frames(&retry_out).len(),
+            1,
+            "the fresh token permits exactly one retry"
+        );
+    }
+
+    /// Pi claims before transport, exposes the exact attempt marker, and keeps ambiguous delivery
+    /// held across process restart until archive or exact operator absence changes the ledger.
+    #[test]
+    fn pi_attempt_only_delivery_is_transactional_and_restart_safe() {
+        assert_attempt_only_delivery(&PI_KIND);
+    }
+
+    /// OMP shares the transaction boundary without sharing provider identity: archive advances the
+    /// FIFO and an operator-confirmed absence rotates the exact token before one retry.
+    #[test]
+    fn omp_attempt_only_delivery_is_transactional_and_restart_safe() {
+        assert_attempt_only_delivery(&OMP_KIND);
     }
 
     /// The measured omp 18.1.7 classifications, one row per case in
@@ -1384,6 +1701,7 @@ mod tests {
         let run = |frames: &[&str]| {
             let mut writer =
                 harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut delivery = delivery(agent_dir, &OMP_KIND);
             let (tx, rx) = mpsc::channel();
             for frame in frames {
                 tx.send(Ok((*frame).to_string())).unwrap();
@@ -1395,6 +1713,7 @@ mod tests {
                 &inbox,
                 agent_dir,
                 &mut writer,
+                &mut delivery,
                 None,
                 "h.worker",
                 &OMP_KIND,
@@ -1458,6 +1777,7 @@ mod tests {
         std::fs::create_dir_all(message::inbox_dir(agent_dir)).unwrap();
         let mut writer =
             harness_state::Writer::new(agent_dir, "h.worker", "pi", Some("h.worker".into()));
+        let mut delivery = delivery(agent_dir, &PI_KIND);
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(
             r#"{"type":"turn","error":{"reason":"401 invalid x-api-key","errorId":16781312}}"#
@@ -1471,6 +1791,7 @@ mod tests {
             &message::inbox_dir(agent_dir),
             agent_dir,
             &mut writer,
+            &mut delivery,
             None,
             "h.worker",
             &PI_KIND,

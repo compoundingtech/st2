@@ -2031,21 +2031,27 @@ fn box_target(
 #[derive(Clone, Copy)]
 enum LedgerProvider {
     Codex,
+    Pi,
     OpenCode,
+    Omp,
 }
 
 impl LedgerProvider {
     fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::Pi => "pi",
             Self::OpenCode => "opencode",
+            Self::Omp => "omp",
         }
     }
 
     fn observe(self, root: &Path, identity: &str) -> Result<st2::delivery_ledger::Observation> {
         match self {
             Self::Codex => st2::codex_app_server::observe_delivery(root, identity),
+            Self::Pi => st2::pi_channel::observe_pi_delivery(root, identity),
             Self::OpenCode => st2::opencode_session::observe_delivery(root, identity),
+            Self::Omp => st2::pi_channel::observe_omp_delivery(root, identity),
         }
     }
 
@@ -2057,7 +2063,9 @@ impl LedgerProvider {
     ) -> Result<st2::delivery_ledger::OperatorOutcome> {
         match self {
             Self::Codex => st2::codex_app_server::operator_refuse(root, identity, refusal),
+            Self::Pi => st2::pi_channel::operator_refuse_pi(root, identity, refusal),
             Self::OpenCode => st2::opencode_session::operator_refuse(root, identity, refusal),
+            Self::Omp => st2::pi_channel::operator_refuse_omp(root, identity, refusal),
         }
     }
 }
@@ -2095,8 +2103,12 @@ fn delivery_target(
     );
     let provider = match spec.effective_session_driver() {
         Some(st2::SessionDriver::Codex) => LedgerProvider::Codex,
+        Some(st2::SessionDriver::Pi) => LedgerProvider::Pi,
         Some(st2::SessionDriver::OpenCode) => LedgerProvider::OpenCode,
-        Some(driver) => anyhow::bail!("{} has not adopted the delivery ledger", driver.as_str()),
+        Some(st2::SessionDriver::Omp) => LedgerProvider::Omp,
+        Some(st2::SessionDriver::Claude) => {
+            anyhow::bail!("claude has not adopted the delivery ledger")
+        }
         None => anyhow::bail!("agent '{}' has no native session driver", spec.bus_id(host)),
     };
     Ok((spec.bus_id(host), provider))
@@ -2210,6 +2222,9 @@ fn delivery_negative_cmd(
         }
         st2::delivery_ledger::OperatorOutcome::AlreadyRefused(_) => {
             anyhow::bail!("delivery attempt already has exact negative evidence")
+        }
+        st2::delivery_ledger::OperatorOutcome::ArchiveSettled { .. } => {
+            anyhow::bail!("delivery message is already settled by its archive receipt")
         }
     };
     let receipt = DeliveryNegativeReceipt {

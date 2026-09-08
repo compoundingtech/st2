@@ -94,6 +94,67 @@ fn delivery_fixture() -> DeliveryFixture {
     }
 }
 
+fn attempt_only_delivery_fixture(
+    harness: st2::delivery_ledger::Harness,
+    driver: &str,
+) -> DeliveryFixture {
+    const AGENT_ID: &str = "0193b8f2-7c31-7a4e-9f11-4c2d6b8a35e7";
+    const IDENTITY: &str = "h.worker";
+    const FILENAME: &str = "1786380000000-aaa111.md";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("catalog");
+    let state = tmp.path().join("state");
+    let agent_dir = root.join("h/worker");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("agent.kdl"),
+        format!(
+            "agent \"worker\" {{\n  identity \"worker\"\n  id \"{AGENT_ID}\"\n  address \"worker\"\n  host \"h\"\n  type \"service\"\n  session-driver \"{driver}\"\n  argv \"{driver}\"\n}}\n"
+        ),
+    )
+    .unwrap();
+    let inbox = agent_dir.join("resources/inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(inbox.join(FILENAME), "operator-visible payload\n").unwrap();
+
+    let ledger_path = agent_dir.join("delivery-ledger.json");
+    let mut ledger = st2::delivery_ledger::Ledger::open(
+        &ledger_path,
+        harness.profile(),
+        IDENTITY,
+        IDENTITY,
+        st2::pi_channel::delivery_correlation,
+    );
+    let permit = match ledger
+        .claim(st2::delivery_ledger::Claimant {
+            filename: FILENAME.to_owned(),
+            binding: IDENTITY.to_owned(),
+            correlation: st2::delivery_ledger::Correlation::native(
+                st2::pi_channel::delivery_correlation(IDENTITY, FILENAME),
+            ),
+            incarnation: None,
+        })
+        .unwrap()
+    {
+        st2::delivery_ledger::Claim::Permitted(permit) => permit,
+        st2::delivery_ledger::Claim::Held(reason) => {
+            panic!("fresh delivery fixture unexpectedly held: {reason:?}")
+        }
+    };
+    let digest = ledger.snapshot().unwrap().digest();
+
+    DeliveryFixture {
+        _tmp: tmp,
+        root,
+        state,
+        ledger_path,
+        filename: FILENAME,
+        token: permit.token(),
+        digest,
+        fence: permit.fence(),
+    }
+}
+
 fn delivery_negative(
     fixture: &DeliveryFixture,
     selector: &[&str],
@@ -1620,6 +1681,67 @@ fn delivery_negative_records_audited_absence_by_address_and_exact_id_without_tra
         );
         assert_eq!(fs::read(&fixture.ledger_path).unwrap(), after);
     }
+}
+
+#[test]
+fn delivery_negative_dispatches_to_pi_and_omp_declaration_ledgers() {
+    for (harness, driver) in [
+        (st2::delivery_ledger::Harness::Pi, "pi"),
+        (st2::delivery_ledger::Harness::Omp, "omp"),
+    ] {
+        let fixture = attempt_only_delivery_fixture(harness, driver);
+        let output = delivery_negative(
+            &fixture,
+            &["worker", fixture.filename],
+            &fixture.token.hex(),
+            &fixture.digest.hex(),
+            Some("verified absent in provider history"),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(receipt["outcome"], "applied");
+        assert_eq!(receipt["harness"], harness.as_str());
+        assert_eq!(receipt["agent"], "h.worker");
+        assert_eq!(receipt["filename"], fixture.filename);
+        assert_eq!(receipt["attemptToken"], fixture.token.hex());
+
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.ledger_path).unwrap()).unwrap();
+        assert_eq!(ledger["entries"][0]["negative"], "absent");
+        assert_eq!(
+            ledger["entries"][0]["operatorAudit"]["reason"],
+            "verified absent in provider history"
+        );
+    }
+}
+
+#[test]
+fn delivery_negative_refuses_a_pi_attempt_settled_by_archive() {
+    let fixture = attempt_only_delivery_fixture(st2::delivery_ledger::Harness::Pi, "pi");
+    let archive = fixture.root.join("h/worker/resources/archive");
+    fs::create_dir_all(&archive).unwrap();
+    fs::write(archive.join(fixture.filename), b"recipient receipt").unwrap();
+    let before = fs::read(&fixture.ledger_path).unwrap();
+
+    let output = delivery_negative(
+        &fixture,
+        &["worker", fixture.filename],
+        &fixture.token.hex(),
+        &fixture.digest.hex(),
+        Some("provider history looked empty"),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("settled by its archive receipt"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&fixture.ledger_path).unwrap(), before);
 }
 
 #[test]

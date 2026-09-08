@@ -1196,7 +1196,6 @@ pub fn snapshot(request: SnapshotRequest) -> Result<SnapshotResult> {
 
     let _lock = CatalogLock::shared(&catalog)?;
     let projection = if request.raw_preimage {
-
         let projection = project_raw_current(&catalog)?;
         validate_projection_link_counts(&catalog, &projection, "raw live catalog")?;
         projection
@@ -1988,6 +1987,24 @@ fn collect_canonical_specs(
     Ok(specs)
 }
 
+fn is_agent_state_name(name: &str) -> bool {
+    matches!(
+        name,
+        "resources"
+            | "archive"
+            | "inbox"
+            | "status"
+            | "harness-context"
+            | "harness-state"
+            | ".harness-state.seq"
+            | ".harness-state.lock"
+            | ".harness-context.lock"
+            | crate::delivery_ledger::LEDGER_FILE
+            | crate::delivery_ledger::LEDGER_LOCK
+    ) || name.starts_with(crate::status::TMP_STAGING_PREFIX)
+        || name.starts_with(crate::delivery_ledger::LEDGER_STAGING_PREFIX)
+}
+
 fn collect_bundle_files(
     root: &Path,
     bundle_root: &Path,
@@ -2023,18 +2040,7 @@ fn collect_bundle_files(
         if canonical_workspace || workspace_dirs.contains(&relative) {
             continue;
         }
-        let state = matches!(
-            name_text,
-            "resources"
-                | "archive"
-                | "inbox"
-                | "status"
-                | "harness-context"
-                | "harness-state"
-                | ".harness-state.seq"
-                | ".harness-state.lock"
-                | ".harness-context.lock"
-        ) || name_text.starts_with(crate::status::TMP_STAGING_PREFIX);
+        let state = is_agent_state_name(name_text);
         if first.is_some() && relative_to_bundle.components().count() == 1 && state {
             if source == ProjectionSource::Prepared {
                 anyhow::bail!(
@@ -2244,9 +2250,7 @@ fn reject_state_children(identity_path: &Path) -> Result<()> {
     for entry in sorted_entries(identity_path)? {
         let name = entry.file_name();
         let name = name.to_str().context("identity path is not UTF-8")?;
-        if matches!(name, "resources" | "archive" | "inbox" | "status")
-            || name.starts_with(crate::status::TMP_STAGING_PREFIX)
-        {
+        if is_agent_state_name(name) {
             anyhow::bail!(
                 "prepared catalog contains state-plane path: {}",
                 entry.path().display()
@@ -2932,10 +2936,7 @@ fn validate_declaration_leaf_path(path: &str) -> Result<()> {
     );
     if canonical_bundle {
         anyhow::ensure!(
-            !matches!(
-                components[3],
-                ".workspace" | "resources" | "archive" | "inbox" | "status"
-            ) && !components[3].starts_with(crate::status::TMP_STAGING_PREFIX),
+            !matches!(components[3], ".workspace") && !is_agent_state_name(components[3]),
             "catalog apply marker contains a workspace or state-plane path"
         );
     }
@@ -3472,15 +3473,42 @@ mod tests {
     }
 
     #[test]
+    fn delivery_ledger_files_are_runtime_state_not_catalog_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = catalog_with_worker(root.path());
+        let before = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+        for name in [
+            crate::delivery_ledger::LEDGER_FILE,
+            crate::delivery_ledger::LEDGER_LOCK,
+            ".delivery-ledger.tmp-123-456",
+        ] {
+            fs::write(agent.join(name), b"runtime delivery evidence").unwrap();
+        }
+
+        let after = project(root.path(), ProjectionSource::Current, root.path())
+            .unwrap()
+            .root_sha256;
+
+        assert_eq!(
+            after, before,
+            "runtime evidence cannot alter catalog identity"
+        );
+        assert!(
+            project(root.path(), ProjectionSource::Prepared, root.path()).is_err(),
+            "prepared declarations cannot smuggle runtime delivery state"
+        );
+    }
+
+    #[test]
     fn current_projection_ignores_and_preserves_an_exact_legacy_staging_file() {
         let root = tempfile::tempdir().unwrap();
         catalog_with_worker(root.path());
         let before = project(root.path(), ProjectionSource::Current, root.path())
             .unwrap()
             .root_sha256;
-        let legacy = root
-            .path()
-            .join("agents/host/.harness-context.tmp-123-456");
+        let legacy = root.path().join("agents/host/.harness-context.tmp-123-456");
         fs::write(&legacy, b"stale legacy staging bytes").unwrap();
 
         let after = project(root.path(), ProjectionSource::Current, root.path())
@@ -3535,5 +3563,4 @@ mod tests {
             );
         }
     }
-
 }
