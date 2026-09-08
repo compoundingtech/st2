@@ -2046,7 +2046,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             let Some(current) = existing.get(&subject.subject) else {
                 continue;
             };
-            if current.owner_run.as_deref() == Some(run.subject.as_str())
+            if current.kind != "stop"
+                && current.owner_run.as_deref() == Some(run.subject.as_str())
                 && current.owner_generation.as_deref() == Some(run.generation.as_str())
                 && current.owner_step.as_deref() != owner_step
             {
@@ -7663,6 +7664,50 @@ version 2
         reconciler.reconcile_once().unwrap();
         let error = reconciler.reconcile_once().unwrap_err();
         assert!(error.to_string().contains("more than one mission or step"));
+    }
+
+    #[test]
+    fn a_step_stop_does_not_collide_with_its_mission_runtime() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+  mission "restart" state="ready" {
+    goal "Restart one mission agent."
+    completion { when "all-steps-exhausted" }
+    agent "worker" { workspace "."; command "true"; restart "always" }
+    step "restart-worker" {
+      agentless
+      stop "agent/${ST_MISSION_RUN}/worker"
+    }
+  }
+
+"#;
+        apply_source(&store, source, "publish-restart");
+        store
+            .create_mission_run(&MissionRunRequest {
+                mission: "restart".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "restart-run".into(),
+            })
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store,
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        assert!(!runtime.starts.lock().unwrap().is_empty());
     }
 
     impl ResourceProvider for FakeResourceProvider {

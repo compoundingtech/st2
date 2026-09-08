@@ -697,7 +697,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
             r#"version 2
-host "node" {{
+  host "local" {{
   document "doc/hosts/node@{}"
   agent "one" {{ workspace {:?}; harness "codex" {{}} }}
 }}"#,

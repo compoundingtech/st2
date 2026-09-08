@@ -953,15 +953,17 @@ fn string_node(name: &str, value: &str) -> KdlNode {
 
 fn parse_host(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
-    let name = one_string_with_children(node)?;
+    let name = placement_host(one_string_with_children(node)?, &context.default_host);
     validate_name(&name, false)?;
     let subject = format!("host/{name}");
+    let mut normalized = node.clone();
+    normalized.entries_mut()[0].set_value(name.clone());
     insert_subject(
         context,
         DesiredSubject {
             subject,
             kind: "host".into(),
-            desired: canonical_node(node)?,
+            desired: canonical_node(&normalized)?,
             member: None,
             owner_run: context.owner_run.clone(),
             owner_generation: None,
@@ -3979,6 +3981,9 @@ version 2
         let source = r#"
             version 2
 
+              host "local" {
+                document "doc/hosts/node-a@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
               exec "setup" {
                 host "local"
                 command "true"
@@ -3999,6 +4004,11 @@ version 2
 
         let intent = parse_test_intent(source, "node-a").unwrap();
 
+        assert!(intent.subjects.contains_key("host/node-a"));
+        assert_eq!(
+            intent.subjects["host/node-a"].desired["arguments"][0],
+            "node-a"
+        );
         assert_eq!(
             intent.subjects["exec/setup"].member.as_ref().unwrap().host,
             "node-a"
