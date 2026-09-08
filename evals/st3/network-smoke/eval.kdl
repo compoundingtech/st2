@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/network-smoke" state="ready" {
+  mission "eval/network-smoke" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/network-smoke."
     step "contract" timeout="2m" {

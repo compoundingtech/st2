@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/mixed-worker-pool" state="ready" {
+  mission "eval/mixed-worker-pool" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "A Codex agent and a Claude agent each claim one step from the same explicit worker pool."
 

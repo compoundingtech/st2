@@ -27,6 +27,20 @@ The daemon must run before the eval starts. The graph command must write to an i
 
 The eval does not need registration or viewer configuration. st3 reads the complete eval directory when the eval command starts.
 
+## Eval deadline
+
+Every eval entry mission declares an explicit timeout no greater than 20 minutes:
+
+```kdl
+mission "eval/example" state="ready" timeout="20m" {
+  goal "Prove one bounded behavior."
+}
+```
+
+The timeout is an absolute mission-run deadline owned by the daemon. The client can disconnect, and the daemon can restart, without losing it. Expiry fails the eval, terminates descendant runs, removes eval-owned runtime state, and records the timeout reason in `eval.verdict`.
+
+Use shorter step timeouts where a local failure should be diagnosed sooner. The mission timeout is the final containment bound for the whole eval.
+
 ## Prerequisites
 
 Use a Linux host with an interactive terminal.

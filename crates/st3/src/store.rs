@@ -13,14 +13,15 @@ use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
-    DocumentVersion, EventRecord, IntentInput, MessageView, MissionInputKind, MissionOutputView,
-    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
-    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
-    PlanningVariantView, ReplicaBatch, ReplicaRange, ReplicationBatch, ReplicationResponse,
-    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
+    DocumentVersion, EventRecord, IntentInput, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind,
+    MissionOutputView, MissionResponse, MissionRevisionOperation, MissionRunDeclaration,
+    MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    NormalizedIntent, PlannedAction, PlanningCandidateView, PlanningPreviewView,
+    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
+    ReplicaRange, ReplicationBatch, ReplicationResponse, ResourceObservationOutcome,
+    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
+    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
 };
 
 const SCHEMA: &str = r#"
@@ -169,6 +170,12 @@ CREATE TABLE IF NOT EXISTS mission_runs (
 );
 CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
 
+CREATE TABLE IF NOT EXISTS mission_run_deadlines (
+    run_id TEXT PRIMARY KEY REFERENCES mission_runs(id),
+    timeout_ms INTEGER NOT NULL,
+    deadline_at_unix_ms TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS run_generations (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -266,7 +273,7 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 "#;
 
 pub struct Store {
@@ -289,11 +296,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || version == 10,
+        table_count == 0 || matches!(version, 10 | 11),
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        version == 0 || version == 10,
+        matches!(version, 0 | 10 | 11),
         "this database uses unsupported st3 schema version {version}"
     );
     Ok(())
@@ -906,6 +913,7 @@ impl Store {
                 format!("run mode `{mode}` is not registered"),
             ));
         }
+        validate_mission_run_timeout(&mission, mode)?;
         let mut variables = BTreeMap::from([
             ("ST_MISSION".into(), mission.id.clone()),
             ("ST_MISSION_REVISION".into(), mission.revision.clone()),
@@ -930,6 +938,8 @@ impl Store {
                 params![run_id, mission.id, mission.revision, generation_id, root_revision, root_run_id, parent_step_run, request.workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, now.to_string()],
             )
             .map_err(internal)?;
+        let deadline_at_unix_ms =
+            insert_mission_deadline_tx(&transaction, &run_id, mission.timeout_ms, now)?;
         transaction
             .execute(
                 "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
@@ -984,6 +994,8 @@ impl Store {
                 "requester": requester,
                 "inputs": inputs,
                 "mode": mode,
+                "timeout_ms": mission.timeout_ms,
+                "deadline_at_unix_ms": deadline_at_unix_ms,
             }
         });
         append_claim_tx(
@@ -2128,6 +2140,7 @@ impl Store {
             &self.origin,
             &predecessor_id,
             &actor,
+            "the parent run generation was superseded",
             now,
         )?;
         transaction
@@ -2227,6 +2240,56 @@ impl Store {
         ids.into_iter()
             .map(|id| mission_run_view_tx(&connection, &id).map_err(Into::into))
             .collect()
+    }
+
+    pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT mission_run_deadlines.deadline_at_unix_ms
+             FROM mission_run_deadlines
+             JOIN mission_runs ON mission_runs.id=mission_run_deadlines.run_id
+             WHERE mission_runs.status IN ('running','standing','blocked')
+               AND mission_runs.phase NOT LIKE 'cleanup-%'
+               AND EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE claims.subject='mission-run/' || mission_runs.id
+                   AND claims.kind='mission-run.created'
+                   AND claims.origin=?1
+               )",
+        )?;
+        let deadlines = statement
+            .query_map([origin], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(deadlines
+            .into_iter()
+            .filter_map(|value| value.parse::<u128>().ok())
+            .min())
+    }
+
+    pub fn terminate_mission_run_descendants(&self, run: &str, reason: &str) -> Result<bool> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let generation: Option<String> = transaction
+            .query_row(
+                "SELECT current_generation_id FROM mission_runs WHERE id=?1",
+                [run],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(generation) = generation else {
+            return Ok(false);
+        };
+        let changed = cancel_descendant_mission_runs_tx(
+            &transaction,
+            &self.origin,
+            &generation,
+            "daemon/runtime",
+            reason,
+            now_ms(),
+        )?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn mission_run_origin(&self, run: &str) -> Result<Option<String>> {
@@ -5843,6 +5906,7 @@ fn create_declared_mission_run_tx(
             format!("mission `mission/{}` is not ready", creation.mission),
         ));
     }
+    validate_mission_run_timeout(&mission, &creation.mode)?;
     let inputs = resolve_mission_run_inputs(transaction, &mission, &creation.inputs)?;
     enforce_mission_run_capacity(transaction, &mission)?;
     let generation_id = Uuid::now_v7().simple().to_string();
@@ -5879,6 +5943,8 @@ fn create_declared_mission_run_tx(
             ],
         )
         .map_err(internal)?;
+    let deadline_at_unix_ms =
+        insert_mission_deadline_tx(transaction, run_id, mission.timeout_ms, now)?;
     transaction
         .execute(
             "INSERT INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
@@ -5951,6 +6017,8 @@ fn create_declared_mission_run_tx(
             "requester": creation.requester,
             "inputs": inputs,
             "mode": creation.mode,
+            "timeout_ms": mission.timeout_ms,
+            "deadline_at_unix_ms": deadline_at_unix_ms,
         }
     });
     let run_claim = append_claim_tx(
@@ -6246,7 +6314,14 @@ fn adopt_declared_mission_revision_tx(
             claim_ids.push(claim.id);
         }
     }
-    cancel_descendant_mission_runs_tx(transaction, origin, &predecessor_id, &actor, now)?;
+    cancel_descendant_mission_runs_tx(
+        transaction,
+        origin,
+        &predecessor_id,
+        &actor,
+        "the parent run generation was superseded",
+        now,
+    )?;
     transaction
         .execute(
             "UPDATE run_generations SET status='superseded', updated_at_unix_ms=?2 WHERE id=?1",
@@ -8197,6 +8272,48 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn insert_mission_deadline_tx(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    timeout_ms: Option<u64>,
+    started_at_unix_ms: u128,
+) -> Result<Option<u128>, St3Error> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(None);
+    };
+    let deadline_at_unix_ms = started_at_unix_ms.saturating_add(u128::from(timeout_ms));
+    transaction
+        .execute(
+            "INSERT INTO mission_run_deadlines(run_id, timeout_ms, deadline_at_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, timeout_ms, deadline_at_unix_ms.to_string()],
+        )
+        .map_err(internal)?;
+    Ok(Some(deadline_at_unix_ms))
+}
+
+fn validate_mission_run_timeout(mission: &MissionSpec, mode: &str) -> Result<(), St3Error> {
+    if mode != "eval" {
+        return Ok(());
+    }
+    let timeout_ms = mission.timeout_ms.ok_or_else(|| {
+        St3Error::new(
+            "missing-eval-timeout",
+            format!("eval entry mission `{}` needs a timeout", mission.id),
+        )
+    })?;
+    if timeout_ms > MAX_EVAL_TIMEOUT_MS {
+        return Err(St3Error::new(
+            "eval-timeout-too-large",
+            format!(
+                "eval entry mission `{}` timeout exceeds the 20 minute limit",
+                mission.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn internal(error: impl std::fmt::Display) -> St3Error {
     St3Error::new("internal", error.to_string())
 }
@@ -8544,6 +8661,18 @@ fn project_mission_run_created(
             params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
         )
         .map_err(internal)?;
+    if let (Some(timeout_ms), Some(deadline_at_unix_ms)) = (
+        fields.get("timeout_ms").and_then(Value::as_u64),
+        fields.get("deadline_at_unix_ms").and_then(Value::as_u64),
+    ) {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO mission_run_deadlines(run_id, timeout_ms, deadline_at_unix_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![run_id, timeout_ms, deadline_at_unix_ms.to_string()],
+            )
+            .map_err(internal)?;
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
@@ -9962,9 +10091,10 @@ fn cancel_descendant_mission_runs_tx(
     origin: &str,
     generation_id: &str,
     actor: &str,
+    reason: &str,
     now: u128,
-) -> Result<(), St3Error> {
-    let reason = "the parent run generation was superseded";
+) -> Result<bool, St3Error> {
+    let mut changed = false;
     for run_id in descendant_mission_run_ids_tx(transaction, generation_id).map_err(internal)? {
         let (status, child_generation): (String, String) = transaction
             .query_row(
@@ -9976,6 +10106,7 @@ fn cancel_descendant_mission_runs_tx(
         if !matches!(status.as_str(), "running" | "standing" | "blocked") {
             continue;
         }
+        changed = true;
         let mut statement = transaction
             .prepare(
                 "SELECT subject FROM step_runs
@@ -10055,7 +10186,7 @@ fn cancel_descendant_mission_runs_tx(
         )
         .map_err(internal)?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Result<MissionRunView> {
@@ -10064,18 +10195,21 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
                 mission_runs.current_generation_id, run_generations.revision,
                 mission_runs.root_revision, mission_runs.root_run_id, mission_runs.parent_step_run,
                 mission_runs.workspace, mission_runs.requester, mission_runs.inputs, mission_runs.mode,
+                mission_run_deadlines.timeout_ms, mission_run_deadlines.deadline_at_unix_ms,
                 mission_runs.status, mission_runs.phase, mission_runs.created_at_unix_ms,
                 mission_runs.updated_at_unix_ms
          FROM mission_runs JOIN run_generations
            ON run_generations.id=mission_runs.current_generation_id
+         LEFT JOIN mission_run_deadlines ON mission_run_deadlines.run_id=mission_runs.id
          WHERE mission_runs.id=?1",
         [run_id],
         |row| {
             let id: String = row.get(0)?;
             let generation_id: String = row.get(3)?;
             let root_run_id: String = row.get(6)?;
-            let created: String = row.get(14)?;
-            let updated: String = row.get(15)?;
+            let deadline: Option<String> = row.get(13)?;
+            let created: String = row.get(16)?;
+            let updated: String = row.get(17)?;
             Ok(MissionRunView {
                 subject: format!("mission-run/{id}"),
                 id,
@@ -10090,8 +10224,10 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
                 requester: row.get(9)?,
                 inputs: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
                 mode: row.get(11)?,
-                status: row.get(12)?,
-                phase: row.get(13)?,
+                timeout_ms: row.get(12)?,
+                deadline_at_unix_ms: deadline.and_then(|value| value.parse().ok()),
+                status: row.get(14)?,
+                phase: row.get(15)?,
                 created_at_unix_ms: created.parse().unwrap_or(0),
                 updated_at_unix_ms: updated.parse().unwrap_or(0),
                 steps: Vec::new(),
@@ -10260,7 +10396,7 @@ mod tests {
         let source = r#"
 version 2
 
-mission "eval/root" state="ready" {
+mission "eval/root" state="ready" timeout="1m" {
   goal "Own one isolated eval tree."
 }
 
@@ -10330,6 +10466,73 @@ agent "worker" { workspace "/eval/child"; command "true"; restart "never" }
             desired.owner_run.as_deref() != Some(root.subject.as_str())
                 && desired.owner_run.as_deref() != Some(child.subject.as_str())
         }));
+    }
+
+    #[test]
+    fn the_store_requires_bounded_eval_deadlines_and_keeps_them_optional_elsewhere() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"
+version 2
+
+mission "eval/missing-deadline" state="ready" {
+  goal "Reject an eval without a deadline."
+}
+
+mission "eval/long-deadline" state="ready" timeout="21m" {
+  goal "Reject an eval with a deadline above the limit."
+}
+
+mission "ordinary" state="ready" {
+  goal "Allow an ordinary mission without a deadline."
+}
+
+mission "bounded" state="ready" timeout="1s" {
+  goal "Store one absolute deadline for an ordinary mission."
+}
+"#,
+            "publish-deadline-missions",
+        );
+        let request = |mission: &str, mode: &str| MissionRunRequest {
+            mission: mission.into(),
+            revision: None,
+            workspace: "/work".into(),
+            requester: Some("person/test".into()),
+            mode: Some(mode.into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: format!("deadline-{mission}-{mode}"),
+        };
+
+        assert_eq!(
+            store
+                .create_mission_run(&request("eval/missing-deadline", "eval"))
+                .unwrap_err()
+                .code,
+            "missing-eval-timeout"
+        );
+        assert_eq!(
+            store
+                .create_mission_run(&request("eval/long-deadline", "eval"))
+                .unwrap_err()
+                .code,
+            "eval-timeout-too-large"
+        );
+
+        let ordinary = store
+            .create_mission_run(&request("ordinary", "run"))
+            .unwrap();
+        assert_eq!(ordinary.timeout_ms, None);
+        assert_eq!(ordinary.deadline_at_unix_ms, None);
+
+        let bounded = store
+            .create_mission_run(&request("bounded", "run"))
+            .unwrap();
+        assert_eq!(bounded.timeout_ms, Some(1_000));
+        assert_eq!(
+            bounded.deadline_at_unix_ms,
+            Some(bounded.created_at_unix_ms + 1_000)
+        );
     }
 
     #[test]
@@ -12035,6 +12238,39 @@ version 2
             .err()
             .expect("schema version 9 must be rejected");
         assert!(error.to_string().contains("unsupported st3 schema"));
+    }
+
+    #[test]
+    fn schema_version_ten_upgrades_additively_for_mission_deadlines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        drop(Store::open(&path, "node").unwrap());
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DROP TABLE mission_run_deadlines", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        drop(connection);
+
+        drop(Store::open(&path, "node").unwrap());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            11
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='mission_run_deadlines'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

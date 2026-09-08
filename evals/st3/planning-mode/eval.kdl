@@ -1,11 +1,11 @@
 version 2
 
-  mission "eval/planning-mode" state="ready" {
+  mission "eval/planning-mode" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Prove one Codex planning session from request through direct approval."
     goal "Keep the proposed mission unpublished until its exact preview is approved."
 
-    step "planning-session" timeout="25m" {
+    step "planning-session" timeout="18m" {
       title "A Codex planner submits one reviewable mission candidate"
         exec "eval/planning-mode/controller" {
           host "local"

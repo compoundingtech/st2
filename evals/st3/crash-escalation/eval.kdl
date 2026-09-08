@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/crash-escalation" state="ready" {
+  mission "eval/crash-escalation" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/crash-escalation."
     step "faults" timeout="1m" {

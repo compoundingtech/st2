@@ -1,11 +1,11 @@
 version 2
 
-  mission "eval/run-generation-revision" state="ready" {
+  mission "eval/run-generation-revision" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Prove an approved targeted planning revision creates one immutable successor generation."
     goal "Prove compatible state and automatic run environment move to the successor."
 
-    step "exercise-revision" timeout="25m" {
+    step "exercise-revision" timeout="18m" {
       title "A Codex planner revises one live mission run"
         exec "eval/run-generation-revision/controller" {
           host "local"

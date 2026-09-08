@@ -4,7 +4,7 @@ version 2
     kind "filesystem.file"
   }
 
-  mission "eval/local-file-refresh" state="ready" {
+  mission "eval/local-file-refresh" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Refresh one local file observation without exposing its content."
 

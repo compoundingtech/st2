@@ -212,6 +212,199 @@ fn wait_for(mut test: impl FnMut() -> bool, message: &str) {
     panic!("{message}");
 }
 
+fn ready_work_subject(binary: &Path, socket: &Path, actor: &str, step: &str) -> Option<String> {
+    let output = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "--json",
+            "work",
+            "ls",
+            "--as",
+            actor,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    value
+        .as_array()?
+        .iter()
+        .find(|item| item["status"] == "ready" && item["step"] == step)
+        .and_then(|item| item["subject"].as_str())
+        .map(str::to_owned)
+}
+
+#[test]
+fn an_agent_wait_wakes_when_new_work_becomes_ready() {
+    let binary = assert_cmd::cargo::cargo_bin!("st3");
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let socket = temporary.path().join("st3.sock");
+    let missions = temporary.path().join("missions.kdl");
+    let actor = "agent/wait-owner/worker";
+    fs::write(
+        &missions,
+        format!(
+            r#"version 2
+
+resource "wait-release" {{ kind "custom.test.wait-release" }}
+
+mission "wait-owner" state="ready" {{
+  goal "Hold one active work lease."
+  agent "worker" {{
+    workspace "${{ST_WORKSPACE}}"
+    command "sleep 30"
+    restart "never"
+  }}
+  step "hold" {{
+    assigned-to "agent/${{ST_MISSION_RUN}}/worker"
+    goal "Wait for a graph condition while retaining this lease."
+  }}
+  step "new" {{
+    assigned-to "agent/${{ST_MISSION_RUN}}/worker"
+    goal "Wake the agent immediately."
+    baseline "the release signal is ready" {{
+      field "status" "resource/wait-release" "is" "ready"
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let mut daemon = start_daemon(binary, &state, &socket);
+    wait_for(
+        || {
+            st3_command(binary)
+                .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        },
+        "the daemon did not become ready",
+    );
+    let published = st3_command(binary)
+        .args(["--endpoint", socket.to_str().unwrap(), "publish"])
+        .arg(&missions)
+        .args(["--as", "person/test"])
+        .output()
+        .unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let started = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "mission",
+            "start",
+            "wait-owner",
+            "--id",
+            "wait-owner",
+            "--workspace",
+            temporary.path().to_str().unwrap(),
+            "--as",
+            "person/test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let mut held = None;
+    wait_for(
+        || {
+            held = ready_work_subject(binary, &socket, actor, "hold");
+            held.is_some()
+        },
+        "the first step did not become ready",
+    );
+    let claimed = st3_command(binary)
+        .args(["--endpoint", socket.to_str().unwrap(), "work", "claim"])
+        .arg(held.unwrap())
+        .args(["--as", actor])
+        .output()
+        .unwrap();
+    assert!(
+        claimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+
+    let wait_stderr = temporary.path().join("wait.stderr");
+    let mut waiting = st3_command(binary);
+    let mut waiting = waiting
+        .env("ST_AGENT", actor)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "wait",
+            "resource/not-ready",
+            "--for",
+            "ready",
+            "--timeout",
+            "5s",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&wait_stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(waiting.try_wait().unwrap().is_none());
+
+    let ready_at = std::time::Instant::now();
+    let released = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "claim",
+            "resource/wait-release",
+            "resource.observed",
+            "--field",
+            "status=ready",
+            "--actor",
+            "person/test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+    let mut offered = None;
+    wait_for(
+        || {
+            offered = ready_work_subject(binary, &socket, actor, "new");
+            offered.is_some()
+        },
+        "the second step did not become ready",
+    );
+    let mut wait_status = None;
+    wait_for(
+        || {
+            wait_status = waiting.try_wait().ok().flatten();
+            wait_status.is_some()
+        },
+        "new ready work did not interrupt the wait",
+    );
+    assert!(!wait_status.unwrap().success());
+    assert!(
+        ready_at.elapsed() < Duration::from_secs(1),
+        "new ready work took too long to interrupt the wait"
+    );
+    let diagnostic = fs::read_to_string(wait_stderr).unwrap();
+    assert!(diagnostic.contains("has ready work"), "{diagnostic}");
+    assert!(diagnostic.contains("Run `st3 work ls`"), "{diagnostic}");
+    daemon.stop();
+}
+
 fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }

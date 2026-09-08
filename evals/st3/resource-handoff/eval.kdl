@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/resource-handoff" state="ready" {
+  mission "eval/resource-handoff" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/resource-handoff."
     step "contract" timeout="1m" {

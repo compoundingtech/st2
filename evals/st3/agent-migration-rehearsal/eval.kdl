@@ -4,7 +4,7 @@ host "local" {
   document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
 }
 
-mission "eval/agent-migration-rehearsal" state="ready" {
+mission "eval/agent-migration-rehearsal" state="ready" timeout="20m" {
   completion { when "all-steps-exhausted" }
   goal "Start one isolated agent with the normal st3 boot contract and complete one assigned mission."
 

@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/claude-skill-inheritance" state="ready" {
+  mission "eval/claude-skill-inheritance" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/claude-skill-inheritance."
     step "start-worker" timeout="10m" {

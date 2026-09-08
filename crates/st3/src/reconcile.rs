@@ -280,7 +280,29 @@ impl<R: RuntimeControl> Reconciler<R> {
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
         loop {
-            self.notify.notified().await;
+            match self.store.next_active_mission_deadline(&self.host) {
+                Ok(Some(deadline)) => {
+                    let delay = deadline.saturating_sub(now_ms()).min(u128::from(u64::MAX)) as u64;
+                    tokio::select! {
+                        _ = self.notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                    }
+                }
+                Ok(None) => self.notify.notified().await,
+                Err(error) => {
+                    let _ = self.record_once(
+                        &format!("daemon/{}", self.host),
+                        "daemon.diagnostic",
+                        BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("code".into(), Value::String("deadline-read-failed".into())),
+                            ("status".into(), Value::String("indeterminate".into())),
+                            ("reason".into(), Value::String(error.to_string())),
+                        ]),
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
             for pass in 0..64 {
                 let before = self.store.index().ok();
                 if let Err(error) = self.reconcile_once() {
@@ -1094,6 +1116,24 @@ impl<R: RuntimeControl> Reconciler<R> {
             if self.store.mission_run_origin(&run.id)?.as_deref() != Some(self.host.as_str()) {
                 continue;
             }
+            if run
+                .deadline_at_unix_ms
+                .is_some_and(|deadline| deadline <= now_ms())
+                && !run.phase.starts_with("cleanup-")
+            {
+                let timeout = run.timeout_ms.unwrap_or_default();
+                let reason = format!("the mission timeout expired after {timeout}ms");
+                changed |= self
+                    .store
+                    .terminate_mission_run_descendants(&run.id, &reason)?;
+                changed |= self.store.set_mission_run_state(
+                    &run.id,
+                    "running",
+                    "cleanup-failed",
+                    Some(&reason),
+                )?;
+                continue;
+            }
             if run.phase == "revision-draining"
                 && self.store.apply_drained_revision(&run.id)?.is_some()
             {
@@ -1590,6 +1630,16 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut status = run.phase.strip_prefix("cleanup-").unwrap_or("failed");
         let mut changed = false;
         if run.mode == "eval" {
+            let run_failure_reason = self
+                .store
+                .latest_claim(&run.subject, Some("mission-run.state"))?
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
             let mut runtime_cleanup_errors = Vec::new();
             match self.store.eval_runtime_records(&run.subject) {
                 Ok(records) => {
@@ -1628,7 +1678,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         "failed" => "fail",
                         _ => "void",
                     },
-                    None,
+                    (status == "failed").then_some(run_failure_reason).flatten(),
                     residue,
                 ),
                 (true, Ok(residue)) => {
@@ -4935,7 +4985,7 @@ version 2
         let source = r#"
 version 2
 
-mission "eval/start-failure" state="ready" {
+mission "eval/start-failure" state="ready" timeout="1m" {
   goal "Clean an eval runtime after its start fails."
   agent "worker" { workspace "/tmp"; command "true"; restart "never" }
 }
@@ -5925,7 +5975,7 @@ version 2
         let source = r#"
             version 2
 
-              mission "eval/simulated-codex" state="ready" {
+              mission "eval/simulated-codex" state="ready" timeout="5m" {
                 goal "Complete mission eval/simulated-codex."
                 step "team" {
                   title "The Codex team is ready"
@@ -7171,7 +7221,7 @@ mission "scheduled-cycle" state="ready" {
         let source = r#"
             version 2
 
-              mission "eval/demo" state="ready" {
+              mission "eval/demo" state="ready" timeout="1m" {
                 goal "Complete mission eval/demo."
                 step "result" timeout="1ms" {
                   agentless
@@ -7257,7 +7307,7 @@ mission "scheduled-cycle" state="ready" {
         let source = r#"
             version 2
 
-              mission "cancel-convergence" state="ready" {
+              mission "cancel-convergence" state="ready" timeout="1m" {
                 goal "Keep one worker ready until cancellation."
                 agent "worker" { workspace "/tmp"; command "true"; restart "never" }
                 step "wait" {
@@ -7334,6 +7384,109 @@ mission "scheduled-cycle" state="ready" {
         .expect("one cancellation wake did not finish cleanup");
         task.abort();
 
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daemon_wakes_at_a_mission_deadline_and_finishes_eval_cleanup() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+
+              mission "eval/deadline" state="ready" timeout="50ms" {
+                goal "Fail and clean up at the daemon-owned deadline."
+                completion { when "all-steps-exhausted" }
+                step "wait" {
+                  agentless
+                  gate "never" { field "status" "resource/never" "is" "ready" }
+                }
+              }
+              mission "eval/deadline/helper" state="ready" {
+                goal "Remain open until the root eval deadline expires."
+                step "wait" {
+                  agentless
+                  gate "never" { field "status" "resource/never" "is" "ready" }
+                }
+              }
+              resource "never" { kind "custom.test.deadline" }
+
+        "#;
+        apply_source(&store, source, "mission-deadline-source");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "eval/deadline".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "mission-deadline-run".into(),
+            })
+            .unwrap();
+        let child = store
+            .create_child_mission_run(
+                &crate::model::MissionRunRequest {
+                    mission: "eval/deadline/helper".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("daemon/runtime".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "mission-deadline-child".into(),
+                },
+                &run,
+                &run.steps[0].subject,
+                None,
+            )
+            .unwrap();
+        let reconciler = Arc::new(Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        ));
+        let task = tokio::spawn(reconciler.run());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = store.mission_run(&run.id).unwrap().unwrap();
+                if current.status == "failed" && current.phase == "terminal" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the daemon did not wake at the mission deadline");
+        task.abort();
+
+        let verdict = store
+            .latest_claim(&run.subject, Some("eval.verdict"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verdict
+                .body
+                .pointer("/fields/verdict")
+                .and_then(Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(
+            verdict
+                .body
+                .pointer("/fields/reason")
+                .and_then(Value::as_str),
+            Some("the mission timeout expired after 50ms")
+        );
+        let child = store.mission_run(&child.id).unwrap().unwrap();
+        assert_eq!(child.status, "cancelled");
+        assert_eq!(child.phase, "terminal");
         assert!(
             store
                 .desired_subjects()

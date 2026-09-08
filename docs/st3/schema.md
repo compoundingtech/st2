@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `801245a127606d609b29ef31dac408ceae19a235b146b58f45cf42e4191ad612`
+Digest: `b7401a1fa18c77d058595d7523454746fc752f6d3dd1cd4e610558b35e4ce8b6`
 
 ## Subject families
 
@@ -72,7 +72,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `message.delivered` | `message` | `system-only` | `once-per-actor` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `message.read` | `message` | `authorized-participant` | `once-per-actor` | `status!:string` |  |
 | `message.sent` | `message` | `ordinary-client` | `once` | `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
-| `mission-run.created` | `mission-run` | `system-only` | `once` | `current_generation:subject-reference`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `workspace:string` | `mission-run` |
+| `mission-run.created` | `mission-run` | `system-only` | `once` | `current_generation:subject-reference`, `deadline_at_unix_ms:integer`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mode:string`, `parent_step_run:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `status:string`, `timeout_ms:integer`, `workspace:string` | `mission-run` |
 | `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
 | `mission.produced` | `mission`, `step-run` | `capability-holder` | `append` | `attempt:integer`, `mission:subject-reference`, `name:string`, `revision:string`, `step_definition:string` | `produces` |
 | `mission.published` | `mission` | `authorized-requester` | `append` | `body:object`, `revision:string`, `state:string` | `mission` |

@@ -4,7 +4,7 @@ version 2
     kind "custom.st3.document-source"
   }
 
-  mission "eval/mission-inputs" state="ready" {
+  mission "eval/mission-inputs" state="ready" timeout="20m" {
     input "message" kind="text"
     input "source" kind="resource"
     completion { when "all-steps-exhausted" }

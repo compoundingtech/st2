@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/mission-document-lift" state="ready" {
+  mission "eval/mission-document-lift" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/mission-document-lift."
     baseline "the exact source mission exists before planning starts" {

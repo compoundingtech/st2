@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/signal-rename-codex" state="ready" {
+  mission "eval/signal-rename-codex" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/signal-rename-codex."
     step "materialize" timeout="30m" {

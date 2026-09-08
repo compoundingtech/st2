@@ -1,6 +1,6 @@
 version 2
 
-mission "eval/constraint-inheritance" state="ready" {
+mission "eval/constraint-inheritance" state="ready" timeout="20m" {
   completion { when "all-steps-exhausted" }
   goal "Prove that a worker receives each constraint from its complete mission ancestry."
   constraint "Keep the mission result local."

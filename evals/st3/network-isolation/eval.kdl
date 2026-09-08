@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/network-isolation" state="ready" {
+  mission "eval/network-isolation" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/network-isolation."
     step "contract" timeout="2m" {

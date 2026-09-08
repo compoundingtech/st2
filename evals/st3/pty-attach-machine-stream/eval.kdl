@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/pty-attach-machine-stream" state="ready" {
+  mission "eval/pty-attach-machine-stream" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/pty-attach-machine-stream."
     step "contract" timeout="2m" {

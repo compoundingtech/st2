@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/ghost-bug-codex" state="ready" {
+  mission "eval/ghost-bug-codex" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/ghost-bug-codex."
     step "start-team" timeout="10m" {

@@ -8,7 +8,7 @@ mission "eval/continuous-stewardship/cycle" state="ready" {
   }
 }
 
-mission "eval/continuous-stewardship" state="ready" {
+mission "eval/continuous-stewardship" state="ready" timeout="20m" {
   completion { when "all-steps-exhausted" }
   goal "Complete two finite stewardship cycles with one long-lived agent and a recurring wake schedule."
 

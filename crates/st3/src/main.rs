@@ -2299,20 +2299,86 @@ async fn run_wait(client: &Client, args: WaitArgs, json_output: bool) -> Result<
 
 async fn wait_for_condition(client: &Client, subject: &str, condition: &str) -> Result<Value> {
     let mut cursor = 0;
+    let actor = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|value| value.starts_with("agent/"));
     loop {
         if let Some(value) = condition_value(client, subject, condition).await? {
             return Ok(value);
         }
+        if let Some(actor) = actor.as_deref()
+            && let Some(reason) = agent_wait_interruption(client, actor).await?
+        {
+            anyhow::bail!(reason);
+        }
+        let scope = actor.as_ref().map_or_else(
+            || format!("&subject={}", urlencoding::encode(subject)),
+            |_| String::new(),
+        );
         let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}&subject={}",
-                urlencoding::encode(subject)
-            ))
+            .get(&format!("/v1/events?after={cursor}{scope}"))
             .await?;
         for event in events {
             cursor = cursor.max(event.store_index);
         }
     }
+}
+
+async fn agent_wait_interruption(client: &Client, actor: &str) -> Result<Option<String>> {
+    let work: Vec<StepRunView> = client
+        .get(&format!(
+            "/v1/work?actor={}&include_terminal=false",
+            urlencoding::encode(actor)
+        ))
+        .await?;
+    let ready = work
+        .iter()
+        .filter(|step| step.status == "ready")
+        .map(|step| step.subject.clone())
+        .collect::<Vec<_>>();
+    let has_claimed_work = work.iter().any(|step| {
+        matches!(step.status.as_str(), "claimed" | "working")
+            && step.claimant.as_deref() == Some(actor)
+    });
+    let messages: Vec<MessageView> = client
+        .get(&format!("/v1/messages?to={}", urlencoding::encode(actor)))
+        .await?;
+    let unread = messages
+        .iter()
+        .filter(|message| matches!(message.status.as_str(), "sent" | "delivered"))
+        .map(|message| message.subject.clone())
+        .collect::<Vec<_>>();
+    Ok(wait_interruption_reason(
+        actor,
+        has_claimed_work,
+        &ready,
+        &unread,
+    ))
+}
+
+fn wait_interruption_reason(
+    actor: &str,
+    has_claimed_work: bool,
+    ready: &[String],
+    unread: &[String],
+) -> Option<String> {
+    if !unread.is_empty() {
+        return Some(format!(
+            "the wait stopped because {actor} has a new message: {}. Run `st3 message ls`",
+            unread.join(", ")
+        ));
+    }
+    if !ready.is_empty() {
+        return Some(format!(
+            "the wait stopped because {actor} has ready work: {}. Run `st3 work ls`",
+            ready.join(", ")
+        ));
+    }
+    (!has_claimed_work).then(|| {
+        format!(
+            "{actor} cannot wait without claimed work. Finish this turn and let native delivery start the next turn"
+        )
+    })
 }
 
 async fn condition_value(client: &Client, subject: &str, condition: &str) -> Result<Option<Value>> {
@@ -6495,6 +6561,31 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_wait_stops_for_messages_work_and_an_empty_lease() {
+        let actor = "agent/worker";
+        assert_eq!(
+            wait_interruption_reason(actor, true, &[], &["message/new".into()]),
+            Some(
+                "the wait stopped because agent/worker has a new message: message/new. Run `st3 message ls`"
+                    .into()
+            )
+        );
+        assert_eq!(
+            wait_interruption_reason(actor, true, &["step-run/new".into()], &[]),
+            Some(
+                "the wait stopped because agent/worker has ready work: step-run/new. Run `st3 work ls`"
+                    .into()
+            )
+        );
+        assert!(
+            wait_interruption_reason(actor, false, &[], &[])
+                .unwrap()
+                .contains("cannot wait without claimed work")
+        );
+        assert_eq!(wait_interruption_reason(actor, true, &[], &[]), None);
+    }
+
+    #[test]
     fn a_short_message_party_resolves_to_its_current_mission_run() {
         assert_eq!(
             normalize_message_subject_in_run("worker", Some("run-id")),
@@ -7137,6 +7228,8 @@ mod tests {
             requester: "person/eval-requester".into(),
             inputs: BTreeMap::new(),
             mode: "eval".into(),
+            timeout_ms: Some(1_200_000),
+            deadline_at_unix_ms: Some(1_200_001),
             status: "running".into(),
             phase: "normal".into(),
             created_at_unix_ms: 1,

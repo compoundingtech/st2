@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/weird-git-setup" state="ready" {
+  mission "eval/weird-git-setup" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/weird-git-setup."
     step "materialize-megarepo" timeout="5m" {

@@ -47,7 +47,7 @@ Direct runtime declarations in a mission belong to each run of that mission. Dir
 Before a native harness starts, st3 renders `.st3/boot.md` into its workspace. The native driver always appends this exact launch text once:
 
 ```text
-Read @.st3/boot.md completely. Then list and claim your current st3 work.
+Read @.st3/boot.md completely. Then list, claim, do, and finish your current st3 work.
 ```
 
 A harness `prompt` is optional. An authored prompt supplies stable repository context only. Mission goals and constraints remain in the graph.
@@ -116,6 +116,16 @@ st3 mission start release \
 Use `--follow` to wait for a terminal or standing run. Use `--print-kdl` to inspect or save the generated declaration without publishing it.
 
 The default mission capacity is one active run. `concurrent-runs` removes the limit. `concurrent-runs max=4` sets a limit. A capacity error rejects the full publication.
+
+An optional mission `timeout="2h"` becomes one absolute deadline on each run. It is not reset by a mission revision or daemon restart. An eval-mode run requires a timeout of 20 minutes or less.
+
+## Waiting during claimed work
+
+`st3 wait` is for a condition needed by work that the current agent has already claimed. It is not an idle-work loop.
+
+When `ST_AGENT` contains an `agent/...` subject, the command watches the complete event graph. It exits early when that agent receives a message or becomes eligible for another ready step. It also refuses to wait when the agent has no claimed step. The harness can then end its turn, and native delivery can start a fresh turn for new work.
+
+This keeps a narrow condition wait from hiding broader graph progress. Scripts outside an agent harness retain the ordinary subject-specific wait behavior.
 
 ## Standing work
 

@@ -114,6 +114,7 @@ fn parse_mission(
         node,
         &[
             "state",
+            "timeout",
             "revisions",
             "revision-reviewer",
             "revision-cutover",
@@ -132,6 +133,15 @@ fn parse_mission(
         .map(|value| parse_mission_state(&value))
         .transpose()?
         .unwrap_or(MissionState::Ready);
+    let timeout_ms = property_string(node, "timeout")?
+        .map(|value| parse_duration(&value))
+        .transpose()?;
+    if timeout_ms == Some(0) {
+        return Err(St3Error::new(
+            "invalid-mission-timeout",
+            format!("mission `{id}` timeout must be greater than zero"),
+        ));
+    }
     let revisions_human_only = parse_revision_protection(node)?;
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let revision_cutover = match property_string(node, "revision-cutover")?.as_deref() {
@@ -355,6 +365,7 @@ fn parse_mission(
         revision: String::new(),
         inputs,
         max_active_runs,
+        timeout_ms,
         revision_owners,
         revisions_human_only,
         revision_reviewer,
@@ -1996,6 +2007,29 @@ version 2
         let mission = &intent.missions["standing"];
         assert!(mission.steps.is_empty());
         assert!(mission.completion.is_none());
+    }
+
+    #[test]
+    fn a_mission_timeout_is_a_positive_run_deadline() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+ mission "bounded" state="ready" timeout="20m" {
+   goal "Finish before the run deadline."
+ } "#,
+            "node",
+        )
+        .unwrap();
+        assert_eq!(intent.missions["bounded"].timeout_ms, Some(1_200_000));
+
+        let error = crate::graph::parse_intent(
+            r#"version 2
+ mission "unbounded" state="ready" timeout="0ms" {
+   goal "Reject a disabled deadline."
+ } "#,
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid-mission-timeout");
     }
 
     #[test]

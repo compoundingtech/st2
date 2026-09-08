@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/pty-attach-only" state="ready" {
+  mission "eval/pty-attach-only" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/pty-attach-only."
     step "contract" timeout="2m" {

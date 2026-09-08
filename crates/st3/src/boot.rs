@@ -15,13 +15,17 @@ A notification does not create work. Repeated delivery does not authorize repeat
 
 Run `"$ST3_BIN" work ls` to list work that is available to you. Claim one eligible step.
 
+If no step is ready, finish this turn. Do not wait for work that is not ready.
+
 Do its work and finish the step in the same turn when possible.
 
 The claim output contains the step goals and all effective constraints. A parent claim can expose nested mission steps.
 
 Use `"$ST3_BIN" work progress` only for a material update. Finish with `"$ST3_BIN" work complete`, `"$ST3_BIN" work fail`, or `"$ST3_BIN" work release`.
 
-Use `"$ST3_BIN" wait` for a graph condition. Do not use an agent turn to poll.
+Use `"$ST3_BIN" wait` only when claimed work needs a graph condition. Do not use an agent turn to poll.
+
+The wait command exits early when a new message or a new eligible step needs your attention.
 
 If an unexpected harness fault needs human attention, publish a `harness.diagnostic` claim on your own agent subject.
 "#;
@@ -66,5 +70,7 @@ mod tests {
                 .contains("Do its work and finish the step in the same turn when possible.")
         );
         assert!(BOOT_DOCUMENT.contains("ST3_BIN"));
+        assert!(BOOT_DOCUMENT.contains("If no step is ready, finish this turn."));
+        assert!(BOOT_DOCUMENT.contains("wait` only when claimed work needs"));
     }
 }

@@ -34,7 +34,7 @@ mission "eval/automatic-github-intake/review" state="ready" {
   }
 }
 
-mission "eval/automatic-github-intake" state="ready" {
+mission "eval/automatic-github-intake" state="ready" timeout="20m" {
   completion { when "all-steps-exhausted" }
   goal "Prove that one post-baseline repository event starts one isolated review mission."
 

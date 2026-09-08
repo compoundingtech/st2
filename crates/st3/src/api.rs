@@ -31,17 +31,17 @@ use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, GateResultRequest,
-    MessageLifecycleRequest, MessageSendRequest, MessageView, MissionOutputView,
-    MissionProductionRequest, MissionRequest, MissionResponse, MissionRevisionRequest,
-    MissionRunRequest, MissionRunView, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
-    PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
-    ReplicationBatch, ReplicationQuery, ReplicationResponse, ResourceUnwatchRequest,
-    ResourceWatchRequest, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
-    WorkRequest,
+    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
+    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
+    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
+    QuickAgentResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse,
+    ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView, ReviewRequest,
+    RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error,
+    StatusResponse, StepRunView, WorkRequest,
 };
 use crate::store::Store;
 
@@ -2921,6 +2921,21 @@ async fn start_eval(
                 ),
             ))
         })?;
+    let timeout_ms = entry.timeout_ms.ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "missing-eval-timeout",
+            format!("eval entry mission `{}` needs a timeout", entry.id),
+        ))
+    })?;
+    if timeout_ms > MAX_EVAL_TIMEOUT_MS {
+        return Err(ApiError::bad(St3Error::new(
+            "eval-timeout-too-large",
+            format!(
+                "eval entry mission `{}` timeout exceeds the 20 minute limit",
+                entry.id
+            ),
+        )));
+    }
     let entry_id = entry.id.clone();
     let entry_revision = entry.revision.clone();
     stage_eval_documents(&state, &workspace, &intent).map_err(ApiError::bad)?;
@@ -5912,7 +5927,7 @@ version 2
                 r#"
 version 2
 
-  mission "eval/demo" state="ready" {{
+  mission "eval/demo" state="ready" timeout="2m" {{
     goal "Complete mission eval/demo."
     baseline "document-content" {{ has "doc/evals/demo/task@{hash}" "hello" }}
     step "document" {{
@@ -5982,6 +5997,49 @@ version 2
     }
 
     #[tokio::test]
+    async fn eval_entries_require_a_bounded_twenty_minute_timeout() {
+        for (timeout, code) in [
+            ("", "missing-eval-timeout"),
+            (" timeout=\"21m\"", "eval-timeout-too-large"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let eval_dir = tempfile::tempdir().unwrap();
+            fs::write(
+                eval_dir.path().join("eval.kdl"),
+                format!(
+                    r#"version 2
+mission "eval/deadline" state="ready"{timeout} {{
+  goal "Prove the eval deadline is explicit and bounded."
+  completion {{ when "all-steps-exhausted" }}
+  step "done" {{ agentless }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+            let bundle = crate::archive::archive_eval(eval_dir.path()).unwrap();
+            let bundle_hash = hex::encode(Sha256::digest(&bundle));
+            let app = router(state(root.path()));
+
+            let (status, body) = json_request(
+                app,
+                "/v1/evals",
+                serde_json::to_value(EvalStartRequest {
+                    name: "deadline".into(),
+                    bundle_hash,
+                    bundle,
+                    inputs: BTreeMap::new(),
+                })
+                .unwrap(),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert_eq!(body["code"], code, "{body}");
+        }
+    }
+
+    #[tokio::test]
     async fn an_eval_can_publish_ready_helper_missions() {
         let root = tempfile::tempdir().unwrap();
         let eval_dir = tempfile::tempdir().unwrap();
@@ -5996,7 +6054,7 @@ mission "eval/demo/helper" state="ready" {
   step "done" { agentless }
 }
 
-mission "eval/demo" state="ready" {
+mission "eval/demo" state="ready" timeout="2m" {
   goal "Run the eval entry mission."
   completion { when "all-steps-exhausted" }
   step "done" { agentless }

@@ -1518,6 +1518,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("requester", reference()),
             ("mode", string()),
             ("inputs", object()),
+            ("timeout_ms", integer()),
+            ("deadline_at_unix_ms", integer()),
             ("parent_step_run", reference()),
             ("default_selector", object()),
         ],

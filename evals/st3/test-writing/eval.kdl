@@ -1,6 +1,6 @@
 version 2
 
-  mission "eval/test-writing" state="ready" {
+  mission "eval/test-writing" state="ready" timeout="20m" {
     completion { when "all-steps-exhausted" }
     goal "Complete mission eval/test-writing."
     step "start-team" timeout="10m" {

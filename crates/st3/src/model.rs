@@ -4,6 +4,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+
 #[derive(Debug)]
 pub struct St3Error {
     pub code: &'static str,
@@ -269,6 +271,8 @@ pub struct MissionSpec {
     pub inputs: BTreeMap<String, MissionInputSpec>,
     #[serde(default = "default_mission_run_limit")]
     pub max_active_runs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub revision_owners: Vec<String>,
     #[serde(default)]
@@ -1145,6 +1149,10 @@ pub struct MissionRunView {
     #[serde(default)]
     pub inputs: BTreeMap<String, MissionRunInput>,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at_unix_ms: Option<u128>,
     pub status: String,
     pub phase: String,
     pub created_at_unix_ms: u128,

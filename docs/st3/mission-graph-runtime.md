@@ -31,6 +31,8 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - A mission allows one active run by default.
 - `concurrent-runs` enables concurrent active runs. An optional `max` property bounds them.
 - A mission can declare exact text and resource inputs.
+- A mission can declare one absolute run `timeout`.
+- An eval entry mission must declare a timeout no greater than 20 minutes.
 
 ## Complete example
 
@@ -128,6 +130,7 @@ After acceptance, cleanup stops both agents before the run becomes completed.
 ```kdl
 mission "MISSION_ID"
   state="ready"
+  timeout="2h"
   revisions="human-only"
   revision-reviewer="person/reviewer"
   revision-cutover="when-idle" {
@@ -182,6 +185,12 @@ The reviewer defaults to the mission run requester. `revision-cutover` is `resta
 A mission can contain direct declarations. Direct agents in the mission can revise the complete mission.
 
 A mission can contain zero steps. A zero-step mission without `completion` becomes standing after reconciliation.
+
+`timeout` is optional for an ordinary mission. It starts when the mission run is created and applies to the complete run, not one step or generation. A revision cannot extend or reset the stored deadline.
+
+The daemon arms an exact wake for the nearest deadline. It does not depend on a client process or periodic polling. At expiry, st3 fails the run, terminates descendant runs, skips remaining normal and final work, removes run-owned runtime state, and records the timeout as the eval failure reason when the run is an eval.
+
+Every eval entry mission needs a timeout of 20 minutes or less. The store enforces this rule for both the eval API and a directly published eval-mode mission run.
 
 `completion` accepts one shortcut or one dependency block. The two forms cannot appear together.
 
