@@ -5765,73 +5765,106 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
     let mut ready = false;
+    let mut last_control_warning = None;
     loop {
         tokio::select! {
             result = &mut task => return result?,
             _ = interval.tick() => {
-                if !ready && state_dir.join("binding.json").is_file() {
-                    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                        subject: subject.into(),
-                        kind: "harness.observed".into(),
-                        actor: Some(subject.into()),
-                        fields: BTreeMap::from([
-                            ("state".into(), Value::String("ready".into())),
+                let tick: Result<()> = async {
+                    if !ready && state_dir.join("binding.json").is_file() {
+                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: BTreeMap::from([
+                                ("state".into(), Value::String("ready".into())),
+                                ("driver".into(), Value::String("codex".into())),
+                                ("transport".into(), Value::String("app-server".into())),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!("codex-ready:{subject}")),
+                        }).await?;
+                        ready = true;
+                    }
+                    forward_projected_messages(
+                        client,
+                        subject,
+                        &inbox,
+                        &archive,
+                        "app-server",
+                    )
+                    .await?;
+                    if let Some(observed) = st2::harness_state::read(
+                        &st2::harness_state::harness_state_path(&agent_dir),
+                        None,
+                    ) {
+                        let status = harness_activity_state(observed.state);
+                        let fields = BTreeMap::from([
+                            ("state".into(), Value::String(status.into())),
                             ("driver".into(), Value::String("codex".into())),
-                            ("transport".into(), Value::String("app-server".into())),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(format!("codex-ready:{subject}")),
-                    }).await?;
-                    ready = true;
-                }
-                forward_projected_messages(
-                    client,
-                    subject,
-                    &inbox,
-                    &archive,
-                    "app-server",
-                )
-                .await?;
-                if let Some(observed) = st2::harness_state::read(
-                    &st2::harness_state::harness_state_path(&agent_dir),
-                    None,
-                ) {
-                    let status = harness_activity_state(observed.state);
-                    let fields = BTreeMap::from([
-                        ("state".into(), Value::String(status.into())),
-                        ("driver".into(), Value::String("codex".into())),
-                        ("blocked_on".into(), Value::String(observed.blocked_on.as_str().into())),
-                        ("ask".into(), Value::String(observed.ask.as_str().into())),
-                        ("input_buffer".into(), Value::String(observed.input_buffer.as_str().into())),
-                        ("reason".into(), observed.reason.clone().map(Value::String).unwrap_or(Value::Null)),
-                        ("exit".into(), observed.exit.clone().map(Value::String).unwrap_or(Value::Null)),
-                    ]);
-                    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
-                        observed.since_ms,
-                        &fields,
-                    ))?));
-                    let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                        subject: subject.into(),
-                        kind: "harness.observed".into(),
-                        actor: Some(subject.into()),
-                        fields,
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: Some(format!("codex-activity:{subject}:{fingerprint}")),
-                    }).await?;
+                            ("blocked_on".into(), Value::String(observed.blocked_on.as_str().into())),
+                            ("ask".into(), Value::String(observed.ask.as_str().into())),
+                            ("input_buffer".into(), Value::String(observed.input_buffer.as_str().into())),
+                            ("reason".into(), observed.reason.clone().map(Value::String).unwrap_or(Value::Null)),
+                            ("exit".into(), observed.exit.clone().map(Value::String).unwrap_or(Value::Null)),
+                        ]);
+                        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+                            observed.since_ms,
+                            &fields,
+                        ))?));
+                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields,
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!("codex-activity:{subject}:{fingerprint}")),
+                        }).await?;
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
             _ = work_interval.tick() => {
-                sync_work_messages(client, subject).await?;
-                let minute = unix_minute()?;
-                if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                let tick: Result<()> = async {
+                    sync_work_messages(client, subject).await?;
+                    let minute = unix_minute()?;
+                    if renewed_minute != Some(minute) {
+                        renew_claimed_work(client, subject, minute).await?;
+                        renewed_minute = Some(minute);
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
         }
     }
+}
+
+fn tolerate_driver_api_outage(
+    subject: &str,
+    error: anyhow::Error,
+    last_warning: &mut Option<Instant>,
+) -> Result<()> {
+    let transient = error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("connect to the st3 API") || message.contains("incomplete HTTP response")
+    });
+    if !transient {
+        return Err(error);
+    }
+    let now = Instant::now();
+    if last_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
+        eprintln!("warning: `{subject}` lost the st3 API and will retry: {error:#}");
+        *last_warning = Some(now);
+    }
+    Ok(())
 }
 
 async fn sync_work_messages(client: &Client, subject: &str) -> Result<()> {
@@ -7097,5 +7130,30 @@ mod tests {
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         }
+    }
+
+    #[test]
+    fn a_codex_driver_retries_a_transient_st3_api_outage() {
+        let mut last_warning = None;
+        tolerate_driver_api_outage(
+            "agent/run/worker",
+            anyhow::anyhow!("incomplete HTTP response"),
+            &mut last_warning,
+        )
+        .unwrap();
+        assert!(last_warning.is_some());
+    }
+
+    #[test]
+    fn a_codex_driver_does_not_retry_a_semantic_api_error() {
+        let mut last_warning = None;
+        let error = tolerate_driver_api_outage(
+            "agent/run/worker",
+            anyhow::anyhow!("the work claim is stale"),
+            &mut last_warning,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("work claim is stale"));
+        assert!(last_warning.is_none());
     }
 }

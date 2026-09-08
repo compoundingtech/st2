@@ -2453,6 +2453,7 @@ impl Store {
             .claim_incarnation
             .clone()
             .or_else(|| request.incarnation.clone());
+        let actor_incarnation = effective_incarnation.clone();
         let (status, worker_reported, claimant, claim_incarnation, claim_expiry) = match action {
             "claim" => {
                 if current.status != "ready" && current.status != "claimed" {
@@ -2504,6 +2505,14 @@ impl Store {
                 params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
             )
             .map_err(internal)?;
+        renew_nested_ancestor_leases_tx(
+            &transaction,
+            &current.generation,
+            &current.step,
+            &actor,
+            actor_incarnation.as_deref(),
+            now,
+        )?;
         let body = json!({"fields": {
             "status": status,
             "summary": request.summary,
@@ -7352,6 +7361,38 @@ fn operation_tx(
         .map_err(Into::into)
 }
 
+fn renew_nested_ancestor_leases_tx(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    step_path: &str,
+    actor: &str,
+    incarnation: Option<&str>,
+    now: u128,
+) -> std::result::Result<(), St3Error> {
+    let generation = generation_id_from_subject(generation);
+    let expiry = now.saturating_add(600_000);
+    transaction
+        .execute(
+            "UPDATE step_runs
+             SET lease_expires_at_unix_ms=?1, updated_at_unix_ms=?2
+             WHERE generation_id=?3
+               AND substr(?4, 1, length(step_path) + 1)=step_path || '/'
+               AND status IN ('claimed','working','verifying')
+               AND lease_owner=?5
+               AND lease_incarnation IS ?6",
+            params![
+                expiry.to_string(),
+                now.to_string(),
+                generation,
+                step_path,
+                actor,
+                incarnation
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
 fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecord>> {
     connection
         .query_row(
@@ -12127,6 +12168,97 @@ version 2
             )
             .unwrap();
         assert_eq!(output.revision, mission.revision);
+    }
+
+    #[test]
+    fn nested_work_renews_the_same_workers_ancestor_lease() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+
+mission "nested-work" state="ready" {
+  goal "Complete nested work."
+  step "outer" {
+    assigned-to "agent/worker"
+    mission "work" {
+      goal "Complete the child work."
+      step "first" { }
+      step "second" { depends-on { step "first" completed } }
+    }
+  }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "nested-lease-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "nested-work".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "nested-lease-run".into(),
+            })
+            .unwrap();
+        let parent = run.steps.iter().find(|step| step.step == "outer").unwrap();
+        let child = run
+            .steps
+            .iter()
+            .find(|step| step.step == "outer/work/first")
+            .unwrap();
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .set_step_state(&parent.subject, "ready", None)
+            .unwrap();
+        store
+            .work_action(&parent.subject, "claim", &request("claim-parent"))
+            .unwrap();
+        store
+            .work_action(&parent.subject, "progress", &request("progress-parent"))
+            .unwrap();
+        store.set_step_state(&child.subject, "ready", None).unwrap();
+        store
+            .work_action(&child.subject, "claim", &request("claim-child"))
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE step_runs SET lease_expires_at_unix_ms='0' WHERE subject=?1",
+                [&parent.subject],
+            )
+            .unwrap();
+
+        store
+            .work_action(&child.subject, "complete", &request("complete-child"))
+            .unwrap();
+
+        let parent = store.step_run(&parent.subject).unwrap().unwrap();
+        assert_eq!(parent.status, "working");
+        assert_eq!(parent.claimant.as_deref(), Some("agent/node.worker"));
+        assert_eq!(parent.claim_incarnation.as_deref(), Some("current"));
+        assert!(parent.claim_expires_at_unix_ms.unwrap() > now_ms());
     }
 
     #[test]

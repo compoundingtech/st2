@@ -281,20 +281,32 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.notify.notify_one();
         loop {
             self.notify.notified().await;
-            if let Err(error) = self.reconcile_once() {
-                let _ = self.record_once(
-                    &format!("daemon/{}", self.host),
-                    "daemon.diagnostic",
-                    BTreeMap::from([
-                        ("severity".into(), Value::String("error".into())),
-                        ("code".into(), Value::String("reconcile-failed".into())),
-                        ("status".into(), Value::String("unreachable".into())),
-                        ("reason".into(), Value::String(error.to_string())),
-                    ]),
-                );
+            for pass in 0..64 {
+                let before = self.store.index().ok();
+                if let Err(error) = self.reconcile_once() {
+                    let _ = self.record_once(
+                        &format!("daemon/{}", self.host),
+                        "daemon.diagnostic",
+                        BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("code".into(), Value::String("reconcile-failed".into())),
+                            ("status".into(), Value::String("unreachable".into())),
+                            ("reason".into(), Value::String(error.to_string())),
+                        ]),
+                    );
+                }
+                self.event_notify
+                    .send_modify(|generation| *generation = generation.saturating_add(1));
+                let changed = before != self.store.index().ok();
+                if !changed {
+                    break;
+                }
+                if pass == 63 {
+                    self.notify.notify_one();
+                } else {
+                    tokio::task::yield_now().await;
+                }
             }
-            self.event_notify
-                .send_modify(|generation| *generation = generation.saturating_add(1));
         }
     }
 
@@ -1187,8 +1199,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
         });
         let mut normal_failure_reason = normal_failed.then(|| "a normal step failed".to_owned());
-        let completion_selected =
-            run.phase == "normal" && self.mission_completion_selected(run, mission, &views)?;
+        let completion_selected = run.phase == "normal"
+            && ((normal_failed && mission.completion.is_some())
+                || self.mission_completion_selected(run, mission, &views)?);
         if completion_selected && !normal_failed {
             let variables = crate::store::mission_run_variables(run, &run.revision);
             if !self.products_hold_with_variables(&mission.products, &variables)? {
@@ -4653,6 +4666,100 @@ version 2
             .expect("the materialized declarations did not request another reconcile pass");
     }
 
+    #[tokio::test]
+    async fn completed_nested_work_wakes_its_successor_without_an_external_publish() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+
+mission "nested-wake" state="ready" {
+  goal "Complete nested work."
+  step "outer" {
+    assigned-to "agent/worker"
+    mission "work" {
+      goal "Complete the child work."
+      step "first" { }
+      step "second" { depends-on { step "first" completed } }
+    }
+  }
+}
+"#;
+        apply_source(&store, source, "nested-wake-source");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "nested-wake".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "nested-wake-run".into(),
+            })
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            notify.clone(),
+        );
+        reconciler.reconcile_once().unwrap();
+        reconciler.reconcile_once().unwrap();
+        let run = store.mission_run(&run.id).unwrap().unwrap();
+        let parent = run.steps.iter().find(|step| step.step == "outer").unwrap();
+        let first = run
+            .steps
+            .iter()
+            .find(|step| step.step == "outer/work/first")
+            .unwrap();
+        let second = run
+            .steps
+            .iter()
+            .find(|step| step.step == "outer/work/second")
+            .unwrap();
+        let request = |key: &str| crate::model::WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&parent.subject, "claim", &request("claim-parent"))
+            .unwrap();
+        store
+            .work_action(&parent.subject, "progress", &request("progress-parent"))
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        store
+            .work_action(&first.subject, "claim", &request("claim-first"))
+            .unwrap();
+        store
+            .work_action(&first.subject, "complete", &request("complete-first"))
+            .unwrap();
+        while tokio::time::timeout(std::time::Duration::from_millis(1), notify.notified())
+            .await
+            .is_ok()
+        {}
+
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+            .await
+            .expect("the completed child did not request another reconcile pass");
+        reconciler.reconcile_once().unwrap();
+
+        let parent = store.step_run(&parent.subject).unwrap().unwrap();
+        let first = store.step_run(&first.subject).unwrap().unwrap();
+        let second = store.step_run(&second.subject).unwrap().unwrap();
+        assert_eq!(parent.status, "working");
+        assert_eq!(parent.claimant.as_deref(), Some("agent/node.worker"));
+        assert_eq!(first.status, "completed");
+        assert_eq!(second.status, "ready");
+    }
+
     #[test]
     fn only_the_mission_run_origin_materializes_its_members() {
         let source = Store::open_memory("source").unwrap();
@@ -6952,6 +7059,11 @@ mission "scheduled-cycle" state="ready" {
                   title "The result appears"
                   gate "condition-1" { field "status" "resource/result" "is" "ok" }
                 }
+                step "after" {
+                  agentless
+                  title "Failed work never releases this step"
+                  depends-on { step "result" completed }
+                }
                 completion { when "all-steps-exhausted" }
                 finally {
                   step "cleanup" {
@@ -7017,6 +7129,98 @@ mission "scheduled-cycle" state="ready" {
                 .unwrap()
                 .iter()
                 .all(|desired| { desired.owner_run.as_deref() != Some(run.subject.as_str()) })
+        );
+    }
+
+    #[tokio::test]
+    async fn one_cancellation_wake_converges_through_runtime_cleanup() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+            version 2
+
+              mission "cancel-convergence" state="ready" {
+                goal "Keep one worker ready until cancellation."
+                agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+                step "wait" {
+                  assigned-to "agent/${ST_MISSION_RUN}/worker"
+                  goal "Wait for cancellation."
+                }
+                finally {
+                  step "cleanup" { agentless }
+                }
+              }
+
+        "#;
+        apply_source(&store, source, "cancel-convergence-source");
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "cancel-convergence".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("eval".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "cancel-convergence-run".into(),
+            })
+            .unwrap();
+        let notify = Arc::new(Notify::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Arc::new(Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            notify.clone(),
+        ));
+        let task = tokio::spawn(reconciler.run());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .started_members
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|member| member.runtime_id.ends_with(".worker"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the worker did not start");
+
+        let cancellation = format!(
+            "version 2\nmission-run {:?} {{ cancellation \"operator-stop\" {{ reason \"the test ended\" }} }}\n",
+            run.id
+        );
+        apply_source(&store, &cancellation, "cancel-convergence-stop");
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = store.mission_run(&run.id).unwrap().unwrap();
+                let cleaned = store
+                    .desired_subjects()
+                    .unwrap()
+                    .iter()
+                    .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()));
+                if current.status == "cancelled" && current.phase == "terminal" && cleaned {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("one cancellation wake did not finish cleanup");
+        task.abort();
+
+        assert!(
+            store
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
         );
     }
 
@@ -7270,7 +7474,7 @@ version 2
     }
 
     #[test]
-    fn a_failed_dependency_blocks_an_unreachable_completion_frontier() {
+    fn a_failed_dependency_selects_terminal_cleanup_for_a_finite_mission() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -7305,16 +7509,19 @@ version 2
             "node".into(),
             Arc::new(Notify::new()),
         );
-        reconciler.reconcile_once().unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
         let run = store.mission_run(&run.id).unwrap().unwrap();
-        assert_eq!(run.status, "blocked");
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.phase, "terminal");
         assert_eq!(
             run.steps
                 .iter()
                 .find(|step| step.step == "dependent")
                 .unwrap()
                 .status,
-            "pending"
+            "cancelled"
         );
     }
 

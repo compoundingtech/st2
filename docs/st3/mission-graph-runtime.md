@@ -729,6 +729,8 @@ A missing eligible agent creates a preview warning. A step blocks only when none
 
 Claimed work uses a renewable claim bound to the agent identity and runtime incarnation.
 
+A nested work action renews active ancestor leases held by the same agent incarnation.
+
 ```sh
 st3 work ls --as agent/RUN/node.worker
 st3 work show step-run/GENERATION/step
@@ -777,6 +779,8 @@ mission-run "RUN_ID" {
 ```
 
 Cancellation revokes active claims and cancels normal work. It then runs the adjacent `finally` graph.
+
+A terminal normal step failure does the same when the mission has an explicit completion rule.
 
 Cancellation also cancels active descendant mission runs. Each descendant uses its own final phase.
 

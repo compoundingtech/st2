@@ -98,7 +98,7 @@ version 2
         }
         step "implement-dual-honor-cutover" {
           title "Publish the Beacon base with temporary compatibility"
-          goal "Rename @acme/signal to @acme/beacon, the signal CLI to beacon, and signal/1 to beacon/1. Keep only the minimum temporary compatibility that lets consumers migrate safely."
+          goal "Rename the signal/ package directory to beacon/, @acme/signal to @acme/beacon, the signal CLI to beacon, and signal/1 to beacon/1. Keep only the minimum temporary compatibility that lets consumers migrate safely."
           depends-on { step "inspect-product-surface" completed }
         }
         step "test-base-compatibility" {

@@ -11,6 +11,7 @@ mission "eval/automatic-github-intake/review" state="ready" {
   goal "Review one automatic repository discovery and keep the result inside the graph workspace."
 
   agent "reviewer" {
+    identity "reviewer.eval"
     workspace "${ST_WORKSPACE}" create=#true
     harness "codex" {
       model "gpt-5.6-sol"
@@ -21,14 +22,14 @@ mission "eval/automatic-github-intake/review" state="ready" {
   }
 
   step "review" timeout="10m" {
-    assigned-to "agent/${ST_MISSION_RUN}/reviewer"
+    assigned-to "agent/${ST_MISSION_RUN}/reviewer.eval"
     goal "Inspect ${input.source}. Write REVIEW.md with the observed change. Do not post to GitHub or change source code."
   }
 
   finally {
     step "cleanup" timeout="2m" {
       agentless
-      stop "agent/${ST_MISSION_RUN}/reviewer"
+      stop "agent/${ST_MISSION_RUN}/reviewer.eval"
     }
   }
 }
@@ -49,14 +50,22 @@ mission "eval/automatic-github-intake" state="ready" {
     observer "observer/repository"
     on "content_hash"
     delivery "mission" {
-      mission "eval/automatic-github-intake/review@c0da2cea809134f356c652d6a55d155762b524c483df738905e24b08843e0b6b"
+      mission "eval/automatic-github-intake/review@1514c363b6448732f572eb80389c143cf15287748162bc9b5101950f4bd4b7e1"
       resource "source"
       workspace "${ST_WORKSPACE}/reviews"
     }
   }
 
+  step "baseline" timeout="2m" {
+    agentless
+    gate "the observer established its baseline" {
+      field "status" "observer/${ST_MISSION_RUN}/repository" is "healthy"
+    }
+  }
+
   step "trigger" timeout="2m" {
     agentless
+    depends-on { step "baseline" completed }
     exec "trigger" {
       host "local"
       workspace "${ST_WORKSPACE}"
@@ -70,10 +79,10 @@ mission "eval/automatic-github-intake" state="ready" {
     agentless
     depends-on { step "trigger" completed }
     gate "one review mission produced an internal result" {
-      exec "find reviews -name REVIEW.md -type f -size +0c | grep -q ."
+      exec "bash ./wait-for-review.sh"
       host "local"
       workspace "${ST_WORKSPACE}"
-      time-limit "10m"
+      time-limit "11m"
     }
   }
 }
