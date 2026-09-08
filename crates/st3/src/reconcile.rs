@@ -1070,6 +1070,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let runs = self.store.active_mission_runs()?;
         let mut changed = false;
         for run in runs {
+            if self.store.mission_run_origin(&run.id)?.as_deref() != Some(self.host.as_str()) {
+                continue;
+            }
             if run.phase == "revision-draining"
                 && self.store.apply_drained_revision(&run.id)?.is_some()
             {
@@ -4647,6 +4650,86 @@ version 2
         tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
             .await
             .expect("the materialized declarations did not request another reconcile pass");
+    }
+
+    #[test]
+    fn only_the_mission_run_origin_materializes_its_members() {
+        let source = Store::open_memory("source").unwrap();
+        let kdl = r#"
+version 2
+
+  mission "origin-owned" state="ready" {
+    goal "Run work on the origin node."
+    step "team" {
+      agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+    }
+  }
+
+"#;
+        let intent = parse_intent(kdl, "source").unwrap();
+        let planned = source
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        source
+            .apply(&intent, &planned.subject_tokens, "publish-origin-owned")
+            .unwrap();
+        let run = source
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "origin-owned".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-origin-owned".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            source.mission_run_origin(&run.id).unwrap().as_deref(),
+            Some("source")
+        );
+
+        let replica = Arc::new(Store::open_memory("replica").unwrap());
+        replica
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.mission_run_origin(&run.id).unwrap().as_deref(),
+            Some("source")
+        );
+        let replica_runtime = Arc::new(FakeRuntime::default());
+        let replica_reconciler = Reconciler::new(
+            replica.clone(),
+            replica_runtime.clone(),
+            "replica".into(),
+            Arc::new(Notify::new()),
+        );
+        replica_reconciler.reconcile_once().unwrap();
+        assert!(replica.desired_subjects().unwrap().is_empty());
+        assert!(replica_runtime.started_members.lock().unwrap().is_empty());
+
+        let source = Arc::new(source);
+        let source_reconciler = Reconciler::new(
+            source.clone(),
+            Arc::new(FakeRuntime::default()),
+            "source".into(),
+            Arc::new(Notify::new()),
+        );
+        source_reconciler.reconcile_once().unwrap();
+        source_reconciler.reconcile_once().unwrap();
+        assert!(
+            source
+                .desired_subjects()
+                .unwrap()
+                .iter()
+                .any(|subject| subject.owner_run.as_deref() == Some(run.subject.as_str()))
+        );
     }
 
     #[test]

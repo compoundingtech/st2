@@ -2229,6 +2229,23 @@ impl Store {
             .collect()
     }
 
+    pub fn mission_run_origin(&self, run: &str) -> Result<Option<String>> {
+        let subject = if run.starts_with("mission-run/") {
+            run.to_owned()
+        } else {
+            format!("mission-run/{run}")
+        };
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT origin FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY store_index LIMIT 1",
+                [subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn active_mission_runs_for_mission(&self, mission: &str) -> Result<Vec<MissionRunView>> {
         let mission = mission.strip_prefix("mission/").unwrap_or(mission);
         let connection = self.connection.lock().expect("store mutex poisoned");

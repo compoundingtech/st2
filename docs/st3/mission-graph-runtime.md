@@ -197,6 +197,12 @@ Without `completion`, the mission never becomes terminal because it exhausted it
 
 A mission run is the sole owner of execution state. An agent cannot exist outside a mission run.
 
+The origin of the `mission-run.created` claim advances the mission run. It also materializes the run declarations.
+
+A replica stores the run and its steps. It can accept eligible work claims, but it does not evaluate the run.
+
+This rule prevents two nodes from creating different local runtimes for one replicated run. An explicit member `host` can place work elsewhere.
+
 An authored runtime ID is local to the run. st3 expands it to these subjects:
 
 - `agent/RUN/LOCAL_ID`;
