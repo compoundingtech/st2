@@ -3000,10 +3000,13 @@ fn up_loop_until_with_residency(
     // Create the bounded control directory durably before subscribing to it with an independent
     // watcher so a request wakes this loop immediately without expanding declaration authority.
     let _residency_watcher = residency_policy
-        .map(|_| crate::residency_host::prepare_wake_dir(root))
-        .transpose()
-        .context("prepare residency wake control directory")?
-        .and_then(|dir| crate::watch::watch_recursive_mutations(&dir, tx.clone()));
+        .map(|_| {
+            let dir = crate::residency_host::prepare_wake_dir(root)
+                .context("prepare residency wake control directory")?;
+            crate::watch::watch_recursive_mutations(&dir, tx.clone())
+                .context("install residency wake control watcher")
+        })
+        .transpose()?;
     let mut watcher = install_watcher(root, tx);
     let mut cap = FlappingCap::default();
     // Carries per-id liveness across passes so a transient `pty list` flicker under load isn't
