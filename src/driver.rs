@@ -198,8 +198,13 @@ fn expand_codex(driver: &CodexDriver, bus_id: &str) -> KdlDocument {
         bus_id.to_string(),
         "--runtime-id".to_string(),
         bus_id.to_string(),
-        "--".to_string(),
     ];
+    // Off by default and rendered only when declared, so the expanded argv of every seat that
+    // says nothing about resume is unchanged and reads as the cold start it now gets.
+    if driver.resume {
+        argv.push("--resume".to_string());
+    }
+    argv.push("--".to_string());
     argv.extend(provider);
     document([node("argv", argv)])
 }
@@ -483,6 +488,7 @@ mod tests {
             &spec(Driver::Codex(CodexDriver {
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("xhigh".into()),
+                resume: false,
                 prompt: "Start work.".into(),
                 args: vec!["--model".into(), "override".into()],
             })),
@@ -514,6 +520,56 @@ mod tests {
                 "Start work."
             ]
         );
+    }
+
+    /// The one axis no other provider has. Off it renders nothing, so a seat that says nothing
+    /// about resume expands exactly as it did before and gets the cold start that is now the
+    /// default; on, it renders the flag the wrapper reads.
+    #[test]
+    fn codex_renders_the_resume_flag_only_when_the_seat_asked_for_it() {
+        let expand = |resume: bool| {
+            let output = expand_driver(
+                &spec(Driver::Codex(CodexDriver {
+                    model: None,
+                    effort: None,
+                    resume,
+                    prompt: "Start work.".into(),
+                    args: Vec::new(),
+                })),
+                "unused",
+            )
+            .unwrap();
+            strings(output.get("argv").unwrap())
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let cold = expand(false);
+        assert!(
+            !cold.iter().any(|argument| argument == "--resume"),
+            "{cold:?}"
+        );
+        let warm = expand(true);
+        assert_eq!(
+            warm.iter().filter(|argument| *argument == "--resume").count(),
+            1,
+            "{warm:?}"
+        );
+        // The flag is st2's, so it must land before the `--` that begins the provider's own argv.
+        let separator = warm
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("the provider argv separator");
+        let flag = warm
+            .iter()
+            .position(|argument| argument == "--resume")
+            .expect("the resume flag");
+        assert!(flag < separator, "{warm:?}");
+        // …and nothing else moves.
+        let mut without = warm.clone();
+        without.remove(flag);
+        assert_eq!(without, cold);
     }
 
     #[test]

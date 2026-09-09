@@ -101,7 +101,9 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         } => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, codex_argv)
+            // The legacy `deliver "app-server"` transport has no driver block, so it has nowhere
+            // to declare `resume` and takes the same default every other seat now takes.
+            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, false, codex_argv)
         }
         Command::ClaudeMcp { identity } => {
             let catalog = catalog_arg(None)?;
@@ -111,11 +113,12 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::Codex {
             identity,
             runtime_id,
+            resume,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, argv)
+            st2::codex_app_server::run_controlled(&catalog, identity, runtime_id, resume, argv)
         }
         Command::Driver(DriverCmd::PiChannel { identity }) => {
             let catalog = catalog_arg(None)?;

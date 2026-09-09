@@ -233,6 +233,101 @@ complement of steerable, a delivery predicate (decision 0001's boundary).
 | `Held { SystemError }` | *withhold* | — | — | see #264's catch-all defect |
 | `Held { UnknownStatus }` | *withhold* | — | — | an unrecognized future status is not a terminal `systemError` and cannot authorize delivery |
 
+### Cold start, and what the thread binding is actually for
+
+st2 owns a persistent Codex thread binding — `st2.codex-thread-binding.v1`, one
+per (catalog root, identity) — **because the thread IS the delivery address**:
+native delivery cannot infer a thread from cwd, process, PTY or `thread/list`,
+so st2 has to know which thread belongs to a seat in order to put a message in
+front of it. Reopening that thread on every relaunch was a side effect of
+needing a stable target, not a decision anybody made about context.
+
+The side effect is visible: after one machine restart, seven Claude seats came
+back at 8-15% context and three Codex seats came back at 68, 79 and 18, holding
+the previous day's conversation. Every seat had been told its session was ending
+and to write durable notes. For three of them it did not end, and an agent that
+remembers can act on a rule it remembers rather than the corrected file it was
+told to read.
+
+**So cold start is the default, and `resume #true` in the `codex {}` block is
+the opt-in.** Clearing the context never means forgetting the binding — that
+would leave the seat unaddressable. It means not REOPENING the thread the
+binding names: with no thread selected the wrapper binds whatever thread the TUI
+starts and rewrites the binding to name it. That is not a new code path. It is
+the path every seat has always taken on its first launch, and delivery is
+unaffected either way because it addresses whatever thread the binding names
+now.
+
+**One consequence belongs to whoever opts in.** A resume that fails is fatal to
+the launch, with no fallback to a fresh thread: an unreadable or foreign
+`binding.json` fails before the app-server starts, a rejected `thread/resume`
+fails as `rejected control thread/resume`, and a resume whose rollout Codex no
+longer holds fails as `saved Codex resume binding has no persisted rollout`
+(`missing_saved_rollout_fails_without_rebinding_the_incarnation`). That is
+fail-closed at admission, consistent with the protocol gate, and it means a seat
+that opted in cannot start once its thread ages out of Codex's storage. Whether
+a failed resume should instead fall back to a fresh thread with a loud
+diagnostic is a policy question this change deliberately does not answer.
+
+### The turn-failure axis (the `error` notification)
+
+Three of the rows above are reached only by a turn that ENDS. `error` is the
+notification that says a turn failed, and it is the only frame that carries a
+cause: `ErrorNotification` requires `error`, `threadId`, `turnId` and
+`willRetry`, and its `error.codexErrorInfo` is Codex's own closed error
+vocabulary. A driver that reads only the thread status and the turn lifecycle
+reports an unexplained `ended` at best and a plain `active` at worst — the
+second is what a seat reads while Codex retries, because a retried turn emits
+no completion and moves no status.
+
+So the driver reads it, on an axis of its own beside the credential axis. It
+does not touch `CodexObservedState`: `Held` stays exactly the complement of
+steerable (decision 0001), so a failing seat stays reachable. Two records
+change.
+
+The **native-driver diagnostic** gains a `turn` stage, published from
+`Source::TurnError`, with `codexErrorInfo` classified by what a person does
+about it:
+
+| `codexErrorInfo` | reason |
+| --- | --- |
+| `usageLimitExceeded`, `rateLimitExceeded`, `sessionBudgetExceeded` | `turnUsageLimit` |
+| `serverOverloaded` | `turnServerOverloaded` |
+| `contextWindowExceeded` | `turnContextWindow` |
+| `httpConnectionFailed`, `responseStreamConnectionFailed`, `responseStreamDisconnected`, `responseTooManyFailedAttempts` | `turnConnection` |
+| `cyberPolicy` | `turnPolicy` |
+| *(no Codex word; Claude's `account_on_hold` and `billing_error`)* | `turnAccount` |
+| `badRequest`, `activeTurnNotSteerable` | `turnRejected` |
+| `internalServerError`, `threadRollbackFailed`, `sandboxError` | `turnInternal` |
+| Codex's own `other`, and any word this build does not know | `turnUnclassified` |
+| `unauthorized` | *not here* — the `providerAuth` stage owns it, from `turn/completed` |
+
+`turnUnclassified` is deliberately distinct from a reader's `unknown`: it is a
+word st2 WROTE, meaning a real failure whose cause this version cannot name.
+Codex's own word travels beside it in the wrapper log, so an operator learns
+the exact cause even where the classification could not.
+
+The **observed record's `reason`** names the same cause, because that is the
+field a reader checks. The rule is that the cause outranks the activity: a bare
+`active`, the word `systemError`, and every hold reason say what kind of work
+the thread believes it is doing, while the turn error says why none of it is
+progressing. Two reasons are left alone — a human ask (`blockedOn: human`),
+which is stronger and more actionable, and `providerAuth`, which names the same
+failure's more specific cause from a stage of its own. The other axes do not
+move: `state` stays whatever Codex reports, and `blockedOn` stays `none`,
+because nothing is asking a human anything and `human` would be a second false
+statement in the field consumers filter on. What a reader gets instead is the
+cause, plus two independent ages for it — the record's own `sinceMs` and the
+diagnostic's `evidenceAgeMs`, neither of which a repeated identical failure
+refreshes.
+
+A standing turn failure clears only on POSITIVE proof that the turn recovered:
+the failed turn reaching `turn/completed` with status `completed`, a thread
+status of `idle`, or a different turn starting. Never on silence, and never on
+a `turn/completed` that itself reports `failed` — a failure is not its own
+recovery. The asymmetry is the point: a stuck seat produces quiet, so quiet
+must not clear the evidence that it is stuck.
+
 `inputBuffer` is `unknown` from this producer: the control stream does not see
 the composer. The projection test must be behavioral — a table that would pass
 with every row mapped to `unknown` is not an oracle (#268 §B). The wrapper
@@ -260,8 +355,19 @@ Two cooperating writers. The hook side classifies turn lifecycle: a submitted
 prompt or tool activity writes `active`; `Stop` writes `idle`; `StopFailure`
 — which Claude fires *instead of* `Stop` when an API error ended the turn —
 also writes `idle`, because the turn is over at the same lifecycle point, with
-reason `providerAuth` for the credential class and `apiError` for every other
-word in that closed vocabulary. It is deliberately not `ended`: the TUI is
+reason `providerAuth` for the credential class and, for every other word in that
+closed vocabulary, the same turn-failure class the Codex producer publishes:
+`rate_limit` is `usageLimit`, `overloaded` is `serverOverloaded`,
+`max_output_tokens` is `contextWindow`, `oauth_org_not_allowed` is `policy`,
+`account_on_hold` and `billing_error` are `account`, `invalid_request` and
+`model_not_found` are `rejected`, `server_error` is `internal`, and Claude's own
+`unknown` — with every word added after this build — is `unclassified`. The same
+class publishes the `turn` stage on the native-driver diagnostic, from
+`Source::TurnError`, cleared by the next `Stop`. Until this landed all ten words
+arrived as the single reason `apiError` on a record that also read `idle` and
+`blockedOn: none`, with no diagnostic at all — which is what a seat waiting for
+work looks like, so an account on hold and a finished turn read the same. It is
+deliberately not `ended`: the TUI is
 still live, a human can re-login and carry on, and the wrapper owns this seat's
 terminal record (OHS-T04). The event carries a second registered command, the
 pre-existing wedge reporter, so both jobs run on one edge;
@@ -448,11 +554,19 @@ The closed stage/reason/source matrix is:
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
 | `providerAuth` | `providerAuthRejected` | `turnResult` |
+| `turn` | `turnUsageLimit`, `turnServerOverloaded`, `turnContextWindow`, `turnConnection`, `turnPolicy`, `turnAccount`, `turnRejected`, `turnInternal`, `turnUnclassified` | `turnError` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
-One in-process publisher retains at most one current failure per stage and
-persists the earliest stage in the table's execution order. Re-publishing the
+One publisher retains at most one current failure per stage and
+persists the earliest stage in the table's execution order. It seeds that set
+from the record already on disk for its own driver, so stage priority survives a
+process boundary: every Claude hook invocation is its own process, and without
+the seeding a later boundary would overwrite an earlier one and stop telling an
+operator the real cause. One residual, stated: the record holds ONE failure, so
+a stage cleared from a fresh process cannot reveal an outstanding failure it
+never read. No producer reaches it today — Claude and Codex both clear their two
+stages on the same edge, a turn that reached its ordinary end. Re-publishing the
 same tuple is a no-op; it does not refresh `observedAt` or increment telemetry.
 A stage success clears only that stage and atomically reveals the next
 outstanding failure. Clearing the final failure removes the record. At a new
@@ -475,13 +589,17 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude, Codex, and omp publish exactly one of those stages — `providerAuth` —
-from their own typed turn-failure signal, and nothing else: every earlier
-boundary is already fail-closed at admission for them (an incompatible Codex
-protocol refuses the launch rather than degrading into an observation, an
-unadmitted omp MINOR refuses it too under OMP-R05, and st2 gates no Claude
-version at all). Every edge comes from the signal that ends a turn, so no
-driver reads provider prose to decide this:
+omp publishes exactly one of those stages — `providerAuth` — from its own typed
+turn-failure signal, and nothing else: every earlier boundary is already
+fail-closed at admission for it (an unadmitted MINOR refuses the launch under
+OMP-R05). **Claude and Codex publish two**, `providerAuth` and `turn`: st2 gates
+no Claude version at all, and Codex's protocol gate refuses an incompatible
+launch rather than degrading into an observation, so the boundaries left for
+both are the two a running seat can meet — the credential, and the turn itself.
+The credential edges come from the signal that ends a turn; the turn edges come
+from the signal that says a turn FAILED — Codex's `error` notification, Claude's
+`StopFailure` word — which is the only one carrying a cause. No driver reads
+provider prose to decide any of it:
 
 | Driver | Rejection | Recovery | `producerVersion` / `support` |
 | --- | --- | --- | --- |
@@ -493,10 +611,14 @@ No driver borrows the word for a neighbouring class: Claude's `rate_limit`,
 `overloaded`, `oauth_org_not_allowed`, `account_on_hold` and `billing_error`,
 Codex's `usageLimitExceeded` and `rateLimitExceeded`, and omp's `UsageLimit`,
 `AccountPolicy` and `Transient` flags are capacity, policy, or account state
-that a re-login cannot fix. Claude's `StopFailure` still writes `idle` with
-reason `apiError` for them — the turn did end — Codex keeps its `systemError`
-terminal, and omp's frame still writes `active` with omp's own bounded prose,
-which is the only place a reader learns that a 403 was about credits. The Codex
+that a re-login cannot fix. Claude's `StopFailure` still writes `idle` for them
+— the turn did end — and names the class on both records instead of borrowing
+the credential's word; Codex keeps its `systemError` terminal and names the
+class beside it; omp's frame still writes `active` with omp's own bounded prose,
+which is the only place a reader learns that a 403 was about credits. **omp is
+the one driver that still has nowhere to put a non-credential turn failure**,
+and its prose is not a machine-readable axis: it is the remaining instance of
+this gap. The Codex
 startup gate pins `unauthorized` and both quota words present in
 `CodexErrorInfo`, so a release that merged them refuses the launch instead of
 letting st2 report an exhausted allowance as a rejected credential; omp needs no
@@ -504,7 +626,10 @@ such gate because its flags are separate bits that cannot merge, but it does
 need the `Class` bit checked, because an unclassified `errorId` is a bare HTTP
 status. Because these three publish only on rejection, an absent record is their
 healthy steady state and Doctor advises nothing for it; OpenCode, which resolves
-its version gate on every launch, still advises on absence.
+its version gate on every launch, still advises on absence. That is exactly why
+the `turn` stage matters: for a seat whose healthy reading is `absent`, a
+failure nobody publishes is indistinguishable from health, and the one that went
+unpublished for a whole night was a provider refusing every turn.
 
 The roster projection always has one fixed shape. `failure` fills every
 evidence field; `absent` and `indeterminate` preserve the same keys with null
@@ -583,6 +708,26 @@ each only once a real test proves it (per `CLAUDE.md`):
   and bounded telemetry labels are proved by focused unit/integration tests in
   `src/driver_diagnostic.rs`, `src/opencode_session.rs`, `src/agents.rs`,
   `src/metrics.rs`, and `tests/doctor.rs`.
+- **Codex cold starts unless it asked to resume** — `resume` defaults off,
+  renders the wrapper flag only when declared, is refused on every other
+  provider, and never disturbs the binding either way. Proved in
+  `src/codex_app_server/tests.rs::a_seat_that_did_not_ask_to_resume_reopens_nothing_and_still_keeps_its_binding`,
+  `src/driver.rs::codex_renders_the_resume_flag_only_when_the_seat_asked_for_it`,
+  and `crates/agent-spec/tests/discovery.rs::typed_driver_blocks_lower_with_kdl_toml_and_json_parity`
+  plus its unsupported-field sibling.
+- **A refused turn names its cause on both records** — the `error` notification
+  is read, classified into the closed `turn` vocabulary, and cleared only by
+  positive recovery; the credential stage still outranks it and a human ask
+  still keeps its own reason. Proved in `src/codex_app_server/tests.rs`
+  (`a_retried_provider_failure_names_itself_while_codex_still_reports_a_live_turn`,
+  `only_positive_recovery_clears_a_standing_turn_failure`,
+  `a_completed_turn_and_a_later_turn_each_clear_the_failure_they_supersede`,
+  `each_codex_error_class_lands_on_its_own_reason_and_the_credential_word_stays_out`,
+  `a_rejected_credential_outranks_a_standing_turn_failure_on_the_same_seat`,
+  `a_human_ask_keeps_its_reason_while_a_turn_failure_stands`,
+  `the_captured_usage_limit_stall_now_names_its_cause_on_both_records`,
+  `a_malformed_error_frame_neither_publishes_nor_clears`) and
+  `src/driver_diagnostic.rs::a_turn_failure_is_evidence_only_from_the_producers_error_notification`.
 
 ## Open design questions
 

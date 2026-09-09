@@ -266,12 +266,27 @@ fn driver_bool(node: &DeclaredNode, provider: &str, field: &str) -> anyhow::Resu
         })
 }
 
-type CommonDriverFields = (Option<String>, Option<String>, bool, String, Vec<String>);
+struct CommonDriverFields {
+    model: Option<String>,
+    effort: Option<String>,
+    dev_channels: bool,
+    resume: bool,
+    prompt: String,
+    args: Vec<String>,
+}
+
+/// Which provider-specific fields this block may declare. Named rather than positional, so a
+/// second boolean cannot be silently transposed with the first.
+#[derive(Clone, Copy, Default)]
+struct DriverExtras {
+    dev_channels: bool,
+    resume: bool,
+}
 
 fn common_driver_fields(
     node: &DeclaredNode,
     provider: &str,
-    allow_dev_channels: bool,
+    extras: DriverExtras,
 ) -> anyhow::Result<CommonDriverFields> {
     anyhow::ensure!(
         node.type_name.is_none() && node.entries.is_empty(),
@@ -280,6 +295,7 @@ fn common_driver_fields(
     let mut model = None;
     let mut effort = None;
     let mut dev_channels = None;
+    let mut resume = None;
     let mut prompt = None;
     let mut args = None;
     for child in &node.children {
@@ -295,12 +311,19 @@ fn common_driver_fields(
                 );
                 effort = Some(driver_string(child, provider, "effort")?);
             }
-            "dev-channels" if allow_dev_channels => {
+            "dev-channels" if extras.dev_channels => {
                 anyhow::ensure!(
                     dev_channels.is_none(),
                     "agent `{provider}` has duplicate `dev-channels`"
                 );
                 dev_channels = Some(driver_bool(child, provider, "dev-channels")?);
+            }
+            "resume" if extras.resume => {
+                anyhow::ensure!(
+                    resume.is_none(),
+                    "agent `{provider}` has duplicate `resume`"
+                );
+                resume = Some(driver_bool(child, provider, "resume")?);
             }
             "prompt" => {
                 anyhow::ensure!(
@@ -316,66 +339,82 @@ fn common_driver_fields(
             other => anyhow::bail!("agent `{provider}` has unsupported field `{other}`"),
         }
     }
-    Ok((
+    Ok(CommonDriverFields {
         model,
         effort,
-        dev_channels.unwrap_or(false),
-        prompt.ok_or_else(|| anyhow::anyhow!("agent `{provider}` requires `prompt`"))?,
-        args.unwrap_or_default(),
-    ))
+        dev_channels: dev_channels.unwrap_or(false),
+        resume: resume.unwrap_or(false),
+        prompt: prompt.ok_or_else(|| anyhow::anyhow!("agent `{provider}` requires `prompt`"))?,
+        args: args.unwrap_or_default(),
+    })
 }
 
 fn claude_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<ClaudeDriver> {
-    let (model, effort, dev_channels, prompt, args) = common_driver_fields(node, "claude", true)?;
+    let fields = common_driver_fields(
+        node,
+        "claude",
+        DriverExtras {
+            dev_channels: true,
+            ..DriverExtras::default()
+        },
+    )?;
     Ok(ClaudeDriver {
-        model,
-        effort,
-        dev_channels,
-        prompt,
-        args,
+        model: fields.model,
+        effort: fields.effort,
+        dev_channels: fields.dev_channels,
+        prompt: fields.prompt,
+        args: fields.args,
     })
 }
 
 fn codex_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<CodexDriver> {
-    let (model, effort, _, prompt, args) = common_driver_fields(node, "codex", false)?;
+    let fields = common_driver_fields(
+        node,
+        "codex",
+        DriverExtras {
+            resume: true,
+            ..DriverExtras::default()
+        },
+    )?;
     Ok(CodexDriver {
-        model,
-        effort,
-        prompt,
-        args,
+        model: fields.model,
+        effort: fields.effort,
+        resume: fields.resume,
+        prompt: fields.prompt,
+        args: fields.args,
     })
 }
 
 fn pi_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<PiDriver> {
-    let (model, effort, _, prompt, args) = common_driver_fields(node, "pi", false)?;
+    let fields = common_driver_fields(node, "pi", DriverExtras::default())?;
     Ok(PiDriver {
-        model,
-        effort,
-        prompt,
-        args,
+        model: fields.model,
+        effort: fields.effort,
+        prompt: fields.prompt,
+        args: fields.args,
     })
 }
 
 fn omp_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OmpDriver> {
-    let (model, effort, _, prompt, args) = common_driver_fields(node, "omp", false)?;
+    let fields = common_driver_fields(node, "omp", DriverExtras::default())?;
     Ok(OmpDriver {
-        model,
-        effort,
-        prompt,
-        args,
+        model: fields.model,
+        effort: fields.effort,
+        prompt: fields.prompt,
+        args: fields.args,
     })
 }
 
 fn opencode_driver_node_to_raw(node: &DeclaredNode) -> anyhow::Result<OpenCodeDriver> {
-    let (model, effort, _, prompt, args) = common_driver_fields(node, "opencode", false)?;
+    let fields = common_driver_fields(node, "opencode", DriverExtras::default())?;
     anyhow::ensure!(
-        effort.is_none(),
+        fields.effort.is_none(),
         "agent `opencode` has unsupported field `effort` (OpenCode has no effort axis)"
     );
     Ok(OpenCodeDriver {
-        model,
-        prompt,
-        args,
+        model: fields.model,
+        prompt: fields.prompt,
+        args: fields.args,
     })
 }
 

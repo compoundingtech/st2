@@ -24,6 +24,7 @@ pub enum Stage {
     Sse,
     Seed,
     ProviderAuth,
+    Turn,
     Delivery,
     ReadBack,
     #[serde(other)]
@@ -31,12 +32,13 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::VersionGate,
         Self::ApiGate,
         Self::Sse,
         Self::Seed,
         Self::ProviderAuth,
+        Self::Turn,
         Self::Delivery,
         Self::ReadBack,
     ];
@@ -48,6 +50,7 @@ impl Stage {
             Self::Sse => "sse",
             Self::Seed => "seed",
             Self::ProviderAuth => "providerAuth",
+            Self::Turn => "turn",
             Self::Delivery => "delivery",
             Self::ReadBack => "readBack",
             Self::Unknown => "unknown",
@@ -55,10 +58,17 @@ impl Stage {
     }
 
     /// Projection order, earliest boundary first. `ProviderAuth` sits between the four gates st2
-    /// owns and the two it can only observe through them: the gates are st2↔producer contract
+    /// owns and the three it can only observe through them: the gates are st2↔producer contract
     /// facts that must hold before any provider-side reading means anything, while a rejected
-    /// credential is the CAUSE whose symptoms are delivery and read-back failures — so it must
-    /// outrank both rather than hide behind them.
+    /// credential is the CAUSE whose symptoms are turn, delivery and read-back failures — so it
+    /// must outrank all three rather than hide behind them.
+    ///
+    /// `Turn` sits directly under it and above `Delivery` for the same reason one step down: a
+    /// provider that refuses the seat's turns is the cause, and a delivery or read-back symptom
+    /// on top of it would name the wrong thing to fix. It carries the failures a running seat
+    /// meets after every gate has passed — an exhausted allowance, an overloaded model, a
+    /// context window, a dropped response stream — which is why absence of this record must
+    /// never be read as "the seat is working".
     const fn index(self) -> Option<usize> {
         match self {
             Self::VersionGate => Some(0),
@@ -66,8 +76,9 @@ impl Stage {
             Self::Sse => Some(2),
             Self::Seed => Some(3),
             Self::ProviderAuth => Some(4),
-            Self::Delivery => Some(5),
-            Self::ReadBack => Some(6),
+            Self::Turn => Some(5),
+            Self::Delivery => Some(6),
+            Self::ReadBack => Some(7),
             Self::Unknown => None,
         }
     }
@@ -122,12 +133,21 @@ pub enum Reason {
     ReadBackUnavailable,
     NotDurable,
     ProviderAuthRejected,
+    TurnUsageLimit,
+    TurnServerOverloaded,
+    TurnContextWindow,
+    TurnConnection,
+    TurnPolicy,
+    TurnAccount,
+    TurnRejected,
+    TurnInternal,
+    TurnUnclassified,
     #[serde(other)]
     Unknown,
 }
 
 impl Reason {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 29] = [
         Self::VersionProbeFailed,
         Self::UnsupportedVersion,
         Self::ApiUnavailable,
@@ -148,6 +168,15 @@ impl Reason {
         Self::ReadBackUnavailable,
         Self::NotDurable,
         Self::ProviderAuthRejected,
+        Self::TurnUsageLimit,
+        Self::TurnServerOverloaded,
+        Self::TurnContextWindow,
+        Self::TurnConnection,
+        Self::TurnPolicy,
+        Self::TurnAccount,
+        Self::TurnRejected,
+        Self::TurnInternal,
+        Self::TurnUnclassified,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -172,6 +201,18 @@ impl Reason {
             Self::ReadBackUnavailable => "readBackUnavailable",
             Self::NotDurable => "notDurable",
             Self::ProviderAuthRejected => "providerAuthRejected",
+            Self::TurnUsageLimit => "turnUsageLimit",
+            Self::TurnServerOverloaded => "turnServerOverloaded",
+            Self::TurnContextWindow => "turnContextWindow",
+            Self::TurnConnection => "turnConnection",
+            Self::TurnPolicy => "turnPolicy",
+            Self::TurnAccount => "turnAccount",
+            Self::TurnRejected => "turnRejected",
+            Self::TurnInternal => "turnInternal",
+            // The producer named a cause this build does not classify. Distinct from
+            // [`Self::Unknown`], which means a READER met a word it cannot decode: this one is a
+            // word st2 wrote on purpose, and it is evidence of a real failure.
+            Self::TurnUnclassified => "turnUnclassified",
             Self::Unknown => "unknown",
         }
     }
@@ -190,6 +231,15 @@ impl Reason {
             | Self::MalformedQuestions
             | Self::MissingAskId => Stage::Seed,
             Self::ProviderAuthRejected => Stage::ProviderAuth,
+            Self::TurnUsageLimit
+            | Self::TurnServerOverloaded
+            | Self::TurnContextWindow
+            | Self::TurnConnection
+            | Self::TurnPolicy
+            | Self::TurnAccount
+            | Self::TurnRejected
+            | Self::TurnInternal
+            | Self::TurnUnclassified => Stage::Turn,
             Self::DeliveryUnavailable | Self::DeliveryRejected => Stage::Delivery,
             Self::ReadBackUnavailable | Self::NotDurable => Stage::ReadBack,
             Self::Unknown => Stage::Unknown,
@@ -220,6 +270,15 @@ impl Reason {
                 matches!(source, Source::PermissionSnapshot | Source::QuestionSnapshot)
             }
             Self::ProviderAuthRejected => matches!(source, Source::TurnResult),
+            Self::TurnUsageLimit
+            | Self::TurnServerOverloaded
+            | Self::TurnContextWindow
+            | Self::TurnConnection
+            | Self::TurnPolicy
+            | Self::TurnAccount
+            | Self::TurnRejected
+            | Self::TurnInternal
+            | Self::TurnUnclassified => matches!(source, Source::TurnError),
             Self::DeliveryUnavailable | Self::DeliveryRejected => {
                 matches!(source, Source::PromptTransport)
             }
@@ -243,12 +302,13 @@ pub enum Source {
     PromptTransport,
     MessageReadBack,
     TurnResult,
+    TurnError,
     #[serde(other)]
     Unknown,
 }
 
 impl Source {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::VersionProbe,
         Self::OpenApiDocument,
         Self::EventStream,
@@ -258,6 +318,7 @@ impl Source {
         Self::PromptTransport,
         Self::MessageReadBack,
         Self::TurnResult,
+        Self::TurnError,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -270,7 +331,13 @@ impl Source {
             Self::QuestionSnapshot => "questionSnapshot",
             Self::PromptTransport => "promptTransport",
             Self::MessageReadBack => "messageReadBack",
+            // The two turn sources are different signals, not spellings of one. `turnResult` is
+            // the producer's statement about how a turn ENDED, and it carries BOTH edges of the
+            // credential axis — Codex's `turn/completed`, Claude's `Stop`/`StopFailure` pair.
+            // `turnError` is the producer's statement that a turn FAILED, and it is the only one
+            // that carries a cause: Codex's `error` notification, Claude's `StopFailure` word.
             Self::TurnResult => "turnResult",
+            Self::TurnError => "turnError",
             Self::Unknown => "unknown",
         }
     }
@@ -389,6 +456,9 @@ pub fn repair_text(observed: &Observed) -> &'static str {
             // generic on purpose — which client owns which credential home is declared outside
             // st2, and no credential knowledge enters this crate (Q12).
             Stage::ProviderAuth => "the seat's provider credential was rejected; re-login with the account's own client and unpark",
+            // Named per cause, because the actions genuinely differ: an exhausted allowance and
+            // an overloaded model both look like a silent seat and want opposite responses.
+            Stage::Turn => "the provider refused or dropped this seat's turns; read the reason word — recovery clears this advisory",
             Stage::Delivery => "restore the native prompt transport; the queued message remains retryable",
             Stage::ReadBack => "restore message read-back; st2 will reconcile without duplicating the prompt",
             Stage::Unknown => "upgrade this st2 reader; an unknown stage is not healthy evidence",
@@ -473,7 +543,7 @@ pub struct Publisher {
     driver: Driver,
     producer_version: Option<String>,
     support: Support,
-    failures: [Option<Record>; 7],
+    failures: [Option<Record>; 8],
 }
 
 impl Publisher {
@@ -495,12 +565,30 @@ impl Publisher {
                 "st2 driver diagnostic malformed predecessor cleanup failed: {error}"
             );
         }
+        // Seed the stage set from whatever readable record this seat already carries for THIS
+        // driver. Without it, a short-lived publisher — every Claude hook invocation is its own
+        // process — would persist its own stage over a predecessor's EARLIER one, and stage
+        // priority would hold only inside a process. Nothing is resurrected that was not already
+        // on disk: `persist` writes the earliest stage it holds, and this only decides which of
+        // two live failures a reader sees.
+        let mut failures: [Option<Record>; 8] = array::from_fn(|_| None);
+        if let Ok(raw) = fs::read(&path)
+            && let Ok(record) = serde_json::from_slice::<Record>(&raw)
+            && record.schema == SCHEMA
+            && record.recovery == RECOVERY
+            && record.driver == driver
+            && record.reason.stage() == record.stage
+            && record.reason.accepts_source(record.source)
+            && let Some(index) = record.stage.index()
+        {
+            failures[index] = Some(record);
+        }
         Self {
             path,
             driver,
             producer_version,
             support,
-            failures: array::from_fn(|_| None),
+            failures,
         }
     }
 
@@ -625,6 +713,32 @@ pub(crate) fn publish_provider_auth(agent_dir: &Path, driver: Driver, edge: Prov
             Source::TurnResult,
         ),
         ProviderAuthEdge::Accepted => publisher.clear(Stage::ProviderAuth),
+    }
+}
+
+/// What one observation proves about the seat's current turn, beside the credential axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnFailureEdge {
+    /// The producer said this turn failed, and named a cause this build classified.
+    Failed(Reason),
+    /// A turn reached its ordinary end. Positive proof, and the only thing that clears a standing
+    /// failure — silence never does, because silence is what a stuck seat produces.
+    Recovered,
+}
+
+/// Record one turn edge on the seat's native-driver diagnostic.
+///
+/// A fresh publisher per edge, exactly like [`publish_provider_auth`] and for the same reason: the
+/// producers of these edges are short-lived. The publisher seeds itself from the record on disk,
+/// so a turn failure published from one hook process cannot hide a credential rejection published
+/// from another.
+pub(crate) fn publish_turn_failure(agent_dir: &Path, driver: Driver, edge: TurnFailureEdge) {
+    let mut publisher = Publisher::new(agent_dir, driver, None, Support::Unknown);
+    match edge {
+        TurnFailureEdge::Failed(reason) => {
+            publisher.publish(Stage::Turn, reason, Source::TurnError)
+        }
+        TurnFailureEdge::Recovered => publisher.clear(Stage::Turn),
     }
 }
 
@@ -803,6 +917,115 @@ mod tests {
                 panic!("{driver:?} is an admitted driver word")
             };
             assert_eq!(other.driver, driver);
+        }
+    }
+
+    /// Stage priority has to hold ACROSS processes, not only inside one. Every Claude hook
+    /// invocation is its own process, so a publisher that started with an empty stage set would
+    /// persist its own boundary over an earlier one somebody else published — and an operator
+    /// would stop being told the real cause the moment a later symptom appeared.
+    #[test]
+    fn a_fresh_publisher_inherits_the_record_it_finds_so_stage_priority_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = path(tmp.path());
+        Publisher::new(tmp.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
+
+        // A later process publishes a LATER boundary. The earlier one must still be projected.
+        Publisher::new(tmp.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&record) else {
+            panic!("the earlier boundary must still be the projected failure")
+        };
+        assert_eq!(failure.stage, Stage::ProviderAuth);
+
+        // Seeding is scoped to this driver's own records: another driver's record is not this
+        // publisher's history and must not be inherited.
+        let foreign = tempfile::tempdir().unwrap();
+        Publisher::new(foreign.path(), Driver::OpenCode, None, Support::Unknown).publish(
+            Stage::ProviderAuth,
+            Reason::ProviderAuthRejected,
+            Source::TurnResult,
+        );
+        Publisher::new(foreign.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&path(foreign.path())) else {
+            panic!("this driver's own failure must be readable")
+        };
+        assert_eq!(failure.stage, Stage::Turn);
+        assert_eq!(failure.driver, Driver::Claude);
+
+        // And a record this reader cannot trust seeds nothing — inheriting a wrongly paired
+        // record would launder it into evidence.
+        let damaged = tempfile::tempdir().unwrap();
+        fs::write(
+            path(damaged.path()),
+            br#"{"schema":"st2.driver-diagnostic.v1","driver":"claude","stage":"providerAuth",
+                "reason":"notDurable","source":"turnResult","support":"unknown",
+                "observedAt":1,"recovery":"clearsOnStageRecovery"}"#,
+        )
+        .unwrap();
+        Publisher::new(damaged.path(), Driver::Claude, None, Support::Unknown).publish(
+            Stage::Turn,
+            Reason::TurnUsageLimit,
+            Source::TurnError,
+        );
+        let Observed::Failure(failure) = read(&path(damaged.path())) else {
+            panic!("the real failure must be readable")
+        };
+        assert_eq!(failure.stage, Stage::Turn);
+    }
+
+    /// The turn boundary is the one a RUNNING seat meets, so it is the one whose absence is most
+    /// easily misread as health. Its wire pairing is pinned like the credential's: a turn failure
+    /// is evidence only when it came from the producer's own error notification.
+    #[test]
+    fn a_turn_failure_is_evidence_only_from_the_producers_error_notification() {
+        let valid = br#"{
+          "schema":"st2.driver-diagnostic.v1","driver":"codex","stage":"turn",
+          "reason":"turnServerOverloaded","source":"turnError","support":"supported",
+          "producerVersion":"codex-cli 0.153.0","observedAt":100,
+          "recovery":"clearsOnStageRecovery"
+        }"#;
+        let observed = read_at(valid, 100);
+        let Observed::Failure(failure) = &observed else {
+            panic!("a refused turn must read as a failure")
+        };
+        assert_eq!(failure.stage, Stage::Turn);
+        assert_eq!(failure.reason, Reason::TurnServerOverloaded);
+        assert_eq!(failure.source, Source::TurnError);
+        assert!(
+            !repair_text(&observed).contains("re-login"),
+            "a refused turn is not a credential problem: {}",
+            repair_text(&observed)
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"turnError", b"turnResult"), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "the turn result names a completed turn; only the error notification carries a cause"
+        );
+        assert_eq!(
+            read_at(&valid.replace(b"\"turn\"", b"\"delivery\""), 100),
+            Observed::Indeterminate(InvalidReason::UnknownVocabulary),
+            "every turn reason belongs to exactly one stage"
+        );
+        // Every turn reason must be readable off the wire on its own stage and source. A word
+        // that decodes only because a sibling does is not a closed vocabulary.
+        for reason in Reason::ALL.into_iter().filter(|r| r.stage() == Stage::Turn) {
+            let bytes = valid.replace(b"turnServerOverloaded", reason.as_str().as_bytes());
+            let Observed::Failure(failure) = read_at(&bytes, 100) else {
+                panic!("{} must read as a failure", reason.as_str())
+            };
+            assert_eq!(failure.reason, reason);
         }
     }
 
