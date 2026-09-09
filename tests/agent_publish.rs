@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -718,6 +719,73 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
         .output()
         .unwrap();
     assert!(!mismatch.status.success());
+}
+
+#[test]
+fn publication_does_not_traverse_unrelated_runtime_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let runtime = catalog.join("agents/host/direct-session/resources");
+    fs::create_dir_all(&runtime).unwrap();
+    let socket = runtime.join("session.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let spec = temp.path().join("candidate.kdl");
+    fs::write(&spec, valid_spec(false)).unwrap();
+
+    let output = publish(&catalog, &spec, &["--expect-absent"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(socket.exists());
+}
+
+#[test]
+fn bundle_workspace_descendants_are_not_publication_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = temp.path().join("catalog");
+    let bundle = temp.path().join("bundle");
+    let workspace = bundle.join(".workspace/deep");
+    fs::create_dir(&catalog).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        bundle.join("agent.kdl"),
+        "agent \"worker\" {\n  host \"host\"\n  workspace \".workspace\"\n  argv \"true\"\n}\n",
+    )
+    .unwrap();
+    let sentinel = workspace.join("sentinel");
+    fs::write(&sentinel, "before").unwrap();
+    let socket = workspace.join("session.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+
+    let before = source_digest("--bundle", &bundle);
+    fs::write(&sentinel, "after").unwrap();
+    let after = source_digest("--bundle", &bundle);
+    assert_eq!(before, after);
+
+    let output = st2()
+        .args([
+            "agent",
+            "publish",
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--bundle",
+            bundle.to_str().unwrap(),
+            "--input-sha256",
+            &after,
+            "--expect-absent",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let published_workspace = catalog.join("agents/host/worker/.workspace");
+    assert!(published_workspace.is_dir());
+    assert!(fs::read_dir(published_workspace).unwrap().next().is_none());
 }
 
 #[test]

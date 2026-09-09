@@ -148,7 +148,7 @@ impl Candidate {
                 CandidateKind::Spec
             }
             PublishSource::Bundle(path) => {
-                crate::catalog_transaction::capture_real_tree(path, stage.path())
+                crate::catalog_transaction::capture_agent_bundle(path, stage.path())
                     .with_context(|| format!("capture bundle {}", path.display()))?;
                 File::open(stage.path())?.sync_all()?;
                 CandidateKind::Bundle
@@ -709,7 +709,8 @@ fn copy_filtered_catalog(
     catalog: &Path,
     prospective_target: &Path,
 ) -> Result<()> {
-    let declaration_parent = source == prospective_target || is_declaration_parent(source)?;
+    let state_parent = source == prospective_target || is_agent_state_parent(source, catalog);
+    let declaration_parent = state_parent || is_declaration_parent(source)?;
     for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
         let entry = entry?;
         let from = entry.path();
@@ -726,9 +727,11 @@ fn copy_filtered_catalog(
         {
             continue;
         }
-        let to = destination.join(name);
+        let to = destination.join(&name);
         let metadata = fs::symlink_metadata(&from)?;
-        if metadata.is_dir() {
+        if state_parent && name_text == ".workspace" && metadata.is_dir() {
+            fs::create_dir(&to)?;
+        } else if metadata.is_dir() {
             fs::create_dir(&to)?;
             copy_filtered_catalog(&from, &to, catalog, prospective_target)?;
         } else if metadata.is_file() {
@@ -740,6 +743,17 @@ fn copy_filtered_catalog(
         }
     }
     Ok(())
+}
+
+fn is_agent_state_parent(path: &Path, catalog: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(catalog) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(components.next(), Some(Component::Normal(name)) if name == "agents")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 fn is_declaration_parent(path: &Path) -> Result<bool> {

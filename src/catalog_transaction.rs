@@ -1772,7 +1772,8 @@ fn collect_full_catalog_errors_with_host_policy(
     runtime: crate::validate::RuntimeRoot<'_>,
     require_explicit_host: bool,
 ) -> Result<FullCatalogErrors> {
-    let found = crate::discover(root);
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let found = crate::discover(&root);
     let mut hosts = BTreeSet::new();
     for spec in &found.specs {
         let host = match spec.host.as_deref() {
@@ -1789,13 +1790,18 @@ fn collect_full_catalog_errors_with_host_policy(
     collect_error_identities(
         &mut identities,
         &mut issues,
-        crate::validate::validate(root),
+        crate::validate::validate_discovered(
+            &root,
+            None,
+            crate::validate::RuntimeRoot::Unknown,
+            &found,
+        ),
     );
     for host in hosts {
         collect_error_identities(
             &mut identities,
             &mut issues,
-            crate::validate::validate_for_host_at(root, &host, runtime),
+            crate::validate::validate_discovered(&root, Some(&host), runtime, &found),
         );
     }
     Ok(FullCatalogErrors { identities, issues })
@@ -3230,9 +3236,9 @@ fn collect_dirs(root: &Path, dirs: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Copy an exact directory capability without following a source symlink at any depth.
-pub(crate) fn capture_real_tree(source: &Path, destination: &Path) -> Result<()> {
-    capture_tree(source, destination, CaptureMode::General)
+/// Capture a publication bundle while retaining `.workspace` only as an empty directory fact.
+pub(crate) fn capture_agent_bundle(source: &Path, destination: &Path) -> Result<()> {
+    capture_tree(source, destination, CaptureMode::AgentBundle)
 }
 
 fn capture_prepared_catalog(source: &Path, destination: &Path) -> Result<()> {
@@ -3241,7 +3247,7 @@ fn capture_prepared_catalog(source: &Path, destination: &Path) -> Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CaptureMode {
-    General,
+    AgentBundle,
     PreparedCatalog,
 }
 
@@ -3341,12 +3347,18 @@ fn capture_dir_capability(
         let target = destination.join(&name);
         if metadata.is_dir() {
             let relative = target.strip_prefix(capture_root)?;
-            if mode == CaptureMode::PreparedCatalog && is_canonical_workspace_fact(relative) {
-                anyhow::ensure!(
-                    capability_dir_entries(&input)?.is_empty(),
-                    "prepared workspace fact must be empty: {}",
-                    relative.display()
-                );
+            let workspace_fact = match mode {
+                CaptureMode::AgentBundle => relative == Path::new(".workspace"),
+                CaptureMode::PreparedCatalog => is_canonical_workspace_fact(relative),
+            };
+            if workspace_fact {
+                if mode == CaptureMode::PreparedCatalog {
+                    anyhow::ensure!(
+                        capability_dir_entries(&input)?.is_empty(),
+                        "prepared workspace fact must be empty: {}",
+                        relative.display()
+                    );
+                }
                 fs::create_dir(&target)?;
                 fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
                 continue;
