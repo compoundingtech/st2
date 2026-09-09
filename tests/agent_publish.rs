@@ -724,10 +724,10 @@ fn bundle_is_atomic_create_only_and_retry_checks_the_full_payload() {
 #[test]
 fn publication_does_not_traverse_unrelated_runtime_state() {
     let temp = tempfile::tempdir().unwrap();
-    let catalog = temp.path().join("catalog");
-    let runtime = catalog.join("agents/host/direct-session/resources");
+    let catalog = temp.path().join("c");
+    let runtime = catalog.join("agents/h/d/resources");
     fs::create_dir_all(&runtime).unwrap();
-    let socket = runtime.join("session.sock");
+    let socket = runtime.join("s");
     let _listener = UnixListener::bind(&socket).unwrap();
     let spec = temp.path().join("candidate.kdl");
     fs::write(&spec, valid_spec(false)).unwrap();
