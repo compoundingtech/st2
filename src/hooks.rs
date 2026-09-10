@@ -761,6 +761,7 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
+
     #[test]
     fn omp_launch_classification_is_exact() {
         let root = Path::new("/catalog");

@@ -184,11 +184,24 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::OmpSession {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::omp_session::run(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => st2::omp_session::run_residency_attempt(
+                    &catalog,
+                    identity,
+                    runtime_id,
+                    argv,
+                    st2::residency::Generation(generation),
+                    incarnation,
+                ),
+                (None, None) => st2::omp_session::run(&catalog, identity, runtime_id, argv),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::Claude { identity }) => {
             eprintln!("warning: `st2 driver claude` is deprecated; use `st2 driver claude-mcp`");

@@ -580,23 +580,25 @@ pub fn load(
 
 pub fn store(path: &Path, ledger: &Ledger) -> Result<(), LoadError> {
     ledger.validate().map_err(LoadError::Invalid)?;
-    let bytes = serde_json::to_vec(ledger)
-        .map_err(std::io::Error::other)
-        .map_err(LoadError::Io)?;
+    atomic_json(path, ledger).map_err(LoadError::Io)
+}
+
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     let parent = path.parent().ok_or_else(|| {
-        LoadError::Io(std::io::Error::new(
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "ledger path has no parent",
-        ))
+        )
     })?;
-    create_dir_all_durable(parent).map_err(LoadError::Io)?;
+    create_dir_all_durable(parent)?;
     crate::fsatomic::replace(
         path,
         &bytes,
         crate::fsatomic::Staging::new(".residency-ledger"),
         crate::fsatomic::Durability::FsyncFileAndDir,
     )
-    .map_err(LoadError::Io)
+    
 }
 
 fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
