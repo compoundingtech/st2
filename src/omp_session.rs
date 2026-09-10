@@ -938,16 +938,18 @@ mod tests {
             "session-exact",
             "an unconfirmed channel attempt must leave the checkpoint retryable"
         );
-        confirm_channel_binding(
+        let stale_error = confirm_channel_binding(
             &state,
             &agent_dir,
             "h.worker",
             "h.worker",
             "runtime-stale",
+            next_seq,
             "session-exact",
             Some(crate::residency::Generation(2)),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(stale_error.to_string().contains("ownership was superseded"));
         assert!(
             !residency_ready(
                 &state,
@@ -972,6 +974,7 @@ mod tests {
         .unwrap();
         confirm_channel_binding(
             &state,
+            &agent_dir,
             "h.worker",
             "h.worker",
             "runtime-next",
