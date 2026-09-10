@@ -809,6 +809,16 @@ pub(crate) enum ServiceCmd {
         /// `<catalog>/pty`. Useful when adopting live sessions from a legacy runner.
         #[arg(long)]
         pty_root: Option<PathBuf>,
+        /// Host idle threshold before an eligible on-demand agent may become cold.
+        #[arg(
+            long,
+            value_parser = st2::parse_duration,
+            requires = "residency_warm_capacity"
+        )]
+        residency_idle_after: Option<Duration>,
+        /// Minimum number of eligible on-demand agents that this host keeps warm.
+        #[arg(long, requires = "residency_idle_after")]
+        residency_warm_capacity: Option<usize>,
         /// Supervisor memory ceiling (MiB). The agents live in sibling scopes and are NOT bounded.
         #[arg(long = "memory-max-mb", default_value_t = st2::service::DEFAULT_MEMORY_MAX_MB)]
         memory_max_mb: u64,
@@ -1294,4 +1304,48 @@ pub(crate) enum RequestCmd {
         #[command(flatten)]
         ctx: MsgCtx,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_install_accepts_only_a_complete_residency_policy() {
+        let parsed = Cli::try_parse_from([
+            "st2",
+            "service",
+            "install",
+            "--residency-idle-after",
+            "5m",
+            "--residency-warm-capacity",
+            "2",
+        ])
+        .unwrap();
+        let Command::Service(ServiceCmd::Install {
+            residency_idle_after,
+            residency_warm_capacity,
+            ..
+        }) = parsed.command
+        else {
+            panic!("expected service install");
+        };
+        assert_eq!(residency_idle_after, Some(Duration::from_secs(300)));
+        assert_eq!(residency_warm_capacity, Some(2));
+
+        assert!(
+            Cli::try_parse_from(["st2", "service", "install", "--residency-idle-after", "5m",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st2",
+                "service",
+                "install",
+                "--residency-warm-capacity",
+                "2",
+            ])
+            .is_err()
+        );
+    }
 }

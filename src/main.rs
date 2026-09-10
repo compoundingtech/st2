@@ -915,6 +915,25 @@ fn catalog_root_for_env() -> Result<PathBuf> {
         )?;
     absolute_catalog_path(&root)
 }
+fn resolve_wake_target<'a>(
+    specs: &'a [st2::AgentSpec],
+    host: &str,
+    selector: &st2::identity::AgentSelector,
+) -> Result<Option<&'a st2::AgentSpec>> {
+    let entries = st2::identity::address_book(specs, host);
+    let resolved = match st2::identity::resolve_local_first(&entries, selector, host) {
+        Ok(resolved) => resolved,
+        Err(st2::identity::ResolveError::Unknown { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if resolved.host != host {
+        return Ok(None);
+    }
+    Ok(specs
+        .iter()
+        .find(|spec| spec.resolved_host(host) == host && spec.effective_id(host) == resolved.id))
+}
+
 fn wake_cmd(
     identity: Option<String>,
     agent_id: Option<String>,
@@ -922,14 +941,11 @@ fn wake_cmd(
 ) -> Result<()> {
     let root = catalog_root_for_env()?;
     let host = host.unwrap_or_else(detect_host);
-    let declaration = selected_declaration(&root, &host, identity, agent_id)?
-        .context("wake requires an agent reference")?;
+    let selector =
+        agent_selector(identity, agent_id).context("wake requires an agent reference")?;
     let found = discover(&root);
-    let spec = found
-        .specs
-        .iter()
-        .find(|spec| spec.bus_id(&host) == declaration)
-        .context("selected wake declaration disappeared")?;
+    let spec = resolve_wake_target(&found.specs, &host, &selector)?
+        .context("wake reference does not name an agent owned by this host")?;
     anyhow::ensure!(
         spec.residency_policy == st2::ResidencyPolicy::OnDemand && spec.desired_state.is_running(),
         "wake target is not a running on-demand agent"
@@ -947,11 +963,13 @@ fn wake_cmd(
 fn request_attach_wake(root: &Path, target: &str) -> Result<()> {
     let host = detect_host();
     let found = discover(root);
-    if let Some(spec) = found.specs.iter().find(|spec| {
-        spec.residency_policy == st2::ResidencyPolicy::OnDemand
-            && spec.desired_state.is_running()
-            && spec.bus_id(&host) == target
-    }) {
+    if let Some(spec) = resolve_wake_target(
+        &found.specs,
+        &host,
+        &st2::identity::AgentSelector::Address(target.to_owned()),
+    )? && spec.residency_policy == st2::ResidencyPolicy::OnDemand
+        && spec.desired_state.is_running()
+    {
         st2::residency_host::request_wake(root, &host, &spec.effective_id(&host))?;
     }
     Ok(())
@@ -2818,13 +2836,26 @@ fn service_cmd(cmd: ServiceCmd) -> Result<()> {
             catalog,
             host,
             pty_root,
+            residency_idle_after,
+            residency_warm_capacity,
             memory_max_mb,
         } => {
             let catalog = match catalog {
                 Some(c) => c,
                 None => catalog_root_for_env()?,
             };
-            st2::service::install(&catalog, host, pty_root, memory_max_mb)
+            st2::service::install(
+                &catalog,
+                host,
+                pty_root,
+                residency_idle_after.zip(residency_warm_capacity).map(
+                    |(idle_after, warm_capacity)| st2::residency_host::HostPolicy {
+                        idle_after,
+                        warm_capacity,
+                    },
+                ),
+                memory_max_mb,
+            )
         }
         ServiceCmd::Status => st2::service::status(),
         ServiceCmd::Uninstall => st2::service::uninstall(),
@@ -3578,4 +3609,79 @@ fn ls(root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addressed_spec() -> st2::AgentSpec {
+        st2::AgentSpec {
+            id: Some("immutable-worker-id".to_owned()),
+            address: Some("chat".to_owned()),
+            identity: "worker".to_owned(),
+            name: None,
+            description: None,
+            host: Some("host-a".to_owned()),
+            role: None,
+            job_type: st2::JobType::Service,
+            workspace: None,
+            supervisor: None,
+            desired_state: st2::AgentDesiredState::Running,
+            residency_policy: st2::ResidencyPolicy::OnDemand,
+            keep: false,
+            restart: None,
+            delivery: None,
+            session_driver: Some(st2::SessionDriver::Omp),
+            driver: None,
+            delivery_readiness: None,
+            resources: Vec::new(),
+            streams: Vec::new(),
+            tasks: Vec::new(),
+            path: PathBuf::from("/catalog/agents/host-a/worker/agent.kdl"),
+        }
+    }
+
+    #[test]
+    fn wake_target_resolves_bare_and_qualified_mutable_addresses() {
+        let specs = vec![addressed_spec()];
+
+        for reference in ["chat", "host-a.chat"] {
+            let target = resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Address(reference.to_owned()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(target.bus_id("host-a"), "host-a.worker");
+            assert_eq!(target.effective_id("host-a"), "immutable-worker-id");
+        }
+    }
+
+    #[test]
+    fn wake_target_does_not_route_by_the_old_identity_after_an_address_override() {
+        let specs = vec![addressed_spec()];
+
+        assert!(
+            resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Address("worker".to_owned()),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            resolve_wake_target(
+                &specs,
+                "host-a",
+                &st2::identity::AgentSelector::Id("immutable-worker-id".to_owned()),
+            )
+            .unwrap()
+            .unwrap()
+            .bus_id("host-a"),
+            "host-a.worker"
+        );
+    }
 }

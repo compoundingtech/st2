@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -473,6 +473,8 @@ pub fn before_reconcile(
     host: &str,
     specs: &mut [AgentSpec],
     sessions: &[Session],
+    debounce: &crate::run::LivenessDebounce,
+    now: Instant,
     runner: &dyn Runner,
     policy: HostPolicy,
     report: &mut UpReport,
@@ -630,7 +632,9 @@ pub fn before_reconcile(
                     }
                 }
                 crate::residency::Action::VerifyAbsent { generation } => {
-                    if group_absent(&ids, sessions) {
+                    if group_absent(&ids, sessions)
+                        && ids.iter().all(|id| !debounce.recently_alive(id, now))
+                    {
                         store_event(&path, &mut ledger, Event::AbsenceVerified { generation })
                     } else {
                         break;
@@ -961,12 +965,16 @@ mod tests {
             killed: std::cell::RefCell::new(Vec::new()),
         };
         let mut report = UpReport::default();
+        let debounce = crate::run::LivenessDebounce::new(Duration::from_secs(10));
+        let now = Instant::now();
 
         before_reconcile(
             catalog.path(),
             "host-a",
             std::slice::from_mut(&mut spec),
             &sessions,
+            &debounce,
+            now,
             &runner,
             HostPolicy {
                 idle_after: Duration::ZERO,
@@ -997,6 +1005,92 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("injected kill failure"))
         );
+    }
+
+    #[test]
+    fn verify_absence_waits_for_liveness_debounce() {
+        let catalog = tempfile::tempdir().unwrap();
+        let agent_dir = catalog.path().join("agents/host-a/worker");
+        std::fs::create_dir_all(agent_dir.join("inbox")).unwrap();
+        let mut spec = on_demand_spec(agent_dir.join("agent.kdl"));
+        let agent_id = spec.effective_id("host-a");
+        let path = crate::residency::ledger_path(catalog.path(), "host-a", &agent_id);
+        let mut ledger =
+            Ledger::active(&agent_id, "host-a", SessionDriver::Omp, Generation(1)).unwrap();
+        ledger.apply(Event::IdleConfirmed {
+            generation: Generation(1),
+        });
+        ledger.apply(Event::CheckpointStored {
+            source: Generation(1),
+            resume: Generation(2),
+        });
+        ledger.apply(Event::OwnedGroupStopped {
+            generation: Generation(1),
+        });
+        crate::residency::store(&path, &ledger).unwrap();
+        let ids = task_ids(&spec, "host-a");
+        let alive = ids.iter().map(|id| session(id, true)).collect::<Vec<_>>();
+        let runner = FailingKillRunner {
+            killed: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut report = UpReport::default();
+        let mut debounce = crate::run::LivenessDebounce::new(Duration::from_secs(10));
+        let observed_alive_at = Instant::now();
+        debounce.observe(&alive, observed_alive_at);
+
+        before_reconcile(
+            catalog.path(),
+            "host-a",
+            std::slice::from_mut(&mut spec),
+            &[],
+            &debounce,
+            observed_alive_at,
+            &runner,
+            HostPolicy {
+                idle_after: Duration::ZERO,
+                warm_capacity: 0,
+            },
+            &mut report,
+        );
+
+        let stored = crate::residency::load(&path, &agent_id, "host-a", SessionDriver::Omp)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored.runtime_residency(),
+            RuntimeResidency::Stopping {
+                step: crate::residency::StopStep::VerifyAbsent,
+                ..
+            }
+        ));
+
+        let confirmed_absent_at = observed_alive_at + Duration::from_secs(10);
+        debounce.observe(&[], confirmed_absent_at);
+        before_reconcile(
+            catalog.path(),
+            "host-a",
+            std::slice::from_mut(&mut spec),
+            &[],
+            &debounce,
+            confirmed_absent_at,
+            &runner,
+            HostPolicy {
+                idle_after: Duration::ZERO,
+                warm_capacity: 0,
+            },
+            &mut report,
+        );
+
+        let stored = crate::residency::load(&path, &agent_id, "host-a", SessionDriver::Omp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.runtime_residency(),
+            &RuntimeResidency::Cold {
+                resume: Generation(2)
+            }
+        );
+        assert!(report.errors.is_empty());
     }
 
     #[test]

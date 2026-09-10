@@ -44,6 +44,8 @@ pub struct ServiceSpec {
     /// Optional machine-local pty registry. This is deliberately independent of the synced catalog:
     /// an explicit adoption can use an existing registry without syncing pid/socket state.
     pty_root: Option<PathBuf>,
+    /// Optional host residency policy baked into the supervised `st2 up` command.
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     memory_max_mb: u64,
     /// Ambient `OTEL_*` environment captured at install time and re-serialized into the unit, so
     /// the supervised supervisor reaches the same OTLP endpoint as an interactive `st2 up`.
@@ -57,6 +59,7 @@ impl ServiceSpec {
         host: Option<String>,
         path: impl Into<String>,
         pty_root: Option<PathBuf>,
+        residency_policy: Option<crate::residency_host::HostPolicy>,
         memory_max_mb: u64,
         otel_env: Vec<(String, String)>,
     ) -> Result<Self> {
@@ -76,12 +79,13 @@ impl ServiceSpec {
             host,
             path,
             pty_root,
+            residency_policy,
             memory_max_mb,
             otel_env,
         })
     }
 
-    /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>]`.
+    /// The `ExecStart` argv: `<st2> up --catalog <catalog> [--host <h>] [residency policy]`.
     fn program_arguments(&self) -> Vec<String> {
         let mut args = vec![
             self.exe.display().to_string(),
@@ -92,6 +96,12 @@ impl ServiceSpec {
         if let Some(host) = &self.host {
             args.push("--host".to_string());
             args.push(host.clone());
+        }
+        if let Some(policy) = self.residency_policy {
+            args.push("--residency-idle-after".to_string());
+            args.push(format!("{}ms", policy.idle_after.as_millis()));
+            args.push("--residency-warm-capacity".to_string());
+            args.push(policy.warm_capacity.to_string());
         }
         args
     }
@@ -106,11 +116,12 @@ pub(crate) fn collect_otel_env() -> Vec<(String, String)> {
 }
 
 /// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
-/// [--memory-max-mb N]`.
+/// [--residency-idle-after DURATION --residency-warm-capacity N] [--memory-max-mb N]`.
 pub fn install(
     catalog: &Path,
     host: Option<String>,
     pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
     memory_max_mb: u64,
 ) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
@@ -129,7 +140,16 @@ pub fn install(
                 .with_context(|| format!("pty root {} does not exist", root.display()))
         })
         .transpose()?;
-    let spec = ServiceSpec::new(exe, &catalog, host, path, pty_root, memory_max_mb, collect_otel_env())?;
+    let spec = ServiceSpec::new(
+        exe,
+        &catalog,
+        host,
+        path,
+        pty_root,
+        residency_policy,
+        memory_max_mb,
+        collect_otel_env(),
+    )?;
 
     install_systemd_user(&spec)?;
 
@@ -342,6 +362,8 @@ fn systemd_quote_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -351,6 +373,7 @@ mod tests {
             "/home/user/catalog",
             None,
             "/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin",
+            None,
             None,
             DEFAULT_MEMORY_MAX_MB,
             Vec::new(),
@@ -384,15 +407,20 @@ mod tests {
             Some("hetz".to_string()),
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/legacy-pty")),
+            Some(crate::residency_host::HostPolicy {
+                idle_after: Duration::from_secs(300),
+                warm_capacity: 2,
+            }),
             512,
             Vec::new(),
         )?;
 
         let unit = render_systemd_user_unit(&spec);
 
-        assert!(
-            unit.contains("ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz")
-        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz \
+             --residency-idle-after 300000ms --residency-warm-capacity 2"
+        ));
         assert!(unit.contains("MemoryMax=512M"));
         assert!(unit.contains("Environment=PTY_ROOT=/srv/legacy-pty"));
         Ok(())
@@ -406,6 +434,7 @@ mod tests {
             None,
             "/opt/st2 tools:/usr/bin",
             Some(PathBuf::from("/srv/pty 100%")),
+            None,
             256,
             Vec::new(),
         )?;
@@ -421,13 +450,15 @@ mod tests {
 
     #[test]
     fn zero_memory_max_is_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, 0, Vec::new()).unwrap_err();
+        let err = ServiceSpec::new("/bin/st2", "/cat", None, "/bin", None, None, 0, Vec::new())
+            .unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
     }
 
     #[test]
     fn empty_path_and_relative_pty_root_are_rejected() {
-        let err = ServiceSpec::new("/bin/st2", "/cat", None, "", None, 1, Vec::new()).unwrap_err();
+        let err =
+            ServiceSpec::new("/bin/st2", "/cat", None, "", None, None, 1, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("PATH cannot be empty"));
 
         let err = ServiceSpec::new(
@@ -436,6 +467,7 @@ mod tests {
             None,
             "/bin",
             Some(PathBuf::from("relative")),
+            None,
             1,
             Vec::new(),
         )
@@ -451,6 +483,7 @@ mod tests {
             None,
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/pty")),
+            None,
             DEFAULT_MEMORY_MAX_MB,
             vec![
                 (
@@ -489,6 +522,7 @@ mod tests {
             "/srv/catalog",
             None,
             "/usr/local/bin:/usr/bin",
+            None,
             None,
             DEFAULT_MEMORY_MAX_MB,
             Vec::new(),

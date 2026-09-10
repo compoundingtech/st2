@@ -1547,7 +1547,7 @@ impl LivenessDebounce {
 
     /// Record which ids are alive as of `now`, and forget ids not seen alive within the grace (bounds
     /// memory; a long-dead id past the grace is no longer debounced anyway).
-    fn observe(&mut self, sessions: &[Session], now: Instant) {
+    pub(crate) fn observe(&mut self, sessions: &[Session], now: Instant) {
         for s in sessions {
             if s.alive {
                 self.last_alive.insert(s.pty_id.clone(), now);
@@ -1558,7 +1558,7 @@ impl LivenessDebounce {
     }
 
     /// True if `id` was seen alive within the grace ending at `now` — a recent flicker, defer it.
-    fn recently_alive(&self, id: &str, now: Instant) -> bool {
+    pub(crate) fn recently_alive(&self, id: &str, now: Instant) -> bool {
         self.last_alive
             .get(id)
             .is_some_and(|&t| now.duration_since(t) < self.grace)
@@ -1878,6 +1878,8 @@ fn reconcile_pass_with_residency(
             this_host,
             &mut eligible_specs,
             &sessions,
+            debounce,
+            now,
             runner,
             policy,
             &mut report,
