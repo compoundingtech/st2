@@ -4,10 +4,11 @@
 //! allocates a terminal, an agent harness) and `exec{}` (a plain process — the ding, daemons, a
 //! stage's script; must NOT allocate a terminal, R09). st2 reads only the runner-normative subset:
 //! `identity`, presentation (`name`, `description`), `host`, `role` (metadata only), `type`,
-//! `workspace`, whole-agent desired state (plus legacy `retired`), `keep`, `supervisor`,
-//! `restart{}`, `deliver`, `session-driver`, typed harness drivers, task lifecycle, Resource
-//! bindings (declaration metadata), and the tasks. Everything else that is render-only (`harness`,
-//! `model`, `persona`, `permissions`, legacy `transport` metadata, `strategy`, `meta{}`) is baked
+//! `workspace`, whole-agent desired state (plus legacy `retired`), residency policy, `keep`,
+//! `supervisor`, `restart{}`, `deliver`, `session-driver`, typed harness drivers, task lifecycle,
+//! Resource bindings (declaration metadata), and the tasks. Everything else that is
+//! render-only (`harness`, `model`, `persona`, `permissions`, legacy `transport` metadata,
+//! `strategy`, `meta{}`) is baked
 //! into the tasks/commands by the render layer and ignored here.
 //!
 //! Three on-disk formats lower to this model: KDL (canonical, parsed by hand in `kdl_format`), and
@@ -48,6 +49,34 @@ pub enum AgentDesiredState {
     Retired {
         reason: Option<String>,
     },
+}
+
+/// Whether a desired-running agent must remain resident or may become cold until demand arrives.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResidencyPolicy {
+    #[default]
+    Always,
+    OnDemand,
+}
+
+impl ResidencyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnDemand => "on-demand",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "always" => Ok(Self::Always),
+            "on-demand" => Ok(Self::OnDemand),
+            _ => anyhow::bail!(
+                "unsupported `residency-policy` value '{value}' (expected `always` or `on-demand`)"
+            ),
+        }
+    }
 }
 
 /// One provider-native message delivery transport declared by an agent.
@@ -347,6 +376,8 @@ pub struct AgentSpec {
     pub supervisor: Option<String>,
     /// Whole-agent lifecycle intent. Non-running states are reconciled absent.
     pub desired_state: AgentDesiredState,
+    /// Residency eligibility while desired state is running. Host policy decides when to use it.
+    pub residency_policy: ResidencyPolicy,
     /// Agent-level GC pin: `true` exempts all of its tasks from garbage collection.
     pub keep: bool,
     /// Crash/restart policy (§4). `None` → the runner's default policy.
@@ -717,6 +748,8 @@ pub(crate) struct RawSpec {
     pub desired_state: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_explicit_optional")]
     pub desired_state_reason: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_explicit_optional")]
+    pub residency_policy: Option<Option<String>>,
     #[serde(default)]
     pub keep: bool,
     pub restart: Option<RawRestart>,
@@ -1264,6 +1297,7 @@ impl RawSpec {
             || self.retired.is_some()
             || self.desired_state.is_some()
             || self.desired_state_reason.is_some()
+            || self.residency_policy.is_some()
             || self.command.is_some()
             || self.argv.is_some()
             || self.ding
@@ -1312,6 +1346,11 @@ impl RawSpec {
             desired_state_value.as_deref(),
             desired_state_reason,
         )?;
+        let residency_policy = reject_explicit_null("residency_policy", self.residency_policy)?
+            .as_deref()
+            .map(ResidencyPolicy::parse)
+            .transpose()?
+            .unwrap_or_default();
         let deliver = reject_explicit_null("deliver", self.deliver)?;
         let delivery = deliver
             .as_deref()
@@ -1341,6 +1380,10 @@ impl RawSpec {
         );
         let effective_session_driver =
             session_driver.or_else(|| driver.as_ref().map(Driver::session_driver));
+        anyhow::ensure!(
+            residency_policy != ResidencyPolicy::OnDemand || effective_session_driver.is_some(),
+            "agent '{identity}' on-demand residency requires a native session driver"
+        );
         if let (Some(delivery), Some(effective)) = (delivery, effective_session_driver) {
             anyhow::ensure!(
                 delivery.session_driver() == effective,
@@ -1511,6 +1554,7 @@ impl RawSpec {
             workspace: self.workspace,
             supervisor: self.supervisor,
             desired_state,
+            residency_policy,
             keep: self.keep,
             restart: self.restart.map(RawRestart::lower),
             delivery,

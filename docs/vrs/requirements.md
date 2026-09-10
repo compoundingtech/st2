@@ -65,6 +65,31 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R44 Declared residency policy:** An Agent Spec declares `residency-policy`
+  as `always` or `on-demand`; omission means `always`. The field controls only
+  whether a desired-running agent is eligible to become cold. It never changes
+  desired state, and suspended or retired agents remain owned by ordinary
+  desired-state reconciliation. `on-demand` requires a declared native session
+  driver. Host policy owns idle thresholds and warm capacity. Inventory exposes
+  declaration policy and runtime residency as separate inputs to the effective
+  decision.
+- **R45 Lossless on-demand transition:** An on-demand transition preserves the
+  exact provider-native session. st2 checkpoints that native binding, stops the
+  complete owned task group, verifies absence, resumes the saved binding,
+  verifies that exact resumed session, and only then delivers demand. Unsupported,
+  mismatched, malformed, or indeterminate evidence refuses the transition; st2
+  never substitutes a fresh session. Runtime residency is one closed axis:
+  `active`, `quiescing`, `stopping`, `cold`, `starting`, or `refused`, distinct
+  from desired state, process observation, harness state, and delivery evidence.
+  Its host-local ledger is durable, generation-fenced, atomically replaced, and
+  restored fail-closed.
+- **R46 Durable wake demand:** The initial authoritative wake sources are a
+  durable inbox message and an explicit operator wake or attach request.
+  Passive CPU, PTY attachment state, filesystem access, and Resource observation
+  do not wake a cold agent. Once checkpointing starts, racing demand remains
+  durable while st2 completes stop, verified absence, exact native resume, and
+  readiness; no cancellation path is required. st2 measures resume-to-ready and
+  demand-to-delivery latency before assigning a latency objective.
 - **R40 Prompt catalog convergence:** A resident catalog supervisor begins a
   new serialized reconciliation pass promptly after a supported declaration
   publication becomes durably visible; it does not normally wait for the

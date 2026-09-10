@@ -529,6 +529,31 @@ st2 source: [`AgentDesiredState`](../../../crates/agent-spec/src/spec.rs),
 [authoring](../../../tests/agent_desired_state.rs), and
 [planning](../../../tests/reconcile.rs).
 
+### F21 Agent `residency-policy`
+
+`residency-policy` is one positional string: `always` or `on-demand`. Omission
+means `always`, and explicit `always` is semantically equal to omission.
+Duplicate nodes, annotations, properties, children, non-string values, and
+unknown values are invalid. TOML and JSON use `residency_policy`; explicit null
+is invalid.
+
+`on-demand` requires a native session driver, either through `session-driver`
+or a typed driver block. The field grants residency eligibility only while
+`desired-state` is running. It does not change desired state, task lifecycle,
+restart policy, delivery ownership, or provider state. Suspended and retired
+declarations continue to use F18 exclusively.
+
+Changing this field is a semantic catalog change. `st2 tasks --json` exposes
+the declared policy separately from the nullable host-local runtime-residency
+record. Host policy owns timing and warm capacity; neither belongs in the Agent
+Spec.
+
+st2 source: [`ResidencyPolicy`](../../../crates/agent-spec/src/spec.rs),
+[KDL lowering](../../../crates/agent-spec/src/kdl_format.rs), and
+[`residency`](../../../src/residency.rs). Evidence:
+[parser](../../../crates/agent-spec/tests/discovery.rs) and
+[inventory](../../../src/task_inventory.rs).
+
 ### F17 Agent `name` and `description`
 
 Update observable declaration and runtime presentation metadata only. Neither
