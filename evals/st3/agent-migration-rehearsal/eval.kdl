@@ -1,15 +1,14 @@
 version 2
 
-host "local" {
-  document "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665"
-}
-
 mission "eval/agent-migration-rehearsal" state="ready" timeout="20m" {
   completion { when "all-steps-exhausted" }
   goal "Start one isolated agent with the normal st3 boot contract and complete one assigned mission."
 
   agent "pilot" {
     workspace "${ST_WORKSPACE}/agent"
+    render {
+      copy "doc/hosts/migration-rehearsal@7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665" ".st3/host/migration-rehearsal.md"
+    }
     harness "codex" {
       model "gpt-5.6-sol"
       effort "medium"
@@ -40,8 +39,8 @@ mission "eval/agent-migration-rehearsal" state="ready" timeout="20m" {
       workspace "${ST_WORKSPACE}/agent"
       time-limit "1m"
     }
-    gate "the runtime rendered and linked the exact host document" {
-      exec "test -s .st3/host/migration-rehearsal.md && grep -Fq '.st3/host/migration-rehearsal.md' .st3/boot.md"
+    gate "the runtime rendered the exact migration document" {
+      exec "test -s .st3/host/migration-rehearsal.md && printf '7a0773a714975b4563b15638cc5b5b6608849dc6c5b1ea07e2632b0edc6a8665  .st3/host/migration-rehearsal.md\\n' | sha256sum --check --status"
       host "local"
       workspace "${ST_WORKSPACE}/agent"
       time-limit "1m"

@@ -1559,7 +1559,7 @@ async fn follow_mission_run(
             prior = summary;
         }
         match run.status.as_str() {
-            "completed" => {
+            status if mission_run_follow_succeeded(status) => {
                 return if json_output {
                     print_value(&run, true)
                 } else {
@@ -1579,6 +1579,10 @@ async fn follow_mission_run(
             ))
             .await?;
     }
+}
+
+fn mission_run_follow_succeeded(status: &str) -> bool {
+    matches!(status, "completed" | "standing")
 }
 
 fn mission_run_signature(run: &MissionRunView) -> Result<String> {
@@ -7101,6 +7105,14 @@ mod tests {
         assert!(should_notify_work_message(&parent, &work));
         assert!(!should_notify_work_message(&inherited, &work));
         assert!(should_notify_work_message(&reassigned, &work));
+    }
+
+    #[test]
+    fn mission_follow_stops_for_completed_and_standing_runs() {
+        assert!(mission_run_follow_succeeded("completed"));
+        assert!(mission_run_follow_succeeded("standing"));
+        assert!(!mission_run_follow_succeeded("running"));
+        assert!(!mission_run_follow_succeeded("failed"));
     }
 
     #[test]

@@ -2901,7 +2901,7 @@ async fn start_eval(
     let kdl = fs::read_to_string(&eval_file)
         .map_err(|error| ApiError::internal(format!("read {}: {error}", eval_file.display())))?;
     let kdl = kdl.replace("${EVAL_ROOT}", &workspace.to_string_lossy());
-    let intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
+    let mut intent = parse_intent(&kdl, &state.node).map_err(ApiError::bad)?;
     let ready = intent
         .missions
         .values()
@@ -2938,6 +2938,16 @@ async fn start_eval(
     }
     let entry_id = entry.id.clone();
     let entry_revision = entry.revision.clone();
+    let idempotency_key = format!("eval:{}:{}:{nonce}", request.name, request.bundle_hash);
+    let owner_run = state
+        .store
+        .mission_run_subject_for_idempotency_key(&idempotency_key);
+    scope_eval_desired_subjects(
+        &mut intent,
+        &state.store.desired_subjects().map_err(ApiError::internal)?,
+        &owner_run,
+    )
+    .map_err(ApiError::bad)?;
     stage_eval_documents(&state, &workspace, &intent).map_err(ApiError::bad)?;
     let mission = state
         .store
@@ -2963,18 +2973,24 @@ async fn start_eval(
             &format!("eval:{}:{}", request.name, request.bundle_hash),
         )
         .map_err(ApiError::bad)?;
-    let run = state
-        .store
-        .create_mission_run(&MissionRunRequest {
-            mission: entry_id,
-            revision: Some(entry_revision),
-            workspace: workspace.to_string_lossy().into_owned(),
-            requester: Some("person/eval-requester".into()),
-            mode: Some("eval".into()),
-            inputs: request.inputs,
-            idempotency_key: format!("eval:{}:{}:{nonce}", request.name, request.bundle_hash),
-        })
-        .map_err(ApiError::bad)?;
+    let run = match state.store.create_mission_run(&MissionRunRequest {
+        mission: entry_id,
+        revision: Some(entry_revision),
+        workspace: workspace.to_string_lossy().into_owned(),
+        requester: Some("person/eval-requester".into()),
+        mode: Some("eval".into()),
+        inputs: request.inputs,
+        idempotency_key,
+    }) {
+        Ok(run) => run,
+        Err(error) => {
+            state
+                .store
+                .discard_desired_owned_by(&owner_run)
+                .map_err(ApiError::internal)?;
+            return Err(ApiError::bad(error));
+        }
+    };
     signal_changed(&state);
     Ok(Json(EvalStartResponse {
         event_cursor: applied
@@ -2982,6 +2998,38 @@ async fn start_eval(
             .max(state.store.index().map_err(ApiError::internal)?),
         mission_run: run.subject,
     }))
+}
+
+fn scope_eval_desired_subjects(
+    intent: &mut crate::model::NormalizedIntent,
+    current: &[crate::model::DesiredSubject],
+    owner_run: &str,
+) -> Result<(), St3Error> {
+    let selected = current
+        .iter()
+        .map(|subject| (subject.subject.as_str(), subject))
+        .collect::<BTreeMap<_, _>>();
+    let mut shared = Vec::new();
+    for (subject, desired) in &mut intent.subjects {
+        let Some(current) = selected.get(subject.as_str()) else {
+            desired.owner_run = Some(owner_run.to_owned());
+            continue;
+        };
+        if *current == desired {
+            shared.push(subject.clone());
+            continue;
+        }
+        return Err(St3Error::new(
+            "eval-desired-conflict",
+            format!(
+                "eval declaration `{subject}` conflicts with the selected desired state; use a run-owned declaration or an isolated daemon"
+            ),
+        ));
+    }
+    for subject in shared {
+        intent.subjects.remove(&subject);
+    }
+    Ok(())
 }
 
 async fn get_eval(
@@ -6037,6 +6085,155 @@ mission "eval/deadline" state="ready"{timeout} {{
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
             assert_eq!(body["code"], code, "{body}");
         }
+    }
+
+    #[test]
+    fn eval_fixtures_are_owned_without_replacing_selected_desired_state() {
+        let current = parse_intent(
+            r#"version 2
+host "node" { document "doc/hosts/production@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+"#,
+            "node",
+        )
+        .unwrap()
+        .subjects
+        .into_values()
+        .collect::<Vec<_>>();
+        let mut conflicting = parse_intent(
+            r#"version 2
+host "local" { document "doc/hosts/eval@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+"#,
+            "node",
+        )
+        .unwrap();
+
+        let error = scope_eval_desired_subjects(&mut conflicting, &current, "mission-run/eval-run")
+            .unwrap_err();
+        assert_eq!(error.code, "eval-desired-conflict");
+        assert_eq!(current[0].subject, "host/node");
+        assert_eq!(
+            current[0].desired["children"][0]["arguments"][0],
+            "doc/hosts/production@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let mut fixture = parse_intent(
+            r#"version 2
+resource "eval/fixture" { kind "filesystem.file" }
+"#,
+            "node",
+        )
+        .unwrap();
+        scope_eval_desired_subjects(&mut fixture, &current, "mission-run/eval-run").unwrap();
+        assert_eq!(
+            fixture.subjects["resource/eval/fixture"]
+                .owner_run
+                .as_deref(),
+            Some("mission-run/eval-run")
+        );
+    }
+
+    #[test]
+    fn eval_reuses_an_identical_selected_declaration_without_owning_it() {
+        let mut intent = parse_intent(
+            r#"version 2
+resource "shared" { kind "filesystem.file" }
+"#,
+            "node",
+        )
+        .unwrap();
+        let current = intent.subjects.values().cloned().collect::<Vec<_>>();
+
+        scope_eval_desired_subjects(&mut intent, &current, "mission-run/eval-run").unwrap();
+
+        assert!(intent.subjects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_eval_cannot_replace_selected_host_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let production = state
+            .store
+            .put_document(
+                "doc/hosts/node",
+                b"Production host facts.\n",
+                &None,
+                "production-host",
+            )
+            .unwrap();
+        let source = format!(
+            "version 2\nhost \"node\" {{ document \"doc/hosts/node@{}\" }}\n",
+            production.hash
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "publish-production-host")
+            .unwrap();
+
+        let eval_dir = tempfile::tempdir().unwrap();
+        let eval_host = b"Eval host facts.\n";
+        let eval_hash = hex::encode(Sha256::digest(eval_host));
+        fs::create_dir_all(eval_dir.path().join(".st3-documents")).unwrap();
+        fs::write(
+            eval_dir.path().join(".st3-documents").join(&eval_hash),
+            eval_host,
+        )
+        .unwrap();
+        fs::write(
+            eval_dir.path().join("eval.kdl"),
+            format!(
+                r#"version 2
+host "local" {{ document "doc/hosts/eval@{eval_hash}" }}
+mission "eval/host-conflict" state="ready" timeout="1m" {{
+  goal "Do not replace production host metadata."
+  completion {{ when "all-steps-exhausted" }}
+  step "done" {{ agentless }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let bundle = crate::archive::archive_eval(eval_dir.path()).unwrap();
+        let bundle_hash = hex::encode(Sha256::digest(&bundle));
+        let app = router(state.clone());
+
+        let (status, body) = json_request(
+            app,
+            "/v1/evals",
+            serde_json::to_value(EvalStartRequest {
+                name: "host-conflict".into(),
+                bundle_hash,
+                bundle,
+                inputs: BTreeMap::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "eval-desired-conflict");
+        let selected = state
+            .store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|desired| desired.subject == "host/node")
+            .unwrap();
+        assert_eq!(
+            selected.desired["children"][0]["arguments"][0],
+            format!("doc/hosts/node@{}", production.hash)
+        );
     }
 
     #[tokio::test]

@@ -287,7 +287,7 @@ fn automatic_intake_pins_its_review_mission() {
 }
 
 #[test]
-fn migration_rehearsal_uses_an_exact_host_document_and_no_custom_prompt() {
+fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3/agent-migration-rehearsal/eval.kdl");

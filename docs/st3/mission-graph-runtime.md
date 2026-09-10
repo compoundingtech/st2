@@ -1035,6 +1035,8 @@ Evidence is a list of claim IDs or immutable graph references that support a res
 
 `st3 eval DIRECTORY` archives the explicit directory, posts staged documents, applies its version 2 intent, and starts the selected eval mission.
 
+New top-level eval fixtures belong to the eval run and leave the selected graph during cleanup. An eval can reuse an identical selected declaration. It cannot replace a different selected declaration, such as production host metadata.
+
 The planning-mode eval uses one real Codex planner. A controller waits on the event stream and directly approves the first valid candidate. Mechanical gates prove that the mission was hidden before approval, the preview graph and diff were rendered, the exact hash was approved, one ready mission was published, no run started, immutable documents were linked, the planner stopped, and the workspace did not change.
 
 The planning variant and stale-generation paths are deterministic API tests. They do not spend a model run.

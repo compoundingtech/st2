@@ -800,6 +800,15 @@ impl Store {
         self.create_mission_run_inner(request, None)
     }
 
+    pub fn mission_run_subject_for_idempotency_key(&self, idempotency_key: &str) -> String {
+        format!(
+            "mission-run/{}",
+            &hex::encode(Sha256::digest(
+                format!("{}:{idempotency_key}", self.origin).as_bytes()
+            ))[..32]
+        )
+    }
+
     pub fn create_child_mission_run(
         &self,
         request: &MissionRunRequest,
@@ -879,9 +888,9 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         let inputs = resolve_mission_run_inputs(&transaction, &mission, &request.inputs)?;
         enforce_mission_run_capacity(&transaction, &mission)?;
-        let run_id = hex::encode(Sha256::digest(
-            format!("{}:{}", self.origin, request.idempotency_key).as_bytes(),
-        ))[..32]
+        let run_id = self
+            .mission_run_subject_for_idempotency_key(&request.idempotency_key)
+            .trim_start_matches("mission-run/")
             .to_owned();
         let subject = format!("mission-run/{run_id}");
         let generation_id = hex::encode(Sha256::digest(
@@ -4352,6 +4361,13 @@ impl Store {
         };
         transaction.commit()?;
         Ok(residue)
+    }
+
+    pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection
+            .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
+            .map_err(Into::into)
     }
 
     pub fn eval_runtime_records(&self, run: &str) -> Result<Vec<(String, bool)>> {

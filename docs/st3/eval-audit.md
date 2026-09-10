@@ -6,7 +6,7 @@ This table records the purpose and the prompt boundary for every st3 eval.
 
 | Eval | Audit result |
 | --- | --- |
-| `agent-migration-rehearsal` | Keep. It proves the generated boot file, exact rendered host facts, assigned work, and cleanup. |
+| `agent-migration-rehearsal` | Keep. It proves the generated boot file, an exact rendered migration document, assigned work, and cleanup. |
 | `automatic-github-intake` | Keep. It proves that one durable resource event starts one isolated, pinned review mission. |
 | `claude-skill-inheritance` | Keep. It proves native Claude skill inheritance without an authored runtime prompt. |
 | `constraint-inheritance` | Keep. It proves that mission constraints reach nested steps. |
