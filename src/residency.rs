@@ -13,7 +13,6 @@ use sha2::{Digest as _, Sha256};
 
 pub const LEDGER_SCHEMA: &str = "st2.residency-ledger.v1";
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation(pub u64);
 
@@ -178,6 +177,11 @@ impl Ledger {
         }
         if self.generation.0 == 0 {
             return Err(ValidationError::Invalid("generation must be positive"));
+        }
+        if matches!(self.runtime_residency, RuntimeResidency::Cold { .. }) && self.wake_pending {
+            return Err(ValidationError::Invalid(
+                "cold residency cannot have pending wake demand",
+            ));
         }
 
         match self.runtime_residency {
@@ -881,6 +885,24 @@ mod tests {
         assert!(matches!(
             load(&path, "another-agent", "host-a", SessionDriver::Codex),
             Err(LoadError::Invalid(ValidationError::OwnershipMismatch))
+        ));
+    }
+
+    #[test]
+    fn cold_with_pending_wake_fails_closed_on_load() {
+        let mut ledger = active();
+        make_cold(&mut ledger);
+        ledger.wake_pending = true;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ledger.json");
+        fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        assert!(matches!(
+            load(&path, "agent-1", "host-a", SessionDriver::Codex),
+            Err(LoadError::Invalid(ValidationError::Invalid(
+                "cold residency cannot have pending wake demand"
+            )))
         ));
     }
 

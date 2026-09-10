@@ -410,6 +410,15 @@ struct DesiredTask {
     runtime_residency: Option<crate::residency::InventoryProjection>,
 }
 
+/// Validated residency authority retained across the runtime and park observations.
+#[derive(Debug)]
+struct ResidencySnapshot {
+    path: PathBuf,
+    agent_id: String,
+    driver: crate::SessionDriver,
+    ledger: Option<crate::residency::Ledger>,
+}
+
 /// Whether two deterministic discovery passes describe the same semantic catalog.
 ///
 /// This detects observed declaration drift without claiming writer serialization.
@@ -436,6 +445,7 @@ pub fn inventory(
         .collect::<Vec<_>>();
     let mut desired = Vec::new();
     let mut runtime_owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut residency_snapshots: Vec<ResidencySnapshot> = Vec::new();
     let mut compiled_specs = found.specs.clone();
     let compilation = crate::reconcile::TaskCompileContext::current(catalog.to_path_buf())
         .and_then(|context| {
@@ -454,9 +464,27 @@ pub fn inventory(
         let agent_id = spec.effective_id(host);
         let runtime_residency = spec.effective_session_driver().and_then(|driver| {
             let path = crate::residency::ledger_path(catalog, host, &agent_id);
+            if let Some(snapshot) = residency_snapshots.iter().find(|snapshot| {
+                snapshot.path == path && snapshot.agent_id == agent_id && snapshot.driver == driver
+            }) {
+                return snapshot
+                    .ledger
+                    .as_ref()
+                    .map(crate::residency::Ledger::inventory_projection);
+            }
             match crate::residency::load(&path, &agent_id, host, driver) {
-                Ok(Some(ledger)) => Some(ledger.inventory_projection()),
-                Ok(None) => None,
+                Ok(ledger) => {
+                    let projection = ledger
+                        .as_ref()
+                        .map(crate::residency::Ledger::inventory_projection);
+                    residency_snapshots.push(ResidencySnapshot {
+                        path,
+                        agent_id: agent_id.clone(),
+                        driver,
+                        ledger,
+                    });
+                    projection
+                }
                 Err(error) => {
                     push_error(
                         &mut errors,
@@ -577,6 +605,27 @@ pub fn inventory(
             &mut errors,
             "park projection reported an incomplete batch".into(),
         );
+    }
+
+    // Rows are trustworthy only when their residency and runtime evidence share one observation era.
+    for snapshot in &residency_snapshots {
+        match crate::residency::load(&snapshot.path, &snapshot.agent_id, host, snapshot.driver) {
+            Ok(ledger) if ledger == snapshot.ledger => {}
+            Ok(_) => push_error(
+                &mut errors,
+                format!(
+                    "agent {:?} residency ledger changed during task observation",
+                    snapshot.agent_id
+                ),
+            ),
+            Err(error) => push_error(
+                &mut errors,
+                format!(
+                    "agent {:?} residency ledger could not be reread after task observation: {error}",
+                    snapshot.agent_id
+                ),
+            ),
+        }
     }
 
     desired.sort_by(|a, b| {
@@ -729,6 +778,26 @@ mod tests {
     impl RuntimeObserver for FixedObserver {
         fn observe(&self, _desired: &[DesiredRuntime]) -> ObservationBatch {
             self.0.clone()
+        }
+    }
+
+    struct WakeDuringObservation {
+        path: PathBuf,
+        ledger: crate::residency::Ledger,
+        batch: ObservationBatch,
+    }
+
+    impl RuntimeObserver for WakeDuringObservation {
+        fn observe(&self, _desired: &[DesiredRuntime]) -> ObservationBatch {
+            let mut ledger = self.ledger.clone();
+            assert_eq!(
+                ledger
+                    .apply(crate::residency::Event::WakeDemandObserved)
+                    .outcome,
+                crate::residency::Outcome::Applied
+            );
+            crate::residency::store(&self.path, &ledger).unwrap();
+            self.batch.clone()
         }
     }
 
@@ -970,6 +1039,66 @@ mod tests {
                 .contains("residency ledger")
         );
         assert!(invalid["tasks"][0]["runtimeResidency"].is_null());
+    }
+
+    #[test]
+    fn residency_change_during_runtime_observation_makes_inventory_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent(
+            tmp.path(),
+            "h",
+            "worker",
+            r#"
+              residency-policy "on-demand"
+              session-driver "codex"
+              pty "agent" { id "h.worker"; argv "agent-bin" }
+            "#,
+        );
+        let path = crate::residency::ledger_path(tmp.path(), "h", "h.worker");
+        let mut ledger = crate::residency::Ledger::active(
+            "h.worker",
+            "h",
+            crate::SessionDriver::Codex,
+            crate::residency::Generation(1),
+        )
+        .unwrap();
+        ledger.apply(crate::residency::Event::IdleConfirmed {
+            generation: crate::residency::Generation(1),
+        });
+        ledger.apply(crate::residency::Event::CheckpointStored {
+            source: crate::residency::Generation(1),
+            resume: crate::residency::Generation(2),
+        });
+        ledger.apply(crate::residency::Event::OwnedGroupStopped {
+            generation: crate::residency::Generation(1),
+        });
+        ledger.apply(crate::residency::Event::AbsenceVerified {
+            generation: crate::residency::Generation(1),
+        });
+        crate::residency::store(&path, &ledger).unwrap();
+
+        let found = crate::discover(tmp.path());
+        let observer = WakeDuringObservation {
+            path,
+            ledger,
+            batch: ObservationBatch {
+                complete: true,
+                observations: vec![running("h.worker", 11)],
+                errors: vec![],
+            },
+        };
+        let value: serde_json::Value = serde_json::from_str(
+            &inventory(tmp.path(), "h", &found, &observer, &crate::park::NoParks).to_json(),
+        )
+        .unwrap();
+
+        assert_eq!(value["complete"], false);
+        assert!(value["errors"].as_array().unwrap().iter().any(|error| {
+            error.as_str()
+                == Some("agent \"h.worker\" residency ledger changed during task observation")
+        }));
+        assert_eq!(value["tasks"][0]["runtimeResidency"]["state"], "cold");
+        assert_eq!(value["tasks"][0]["runtime"]["state"], "running");
     }
 
     /// The whole operational complaint in #204: a parked task reported `desiredState: running`,
