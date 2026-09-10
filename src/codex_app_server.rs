@@ -991,7 +991,8 @@ impl CodexInboxDelivery {
             .entries()
             .iter()
             .filter(|entry| {
-                entry.binding == state.thread_id() && entry.phase < delivery_ledger::Phase::Consumed
+                entry.binding == state.thread_id()
+                    && entry.phase < delivery_ledger::Phase::Consumed
             })
             .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
             .collect();
@@ -1480,7 +1481,14 @@ pub fn run_controlled(
     runtime_id: String,
     codex_argv: Vec<String>,
 ) -> Result<()> {
-    run_controlled_with_required_resume(catalog_root, identity, runtime_id, codex_argv, None, None)
+    run_controlled_with_required_resume(
+        catalog_root,
+        identity,
+        runtime_id,
+        codex_argv,
+        None,
+        None,
+    )
 }
 
 /// Run one host-owned cold-residency attempt under its exact incarnation.
@@ -2606,7 +2614,8 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
+        let delivery_ledger_path =
+            control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
@@ -3035,8 +3044,11 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
     // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
     // claim for the next runtime to trip over.
-    match crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)
-    {
+    match crate::flock::FileLock::hold(
+        file,
+        crate::flock::Mode::Exclusive,
+        crate::flock::Wait::Now,
+    ) {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(anyhow::anyhow!(
             "Codex runtime already has an owner at {}",

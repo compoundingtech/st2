@@ -1268,7 +1268,8 @@ fn evidence_loss_marks_the_stream_discontinuous_for_a_restated_state() {
 
 #[test]
 fn delivery_client_id_is_stable_and_binds_every_identity_component() {
-    let id = stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
+    let id =
+        stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md");
     assert_eq!(
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-abc123.md")
@@ -1293,7 +1294,8 @@ fn review_compaction_and_dnd_hold_the_unread_fifo_head() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+            .unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [CodexHoldReason::Review, CodexHoldReason::Compaction] {
         let state = subscribed_state(CodexObservedState::Held {
@@ -1603,14 +1605,12 @@ fn a_rejected_exact_steer_has_no_fallback_and_remains_retryable_after_state_chan
             )
             .unwrap()
     );
-    assert!(
-        delivery
-            .accept_response(
-                &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
-                active.observed(),
-            )
-            .unwrap()
-    );
+    assert!(delivery
+        .accept_response(
+            &json!({ "id": request_id, "error": { "code": -32600, "message": "stale turn" } }),
+            active.observed(),
+        )
+        .unwrap());
     assert_eq!(delivery.maybe_request(&active).unwrap(), None);
     assert!(config.inbox.join(&filename).is_file());
 
@@ -1828,11 +1828,11 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
     )
     .unwrap();
     let mut attempted = inbox_delivery(absent_tmp.path(), absent_config.clone());
-    let absent_client_id =
-        attempted.maybe_request(&idle).unwrap().unwrap()["params"]["clientUserMessageId"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    let absent_client_id = attempted.maybe_request(&idle).unwrap().unwrap()
+        ["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     drop(attempted);
 
     let mut replacement = inbox_delivery(absent_tmp.path(), absent_config);
@@ -1851,13 +1851,18 @@ fn an_ambiguous_attempt_reconciles_resume_history_before_retry() {
         )
         .unwrap();
     assert_eq!(
-        replacement.ledger.entry(&absent_filename).unwrap().negative,
+        replacement
+            .ledger
+            .entry(&absent_filename)
+            .unwrap()
+            .negative,
         Some(delivery_ledger::NegativeReceipt::Absent),
         "the absence is retained as evidence, not erased"
     );
     let retry = replacement.maybe_request(&idle).unwrap().unwrap();
     assert_eq!(retry["params"]["clientUserMessageId"], absent_client_id);
 }
+
 
 #[test]
 fn subscribed_control_pump_delivers_a_typed_reference_to_the_real_fifo_head() {
@@ -2031,7 +2036,8 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
         // pump's read of the frame just written. Bounded, so a pump that stopped handing
         // frames to the producer fails this test instead of hanging it.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while harness_context::read(&harness_context::harness_context_path(&agent_dir)).is_none()
+        while harness_context::read(&harness_context::harness_context_path(&agent_dir))
+            .is_none()
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
@@ -2068,13 +2074,14 @@ fn the_control_pump_publishes_a_context_reading_from_a_live_token_usage_notifica
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
 
-    let observed =
-        context_record(&tmp.path().join("agents/h/worker")).expect("the pump published nothing");
+    let observed = context_record(&tmp.path().join("agents/h/worker"))
+        .expect("the pump published nothing");
     assert_eq!(observed.harness, harness_context::Harness::Codex);
     assert_eq!(observed.used_tokens, Some(92_283));
     assert_eq!(observed.window_tokens, Some(258_400));
     assert_eq!(observed.used_percent, Some(33.0));
 }
+
 
 #[test]
 fn control_initializes_before_recording_the_first_thread_only() {
@@ -2177,9 +2184,10 @@ fn control_initializes_before_recording_the_first_thread_only() {
         .unwrap()
         .unwrap();
     assert_eq!(binding.thread_id(), "thread-main");
-    let state = load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
-        .unwrap()
-        .unwrap();
+    let state =
+        load_current_control_state(&state.join("control-state.json"), &runtime, &binding)
+            .unwrap()
+            .unwrap();
     assert_eq!(
         state.observed(),
         &CodexObservedState::Active {
@@ -2625,7 +2633,8 @@ fn missing_saved_rollout_fails_without_rebinding_the_incarnation() {
     let _ = shutdown.shutdown(Shutdown::Both);
     pump.join().unwrap();
     assert_eq!(
-        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap()).unwrap(),
+        serde_json::from_slice::<CodexThreadBinding>(&fs::read(&binding_path).unwrap())
+            .unwrap(),
         prior_binding
     );
     assert!(!control_state_path.exists());
@@ -3158,7 +3167,8 @@ fn exiting_review_mode_mid_turn_restores_the_steerable_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+            .unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
 
     let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
@@ -3608,7 +3618,8 @@ fn persisted_control_state_is_bound_to_the_exact_runtime_incarnation() {
 
     let replacement = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
     let replacement_binding = CodexThreadBinding::new(&replacement, "thread-main".into());
-    let error = load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
+    let error =
+        load_current_control_state(&path, &replacement, &replacement_binding).unwrap_err();
     assert!(error.to_string().contains("different runtime binding"));
 }
 
@@ -3794,8 +3805,11 @@ fn hook_preflight_uses_the_explicit_controlled_workspace() {
         fs::canonicalize(explicit).unwrap()
     );
     assert!(
-        authored_bypasses_hook_trust(&["--dangerously-bypass-hook-trust".into(), "boot".into()])
-            .unwrap()
+        authored_bypasses_hook_trust(&[
+            "--dangerously-bypass-hook-trust".into(),
+            "boot".into()
+        ])
+        .unwrap()
     );
     assert!(
         !authored_bypasses_hook_trust(&["--".into(), "--dangerously-bypass-hook-trust".into()])
@@ -4065,7 +4079,8 @@ fn a_killed_wrapper_reaps_its_app_server_and_the_next_launch_recovers_its_socket
 
 #[test]
 fn app_server_configuration_extraction_fails_closed_at_ambiguous_boundaries() {
-    let missing = controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
+    let missing =
+        controlled_app_server_args("unix:///server.sock", &["-c".into()]).unwrap_err();
     assert!(missing.to_string().contains("has no value"));
 
     let unknown = controlled_app_server_args(
@@ -4390,7 +4405,8 @@ fn waiting_on_a_human_holds_the_exact_turn_and_releases_it_when_the_flag_clears(
     let tmp = tempfile::tempdir().unwrap();
     let config = delivery_config(tmp.path());
     let filename =
-        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body")
+            .unwrap();
     let mut delivery = inbox_delivery(tmp.path(), config.clone());
     for reason in [
         CodexHoldReason::WaitingOnApproval,
