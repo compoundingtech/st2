@@ -153,9 +153,11 @@ fn bind_omp_channel_session(
 fn confirm_omp_channel_session(
     input: &Receiver<io::Result<String>>,
     state_dir: &Path,
+    agent_dir: &Path,
     identity: &str,
     runtime_id: &str,
     runtime_incarnation: Option<&str>,
+    ownership_seq: u64,
     native_session_id: &str,
     resume_generation: Option<crate::residency::Generation>,
 ) -> Result<()> {
@@ -174,9 +176,11 @@ fn confirm_omp_channel_session(
     );
     crate::omp_session::confirm_channel_binding(
         state_dir,
+        agent_dir,
         identity,
         runtime_id,
         runtime_incarnation,
+        ownership_seq,
         native_session_id,
         resume_generation,
     )?;
@@ -204,6 +208,18 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     let wrapper_session = std::env::var(kind.session_env)
         .ok()
         .filter(|value| !value.is_empty());
+    let wrapper_seq = if kind.harness == harness_context::Harness::Omp {
+        Some(
+            std::env::var(kind.seq_env)
+                .context("OMP channel has no wrapper ownership sequence")?
+                .parse::<u64>()
+                .context("OMP channel wrapper ownership sequence is invalid")?,
+        )
+    } else {
+        std::env::var(kind.seq_env)
+            .ok()
+            .and_then(|seq| seq.parse::<u64>().ok())
+    };
     let context_session = wrapper_session
         .clone()
         .unwrap_or_else(harness_state::session_token);
@@ -239,7 +255,13 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
             resume_generation,
             expected_native_session.as_deref(),
         )?;
-        Some((state_dir, native_session_id, resume_generation))
+        let ownership_seq = wrapper_seq.context("OMP channel has no wrapper ownership sequence")?;
+        Some((
+            state_dir,
+            native_session_id,
+            resume_generation,
+            ownership_seq,
+        ))
     } else {
         None
     };
@@ -254,13 +276,15 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
         }),
     )?;
     stdout.flush()?;
-    if let Some((state_dir, native_session_id, resume_generation)) = omp_binding {
+    if let Some((state_dir, native_session_id, resume_generation, ownership_seq)) = omp_binding {
         confirm_omp_channel_session(
             &input_rx,
             &state_dir,
+            &agent_dir,
             identity,
             &pty_session,
             wrapper_session.as_deref(),
+            ownership_seq,
             &native_session_id,
             resume_generation,
         )?;
@@ -270,10 +294,7 @@ fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()
     if let Some(session) = wrapper_session {
         // Full adopted ownership when the wrapper exported it: the claimed sequence gives the
         // token a direction, so a straggler channel from a superseded session is refused.
-        writer = match std::env::var(kind.seq_env)
-            .ok()
-            .and_then(|seq| seq.parse::<u64>().ok())
-        {
+        writer = match wrapper_seq {
             Some(seq) => writer.with_ownership(session, seq),
             None => writer.with_session(session),
         };
@@ -759,6 +780,9 @@ mod tests {
             r#"{"type":"session","sessionId":"session-exact"}"#.to_string()
         ))
         .unwrap();
+        let agent_dir = temp.path().join("agent");
+        let ownership_seq =
+            harness_state::claim(&agent_dir, "h.worker", "omp", "runtime-next").unwrap();
         let native_session_id = bind_omp_channel_session(
             &rx,
             &state,
@@ -787,9 +811,11 @@ mod tests {
         confirm_omp_channel_session(
             &rx,
             &state,
+            &agent_dir,
             "h.worker",
             "h.worker",
             Some("runtime-next"),
+            ownership_seq,
             &native_session_id,
             Some(crate::residency::Generation(2)),
         )

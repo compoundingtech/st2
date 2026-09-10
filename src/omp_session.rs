@@ -46,6 +46,7 @@ const CHECKPOINT_SCHEMA: &str = "st2.omp-residency-checkpoint.v1";
 const BINDING_FILE: &str = "binding.json";
 const PENDING_BINDING_FILE: &str = "binding.pending.json";
 const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
+const RESUME_FENCE_ENV: [&str; 2] = [CHANNEL_EXPECTED_NATIVE_SESSION, CHANNEL_RESUME_GENERATION];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -169,9 +170,11 @@ pub fn record_channel_binding(
 
 pub fn confirm_channel_binding(
     state_dir: &Path,
+    agent_dir: &Path,
     agent: &str,
     runtime_id: &str,
     runtime_incarnation: &str,
+    ownership_seq: u64,
     native_session_id: &str,
     resume_generation: Option<crate::residency::Generation>,
 ) -> Result<OmpSessionBinding> {
@@ -184,7 +187,15 @@ pub fn confirm_channel_binding(
         "OMP channel readiness belongs to a different native session binding"
     );
     binding.ready = true;
-    crate::residency::atomic_json(&state_dir.join(BINDING_FILE), &binding)?;
+    crate::harness_state::with_current_ownership(
+        agent_dir,
+        runtime_incarnation,
+        ownership_seq,
+        || {
+            crate::residency::atomic_json(&state_dir.join(BINDING_FILE), &binding)?;
+            Ok(())
+        },
+    )?;
     // The candidate is non-authoritative after promotion. Leaving it behind is safer than
     // invalidating a completed handshake because cleanup failed.
     let _ = fs::remove_file(state_dir.join(PENDING_BINDING_FILE));
@@ -381,7 +392,16 @@ pub fn run(
     runtime_id: String,
     omp_argv: Vec<String>,
 ) -> Result<()> {
-    pi_family_session::run_for(catalog_root, identity, runtime_id, omp_argv, &OMP_KIND)
+    pi_family_session::run_for_with_environment(
+        catalog_root,
+        identity,
+        runtime_id,
+        omp_argv,
+        &OMP_KIND,
+        &[],
+        &RESUME_FENCE_ENV,
+        None,
+    )
 }
 
 /// Run one host-owned cold-residency attempt under its exact incarnation.
@@ -444,10 +464,7 @@ fn run_with_required_resume(
         omp_argv,
         &OMP_KIND,
         &residency_env,
-        &[
-            CHANNEL_EXPECTED_NATIVE_SESSION,
-            CHANNEL_RESUME_GENERATION,
-        ],
+        &RESUME_FENCE_ENV,
         Some(required_incarnation),
     )
 }
@@ -518,6 +535,10 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+    }
+
+    fn claim_omp(agent_dir: &Path, incarnation: &str) -> u64 {
+        crate::harness_state::claim(agent_dir, "h.worker", "omp", incarnation).unwrap()
     }
 
     /// Pins the admitted set itself — the intent carried over from the exact-version gate.
@@ -709,6 +730,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ordinary_launch_clears_inherited_resume_fences() {
+        const CHILD_ROOT: &str = "ST2_TEST_OMP_ORDINARY_CHILD_ROOT";
+        const CHILD_PROVIDER: &str = "ST2_TEST_OMP_ORDINARY_CHILD_PROVIDER";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let provider = std::env::var(CHILD_PROVIDER).unwrap();
+            run(
+                &PathBuf::from(root).join("catalog"),
+                "worker".into(),
+                "worker".into(),
+                vec![provider, "boot".into()],
+            )
+            .unwrap();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let catalog = temp.path().join("catalog");
+        let agent_dir = catalog.join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let host = crate::run::detect_host();
+        std::fs::write(
+            agent_dir.join("agent.kdl"),
+            format!(r#"agent "worker" {{ host "{host}"; command "true" }}"#),
+        )
+        .unwrap();
+        let marker = temp.path().join("provider-env");
+        let fake = FakeExecutable::new(&format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then printf 'omp v18.1.7\\n'; exit 0; fi\n\
+             printf '%s|%s\\n' \"${{ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
+             \"${{ST2_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
+            marker.display()
+        ));
+        let hooks = temp.path().join("hooks");
+        crate::hooks::install_at(&hooks, false).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "omp_session::tests::ordinary_launch_clears_inherited_resume_fences",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, temp.path())
+            .env(CHILD_PROVIDER, fake.path())
+            .env("ST_HOOKS", hooks)
+            .env("XDG_STATE_HOME", temp.path().join("state"))
+            .env(CHANNEL_EXPECTED_NATIVE_SESSION, "ambient-session")
+            .env(CHANNEL_RESUME_GENERATION, "99")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "nested ordinary launch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "unset|unset\n");
+    }
 
     #[test]
     fn mandatory_residency_validation_precedes_any_provider_child() {
@@ -740,6 +821,8 @@ mod tests {
     fn residency_resume_binds_the_exact_native_session_and_generation() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
+        let agent_dir = temp.path().join("agent");
+        let prior_seq = claim_omp(&agent_dir, "runtime-prior");
         record_channel_binding(
             &state,
             "h.worker",
@@ -752,9 +835,11 @@ mod tests {
         .unwrap();
         confirm_channel_binding(
             &state,
+            &agent_dir,
             "h.worker",
             "h.worker",
             "runtime-prior",
+            prior_seq,
             "session-exact",
             None,
         )
@@ -802,6 +887,7 @@ mod tests {
             .unwrap()
         );
 
+        let next_seq = claim_omp(&agent_dir, "runtime-next");
         record_channel_binding(
             &state,
             "h.worker",
@@ -836,9 +922,11 @@ mod tests {
         );
         confirm_channel_binding(
             &state,
+            &agent_dir,
             "h.worker",
             "h.worker",
             "runtime-next",
+            next_seq,
             "session-exact",
             Some(crate::residency::Generation(2)),
         )
@@ -855,9 +943,70 @@ mod tests {
     }
 
     #[test]
+    fn superseded_wrapper_cannot_promote_over_the_current_owners_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let agent_dir = temp.path().join("agent");
+        let predecessor_seq = claim_omp(&agent_dir, "runtime-predecessor");
+        let successor_seq = claim_omp(&agent_dir, "runtime-successor");
+
+        record_channel_binding(
+            &state,
+            "h.worker",
+            "h.worker",
+            "runtime-successor",
+            "session-successor",
+            None,
+            None,
+        )
+        .unwrap();
+        let successor = confirm_channel_binding(
+            &state,
+            &agent_dir,
+            "h.worker",
+            "h.worker",
+            "runtime-successor",
+            successor_seq,
+            "session-successor",
+            None,
+        )
+        .unwrap();
+
+        record_channel_binding(
+            &state,
+            "h.worker",
+            "h.worker",
+            "runtime-predecessor",
+            "session-predecessor",
+            None,
+            None,
+        )
+        .unwrap();
+        let error = confirm_channel_binding(
+            &state,
+            &agent_dir,
+            "h.worker",
+            "h.worker",
+            "runtime-predecessor",
+            predecessor_seq,
+            "session-predecessor",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ownership was superseded"));
+        assert_eq!(
+            load_binding(&state, "h.worker", "h.worker").unwrap(),
+            Some(successor)
+        );
+    }
+
+    #[test]
     fn mandatory_omp_resume_refuses_corrupt_foreign_and_stale_checkpoints() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
+        let agent_dir = temp.path().join("agent");
+        let prior_seq = claim_omp(&agent_dir, "runtime-prior");
         record_channel_binding(
             &state,
             "h.worker",
@@ -870,9 +1019,11 @@ mod tests {
         .unwrap();
         confirm_channel_binding(
             &state,
+            &agent_dir,
             "h.worker",
             "h.worker",
             "runtime-prior",
+            prior_seq,
             "session-exact",
             None,
         )
