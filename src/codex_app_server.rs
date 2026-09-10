@@ -991,8 +991,7 @@ impl CodexInboxDelivery {
             .entries()
             .iter()
             .filter(|entry| {
-                entry.binding == state.thread_id()
-                    && entry.phase < delivery_ledger::Phase::Consumed
+                entry.binding == state.thread_id() && entry.phase < delivery_ledger::Phase::Consumed
             })
             .map(|entry| (entry.filename.clone(), entry.correlation.value.clone()))
             .collect();
@@ -1481,14 +1480,7 @@ pub fn run_controlled(
     runtime_id: String,
     codex_argv: Vec<String>,
 ) -> Result<()> {
-    run_controlled_with_required_resume(
-        catalog_root,
-        identity,
-        runtime_id,
-        codex_argv,
-        None,
-        None,
-    )
+    run_controlled_with_required_resume(catalog_root, identity, runtime_id, codex_argv, None, None)
 }
 
 /// Run one host-owned cold-residency attempt under its exact incarnation.
@@ -2614,8 +2606,7 @@ fn pump_control(
         let mut control_state: Option<CodexControlState> = None;
         let mut subscription_pending = false;
         let mut peer_closed = false;
-        let delivery_ledger_path =
-            control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
+        let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(config, delivery_ledger_path.clone(), runtime.clone())
@@ -3044,11 +3035,8 @@ fn acquire_owner_lock(state_dir: &Path) -> Result<crate::flock::FileLock> {
         .with_context(|| format!("opening Codex runtime owner lock {}", path.display()))?;
     // Closing the descriptor releases the process-scoped lock, so a crashed owner leaves no stale
     // claim for the next runtime to trip over.
-    match crate::flock::FileLock::hold(
-        file,
-        crate::flock::Mode::Exclusive,
-        crate::flock::Wait::Now,
-    ) {
+    match crate::flock::FileLock::hold(file, crate::flock::Mode::Exclusive, crate::flock::Wait::Now)
+    {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(anyhow::anyhow!(
             "Codex runtime already has an owner at {}",
@@ -3095,25 +3083,31 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     result
 }
 
-#[cfg(test)]
-fn load_current_binding(
-    path: &Path,
-    runtime: &CodexRuntime,
-) -> Result<Option<CodexThreadBinding>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let binding: CodexThreadBinding = serde_json::from_slice(&bytes)?;
+fn load_runtime(path: &Path, agent: &str, runtime_id: &str) -> Result<CodexRuntime> {
+    let bytes =
+        fs::read(path).with_context(|| format!("reading Codex runtime {}", path.display()))?;
+    let runtime: CodexRuntime = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        binding.schema == BINDING_SCHEMA,
-        "unsupported Codex binding schema"
+        runtime.schema == RUNTIME_SCHEMA,
+        "unsupported Codex runtime schema"
     );
     anyhow::ensure!(
-        binding.agent == runtime.agent
-            && binding.runtime_id == runtime.runtime_id
-            && binding.runtime_incarnation == runtime.incarnation,
+        runtime.agent == agent && runtime.runtime_id == runtime_id,
+        "Codex runtime belongs to a different agent runtime"
+    );
+    anyhow::ensure!(
+        !runtime.incarnation.is_empty(),
+        "Codex runtime incarnation is empty"
+    );
+    Ok(runtime)
+}
+
+fn load_current_binding(path: &Path, runtime: &CodexRuntime) -> Result<Option<CodexThreadBinding>> {
+    let Some(binding) = load_thread_binding(path, &runtime.agent, &runtime.runtime_id)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        binding.runtime_incarnation == runtime.incarnation,
         "Codex thread binding belongs to a different runtime incarnation"
     );
     Ok(Some(binding))
@@ -3156,7 +3150,8 @@ pub fn checkpoint_residency(
         source_generation.0.checked_add(1) == Some(resume_generation.0),
         "Codex residency checkpoint generation is not monotonic"
     );
-    let binding = load_thread_binding(&state_dir.join("binding.json"), agent, runtime_id)?
+    let runtime = load_runtime(&state_dir.join("runtime.json"), agent, runtime_id)?;
+    let binding = load_current_binding(&state_dir.join("binding.json"), &runtime)?
         .with_context(|| format!("Codex runtime {runtime_id:?} has no native thread binding"))?;
     let checkpoint = CodexResidencyCheckpoint {
         schema: RESIDENCY_CHECKPOINT_SCHEMA.to_owned(),
