@@ -212,11 +212,26 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
         Command::Driver(DriverCmd::ClaudeSession {
             identity,
             runtime_id,
+            required_resume_generation,
+            required_resume_incarnation,
             argv,
         }) => {
             let catalog = catalog_arg(None)?;
             let catalog = catalog.canonicalize().unwrap_or(catalog);
-            st2::claude_session::run(&catalog, identity, runtime_id, argv)
+            match (required_resume_generation, required_resume_incarnation) {
+                (Some(generation), Some(incarnation)) => {
+                    st2::claude_session::run_residency_attempt(
+                        &catalog,
+                        identity,
+                        runtime_id,
+                        argv,
+                        st2::residency::Generation(generation),
+                        incarnation,
+                    )
+                }
+                (None, None) => st2::claude_session::run(&catalog, identity, runtime_id, argv),
+                _ => unreachable!("clap requires the complete residency launch fence"),
+            }
         }
         Command::Driver(DriverCmd::ClaudeObserve {
             identity,
