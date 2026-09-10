@@ -47,6 +47,7 @@ pub fn run_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
+
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "Claude required runtime incarnation is empty"
@@ -708,6 +709,13 @@ fn load_checkpoint(
         "Claude residency checkpoint belongs to a different agent runtime"
     );
     anyhow::ensure!(
+        !checkpoint.binding.runtime_incarnation.is_empty()
+            && valid_uuid(&checkpoint.binding.native_session_id)
+            && checkpoint.binding.canonical_workspace.is_absolute()
+            && checkpoint.binding.transcript_path.is_absolute(),
+        "Claude residency checkpoint has an incomplete native session binding"
+    );
+    anyhow::ensure!(
         checkpoint.transcript_sha256.len() == 64
             && checkpoint
                 .transcript_sha256
@@ -716,6 +724,25 @@ fn load_checkpoint(
         "Claude residency checkpoint has an invalid transcript digest"
     );
     Ok(checkpoint)
+}
+
+fn validate_residency_candidate(
+    checkpoint: &ClaudeResidencyCheckpoint,
+    candidate: &ClaudeSessionBinding,
+    resume_generation: crate::residency::Generation,
+) -> Result<()> {
+    anyhow::ensure!(
+        candidate.resume_generation == Some(resume_generation)
+            && candidate.runtime_incarnation != checkpoint.binding.runtime_incarnation,
+        "Claude SessionStart does not prove the required residency generation and a new wrapper incarnation"
+    );
+    anyhow::ensure!(
+        candidate.native_session_id == checkpoint.binding.native_session_id
+            && candidate.canonical_workspace == checkpoint.binding.canonical_workspace
+            && candidate.transcript_path == checkpoint.binding.transcript_path,
+        "Claude resumed a different native session than the residency checkpoint"
+    );
+    Ok(())
 }
 
 pub fn required_residency_resume(
@@ -757,15 +784,11 @@ pub fn residency_ready(
     let current = load_binding(state_dir, agent, runtime_id)?;
     if let Some(current) = &current
         && current.resume_generation == Some(resume_generation)
-        && current.runtime_incarnation == expected_runtime_incarnation
     {
-        anyhow::ensure!(
-            current.native_session_id == checkpoint.binding.native_session_id
-                && current.canonical_workspace == checkpoint.binding.canonical_workspace
-                && current.transcript_path == checkpoint.binding.transcript_path,
-            "Claude ready binding does not match the residency checkpoint"
-        );
-        return Ok(true);
+        validate_residency_candidate(&checkpoint, current, resume_generation)?;
+        if current.runtime_incarnation == expected_runtime_incarnation {
+            return Ok(true);
+        }
     }
     let Some(candidate) = load_pending_binding(state_dir, agent, runtime_id)? else {
         return Ok(false);
@@ -777,17 +800,10 @@ pub fn residency_ready(
             "Claude native session changed after this residency generation became ready"
         );
     }
+    validate_residency_candidate(&checkpoint, &candidate, resume_generation)?;
     anyhow::ensure!(
-        candidate.resume_generation == Some(resume_generation)
-            && candidate.runtime_incarnation != checkpoint.binding.runtime_incarnation
-            && candidate.runtime_incarnation == expected_runtime_incarnation,
-        "Claude SessionStart does not prove the required residency generation and wrapper incarnation"
-    );
-    anyhow::ensure!(
-        candidate.native_session_id == checkpoint.binding.native_session_id
-            && candidate.canonical_workspace == checkpoint.binding.canonical_workspace
-            && candidate.transcript_path == checkpoint.binding.transcript_path,
-        "Claude resumed a different native session than the residency checkpoint"
+        candidate.runtime_incarnation == expected_runtime_incarnation,
+        "Claude SessionStart does not prove the expected wrapper incarnation"
     );
     validate_transcript(
         &candidate.transcript_path,
@@ -2474,6 +2490,20 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
+        let empty_incarnation = run_residency_attempt(
+            temp.path(),
+            "no-spawn.worker".into(),
+            "no-spawn.worker".into(),
+            vec!["claude".into()],
+            crate::residency::Generation(2),
+            String::new(),
+        )
+        .unwrap_err();
+        assert!(
+            empty_incarnation
+                .to_string()
+                .contains("required runtime incarnation is empty")
+        );
         let marker = temp.path().join("provider-started");
         let provider = temp.path().join("claude");
         fs::write(

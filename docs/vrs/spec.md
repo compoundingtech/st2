@@ -757,6 +757,20 @@ state, and Resource observation are not demand. Host policy owns idle thresholds
 and warm capacity. Telemetry measures resume-to-ready and demand-to-delivery
 latency before the project assigns a latency objective.
 
+The folder-catalog supervisor enables this policy only when `st2 up` receives
+both `--residency-idle-after <duration>` and
+`--residency-warm-capacity <count>`. If a catalog contains a running on-demand
+agent and the host omits this policy, reconciliation holds that agent
+`adopt-only` and reports an error instead of launching it. `st2 wake` writes an
+explicit durable wake request. `st2 pty attach <agent-address>` writes the same
+request before attaching. Each launch attempt has a host-minted incarnation
+fence. A retry after a missing provider rotates this fence. A live provider
+retains the fence while reconciliation completes its sidecars. Provider
+readiness must match the independent fence, so a binding left by an earlier
+failed attempt cannot make a later attempt active. A wake request that races
+with checkpoint or stop remains pending until the complete task group is absent
+and exact native resume can start.
+
 ## Host-local scheduling and supervision
 
 ```text

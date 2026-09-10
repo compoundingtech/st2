@@ -2739,6 +2739,139 @@ fn residency_checkpoint_rejects_a_binding_from_a_prior_runtime_incarnation() {
 }
 
 #[test]
+fn residency_readiness_requires_the_exact_thread_under_the_expected_incarnation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let prior = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let prior_binding = CodexThreadBinding::new(&prior, "thread-prior".into());
+    atomic_json(&state.join("runtime.json"), &prior).unwrap();
+    atomic_json(&state.join("binding.json"), &prior_binding).unwrap();
+    checkpoint_residency(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(1),
+        crate::residency::Generation(2),
+    )
+    .unwrap();
+
+    fs::remove_file(state.join("binding.json")).unwrap();
+    assert!(
+        !residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "attempt-next",
+        )
+        .unwrap()
+    );
+
+    atomic_json(&state.join("binding.json"), &prior_binding).unwrap();
+    let stale = residency_ready(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        "attempt-next",
+    )
+    .unwrap_err();
+    assert!(stale.to_string().contains("new runtime incarnation"));
+
+    let foreign = CodexRuntime::fresh("h.other".into(), "h.other".into()).unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&foreign, "thread-prior".into()),
+    )
+    .unwrap();
+    let foreign = residency_ready(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        "attempt-next",
+    )
+    .unwrap_err();
+    assert!(foreign.to_string().contains("different agent runtime"));
+
+    let stale_attempt = CodexRuntime::with_incarnation(
+        "h.worker".into(),
+        "h.worker".into(),
+        "attempt-stale".into(),
+    )
+    .unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&stale_attempt, "thread-other".into()),
+    )
+    .unwrap();
+    let mismatched = residency_ready(
+        &state,
+        "h.worker",
+        "h.worker",
+        crate::residency::Generation(2),
+        "attempt-next",
+    )
+    .unwrap_err();
+    assert!(
+        mismatched
+            .to_string()
+            .contains("checkpointed native thread")
+    );
+
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&stale_attempt, "thread-prior".into()),
+    )
+    .unwrap();
+    assert!(
+        !residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "attempt-next",
+        )
+        .unwrap(),
+        "a stale prior-attempt binding became ready"
+    );
+
+    let replacement = CodexRuntime::with_incarnation(
+        "h.worker".into(),
+        "h.worker".into(),
+        "attempt-next".into(),
+    )
+    .unwrap();
+    atomic_json(
+        &state.join("binding.json"),
+        &CodexThreadBinding::new(&replacement, "thread-prior".into()),
+    )
+    .unwrap();
+    assert!(
+        residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(2),
+            "attempt-next",
+        )
+        .unwrap()
+    );
+    assert!(
+        residency_ready(
+            &state,
+            "h.worker",
+            "h.worker",
+            crate::residency::Generation(3),
+            "attempt-next",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different generation")
+    );
+}
+
+#[test]
 fn mandatory_residency_resume_refuses_missing_or_authored_session_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");

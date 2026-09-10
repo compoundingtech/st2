@@ -598,10 +598,9 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Resul
         crate::fsatomic::Staging::new(".residency-ledger"),
         crate::fsatomic::Durability::FsyncFileAndDir,
     )
-    
 }
 
-fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
     let mut missing = Vec::new();
     let mut cursor = path;
     while !cursor.try_exists()? {

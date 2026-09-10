@@ -252,6 +252,7 @@ pub fn residency_ready(
     agent: &str,
     runtime_id: &str,
     resume_generation: crate::residency::Generation,
+    expected_runtime_incarnation: &str,
 ) -> Result<bool> {
     let checkpoint = load_checkpoint(state_dir, agent, runtime_id, resume_generation)?;
     let Some(current) = load_binding(state_dir, agent, runtime_id)? else {
@@ -271,7 +272,7 @@ pub fn residency_ready(
         current.native_session_id == checkpoint.binding.native_session_id,
         "OMP resumed a different native session than the residency checkpoint"
     );
-    Ok(true)
+    Ok(current.runtime_incarnation == expected_runtime_incarnation)
 }
 
 fn load_binding(
@@ -413,6 +414,7 @@ pub fn run_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
+
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "OMP required runtime incarnation is empty"
@@ -794,6 +796,20 @@ mod tests {
     #[test]
     fn mandatory_residency_validation_precedes_any_provider_child() {
         let temp = tempfile::tempdir().unwrap();
+        let empty_incarnation = run_residency_attempt(
+            temp.path(),
+            "residency-no-spawn.worker".into(),
+            "residency-no-spawn.worker".into(),
+            vec!["omp".into()],
+            crate::residency::Generation(2),
+            String::new(),
+        )
+        .unwrap_err();
+        assert!(
+            empty_incarnation
+                .to_string()
+                .contains("required runtime incarnation is empty")
+        );
         let marker = temp.path().join("provider-started");
         let fake = FakeExecutable::new(&format!(
             "#!/bin/sh\ntouch '{}'\nprintf 'omp v18.1.7\\n'\n",
@@ -818,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn residency_resume_binds_the_exact_native_session_and_generation() {
+    fn residency_resume_binds_the_exact_native_session_generation_and_incarnation() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         let agent_dir = temp.path().join("agent");
@@ -883,6 +899,7 @@ mod tests {
                 "h.worker",
                 "h.worker",
                 crate::residency::Generation(2),
+                "runtime-next",
             )
             .unwrap()
         );
@@ -892,7 +909,7 @@ mod tests {
             &state,
             "h.worker",
             "h.worker",
-            "runtime-next",
+            "runtime-stale",
             "session-exact",
             Some(crate::residency::Generation(2)),
             Some("session-exact"),
@@ -904,6 +921,7 @@ mod tests {
                 "h.worker",
                 "h.worker",
                 crate::residency::Generation(2),
+                "runtime-next",
             )
             .unwrap(),
             "binding publication alone is not channel readiness"
@@ -920,6 +938,40 @@ mod tests {
             "session-exact",
             "an unconfirmed channel attempt must leave the checkpoint retryable"
         );
+        let stale_error = confirm_channel_binding(
+            &state,
+            &agent_dir,
+            "h.worker",
+            "h.worker",
+            "runtime-stale",
+            next_seq,
+            "session-exact",
+            Some(crate::residency::Generation(2)),
+        )
+        .unwrap_err();
+        assert!(stale_error.to_string().contains("ownership was superseded"));
+        assert!(
+            !residency_ready(
+                &state,
+                "h.worker",
+                "h.worker",
+                crate::residency::Generation(2),
+                "runtime-next",
+            )
+            .unwrap(),
+            "a stale prior-attempt binding became ready"
+        );
+
+        record_channel_binding(
+            &state,
+            "h.worker",
+            "h.worker",
+            "runtime-next",
+            "session-exact",
+            Some(crate::residency::Generation(2)),
+            Some("session-exact"),
+        )
+        .unwrap();
         confirm_channel_binding(
             &state,
             &agent_dir,
@@ -937,6 +989,7 @@ mod tests {
                 "h.worker",
                 "h.worker",
                 crate::residency::Generation(2),
+                "runtime-next",
             )
             .unwrap()
         );

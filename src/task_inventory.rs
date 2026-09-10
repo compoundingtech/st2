@@ -462,38 +462,46 @@ pub fn inventory(
         }
         let bus_id = spec.bus_id(host);
         let agent_id = spec.effective_id(host);
-        let runtime_residency = spec.effective_session_driver().and_then(|driver| {
-            let path = crate::residency::ledger_path(catalog, host, &agent_id);
-            if let Some(snapshot) = residency_snapshots.iter().find(|snapshot| {
-                snapshot.path == path && snapshot.agent_id == agent_id && snapshot.driver == driver
-            }) {
-                return snapshot
-                    .ledger
-                    .as_ref()
-                    .map(crate::residency::Ledger::inventory_projection);
-            }
-            match crate::residency::load(&path, &agent_id, host, driver) {
-                Ok(ledger) => {
-                    let projection = ledger
+        let runtime_residency = if spec.desired_state.is_running()
+            && spec.residency_policy == crate::ResidencyPolicy::OnDemand
+        {
+            spec.effective_session_driver().and_then(|driver| {
+                let path = crate::residency::ledger_path(catalog, host, &agent_id);
+                if let Some(snapshot) = residency_snapshots.iter().find(|snapshot| {
+                    snapshot.path == path
+                        && snapshot.agent_id == agent_id
+                        && snapshot.driver == driver
+                }) {
+                    return snapshot
+                        .ledger
                         .as_ref()
                         .map(crate::residency::Ledger::inventory_projection);
-                    residency_snapshots.push(ResidencySnapshot {
-                        path,
-                        agent_id: agent_id.clone(),
-                        driver,
-                        ledger,
-                    });
-                    projection
                 }
-                Err(error) => {
-                    push_error(
-                        &mut errors,
-                        format!("agent {agent_id:?} residency ledger: {error}"),
-                    );
-                    None
+                match crate::residency::load(&path, &agent_id, host, driver) {
+                    Ok(ledger) => {
+                        let projection = ledger
+                            .as_ref()
+                            .map(crate::residency::Ledger::inventory_projection);
+                        residency_snapshots.push(ResidencySnapshot {
+                            path,
+                            agent_id: agent_id.clone(),
+                            driver,
+                            ledger,
+                        });
+                        projection
+                    }
+                    Err(error) => {
+                        push_error(
+                            &mut errors,
+                            format!("agent {agent_id:?} residency ledger: {error}"),
+                        );
+                        None
+                    }
                 }
-            }
-        });
+            })
+        } else {
+            None
+        };
         for task in &spec.tasks {
             // Active declaration-only metadata has no desired runtime. Retired tasks remain in the
             // inventory even without launch material so stale generations stay visible.
@@ -1039,6 +1047,43 @@ mod tests {
                 .contains("residency ledger")
         );
         assert!(invalid["tasks"][0]["runtimeResidency"].is_null());
+    }
+
+    #[test]
+    fn inventory_ignores_residency_ledger_without_running_on_demand_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::residency::ledger_path(tmp.path(), "h", "h.worker");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not-json").unwrap();
+
+        for declaration in [
+            r#"
+              residency-policy "always"
+              session-driver "codex"
+              pty "agent" { id "h.worker"; argv "agent-bin" }
+            "#,
+            r#"
+              desired-state "suspended" reason="Operator pause"
+              residency-policy "on-demand"
+              session-driver "codex"
+              pty "agent" { id "h.worker"; argv "agent-bin" }
+            "#,
+        ] {
+            write_agent(tmp.path(), "h", "worker", declaration);
+            let value = json(
+                tmp.path(),
+                "h",
+                ObservationBatch {
+                    complete: true,
+                    observations: vec![],
+                    errors: vec![],
+                },
+            );
+
+            assert_eq!(value["complete"], true);
+            assert_eq!(value["errors"], Value::Array(vec![]));
+            assert!(value["tasks"][0]["runtimeResidency"].is_null());
+        }
     }
 
     #[test]
