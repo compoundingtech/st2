@@ -780,6 +780,12 @@ st3 work fail step-run/GENERATION/step --reason "The compiler rejected the sourc
 st3 work release step-run/GENERATION/step --reason "The work needs another owner."
 ```
 
+The default work list shows ready, active, and blocked work. It summarizes waiting and terminal work.
+
+Add `--all` to show waiting and terminal work. Add `--json` to keep the stable machine view for the selected set.
+
+The default `work show` and `work claim` output gives a human-readable step view. It keeps every actionable subject exact.
+
 A worker completion report is not a correctness result. Products and gates still control final completion.
 
 The native driver renews active claims. It delivers one Small Talk message for each readiness epoch and harness incarnation.
@@ -992,6 +998,12 @@ Store a summary, a redacted sample, or a hash when later work needs durable evid
 `st3 mission start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal or standing.
 
 `st3 mission show MISSION_RUN` reads one exact run. `st3 mission show MISSION` works only when that mission has exactly one nonterminal run.
+
+The default mission view shows the complete run summary and its active graph branch. Add `--follow` to watch an existing run.
+
+Follow mode redraws one screen on a terminal. It appends each changed snapshot when another program reads the output.
+
+Add `--json` to any mission or work view when a program needs the stable data shape.
 
 The mission shortcut fails when it finds zero or multiple active runs. The error tells the caller to use an exact mission-run subject.
 

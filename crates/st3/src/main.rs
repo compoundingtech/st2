@@ -33,6 +33,13 @@ use st3::store::Store;
 use tokio::sync::{Notify, watch};
 use walkdir::WalkDir;
 
+mod presentation;
+
+use presentation::{
+    OutputStyle, follow_snapshot, mission_run_signature, render_generation, render_generations,
+    render_mission_run, render_revision_proposal, render_step_run, render_work_list,
+};
+
 #[derive(Parser)]
 #[command(name = "st3", version, about = "Claims-graph agent reconciler")]
 struct Cli {
@@ -221,6 +228,8 @@ enum MissionViewCommand {
 #[derive(Args)]
 struct MissionShowArgs {
     mission_or_run: String,
+    #[arg(long)]
+    follow: bool,
 }
 
 #[derive(Args)]
@@ -1438,7 +1447,18 @@ async fn run_mission_view(
                 );
                 runs.into_iter().next().expect("one active run was checked")
             };
-            print_value(&run, json_output)
+            if args.follow {
+                return follow_mission_run(client, run, 0, json_output).await;
+            }
+            if json_output {
+                return print_value(&run, true);
+            }
+            let runs = load_mission_run_tree(client, &run).await?;
+            print!(
+                "{}",
+                render_mission_run(&run, &runs, OutputStyle::stdout(), current_unix_ms()?)
+            );
+            Ok(())
         }
         MissionViewCommand::Start(args) => start_mission_run(client, args, json_output).await,
     }
@@ -1552,10 +1572,23 @@ async fn follow_mission_run(
     json_output: bool,
 ) -> Result<()> {
     let mut prior = String::new();
+    let interactive = std::io::stdout().is_terminal();
+    let _screen = if !json_output && interactive {
+        Some(TerminalScreen::open()?)
+    } else {
+        None
+    };
+    let style = OutputStyle::stdout();
     loop {
-        let summary = mission_run_signature(&run)?;
+        let runs = load_mission_run_tree(client, &run).await?;
+        let summary = mission_run_signature(&runs)?;
         if summary != prior && !json_output {
-            print_mission_run_tree(&run);
+            let frame = render_mission_run(&run, &runs, style, current_unix_ms()?);
+            print!(
+                "{}",
+                follow_snapshot(&frame, interactive, !prior.is_empty())
+            );
+            std::io::stdout().flush()?;
             prior = summary;
         }
         match run.status.as_str() {
@@ -1581,58 +1614,26 @@ async fn follow_mission_run(
     }
 }
 
+async fn load_mission_run_tree(
+    client: &Client,
+    selected: &MissionRunView,
+) -> Result<Vec<MissionRunView>> {
+    let runs: Vec<MissionRunView> = client
+        .get(&format!(
+            "/v1/mission-runs?root={}",
+            urlencoding::encode(&selected.root_mission_run)
+        ))
+        .await?;
+    anyhow::ensure!(
+        runs.iter().any(|run| run.subject == selected.subject),
+        "mission run `{}` is absent from its root graph",
+        selected.subject
+    );
+    Ok(runs)
+}
+
 fn mission_run_follow_succeeded(status: &str) -> bool {
     matches!(status, "completed" | "standing")
-}
-
-fn mission_run_signature(run: &MissionRunView) -> Result<String> {
-    serde_json::to_string(&json!({
-        "revision": run.revision,
-        "status": run.status,
-        "phase": run.phase,
-        "steps": run.steps.iter().map(|step| json!({
-            "step": step.step,
-            "status": step.status,
-            "attempt": step.attempt,
-            "reason": step.blocked_reason,
-        })).collect::<Vec<_>>(),
-    }))
-    .map_err(Into::into)
-}
-
-fn print_mission_run_tree(run: &MissionRunView) {
-    println!(
-        "{} {} ({}, revision {})",
-        run.subject,
-        run.status,
-        run.phase,
-        &run.revision[..run.revision.len().min(12)]
-    );
-    for (index, step) in run.steps.iter().enumerate() {
-        let depth = step.step.matches('/').count();
-        let branch = if index + 1 == run.steps.len() {
-            "└─"
-        } else {
-            "├─"
-        };
-        let title = step.title.as_deref().unwrap_or(&step.step);
-        let retry = if step.attempt > 1 {
-            format!("; attempt {}", step.attempt)
-        } else {
-            String::new()
-        };
-        println!(
-            "{}{} [{}{}] {}",
-            "  ".repeat(depth),
-            branch,
-            step.status,
-            retry,
-            title
-        );
-        if let Some(reason) = &step.blocked_reason {
-            println!("{}   {}", "  ".repeat(depth), reason);
-        }
-    }
 }
 
 async fn run_import(client: &Client, args: ImportArgs, json_output: bool) -> Result<()> {
@@ -3696,34 +3697,23 @@ async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) 
 async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
     match command {
         WorkCommand::Ls { actor, all } => {
-            let path = if let Some(actor) = actor {
+            let include_terminal = if json_output { all } else { true };
+            let path = if let Some(actor) = actor.as_deref() {
                 format!(
-                    "/v1/work?actor={}&include_terminal={all}",
-                    urlencoding::encode(&actor)
+                    "/v1/work?actor={}&include_terminal={include_terminal}",
+                    urlencoding::encode(actor)
                 )
             } else {
-                format!("/v1/work?include_terminal={all}")
+                format!("/v1/work?include_terminal={include_terminal}")
             };
             let work: Vec<StepRunView> = client.get(&path).await?;
             if json_output {
                 return print_value(&work, true);
             }
-            for step in work {
-                let queue = step
-                    .queue
-                    .as_deref()
-                    .zip(step.queue_position)
-                    .map(|(queue, position)| format!("queue {queue} #{position}"))
-                    .unwrap_or_else(|| "-".into());
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    step.status,
-                    work_actor_label(&step),
-                    step.subject,
-                    queue,
-                    step.title.as_deref().unwrap_or(&step.step)
-                );
-            }
+            print!(
+                "{}",
+                render_work_list(actor.as_deref(), &work, all, OutputStyle::stdout())
+            );
             Ok(())
         }
         WorkCommand::Show { subject } => {
@@ -3740,30 +3730,10 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
             if json_output {
                 print_value(&step, true)
             } else {
-                println!(
-                    "{}\t{}\t{}",
-                    step.status,
-                    work_actor_label(&step),
-                    step.subject
+                print!(
+                    "{}",
+                    render_step_run(&step, OutputStyle::stdout(), current_unix_ms()?)
                 );
-                if let Some(title) = step.title {
-                    println!("Title: {title}");
-                }
-                if let Some((queue, position)) = step.queue.as_deref().zip(step.queue_position) {
-                    println!("Queue: {queue} #{position}");
-                }
-                for goal in step.goals {
-                    println!("Goal: {goal}");
-                }
-                for constraint in step.constraints {
-                    println!("Constraint: {constraint}");
-                }
-                for grouping in step.under {
-                    match grouping.reason {
-                        Some(reason) => println!("Under: {} ({reason})", grouping.agent),
-                        None => println!("Under: {}", grouping.agent),
-                    }
-                }
                 Ok(())
             }
         }
@@ -3852,7 +3822,15 @@ async fn run_work_revision(
                     urlencoding::encode(&run)
                 ))
                 .await?;
-            print_value(&proposal, json_output)
+            if json_output {
+                print_value(&proposal, true)
+            } else {
+                print!(
+                    "{}",
+                    render_revision_proposal(&proposal, OutputStyle::stdout(), current_unix_ms()?)
+                );
+                Ok(())
+            }
         }
         WorkRevisionCommand::Generations { run } => {
             let generations: Vec<RunGenerationView> = client
@@ -3861,7 +3839,18 @@ async fn run_work_revision(
                     urlencoding::encode(&run)
                 ))
                 .await?;
-            print_value(&generations, json_output)
+            if json_output {
+                print_value(&generations, true)
+            } else {
+                let mission_run: MissionRunView = client
+                    .get(&format!("/v1/mission-runs/{}", urlencoding::encode(&run)))
+                    .await?;
+                print!(
+                    "{}",
+                    render_generations(&mission_run, &generations, OutputStyle::stdout())
+                );
+                Ok(())
+            }
         }
         WorkRevisionCommand::Generation { generation } => {
             let generation: RunGenerationView = client
@@ -3870,7 +3859,12 @@ async fn run_work_revision(
                     urlencoding::encode(&generation)
                 ))
                 .await?;
-            print_value(&generation, json_output)
+            if json_output {
+                print_value(&generation, true)
+            } else {
+                print!("{}", render_generation(&generation, OutputStyle::stdout()));
+                Ok(())
+            }
         }
         WorkRevisionCommand::Approve {
             proposal,
@@ -3984,21 +3978,13 @@ async fn post_work(
     if json_output {
         print_value(&response, true)
     } else {
-        println!("{}\t{}", response.status, response.subject);
         if action == "claim" {
-            if let Some(title) = response.title {
-                println!("Title: {title}");
-            }
-            if let Some((queue, position)) = response.queue.as_deref().zip(response.queue_position)
-            {
-                println!("Queue: {queue} #{position}");
-            }
-            for goal in response.goals {
-                println!("Goal: {goal}");
-            }
-            for constraint in response.constraints {
-                println!("Constraint: {constraint}");
-            }
+            print!(
+                "{}",
+                render_step_run(&response, OutputStyle::stdout(), current_unix_ms()?)
+            );
+        } else {
+            println!("{}\t{}", response.status, response.subject);
         }
         Ok(())
     }
@@ -4922,20 +4908,6 @@ fn work_actor(step: &StepRunView) -> Option<&str> {
         .as_deref()
         .or(step.assigned_to.as_deref())
         .or_else(|| (step.available_to.len() == 1).then(|| step.available_to[0].as_str()))
-}
-
-fn work_actor_label(step: &StepRunView) -> String {
-    if let Some(actor) = work_actor(step) {
-        short_actor(actor).to_owned()
-    } else if !step.available_to.is_empty() {
-        step.available_to
-            .iter()
-            .map(|actor| short_actor(actor))
-            .collect::<Vec<_>>()
-            .join(",")
-    } else {
-        "-".into()
-    }
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -6157,6 +6129,10 @@ fn unix_minute() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 60)
 }
 
+fn current_unix_ms() -> Result<u128> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+}
+
 async fn forward_projected_messages(
     client: &Client,
     subject: &str,
@@ -6635,6 +6611,26 @@ mod tests {
         assert_eq!(args.mission, "release/demo");
         assert_eq!(args.id.as_deref(), Some("release/demo/test"));
         assert_eq!(args.actor.as_deref(), Some("agent/operator"));
+    }
+
+    #[test]
+    fn mission_show_accepts_follow() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "mission",
+            "show",
+            "mission-run/release/demo",
+            "--follow",
+        ])
+        .unwrap();
+        let Command::Mission {
+            command: MissionViewCommand::Show(args),
+        } = cli.command
+        else {
+            panic!("the mission show command did not parse");
+        };
+        assert_eq!(args.mission_or_run, "mission-run/release/demo");
+        assert!(args.follow);
     }
 
     #[test]
