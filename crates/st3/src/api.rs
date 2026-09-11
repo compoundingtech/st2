@@ -2190,11 +2190,13 @@ async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    let response = state
+    let (response, appended) = state
         .store
-        .append_client_claim(&request)
+        .append_client_claim_outcome(&request)
         .map_err(ApiError::bad)?;
-    signal_changed(&state);
+    if appended {
+        signal_changed(&state);
+    }
     Ok(Json(response))
 }
 
@@ -6807,7 +6809,9 @@ version 2
     #[tokio::test]
     async fn public_claim_admission_and_idempotency_use_the_exported_schema() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
+        let state = state(root.path());
+        let reconcile_notify = state.notify.clone();
+        let app = router(state);
 
         let (status, schema) = get_request(app.clone(), "/v1/schema").await;
         assert_eq!(status, StatusCode::OK, "{schema}");
@@ -6850,6 +6854,12 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{first}");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reconcile_notify.notified(),
+        )
+        .await
+        .expect("a new claim must wake reconciliation");
         let (status, retry) = json_request(
             app.clone(),
             "/v1/claims",
@@ -6858,6 +6868,15 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{retry}");
         assert_eq!(retry["id"], first["id"]);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                reconcile_notify.notified(),
+            )
+            .await
+            .is_err(),
+            "an idempotent claim replay must not wake reconciliation"
+        );
 
         let mut changed = resource;
         changed.fields.insert("value".into(), Value::from(2));

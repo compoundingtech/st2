@@ -5417,6 +5417,7 @@ async fn run_st2_native_driver(
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
+    let mut last_activity_fingerprint = None;
     let mut ready = false;
     loop {
         tokio::select! {
@@ -5465,7 +5466,14 @@ async fn run_st2_native_driver(
                         }).await?;
                         ready = true;
                     }
-                    publish_harness_activity(client, subject, driver, &observed).await?;
+                    publish_harness_activity(
+                        client,
+                        subject,
+                        driver,
+                        &observed,
+                        &mut last_activity_fingerprint,
+                    )
+                    .await?;
                 }
                 if driver != "claude" {
                     forward_projected_messages(client, subject, &inbox, &archive, "native").await?;
@@ -5589,6 +5597,7 @@ async fn publish_harness_activity(
     subject: &str,
     driver: &str,
     observed: &st2::harness_state::Observed,
+    last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let status = harness_activity_state(observed.state);
     let fields = BTreeMap::from([
@@ -5624,6 +5633,9 @@ async fn publish_harness_activity(
         observed.since_ms,
         &fields,
     ))?));
+    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
     let _: ClaimRecord = client
         .post(
             "/v1/claims",
@@ -5638,6 +5650,7 @@ async fn publish_harness_activity(
             },
         )
         .await?;
+    *last_fingerprint = Some(fingerprint);
     Ok(())
 }
 

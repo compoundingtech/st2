@@ -198,3 +198,11 @@ A later version can add an `until` predicate or one deadline. This option is not
 - The local file provider reports metadata and never reports file content.
 - A direct observer without a subscription records observations and sends no message.
 - A manual refresh waits for its exact attempt and reports an unchanged success without a new resource claim.
+
+## Observer process isolation to evaluate
+
+The daemon can schedule observations and accept their results.
+
+An external worker process can run each provider operation. This boundary can keep a provider failure outside the daemon.
+
+The design must test crashes, hangs, time limits, bounded results, and failed observation records before it selects this boundary.

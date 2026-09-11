@@ -3994,6 +3994,13 @@ impl Store {
     }
 
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
+        self.append_claim_outcome(input).map(|(claim, _)| claim)
+    }
+
+    fn append_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
@@ -4019,6 +4026,7 @@ impl Store {
             }
             return claim_by_id_tx(&connection, &canonical_claim)
                 .map_err(internal)?
+                .map(|claim| (claim, false))
                 .ok_or_else(|| St3Error::new("internal", "the operation claim is missing"));
         }
         let transaction = connection.transaction().map_err(internal)?;
@@ -4078,7 +4086,7 @@ impl Store {
             register_operation_tx(&transaction, &record).map_err(internal)?;
         }
         transaction.commit().map_err(internal)?;
-        Ok(record)
+        Ok((record, true))
     }
 
     pub fn validate_claim_input(&self, input: &ClaimInput) -> Result<(), St3Error> {
@@ -4093,6 +4101,14 @@ impl Store {
     }
 
     pub fn append_client_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
+        self.append_client_claim_outcome(input)
+            .map(|(claim, _)| claim)
+    }
+
+    pub(crate) fn append_client_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         st3_schema::registry()
             .validate_public_claim(
                 &input.subject,
@@ -4101,7 +4117,7 @@ impl Store {
                 input.actor.as_deref(),
             )
             .map_err(|error| St3Error::new(error.code, error.message))?;
-        self.append_claim(input)
+        self.append_claim_outcome(input)
     }
 
     pub fn idempotent_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
