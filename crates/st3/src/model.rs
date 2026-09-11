@@ -467,8 +467,17 @@ pub struct NormalizedIntent {
     pub planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
     #[serde(default)]
     pub resource_refreshes: Vec<ResourceRefreshOperation>,
+    #[serde(default)]
+    pub replica_repairs: Vec<ReplicaRepairDeclaration>,
     pub document_refs: BTreeSet<String>,
     pub normalized: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicaRepairDeclaration {
+    pub record_ref: String,
+    pub replacement_claim_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1332,6 +1341,102 @@ pub struct MissionOutputView {
     pub claim_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ReplicaEnvelopeId {
+    pub writer: String,
+    pub sequence: u64,
+    pub hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicaEnvelope {
+    pub writer: String,
+    pub sequence: u64,
+    pub previous_hash: Option<String>,
+    pub hash: String,
+    pub accepted_at_unix_ms: u128,
+    /// Base64-encoded CBOR. Receipt does not decode this field.
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReplicationInventory {
+    #[serde(default)]
+    pub envelopes: Vec<ReplicaEnvelopeId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationExchange {
+    pub peer: String,
+    pub fleet_id: String,
+    pub schema_digest: String,
+    pub authority_digest: String,
+    pub graph_digest: String,
+    pub inventory: ReplicationInventory,
+    #[serde(default)]
+    pub envelopes: Vec<ReplicaEnvelope>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationReceipt {
+    pub received: usize,
+    pub duplicate: usize,
+    pub inventory: ReplicationInventory,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicaRecordView {
+    pub record_ref: String,
+    pub writer: String,
+    pub sequence: u64,
+    pub envelope_hash: String,
+    pub position: u64,
+    pub state: String,
+    pub claim_id: Option<String>,
+    pub subject: Option<String>,
+    pub kind: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub replacement_claim_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReplicationStatus {
+    pub configured: bool,
+    pub fleet_id: Option<String>,
+    pub authority_digest: String,
+    pub graph_digest: String,
+    pub received_envelopes: u64,
+    pub pending_records: u64,
+    pub valid_records: u64,
+    pub unknown_records: u64,
+    pub invalid_records: u64,
+    pub repaired_records: u64,
+    pub unhealthy_projections: u64,
+    pub peers: Vec<ReplicationPeerStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationPeerStatus {
+    pub peer: String,
+    pub status: String,
+    pub last_success_at_unix_ms: Option<u128>,
+    pub last_error: Option<String>,
+    pub schema_digest: Option<String>,
+    pub authority_digest: Option<String>,
+    pub graph_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationRepairRequest {
+    pub record_ref: String,
+    pub replacement_claim_id: String,
+    pub reason: String,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationBatch {
     pub peer: String,
@@ -1339,12 +1444,6 @@ pub struct ReplicationBatch {
     pub replica_heads: BTreeMap<String, u64>,
     pub batches: Vec<ReplicaBatch>,
     pub blobs: BTreeMap<String, Vec<u8>>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ReplicationQuery {
-    #[serde(default)]
-    pub replica_heads: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1358,6 +1457,7 @@ pub struct ReplicaBatch {
     pub claims: Vec<ClaimRecord>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationResponse {
     pub accepted_through: u64,
@@ -1368,6 +1468,7 @@ pub struct ReplicationResponse {
     pub missing_ranges: Vec<ReplicaRange>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicaRange {
     pub origin: String,

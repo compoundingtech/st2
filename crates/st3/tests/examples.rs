@@ -300,7 +300,7 @@ fn migration_rehearsal_uses_an_exact_migration_document_and_no_custom_prompt() {
 }
 
 #[test]
-fn st3_eval_inventory_has_fifteen_model_free_and_sixteen_model_backed_evals() {
+fn st3_eval_inventory_has_sixteen_model_free_and_sixteen_model_backed_evals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("evals/st3");
@@ -317,6 +317,7 @@ fn st3_eval_inventory_has_fifteen_model_free_and_sixteen_model_backed_evals() {
         "pty-attach-only",
         "pty-send-peek",
         "queue-revision",
+        "replication-convergence",
         "resource-cold-start",
         "resource-handoff",
         "resource-retarget",

@@ -33,9 +33,14 @@ impl Drop for Daemon {
 fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
     let stderr = fs::File::create(socket.with_extension("daemon.stderr"))
         .expect("create the daemon diagnostic log");
+    let config = root.join("config.toml");
+    fs::create_dir_all(root).expect("create the daemon state directory");
+    fs::write(&config, "").expect("create an isolated daemon config");
     Daemon(
         st3_command(binary)
             .arg("up")
+            .arg("--config")
+            .arg(config)
             .args(["--node", "survival-node"])
             .arg("--state-dir")
             .arg(root)
@@ -43,7 +48,6 @@ fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
             .arg(root.join("pty"))
             .arg("--socket")
             .arg(socket)
-            .args(["--peer-listen", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))

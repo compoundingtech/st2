@@ -15,7 +15,7 @@ Each stored field has one class:
 - Authority stores the fact and accepts its mutation.
 - Reference names one authority record or content hash.
 - Derived projection supports a query and accepts writes only from its reducer.
-- Local cursor records progress against an external or replicated sequence.
+- Local transport state records peer health without controlling authority admission.
 - Short-lived capability controls one bounded operation.
 
 A table name does not select the class. The review classifies each field and each write path.
@@ -57,7 +57,10 @@ The following areas need the field classification and rebuild proof:
 - `idempotency.response` can become a second result authority when an endpoint returns its stored response.
 - `documents` must remain a name-to-hash reference. Only `blobs` stores document bytes.
 - `batches` and `claims` repeat origin and acceptance data. The review must name which fields establish causality.
-- `peer_cursors` and `peer_replica_cursors` are local progress state. They must not become replicated graph facts.
+- `replica_envelopes` preserve all authenticated candidates. A writer sequence is not a uniqueness boundary.
+- `replica_records` store validation state. Their raw bytes come from the owning envelope payload.
+- `replication_peers` stores local transport health. It does not select or reject replicated authority.
+- `peer_cursors` and `peer_replica_cursors` remain only for old unit-test coverage. Production does not use them.
 - `capabilities` are local, short-lived authority. Claims can record their results but cannot reactivate them.
 - Resource observation claims own normalized external facts. Provider cursors and observer health cannot replace those facts.
 - Runtime files and runtime observation claims can disagree. The design must name the observation authority at each lifecycle boundary.

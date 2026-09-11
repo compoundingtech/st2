@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -18,14 +19,19 @@ use crate::model::{
     MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
     NormalizedIntent, PlannedAction, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
-    ReplicaRange, ReplicationBatch, ReplicationResponse, ResourceObservationOutcome,
-    ResourceRefreshOperation, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange,
-    SubjectStatus, SubscriptionSpec, WorkRequest, WorkSelector,
+    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
+    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
+    WorkRequest, WorkSelector,
 };
+#[cfg(test)]
+use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
 
@@ -40,9 +46,10 @@ CREATE TABLE IF NOT EXISTS batches (
     replica_sequence INTEGER NOT NULL,
     previous_hash TEXT,
     hash TEXT NOT NULL,
-    accepted_at_unix_ms TEXT NOT NULL,
-    UNIQUE(origin, replica_sequence)
+    accepted_at_unix_ms TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS batches_writer_sequence
+ON batches(origin, replica_sequence);
 
 CREATE TABLE IF NOT EXISTS claims (
     store_index INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +130,63 @@ CREATE TABLE IF NOT EXISTS peer_replica_cursors (
     origin TEXT NOT NULL,
     accepted_through INTEGER NOT NULL,
     PRIMARY KEY(peer, origin)
+);
+
+CREATE TABLE IF NOT EXISTS replica_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    previous_hash TEXT,
+    accepted_at_unix_ms TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    batch_id TEXT,
+    relay TEXT NOT NULL,
+    receipt_state TEXT NOT NULL CHECK(receipt_state IN ('pending','validated','degraded')),
+    validation_error TEXT,
+    received_at_unix_ms TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+CREATE INDEX IF NOT EXISTS replica_envelopes_state
+ON replica_envelopes(receipt_state, writer, sequence);
+
+CREATE TABLE IF NOT EXISTS replica_records (
+    record_ref TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    raw BLOB NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','valid','unknown','invalid','repaired')),
+    claim_id TEXT,
+    subject_hint TEXT,
+    kind_hint TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    replacement_claim_id TEXT,
+    updated_at_unix_ms TEXT NOT NULL,
+    UNIQUE(writer, sequence, envelope_hash, position)
+);
+CREATE INDEX IF NOT EXISTS replica_records_state
+ON replica_records(state, writer, sequence);
+
+CREATE TABLE IF NOT EXISTS projection_health (
+    aggregate TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('healthy','stale','indeterminate')),
+    last_good_store_index INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    error_message TEXT,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replication_peers (
+    peer TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK(status IN ('unknown','up','down','auth-failed')),
+    last_success_at_unix_ms TEXT,
+    last_error TEXT,
+    schema_digest TEXT,
+    authority_digest TEXT,
+    graph_digest TEXT,
+    updated_at_unix_ms TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (
@@ -235,8 +299,6 @@ CREATE TABLE IF NOT EXISTS revision_proposals (
     created_at_unix_ms TEXT NOT NULL,
     updated_at_unix_ms TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS revision_proposals_one_pending
-ON revision_proposals(run_id) WHERE status IN ('pending-approval','draining');
 CREATE TABLE IF NOT EXISTS planning_sessions (
     id TEXT PRIMARY KEY,
     mission_id TEXT NOT NULL,
@@ -273,12 +335,26 @@ CREATE TABLE IF NOT EXISTS planning_previews (
     created_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(session_id, variant)
 );
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;
 "#;
 
 pub struct Store {
     connection: Mutex<Connection>,
     origin: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReplicaEnvelopePayload {
+    batch: ReplicaBatch,
+    blobs: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReplicationAdmission {
+    pub valid: usize,
+    pub unknown: usize,
+    pub invalid: usize,
+    pub changed: bool,
 }
 
 struct ChildMissionContext {
@@ -296,12 +372,60 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10 | 11),
+        table_count == 0 || matches!(version, 10 | 11 | 12),
         "this database uses an unsupported st3 schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11),
+        matches!(version, 0 | 10 | 11 | 12),
         "this database uses unsupported st3 schema version {version}"
+    );
+    Ok(())
+}
+
+fn migrate_schema(connection: &Connection) -> Result<()> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 0 || version == 12 {
+        return Ok(());
+    }
+    if version == 10 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mission_run_deadlines (
+                 run_id TEXT PRIMARY KEY REFERENCES mission_runs(id),
+                 timeout_ms INTEGER NOT NULL,
+                 deadline_at_unix_ms TEXT NOT NULL
+             );
+             PRAGMA user_version = 11;",
+        )?;
+    }
+    connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA legacy_alter_table = ON;
+         BEGIN IMMEDIATE;
+         ALTER TABLE batches RENAME TO batches_schema_11;
+         CREATE TABLE batches (
+             id TEXT PRIMARY KEY,
+             origin TEXT NOT NULL,
+             replica_sequence INTEGER NOT NULL,
+             previous_hash TEXT,
+             hash TEXT NOT NULL,
+             accepted_at_unix_ms TEXT NOT NULL
+         );
+         INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms)
+         SELECT id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms
+         FROM batches_schema_11;
+         DROP TABLE batches_schema_11;
+         DROP INDEX IF EXISTS revision_proposals_one_pending;
+         COMMIT;
+         PRAGMA legacy_alter_table = OFF;
+         PRAGMA foreign_keys = ON;",
+    )?;
+    let failures: u64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    anyhow::ensure!(
+        failures == 0,
+        "the schema migration broke {failures} foreign keys"
     );
     Ok(())
 }
@@ -362,38 +486,44 @@ fn discovered_collection_items(
 
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
+        let origin = origin.into();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st3 database {}", path.display()))?;
         reject_old_schema(&connection)?;
+        migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
             rebuild_planning_tx(&transaction)?;
+            seed_replica_envelopes_tx(&transaction, &origin)?;
             transaction.commit()?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
-            origin: origin.into(),
+            origin,
         })
     }
 
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
+        let origin = origin.into();
         let mut connection = Connection::open_in_memory()?;
         reject_old_schema(&connection)?;
+        migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
             rebuild_planning_tx(&transaction)?;
+            seed_replica_envelopes_tx(&transaction, &origin)?;
             transaction.commit()?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
-            origin: origin.into(),
+            origin,
         })
     }
 
@@ -3174,6 +3304,28 @@ impl Store {
                 blockers.push(format!("resource `{}` does not exist", refresh.resource));
             }
         }
+        for repair in &intent.replica_repairs {
+            let repair_subject = format!(
+                "repair/{}",
+                repair
+                    .record_ref
+                    .strip_prefix("record/")
+                    .unwrap_or(&repair.record_ref)
+            );
+            tokens.insert(
+                repair_subject.clone(),
+                claim_ids_at(&connection, &repair_subject, Some(store_index)).map_err(internal)?,
+            );
+            match validate_replica_repair(&connection, repair) {
+                Ok(true) => actions.push(PlannedAction {
+                    subject: repair_subject,
+                    action: "repair-record".into(),
+                    reason: "the invalid record has no matching repair".into(),
+                }),
+                Ok(false) => {}
+                Err(error) => blockers.push(error.message),
+            }
+        }
 
         blockers.sort();
         blockers.dedup();
@@ -3320,6 +3472,28 @@ impl Store {
                 ));
             }
         }
+        for repair in &intent.replica_repairs {
+            let subject = format!(
+                "repair/{}",
+                repair
+                    .record_ref
+                    .strip_prefix("record/")
+                    .unwrap_or(&repair.record_ref)
+            );
+            let actual = claim_ids_at(&transaction, &subject, None).map_err(internal)?;
+            let expected = expected.get(&subject).ok_or_else(|| {
+                St3Error::new(
+                    "missing-subject-token",
+                    format!("apply omitted the subject token for `{subject}`"),
+                )
+            })?;
+            if &actual != expected {
+                return Err(St3Error::new(
+                    "stale-subject",
+                    format!("repair `{subject}` changed after planning"),
+                ));
+            }
+        }
         let desired_changed = intent.subjects.iter().any(|(subject, desired)| {
             current_desired_row_tx(&transaction, subject)
                 .map(|current| {
@@ -3429,6 +3603,9 @@ impl Store {
                 refresh,
             )?;
         }
+        for repair in &intent.replica_repairs {
+            operations_changed |= validate_replica_repair(&transaction, repair)?;
+        }
         let changed = desired_changed || missions_changed || operations_changed;
         if !changed {
             let store_index = current_index_tx(&transaction).map_err(internal)?;
@@ -3463,6 +3640,19 @@ impl Store {
                         .map_err(internal)?
                         .into_iter()
                         .collect(),
+                );
+            }
+            for repair in &intent.replica_repairs {
+                let subject = format!(
+                    "repair/{}",
+                    repair
+                        .record_ref
+                        .strip_prefix("record/")
+                        .unwrap_or(&repair.record_ref)
+                );
+                subject_tokens.insert(
+                    subject.clone(),
+                    claim_ids_at(&transaction, &subject, None).map_err(internal)?,
                 );
             }
             let response = ApplyResponse {
@@ -3840,6 +4030,56 @@ impl Store {
                 reason: "the refresh request was accepted".into(),
             });
         }
+        for repair in &intent.replica_repairs {
+            if !validate_replica_repair(&transaction, repair)? {
+                continue;
+            }
+            let record_id = repair
+                .record_ref
+                .strip_prefix("record/")
+                .unwrap_or(&repair.record_ref);
+            let subject = format!("repair/{record_id}");
+            let body = json!({
+                "fields": {
+                    "record": repair.record_ref,
+                    "replacement": repair.replacement_claim_id,
+                    "reason": repair.reason,
+                }
+            });
+            let claim = append_claim_tx(
+                &transaction,
+                &self.origin,
+                &subject,
+                "record.repaired",
+                actor,
+                &body,
+                &[],
+                Some(&batch_id),
+            )
+            .map_err(internal)?;
+            transaction
+                .execute(
+                    "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
+                        error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
+                     WHERE record_ref=?1 AND state IN ('invalid','unknown','repaired')",
+                    params![
+                        repair.record_ref,
+                        repair.replacement_claim_id,
+                        now_ms().to_string()
+                    ],
+                )
+                .map_err(internal)?;
+            claim_ids.push(claim.id);
+            tokens.insert(
+                subject.clone(),
+                claim_ids_at(&transaction, &subject, None).map_err(internal)?,
+            );
+            operation_receipts.push(PlannedAction {
+                subject,
+                action: "repair-record".into(),
+                reason: "the replacement claim resolved the invalid record".into(),
+            });
+        }
         let store_index = current_index_tx(&transaction).map_err(internal)?;
         let response = ApplyResponse {
             changed: true,
@@ -3997,10 +4237,7 @@ impl Store {
         self.append_claim_outcome(input).map(|(claim, _)| claim)
     }
 
-    fn append_claim_outcome(
-        &self,
-        input: &ClaimInput,
-    ) -> Result<(ClaimRecord, bool), St3Error> {
+    fn append_claim_outcome(&self, input: &ClaimInput) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         let operation = claim_operation(input)?;
         let mut connection = self.connection.lock().expect("store mutex poisoned");
@@ -5273,17 +5510,532 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn bind_fleet(&self, fleet_id: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let stored = connection
+            .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if let Some(stored) = stored {
+            anyhow::ensure!(
+                stored == fleet_id,
+                "this nonempty store belongs to fleet `{stored}`"
+            );
+            return Ok(());
+        }
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('fleet_id', ?1)",
+            [fleet_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        seed_replica_envelopes_tx(&transaction, &self.origin)?;
+        transaction.commit()?;
+        let mut statement = connection.prepare(
+            "SELECT writer, sequence, envelope_hash FROM replica_envelopes
+             ORDER BY writer, sequence, envelope_hash",
+        )?;
+        let envelopes = statement
+            .query_map([], |row| {
+                Ok(ReplicaEnvelopeId {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    hash: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReplicationInventory { envelopes })
+    }
+
+    pub fn export_replication_exchange(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+    ) -> Result<ReplicationExchange> {
+        let inventory = self.replication_inventory()?;
+        let known = remote.envelopes.iter().cloned().collect::<BTreeSet<_>>();
+        let missing = inventory
+            .envelopes
+            .iter()
+            .filter(|identity| !known.contains(*identity))
+            .take(512)
+            .cloned()
+            .collect::<Vec<_>>();
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let mut envelopes = Vec::with_capacity(missing.len());
+        for identity in missing {
+            let envelope = connection.query_row(
+                "SELECT previous_hash, accepted_at_unix_ms, payload
+                 FROM replica_envelopes
+                 WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                params![identity.writer, identity.sequence, identity.hash],
+                |row| {
+                    let accepted_at = row.get::<_, String>(1)?;
+                    Ok(ReplicaEnvelope {
+                        writer: identity.writer.clone(),
+                        sequence: identity.sequence,
+                        previous_hash: row.get(0)?,
+                        hash: identity.hash.clone(),
+                        accepted_at_unix_ms: accepted_at.parse().unwrap_or_default(),
+                        payload: row.get(2)?,
+                    })
+                },
+            )?;
+            envelopes.push(envelope);
+        }
+        Ok(ReplicationExchange {
+            peer: self.origin.clone(),
+            fleet_id: fleet_id.to_owned(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: authority_digest(&connection)?,
+            graph_digest: graph_digest(&connection)?,
+            inventory,
+            envelopes,
+        })
+    }
+
+    pub fn receive_replication_exchange(
+        &self,
+        relay: &str,
+        fleet_id: &str,
+        input: &ReplicationExchange,
+    ) -> Result<ReplicationReceipt, St3Error> {
+        if input.peer != relay {
+            return Err(St3Error::new(
+                "peer-label-mismatch",
+                "the authenticated peer label does not match the exchange label",
+            ));
+        }
+        if input.fleet_id != fleet_id {
+            return Err(St3Error::new(
+                "fleet-id-mismatch",
+                "the peer belongs to another fleet",
+            ));
+        }
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction().map_err(internal)?;
+        let mut received = 0;
+        let mut duplicate = 0;
+        let now = now_ms().to_string();
+        for envelope in &input.envelopes {
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO replica_envelopes(
+                         writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
+                         payload, relay, receipt_state, received_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                    params![
+                        envelope.writer,
+                        envelope.sequence,
+                        envelope.hash,
+                        envelope.previous_hash,
+                        envelope.accepted_at_unix_ms.to_string(),
+                        envelope.payload,
+                        relay,
+                        now,
+                    ],
+                )
+                .map_err(internal)?;
+            if inserted == 0 {
+                duplicate += 1;
+            } else {
+                received += 1;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, schema_digest,
+                                                authority_digest, graph_digest, updated_at_unix_ms)
+                 VALUES (?1, 'up', ?2, ?3, ?4, ?5, ?2)
+                 ON CONFLICT(peer) DO UPDATE SET status='up', last_success_at_unix_ms=excluded.last_success_at_unix_ms,
+                    last_error=NULL, schema_digest=excluded.schema_digest,
+                    authority_digest=excluded.authority_digest, graph_digest=excluded.graph_digest,
+                    updated_at_unix_ms=excluded.updated_at_unix_ms",
+                params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        drop(connection);
+        let inventory = self.replication_inventory().map_err(internal)?;
+        Ok(ReplicationReceipt {
+            received,
+            duplicate,
+            inventory,
+        })
+    }
+
+    pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms, payload
+             FROM replica_envelopes
+             WHERE receipt_state='pending'
+                OR EXISTS (
+                    SELECT 1 FROM replica_records
+                    WHERE replica_records.writer=replica_envelopes.writer
+                      AND replica_records.sequence=replica_envelopes.sequence
+                      AND replica_records.envelope_hash=replica_envelopes.envelope_hash
+                      AND replica_records.state='unknown'
+                )
+             ORDER BY writer, sequence, envelope_hash",
+        )?;
+        let envelopes = statement
+            .query_map([], |row| {
+                Ok(ReplicaEnvelope {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    hash: row.get(2)?,
+                    previous_hash: row.get(3)?,
+                    accepted_at_unix_ms: row.get::<_, String>(4)?.parse().unwrap_or_default(),
+                    payload: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut outcome = ReplicationAdmission::default();
+        for envelope in envelopes {
+            let transaction = connection.transaction()?;
+            let result = validate_and_admit_envelope_tx(&transaction, &envelope, &mut outcome);
+            match result {
+                Ok(()) => transaction.commit()?,
+                Err(error) => {
+                    transaction.rollback()?;
+                    let record_ref =
+                        replica_record_ref(&envelope.writer, envelope.sequence, &envelope.hash, 0);
+                    connection.execute(
+                        "INSERT INTO replica_records(
+                             record_ref, writer, sequence, envelope_hash, position, raw, state,
+                             error_code, error_message, updated_at_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, 'invalid', ?6, ?7, ?8)
+                         ON CONFLICT(record_ref) DO UPDATE SET state='invalid', error_code=excluded.error_code,
+                            error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![
+                            record_ref,
+                            envelope.writer,
+                            envelope.sequence,
+                            envelope.hash,
+                            envelope.payload,
+                            error.code,
+                            error.message,
+                            now_ms().to_string(),
+                        ],
+                    )?;
+                    connection.execute(
+                        "UPDATE replica_envelopes SET receipt_state='degraded', validation_error=?4
+                         WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+                        params![
+                            envelope.writer,
+                            envelope.sequence,
+                            envelope.hash,
+                            error.message
+                        ],
+                    )?;
+                    outcome.invalid += 1;
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub fn project_replication_backlog(&self) -> Result<bool> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let result = (|| -> Result<(), St3Error> {
+            rebuild_operations_tx(&transaction).map_err(internal)?;
+            project_replicated_base_claims(&transaction)?;
+            project_replicated_mission_runs(&transaction)?;
+            rebuild_planning_tx(&transaction).map_err(internal)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                transaction.execute(
+                    "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                     VALUES ('graph', 'healthy', ?1, ?2)
+                     ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=excluded.last_good_store_index,
+                        error_code=NULL, error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![current_index_tx(&transaction)?, now_ms().to_string()],
+                )?;
+                transaction.commit()?;
+                Ok(true)
+            }
+            Err(error) => {
+                transaction.rollback()?;
+                connection.execute(
+                    "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
+                     VALUES ('graph', 'stale', ?1, ?2, ?3)
+                     ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
+                        error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![error.code, error.message, now_ms().to_string()],
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn apply_replication_repairs(&self) -> Result<usize> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let transaction = connection.transaction()?;
+        let mut statement = transaction
+            .prepare("SELECT id, body FROM claims WHERE kind='record.repaired' ORDER BY id")?;
+        let repairs = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut changed = 0;
+        for (repair_claim, body) in repairs {
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
+                continue;
+            };
+            let replacement_exists = transaction
+                .query_row(
+                    "SELECT 1 FROM claims WHERE id=?1",
+                    [replacement],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !replacement_exists {
+                continue;
+            }
+            changed += transaction.execute(
+                "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
+                    error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
+                 WHERE record_ref=?1 AND state IN ('invalid','unknown','repaired')
+                   AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
+                params![record_ref, replacement, now_ms().to_string()],
+            )?;
+            transaction.execute(
+                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                 VALUES (?1, 'healthy', ?2, ?3)
+                 ON CONFLICT(aggregate) DO UPDATE SET status='healthy',
+                    last_good_store_index=excluded.last_good_store_index, error_code=NULL,
+                    error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                params![format!("repair:{record_ref}:{repair_claim}"), current_index_tx(&transaction)?, now_ms().to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn repair_replica_record(
+        &self,
+        record_ref: &str,
+        replacement_claim_id: &str,
+        reason: &str,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        {
+            let connection = self.connection.lock().expect("store mutex poisoned");
+            let state = connection
+                .query_row(
+                    "SELECT state FROM replica_records WHERE record_ref=?1",
+                    [record_ref],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "unknown-replica-record",
+                        "the replica record does not exist",
+                    )
+                })?;
+            if !matches!(state.as_str(), "invalid" | "unknown" | "repaired") {
+                return Err(St3Error::new(
+                    "record-does-not-need-repair",
+                    "only an invalid or unknown replica record can be repaired",
+                ));
+            }
+            let replacement_exists = connection
+                .query_row(
+                    "SELECT 1 FROM claims WHERE id=?1",
+                    [replacement_claim_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(internal)?
+                .is_some();
+            if !replacement_exists {
+                return Err(St3Error::new(
+                    "unknown-replacement-claim",
+                    "the replacement claim does not exist or is not valid",
+                ));
+            }
+        }
+        let record_id = record_ref.strip_prefix("record/").unwrap_or(record_ref);
+        let claim = self.append_claim(&ClaimInput {
+            subject: format!("repair/{record_id}"),
+            kind: "record.repaired".into(),
+            actor: Some(actor.into()),
+            fields: BTreeMap::from([
+                ("record".into(), Value::String(record_ref.into())),
+                (
+                    "replacement".into(),
+                    Value::String(replacement_claim_id.into()),
+                ),
+                ("reason".into(), Value::String(reason.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key.into()),
+        })?;
+        self.apply_replication_repairs().map_err(internal)?;
+        Ok(claim)
+    }
+
+    pub fn replica_records(&self, unresolved_only: bool) -> Result<Vec<ReplicaRecordView>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let filter = if unresolved_only {
+            " WHERE state IN ('invalid','unknown')"
+        } else {
+            ""
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT record_ref, writer, sequence, envelope_hash, position, state, claim_id,
+                    subject_hint, kind_hint, error_code, error_message, replacement_claim_id
+             FROM replica_records{filter} ORDER BY writer, sequence, envelope_hash, position"
+        ))?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(ReplicaRecordView {
+                    record_ref: row.get(0)?,
+                    writer: row.get(1)?,
+                    sequence: row.get(2)?,
+                    envelope_hash: row.get(3)?,
+                    position: row.get(4)?,
+                    state: row.get(5)?,
+                    claim_id: row.get(6)?,
+                    subject: row.get(7)?,
+                    kind: row.get(8)?,
+                    error_code: row.get(9)?,
+                    error_message: row.get(10)?,
+                    replacement_claim_id: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn replica_record(&self, record_ref: &str) -> Result<Option<ReplicaRecordView>> {
+        Ok(self
+            .replica_records(false)?
+            .into_iter()
+            .find(|record| record.record_ref == record_ref))
+    }
+
+    pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
+                updated_at_unix_ms=excluded.updated_at_unix_ms",
+            params![peer, status, error, now_ms().to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn replication_status(
+        &self,
+        configured: bool,
+        fleet_id: Option<&str>,
+        configured_peers: &[String],
+    ) -> Result<ReplicationStatus> {
+        let _ = self.replication_inventory()?;
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let count = |state: &str| -> Result<u64> {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM replica_records WHERE state=?1",
+                [state],
+                |row| row.get(0),
+            )?)
+        };
+        let mut peers = Vec::new();
+        for peer in configured_peers {
+            peers.push(
+                connection
+                    .query_row(
+                        "SELECT status, last_success_at_unix_ms, last_error, schema_digest,
+                                authority_digest, graph_digest
+                         FROM replication_peers WHERE peer=?1",
+                        [peer],
+                        |row| {
+                            Ok(ReplicationPeerStatus {
+                                peer: peer.clone(),
+                                status: row.get(0)?,
+                                last_success_at_unix_ms: row
+                                    .get::<_, Option<String>>(1)?
+                                    .and_then(|value| value.parse().ok()),
+                                last_error: row.get(2)?,
+                                schema_digest: row.get(3)?,
+                                authority_digest: row.get(4)?,
+                                graph_digest: row.get(5)?,
+                            })
+                        },
+                    )
+                    .optional()?
+                    .unwrap_or(ReplicationPeerStatus {
+                        peer: peer.clone(),
+                        status: "unknown".into(),
+                        last_success_at_unix_ms: None,
+                        last_error: None,
+                        schema_digest: None,
+                        authority_digest: None,
+                        graph_digest: None,
+                    }),
+            );
+        }
+        Ok(ReplicationStatus {
+            configured,
+            fleet_id: fleet_id.map(str::to_owned),
+            authority_digest: authority_digest(&connection)?,
+            graph_digest: graph_digest(&connection)?,
+            received_envelopes: connection.query_row(
+                "SELECT COUNT(*) FROM replica_envelopes",
+                [],
+                |row| row.get(0),
+            )?,
+            pending_records: count("pending")?,
+            valid_records: count("valid")?,
+            unknown_records: count("unknown")?,
+            invalid_records: count("invalid")?,
+            repaired_records: count("repaired")?,
+            unhealthy_projections: connection.query_row(
+                "SELECT COUNT(*) FROM projection_health WHERE status<>'healthy'",
+                [],
+                |row| row.get(0),
+            )?,
+            peers,
+        })
+    }
+
+    #[cfg(test)]
     pub fn export_replication(&self, after_sequence: u64) -> Result<ReplicationBatch> {
         let mut heads = self.replica_heads()?;
         heads.insert(self.origin.clone(), after_sequence);
         self.export_replication_for_heads(&heads)
     }
 
+    #[cfg(test)]
     pub fn replica_heads(&self) -> Result<BTreeMap<String, u64>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         replica_heads(&connection)
     }
 
+    #[cfg(test)]
     pub fn export_replication_for_heads(
         &self,
         heads: &BTreeMap<String, u64>,
@@ -5340,6 +6092,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub fn peer_cursor(&self, peer: &str) -> Result<u64> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection
@@ -5352,6 +6105,7 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn import_replication(
         &self,
         relay: &str,
@@ -7794,6 +8548,23 @@ fn has_unknown_claim_at(
     subject: &str,
     at_index: Option<u64>,
 ) -> Result<Option<String>> {
+    if at_index.is_none() {
+        let unresolved = connection
+            .query_row(
+                "SELECT state, kind_hint FROM replica_records
+                 WHERE subject_hint=?1 AND state IN ('unknown','invalid')
+                 ORDER BY record_ref LIMIT 1",
+                [subject],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        if let Some((state, kind)) = unresolved {
+            return Ok(Some(format!(
+                "replica-{state}:{}",
+                kind.unwrap_or_else(|| "unknown-kind".into())
+            )));
+        }
+    }
     let through = at_index.unwrap_or(i64::MAX as u64);
     let conflict = connection
         .query_row(
@@ -8079,6 +8850,7 @@ fn current_index(connection: &Connection) -> Result<u64> {
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn replica_heads(connection: &Connection) -> Result<BTreeMap<String, u64>> {
     let mut statement = connection.prepare(
         "SELECT origin, MAX(replica_sequence) FROM batches GROUP BY origin ORDER BY origin",
@@ -8363,6 +9135,275 @@ fn claim_append_error(error: anyhow::Error) -> St3Error {
     }
 }
 
+fn validate_replica_repair(
+    connection: &Connection,
+    repair: &ReplicaRepairDeclaration,
+) -> Result<bool, St3Error> {
+    let state = connection
+        .query_row(
+            "SELECT state FROM replica_records WHERE record_ref=?1",
+            [&repair.record_ref],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .ok_or_else(|| {
+            St3Error::new(
+                "unknown-replica-record",
+                format!("replica record `{}` does not exist", repair.record_ref),
+            )
+        })?;
+    if !matches!(state.as_str(), "invalid" | "unknown" | "repaired") {
+        return Err(St3Error::new(
+            "record-does-not-need-repair",
+            format!("replica record `{}` is {state}", repair.record_ref),
+        ));
+    }
+    let replacement_exists = connection
+        .query_row(
+            "SELECT 1 FROM claims WHERE id=?1",
+            [&repair.replacement_claim_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(internal)?
+        .is_some();
+    if !replacement_exists {
+        return Err(St3Error::new(
+            "unknown-replacement-claim",
+            format!(
+                "replacement claim `{}` does not exist or is not valid",
+                repair.replacement_claim_id
+            ),
+        ));
+    }
+    let subject = format!(
+        "repair/{}",
+        repair
+            .record_ref
+            .strip_prefix("record/")
+            .unwrap_or(&repair.record_ref)
+    );
+    let mut statement = connection
+        .prepare("SELECT body FROM claims WHERE subject=?1 AND kind='record.repaired' ORDER BY id")
+        .map_err(internal)?;
+    let bodies = statement
+        .query_map([subject], |row| row.get::<_, String>(0))
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    for body in bodies {
+        let body: Value = serde_json::from_str(&body).map_err(internal)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let same = fields.get("record").and_then(Value::as_str) == Some(repair.record_ref.as_str())
+            && fields.get("replacement").and_then(Value::as_str)
+                == Some(repair.replacement_claim_id.as_str())
+            && fields.get("reason").and_then(Value::as_str) == Some(repair.reason.as_str());
+        if same {
+            return Ok(false);
+        }
+        return Err(St3Error::new(
+            "conflicting-repair",
+            format!(
+                "replica record `{}` already has another repair",
+                repair.record_ref
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn seed_replica_envelopes_tx(transaction: &Transaction<'_>, relay: &str) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms
+         FROM batches
+         WHERE NOT EXISTS (
+             SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id
+         )
+         ORDER BY origin, replica_sequence, id",
+    )?;
+    let headers = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (id, writer, sequence, previous_hash, legacy_hash, accepted_at) in headers {
+        let mut claim_statement = transaction.prepare(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE batch_id=?1 ORDER BY store_index",
+        )?;
+        let claims = claim_statement
+            .query_map([&id], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(claim_statement);
+        let mut blobs = BTreeMap::new();
+        collect_referenced_blobs(transaction, &claims, &mut blobs)?;
+        let batch = ReplicaBatch {
+            id: id.clone(),
+            origin: writer.clone(),
+            replica_sequence: sequence,
+            previous_hash: previous_hash.clone(),
+            hash: legacy_hash,
+            accepted_at_unix_ms: accepted_at.parse().unwrap_or_default(),
+            claims: claims.clone(),
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&ReplicaEnvelopePayload { batch, blobs }, &mut payload)?;
+        let envelope_hash = replica_envelope_hash(
+            &writer,
+            sequence,
+            previous_hash.as_deref(),
+            accepted_at.parse().unwrap_or_default(),
+            &payload,
+        );
+        let encoded_payload = base64::engine::general_purpose::STANDARD.encode(&payload);
+        transaction.execute(
+            "INSERT OR IGNORE INTO replica_envelopes(
+                 writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
+                 payload, batch_id, relay, receipt_state, received_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'validated', ?5)",
+            params![
+                writer,
+                sequence,
+                envelope_hash,
+                previous_hash,
+                accepted_at,
+                encoded_payload,
+                id,
+                relay
+            ],
+        )?;
+        for (position, claim) in claims.iter().enumerate() {
+            let mut raw = Vec::new();
+            ciborium::into_writer(claim, &mut raw)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO replica_records(
+                     record_ref, writer, sequence, envelope_hash, position, raw, state,
+                     claim_id, subject_hint, kind_hint, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, ?10)",
+                params![
+                    replica_record_ref(&writer, sequence, &envelope_hash, position as u64),
+                    writer,
+                    sequence,
+                    envelope_hash,
+                    position as u64,
+                    raw,
+                    claim.id,
+                    claim.subject,
+                    claim.kind,
+                    accepted_at,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn replica_envelope_hash(
+    writer: &str,
+    sequence: u64,
+    previous_hash: Option<&str>,
+    accepted_at_unix_ms: u128,
+    payload: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"st3-replica-envelope-v1\0");
+    for field in [
+        writer.to_owned(),
+        sequence.to_string(),
+        previous_hash.unwrap_or_default().to_owned(),
+        accepted_at_unix_ms.to_string(),
+        hex::encode(Sha256::digest(payload)),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position: u64) -> String {
+    let digest = Sha256::digest(
+        format!("st3-replica-record-v1\0{writer}\0{sequence}\0{envelope_hash}\0{position}")
+            .as_bytes(),
+    );
+    format!("record/{}", hex::encode(digest))
+}
+
+fn authority_digest(connection: &Connection) -> Result<String> {
+    digest_queries(
+        connection,
+        &[(
+            "envelopes",
+            "SELECT json_array(writer, sequence, envelope_hash, previous_hash, hex(payload))
+             FROM replica_envelopes ORDER BY writer, sequence, envelope_hash",
+        )],
+    )
+}
+
+fn graph_digest(connection: &Connection) -> Result<String> {
+    digest_queries(
+        connection,
+        &[
+            (
+                "desired",
+                "SELECT json_array(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step)
+                 FROM desired ORDER BY subject",
+            ),
+            (
+                "missions",
+                "SELECT json_array(mission_id, revision, state, claim_id)
+                 FROM mission_definitions ORDER BY mission_id",
+            ),
+            (
+                "runs",
+                "SELECT json_array(id, mission_id, current_generation_id, status, phase)
+                 FROM mission_runs ORDER BY id",
+            ),
+            (
+                "generations",
+                "SELECT json_array(id, run_id, revision, predecessor_id, status)
+                 FROM run_generations ORDER BY id",
+            ),
+            (
+                "steps",
+                "SELECT json_array(subject, generation_id, step_path, status, attempt, lease_owner, blocked_reason)
+                 FROM step_runs ORDER BY subject",
+            ),
+            (
+                "proposals",
+                "SELECT json_array(id, run_id, source_generation_id, candidate_revision, status, approvals, successor_generation_id)
+                 FROM revision_proposals ORDER BY id",
+            ),
+        ],
+    )
+}
+
+fn digest_queries(connection: &Connection, queries: &[(&str, &str)]) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"st3-logical-digest-v1\0");
+    for (name, query) in queries {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        let mut statement = connection.prepare(query)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in rows {
+            digest.update((row.len() as u64).to_be_bytes());
+            digest.update(row.as_bytes());
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn collect_referenced_blobs(
     connection: &Connection,
     claims: &[ClaimRecord],
@@ -8456,7 +9497,253 @@ fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
     Ok(())
 }
 
-fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
+fn validate_and_admit_envelope_tx(
+    transaction: &Transaction<'_>,
+    envelope: &ReplicaEnvelope,
+    outcome: &mut ReplicationAdmission,
+) -> Result<(), St3Error> {
+    let payload_bytes = base64::engine::general_purpose::STANDARD
+        .decode(envelope.payload.as_bytes())
+        .map_err(|error| {
+            St3Error::new(
+                "invalid-envelope-payload",
+                format!("the envelope payload is not valid base64: {error}"),
+            )
+        })?;
+    let expected_hash = replica_envelope_hash(
+        &envelope.writer,
+        envelope.sequence,
+        envelope.previous_hash.as_deref(),
+        envelope.accepted_at_unix_ms,
+        &payload_bytes,
+    );
+    if expected_hash != envelope.hash {
+        return Err(St3Error::new(
+            "envelope-hash-mismatch",
+            "the envelope hash does not match its payload",
+        ));
+    }
+    let payload: ReplicaEnvelopePayload =
+        ciborium::from_reader(payload_bytes.as_slice()).map_err(|error| {
+            St3Error::new(
+                "invalid-envelope-payload",
+                format!("the envelope payload is not valid CBOR: {error}"),
+            )
+        })?;
+    let batch = &payload.batch;
+    if batch.origin != envelope.writer
+        || batch.replica_sequence != envelope.sequence
+        || batch.previous_hash != envelope.previous_hash
+        || batch.accepted_at_unix_ms != envelope.accepted_at_unix_ms
+    {
+        return Err(St3Error::new(
+            "envelope-batch-mismatch",
+            "the envelope and its batch identify different writes",
+        ));
+    }
+    verify_replica_batch_header(batch)?;
+    let now = now_ms().to_string();
+    let mut degraded = false;
+    for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
+        let position = batch.claims.len() as u64 + offset as u64;
+        let record_ref = replica_record_ref(
+            &envelope.writer,
+            envelope.sequence,
+            &envelope.hash,
+            position,
+        );
+        let valid = hex::encode(Sha256::digest(bytes)) == *hash;
+        let previous_state = transaction
+            .query_row(
+                "SELECT state FROM replica_records WHERE record_ref=?1",
+                [&record_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if valid {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
+                    params![hash, bytes, bytes.len() as u64],
+                )
+                .map_err(internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO replica_records(
+                         record_ref, writer, sequence, envelope_hash, position, raw, state,
+                         subject_hint, kind_hint, updated_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, 'blob', ?8)
+                     ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'valid' END,
+                        subject_hint=excluded.subject_hint,
+                            kind_hint='blob',
+                            error_code=CASE WHEN state='repaired' THEN error_code ELSE NULL END,
+                            error_message=CASE WHEN state='repaired' THEN error_message ELSE NULL END,
+                        updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![
+                        record_ref,
+                        envelope.writer,
+                        envelope.sequence,
+                        envelope.hash,
+                        position,
+                        bytes,
+                        format!("blob/{hash}"),
+                        now_ms().to_string(),
+                    ],
+                )
+                .map_err(internal)?;
+            outcome.valid += 1;
+            outcome.changed |= previous_state.as_deref() != Some("valid");
+        } else {
+            degraded = true;
+            transaction
+                .execute(
+                    "INSERT INTO replica_records(
+                         record_ref, writer, sequence, envelope_hash, position, raw, state,
+                         subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, 'blob',
+                               'blob-hash-mismatch', ?8, ?9)
+                     ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
+                        subject_hint=excluded.subject_hint, kind_hint='blob', error_code=excluded.error_code,
+                        error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![
+                        record_ref,
+                        envelope.writer,
+                        envelope.sequence,
+                        envelope.hash,
+                        position,
+                        bytes,
+                        format!("blob/{hash}"),
+                        format!("replicated blob `{hash}` failed verification"),
+                        now_ms().to_string(),
+                    ],
+                )
+                .map_err(internal)?;
+            outcome.invalid += 1;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                batch.id,
+                batch.origin,
+                batch.replica_sequence,
+                batch.previous_hash,
+                batch.hash,
+                batch.accepted_at_unix_ms.to_string(),
+            ],
+        )
+        .map_err(internal)?;
+    for (position, claim) in batch.claims.iter().enumerate() {
+        let position = position as u64;
+        let record_ref = replica_record_ref(
+            &envelope.writer,
+            envelope.sequence,
+            &envelope.hash,
+            position,
+        );
+        let mut raw = Vec::new();
+        ciborium::into_writer(claim, &mut raw).map_err(internal)?;
+        let previous_state = transaction
+            .query_row(
+                "SELECT state FROM replica_records WHERE record_ref=?1",
+                [&record_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        let classification = validate_replicated_claim(transaction, batch, claim);
+        match classification {
+            Ok(true) => {
+                let inserted = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            claim.id,
+                            claim.batch_id,
+                            claim.subject,
+                            claim.kind,
+                            claim.origin,
+                            claim.actor,
+                            serde_json::to_string(&claim.body).map_err(internal)?,
+                            serde_json::to_string(&claim.predecessors).map_err(internal)?,
+                            claim.accepted_at_unix_ms.to_string(),
+                        ],
+                    )
+                    .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO replica_records(
+                             record_ref, writer, sequence, envelope_hash, position, raw, state,
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'valid', ?7, ?8, ?9, NULL, NULL, ?10)
+                         ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'valid' END,
+                            claim_id=excluded.claim_id,
+                            subject_hint=excluded.subject_hint, kind_hint=excluded.kind_hint,
+                            error_code=CASE WHEN state='repaired' THEN error_code ELSE NULL END,
+                            error_message=CASE WHEN state='repaired' THEN error_message ELSE NULL END,
+                            updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now],
+                    )
+                    .map_err(internal)?;
+                outcome.valid += 1;
+                outcome.changed |= inserted != 0 || previous_state.as_deref() != Some("valid");
+            }
+            Ok(false) => {
+                degraded = true;
+                transaction
+                    .execute(
+                        "INSERT INTO replica_records(
+                             record_ref, writer, sequence, envelope_hash, position, raw, state,
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', ?7, ?8, ?9,
+                                   'unknown-claim-kind', 'this st3 build does not know the claim kind', ?10)
+                         ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'unknown' END,
+                            error_code=CASE WHEN state='repaired' THEN error_code ELSE 'unknown-claim-kind' END,
+                            error_message='this st3 build does not know the claim kind', updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, now],
+                    )
+                    .map_err(internal)?;
+                outcome.unknown += 1;
+            }
+            Err(error) => {
+                degraded = true;
+                transaction
+                    .execute(
+                        "INSERT INTO replica_records(
+                             record_ref, writer, sequence, envelope_hash, position, raw, state,
+                             claim_id, subject_hint, kind_hint, error_code, error_message, updated_at_unix_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'invalid', ?7, ?8, ?9, ?10, ?11, ?12)
+                         ON CONFLICT(record_ref) DO UPDATE SET state=CASE WHEN state='repaired' THEN state ELSE 'invalid' END,
+                            error_code=excluded.error_code, error_message=excluded.error_message,
+                            updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![record_ref, envelope.writer, envelope.sequence, envelope.hash, position, raw, claim.id, claim.subject, claim.kind, error.code, error.message, now],
+                    )
+                    .map_err(internal)?;
+                outcome.invalid += 1;
+            }
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE replica_envelopes SET receipt_state=?4, validation_error=NULL, batch_id=?5
+             WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
+            params![
+                envelope.writer,
+                envelope.sequence,
+                envelope.hash,
+                if degraded { "degraded" } else { "validated" },
+                batch.id,
+            ],
+        )
+        .map_err(internal)?;
+    Ok(())
+}
+
+fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), St3Error> {
     let expected_batch = batch_header_hash(
         &batch.origin,
         batch.replica_sequence,
@@ -8476,6 +9763,113 @@ fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
             format!("replicated batch `{}` failed verification", batch.id),
         ));
     }
+    Ok(())
+}
+
+fn validate_replicated_claim(
+    transaction: &Transaction<'_>,
+    batch: &ReplicaBatch,
+    claim: &ClaimRecord,
+) -> Result<bool, St3Error> {
+    if claim.batch_id != batch.id || claim.origin != batch.origin {
+        return Err(St3Error::new(
+            "claim-batch-mismatch",
+            format!(
+                "replicated claim `{}` names another batch or writer",
+                claim.id
+            ),
+        ));
+    }
+    let expected = claim_hash(
+        &claim.batch_id,
+        &claim.subject,
+        &claim.kind,
+        &claim.origin,
+        claim.actor.as_deref(),
+        &claim.body,
+        &claim.predecessors,
+    )
+    .map_err(internal)?;
+    if expected != claim.id {
+        return Err(St3Error::new(
+            "claim-hash-mismatch",
+            format!("replicated claim `{}` failed verification", claim.id),
+        ));
+    }
+    if !known_replicated_claim_kind(&claim.kind) {
+        return Ok(false);
+    }
+    let fields = schema_fields_for_body(&claim.kind, &claim.body).map_err(|error| {
+        St3Error::new(
+            "invalid-replicated-claim",
+            format!(
+                "replicated claim `{}` has an invalid body: {error}",
+                claim.id
+            ),
+        )
+    })?;
+    st3_schema::registry()
+        .validate_claim(&claim.subject, &claim.kind, &fields)
+        .map_err(|error| {
+            St3Error::new(
+                "invalid-replicated-claim",
+                format!(
+                    "replicated claim `{}` violates {}: {}",
+                    claim.id, error.code, error.message
+                ),
+            )
+        })?;
+    ensure_claim_blobs(transaction, claim)?;
+    Ok(true)
+}
+
+fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                    claims.origin, claims.actor, claims.body, claims.predecessors,
+                    claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+                      batches.origin, batches.replica_sequence,
+                      COALESCE((SELECT MIN(position) FROM replica_records
+                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
+        )
+        .map_err(internal)?;
+    let claims = statement
+        .query_map([], claim_from_row)
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
+    for claim in claims {
+        insert_event(
+            transaction,
+            claim.store_index,
+            &claim.kind,
+            &claim.subject,
+            &claim.body,
+        )
+        .map_err(internal)?;
+        match claim.kind.as_str() {
+            "intent.desired" => {
+                let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                    .map_err(internal)?;
+                select_replicated_desired(transaction, &claim, &desired)?;
+            }
+            "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
+            "mission.published" => {
+                select_replicated_mission(transaction, &claim, claim.store_index)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn verify_replica_batch(batch: &ReplicaBatch) -> Result<(), St3Error> {
+    verify_replica_batch_header(batch)?;
     for claim in &batch.claims {
         if claim.batch_id != batch.id || claim.origin != batch.origin {
             return Err(St3Error::new(
@@ -8572,13 +9966,18 @@ fn select_replicated_desired(
 fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims
+            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+                    claims.origin, claims.actor, claims.body, claims.predecessors,
+                    claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE kind IN ('mission-run.created','mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                             'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                             'step-run.carried','step-run.state','step-run.retried',
                             'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')
-             ORDER BY store_index",
+             ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+                      batches.origin, batches.replica_sequence,
+                      COALESCE((SELECT MIN(position) FROM replica_records
+                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
         )
         .map_err(internal)?;
     let claims = statement
@@ -8962,10 +10361,20 @@ fn project_revision_proposal(
             .map_err(internal)?
             .unwrap_or_default();
         approvals.insert(reviewer.to_owned());
-        let draining = fields
-            .get("all_approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let terminal = transaction
+            .query_row(
+                "SELECT status IN ('applied','cancelled') FROM revision_proposals WHERE id=?1",
+                [proposal_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .unwrap_or(false);
+        let draining = !terminal
+            && fields
+                .get("all_approved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
             && transaction
                 .query_row(
                     "SELECT cutover='when-idle' FROM revision_proposals WHERE id=?1",
@@ -10436,6 +11845,64 @@ fn step_generation_is_current(
 mod tests {
     use super::*;
     use crate::graph::parse_test_intent as parse_intent;
+    use proptest::prelude::*;
+
+    const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    fn rewrite_envelope(
+        envelope: &ReplicaEnvelope,
+        update: impl FnOnce(&mut ReplicaEnvelopePayload),
+    ) -> ReplicaEnvelope {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(envelope.payload.as_bytes())
+            .expect("envelope base64");
+        let mut payload: ReplicaEnvelopePayload =
+            ciborium::from_reader(bytes.as_slice()).expect("envelope CBOR");
+        update(&mut payload);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).expect("updated envelope CBOR");
+        ReplicaEnvelope {
+            hash: replica_envelope_hash(
+                &envelope.writer,
+                envelope.sequence,
+                envelope.previous_hash.as_deref(),
+                envelope.accepted_at_unix_ms,
+                &bytes,
+            ),
+            payload: base64::engine::general_purpose::STANDARD.encode(bytes),
+            ..envelope.clone()
+        }
+    }
+
+    fn receive_and_project(
+        target: &Store,
+        relay: &str,
+        exchange: &ReplicationExchange,
+    ) -> ReplicationAdmission {
+        target.bind_fleet(TEST_FLEET).expect("target fleet");
+        target
+            .receive_replication_exchange(relay, TEST_FLEET, exchange)
+            .expect("replication receipt");
+        let admission = target
+            .validate_replication_backlog()
+            .expect("replication admission");
+        target
+            .apply_replication_repairs()
+            .expect("replication repairs");
+        assert!(
+            target
+                .project_replication_backlog()
+                .expect("replication projection")
+        );
+        admission
+    }
+
+    fn exchange_from(source: &Store, remote: &ReplicationInventory) -> ReplicationExchange {
+        source.bind_fleet(TEST_FLEET).expect("source fleet");
+        source
+            .export_replication_exchange(TEST_FLEET, remote)
+            .expect("replication exchange")
+    }
 
     fn simple(command: &str) -> NormalizedIntent {
         parse_intent(
@@ -11943,6 +13410,483 @@ version 2
     }
 
     #[test]
+    fn replay_keeps_an_applied_proposal_terminal_beside_a_pending_proposal() {
+        let source = Store::open_memory("source").unwrap();
+        let publish = |goal: &str, key: &str| {
+            let kdl = format!(
+                r#"
+version 2
+
+mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
+  goal "Keep proposal states monotonic."
+  agent "owner" {{ workspace "."; command "true" }}
+  step "work" {{ goal {goal:?} }}
+}}
+"#
+            );
+            publish_mission(&source, &kdl, key)
+        };
+        let first = publish("Use the first goal.", "proposal-replay-one");
+        let run = source
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id,
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "proposal-replay-run".into(),
+            })
+            .unwrap();
+        let owner = format!("agent/{}/owner", run.id);
+        let second = publish("Use the second goal.", "proposal-replay-two");
+        let applied = source
+            .create_revision_proposal(
+                &run.id,
+                &second,
+                &owner,
+                "apply the first revision",
+                "proposal-replay-create-a",
+            )
+            .unwrap();
+        source
+            .approve_revision_proposal(
+                &applied.id,
+                "person/reviewer",
+                applied.preview_hash.as_deref().unwrap(),
+                "proposal-replay-approve-a",
+            )
+            .unwrap();
+        assert_eq!(
+            source
+                .revision_proposal(&applied.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+
+        let third = publish("Use the third goal.", "proposal-replay-three");
+        let pending = source
+            .create_revision_proposal(
+                &run.id,
+                &third,
+                &owner,
+                "leave the next revision pending",
+                "proposal-replay-create-b",
+            )
+            .unwrap();
+
+        let target = Store::open_memory("target").unwrap();
+        let exchange = exchange_from(&source, &ReplicationInventory::default());
+        receive_and_project(&target, "source", &exchange);
+        for _ in 0..3 {
+            assert!(target.project_replication_backlog().unwrap());
+        }
+        assert_eq!(
+            target
+                .revision_proposal(&applied.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+        assert_eq!(
+            target
+                .revision_proposal(&pending.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending-approval"
+        );
+    }
+
+    #[test]
+    fn one_invalid_claim_does_not_block_its_valid_sibling_or_later_envelopes() {
+        let source = Store::open_memory("source").unwrap();
+        let valid = source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("valid-sibling".into()),
+            })
+            .unwrap();
+        let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+        let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
+            let mut invalid = payload.batch.claims[0].clone();
+            invalid.body["fields"]["unexpected"] = Value::Bool(true);
+            invalid.id = claim_hash(
+                &invalid.batch_id,
+                &invalid.subject,
+                &invalid.kind,
+                &invalid.origin,
+                invalid.actor.as_deref(),
+                &invalid.body,
+                &invalid.predecessors,
+            )
+            .unwrap();
+            payload.batch.claims.push(invalid);
+        });
+        exchange.envelopes = vec![candidate.clone()];
+        exchange.inventory.envelopes = vec![ReplicaEnvelopeId {
+            writer: candidate.writer.clone(),
+            sequence: candidate.sequence,
+            hash: candidate.hash.clone(),
+        }];
+
+        let target = Store::open_memory("target").unwrap();
+        let admission = receive_and_project(&target, "source", &exchange);
+        assert_eq!(admission.valid, 1);
+        assert_eq!(admission.invalid, 1);
+        assert_eq!(
+            target
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            valid.id
+        );
+        assert_eq!(
+            target.status(Some("host/source")).unwrap().subjects[0].reachability,
+            "indeterminate"
+        );
+
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/later".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("later-envelope".into()),
+            })
+            .unwrap();
+        let later = exchange_from(&source, &target.replication_inventory().unwrap());
+        receive_and_project(&target, "source", &later);
+        assert!(
+            target
+                .latest_claim("host/later", Some("transport.observed"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_invalid_blob_does_not_block_an_unrelated_valid_claim() {
+        let source = Store::open_memory("source").unwrap();
+        let valid = source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("valid-beside-invalid-blob".into()),
+            })
+            .unwrap();
+        let exchange = exchange_from(&source, &ReplicationInventory::default());
+        let candidate = rewrite_envelope(&exchange.envelopes[0], |payload| {
+            payload
+                .blobs
+                .insert("0".repeat(64), b"wrong bytes".to_vec());
+        });
+        let input = ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: TEST_FLEET.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory {
+                envelopes: vec![ReplicaEnvelopeId {
+                    writer: candidate.writer.clone(),
+                    sequence: candidate.sequence,
+                    hash: candidate.hash.clone(),
+                }],
+            },
+            envelopes: vec![candidate],
+        };
+
+        let target = Store::open_memory("target").unwrap();
+        let admission = receive_and_project(&target, "source", &input);
+        assert_eq!(admission.valid, 1);
+        assert_eq!(admission.invalid, 1);
+        assert_eq!(
+            target
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            valid.id
+        );
+        let records = target.replica_records(true).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind.as_deref(), Some("blob"));
+        assert_eq!(records[0].error_code.as_deref(), Some("blob-hash-mismatch"));
+    }
+
+    #[test]
+    fn same_sequence_candidates_converge_in_any_receipt_order() {
+        let source = Store::open_memory("source").unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("candidate-source".into()),
+            })
+            .unwrap();
+        let original =
+            exchange_from(&source, &ReplicationInventory::default()).envelopes[0].clone();
+        let fork = rewrite_envelope(&original, |payload| {
+            let claim = &mut payload.batch.claims[0];
+            claim.kind = "future.transport-observed".into();
+            claim.id = claim_hash(
+                &claim.batch_id,
+                &claim.subject,
+                &claim.kind,
+                &claim.origin,
+                claim.actor.as_deref(),
+                &claim.body,
+                &claim.predecessors,
+            )
+            .unwrap();
+        });
+        let make_exchange = |envelopes: Vec<ReplicaEnvelope>| ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: TEST_FLEET.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory {
+                envelopes: envelopes
+                    .iter()
+                    .map(|envelope| ReplicaEnvelopeId {
+                        writer: envelope.writer.clone(),
+                        sequence: envelope.sequence,
+                        hash: envelope.hash.clone(),
+                    })
+                    .collect(),
+            },
+            envelopes,
+        };
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        receive_and_project(
+            &left,
+            "source",
+            &make_exchange(vec![original.clone(), fork.clone()]),
+        );
+        receive_and_project(&right, "source", &make_exchange(vec![fork, original]));
+        let left_status = left
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        let right_status = right
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        assert_eq!(left_status.received_envelopes, 2);
+        assert_eq!(left_status.authority_digest, right_status.authority_digest);
+        assert_eq!(left_status.graph_digest, right_status.graph_digest);
+        assert_eq!(left_status.unknown_records, 1);
+        assert_eq!(right_status.unknown_records, 1);
+    }
+
+    #[test]
+    fn concurrent_graph_writes_converge_after_a_partition() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let initial = simple("true");
+        let initial_preview = left
+            .mission(
+                &initial,
+                IntentInput {
+                    kdl: "initial".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        left.apply(&initial, &initial_preview.subject_tokens, "initial")
+            .unwrap();
+        let initial_exchange = exchange_from(&left, &ReplicationInventory::default());
+        receive_and_project(&right, "left", &initial_exchange);
+
+        let left_change = simple("printf-left");
+        let left_preview = left
+            .mission(
+                &left_change,
+                IntentInput {
+                    kdl: "left".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        left.apply(&left_change, &left_preview.subject_tokens, "left-change")
+            .unwrap();
+
+        let right_change = simple("printf-right");
+        let right_preview = right
+            .mission(
+                &right_change,
+                IntentInput {
+                    kdl: "right".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        right
+            .apply(&right_change, &right_preview.subject_tokens, "right-change")
+            .unwrap();
+
+        let to_right = exchange_from(&left, &right.replication_inventory().unwrap());
+        receive_and_project(&right, "left", &to_right);
+        let to_left = exchange_from(&right, &left.replication_inventory().unwrap());
+        receive_and_project(&left, "right", &to_left);
+
+        let left_status = left
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        let right_status = right
+            .replication_status(true, Some(TEST_FLEET), &[])
+            .unwrap();
+        assert_eq!(left_status.authority_digest, right_status.authority_digest);
+        assert_eq!(left_status.graph_digest, right_status.graph_digest);
+        assert_eq!(
+            left.selected_desired_revision("exec/work").unwrap(),
+            right.selected_desired_revision("exec/work").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_explicit_repair_keeps_the_bad_record_and_names_its_replacement() {
+        let source = Store::open_memory("source").unwrap();
+        let replacement = source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("repair-replacement".into()),
+            })
+            .unwrap();
+        let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+        let original = exchange.envelopes[0].clone();
+        let broken = rewrite_envelope(&original, |payload| {
+            let claim = &mut payload.batch.claims[0];
+            claim.body["fields"]["unexpected"] = Value::Bool(true);
+            claim.id = claim_hash(
+                &claim.batch_id,
+                &claim.subject,
+                &claim.kind,
+                &claim.origin,
+                claim.actor.as_deref(),
+                &claim.body,
+                &claim.predecessors,
+            )
+            .unwrap();
+        });
+        exchange.envelopes = vec![original, broken];
+        let target = Store::open_memory("target").unwrap();
+        receive_and_project(&target, "source", &exchange);
+        let record = target.replica_records(true).unwrap().remove(0);
+        let first = target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace the malformed observation",
+                "person/operator",
+                "repair-once",
+            )
+            .unwrap();
+        let retry = target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace the malformed observation",
+                "person/operator",
+                "repair-once",
+            )
+            .unwrap();
+        assert_eq!(first.id, retry.id);
+        let repaired = target.replica_record(&record.record_ref).unwrap().unwrap();
+        assert_eq!(repaired.state, "repaired");
+        assert_eq!(repaired.replacement_claim_id, Some(replacement.id));
+        assert!(target.replica_records(true).unwrap().is_empty());
+
+        let repair_exchange = exchange_from(&target, &source.replication_inventory().unwrap());
+        receive_and_project(&source, "target", &repair_exchange);
+        let replicated = source.replica_record(&record.record_ref).unwrap().unwrap();
+        assert_eq!(replicated.state, "repaired");
+        assert!(source.replica_records(true).unwrap().is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn envelope_sets_converge_after_sparse_duplicate_delivery(
+            reverse in any::<bool>(),
+            copies in 1usize..4,
+            split_seed in 0usize..8,
+        ) {
+            let source = Store::open_memory("source").unwrap();
+            for index in 0..4 {
+                source
+                    .append_claim(&ClaimInput {
+                        subject: format!("host/source-{index}"),
+                        kind: "transport.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("source-{index}")),
+                    })
+                    .unwrap();
+            }
+            let complete = exchange_from(&source, &ReplicationInventory::default());
+            let mut delivered = complete.envelopes.clone();
+            if reverse {
+                delivered.reverse();
+            }
+            let split = split_seed % (delivered.len() + 1);
+            let second = delivered.split_off(split);
+            let duplicate = |part: &[ReplicaEnvelope]| {
+                let mut envelopes = Vec::new();
+                for envelope in part {
+                    envelopes.extend(std::iter::repeat_n(envelope.clone(), copies));
+                }
+                ReplicationExchange {
+                    envelopes,
+                    ..complete.clone()
+                }
+            };
+            let target = Store::open_memory("target").unwrap();
+            receive_and_project(&target, "source", &duplicate(&delivered));
+            receive_and_project(&target, "source", &duplicate(&second));
+            receive_and_project(&target, "source", &complete);
+            let source_status = source
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap();
+            let target_status = target
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap();
+            prop_assert_eq!(source_status.authority_digest, target_status.authority_digest);
+            prop_assert_eq!(source_status.graph_digest, target_status.graph_digest);
+            prop_assert_eq!(target_status.pending_records, 0);
+            prop_assert_eq!(target_status.invalid_records, 0);
+            prop_assert_eq!(target_status.unknown_records, 0);
+        }
+    }
+
+    #[test]
     fn replication_rejects_tampered_claims() {
         let source = Store::open_memory("source").unwrap();
         source
@@ -12338,7 +14282,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            11
+            12
         );
         assert_eq!(
             connection
@@ -12349,6 +14293,70 @@ version 2
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn schema_version_eleven_removes_writer_sequence_and_pending_proposal_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 CREATE TABLE batches (
+                   id TEXT PRIMARY KEY,
+                   origin TEXT NOT NULL,
+                   replica_sequence INTEGER NOT NULL,
+                   previous_hash TEXT,
+                   hash TEXT NOT NULL,
+                   accepted_at_unix_ms TEXT NOT NULL,
+                   UNIQUE(origin, replica_sequence)
+                 );
+                 CREATE TABLE claims (
+                   store_index INTEGER PRIMARY KEY AUTOINCREMENT,
+                   id TEXT NOT NULL UNIQUE,
+                   batch_id TEXT NOT NULL REFERENCES batches(id),
+                   subject TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   origin TEXT NOT NULL,
+                   actor TEXT,
+                   body TEXT NOT NULL,
+                   predecessors TEXT NOT NULL,
+                   accepted_at_unix_ms TEXT NOT NULL
+                 );
+                 PRAGMA user_version=11;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, "node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO batches VALUES ('a','writer',1,NULL,'a','1')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO batches VALUES ('b','writer',1,NULL,'b','1')",
+                [],
+            )
+            .unwrap();
+        let unique_indexes: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('batches') WHERE [unique]=1 AND origin='u'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique_indexes, 0, "the writer sequence index is not unique");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            12
         );
     }
 

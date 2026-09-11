@@ -12,7 +12,7 @@ use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use st3::api::{AppState, router, serve_tcp, serve_unix};
+use st3::api::{AppState, router, serve_unix};
 use st3::archive::archive_eval;
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
@@ -23,10 +23,11 @@ use st3::model::{
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRevisionRequest, MissionRunView, MissionState, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    QuickAgentResponse, ResourceRefreshView, ResourceWatchView, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
+    ResourceRefreshView, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -94,6 +95,11 @@ enum Command {
     Wait(WaitArgs),
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
+    /// Inspect and repair fleet replication.
+    Replication {
+        #[command(subcommand)]
+        command: ReplicationCommand,
+    },
     /// Manage the Linux or macOS st3 user service.
     Service {
         #[command(subcommand)]
@@ -159,7 +165,29 @@ enum Command {
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
     #[command(hide = true)]
+    ReplicationWorker(ReplicationWorkerArgs),
+    #[command(hide = true)]
     Driver(DriverArgs),
+}
+
+#[derive(Args)]
+struct ReplicationWorkerArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    node: Option<String>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    #[arg(long)]
+    peer_listen: Option<String>,
+    #[arg(long)]
+    fleet_id: Option<String>,
+    #[arg(long)]
+    shared_secret_file: Option<PathBuf>,
+    #[arg(long, value_parser = parse_peer)]
+    peer: Vec<PeerConfig>,
 }
 
 #[derive(Args)]
@@ -177,6 +205,10 @@ struct UpArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
+    #[arg(long)]
+    fleet_id: Option<String>,
+    #[arg(long)]
+    shared_secret_file: Option<PathBuf>,
     #[arg(long, value_parser = parse_peer)]
     peer: Vec<PeerConfig>,
 }
@@ -473,6 +505,33 @@ enum ServiceCommand {
         config: Option<PathBuf>,
     },
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ReplicationCommand {
+    /// Show fleet receipt, validation, projection, and peer health.
+    Status,
+    /// List invalid and unknown replicated records.
+    Invalid {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one replicated record diagnostic.
+    Inspect { record: String },
+    /// Compare local logical digests with one peer's last signed response.
+    Diff { peer: String },
+    /// Replace one invalid record with an admitted claim.
+    Repair {
+        record: String,
+        #[arg(long = "with")]
+        replacement_claim: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "as", env = "ST_AGENT")]
+        actor: String,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -987,7 +1046,32 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
-    let config = Config::load(None)?;
+    if let Command::ReplicationWorker(args) = cli.command {
+        let mut config = Config::load_unvalidated(args.config.as_deref())?;
+        if let Some(value) = args.node {
+            config.node = value;
+        }
+        if let Some(value) = args.state_dir {
+            config.state_dir = value;
+        }
+        if let Some(value) = args.socket {
+            config.socket = value;
+        }
+        if let Some(value) = args.peer_listen {
+            config.peer_listen = Some(value);
+        }
+        if let Some(value) = args.fleet_id {
+            config.fleet_id = Some(value);
+        }
+        if let Some(value) = args.shared_secret_file {
+            config.shared_secret_file = Some(value);
+        }
+        if !args.peer.is_empty() {
+            config.peers = args.peer;
+        }
+        return st3::peer::run_worker(config).await;
+    }
+    let config = Config::load_unvalidated(None)?;
     let endpoint = cli
         .endpoint
         .or_else(|| std::env::var("ST3_ENDPOINT").ok())
@@ -997,6 +1081,7 @@ async fn run(cli: Cli) -> Result<()> {
     let client = Client::new(endpoint.clone());
     match cli.command {
         Command::Up(_) => unreachable!(),
+        Command::ReplicationWorker(_) => unreachable!(),
         Command::Claude(args) => {
             run_quick(&client, endpoint, &config, args, "claude", cli.json).await
         }
@@ -1015,6 +1100,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trace(args) => run_trace(&client, args, cli.json).await,
         Command::Wait(args) => run_wait(&client, args, cli.json).await,
         Command::Doctor(args) => run_doctor(&client, args, cli.json).await,
+        Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Service { command } => run_service(command),
         Command::ClaudeChannel { command } => run_claude_channel(command),
         Command::Doc { command } => run_doc(&client, command, cli.json).await,
@@ -1045,7 +1131,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_up(args: UpArgs) -> Result<()> {
-    let mut config = Config::load(args.config.as_deref())?;
+    let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
         config.node = node;
     }
@@ -1061,19 +1147,38 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
     }
+    if let Some(fleet_id) = args.fleet_id {
+        config.fleet_id = Some(fleet_id);
+    }
+    if let Some(shared_secret_file) = args.shared_secret_file {
+        config.shared_secret_file = Some(shared_secret_file);
+    }
     if !args.peer.is_empty() {
         config.peers = args.peer;
     }
     config.validate()?;
     fs::create_dir_all(&config.state_dir)?;
-    eprintln!("st3: security warning: v1 trusts every configured peer and has no TLS or ACLs");
-    if let Some(address) = &config.peer_listen {
-        eprintln!("st3: trusted peer API listening on http://{address}");
-    }
     let store = Arc::new(Store::open(
         &config.state_dir.join("claims.sqlite3"),
         &config.node,
     )?);
+    if let Some(fleet_id) = &config.fleet_id {
+        store.bind_fleet(fleet_id)?;
+    }
+    let admission = store.validate_replication_backlog()?;
+    store.apply_replication_repairs()?;
+    let projected = store.project_replication_backlog()?;
+    if !projected {
+        eprintln!(
+            "st3: the replicated projection is stale; the daemon will use its last good graph"
+        );
+    }
+    if admission.invalid != 0 || admission.unknown != 0 {
+        eprintln!(
+            "st3: replication has {} invalid and {} unknown records",
+            admission.invalid, admission.unknown
+        );
+    }
     store.append_claim(&ClaimInput {
         subject: format!("daemon/{}", config.node),
         kind: "daemon.started".into(),
@@ -1108,11 +1213,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .pty_root
         .clone()
         .unwrap_or_else(|| config.state_dir.join("pty"));
-    let trusted_peers = config
-        .peers
-        .iter()
-        .map(|peer| peer.name.clone())
-        .collect::<BTreeSet<_>>();
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -1120,7 +1220,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         node: config.node.clone(),
         state_dir: config.state_dir.clone(),
         pty_root: pty_root.clone(),
-        trusted_peers,
+        fleet_id: config.fleet_id.clone(),
+        configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
     };
     let reconciler = Arc::new(Reconciler::native(
         store.clone(),
@@ -1132,21 +1233,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
     ));
     tokio::spawn(reconciler.run());
-    st3::peer::start(
-        store,
-        config.node.clone(),
-        config.peers.clone(),
-        notify,
-        event_notify,
-    );
-    if let Some(address) = config.peer_listen.clone() {
-        let app = router(state.clone());
-        tokio::spawn(async move {
-            if let Err(error) = serve_tcp(&address, app).await {
-                eprintln!("st3: peer server failed: {error:#}");
-            }
-        });
-    }
     eprintln!("st3: local API listening at {}", config.socket.display());
     serve_unix(&config.socket, router(state)).await
 }
@@ -2475,6 +2561,176 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         "st3 doctor found a warning in strict mode"
     );
     Ok(())
+}
+
+async fn run_replication(
+    client: &Client,
+    command: ReplicationCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        ReplicationCommand::Status => {
+            let status: ReplicationStatus = client.get("/v1/replication/status").await?;
+            if json_output {
+                return print_value(&status, true);
+            }
+            println!(
+                "fleet\t{}",
+                status.fleet_id.as_deref().unwrap_or("local-only")
+            );
+            println!("authority-digest\t{}", status.authority_digest);
+            println!("graph-digest\t{}", status.graph_digest);
+            println!("envelopes\t{}", status.received_envelopes);
+            println!(
+                "records\tvalid={} pending={} unknown={} invalid={} repaired={}",
+                status.valid_records,
+                status.pending_records,
+                status.unknown_records,
+                status.invalid_records,
+                status.repaired_records
+            );
+            println!("unhealthy-projections\t{}", status.unhealthy_projections);
+            for peer in status.peers {
+                println!(
+                    "peer\t{}\t{}\t{}",
+                    peer.peer,
+                    peer.status,
+                    peer.last_error.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        ReplicationCommand::Invalid { all } => {
+            let records: Vec<ReplicaRecordView> = client
+                .get(&format!(
+                    "/v1/replication/records?unresolved={}",
+                    if all { "false" } else { "true" }
+                ))
+                .await?;
+            if json_output {
+                return print_value(&records, true);
+            }
+            for record in records {
+                println!(
+                    "{}\t{}\t{}:{}\t{}\t{}",
+                    record.state,
+                    record.record_ref,
+                    record.writer,
+                    record.sequence,
+                    record.subject.as_deref().unwrap_or("unknown-subject"),
+                    record.error_message.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        ReplicationCommand::Inspect { record } => {
+            let record: ReplicaRecordView = client
+                .get(&format!(
+                    "/v1/replication/records/{}",
+                    urlencoding::encode(record.strip_prefix("record/").unwrap_or(&record))
+                ))
+                .await?;
+            if json_output {
+                return print_value(&record, true);
+            }
+            println!("record\t{}", record.record_ref);
+            println!("state\t{}", record.state);
+            println!("writer\t{}", record.writer);
+            println!("sequence\t{}", record.sequence);
+            println!("envelope\t{}", record.envelope_hash);
+            println!("position\t{}", record.position);
+            println!("claim\t{}", record.claim_id.as_deref().unwrap_or(""));
+            println!("subject\t{}", record.subject.as_deref().unwrap_or(""));
+            println!("kind\t{}", record.kind.as_deref().unwrap_or(""));
+            println!("error-code\t{}", record.error_code.as_deref().unwrap_or(""));
+            println!("error\t{}", record.error_message.as_deref().unwrap_or(""));
+            println!(
+                "replacement\t{}",
+                record.replacement_claim_id.as_deref().unwrap_or("")
+            );
+            Ok(())
+        }
+        ReplicationCommand::Diff { peer } => {
+            let status: ReplicationStatus = client.get("/v1/replication/status").await?;
+            let remote = status
+                .peers
+                .iter()
+                .find(|item| item.peer == peer)
+                .with_context(|| format!("peer `{peer}` is not configured"))?;
+            let value = json!({
+                "peer": peer,
+                "status": remote.status,
+                "authority": {
+                    "local": status.authority_digest,
+                    "remote": remote.authority_digest,
+                    "equal": remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()),
+                },
+                "graph": {
+                    "local": status.graph_digest,
+                    "remote": remote.graph_digest,
+                    "equal": remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()),
+                },
+            });
+            if json_output {
+                return print_value(&value, true);
+            }
+            println!("peer\t{}\t{}", peer, remote.status);
+            println!(
+                "authority\t{}\t{}\t{}",
+                if remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()) {
+                    "equal"
+                } else {
+                    "different"
+                },
+                status.authority_digest,
+                remote.authority_digest.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "graph\t{}\t{}\t{}",
+                if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
+                    "equal"
+                } else {
+                    "different"
+                },
+                status.graph_digest,
+                remote.graph_digest.as_deref().unwrap_or("unknown")
+            );
+            Ok(())
+        }
+        ReplicationCommand::Repair {
+            record,
+            replacement_claim,
+            reason,
+            actor,
+            idempotency_key,
+        } => {
+            let record_ref = if record.starts_with("record/") {
+                record
+            } else {
+                format!("record/{record}")
+            };
+            let idempotency_key = idempotency_key.unwrap_or_else(|| {
+                hex::encode(Sha256::digest(
+                    format!("repair\0{record_ref}\0{replacement_claim}\0{reason}\0{actor}")
+                        .as_bytes(),
+                ))
+            });
+            let request = ReplicationRepairRequest {
+                record_ref,
+                replacement_claim_id: replacement_claim,
+                reason,
+                actor,
+                idempotency_key,
+            };
+            let claim: ClaimRecord = client.post("/v1/replication/repair", &request).await?;
+            if json_output {
+                print_value(&claim, true)
+            } else {
+                println!("repaired\t{}", claim.id);
+                Ok(())
+            }
+        }
+    }
 }
 
 fn run_service(command: ServiceCommand) -> Result<()> {

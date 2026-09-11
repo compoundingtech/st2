@@ -163,7 +163,9 @@ The optional peer listener accepts only IPv4 or IPv6 loopback addresses. A non-l
 
 Cross-host replication uses Fabric or another trusted local port exposer. st3 does not expose its peer API directly to the network.
 
-The test suite runs two real loopback daemons with separate SQLite stores. It proves claim replication in both directions.
+The test suite runs signed loopback peers with separate SQLite stores. It proves authority transfer in both directions.
+
+The service installer supervises replication as a separate systemd user service or launchd agent.
 
 Linux uses a systemd user service. macOS uses a launchd agent with restart, log, and file-limit settings.
 

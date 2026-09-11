@@ -1,8 +1,8 @@
 # st3 data authority
 
-This document classifies each SQLite table in schema version 10.
+This document classifies each SQLite table in schema version 12.
 
-Schema version 10 does not migrate an earlier database. Start the renamed system with a new state directory.
+Schema version 12 upgrades schema versions 10 and 11 in place.
 
 The claim log and immutable blobs are the durable graph authority.
 
@@ -30,12 +30,20 @@ All other tables are indexes, projections, local capabilities, or transport reco
 | `idempotency` | Opaque response cache | Hashed caller keys and derived responses |
 | `mission_run_requests` | Opaque validation cache | Hashed caller keys and request digests |
 | `capabilities` | Local short-lived authority | Dedicated API issuance; capabilities do not replicate |
-| `peer_cursors` | Transport recovery state | Successful exchanges with a configured peer |
-| `peer_replica_cursors` | Transport recovery state | Accepted per-origin replica sequences |
+| `replica_envelopes` | Replicated authority | Authenticated outer envelopes and their exact payloads |
+| `replica_records` | Admission state | Envelope records, validation results, and repair references |
+| `projection_health` | Local diagnostic projection | Projection attempts against admitted authority |
+| `replication_peers` | Local transport state | Last signed exchange or transport failure for each configured peer |
+| `peer_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
+| `peer_replica_cursors` | Legacy test state | The removed cursor protocol; production does not use this table |
 
 The store rebuilds operation and planning projections when it opens.
 
-Replica import rebuilds planning projections after it accepts a complete claim batch.
+Replication receipt stores an envelope before admission decodes its payload.
+
+Admission validates each claim and blob independently. Invalid or unknown records do not enter graph projections.
+
+Projection uses admitted claims and keeps the last good graph when one reduction fails.
 
 `st3 doctor` compares the operation projection with the claim log.
 
@@ -50,6 +58,10 @@ An exact retry returns the original claim.
 A retry with different input returns `idempotency-mismatch`.
 
 Conflicting replicated operations mark the affected graph subject as indeterminate.
+
+A `record.repaired` claim names one bad record and one valid replacement claim.
+
+Repair keeps the original record. It changes the record state to `repaired` and records the replacement reference.
 
 The database does not store the caller key.
 

@@ -17,6 +17,8 @@ pub struct PeerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub node: String,
+    pub fleet_id: Option<String>,
+    pub shared_secret_file: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub pty_root: Option<PathBuf>,
     pub socket: PathBuf,
@@ -33,6 +35,8 @@ impl Default for Config {
             .join("st3.sock");
         Self {
             node: host_name(),
+            fleet_id: None,
+            shared_secret_file: None,
             state_dir,
             pty_root: None,
             socket,
@@ -50,6 +54,12 @@ impl Config {
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
+        let config = Self::load_unvalidated(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn load_unvalidated(path: Option<&Path>) -> Result<Self> {
         let selected = path
             .map(Path::to_path_buf)
             .unwrap_or_else(Self::default_path);
@@ -75,12 +85,31 @@ impl Config {
         if config.socket.as_os_str().is_empty() {
             config.socket = defaults.socket;
         }
-        config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        let fleet_configured = self.fleet_id.is_some() || self.shared_secret_file.is_some();
+        let peers_configured = self.peer_listen.is_some() || !self.peers.is_empty();
+        anyhow::ensure!(
+            fleet_configured == peers_configured,
+            "fleet_id and shared_secret_file are required exactly when fleet peers are configured"
+        );
+        anyhow::ensure!(
+            self.fleet_id.is_some() == self.shared_secret_file.is_some(),
+            "fleet_id and shared_secret_file must be configured together"
+        );
+        anyhow::ensure!(
+            self.peer_listen.is_some() == !self.peers.is_empty(),
+            "a fleet node needs both a peer listener and at least one peer"
+        );
+        if let Some(fleet_id) = &self.fleet_id {
+            anyhow::ensure!(
+                uuid::Uuid::parse_str(fleet_id).is_ok(),
+                "fleet_id must be a UUID"
+            );
+        }
         if let Some(address) = &self.peer_listen {
             let address = address
                 .parse::<SocketAddr>()
@@ -104,9 +133,21 @@ impl Config {
                 "peer '{}' uses the local node label",
                 peer.name
             );
+            let url = reqwest::Url::parse(&peer.url)
+                .with_context(|| format!("parse peer URL for '{}'", peer.name))?;
             anyhow::ensure!(
-                peer.url.starts_with("http://"),
+                url.scheme() == "http",
                 "peer '{}' must use plain http:// in st3 v1",
+                peer.name
+            );
+            let host = url.host_str().unwrap_or_default();
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            anyhow::ensure!(
+                loopback,
+                "peer '{}' must use a loopback URL exposed by Fabric",
                 peer.name
             );
         }
@@ -136,6 +177,7 @@ fn host_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn defaults_to_a_local_only_daemon() {
@@ -149,6 +191,12 @@ mod tests {
     fn a_peer_listener_must_use_a_loopback_address() {
         let mut config = Config {
             peer_listen: Some("0.0.0.0:31313".into()),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/tmp/st3-test-secret".into()),
+            peers: vec![PeerConfig {
+                name: "peer".into(),
+                url: "http://127.0.0.1:31314".into(),
+            }],
             ..Config::default()
         };
         assert!(
@@ -162,6 +210,59 @@ mod tests {
         config.peer_listen = Some("127.0.0.1:31313".into());
         config.validate().unwrap();
         config.peer_listen = Some("[::1]:31313".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn fleet_configuration_is_complete_and_uses_only_loopback_transport() {
+        let mut config = Config {
+            peer_listen: Some("127.0.0.1:31313".into()),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/tmp/st3-test-secret".into()),
+            peers: vec![PeerConfig {
+                name: "peer".into(),
+                url: "http://127.0.0.1:31314".into(),
+            }],
+            ..Config::default()
+        };
+        config.validate().unwrap();
+
+        config.peers.clear();
+        assert!(config.validate().unwrap_err().to_string().contains("both"));
+        config.peers.push(PeerConfig {
+            name: "peer".into(),
+            url: "http://192.0.2.1:31314".into(),
+        });
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
+        );
+    }
+
+    #[test]
+    fn command_overrides_can_complete_an_old_partial_fleet_config() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+node = "replica-a"
+peer_listen = "127.0.0.1:31313"
+
+[[peers]]
+name = "replica-b"
+url = "http://127.0.0.1:31314"
+"#,
+        )
+        .unwrap();
+
+        assert!(Config::load(Some(&path)).is_err());
+        let mut config = Config::load_unvalidated(Some(&path)).unwrap();
+        config.fleet_id = Some("1f91ca65-7793-48cc-866e-ac15690130e1".into());
+        config.shared_secret_file = Some(root.path().join("fleet.secret"));
         config.validate().unwrap();
     }
 }

@@ -8,8 +8,9 @@ use crate::model::{
     DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
     MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
     NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
-    PlanningSessionCreation, PlanningSessionDeclaration, ResourceRefreshOperation,
-    RestartIntensity, RestartType, RuntimeResetOperation, ScheduleSpec, St3Error, SubscriptionSpec,
+    PlanningSessionCreation, PlanningSessionDeclaration, ReplicaRepairDeclaration,
+    ResourceRefreshOperation, RestartIntensity, RestartType, RuntimeResetOperation, ScheduleSpec,
+    St3Error, SubscriptionSpec,
 };
 
 const ROOT_NODES: &[&str] = &[
@@ -27,6 +28,7 @@ const ROOT_NODES: &[&str] = &[
     "mission-run",
     "planning-session",
     "message",
+    "repair",
     "schedule",
     "stop",
 ];
@@ -58,6 +60,7 @@ struct ParseContext {
     mission_runs: BTreeMap<String, MissionRunDeclaration>,
     planning_sessions: BTreeMap<String, PlanningSessionDeclaration>,
     resource_refreshes: Vec<ResourceRefreshOperation>,
+    replica_repairs: Vec<ReplicaRepairDeclaration>,
 }
 
 pub fn parse_intent(source: &str, default_host: &str) -> Result<NormalizedIntent, St3Error> {
@@ -210,6 +213,7 @@ fn parse_intent_with_owner(
         mission_runs: BTreeMap::new(),
         planning_sessions: BTreeMap::new(),
         resource_refreshes: Vec::new(),
+        replica_repairs: Vec::new(),
     };
     for node in &declarations {
         parse_desired_node(node, None, &mut context)?;
@@ -234,6 +238,7 @@ fn parse_intent_with_owner(
         mission_runs: context.mission_runs,
         planning_sessions: context.planning_sessions,
         resource_refreshes: context.resource_refreshes,
+        replica_repairs: context.replica_repairs,
         document_refs: context.document_refs,
         normalized,
     })
@@ -310,6 +315,7 @@ fn parse_desired_node(
         "mission-run" => parse_mission_run_declaration(node, context),
         "planning-session" => parse_planning_session_declaration(node, context),
         "resource" => parse_resource_declaration(node, context),
+        "repair" => parse_replica_repair(node, context),
         "stop" => parse_stop(node, context),
         _ => parse_structure(node, kind, context),
     }
@@ -689,6 +695,65 @@ fn parse_resource_refresh(
         id,
         timeout_ms,
     })
+}
+
+fn parse_replica_repair(node: &KdlNode, context: &mut ParseContext) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let record_ref = one_string_with_children(node)?;
+    let record_id = record_ref.strip_prefix("record/").ok_or_else(|| {
+        St3Error::new(
+            "invalid-replica-record",
+            "a repair target must use the `record/HASH` form",
+        )
+    })?;
+    if record_id.len() != 64 || !record_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(St3Error::new(
+            "invalid-replica-record",
+            "a repair target must contain one 64-character hexadecimal hash",
+        ));
+    }
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-repair", "a repair needs a replacement and reason"))?;
+    reject_unknown_children(body, &["replacement", "reason"], "repair", &record_ref)?;
+    let replacement_claim_id = required_child_string(body, "replacement", &record_ref)?;
+    let reason = required_child_string(body, "reason", &record_ref)?;
+    if replacement_claim_id.trim().is_empty() || reason.trim().is_empty() {
+        return Err(St3Error::new(
+            "empty-repair-field",
+            "a repair replacement and reason cannot be empty",
+        ));
+    }
+    if replacement_claim_id.len() != 64
+        || !replacement_claim_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(St3Error::new(
+            "invalid-replacement-claim",
+            "a repair replacement must be one 64-character claim ID",
+        ));
+    }
+    let repair = ReplicaRepairDeclaration {
+        record_ref: record_ref.clone(),
+        replacement_claim_id,
+        reason,
+    };
+    if let Some(existing) = context
+        .replica_repairs
+        .iter()
+        .find(|existing| existing.record_ref == record_ref)
+    {
+        if existing != &repair {
+            return Err(St3Error::new(
+                "conflicting-repair",
+                format!("repair `{record_ref}` repeats with different content"),
+            ));
+        }
+    } else {
+        context.replica_repairs.push(repair);
+    }
+    Ok(())
 }
 
 fn parse_planning_session_declaration(
@@ -3783,6 +3848,33 @@ mod tests {
         )
         .unwrap();
         assert!(direct.missions.contains_key("work"));
+    }
+
+    #[test]
+    fn repair_is_a_strict_root_declaration() {
+        let record = "a".repeat(64);
+        let replacement = "b".repeat(64);
+        let intent = parse_intent(
+            &format!(
+                "version 2\nrepair \"record/{record}\" {{ replacement \"{replacement}\"; reason \"replace invalid input\" }}"
+            ),
+            "node",
+        )
+        .unwrap();
+        assert_eq!(intent.replica_repairs.len(), 1);
+        assert_eq!(
+            intent.replica_repairs[0].record_ref,
+            format!("record/{record}")
+        );
+
+        let invalid = parse_intent(
+            &format!(
+                "version 2\nrepair \"record/{record}\" {{ replacement \"short\"; reason \"replace invalid input\" }}"
+            ),
+            "node",
+        )
+        .unwrap_err();
+        assert_eq!(invalid.code, "invalid-replacement-claim");
     }
 
     #[test]

@@ -249,7 +249,7 @@ st3 has these components:
 7. Process and PTY adapters observe runtime state.
 8. Small Talk maps durable message claims to native harness delivery or an explicit DING child.
 9. Gate runners execute bounded mechanical or LLM checks.
-10. The peer adapter exchanges causal claim batches between trusted nodes.
+10. The replication worker exchanges authenticated envelope sets between configured fleet nodes.
 
 The CLI contains no independent reducer or reconciler. A CLI connection does not start a second daemon.
 
@@ -519,13 +519,23 @@ An unknown replicated claim remains in history and makes its subject indetermina
 
 ## Peer replication
 
-Each host accepts local writes and sequences local replica batches. Peers exchange missing causal batches and referenced blobs.
+Fleet replication is optional. A node with no fleet configuration stays fully local.
+
+Each host accepts local writes and creates immutable replica envelopes. Peers exchange missing envelope identities, claims, and referenced blobs.
+
+An envelope identity contains a writer, sequence, and envelope hash. The set can contain sparse sequences and competing candidates.
 
 Different subject changes merge. Concurrent changes to one subject create multiple visible leaves. Every node uses the same deterministic selected revision while it reports all conflicts.
 
 A later authorized write cites all current leaves and resolves the conflict.
 
 A network partition does not stop local work. Each host continues from the last claims it accepted.
+
+The separate replication worker stores authenticated envelopes before it decodes their content. Invalid content cannot stop receipt of later content.
+
+Admission, projection, and execution are separate stages. The main daemon executes only the last good graph projection.
+
+[replication.md](./replication.md) defines configuration, authentication, convergence, inspection, and repair.
 
 ## Security properties
 
@@ -543,7 +553,9 @@ A network partition does not stop local work. Each host continues from the last 
 - Git repositories and shared st3 documents do not store credentials or raw private measurements.
 - Durable evidence uses summaries, redacted samples, hashes, or restricted external storage.
 
-The configured peer transport is for a trusted network. Authentication, encryption, and peer authorization remain outside the first protocol.
+Every peer request and response uses a shared-fleet HMAC. A response signature binds its exact request.
+
+The peer listener and peer URLs use loopback only. Fabric or a similar local port exposer carries cross-host traffic.
 
 ## Failure handling
 

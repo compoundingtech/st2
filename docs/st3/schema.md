@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `b7401a1fa18c77d058595d7523454746fc752f6d3dd1cd4e610558b35e4ce8b6`
+Digest: `fc72a7d2c416d3c01b3ec1b8dddaf44c03972048fdb0cd28f7e7e839eb1e8095`
 
 ## Subject families
 
@@ -25,6 +25,7 @@ Digest: `b7401a1fa18c77d058595d7523454746fc752f6d3dd1cd4e610558b35e4ce8b6`
 | `person` | `person/IDENTITY` | no | A human actor. |
 | `planning-session` | `planning-session/ID` | no | A durable planning session. |
 | `pty` | `pty/RUN/LOCAL_ID` | no | A mission-run terminal runtime. |
+| `repair` | `repair/RECORD_ID` | yes | An explicit replacement for an invalid replicated record. |
 | `resource` | `resource/NAME` | yes | An observed external or durable fact bag. |
 | `revision-proposal` | `revision-proposal/ID` | no | A mission revision proposal. |
 | `run-generation` | `run-generation/ID` | no | An immutable mission-run generation. |
@@ -85,6 +86,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `planning-session.revision-requested` | `planning-session` | `authorized-requester` | `append` | `candidate_revision:integer`, `feedback:subject-reference`, `requester:subject-reference`, `variant:string` | `feedback` |
 | `planning-session.started` | `planning-session` | `authorized-requester` | `once` | `mission:subject-reference`, `planner:subject-reference`, `request:subject-reference`, `requester:subject-reference`, `target_generation:subject-reference`, `target_run:subject-reference`, `workspace:string` | `planning-session` |
 | `publication.operation` | `*` | `system-only` | `append` | `action:string`, `operation:string`, `status!:string` | `revision`, `reset`, `cancellation`, `refresh`, `feedback` |
+| `record.repaired` | `repair` | `ordinary-client` | `once` | `reason!:string`, `record!:string`, `replacement!:string` | `repair` |
 | `render.applied` | `agent`, `exec`, `pty` | `system-only` | `append` | `writes:array` |  |
 | `resource.observed` | `resource` | `ordinary-client` | `append` | `kind:string`, `observed_at:integer`, `state:any` | `resource` |
 | `revision-proposal.applied` | `revision-proposal` | `system-only` | `once` | `reason:string`, `status:string`, `successor_generation:subject-reference` |  |

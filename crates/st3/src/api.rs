@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,7 +36,7 @@ use crate::model::{
     MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicationBatch, ReplicationQuery, ReplicationResponse,
+    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
     ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover, RevisionProposalView,
     RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
@@ -53,7 +53,8 @@ pub struct AppState {
     pub node: String,
     pub state_dir: std::path::PathBuf,
     pub pty_root: std::path::PathBuf,
-    pub trusted_peers: std::collections::BTreeSet<String>,
+    pub fleet_id: Option<String>,
+    pub configured_peers: Vec<String>,
 }
 
 fn signal_changed(state: &AppState) {
@@ -61,6 +62,10 @@ fn signal_changed(state: &AppState) {
     state
         .event_notify
         .send_modify(|generation| *generation = generation.saturating_add(1));
+    let _ = fs::write(
+        state.state_dir.join("replication.wake"),
+        format!("{}\n", uuid::Uuid::now_v7()),
+    );
 }
 
 #[derive(Debug)]
@@ -167,6 +172,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
+        .route("/v1/replication/status", get(replication_status))
+        .route("/v1/replication/records", get(replication_records))
+        .route("/v1/replication/records/{*record}", get(replication_record))
+        .route("/v1/replication/repair", post(repair_replication_record))
+        .route("/v1/internal/replication-wake", post(replication_wake))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
@@ -204,11 +214,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
-        .route("/v1/sessions/terminal/{*subject}", get(terminal_session))
-        .route("/v1/peer/export", get(export_peer))
-        .route("/v1/peer/cursor", get(peer_cursor))
-        .route("/v1/peer/claims", post(import_peer))
-        .route("/v1/peer/claims/query", post(query_peer));
+        .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
     #[cfg(test)]
     let app = app
         .route("/v1/planning-sessions", post(start_planning_session))
@@ -588,6 +594,53 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             driver_gaps.join("; ")
         },
     });
+    match state.store.replication_status(
+        state.fleet_id.is_some(),
+        state.fleet_id.as_deref(),
+        &state.configured_peers,
+    ) {
+        Ok(replication) if !replication.configured => checks.push(DoctorCheck {
+            name: "replication".into(),
+            status: "pass".into(),
+            message: "this node is intentionally local-only".into(),
+        }),
+        Ok(replication) => {
+            let unavailable = replication
+                .peers
+                .iter()
+                .filter(|peer| peer.status != "up")
+                .map(|peer| format!("{}={}", peer.peer, peer.status))
+                .collect::<Vec<_>>();
+            let unresolved = replication.invalid_records + replication.unknown_records;
+            let status = if replication.unhealthy_projections != 0 {
+                "fail"
+            } else if !unavailable.is_empty() || unresolved != 0 {
+                "warn"
+            } else {
+                "pass"
+            };
+            checks.push(DoctorCheck {
+                name: "replication".into(),
+                status: status.into(),
+                message: format!(
+                    "{} envelopes; {} unresolved records; {} unhealthy projections; peers {}",
+                    replication.received_envelopes,
+                    unresolved,
+                    replication.unhealthy_projections,
+                    if unavailable.is_empty() {
+                        "up".into()
+                    } else {
+                        unavailable.join(", ")
+                    }
+                ),
+            });
+        }
+        Err(error) => checks.push(DoctorCheck {
+            name: "replication".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {
@@ -599,6 +652,101 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         status: report_status.into(),
         checks,
     }))
+}
+
+async fn replication_status(
+    State(state): State<AppState>,
+) -> Result<Json<ReplicationStatus>, ApiError> {
+    state
+        .store
+        .replication_status(
+            state.fleet_id.is_some(),
+            state.fleet_id.as_deref(),
+            &state.configured_peers,
+        )
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+#[derive(Deserialize)]
+struct ReplicationRecordsQuery {
+    #[serde(default = "default_true")]
+    unresolved: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn replication_records(
+    State(state): State<AppState>,
+    Query(query): Query<ReplicationRecordsQuery>,
+) -> Result<Json<Vec<ReplicaRecordView>>, ApiError> {
+    state
+        .store
+        .replica_records(query.unresolved)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn replication_record(
+    State(state): State<AppState>,
+    AxumPath(record): AxumPath<String>,
+) -> Result<Json<ReplicaRecordView>, ApiError> {
+    let record = if record.starts_with("record/") {
+        record
+    } else {
+        format!("record/{record}")
+    };
+    state
+        .store
+        .replica_record(&record)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("replica record `{record}` does not exist")))
+}
+
+async fn repair_replication_record(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationRepairRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let claim = state
+        .store
+        .repair_replica_record(
+            &request.record_ref,
+            &request.replacement_claim_id,
+            &request.reason,
+            &request.actor,
+            &request.idempotency_key,
+        )
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
+}
+
+async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let admission = state
+        .store
+        .validate_replication_backlog()
+        .map_err(ApiError::internal)?;
+    let repairs = state
+        .store
+        .apply_replication_repairs()
+        .map_err(ApiError::internal)?;
+    let projected = state
+        .store
+        .project_replication_backlog()
+        .map_err(ApiError::internal)?;
+    if projected && (admission.changed || repairs != 0) {
+        signal_changed(&state);
+    }
+    Ok(Json(json!({
+        "admitted": admission.valid,
+        "unknown": admission.unknown,
+        "invalid": admission.invalid,
+        "repairs": repairs,
+        "projected": projected,
+    })))
 }
 
 async fn start_planning_session(
@@ -4633,100 +4781,6 @@ async fn terminal_proxy(
     let _ = output.kill().await;
 }
 
-#[derive(Deserialize)]
-struct PeerExportQuery {
-    #[serde(default)]
-    after: u64,
-}
-
-async fn export_peer(
-    State(state): State<AppState>,
-    Query(query): Query<PeerExportQuery>,
-) -> Result<Json<ReplicationBatch>, ApiError> {
-    state
-        .store
-        .export_replication(query.after)
-        .map(Json)
-        .map_err(ApiError::internal)
-}
-
-async fn import_peer(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(batch): Json<ReplicationBatch>,
-) -> Result<Json<ReplicationResponse>, ApiError> {
-    let relay = headers
-        .get("x-st3-peer")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or(&batch.peer);
-    if !state.trusted_peers.contains(relay) {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "unconfigured-peer".into(),
-            message: format!("peer `{relay}` is not configured as trusted"),
-            details: serde_json::Map::new(),
-        });
-    }
-    let response = state
-        .store
-        .import_replication(relay, &batch)
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
-}
-
-async fn query_peer(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(query): Json<ReplicationQuery>,
-) -> Result<Json<ReplicationBatch>, ApiError> {
-    let relay = headers
-        .get("x-st3-peer")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "unconfigured-peer".into(),
-            message: "the replication query has no configured peer label".into(),
-            details: serde_json::Map::new(),
-        })?;
-    if !state.trusted_peers.contains(relay) {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "unconfigured-peer".into(),
-            message: format!("peer `{relay}` is not configured as trusted"),
-            details: serde_json::Map::new(),
-        });
-    }
-    state
-        .store
-        .export_replication_for_heads(&query.replica_heads)
-        .map(Json)
-        .map_err(ApiError::internal)
-}
-
-#[derive(Deserialize)]
-struct PeerCursorQuery {
-    peer: String,
-}
-
-async fn peer_cursor(
-    State(state): State<AppState>,
-    Query(query): Query<PeerCursorQuery>,
-) -> Result<Json<Value>, ApiError> {
-    if query.peer != state.node && !state.trusted_peers.contains(&query.peer) {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "unconfigured-peer".into(),
-            message: format!("peer `{}` is not configured as trusted", query.peer),
-            details: serde_json::Map::new(),
-        });
-    }
-    Ok(Json(json!({
-        "peer": query.peer,
-        "accepted_through": state.store.peer_cursor(&query.peer).map_err(ApiError::internal)?,
-    })))
-}
-
 fn normalize_message_party(value: &str) -> String {
     if value == "requester" {
         "person/requester".into()
@@ -4751,7 +4805,8 @@ mod tests {
             node: "node".into(),
             state_dir: root.to_path_buf(),
             pty_root: root.join("pty"),
-            trusted_peers: Default::default(),
+            fleet_id: None,
+            configured_peers: Vec::new(),
         }
     }
 

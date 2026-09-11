@@ -587,6 +587,12 @@ fn build_registry() -> Registry {
             true,
         ),
         (
+            "repair",
+            "repair/RECORD_ID",
+            "An explicit replacement for an invalid replicated record.",
+            true,
+        ),
+        (
             "revision-proposal",
             "revision-proposal/ID",
             "A mission revision proposal.",
@@ -1459,6 +1465,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             true,
             &[],
         ),
+        (
+            "record.repaired",
+            &["repair"],
+            WritePolicy::OrdinaryClient,
+            Cardinality::Once,
+            Some("replication"),
+            false,
+            &["repair"],
+        ),
     ];
     for (kind, subjects, policy, cardinality, projection, wake, source_kdl) in definitions {
         claims.insert(
@@ -1689,6 +1704,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("protocol", string()),
             ("last_success_at", integer()),
             ("remote_heads", object()),
+        ],
+        "record.repaired" => &[
+            ("record", required_string()),
+            ("replacement", required_string()),
+            ("reason", required_string()),
         ],
         "runtime.action.requested" => &[
             ("action", string()),
@@ -2111,6 +2131,7 @@ mod tests {
                 "person",
                 "planning-session",
                 "pty",
+                "repair",
                 "resource",
                 "revision-proposal",
                 "run-generation",
@@ -2176,6 +2197,7 @@ mod tests {
                 "planning-session.revision-requested",
                 "planning-session.started",
                 "publication.operation",
+                "record.repaired",
                 "render.applied",
                 "resource.observed",
                 "revision-proposal.applied",

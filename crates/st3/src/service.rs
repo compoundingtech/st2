@@ -20,7 +20,10 @@ use crate::config::Config;
 
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "st3.service";
+#[cfg(target_os = "linux")]
+const REPLICATION_SERVICE_NAME: &str = "st3-replication.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
+const REPLICATION_SERVICE_LABEL: &str = "com.compoundingtech.st3.replication";
 pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 const PROVIDER_PROGRAMS: &[&str] = &["codex", "claude", "pi", "opencode", "omp"];
 
@@ -85,6 +88,38 @@ impl ServiceSpec {
         for peer in &self.config.peers {
             arguments.extend(["--peer".into(), format!("{}={}", peer.name, peer.url)]);
         }
+        if let Some(fleet_id) = &self.config.fleet_id {
+            arguments.extend(["--fleet-id".into(), fleet_id.clone()]);
+        }
+        if let Some(secret) = &self.config.shared_secret_file {
+            arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
+        }
+        arguments
+    }
+
+    fn replication_program_arguments(&self) -> Vec<String> {
+        let mut arguments = vec![
+            self.exe.display().to_string(),
+            "replication-worker".into(),
+            "--node".into(),
+            self.config.node.clone(),
+            "--state-dir".into(),
+            self.config.state_dir.display().to_string(),
+            "--socket".into(),
+            self.config.socket.display().to_string(),
+        ];
+        if let Some(peer_listen) = &self.config.peer_listen {
+            arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
+        }
+        for peer in &self.config.peers {
+            arguments.extend(["--peer".into(), format!("{}={}", peer.name, peer.url)]);
+        }
+        if let Some(fleet_id) = &self.config.fleet_id {
+            arguments.extend(["--fleet-id".into(), fleet_id.clone()]);
+        }
+        if let Some(secret) = &self.config.shared_secret_file {
+            arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
+        }
         arguments
     }
 }
@@ -103,6 +138,16 @@ pub fn install(mut config: Config) -> Result<()> {
         .pty_root
         .as_ref()
         .map(|root| absolute_from(&current, root));
+    config.shared_secret_file = config
+        .shared_secret_file
+        .as_ref()
+        .map(|path| absolute_from(&current, path));
+    if let (Some(fleet_id), Some(secret)) = (
+        config.fleet_id.as_deref(),
+        config.shared_secret_file.as_deref(),
+    ) {
+        crate::peer::FleetAuth::load(fleet_id, secret)?;
+    }
     let path = service_path(&exe)?;
     let spec = ServiceSpec::new(exe, config, path, DEFAULT_MEMORY_MAX_MB)?;
     install_native_service(&spec)?;
@@ -357,7 +402,13 @@ fn status_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn restart_native_service(config: &Config) -> Result<()> {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
+        .status();
     run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    if config.fleet_id.is_some() {
+        run_command("systemctl", &["--user", "start", REPLICATION_SERVICE_NAME])?;
+    }
     wait_for_socket(&config.socket)
 }
 
@@ -368,29 +419,45 @@ fn uninstall_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn stop_native_service() -> Result<()> {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", REPLICATION_SERVICE_NAME])
+        .status();
     run_command("systemctl", &["--user", "stop", SERVICE_NAME])
 }
 
 #[cfg(target_os = "linux")]
 fn start_native_service() -> Result<()> {
-    run_command("systemctl", &["--user", "start", SERVICE_NAME])
+    run_command("systemctl", &["--user", "start", SERVICE_NAME])?;
+    if replication_systemd_user_unit_path()?.exists() {
+        run_command("systemctl", &["--user", "start", REPLICATION_SERVICE_NAME])?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn install_native_service(spec: &ServiceSpec) -> Result<()> {
     let plist = launch_agent_path()?;
+    let replication_plist = replication_launch_agent_path()?;
     let logs = spec.config.state_dir.join("logs");
     fs::create_dir_all(&logs)?;
     if let Some(parent) = plist.parent() {
         fs::create_dir_all(parent)?;
     }
     let previous = read_existing_file(&plist)?;
+    let previous_replication = read_existing_file(&replication_plist)?;
     fs::write(&plist, render_launchd_plist(spec))?;
+    if spec.config.fleet_id.is_some() {
+        fs::write(&replication_plist, render_launchd_replication_plist(spec))?;
+    }
     let domain = launch_domain();
     let service = format!("{domain}/{SERVICE_LABEL}");
+    let replication_service = format!("{domain}/{REPLICATION_SERVICE_LABEL}");
     let install = (|| -> Result<()> {
         let _ = Command::new("launchctl")
             .args(["bootout", &service])
+            .status();
+        let _ = Command::new("launchctl")
+            .args(["bootout", &replication_service])
             .status();
         run_command("launchctl", &["enable", &service])?;
         run_command(
@@ -398,6 +465,25 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
             &["bootstrap", &domain, &plist.display().to_string()],
         )?;
         run_command("launchctl", &["kickstart", &service])?;
+        if spec.config.fleet_id.is_some() {
+            run_command("launchctl", &["enable", &replication_service])?;
+            run_command(
+                "launchctl",
+                &[
+                    "bootstrap",
+                    &domain,
+                    &replication_plist.display().to_string(),
+                ],
+            )?;
+            run_command("launchctl", &["kickstart", &replication_service])?;
+        } else {
+            let _ = Command::new("launchctl")
+                .args(["disable", &replication_service])
+                .status();
+            if replication_plist.exists() {
+                fs::remove_file(&replication_plist)?;
+            }
+        }
         wait_for_socket(&spec.config.socket)
     })();
     if let Err(error) = install {
@@ -405,7 +491,11 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
             let _ = Command::new("launchctl")
                 .args(["bootout", &service])
                 .status();
+            let _ = Command::new("launchctl")
+                .args(["bootout", &replication_service])
+                .status();
             restore_file(&plist, previous.as_deref())?;
+            restore_file(&replication_plist, previous_replication.as_deref())?;
             if previous.is_some() {
                 run_command("launchctl", &["enable", &service])?;
                 run_command(
@@ -418,6 +508,18 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
                     .args(["disable", &service])
                     .status();
             }
+            if previous_replication.is_some() {
+                run_command("launchctl", &["enable", &replication_service])?;
+                run_command(
+                    "launchctl",
+                    &[
+                        "bootstrap",
+                        &domain,
+                        &replication_plist.display().to_string(),
+                    ],
+                )?;
+                run_command("launchctl", &["kickstart", &replication_service])?;
+            }
             Ok(())
         })();
         if let Err(rollback) = rollback {
@@ -428,6 +530,9 @@ fn install_native_service(spec: &ServiceSpec) -> Result<()> {
         return Err(error).context("the launchd install failed; st3 restored the prior service");
     }
     println!("plist\t{}", plist.display());
+    if spec.config.fleet_id.is_some() {
+        println!("replication-plist\t{}", replication_plist.display());
+    }
     Ok(())
 }
 
@@ -436,19 +541,37 @@ fn status_native_service() -> Result<()> {
     run_command(
         "launchctl",
         &["print", &format!("{}/{SERVICE_LABEL}", launch_domain())],
-    )
+    )?;
+    if replication_launch_agent_path()?.exists() {
+        run_command(
+            "launchctl",
+            &[
+                "print",
+                &format!("{}/{REPLICATION_SERVICE_LABEL}", launch_domain()),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn restart_native_service(config: &Config) -> Result<()> {
+    let domain = launch_domain();
+    let replication_service = format!("{domain}/{REPLICATION_SERVICE_LABEL}");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &replication_service])
+        .status();
     run_command(
         "launchctl",
-        &[
-            "kickstart",
-            "-k",
-            &format!("{}/{SERVICE_LABEL}", launch_domain()),
-        ],
+        &["kickstart", "-k", &format!("{domain}/{SERVICE_LABEL}")],
     )?;
+    if config.fleet_id.is_some() {
+        let plist = replication_launch_agent_path()?;
+        run_command(
+            "launchctl",
+            &["bootstrap", &domain, &plist.display().to_string()],
+        )?;
+    }
     wait_for_socket(&config.socket)
 }
 
@@ -461,15 +584,32 @@ fn uninstall_native_service() -> Result<()> {
     let _ = Command::new("launchctl")
         .args(["disable", &service])
         .status();
+    let replication_service = format!("{}/{REPLICATION_SERVICE_LABEL}", launch_domain());
+    let _ = Command::new("launchctl")
+        .args(["bootout", &replication_service])
+        .status();
+    let _ = Command::new("launchctl")
+        .args(["disable", &replication_service])
+        .status();
     let plist = launch_agent_path()?;
     if plist.exists() {
         fs::remove_file(plist)?;
+    }
+    let replication_plist = replication_launch_agent_path()?;
+    if replication_plist.exists() {
+        fs::remove_file(replication_plist)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn stop_native_service() -> Result<()> {
+    let _ = Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("{}/{REPLICATION_SERVICE_LABEL}", launch_domain()),
+        ])
+        .status();
     run_command(
         "launchctl",
         &["bootout", &format!("{}/{SERVICE_LABEL}", launch_domain())],
@@ -487,34 +627,84 @@ fn start_native_service() -> Result<()> {
     run_command(
         "launchctl",
         &["kickstart", &format!("{domain}/{SERVICE_LABEL}")],
-    )
+    )?;
+    let replication_plist = replication_launch_agent_path()?;
+    if replication_plist.exists() {
+        run_command(
+            "launchctl",
+            &[
+                "bootstrap",
+                &domain,
+                &replication_plist.display().to_string(),
+            ],
+        )?;
+        run_command(
+            "launchctl",
+            &[
+                "kickstart",
+                &format!("{domain}/{REPLICATION_SERVICE_LABEL}"),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
     let unit_path = systemd_user_unit_path()?;
+    let replication_path = replication_systemd_user_unit_path()?;
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let previous = read_existing_file(&unit_path)?;
+    let previous_replication = read_existing_file(&replication_path)?;
     fs::write(&unit_path, render_systemd_user_unit(spec))?;
+    if spec.config.fleet_id.is_some() {
+        fs::write(&replication_path, render_systemd_replication_unit(spec))?;
+    }
     let install = (|| -> Result<()> {
         run_command("systemctl", &["--user", "daemon-reload"])?;
         run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
         run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+        if spec.config.fleet_id.is_some() {
+            run_command("systemctl", &["--user", "enable", REPLICATION_SERVICE_NAME])?;
+            run_command(
+                "systemctl",
+                &["--user", "restart", REPLICATION_SERVICE_NAME],
+            )?;
+        } else {
+            let _ = Command::new("systemctl")
+                .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
+                .status();
+            if replication_path.exists() {
+                fs::remove_file(&replication_path)?;
+                run_command("systemctl", &["--user", "daemon-reload"])?;
+            }
+        }
         wait_for_socket(&spec.config.socket)
     })();
     if let Err(error) = install {
         let rollback = (|| -> Result<()> {
             if previous.is_some() {
                 restore_file(&unit_path, previous.as_deref())?;
+                restore_file(&replication_path, previous_replication.as_deref())?;
                 run_command("systemctl", &["--user", "daemon-reload"])?;
                 run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
+                if previous_replication.is_some() {
+                    run_command(
+                        "systemctl",
+                        &["--user", "restart", REPLICATION_SERVICE_NAME],
+                    )?;
+                }
             } else {
                 let _ = Command::new("systemctl")
                     .args(["--user", "disable", "--now", SERVICE_NAME])
                     .status();
+                let _ = Command::new("systemctl")
+                    .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
+                    .status();
                 restore_file(&unit_path, None)?;
+                restore_file(&replication_path, previous_replication.as_deref())?;
                 run_command("systemctl", &["--user", "daemon-reload"])?;
             }
             Ok(())
@@ -527,6 +717,9 @@ fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
         return Err(error).context("the systemd install failed; st3 restored the prior service");
     }
     println!("unit\t{}", unit_path.display());
+    if spec.config.fleet_id.is_some() {
+        println!("replication-unit\t{}", replication_path.display());
+    }
     Ok(())
 }
 
@@ -535,7 +728,14 @@ fn status_systemd_user() -> Result<()> {
     run_command(
         "systemctl",
         &["--user", "status", SERVICE_NAME, "--no-pager"],
-    )
+    )?;
+    if replication_systemd_user_unit_path()?.exists() {
+        run_command(
+            "systemctl",
+            &["--user", "status", REPLICATION_SERVICE_NAME, "--no-pager"],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -543,9 +743,16 @@ fn uninstall_systemd_user() -> Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", SERVICE_NAME])
         .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
+        .status();
     let unit_path = systemd_user_unit_path()?;
     if unit_path.exists() {
         fs::remove_file(unit_path)?;
+    }
+    let replication_path = replication_systemd_user_unit_path()?;
+    if replication_path.exists() {
+        fs::remove_file(replication_path)?;
     }
     run_command("systemctl", &["--user", "daemon-reload"])
 }
@@ -605,6 +812,15 @@ fn launch_agent_path() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn replication_launch_agent_path() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+            .join("Library/LaunchAgents")
+            .join(format!("{REPLICATION_SERVICE_LABEL}.plist")),
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn launch_domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
@@ -618,6 +834,17 @@ fn systemd_user_unit_path() -> Result<PathBuf> {
         .context("HOME and XDG_CONFIG_HOME are not set")?
         .join("systemd/user")
         .join(SERVICE_NAME))
+}
+
+#[cfg(target_os = "linux")]
+fn replication_systemd_user_unit_path() -> Result<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    Ok(base
+        .context("HOME and XDG_CONFIG_HOME are not set")?
+        .join("systemd/user")
+        .join(REPLICATION_SERVICE_NAME))
 }
 
 fn wait_for_socket(socket: &Path) -> Result<()> {
@@ -675,20 +902,83 @@ WantedBy=default.target\n",
     )
 }
 
+pub fn render_systemd_replication_unit(spec: &ServiceSpec) -> String {
+    render_systemd_program_unit(
+        "st3 authenticated replication worker",
+        &spec.replication_program_arguments(),
+        spec,
+    )
+}
+
+fn render_systemd_program_unit(
+    description: &str,
+    arguments: &[String],
+    spec: &ServiceSpec,
+) -> String {
+    let exec_start = arguments
+        .iter()
+        .map(|argument| systemd_quote_arg(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "[Unit]\n\
+Description={description}\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+Environment={}\n\
+ExecStart={exec_start}\n\
+Restart=on-failure\n\
+RestartSec=5s\n\
+MemoryMax={}M\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n",
+        systemd_quote_arg(&format!("PATH={}", spec.path)),
+        spec.memory_max_mb,
+    )
+}
+
 pub fn render_launchd_plist(spec: &ServiceSpec) -> String {
-    let arguments = spec
-        .program_arguments()
+    render_launchd_program_plist(
+        SERVICE_LABEL,
+        &spec.program_arguments(),
+        "st3.stdout.log",
+        "st3.stderr.log",
+        spec,
+    )
+}
+
+pub fn render_launchd_replication_plist(spec: &ServiceSpec) -> String {
+    render_launchd_program_plist(
+        REPLICATION_SERVICE_LABEL,
+        &spec.replication_program_arguments(),
+        "st3-replication.stdout.log",
+        "st3-replication.stderr.log",
+        spec,
+    )
+}
+
+fn render_launchd_program_plist(
+    label: &str,
+    program_arguments: &[String],
+    stdout_name: &str,
+    stderr_name: &str,
+    spec: &ServiceSpec,
+) -> String {
+    let arguments = program_arguments
         .iter()
         .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
         .collect::<String>();
-    let stdout = spec.config.state_dir.join("logs/st3.stdout.log");
-    let stderr = spec.config.state_dir.join("logs/st3.stderr.log");
+    let stdout = spec.config.state_dir.join("logs").join(stdout_name);
+    let stderr = spec.config.state_dir.join("logs").join(stderr_name);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n\
 <dict>\n\
-  <key>Label</key><string>{SERVICE_LABEL}</string>\n\
+  <key>Label</key><string>{label}</string>\n\
   <key>ProgramArguments</key>\n  <array>\n{arguments}  </array>\n\
   <key>EnvironmentVariables</key>\n  <dict><key>PATH</key><string>{}</string></dict>\n\
   <key>RunAtLoad</key><true/>\n\
@@ -779,13 +1069,15 @@ mod tests {
     fn unit_bakes_the_effective_config_and_limit() -> Result<()> {
         let config = Config {
             node: "node-a".into(),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/var/lib/st3/fleet.secret".into()),
             state_dir: "/var/lib/st3".into(),
             pty_root: Some("/var/lib/pty".into()),
             socket: "/run/user/1000/st3.sock".into(),
             peer_listen: Some("127.0.0.1:31313".into()),
             peers: vec![PeerConfig {
                 name: "node-b".into(),
-                url: "http://node-b:31313".into(),
+                url: "http://127.0.0.1:31314".into(),
             }],
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, "/usr/bin", 1024)?;
@@ -793,9 +1085,13 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/bin/st3 up --node node-a"));
         assert!(unit.contains("--state-dir /var/lib/st3"));
         assert!(unit.contains("--pty-root /var/lib/pty"));
-        assert!(unit.contains("--peer node-b=http://node-b:31313"));
+        assert!(unit.contains("--peer node-b=http://127.0.0.1:31314"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("Restart=on-failure"));
+        let replication = render_systemd_replication_unit(&spec);
+        assert!(replication.contains("replication-worker"));
+        assert!(replication.contains("--fleet-id 1f91ca65-7793-48cc-866e-ac15690130e1"));
+        assert!(replication.contains("--shared-secret-file /var/lib/st3/fleet.secret"));
         Ok(())
     }
 
