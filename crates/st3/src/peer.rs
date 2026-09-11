@@ -347,7 +347,7 @@ async fn receive_exchange(
         anyhow::ensure!(state.peers.contains(&relay), "the peer is not configured");
         let request: ReplicationExchange =
             serde_json::from_slice(&body).context("decode the replication exchange")?;
-        state
+        let receipt = state
             .store
             .receive_replication_exchange(&relay, state.auth.fleet_id(), &request)?;
         let admission = state.store.validate_replication_backlog()?;
@@ -355,9 +355,11 @@ async fn receive_exchange(
         if admission.changed {
             wake_main(&state.main_socket).await;
         }
-        state
-            .outbound_notify
-            .send_modify(|generation| *generation = generation.saturating_add(1));
+        if receipt.received != 0 {
+            state
+                .outbound_notify
+                .send_modify(|generation| *generation = generation.saturating_add(1));
+        }
         let response = state
             .store
             .export_replication_exchange(state.auth.fleet_id(), &request.inventory)?;
@@ -728,5 +730,61 @@ mod tests {
             target_status.authority_digest
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_inbound_exchange_does_not_wake_outbound_replication() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[7; 32]);
+        let source = Store::open_memory("source").unwrap();
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("source-up".into()),
+            })
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        let body = Bytes::from(serde_json::to_vec(&exchange).unwrap());
+        let (outbound_notify, mut outbound_wake) = watch::channel(0_u64);
+        let state = PeerState {
+            store: target,
+            node: "target".into(),
+            auth: auth.clone(),
+            peers: BTreeSet::from(["source".into()]),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify,
+        };
+
+        let first = receive_exchange(
+            State(state.clone()),
+            auth.request_headers("source", &body).unwrap(),
+            body.clone(),
+        )
+        .await;
+        assert!(first.status().is_success());
+        outbound_wake.changed().await.unwrap();
+        let _ = outbound_wake.borrow_and_update();
+
+        let duplicate = receive_exchange(
+            State(state.clone()),
+            auth.request_headers("source", &body).unwrap(),
+            body,
+        )
+        .await;
+        assert!(duplicate.status().is_success());
+        assert!(
+            !outbound_wake.has_changed().unwrap(),
+            "a duplicate receipt must not start a replication echo loop"
+        );
     }
 }
