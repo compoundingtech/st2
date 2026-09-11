@@ -168,6 +168,8 @@ CREATE TABLE IF NOT EXISTS replica_records (
 );
 CREATE INDEX IF NOT EXISTS replica_records_state
 ON replica_records(state, writer, sequence);
+CREATE INDEX IF NOT EXISTS replica_records_claim
+ON replica_records(claim_id, position);
 
 CREATE TABLE IF NOT EXISTS projection_health (
     aggregate TEXT PRIMARY KEY,
@@ -14366,6 +14368,31 @@ version 2
         let path = directory.path().join("state.sqlite3");
         drop(Store::open(&path, "node").unwrap());
         Store::open(&path, "node").unwrap();
+    }
+
+    #[test]
+    fn replication_projection_uses_the_claim_position_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT claims.id,
+                        COALESCE((SELECT MIN(position) FROM replica_records
+                                  WHERE replica_records.claim_id=claims.id), 0)
+                 FROM claims",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("replica_records_claim"),
+            "the projection query must use the claim position index:\n{plan}"
+        );
     }
 
     #[test]
