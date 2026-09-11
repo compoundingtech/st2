@@ -31,6 +31,8 @@ impl Drop for Daemon {
 }
 
 fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
+    let stderr = fs::File::create(socket.with_extension("daemon.stderr"))
+        .expect("create the daemon diagnostic log");
     Daemon(
         st3_command(binary)
             .arg("up")
@@ -44,7 +46,7 @@ fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
             .args(["--peer-listen", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("start st3"),
     )
@@ -139,10 +141,19 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         ])
         .output()
         .unwrap();
+    let inspected = st3_command(binary)
+        .args(["--endpoint", socket.to_str().unwrap(), "inspect", &subject])
+        .output()
+        .unwrap();
+    let daemon_stderr = fs::read_to_string(socket.with_extension("daemon.stderr"))
+        .unwrap_or_else(|error| format!("cannot read the daemon diagnostic log: {error}"));
     assert!(
         waited.status.success(),
-        "{}",
-        String::from_utf8_lossy(&waited.stderr)
+        "wait: {}\ninspect stdout:\n{}\ninspect stderr:\n{}\ndaemon stderr:\n{}",
+        String::from_utf8_lossy(&waited.stderr),
+        String::from_utf8_lossy(&inspected.stdout),
+        String::from_utf8_lossy(&inspected.stderr),
+        daemon_stderr,
     );
     let listed = st3_command(binary)
         .args(["--endpoint", socket.to_str().unwrap(), "pty", "ls"])
