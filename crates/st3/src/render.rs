@@ -69,15 +69,8 @@ fn prepare_render(
     let mut warnings = Vec::new();
     for operation in children(render) {
         let operation_name = name(operation).context("render operation has no name")?;
-        if operation_name == "git-exclude" && !workspace.join(".git/info").is_dir() {
-            warnings.push(format!(
-                "skip git-exclude because {} has no .git/info directory",
-                workspace.display()
-            ));
-            continue;
-        }
         let arguments = arguments(operation);
-        let (path, bytes) = match operation_name {
+        let (destination, bytes, check_tracked) = match operation_name {
             "copy" => {
                 anyhow::ensure!(
                     arguments.len() == 2,
@@ -96,10 +89,8 @@ fn prepare_render(
                 } else {
                     fs::read(source).with_context(|| format!("read render source {source}"))?
                 };
-                (
-                    arguments[1].as_str().context("destination is not text")?,
-                    bytes,
-                )
+                let path = arguments[1].as_str().context("destination is not text")?;
+                (destination(workspace, path)?, bytes, true)
             }
             "file" => {
                 anyhow::ensure!(
@@ -112,12 +103,10 @@ fn prepare_render(
                     .map(str::to_owned)
                     .or_else(|| child_string(operation, "content"))
                     .context("render file has no content")?;
-                (
-                    arguments[0]
-                        .as_str()
-                        .context("render file destination is not text")?,
-                    content.into_bytes(),
-                )
+                let path = arguments[0]
+                    .as_str()
+                    .context("render file destination is not text")?;
+                (destination(workspace, path)?, content.into_bytes(), true)
             }
             "json-upsert" => {
                 anyhow::ensure!(
@@ -153,32 +142,23 @@ fn prepare_render(
                 );
                 let mut bytes = serde_json::to_vec_pretty(&current)?;
                 bytes.push(b'\n');
-                (path, bytes)
+                (destination, bytes, true)
             }
-            "ensure-line" | "git-exclude" => {
-                let path = if operation_name == "git-exclude" {
-                    ".git/info/exclude"
-                } else {
-                    anyhow::ensure!(
-                        arguments.len() == 2,
-                        "ensure-line needs destination and line"
-                    );
-                    arguments[0]
-                        .as_str()
-                        .context("ensure-line destination is not text")?
-                };
+            "ensure-line" => {
+                anyhow::ensure!(
+                    arguments.len() == 2,
+                    "ensure-line needs destination and line"
+                );
+                let path = arguments[0]
+                    .as_str()
+                    .context("ensure-line destination is not text")?;
                 let destination = destination(workspace, path)?;
                 let mut current = match fs::read_to_string(&destination) {
                     Ok(value) => value,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
                     Err(error) => return Err(error.into()),
                 };
-                let lines = if operation_name == "git-exclude" {
-                    arguments
-                } else {
-                    &arguments[1..]
-                };
-                for value in lines {
+                for value in &arguments[1..] {
                     let line = value.as_str().context("render line is not text")?;
                     if !current.lines().any(|existing| existing == line) {
                         if !current.is_empty() && !current.ends_with('\n') {
@@ -188,13 +168,40 @@ fn prepare_render(
                         current.push('\n');
                     }
                 }
-                (path, current.into_bytes())
+                (destination, current.into_bytes(), true)
+            }
+            "git-exclude" => {
+                anyhow::ensure!(!arguments.is_empty(), "git-exclude needs at least one path");
+                let Some(destination) = git_exclude_destination(workspace)? else {
+                    warnings.push(format!(
+                        "skip git-exclude because {} has no supported Git metadata",
+                        workspace.display()
+                    ));
+                    continue;
+                };
+                let mut current = match fs::read_to_string(&destination) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => return Err(error.into()),
+                };
+                for value in arguments {
+                    let line = value.as_str().context("render line is not text")?;
+                    if !current.lines().any(|existing| existing == line) {
+                        if !current.is_empty() && !current.ends_with('\n') {
+                            current.push('\n');
+                        }
+                        current.push_str(line);
+                        current.push('\n');
+                    }
+                }
+                (destination, current.into_bytes(), false)
             }
             other => anyhow::bail!("unknown render operation `{other}`"),
         };
-        let destination = destination(workspace, path)?;
         let mode = if executable(operation) { 0o755 } else { 0o644 };
-        ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+        if check_tracked {
+            ensure_tracked_file_is_unchanged(workspace, &destination, &bytes)?;
+        }
         if let Some(existing) = writes
             .iter()
             .find(|write: &&PlannedWrite| write.destination == destination)
@@ -213,6 +220,66 @@ fn prepare_render(
         });
     }
     Ok((writes, warnings))
+}
+
+fn git_exclude_destination(workspace: &Path) -> Result<Option<PathBuf>> {
+    let dot_git = workspace.join(".git");
+    let metadata = match fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() {
+        return Ok(Some(dot_git.join("info/exclude")));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let pointer = fs::read_to_string(&dot_git)
+        .with_context(|| format!("read Git directory pointer {}", dot_git.display()))?;
+    let mut lines = pointer.lines();
+    let Some(path) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir: "))
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    if lines.any(|line| !line.is_empty()) {
+        return Ok(None);
+    }
+    let git_dir = resolve_git_metadata_path(workspace, path)?;
+    if !git_dir.is_dir() {
+        return Ok(None);
+    }
+    let common_dir_file = git_dir.join("commondir");
+    let common_dir = match fs::read_to_string(&common_dir_file) {
+        Ok(pointer) => {
+            let path = pointer.trim_end_matches(['\r', '\n']);
+            if path.is_empty() || path.contains(['\r', '\n']) {
+                return Ok(None);
+            }
+            let path = resolve_git_metadata_path(&git_dir, path)?;
+            if !path.is_dir() {
+                return Ok(None);
+            }
+            path
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(common_dir.join("info/exclude")))
+}
+
+fn resolve_git_metadata_path(base: &Path, value: &str) -> Result<PathBuf> {
+    let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    fs::canonicalize(&path).with_context(|| format!("resolve Git metadata path {}", path.display()))
 }
 
 pub fn apply_all(
@@ -848,6 +915,85 @@ host "node" {{
             fs::read_to_string(workspace.path().join("tracked")).unwrap(),
             "original\n"
         );
+    }
+
+    #[test]
+    fn git_exclude_updates_a_normal_repository_once() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        let desired = serde_json::json!({
+            "children": [{
+                "name": "render",
+                "children": [{ "name": "git-exclude", "arguments": [".st3/"] }]
+            }]
+        });
+
+        apply(&store, &desired, workspace.path()).unwrap();
+        apply(&store, &desired, workspace.path()).unwrap();
+
+        let exclude = fs::read_to_string(workspace.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|line| *line == ".st3/").count(), 1);
+    }
+
+    #[test]
+    fn git_exclude_updates_the_common_directory_for_a_linked_worktree() {
+        let store = Store::open_memory("node").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("owner");
+        let common = root.path().join("repository/.git");
+        let worktree_git = common.join("worktrees/owner");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(
+            workspace.join(".git"),
+            "gitdir: ../repository/.git/worktrees/owner\n",
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        fs::write(common.join("info/exclude"), "existing\n").unwrap();
+        let desired = serde_json::json!({
+            "children": [{
+                "name": "render",
+                "children": [{ "name": "git-exclude", "arguments": [".st3/"] }]
+            }]
+        });
+
+        let result = apply(&store, &desired, &workspace).unwrap();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            fs::read_to_string(common.join("info/exclude")).unwrap(),
+            "existing\n.st3/\n"
+        );
+        assert_eq!(
+            result.receipts[0].destination,
+            common.join("info/exclude").display().to_string()
+        );
+    }
+
+    #[test]
+    fn git_exclude_warns_for_a_malformed_git_directory_pointer() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".git"), "not a Git pointer\n").unwrap();
+        let desired = serde_json::json!({
+            "children": [{
+                "name": "render",
+                "children": [{ "name": "git-exclude", "arguments": [".st3/"] }]
+            }]
+        });
+
+        let result = apply(&store, &desired, workspace.path()).unwrap();
+
+        assert!(result.receipts.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("has no supported Git metadata"));
     }
 
     #[test]
