@@ -371,7 +371,9 @@ fn process_identity(pid: u32) -> Result<(char, u64)> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn process_start_token(pid: u32) -> Result<u64> {
-    process_identity(pid).map(|(_, token)| token)
+    // This platform has no portable process start token. The runtime uses the
+    // PID as its best available token, so a fast exit must not make spawn fail.
+    Ok(pid as u64)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -398,6 +400,16 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_start_token_survives_a_fast_process_exit() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+
+        assert_eq!(process_start_token(pid).unwrap(), pid as u64);
+    }
 
     fn wait_for_exit(runtime: &ExecRuntime, id: &str) -> ExecGeneration {
         for _ in 0..200 {
