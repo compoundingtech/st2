@@ -62,7 +62,10 @@ fn pty_helpers_use_graph_subjects_and_expected_incarnations() {
         .status()
         .expect("the PTY runtime is required");
     assert!(pty.success(), "the PTY runtime is required");
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::Builder::new()
+        .prefix("st3-pty-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let state = temporary.path().join("state");
     let socket = temporary.path().join("st3.sock");
     let intent = temporary.path().join("pty.kdl");
