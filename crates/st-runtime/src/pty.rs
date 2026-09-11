@@ -120,14 +120,30 @@ impl PtyRuntime {
         const ATTEMPTS: u32 = 4;
         let mut last_error = String::new();
         for attempt in 0..ATTEMPTS {
+            std::fs::create_dir_all(&self.root).context("create the PTY runtime directory")?;
+            let diagnostic_path = self.root.join(format!(".{unit}.{attempt}.spawn.stderr"));
+            let diagnostic = std::fs::File::create(&diagnostic_path)
+                .context("create the PTY spawn diagnostic log")?;
             let mut command =
                 crate::wrap_isolated(&unit, std::ffi::OsStr::new(&self.binary), &argument_refs);
-            command.env("PTY_ROOT", &self.root);
-            let output = command.output()?;
-            if output.status.success() {
+            command
+                .env("PTY_ROOT", &self.root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(diagnostic));
+            let status = match command.status() {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&diagnostic_path);
+                    return Err(error.into());
+                }
+            };
+            let diagnostic =
+                std::fs::read(&diagnostic_path).context("read the PTY spawn diagnostic log")?;
+            let _ = std::fs::remove_file(&diagnostic_path);
+            if status.success() {
                 return Ok(());
             }
-            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            last_error = String::from_utf8_lossy(&diagnostic).trim().to_string();
             if !last_error.contains("already in use") || attempt + 1 == ATTEMPTS {
                 break;
             }
@@ -417,6 +433,33 @@ exit 0
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("TERM=screen-256color"));
         assert!(!arguments.contains("TERM=xterm-256color"));
+    }
+
+    #[test]
+    fn spawn_does_not_wait_for_detached_descendant_output() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fake-pty-detach");
+        fs::write(&binary, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+
+        let started = std::time::Instant::now();
+        runtime
+            .spawn(
+                "work",
+                &Launch::Argv(vec!["true".into()]),
+                root.path(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "PTY spawn waited for a detached descendant"
+        );
     }
 
     #[test]
