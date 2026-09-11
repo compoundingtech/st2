@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
 WHERE json_extract(body, '$._operation.id') IS NOT NULL;
@@ -148,6 +149,8 @@ CREATE TABLE IF NOT EXISTS replica_envelopes (
 );
 CREATE INDEX IF NOT EXISTS replica_envelopes_state
 ON replica_envelopes(receipt_state, writer, sequence);
+CREATE INDEX IF NOT EXISTS replica_envelopes_batch
+ON replica_envelopes(batch_id);
 
 CREATE TABLE IF NOT EXISTS replica_records (
     record_ref TEXT PRIMARY KEY,
@@ -14392,6 +14395,41 @@ version 2
         assert!(
             plan.contains("replica_records_claim"),
             "the projection query must use the claim position index:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn replication_inventory_uses_the_batch_indexes() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let plan = |query: &str| {
+            let mut statement = connection.prepare(query).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+        };
+        let missing_envelopes = plan(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM batches
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM replica_envelopes
+                 WHERE replica_envelopes.batch_id=batches.id
+             )",
+        );
+        assert!(
+            missing_envelopes.contains("replica_envelopes_batch"),
+            "the inventory seed query must use the envelope batch index:\n{missing_envelopes}"
+        );
+        let batch_claims = plan(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM claims WHERE batch_id='batch/example' ORDER BY store_index",
+        );
+        assert!(
+            batch_claims.contains("claims_batch_index"),
+            "the inventory seed query must use the claim batch index:\n{batch_claims}"
         );
     }
 
