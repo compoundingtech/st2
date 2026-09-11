@@ -184,11 +184,7 @@ impl ExecRuntime {
                 Ok(Some(ExecObservation::Exited(generation)))
             }
             Ok(_) => Ok(Some(ExecObservation::Exited(generation))),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
+            Err(error) if process_is_absent(&error) => {
                 Ok(Some(ExecObservation::Exited(generation)))
             }
             Err(error) => Ok(Some(ExecObservation::Indeterminate(error.to_string()))),
@@ -317,6 +313,12 @@ impl ExecRuntime {
     }
 }
 
+fn process_is_absent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    })
+}
+
 fn rotate_file(current: &Path, previous: &Path) -> Result<()> {
     if !current.exists() {
         return Ok(());
@@ -409,6 +411,13 @@ mod tests {
         child.wait().unwrap();
 
         assert_eq!(process_start_token(pid).unwrap(), pid as u64);
+    }
+
+    #[test]
+    fn an_absent_process_is_a_normal_exit_on_every_unix_platform() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ESRCH));
+
+        assert!(process_is_absent(&error));
     }
 
     fn wait_for_exit(runtime: &ExecRuntime, id: &str) -> ExecGeneration {
