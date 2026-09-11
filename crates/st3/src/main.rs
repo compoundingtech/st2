@@ -21,7 +21,7 @@ use st3::model::{
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, IntentInput, MessageLifecycleRequest,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRunView, MissionState, PlanningApprovalRequest,
+    MissionResponse, MissionRevisionRequest, MissionRunView, MissionState, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
     QuickAgentResponse, ResourceRefreshView, ResourceWatchView, ReviewRequest,
     RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
@@ -2398,6 +2398,7 @@ async fn condition_value(client: &Client, subject: &str, condition: &str) -> Res
     let matches = match condition {
         "running" => matches!(actual_status, Some("running" | "ready")),
         "ready" => actual_status == Some("ready"),
+        "standing" => actual_status == Some("standing"),
         "completed" => actual_status == Some("completed"),
         "failed" => actual_status == Some("failed"),
         "cancelled" => actual_status == Some("cancelled"),
@@ -2427,6 +2428,7 @@ fn validate_wait_condition(condition: &str) -> Result<()> {
             condition,
             "running"
                 | "ready"
+                | "standing"
                 | "completed"
                 | "failed"
                 | "cancelled"
@@ -3707,11 +3709,18 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 return print_value(&work, true);
             }
             for step in work {
+                let queue = step
+                    .queue
+                    .as_deref()
+                    .zip(step.queue_position)
+                    .map(|(queue, position)| format!("queue {queue} #{position}"))
+                    .unwrap_or_else(|| "-".into());
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     step.status,
                     work_actor_label(&step),
                     step.subject,
+                    queue,
                     step.title.as_deref().unwrap_or(&step.step)
                 );
             }
@@ -3739,6 +3748,9 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 );
                 if let Some(title) = step.title {
                     println!("Title: {title}");
+                }
+                if let Some((queue, position)) = step.queue.as_deref().zip(step.queue_position) {
+                    println!("Queue: {queue} #{position}");
                 }
                 for goal in step.goals {
                     println!("Goal: {goal}");
@@ -3804,45 +3816,24 @@ async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> R
                 print!("{revision_kdl}");
                 return Ok(());
             }
-            publish_text(
-                client,
-                kdl,
-                format!("st3 work revise {} candidate", run.subject),
-                actor.clone(),
-            )
-            .await?;
-            let publication = publish_text(
-                client,
-                revision_kdl,
-                format!("st3 work revise {} operation", run.subject),
-                actor,
-            )
-            .await?;
-            let current: MissionRunView = client
-                .get(&format!(
-                    "/v1/mission-runs/{}",
-                    urlencoding::encode(&run.subject)
-                ))
-                .await?;
-            let proposal = client
-                .get::<RevisionProposalView>(&format!(
-                    "/v1/mission-runs/{}/revision-proposal",
-                    urlencoding::encode(&run.subject)
-                ))
-                .await
-                .ok();
-            if let Some(proposal) = proposal {
-                print_value(
-                    &RevisionSubmissionView {
-                        status: proposal.status.clone(),
-                        mission_run: current,
-                        proposal: Some(proposal),
+            let response: RevisionSubmissionView = client
+                .post(
+                    &format!(
+                        "/v1/mission-runs/{}/revision",
+                        urlencoding::encode(&run.subject)
+                    ),
+                    &MissionRevisionRequest {
+                        intent: IntentInput {
+                            kdl,
+                            source_name: Some(args.file.display().to_string()),
+                        },
+                        actor,
+                        reason: args.reason,
+                        idempotency_key: operation,
                     },
-                    json_output,
                 )
-            } else {
-                print_value(&publication, json_output)
-            }
+                .await?;
+            print_value(&response, json_output)
         }
         WorkCommand::Revision { command } => run_work_revision(client, command, json_output).await,
     }
@@ -3997,6 +3988,10 @@ async fn post_work(
         if action == "claim" {
             if let Some(title) = response.title {
                 println!("Title: {title}");
+            }
+            if let Some((queue, position)) = response.queue.as_deref().zip(response.queue_position)
+            {
+                println!("Queue: {queue} #{position}");
             }
             for goal in response.goals {
                 println!("Goal: {goal}");
@@ -4876,15 +4871,22 @@ fn render_graph_step(output: &mut String, step: &StepRunView, indent: &str) {
     } else {
         String::new()
     };
+    let queue = step
+        .queue
+        .as_deref()
+        .zip(step.queue_position)
+        .map(|(queue, position)| format!(" · queue {queue} #{position}"))
+        .unwrap_or_default();
     let _ = writeln!(
         output,
-        "{indent}{} {:<10} {} — {}{}{}",
+        "{indent}{} {:<10} {} — {}{}{}{}",
         graph_state_mark(&step.status),
         step.status,
         step.step.rsplit('/').next().unwrap_or(&step.step),
         title,
         actor,
-        attempt
+        attempt,
+        queue
     );
     if let Some(reason) = &step.blocked_reason {
         let _ = writeln!(output, "{indent}  reason: {reason}");
@@ -6113,11 +6115,17 @@ fn work_message_request(
 }
 
 fn work_notification(step: &StepRunView) -> String {
+    let queue = step
+        .queue
+        .as_deref()
+        .zip(step.queue_position)
+        .map(|(queue, position)| format!("\nQueue: {queue} #{position}"))
+        .unwrap_or_default();
     format!(
         "A mission step is ready: {0}. Run `st3 work claim {0}` to read and claim it.\n\nTitle: {1}",
         step.subject,
         step.title.as_deref().unwrap_or(&step.step),
-    )
+    ) + &queue
 }
 
 async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Result<()> {
@@ -6697,6 +6705,13 @@ mod tests {
     }
 
     #[test]
+    fn wait_accepts_a_standing_mission_run() {
+        validate_wait_condition("standing").unwrap();
+        let run = serde_json::json!({ "status": "standing" });
+        assert_eq!(projected_actual_status(Some(&run)), Some("standing"));
+    }
+
+    #[test]
     fn an_ended_harness_uses_the_registered_state() {
         assert_eq!(
             harness_activity_state(st2::harness_state::Activity::Ended),
@@ -6970,6 +6985,8 @@ mod tests {
             run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: "build".into(),
+            queue: None,
+            queue_position: None,
             definition_hash: "definition".into(),
             status: "ready".into(),
             attempt: 2,
@@ -7069,6 +7086,8 @@ mod tests {
             run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: path.into(),
+            queue: None,
+            queue_position: None,
             definition_hash: "definition".into(),
             status: "ready".into(),
             attempt: 1,
@@ -7262,6 +7281,8 @@ mod tests {
             run: run.into(),
             generation: "run-generation/current".into(),
             step: step.into(),
+            queue: None,
+            queue_position: None,
             definition_hash: "definition".into(),
             status: status.into(),
             attempt: 1,

@@ -178,6 +178,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/mission-runs/{run}/revision-proposal",
             get(get_run_revision_proposal),
         )
+        .route("/v1/mission-runs/{run}/revision", post(revise_mission_run))
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
         .route(
@@ -228,8 +229,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runtimes/reset/{*subject}", post(reset_runtime))
         .route("/v1/claude", post(quick_claude))
         .route("/v1/codex", post(quick_codex))
-        .route("/v1/mission-runs", post(start_mission_run))
-        .route("/v1/mission-runs/{run}/revision", post(revise_mission_run));
+        .route("/v1/mission-runs", post(start_mission_run));
     app.layer(from_fn_with_state(state.clone(), response_envelope))
         .with_state(state)
 }
@@ -1539,7 +1539,13 @@ fn render_planning_graph(mission: &crate::model::MissionSpec) -> String {
             } else {
                 format!("after {}", dependencies.join(", "))
             };
-            lines.push(format!("{indent}{} [{}]", step.path, suffix));
+            let queue = step
+                .queue
+                .as_deref()
+                .zip(step.queue_position)
+                .map(|(queue, position)| format!(" · queue {queue} #{position}"))
+                .unwrap_or_default();
+            lines.push(format!("{indent}{} [{suffix}]{queue}", step.path));
             for product in &step.products {
                 lines.push(format!("{indent}  produces {}", product.subject));
             }
@@ -1682,6 +1688,20 @@ async fn apply(
         ))
     })?;
     let intent = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
+    if normalized_agent_actor(actor).is_some() && !intent.missions.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "agent-mission-publication-route",
+            "an agent must publish a mission through `st3 work publish-mission` or `st3 work revise`",
+        )));
+    }
+    for declaration in intent.mission_runs.values() {
+        if let Some(creation) = &declaration.creation {
+            require_agent_mission_authority(&state, actor, "start", &creation.mission)?;
+        }
+        for revision in declaration.revisions.values() {
+            require_agent_mission_authority(&state, actor, "revise", &revision.mission)?;
+        }
+    }
     let mut response = state
         .store
         .apply_as(
@@ -3086,6 +3106,8 @@ async fn start_mission_run(
     State(state): State<AppState>,
     Json(request): Json<MissionRunRequest>,
 ) -> Result<Json<MissionRunView>, ApiError> {
+    let requester = request.requester.as_deref().unwrap_or("person/requester");
+    require_agent_mission_authority(&state, requester, "start", &request.mission)?;
     let response = state
         .store
         .create_mission_run(&request)
@@ -3210,6 +3232,7 @@ async fn revise_mission_run(
     } else {
         format!("agent/{}", request.actor)
     };
+    require_agent_mission_authority(&state, &actor, "revise", mission_id)?;
     let (_, reviewers) = crate::store::analyze_mission_revision(
         &old,
         replacement,
@@ -3518,6 +3541,7 @@ async fn publish_work_mission(
             format!("step `{}` does not declare produces-mission", step.step),
         ))
     })?;
+    require_agent_mission_authority(&state, &actor, "publish", expected_mission)?;
 
     let initial = parse_intent(&request.intent.kdl, &state.node).map_err(ApiError::bad)?;
     if initial.missions.len() != 1 {
@@ -3592,6 +3616,50 @@ async fn publish_work_mission(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(output))
+}
+
+fn require_agent_mission_authority(
+    state: &AppState,
+    actor: &str,
+    action: &str,
+    mission: &str,
+) -> Result<(), ApiError> {
+    let Some(actor) = normalized_agent_actor(actor) else {
+        return Ok(());
+    };
+    let mission = mission.strip_prefix("mission/").unwrap_or(mission);
+    let desired = state
+        .store
+        .desired_subjects()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|desired| desired.kind == "agent" && desired.subject == actor)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-agent-mission-authority",
+                format!("`{actor}` has no current desired agent declaration"),
+            ))
+        })?;
+    let authority = crate::graph::agent_mission_authority(&desired.desired);
+    if authority.allows(action, mission) {
+        Ok(())
+    } else {
+        Err(ApiError::bad(St3Error::new(
+            "mission-authority-denied",
+            format!("`{actor}` cannot {action} mission `{mission}`"),
+        )))
+    }
+}
+
+fn normalized_agent_actor(actor: &str) -> Option<String> {
+    if actor.starts_with("person/") || actor.starts_with("daemon/") || actor.starts_with("system/")
+    {
+        None
+    } else if actor.starts_with("agent/") {
+        Some(actor.to_owned())
+    } else {
+        Some(format!("agent/{actor}"))
+    }
 }
 
 async fn post_work_action(
@@ -4682,6 +4750,48 @@ mod tests {
             state_dir: root.to_path_buf(),
             pty_root: root.join("pty"),
             trusted_peers: Default::default(),
+        }
+    }
+
+    fn materialize_run_agents(state: &AppState, run: &MissionRunView) {
+        let mission = state
+            .store
+            .mission_spec(
+                run.mission.strip_prefix("mission/").unwrap_or(&run.mission),
+                Some(&run.revision),
+            )
+            .unwrap()
+            .unwrap();
+        let Some(source) = mission.declarations_kdl.as_deref() else {
+            return;
+        };
+        let intent = crate::graph::parse_execution_intent(source, &state.node, &run.id).unwrap();
+        state
+            .store
+            .apply_internal(&intent, &format!("test-materialize:{}", run.id))
+            .unwrap();
+    }
+
+    fn apply_request(state: &AppState, source: &str, actor: &str, key: &str) -> ApplyRequest {
+        let intent = parse_intent(source, &state.node).unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        ApplyRequest {
+            intent: crate::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+            expected_subjects: preview.subject_tokens,
+            idempotency_key: key.into(),
+            actor: Some(actor.into()),
         }
     }
 
@@ -6287,7 +6397,7 @@ mission "eval/demo" state="ready" timeout="2m" {
     }
 
     #[tokio::test]
-    async fn a_mission_revision_publishes_without_adjacent_runtime_state() {
+    async fn a_mission_revision_requires_current_agent_authority() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
@@ -6295,7 +6405,11 @@ version 2
 
   mission "revision" state="ready" {
     goal "Complete mission revision."
-     agent "sup" { workspace "."; command "true" }
+     agent "sup" {
+       workspace "."
+       command "true"
+       mission-authority { revise "revision" }
+     }
     step "work" { goal "First goal." }
   }
 
@@ -6327,13 +6441,19 @@ version 2
                 idempotency_key: "revision-run".into(),
             })
             .unwrap();
+        materialize_run_agents(&state, &run);
+        let actor = format!("agent/{}/sup", run.id);
         let app = router(state.clone());
         let replacement = r#"
 version 2
 
   mission "revision" state="ready" {
     goal "Complete mission revision."
-     agent "sup" { workspace "."; command "true" }
+     agent "sup" {
+       workspace "."
+       command "true"
+       mission-authority { revise "revision" }
+     }
     step "work" { goal "Corrected goal." }
   }
 
@@ -6346,7 +6466,7 @@ version 2
                     kdl: replacement.into(),
                     source_name: None,
                 },
-                actor: "agent/node.sup".into(),
+                actor,
                 reason: "the first goal was incomplete".into(),
                 idempotency_key: "revision-two".into(),
             })
@@ -6358,7 +6478,133 @@ version 2
         assert_ne!(revised["mission_run"]["revision"], run.revision);
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
-        assert!(state.store.desired_subjects().unwrap().is_empty());
+        assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_start_authority_is_action_specific_and_cannot_be_self_granted() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+mission "authority-host" state="ready" {
+  goal "Keep two authority test agents available."
+  agent "starter" {
+    workspace "."
+    command "true"
+    mission-authority { start "authority-target" }
+  }
+  agent "publisher" {
+    workspace "."
+    command "true"
+    mission-authority { publish "authority-target" }
+  }
+}
+
+mission "authority-target" state="ready" {
+  concurrent-runs
+  goal "Keep each authorized test run open."
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "authority-host")
+            .unwrap();
+        let host = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "authority-host".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "authority-host-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        let starter = format!("agent/{}/starter", host.id);
+        let publisher = format!("agent/{}/publisher", host.id);
+        let target = intent.missions["authority-target"].revision.clone();
+        let declaration = |id: &str, requester: &str| {
+            format!(
+                "version 2\nmission-run {id:?} {{\n  mission {:?}\n  workspace {:?}\n  requester {requester:?}\n}}\n",
+                format!("mission/authority-target@{target}"),
+                root.path().display().to_string(),
+            )
+        };
+        let app = router(state.clone());
+
+        let allowed = declaration("authority-target/allowed", &starter);
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &allowed,
+                &starter,
+                "authority-start-allowed",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let denied = declaration("authority-target/denied", &publisher);
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &denied,
+                &publisher,
+                "authority-start-denied",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "mission-authority-denied");
+
+        let self_grant = r#"version 2
+mission "authority-self-grant" state="ready" {
+  goal "Reject this generic agent publication."
+  agent "self" {
+    workspace "."
+    command "true"
+    mission-authority { publish "authority-self-grant" }
+  }
+}
+"#;
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(ApplyRequest {
+                intent: crate::model::IntentInput {
+                    kdl: self_grant.into(),
+                    source_name: None,
+                },
+                expected_subjects: BTreeMap::new(),
+                idempotency_key: "authority-self-grant".into(),
+                actor: Some(starter),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-mission-publication-route");
     }
 
     #[tokio::test]
@@ -6370,8 +6616,13 @@ version 2
 
   mission "bootstrap" state="ready" {
     goal "Complete mission bootstrap."
+    agent "planner" {
+      workspace "."
+      command "true"
+      mission-authority { publish "project/*" }
+    }
     step "compile" {
-      assigned-to "agent/planner"
+      assigned-to "agent/${ST_MISSION_RUN}/planner"
       produces-mission "project/work"
     }
   }
@@ -6404,6 +6655,8 @@ version 2
                 idempotency_key: "run-bootstrap-output".into(),
             })
             .unwrap();
+        materialize_run_agents(&state, &run);
+        let actor = format!("agent/{}/planner", run.id);
         let step = run.steps[0].clone();
         state
             .store
@@ -6428,7 +6681,7 @@ version 2
                     kdl: produced.into(),
                     source_name: Some("generated.kdl".into()),
                 },
-                actor: "agent/node.planner".into(),
+                actor: actor.clone(),
                 incarnation: Some("test".into()),
                 idempotency_key: "reject-unclaimed-output".into(),
             })
@@ -6443,7 +6696,7 @@ version 2
                 &step.subject,
                 "claim",
                 &WorkRequest {
-                    actor: Some("agent/node.planner".into()),
+                    actor: Some(actor.clone()),
                     incarnation: Some("test".into()),
                     summary: None,
                     reason: None,
@@ -6466,7 +6719,7 @@ version 2
                     kdl: wrong.into(),
                     source_name: Some("wrong.kdl".into()),
                 },
-                actor: "agent/node.planner".into(),
+                actor: actor.clone(),
                 incarnation: Some("test".into()),
                 idempotency_key: "reject-wrong-output".into(),
             })
@@ -6483,7 +6736,7 @@ version 2
                     kdl: produced.into(),
                     source_name: Some("generated.kdl".into()),
                 },
-                actor: "agent/node.planner".into(),
+                actor,
                 incarnation: Some("test".into()),
                 idempotency_key: "publish-produced-work".into(),
             })

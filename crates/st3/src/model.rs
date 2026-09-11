@@ -229,6 +229,10 @@ impl Default for RetrySpec {
 pub struct StepSpec {
     pub id: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
     pub title: Option<String>,
     #[serde(default)]
     pub goals: Vec<String>,
@@ -339,6 +343,33 @@ pub struct UnderSpec {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MissionAuthority {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publish: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revise: Vec<String>,
+}
+
+impl MissionAuthority {
+    pub fn allows(&self, action: &str, mission: &str) -> bool {
+        let patterns = match action {
+            "publish" => &self.publish,
+            "start" => &self.start,
+            "revise" => &self.revise,
+            _ => return false,
+        };
+        patterns.iter().any(|pattern| {
+            pattern == mission
+                || pattern
+                    .strip_suffix("/*")
+                    .is_some_and(|prefix| mission.starts_with(&format!("{prefix}/")))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1167,6 +1198,10 @@ pub struct StepRunView {
     pub run: String,
     pub generation: String,
     pub step: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
     pub definition_hash: String,
     pub status: String,
     pub attempt: u32,

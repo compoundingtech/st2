@@ -133,6 +133,25 @@ A mission completes only through `completion`. A mission with no completion bloc
 
 This rule supports a long-lived conversation agent without a separate mission type. The open mission continues to assert the agent declaration. New mission revisions can add work. A named revision moves the run to a successor generation.
 
+## Ordered queue authoring
+
+Use `queue` when source order is an intentional one-at-a-time workflow.
+
+```kdl
+queue "investigations" {
+  assigned-to "agent/${ST_MISSION_RUN}/steward"
+  step "measure" { goal "Measure one reported problem." }
+  step "improve" { goal "Implement and verify the improvement." }
+  step "ship" { goal "Ship the verified change." }
+}
+```
+
+st3 expands each item after the first with a `completed` dependency on its immediate predecessor. Each step keeps its ordinary flat ID.
+
+The queue ID and position appear in preview, work, graph, and generation views. Reordering a queue is a normal mission revision.
+
+Unmoved compatible work carries into the successor generation. Moved work and its dependents restart under the normal hash rules.
+
 ## Named operations
 
 An operational block has an ID inside its owner subject.
@@ -171,7 +190,31 @@ An authorized revision with immediate cutover creates one successor generation a
 
 A human-protected revision creates a durable revision proposal. The named operation remains accepted and idempotent. A reviewer approves the exact preview through the observed review command. The approval then creates the successor generation.
 
-`st3 work revise RUN FILE --reason TEXT` publishes the candidate and the named revision. `--print-kdl` prints only the operation and tells the operator which candidate file to publish first.
+`st3 work revise RUN FILE --reason TEXT` submits the candidate through the dedicated revision route. The route publishes and applies or proposes the revision atomically.
+
+`--print-kdl` prints only the declarative operation. It tells the operator which candidate file to publish first.
+
+## Agent mission authority
+
+An agent has no mission publication, start, or revision authority by default.
+
+```kdl
+mission-authority {
+  publish "project/generated/*"
+  start "project/generated/*"
+  revise "project/generated/*"
+}
+```
+
+Put this block inside the agent declaration. Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix.
+
+Publishing requires `publish` authority, a claimed producing step, and an exact `produces-mission` match. Use `st3 work publish-mission`.
+
+Starting requires separate `start` authority. Revising requires separate `revise` authority and structural authority in the current generation.
+
+Generic `st3 publish` rejects mission definitions from an agent. A candidate definition cannot grant authority to the same agent.
+
+Persons and internal system actions are unchanged. The identity check assumes a trusted local runtime because `--as` can name another actor.
 
 ### Runtime reset
 

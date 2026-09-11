@@ -50,7 +50,7 @@ mission "eval/automatic-github-intake" state="ready" timeout="20m" {
     observer "observer/repository"
     on "content_hash"
     delivery "mission" {
-      mission "eval/automatic-github-intake/review@1514c363b6448732f572eb80389c143cf15287748162bc9b5101950f4bd4b7e1"
+      mission "eval/automatic-github-intake/review@37474d0a14af6b34ca78607a5a9b9676ea399f3192b7743021707be500ddf414"
       resource "source"
       workspace "${ST_WORKSPACE}/reviews"
     }

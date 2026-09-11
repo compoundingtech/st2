@@ -2386,13 +2386,17 @@ impl Store {
              ORDER BY created_at_unix_ms, step_path",
         )?;
         let rows = statement.query_map(params![actor, include_terminal], step_run_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut views = rows.collect::<Result<Vec<_>, _>>()?;
+        for view in &mut views {
+            enrich_step_queue(&connection, view)?;
+        }
+        Ok(views)
     }
 
     pub fn step_run(&self, subject: &str) -> Result<Option<StepRunView>> {
         let subject = normalize_step_run(subject);
         let connection = self.connection.lock().expect("store mutex poisoned");
-        connection
+        let mut view = connection
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                         lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
@@ -2401,7 +2405,11 @@ impl Store {
                 step_run_from_row,
             )
             .optional()
-            .map_err(Into::into)
+            .map_err(anyhow::Error::from)?;
+        if let Some(view) = &mut view {
+            enrich_step_queue(&connection, view)?;
+        }
+        Ok(view)
     }
 
     pub fn work_action(
@@ -2615,10 +2623,11 @@ impl Store {
             None,
         )
         .map_err(internal)?;
-        let view = transaction.query_row(
+        let mut view = transaction.query_row(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
+        enrich_step_queue(&transaction, &mut view).map_err(internal)?;
         transaction
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2815,12 +2824,9 @@ impl Store {
                 mission.blockers.join("; "),
             ));
         }
-        let materialization = serde_json::to_vec(&(
-            key,
-            &mission.normalized,
-            &mission.subject_tokens,
-        ))
-        .map_err(internal)?;
+        let materialization =
+            serde_json::to_vec(&(key, &mission.normalized, &mission.subject_tokens))
+                .map_err(internal)?;
         let key = format!(
             "internal:{key}:{}",
             hex::encode(Sha256::digest(materialization))
@@ -9691,6 +9697,8 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         run: format!("mission-run/{}", row.get::<_, String>(1)?),
         generation,
         step: row.get(2)?,
+        queue: None,
+        queue_position: None,
         definition_hash: row.get(3)?,
         status: row.get(4)?,
         attempt: row.get::<_, u32>(5)?,
@@ -9711,6 +9719,37 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
     })
+}
+
+fn enrich_step_queue(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
+    let body = connection
+        .query_row(
+            "SELECT mission_revisions.body
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             JOIN mission_revisions
+               ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE run_generations.id=?1",
+            [generation_id_from_subject(&view.generation)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(());
+    };
+    let mission = serde_json::from_str::<MissionSpec>(&body).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            body.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    if let Some(step) = crate::mission::find_step(&mission, &view.step) {
+        view.queue.clone_from(&step.queue);
+        view.queue_position = step.queue_position;
+    }
+    Ok(())
 }
 
 fn planning_session_view_tx(
@@ -10261,6 +10300,9 @@ fn mission_run_view_tx(connection: &Connection, run_id: &str) -> rusqlite::Resul
             step_run_from_row,
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    for step in &mut view.steps {
+        enrich_step_queue(connection, step)?;
+    }
     Ok(view)
 }
 
@@ -10302,6 +10344,9 @@ fn run_generation_view_tx(
     view.steps = statement
         .query_map([generation_id], step_run_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
+    for step in &mut view.steps {
+        enrich_step_queue(connection, step)?;
+    }
     Ok(view)
 }
 
@@ -10724,16 +10769,16 @@ mission "guarded" state="ready" {
         assert_eq!(replay.store_index, first.store_index);
         assert!(replay.batch_id.is_none());
 
-        let stop = crate::graph::parse_test_intent(
-            "version 2\nstop \"exec/work\"\n",
-            "node",
-        )
-        .unwrap();
+        let stop =
+            crate::graph::parse_test_intent("version 2\nstop \"exec/work\"\n", "node").unwrap();
         assert!(store.apply_internal(&stop, "stop:test").unwrap().changed);
 
         let restored = store.apply_internal(&intent, "materialize:test").unwrap();
         assert!(restored.changed);
-        assert_eq!(store.selected_desired_kind("exec/work").unwrap(), Some("exec".into()));
+        assert_eq!(
+            store.selected_desired_kind("exec/work").unwrap(),
+            Some("exec".into())
+        );
     }
 
     #[test]
@@ -11092,7 +11137,7 @@ version 2
         let client_intent = crate::graph::parse_intent(source, "local").unwrap();
         let server_mission = server_intent.missions.values().next().unwrap();
         let client_mission = client_intent.missions.values().next().unwrap();
-        assert_ne!(server_mission.revision, client_mission.revision);
+        assert_eq!(server_mission.revision, client_mission.revision);
 
         let store = Store::open_memory("server-node").unwrap();
         let response = store
@@ -11728,6 +11773,7 @@ version 2
                 idempotency_key: "lineage-run".into(),
             })
             .unwrap();
+        let owner = format!("agent/{}/owner", run.id);
         let stable = run.steps.iter().find(|step| step.step == "stable").unwrap();
         source
             .set_step_state(&stable.subject, "completed", None)
@@ -11737,7 +11783,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &second,
-                "agent/source.owner",
+                &owner,
                 "replicate a successor generation",
                 "lineage-cutover",
             )
@@ -11831,12 +11877,13 @@ version 2
                 idempotency_key: "proposal-run".into(),
             })
             .unwrap();
+        let owner = format!("agent/{}/owner", run.id);
         let second = publish("Use the second goal.", "proposal-two");
         let proposal = source
             .create_revision_proposal(
                 &run.id,
                 &second,
-                "agent/source.owner",
+                &owner,
                 "replicate the proposal lifecycle",
                 "proposal-create",
             )
@@ -12721,6 +12768,7 @@ version 2
                 idempotency_key: "revision-run".into(),
             })
             .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
         for step in &run.steps {
             store
                 .set_step_state(&step.subject, "completed", None)
@@ -12749,7 +12797,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "the work needs a new constraint",
                 "adopt-revision-two",
             )
@@ -12799,7 +12847,7 @@ version 2
   agent "worker" { workspace "."; command "true" }
   mission "generation" state="ready" {
     goal "Test immutable generations."
-    step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
+    step "active" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
     step "changed" { goal "Use the first definition." }
     step "dependent" {
@@ -12822,6 +12870,7 @@ version 2
                 idempotency_key: "generation-run".into(),
             })
             .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
         let active = run
             .steps
             .iter()
@@ -12831,7 +12880,7 @@ version 2
             .clone();
         store.set_step_state(&active, "ready", None).unwrap();
         let request = |key: &str| WorkRequest {
-            actor: Some("agent/node.worker".into()),
+            actor: Some(worker.clone()),
             incarnation: Some("worker-one".into()),
             summary: None,
             reason: None,
@@ -12860,7 +12909,7 @@ version 2
   agent "worker" { workspace "."; command "true" }
   mission "generation" state="ready" {
     goal "Test immutable generations."
-    step "active" { assigned-to "agent/worker"; goal "Keep this definition." }
+    step "active" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Keep this definition." }
     step "stable" { goal "Carry this result." }
     step "changed" { goal "Use the second definition." }
     step "dependent" {
@@ -12876,7 +12925,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "the work now needs the second definition",
                 "generation-cutover",
             )
@@ -12926,7 +12975,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "the work now needs the second definition",
                 "generation-cutover",
             )
@@ -12974,6 +13023,7 @@ version 2
                 idempotency_key: "authority-run".into(),
             })
             .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
         let escalated = publish(
             r#"
 version 2
@@ -12994,7 +13044,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &escalated,
-                "agent/node.worker",
+                &worker,
                 "grant authority in the candidate graph",
                 "authority-cutover",
             )
@@ -13091,12 +13141,13 @@ version 2
                 idempotency_key: "protected-run".into(),
             })
             .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
         let second = publish("Use the second goal.", "protected-two");
         let proposal = store
             .create_revision_proposal(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "the first goal is incomplete",
                 "protected-proposal",
             )
@@ -13268,8 +13319,8 @@ version 2
   agent "worker" {{ workspace "."; command "true" }}
   mission "drain" state="ready"{cutover} {{
     goal "Test a drained cutover."
-    step "active" {{ assigned-to "agent/worker"; goal "Keep active work." }}
-    step "waiting" {{ assigned-to "agent/worker"; goal {goal:?} }}
+    step "active" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal "Keep active work." }}
+    step "waiting" {{ assigned-to "agent/${{ST_MISSION_RUN}}/worker"; goal {goal:?} }}
   }}
 
 "#
@@ -13299,6 +13350,7 @@ version 2
                 idempotency_key: "drain-run".into(),
             })
             .unwrap();
+        let worker = format!("agent/{}/worker", run.id);
         let active = run.steps.iter().find(|step| step.step == "active").unwrap();
         let waiting = run
             .steps
@@ -13312,6 +13364,14 @@ version 2
             .set_step_state(&waiting.subject, "ready", None)
             .unwrap();
         let request = |key: &str| WorkRequest {
+            actor: Some(worker.clone()),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        let child_request = |key: &str| WorkRequest {
             actor: Some("agent/node.worker".into()),
             incarnation: Some("worker-one".into()),
             summary: None,
@@ -13366,14 +13426,14 @@ version 2
             .work_action(
                 &child_active.subject,
                 "claim",
-                &request("drain-child-claim"),
+                &child_request("drain-child-claim"),
             )
             .unwrap();
         store
             .work_action(
                 &child_active.subject,
                 "progress",
-                &request("drain-child-progress"),
+                &child_request("drain-child-progress"),
             )
             .unwrap();
         store
@@ -13387,7 +13447,7 @@ version 2
             .adopt_mission_revision(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "skip the current cutover rule",
                 "drain-direct-adopt",
             )
@@ -13397,7 +13457,7 @@ version 2
             .create_revision_proposal(
                 &run.id,
                 &second,
-                "agent/node.worker",
+                &worker,
                 "wait for active work",
                 "drain-proposal",
             )
@@ -13426,7 +13486,7 @@ version 2
             .work_action(
                 &child_active.subject,
                 "complete",
-                &request("drain-child-complete"),
+                &child_request("drain-child-complete"),
             )
             .unwrap();
         store
@@ -14186,6 +14246,100 @@ version 2
                 .unwrap_err()
                 .code,
             "immutable-resource-kind"
+        );
+    }
+
+    #[test]
+    fn queue_metadata_survives_runtime_views_and_reordering_resets_moved_work() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |order: &[&str], key: &str| {
+            let items = order
+                .iter()
+                .map(|id| format!("step {id:?} {{ goal \"Complete {id}.\" }}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let source = format!(
+                r#"version 2
+mission "queue-revision" state="ready" {{
+  goal "Process the ordered queue."
+  queue "investigations" {{
+    agentless
+    {items}
+  }}
+}}"#
+            );
+            publish_mission(&store, &source, key)
+        };
+
+        let initial = publish(&["one", "two", "three"], "queue-revision-one");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: initial.id,
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "queue-revision-run".into(),
+            })
+            .unwrap();
+        let mut initial_steps = run
+            .steps
+            .iter()
+            .map(|step| {
+                (
+                    step.step.as_str(),
+                    step.queue.as_deref(),
+                    step.queue_position,
+                )
+            })
+            .collect::<Vec<_>>();
+        initial_steps.sort_by_key(|step| step.2);
+        assert_eq!(
+            initial_steps,
+            vec![
+                ("one", Some("investigations"), Some(1)),
+                ("two", Some("investigations"), Some(2)),
+                ("three", Some("investigations"), Some(3)),
+            ]
+        );
+        for step in &run.steps {
+            store
+                .set_step_state(&step.subject, "completed", None)
+                .unwrap();
+            let direct = store.step_run(&step.subject).unwrap().unwrap();
+            assert_eq!(direct.queue.as_deref(), Some("investigations"));
+        }
+
+        let reordered = publish(&["one", "three", "two"], "queue-revision-two");
+        let revised = store
+            .adopt_mission_revision(
+                &run.id,
+                &reordered,
+                "person/test",
+                "put the third investigation before the second",
+                "queue-revision-cutover",
+            )
+            .unwrap();
+        let mut revised_steps = revised
+            .steps
+            .iter()
+            .map(|step| {
+                (
+                    step.step.as_str(),
+                    step.status.as_str(),
+                    step.queue_position,
+                )
+            })
+            .collect::<Vec<_>>();
+        revised_steps.sort_by_key(|step| step.2);
+        assert_eq!(
+            revised_steps,
+            vec![
+                ("one", "completed", Some(1)),
+                ("three", "pending", Some(2)),
+                ("two", "pending", Some(3)),
+            ]
         );
     }
 }

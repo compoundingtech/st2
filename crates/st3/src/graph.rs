@@ -1030,11 +1030,11 @@ fn parse_agent(
     let runtime_id = context.owner_run.as_ref().map_or_else(
         || bus_id.clone(),
         |run| {
-            format!(
+            bounded_runtime_id(&format!(
                 "{}.{}",
                 owner_run_id(run).replace('/', "."),
                 identity.replace('/', ".")
-            )
+            ))
         },
     );
     let (workspace, workspace_create) =
@@ -2039,6 +2039,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "mission-authority",
         "pty",
         "exec",
     ];
@@ -2055,8 +2056,46 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "mission-authority",
     ] {
         unique_child(document, child)?;
+    }
+    if let Some(authority) = unique_child(document, "mission-authority")? {
+        ensure_bare(authority)?;
+        let body = authority.children().ok_or_else(|| {
+            St3Error::new(
+                "empty-mission-authority",
+                "mission-authority needs at least one rule",
+            )
+        })?;
+        reject_unknown_children(
+            body,
+            &["publish", "start", "revise"],
+            "mission-authority",
+            owner,
+        )?;
+        let mut rules = BTreeSet::new();
+        for rule in body.nodes() {
+            ensure_no_properties(rule)?;
+            ensure_no_children(rule)?;
+            let pattern = one_string(rule)?;
+            validate_mission_authority_pattern(&pattern)?;
+            if !rules.insert((rule.name().value().to_owned(), pattern.clone())) {
+                return Err(St3Error::new(
+                    "duplicate-mission-authority",
+                    format!(
+                        "agent `{owner}` repeats mission authority `{} {pattern}`",
+                        rule.name().value()
+                    ),
+                ));
+            }
+        }
+        if rules.is_empty() {
+            return Err(St3Error::new(
+                "empty-mission-authority",
+                "mission-authority needs at least one rule",
+            ));
+        }
     }
     for under in document
         .nodes()
@@ -2108,6 +2147,61 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         validate_driver(driver)?;
     }
     Ok(())
+}
+
+fn validate_mission_authority_pattern(pattern: &str) -> Result<(), St3Error> {
+    if pattern.starts_with("mission/") || pattern.contains('*') && !pattern.ends_with("/*") {
+        return Err(St3Error::new(
+            "invalid-mission-authority-pattern",
+            "mission authority needs an exact mission ID or a terminal `/*` namespace",
+        ));
+    }
+    let mission = pattern.strip_suffix("/*").unwrap_or(pattern);
+    if mission.is_empty() || mission.contains('*') {
+        return Err(St3Error::new(
+            "invalid-mission-authority-pattern",
+            "mission authority needs an exact mission ID or a terminal `/*` namespace",
+        ));
+    }
+    crate::mission::validate_mission_id(mission)
+}
+
+pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthority {
+    let mut authority = crate::model::MissionAuthority::default();
+    let Some(children) = desired.get("children").and_then(Value::as_array) else {
+        return authority;
+    };
+    let Some(block) = children
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("mission-authority"))
+    else {
+        return authority;
+    };
+    for rule in block
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(action) = rule.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(pattern) = rule
+            .get("arguments")
+            .and_then(Value::as_array)
+            .and_then(|arguments| arguments.first())
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        match action {
+            "publish" => authority.publish.push(pattern.to_owned()),
+            "start" => authority.start.push(pattern.to_owned()),
+            "revise" => authority.revise.push(pattern.to_owned()),
+            _ => {}
+        }
+    }
+    authority
 }
 
 fn validate_task_body(
@@ -3607,6 +3701,17 @@ fn runtime_id(subject: &str) -> String {
     subject.replace('/', ".")
 }
 
+fn bounded_runtime_id(candidate: &str) -> String {
+    const MAX_BYTES: usize = 48;
+    const DIGEST_BYTES: usize = 20;
+    if candidate.len() <= MAX_BYTES {
+        return candidate.into();
+    }
+    let digest = hex::encode(Sha256::digest(candidate.as_bytes()));
+    let prefix_bytes = MAX_BYTES - DIGEST_BYTES - 1;
+    format!("{}.{}", &candidate[..prefix_bytes], &digest[..DIGEST_BYTES])
+}
+
 fn valid_field_path(path: &str) -> bool {
     path.split('.').all(|segment| {
         !segment.is_empty()
@@ -3810,6 +3915,50 @@ agent "worker" { command "true" }
             .as_ref()
             .unwrap();
         assert_eq!(member.runtime_id, "fixture.network-a.run-one.worker");
+    }
+
+    #[test]
+    fn a_long_mission_run_produces_a_bounded_stable_runtime_id() {
+        let source = r#"version 2
+agent "worker" { command "true" }
+"#;
+        let first = parse_execution_intent(
+            source,
+            "node",
+            "eval/mission-authority/produced/0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let repeated = parse_execution_intent(
+            source,
+            "node",
+            "eval/mission-authority/produced/0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let other = parse_execution_intent(
+            source,
+            "node",
+            "eval/mission-authority/produced/fedcba9876543210fedcba9876543210",
+        )
+        .unwrap();
+        let subject =
+            "agent/eval/mission-authority/produced/0123456789abcdef0123456789abcdef/worker";
+        let first_id = &first.subjects[subject].member.as_ref().unwrap().runtime_id;
+        let repeated_id = &repeated.subjects[subject]
+            .member
+            .as_ref()
+            .unwrap()
+            .runtime_id;
+        let other_id = &other
+            .subjects
+            ["agent/eval/mission-authority/produced/fedcba9876543210fedcba9876543210/worker"]
+            .member
+            .as_ref()
+            .unwrap()
+            .runtime_id;
+
+        assert_eq!(first_id, repeated_id);
+        assert_ne!(first_id, other_id);
+        assert!(first_id.len() <= 48);
     }
 
     #[test]

@@ -380,6 +380,10 @@ A mission or step selects work with `assigned-to`, repeated `available-to`, or b
 
 The nearest selector wins. A local selector replaces its inherited selector.
 
+A `queue` expands to ordinary flat steps. Each item after the first depends on its immediate predecessor being completed.
+
+Queue identity and position remain visible in mission and runtime views. Reordering uses the normal generation compatibility rules.
+
 The first eligible pool claim wins one step atomically. One agent can claim multiple ready steps.
 
 An absent selector means agentless work. A missing eligible agent creates a warning instead of a publication blocker.
@@ -528,6 +532,7 @@ A network partition does not stop local work. Each host continues from the last 
 - The local API uses a user-owned Unix socket.
 - Apply, revision, review, work, terminal, and gate operations use explicit authority or one-use capabilities.
 - Revision authority uses the current graph placement and cannot come from a candidate revision.
+- Agent mission publication, start, and revision use separate authority rules from the current desired agent.
 - Human revision approval binds one source generation and one preview hash.
 - Mission work claims bind to one agent incarnation.
 - Terminal input and signals cite the expected incarnation.

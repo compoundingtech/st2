@@ -279,6 +279,33 @@ Dependencies cannot cross the normal and final phases. A final step does not mak
 
 Step revision protection adds to inherited mission protection. Direct agents in the step can revise that step subtree.
 
+## Ordered queues
+
+A queue is concise syntax for a strict sequence of ordinary steps.
+
+```kdl
+queue "investigations" {
+  assigned-to "agent/${ST_MISSION_RUN}/steward"
+  step "measure" { goal "Measure the current behavior." }
+  step "improve" { goal "Implement and verify one improvement." }
+  step "ship" { goal "Ship the verified improvement." }
+}
+```
+
+The queue needs one or more steps. Queue steps keep flat mission step paths.
+
+Each item after the first depends on its immediate predecessor being `completed`. Explicit additional dependencies remain valid.
+
+A queue can set exactly one selector family. A step selector overrides the queue selector, and a queue selector overrides the mission selector.
+
+The parsed mission and runtime views retain the queue ID and one-based position. Text and JSON views expose both values.
+
+An ordinary mission body can contain multiple queues and ordinary steps. A nested mission can also contain a queue.
+
+A queue cannot contain another queue or a `finally` block in this version. A `finally` block cannot contain a queue.
+
+Queue order is definition state. Reordering items changes moved step hashes and uses the ordinary successor-generation compatibility rules.
+
 ## Goals
 
 A goal is a concise, falsifiable statement about the result.
@@ -844,6 +871,34 @@ Revision authority comes from agent placement in the current generation.
 - A direct agent adjacent to missions can revise those missions.
 
 The run requester can propose any revision. A work selector does not grant revision authority.
+
+An agent also needs explicit mission operation authority in its current desired declaration:
+
+```kdl
+agent "planner" {
+  workspace "${ST_WORKSPACE}"
+  harness "codex" {}
+  mission-authority {
+    publish "project/generated"
+    start "fleet/fabric/*"
+    revise "fleet/fabric/*"
+  }
+}
+```
+
+Each rule accepts an exact mission ID or a terminal `/*` namespace. The value omits the `mission/` subject prefix.
+
+No agent receives mission authority by default. `publish`, `start`, and `revise` are separate permissions.
+
+Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st3 work publish-mission`.
+
+Mission start requires `start` authority. Mission revision requires both `revise` authority and existing structural revision authority.
+
+The daemon reads authority from the current desired agent. A candidate mission cannot grant authority to its publisher.
+
+Persons and internal system actions keep their existing authority. System starts from `uses-mission`, schedules, and subscriptions are unchanged.
+
+This check protects a trusted local runtime. Caller identity is not cryptographically authenticated, so `--as` remains a trusted-operator boundary.
 
 st3 checks the current generation. A candidate cannot add itself as an owner and use that new authority.
 

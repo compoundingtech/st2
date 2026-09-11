@@ -1570,7 +1570,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("running", None)
             } else if failed {
                 ("blocked", Some("the mission has no available step"))
-            } else if mission.completion.is_none() {
+            } else if mission.completion.is_none() && !changed {
                 ("standing", Some("the open mission has no available step"))
             } else {
                 ("running", None)
@@ -1966,6 +1966,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run: run.subject.clone(),
                         generation: run.generation.clone(),
                         step: step.spec.path.clone(),
+                        queue: None,
+                        queue_position: None,
                         definition_hash: step.spec.definition_hash.clone(),
                         status: "pending".into(),
                         attempt: 1,
@@ -7788,6 +7790,57 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store.mission_run(&zero.id).unwrap().unwrap().status,
+            "standing"
+        );
+    }
+
+    #[test]
+    fn an_open_queue_does_not_report_standing_between_ready_items() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+mission "queue" state="ready" {
+  goal "Complete an ordered queue."
+  queue "work" {
+    agentless
+    step "one" { goal "Complete the first item." }
+    step "two" { goal "Complete the second item." }
+  }
+}
+"#;
+        apply_source(&store, source, "publish-queue");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "queue".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "run-queue".into(),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+
+        loop {
+            reconciler.reconcile_once().unwrap();
+            let view = store.mission_run(&run.id).unwrap().unwrap();
+            let all_completed = view.steps.iter().all(|step| step.status == "completed");
+            assert!(all_completed || view.status == "running");
+            if all_completed {
+                reconciler.reconcile_once().unwrap();
+                break;
+            }
+        }
+
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().status,
             "standing"
         );
     }

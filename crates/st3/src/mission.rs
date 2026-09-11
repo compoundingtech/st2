@@ -267,6 +267,17 @@ fn parse_mission(
                 }
                 display_order.push(step.id);
             }
+            "queue" => {
+                for step in parse_queue(child, default_host, &input_names)? {
+                    if steps.insert(step.id.clone(), step.clone()).is_some() {
+                        return Err(St3Error::new(
+                            "duplicate-step",
+                            format!("mission `{id}` repeats step `{}`", step.id),
+                        ));
+                    }
+                    display_order.push(step.id);
+                }
+            }
             "completion" => {
                 if completion.is_some() {
                     return Err(St3Error::new(
@@ -548,6 +559,8 @@ fn parse_step(
     let mut step = StepSpec {
         id,
         path,
+        queue: None,
+        queue_position: None,
         title,
         goals,
         constraints,
@@ -572,6 +585,123 @@ fn parse_step(
     validate_variables(&serde_json::to_value(&step).map_err(internal)?, input_names)?;
     step.definition_hash = hash(&step)?;
     Ok(step)
+}
+
+fn parse_queue(
+    node: &KdlNode,
+    default_host: &str,
+    input_names: &BTreeSet<String>,
+) -> Result<Vec<StepSpec>, St3Error> {
+    reject_type(node)?;
+    ensure_only_properties(node, &[])?;
+    let values = positional_strings(node)?;
+    if values.len() != 1 {
+        return Err(St3Error::new(
+            "invalid-queue-id",
+            "a queue needs exactly one ID",
+        ));
+    }
+    let id = values[0].clone();
+    validate_id(&id, "queue")?;
+    let children = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-queue", format!("queue `{id}` has no steps")))?;
+    let mut assigned_to = None;
+    let mut available_to = Vec::new();
+    let mut agentless = false;
+    let mut steps = Vec::new();
+    for child in children.nodes() {
+        match child.name().value() {
+            "assigned-to" => {
+                if assigned_to.is_some() {
+                    return Err(St3Error::new(
+                        "duplicate-queue-field",
+                        format!("queue `{id}` repeats `assigned-to`"),
+                    ));
+                }
+                assigned_to = Some(normalize_assignee(&first_string(child)?, default_host));
+            }
+            "available-to" => {
+                let agent = normalize_assignee(&first_string(child)?, default_host);
+                if available_to.contains(&agent) {
+                    return Err(St3Error::new(
+                        "duplicate-work-agent",
+                        format!("queue `{id}` repeats available agent `{agent}`"),
+                    ));
+                }
+                available_to.push(agent);
+            }
+            "agentless" => {
+                ensure_bare(child)?;
+                agentless = true;
+            }
+            "step" => steps.push(parse_step(child, "", default_host, false, input_names)?),
+            other => {
+                return Err(St3Error::new(
+                    "invalid-queue-child",
+                    format!("queue `{id}` cannot contain `{other}`"),
+                ));
+            }
+        }
+    }
+    if steps.is_empty() {
+        return Err(St3Error::new(
+            "empty-queue",
+            format!("queue `{id}` needs at least one step"),
+        ));
+    }
+    let queue_selector = build_work_selector(
+        &format!("queue `{id}`"),
+        assigned_to,
+        available_to,
+        agentless,
+    )?;
+    let mut prior = None::<String>;
+    for (index, step) in steps.iter_mut().enumerate() {
+        step.queue = Some(id.clone());
+        step.queue_position = Some(u32::try_from(index + 1).map_err(internal)?);
+        if step.work_selector.is_none() {
+            step.work_selector.clone_from(&queue_selector);
+        }
+        if let Some(prior) = prior.as_deref() {
+            let mut saw_completed = false;
+            let mut dependencies = Vec::with_capacity(step.dependencies.len() + 1);
+            for dependency in std::mem::take(&mut step.dependencies) {
+                match &dependency {
+                    DependencySpec::Step {
+                        step: target,
+                        state,
+                    } if target == prior => {
+                        if state != "completed" {
+                            return Err(St3Error::new(
+                                "conflicting-queue-dependency",
+                                format!(
+                                    "queue `{id}` step `{}` requires predecessor `{prior}` to be `{state}`",
+                                    step.id
+                                ),
+                            ));
+                        }
+                        if !saw_completed {
+                            dependencies.push(dependency);
+                            saw_completed = true;
+                        }
+                    }
+                    _ => dependencies.push(dependency),
+                }
+            }
+            if !saw_completed {
+                dependencies.push(DependencySpec::Step {
+                    step: prior.to_owned(),
+                    state: "completed".into(),
+                });
+            }
+            step.dependencies = dependencies;
+        }
+        prior = Some(step.id.clone());
+        step.definition_hash.clear();
+        step.definition_hash = hash(step)?;
+    }
+    Ok(steps)
 }
 
 fn build_work_selector(
@@ -773,7 +903,7 @@ fn declarations_document(nodes: Vec<KdlNode>) -> Option<String> {
     Some(document.to_string())
 }
 
-fn agent_owner(node: &KdlNode, default_host: &str) -> Result<String, St3Error> {
+fn agent_owner(node: &KdlNode, _default_host: &str) -> Result<String, St3Error> {
     let name = first_string(node)?;
     let children = node.children().ok_or_else(|| {
         St3Error::new("missing-agent-body", format!("agent `{name}` has no body"))
@@ -785,19 +915,7 @@ fn agent_owner(node: &KdlNode, default_host: &str) -> Result<String, St3Error> {
         .map(first_string)
         .transpose()?
         .unwrap_or(name);
-    let host = children
-        .nodes()
-        .iter()
-        .find(|child| child.name().value() == "host")
-        .map(first_string)
-        .transpose()?
-        .unwrap_or_else(|| default_host.to_owned());
-    let identity = if identity.contains('.') {
-        identity
-    } else {
-        format!("{host}.{identity}")
-    };
-    Ok(format!("agent/{identity}"))
+    Ok(format!("agent/${{ST_MISSION_RUN}}/{identity}"))
 }
 
 fn validate_goal_count(context: &str, goals: &[String], required: bool) -> Result<(), St3Error> {
@@ -1393,6 +1511,8 @@ fn normalize_assignee(value: &str, default_host: &str) -> String {
     let identity = value.strip_prefix("agent/").unwrap_or(value);
     if identity.contains('.') || identity.contains("${") {
         format!("agent/{identity}")
+    } else if identity.contains('/') {
+        value.to_owned()
     } else {
         format!("agent/{default_host}.{identity}")
     }
@@ -1992,7 +2112,183 @@ version 2
             r#"version 2
  mission "bad" state="ready" { goal "Reject a cross-phase dependency."; step "work" { }; finally { step "cleanup" { depends-on { step "work" completed } } } } "#,
         ] {
-            assert!(crate::graph::parse_intent(source, "node").is_err());
+            let invalid = crate::graph::parse_intent(source, "node").and_then(|intent| {
+                crate::graph::parse_execution_intent(
+                    intent.missions["bad"].declarations_kdl.as_deref().unwrap(),
+                    "node",
+                    "bad",
+                )
+            });
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[test]
+    fn queues_retain_order_and_apply_selector_precedence() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+mission "queued" state="ready" {
+  goal "Complete the queue."
+  assigned-to "mission-worker"
+  step "before" { agentless }
+  queue "investigations" {
+    available-to "pool.one"
+    available-to "pool.two"
+    step "first" { }
+    step "second" {
+      depends-on { step "first" completed; step "first" completed; step "before" completed }
+    }
+    step "third" {
+      assigned-to "agent/external/run/worker"
+    }
+  }
+  step "after" { }
+}"#,
+            "node",
+        )
+        .unwrap();
+        let mission = &intent.missions["queued"];
+        assert_eq!(
+            mission.display_order,
+            ["before", "first", "second", "third", "after"]
+        );
+        assert_eq!(
+            mission.steps["first"].queue.as_deref(),
+            Some("investigations")
+        );
+        assert_eq!(mission.steps["first"].queue_position, Some(1));
+        assert_eq!(mission.steps["second"].queue_position, Some(2));
+        assert_eq!(mission.steps["third"].queue_position, Some(3));
+        assert_eq!(
+            mission.steps["first"].work_selector,
+            Some(crate::model::WorkSelector::Available {
+                agents: vec!["agent/pool.one".into(), "agent/pool.two".into()]
+            })
+        );
+        assert_eq!(
+            mission.steps["third"].work_selector,
+            Some(crate::model::WorkSelector::Assigned {
+                agent: "agent/external/run/worker".into()
+            })
+        );
+        assert_eq!(
+            mission.steps["second"]
+                .dependencies
+                .iter()
+                .filter(|dependency| matches!(
+                    dependency,
+                    crate::model::DependencySpec::Step { step, state }
+                        if step == "first" && state == "completed"
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            mission.steps["second"]
+                .dependencies
+                .iter()
+                .any(|dependency| matches!(
+                    dependency,
+                    crate::model::DependencySpec::Step { step, state }
+                        if step == "before" && state == "completed"
+                ))
+        );
+        assert!(mission.steps["after"].queue.is_none());
+        assert!(mission.steps["first"].definition_hash != mission.steps["second"].definition_hash);
+    }
+
+    #[test]
+    fn queues_reject_ambiguous_or_unsupported_shapes() {
+        for (source, code) in [
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject an empty queue."; queue "empty" { agentless } }"#,
+                "empty-queue",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject queue selector conflict."; queue "q" { agentless; assigned-to "one"; step "work" { } } }"#,
+                "conflicting-work-selector",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject nested queues."; queue "outer" { queue "inner" { step "work" { } } } }"#,
+                "invalid-queue-child",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject a final queue."; finally { queue "q" { step "work" { } } } }"#,
+                "invalid-finally-child",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject duplicate steps."; step "same" { }; queue "q" { step "same" { } } }"#,
+                "duplicate-step",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" { goal "Reject a conflicting queue dependency."; queue "q" { step "one" { }; step "two" { depends-on { step "one" failed } } } }"#,
+                "conflicting-queue-dependency",
+            ),
+        ] {
+            assert_eq!(
+                crate::graph::parse_intent(source, "node").unwrap_err().code,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn agent_mission_authority_uses_exact_and_terminal_namespace_rules() {
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+mission "standing" state="ready" {
+  goal "Keep the planner available."
+  agent "planner" {
+    workspace "."
+    command "true"
+    mission-authority {
+      publish "project/generated"
+      publish "fleet/fabric/*"
+      start "fleet/fabric/*"
+      revise "fleet/fabric/queue"
+    }
+  }
+}"#,
+            "node",
+        )
+        .unwrap();
+        let runtime = crate::graph::parse_execution_intent(
+            intent.missions["standing"]
+                .declarations_kdl
+                .as_deref()
+                .unwrap(),
+            "node",
+            "standing",
+        )
+        .unwrap();
+        let desired = &runtime.subjects["agent/standing/planner"].desired;
+        let authority = crate::graph::agent_mission_authority(desired);
+        assert!(authority.allows("publish", "project/generated"));
+        assert!(authority.allows("publish", "fleet/fabric/cycle"));
+        assert!(!authority.allows("publish", "fleet/fabrics/cycle"));
+        assert!(authority.allows("start", "fleet/fabric/cycle"));
+        assert!(authority.allows("revise", "fleet/fabric/queue"));
+        assert!(!authority.allows("revise", "fleet/fabric/other"));
+
+        for source in [
+            r#"version 2
+mission "bad" state="ready" { goal "Reject empty authority."; agent "bad" { workspace "."; command "true"; mission-authority { } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a prefixed mission."; agent "bad" { workspace "."; command "true"; mission-authority { publish "mission/work" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" { workspace "."; command "true"; mission-authority { publish "work/*/bad" } } }"#,
+            r#"version 2
+mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; mission-authority { publish "work/*"; publish "work/*" } } }"#,
+        ] {
+            let intent = crate::graph::parse_intent(source, "node").unwrap();
+            let declarations = intent.missions["bad"].declarations_kdl.as_deref().unwrap();
+            assert!(crate::graph::parse_execution_intent(declarations, "node", "bad").is_err());
         }
     }
 
@@ -2083,7 +2379,10 @@ version 2
         )
         .unwrap();
         let mission = &intent.missions["placed"];
-        assert_eq!(mission.revision_owners, vec!["agent/node.mission-owner"]);
+        assert_eq!(
+            mission.revision_owners,
+            vec!["agent/${ST_MISSION_RUN}/mission-owner"]
+        );
         assert!(mission.revisions_human_only);
         assert_eq!(mission.revision_reviewer.as_deref(), Some("person/mission"));
         assert_eq!(
@@ -2091,7 +2390,10 @@ version 2
             crate::model::RevisionCutover::WhenIdle
         );
         let step = &mission.steps["work"];
-        assert_eq!(step.revision_owners, vec!["agent/node.step-owner"]);
+        assert_eq!(
+            step.revision_owners,
+            vec!["agent/${ST_MISSION_RUN}/step-owner"]
+        );
         assert!(step.revisions_human_only);
         assert_eq!(step.revision_reviewer.as_deref(), Some("person/step"));
         assert!(!step.revision_owners.contains(&"agent/assignee".into()));
