@@ -41,6 +41,7 @@ fn start_daemon(binary: &Path, root: &Path, socket: &Path) -> Daemon {
             .arg(root.join("pty"))
             .arg("--socket")
             .arg(socket)
+            .args(["--peer-listen", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
