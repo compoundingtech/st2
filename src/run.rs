@@ -714,6 +714,58 @@ impl PtyCli {
         serde_json::from_slice(&out.stdout)
             .map_err(|error| anyhow::anyhow!("parsing `pty stats --json`: {error}"))
     }
+
+    fn stats_entry_at(&self, root: &Path, pty_id: &str) -> anyhow::Result<PtyStatsEntry> {
+        let out = output_full_stdout_with_timeout(
+            Command::new(&self.bin)
+                .args(["stats", "--json", pty_id])
+                .env("PTY_ROOT", root),
+            PTY_LIST_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("`pty stats --json {pty_id}` failed: {error}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`pty stats --json {pty_id}` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        serde_json::from_slice(&out.stdout)
+            .map_err(|error| anyhow::anyhow!("parsing `pty stats --json {pty_id}`: {error}"))
+    }
+
+    /// Prove that a successful detached launch produced one live generation.
+    ///
+    /// `pty list` is registry state and can briefly retain `running` after the
+    /// process exits. The socket-backed stats reply is the linearization point:
+    /// it must report a live process for the same daemon PID and `createdAt`
+    /// generation that the registry named.
+    fn confirm_spawned_session(&self, pty_id: &str, root: &Path) -> anyhow::Result<()> {
+        let entries = self.list_entries_at(root)?;
+        let mut matching = entries.iter().filter(|entry| entry.name == pty_id);
+        let Some(initial) = matching.next() else {
+            anyhow::bail!("spawned pty '{pty_id}' is absent from `pty list --json`");
+        };
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "spawned pty '{pty_id}' has duplicate `pty list --json` entries"
+        );
+        anyhow::ensure!(
+            initial.status == "running",
+            "spawned pty '{pty_id}' is not running (`pty list --json` reported {:?})",
+            initial.status
+        );
+        anyhow::ensure!(
+            initial.pid.is_some() && initial.created_at.is_some(),
+            "spawned pty '{pty_id}' lacks daemon generation evidence"
+        );
+
+        let stats = self.stats_entry_at(root, pty_id)?;
+        confirm_pty_generation(initial, std::slice::from_ref(&stats)).map_err(|reason| {
+            anyhow::anyhow!(
+                "spawned pty '{pty_id}' failed identity-bound liveness confirmation: {reason:?}"
+            )
+        })
+    }
 }
 
 /// Apply both assignments and removals from an inner command to its isolation wrapper.
@@ -759,6 +811,7 @@ impl Runner for PtyCli {
         let args: Vec<OsString> = inner.get_args().map(|a| a.to_os_string()).collect();
         let arg_refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
         let unit = crate::isolate::scope_unit(&target.pty_id);
+        let pty_root = effective_pty_root(&self.catalog_root);
 
         // Atomic reap-then-respawn: a session id JUST reaped in this same pass (execute's
         // reap-then-respawn after a hard-kill) can linger microseconds in the per-session pty daemon —
@@ -774,7 +827,7 @@ impl Runner for PtyCli {
             apply_command_env(&inner, &mut cmd);
             let out = cmd.output()?;
             if out.status.success() {
-                return Ok(());
+                return self.confirm_spawned_session(&target.pty_id, &pty_root);
             }
             last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             let corpse_race = last_err.contains("already in use");
@@ -785,7 +838,7 @@ impl Runner for PtyCli {
             let _ = Command::new(&self.bin)
                 .arg("rm")
                 .arg(&target.pty_id)
-                .env("PTY_ROOT", effective_pty_root(&self.catalog_root))
+                .env("PTY_ROOT", &pty_root)
                 .output();
             std::thread::sleep(Duration::from_millis(100 * u64::from(attempt + 1)));
         }

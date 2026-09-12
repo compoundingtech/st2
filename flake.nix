@@ -6,9 +6,9 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    # Packaged PTY dependency: the merged revision with atomic metadata patching and the
+    # Rust PTY candidate with atomic registry publication and the
     # fleet-observation guarantees required by st2 reconciliation.
-    pty.url = "github:compoundingtech/pty/504ac7332895fe1fa3767b530dcd99f091f56cda";
+    pty.url = "github:compoundingtech/pty-rust/81090e758bee1d52b07eb46ecea15f17561f4feb";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that `checks.release-integration` drives to prove
@@ -488,10 +488,6 @@
           touch "$out"
         '';
 
-        # Real producer-consumer contract: st2 consumes `pty list --json` from the exact pty
-        # revision that owns fleet observation. Fake CLI fixtures below still cover malformed
-        # output and a wedged child; this check proves the healthy 0/75/100/500-session path crosses
-        # both packaged binaries within st2's short outer deadline.
         # The pi extension's only compile-time coupling to pi.
         #
         # `hooks/pi-channel.ts` is shipped as an opaque asset inside the content-addressed hook set
@@ -567,55 +563,68 @@
             touch $out
           '';
 
+        # Package-agnostic producer-consumer contract: exercise only the installed `pty`
+        # executable and st2's consumer. The exported upstream check owns deterministic
+        # liveness fault injection, and is required rather than optional.
         checks.pty-fleet-contract = pkgs.runCommand "st2-pty-fleet-contract-${version}" {
           nativeBuildInputs = [
             pkgs.coreutils
             pkgs.jq
-            pkgs.nodejs
+            pty.checks.${system}.fleet-liveness
             pty.packages.${system}.default
             st2
           ];
         } ''
           export HOME=$(mktemp -d)
           catalog=$(mktemp -d)
+          pty_bin=${pty.packages.${system}.default}/bin/pty
           mkdir -p "$catalog/agents/contract/gone"
           printf '%s\n' \
             'agent "gone" { host "contract"; retired #true; command "true" }' \
             > "$catalog/agents/contract/gone/agent.kdl"
 
-          # Run the exact packaged producer's deterministic fault seams. These prove EPERM avoids
-          # socket fallback and hundreds of indefinitely-hung ambiguous probes share one deadline.
-          test_config=$(mktemp --suffix=.mjs)
-          printf '%s\n' 'export default { test: {} }' > "$test_config"
-          node \
-            ${pty.packages.${system}.default}/lib/pty/node_modules/vitest/vitest.mjs \
-            run tests/list-liveness-budget.test.ts \
-            --config "$test_config" \
-            --root ${pty.packages.${system}.default}/lib/pty
-
           for fleet_size in 0 75 100 500; do
             root=$(mktemp -d)
+            expected_names="expected-$fleet_size.txt"
+            : > "$expected_names"
+
             i=0
             while test "$i" -lt "$fleet_size"; do
-              session=$(printf 'session-%03d' "$i")
-              : > "$root/$session.sock"
-              printf '%s\n' "$$" > "$root/$session.pid"
+              printf 'session-%03d\n' "$i" >> "$expected_names"
               i=$((i + 1))
             done
 
-            PTY_ROOT="$root" timeout 2s pty list --json > "pty-$fleet_size.json"
+            # Create through the public CLI in reverse order. Keep at most one child alive
+            # at once, then retain its exited record for the list/doctor fleet.
+            i=$fleet_size
+            while test "$i" -gt 0; do
+              i=$((i - 1))
+              session=$(printf 'session-%03d' "$i")
+              PTY_ROOT="$root" "$pty_bin" run -d --id "$session" \
+                --no-display-name -- sh -c 'exec sleep 300' >/dev/null
+              PTY_ROOT="$root" "$pty_bin" kill "$session" >/dev/null
+            done
+
+            PTY_ROOT="$root" timeout 2s "$pty_bin" list --json \
+              > "pty-$fleet_size.json"
             jq -e --argjson size "$fleet_size" \
-              'length == $size and all(.status == "running")' \
+              'type == "array" and length == $size and all(.status == "exited")' \
               "pty-$fleet_size.json" >/dev/null
+            jq -r '.[].name' "pty-$fleet_size.json" > "actual-$fleet_size.txt"
+            cmp "$expected_names" "actual-$fleet_size.txt"
 
             PTY_ROOT="$root" timeout 2s \
-              st2 doctor --catalog "$catalog" --host contract \
+              ${st2}/bin/st2 doctor --catalog "$catalog" --host contract \
               > "doctor-$fleet_size.out"
             grep -F 'contract.gone retirement complete' \
               "doctor-$fleet_size.out" >/dev/null
+
+            while IFS= read -r session; do
+              PTY_ROOT="$root" "$pty_bin" rm "$session" >/dev/null
+            done < "$expected_names"
           done
 
-          touch $out
+          touch "$out"
         '';
 
         # Smoke test that the built binary actually runs and its command tree is
