@@ -3042,7 +3042,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .unwrap_or_else(now_ms)
                 });
             let operation = format!(
-                "{}:{revision}:{next_check}:{}",
+                "{}:{revision}:{}",
                 observer.subject,
                 refresh_attempt.as_deref().unwrap_or("scheduled")
             );
@@ -4322,6 +4322,7 @@ fn prepend_executable_dir(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::{SecondsFormat, Utc};
 
@@ -8155,6 +8156,76 @@ version 2
     }
 
     struct FakeResourceProvider;
+
+    struct BlockingResourceProvider {
+        calls: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+
+    impl ResourceProvider for BlockingResourceProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                Ok(crate::resource::ProviderObservation {
+                    facts: serde_json::json!({"state": "open"}),
+                    cursor: Some("one".into()),
+                    next_check_unix_ms: now_ms().saturating_add(60_000),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_observer_has_only_one_provider_call_in_flight() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = r#"
+version 2
+
+resource "one" { kind "custom.example.state" }
+observer "one" {
+  resource "resource/one"
+  provider "example.state"
+  locator "one"
+  field "state"
+}
+"#;
+        apply_source(&store, source, "publish-one-observer");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let reconciler = Reconciler::new(
+            store,
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(BlockingResourceProvider {
+            calls: calls.clone(),
+            release: release.clone(),
+        }));
+
+        reconciler.reconcile_once().unwrap();
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+    }
 
     #[test]
     fn a_changed_subscription_starts_one_exact_resource_input_mission() {
