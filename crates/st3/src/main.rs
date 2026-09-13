@@ -2079,24 +2079,6 @@ async fn wait_for_actual(client: &Client, subject: &str, mut cursor: u64) -> Res
     }
 }
 
-async fn wait_for_message_view(client: &Client, subject: &str, mut cursor: u64) -> Result<()> {
-    loop {
-        if read_message(client, subject).await.is_ok() {
-            return Ok(());
-        }
-        let events: Vec<EventRecord> = client
-            .get(&format!(
-                "/v1/events?after={cursor}&subject={}&wait=false",
-                urlencoding::encode(subject)
-            ))
-            .await?;
-        for event in events {
-            cursor = cursor.max(event.store_index);
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 async fn run_logs(client: &Client, args: LogsArgs, json_output: bool) -> Result<()> {
     let chunk = follow_logs(
         client,
@@ -4440,31 +4422,21 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
         print!("{kdl}");
         return Ok(None);
     }
-    let actor = from;
-    let parsed = st3::parse_intent(&kdl, "local")?;
-    let revision = parsed.missions[&mission_id].revision.clone();
-    publish_text(
-        client,
-        kdl,
-        format!("st3 message send {id} mission"),
-        actor.clone(),
-    )
-    .await?;
-    let workspace = std::env::current_dir()?.canonicalize()?;
-    let run_kdl = mission_run_intent(
-        &mission_id,
-        &mission_id,
-        &revision,
-        &workspace,
-        &normalize_requester_subject(&actor),
-        &BTreeMap::new(),
-        "run",
-    );
-    let applied =
-        publish_text(client, run_kdl, format!("st3 message send {id} run"), actor).await?;
-    let subject = format!("message/{id}");
-    wait_for_message_view(client, &subject, applied.store_index).await?;
-    read_message(client, &subject).await.map(Some)
+    client
+        .post(
+            "/v1/messages",
+            &MessageSendRequest {
+                idempotency_key: format!("st3-message-send:{id}"),
+                from,
+                to,
+                content: args.body,
+                title: args.subject,
+                in_reply_to: args.in_reply_to,
+                tags: args.tags,
+            },
+        )
+        .await
+        .map(Some)
 }
 
 #[allow(clippy::too_many_arguments)]
