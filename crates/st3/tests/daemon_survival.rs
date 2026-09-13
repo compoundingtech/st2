@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -769,5 +770,139 @@ fn an_exec_survives_a_daemon_restart_and_is_adopted() {
         String::from_utf8_lossy(&logs.stderr)
     );
     assert_eq!(logs.stdout, b"survived");
+    replacement.stop();
+}
+
+#[test]
+fn a_claude_channel_reconnects_after_a_daemon_restart() {
+    let binary = assert_cmd::cargo::cargo_bin!("st3");
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let socket = temporary.path().join("st3.sock");
+    let mut daemon = start_daemon(binary, &state, &socket);
+    wait_for(
+        || {
+            st3_command(binary)
+                .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        },
+        "the first daemon did not become ready",
+    );
+
+    let channel_stderr = temporary.path().join("channel.stderr");
+    let mut channel = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "driver",
+            "claude-mcp",
+            "--subject",
+            "agent/survival/claude",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(fs::File::create(&channel_stderr).unwrap()))
+        .spawn()
+        .expect("start the Claude channel");
+    let mut channel_stdin = channel.stdin.take().unwrap();
+    let mut channel_stdout = BufReader::new(channel.stdout.take().unwrap());
+    channel_stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .unwrap();
+    channel_stdin.flush().unwrap();
+    let mut initialized = String::new();
+    channel_stdout.read_line(&mut initialized).unwrap();
+    assert!(initialized.contains("\"id\":1"), "{initialized}");
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "status",
+                    "agent/survival/claude",
+                    "--json",
+                ])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("\"state\": \"ready\"")
+                })
+        },
+        "the Claude channel did not publish readiness",
+    );
+
+    daemon.stop();
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        channel.try_wait().unwrap().is_none(),
+        "the Claude channel stopped with the daemon: {}",
+        fs::read_to_string(&channel_stderr).unwrap_or_default()
+    );
+
+    let mut replacement = start_daemon(binary, &state, &socket);
+    wait_for(
+        || {
+            st3_command(binary)
+                .args(["--endpoint", socket.to_str().unwrap(), "doctor"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        },
+        "the replacement daemon did not become ready",
+    );
+    let sent = st3_command(binary)
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "message",
+            "send",
+            "agent/survival/claude",
+            "-m",
+            "SURVIVED-RESTART",
+            "--from",
+            "person/test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let message = format!("message/{}", String::from_utf8_lossy(&sent.stdout).trim());
+    wait_for(
+        || {
+            st3_command(binary)
+                .args([
+                    "--endpoint",
+                    socket.to_str().unwrap(),
+                    "status",
+                    &message,
+                    "--json",
+                ])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .contains("\"status\": \"delivered\"")
+                })
+        },
+        "the restarted Claude channel did not deliver the message",
+    );
+    let mut notification = String::new();
+    channel_stdout.read_line(&mut notification).unwrap();
+    assert!(notification.contains("notifications/claude/channel"));
+    assert!(notification.contains("SURVIVED-RESTART"));
+
+    drop(channel_stdin);
+    wait_for(
+        || channel.try_wait().ok().flatten().is_some(),
+        "the Claude channel did not stop after input closed",
+    );
     replacement.stop();
 }

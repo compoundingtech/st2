@@ -5644,72 +5644,94 @@ async fn run_st2_native_driver(
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
     let mut ready = false;
+    let mut last_control_warning = None;
     loop {
         tokio::select! {
             result = &mut task => {
                 let outcome = result?;
-                let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                    subject: subject.into(),
-                    kind: "runtime.observed".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("exited".into())),
-                        ("runtime_id".into(), Value::String(runtime_id.clone())),
-                        ("exit_code".into(), Value::from(if outcome.is_ok() { 0 } else { 1 })),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                }).await?;
+                loop {
+                    let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "runtime.observed".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("status".into(), Value::String("exited".into())),
+                            ("runtime_id".into(), Value::String(runtime_id.clone())),
+                            ("exit_code".into(), Value::from(if outcome.is_ok() { 0 } else { 1 })),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("native-exit:{subject}:{runtime_id}")),
+                    }).await;
+                    match result {
+                        Ok(_) => break,
+                        Err(error) => {
+                            tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                }
                 return outcome;
             }
             _ = interval.tick() => {
-                if let Some(observed) = st2::harness_state::read(
-                    &st2::harness_state::harness_state_path(&agent_dir),
-                    None,
-                ) {
-                    if !ready
-                        && driver != "claude"
-                        && !matches!(
-                            observed.state,
-                            st2::harness_state::Activity::Unknown
-                                | st2::harness_state::Activity::Ended
+                let tick: Result<()> = async {
+                    if let Some(observed) = st2::harness_state::read(
+                        &st2::harness_state::harness_state_path(&agent_dir),
+                        None,
+                    ) {
+                        if !ready
+                            && driver != "claude"
+                            && !matches!(
+                                observed.state,
+                                st2::harness_state::Activity::Unknown
+                                    | st2::harness_state::Activity::Ended
+                            )
+                        {
+                            let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                                subject: subject.into(),
+                                kind: "harness.observed".into(),
+                                actor: Some(subject.into()),
+                                fields: BTreeMap::from([
+                                    ("state".into(), Value::String("ready".into())),
+                                    ("driver".into(), Value::String(driver.into())),
+                                    ("transport".into(), Value::String("native".into())),
+                                ]),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: Some(format!("native-ready:{subject}:{driver}")),
+                            }).await?;
+                            ready = true;
+                        }
+                        publish_harness_activity(
+                            client,
+                            subject,
+                            driver,
+                            &observed,
+                            &mut last_activity_fingerprint,
                         )
-                    {
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.observed".into(),
-                            actor: Some(subject.into()),
-                            fields: BTreeMap::from([
-                                ("state".into(), Value::String("ready".into())),
-                                ("driver".into(), Value::String(driver.into())),
-                                ("transport".into(), Value::String("native".into())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!("native-ready:{subject}:{driver}")),
-                        }).await?;
-                        ready = true;
+                        .await?;
                     }
-                    publish_harness_activity(
-                        client,
-                        subject,
-                        driver,
-                        &observed,
-                        &mut last_activity_fingerprint,
-                    )
-                    .await?;
-                }
-                if driver != "claude" {
-                    forward_projected_messages(client, subject, &inbox, &archive, "native").await?;
+                    if driver != "claude" {
+                        forward_projected_messages(client, subject, &inbox, &archive, "native").await?;
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
             _ = work_interval.tick(), if driver != "claude" => {
-                sync_work_messages(client, subject).await?;
-                let minute = unix_minute()?;
-                if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                let tick: Result<()> = async {
+                    sync_work_messages(client, subject).await?;
+                    let minute = unix_minute()?;
+                    if renewed_minute != Some(minute) {
+                        renew_claimed_work(client, subject, minute).await?;
+                        renewed_minute = Some(minute);
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
         }
@@ -6159,7 +6181,20 @@ fn tolerate_driver_api_outage(
 ) -> Result<()> {
     let transient = error.chain().any(|cause| {
         let message = cause.to_string();
-        message.contains("connect to the st3 API") || message.contains("incomplete HTTP response")
+        message.contains("connect to the st3 API")
+            || message.contains("incomplete HTTP response")
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
     });
     if !transient {
         return Err(error);
@@ -6475,8 +6510,10 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut delivered = BTreeSet::new();
+    let mut announced = BTreeSet::new();
     let mut renewed_minute = None;
+    let mut ready = false;
+    let mut last_control_warning = None;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -6496,18 +6533,6 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                     })),
                     Some("notifications/initialized") => {
                         initialized = true;
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.observed".into(),
-                            actor: Some(subject.into()),
-                            fields: BTreeMap::from([
-                                ("state".into(), Value::String("ready".into())),
-                                ("driver".into(), Value::String("claude".into())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: None,
-                        }).await?;
                         None
                     }
                     Some("tools/list") => id.map(|id| json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}})),
@@ -6523,54 +6548,74 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                 }
             }
             _ = interval.tick(), if initialized => {
-                let messages: Vec<MessageView> = client
-                    .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
-                    .await?;
-                for message in messages.into_iter().filter(|message| message.status == "sent") {
-                    if !delivered.insert(message.subject.clone()) {
-                        continue;
+                let tick: Result<()> = async {
+                    if !ready {
+                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
+                            subject: subject.into(),
+                            kind: "harness.observed".into(),
+                            actor: Some(subject.into()),
+                            fields: BTreeMap::from([
+                                ("state".into(), Value::String("ready".into())),
+                                ("driver".into(), Value::String("claude".into())),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!("claude-ready:{subject}")),
+                        }).await?;
+                        ready = true;
                     }
-                    let content = if message.content.starts_with("doc/") {
-                        let value: Value = client
-                            .get(&format!("/v1/documents/content?reference={}", urlencoding::encode(&message.content)))
-                            .await?;
-                        let bytes = serde_json::from_value::<Vec<u8>>(value.get("bytes").cloned().context("document response lacks bytes")?)?;
-                        String::from_utf8(bytes).context("message document is not UTF-8")?
-                    } else {
-                        message.content.clone()
-                    };
-                    let content = message.title.as_ref().map_or(content.clone(), |title| format!("Subject: {title}\n\n{content}"));
-                    let notification = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/claude/channel",
-                        "params": {
-                            "content": content,
-                            "meta": {
-                                "from": message.from,
-                                "messageId": message.subject,
-                                "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
-                                "identity": subject
-                            }
+                    let messages: Vec<MessageView> = client
+                        .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
+                        .await?;
+                    for message in messages.into_iter().filter(|message| message.status == "sent") {
+                        if !announced.contains(&message.subject) {
+                            let content = message_content(client, &message).await?;
+                            let content = message.title.as_ref().map_or(content.clone(), |title| format!("Subject: {title}\n\n{content}"));
+                            let notification = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/claude/channel",
+                                "params": {
+                                    "content": content,
+                                    "meta": {
+                                        "from": message.from,
+                                        "messageId": message.subject,
+                                        "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
+                                        "identity": subject
+                                    }
+                                }
+                            });
+                            stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                            announced.insert(message.subject.clone());
                         }
-                    });
-                    stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                    deliver_message(
-                        client,
-                        &message.subject,
-                        subject,
-                        format!("message-delivered:{}:{subject}", message.subject),
-                    )
-                    .await?;
+                        deliver_message(
+                            client,
+                            &message.subject,
+                            subject,
+                            format!("message-delivered:{}:{subject}", message.subject),
+                        )
+                        .await?;
+                        announced.remove(&message.subject);
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
             _ = work_interval.tick(), if initialized => {
-                sync_work_messages(client, subject).await?;
-                let minute = unix_minute()?;
-                if renewed_minute != Some(minute) {
-                    renew_claimed_work(client, subject, minute).await?;
-                    renewed_minute = Some(minute);
+                let tick: Result<()> = async {
+                    sync_work_messages(client, subject).await?;
+                    let minute = unix_minute()?;
+                    if renewed_minute != Some(minute) {
+                        renew_claimed_work(client, subject, minute).await?;
+                        renewed_minute = Some(minute);
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = tick {
+                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
         }
@@ -7544,7 +7589,7 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_driver_retries_a_transient_st3_api_outage() {
+    fn a_runtime_driver_retries_a_transient_st3_api_outage() {
         let mut last_warning = None;
         tolerate_driver_api_outage(
             "agent/run/worker",
@@ -7556,7 +7601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_driver_does_not_retry_a_semantic_api_error() {
+    fn a_runtime_driver_does_not_retry_a_semantic_api_error() {
         let mut last_warning = None;
         let error = tolerate_driver_api_outage(
             "agent/run/worker",
