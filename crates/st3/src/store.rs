@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -464,6 +464,7 @@ pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
     committed_index: Arc<AtomicU64>,
+    actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<ReplicationSnapshot>>,
     origin: String,
@@ -663,6 +664,7 @@ impl Store {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers: ReadPool::new(readers),
             committed_index,
+            actual_cache: Mutex::new(HashMap::new()),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -697,6 +699,7 @@ impl Store {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers: ReadPool::new(readers),
             committed_index,
+            actual_cache: Mutex::new(HashMap::new()),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             origin,
@@ -5604,8 +5607,26 @@ impl Store {
     }
 
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
+        let before = self.committed_index.load(Ordering::Acquire);
+        if let Some((_, value)) = self
+            .actual_cache
+            .lock()
+            .expect("actual cache mutex poisoned")
+            .get(subject)
+            .filter(|(index, _)| *index == before)
+        {
+            return Ok(value.clone());
+        }
         let connection = self.readers.get();
-        latest_actual(&connection, subject)
+        let value = latest_actual(&connection, subject)?;
+        let after = self.committed_index.load(Ordering::Acquire);
+        if before == after {
+            self.actual_cache
+                .lock()
+                .expect("actual cache mutex poisoned")
+                .insert(subject.to_owned(), (after, value.clone()));
+        }
+        Ok(value)
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
@@ -12769,6 +12790,41 @@ observer "ordered/file" {
         assert_eq!(index, 0);
         assert_eq!(status.store_index, 0);
         drop(writer);
+    }
+
+    #[test]
+    fn the_current_actual_cache_follows_the_store_index() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/run/worker";
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("running".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let first = store.latest_actual_value(subject).unwrap().unwrap();
+        assert_eq!(first["status"], "running");
+        let first_index = store.actual_cache.lock().unwrap().get(subject).unwrap().0;
+
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("stopped".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let second = store.latest_actual_value(subject).unwrap().unwrap();
+        assert_eq!(second["status"], "stopped");
+        assert!(store.actual_cache.lock().unwrap().get(subject).unwrap().0 > first_index);
     }
 
     #[test]
