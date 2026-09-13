@@ -331,6 +331,28 @@ fn new_request_id() -> String {
     )
 }
 
+async fn blocking_store<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)
+}
+
+async fn blocking_action<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, St3Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad)
+}
+
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -389,6 +411,12 @@ fn isolation_name(mode: st_runtime::Isolation) -> &'static str {
 }
 
 async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, ApiError> {
+    tokio::task::spawn_blocking(move || doctor_report(&state))
+        .await
+        .map_err(ApiError::internal)?
+}
+
+fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
         Ok(index) => checks.push(DoctorCheck {
@@ -657,15 +685,13 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
 async fn replication_status(
     State(state): State<AppState>,
 ) -> Result<Json<ReplicationStatus>, ApiError> {
-    state
-        .store
-        .replication_status(
-            state.fleet_id.is_some(),
-            state.fleet_id.as_deref(),
-            &state.configured_peers,
-        )
+    let store = state.store.clone();
+    let configured = state.fleet_id.is_some();
+    let fleet = state.fleet_id.clone();
+    let peers = state.configured_peers.clone();
+    blocking_store(move || store.replication_status(configured, fleet.as_deref(), &peers))
+        .await
         .map(Json)
-        .map_err(ApiError::internal)
 }
 
 #[derive(Deserialize)]
@@ -682,11 +708,10 @@ async fn replication_records(
     State(state): State<AppState>,
     Query(query): Query<ReplicationRecordsQuery>,
 ) -> Result<Json<Vec<ReplicaRecordView>>, ApiError> {
-    state
-        .store
-        .replica_records(query.unresolved)
+    let store = state.store.clone();
+    blocking_store(move || store.replica_records(query.unresolved))
+        .await
         .map(Json)
-        .map_err(ApiError::internal)
 }
 
 async fn replication_record(
@@ -698,10 +723,10 @@ async fn replication_record(
     } else {
         format!("record/{record}")
     };
-    state
-        .store
-        .replica_record(&record)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let record_for_read = record.clone();
+    blocking_store(move || store.replica_record(&record_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("replica record `{record}` does not exist")))
 }
@@ -918,10 +943,10 @@ async fn get_planning_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PlanningSessionView>, ApiError> {
-    state
-        .store
-        .planning_session(&id)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let id_for_read = id.clone();
+    blocking_store(move || store.planning_session(&id_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("planning session `{id}` does not exist")))
 }
@@ -1868,11 +1893,11 @@ async fn get_mission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<crate::model::MissionSpec>, ApiError> {
-    let id = id.strip_prefix("mission/").unwrap_or(&id);
-    state
-        .store
-        .mission_spec(id, None)
-        .map_err(ApiError::internal)?
+    let id = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
+    let store = state.store.clone();
+    let id_for_read = id.clone();
+    blocking_store(move || store.mission_spec(&id_for_read, None))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("mission `mission/{id}` does not exist")))
 }
@@ -2156,10 +2181,6 @@ async fn refresh_resource(
             format!("resource `{resource}` has no active observer"),
         )));
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
     let attempts = observers
         .iter()
         .map(|(observer, _)| {
@@ -2183,14 +2204,11 @@ async fn refresh_resource(
             .store
             .append_claim(&ClaimInput {
                 subject: observer.clone(),
-                kind: "observer.state".into(),
+                kind: "observer.refresh-requested".into(),
                 actor: None,
                 fields: BTreeMap::from([
-                    ("state".into(), Value::String("healthy".into())),
-                    ("reason".into(), Value::String("manual refresh".into())),
                     ("revision".into(), Value::String(revision)),
                     ("attempt".into(), Value::String(attempts[observer].clone())),
-                    ("next_check_unix_ms".into(), Value::String(now.to_string())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -2293,11 +2311,10 @@ async fn list_documents(
     State(state): State<AppState>,
     Query(query): Query<DocumentQuery>,
 ) -> Result<Json<Vec<DocumentVersion>>, ApiError> {
-    state
-        .store
-        .list_documents(query.name.as_deref())
+    let store = state.store.clone();
+    blocking_store(move || store.list_documents(query.name.as_deref()))
+        .await
         .map(Json)
-        .map_err(ApiError::internal)
 }
 
 #[derive(Deserialize)]
@@ -2321,10 +2338,11 @@ async fn get_document(
             "a document reference needs `@HASH`",
         ))
     })?;
-    let bytes = state
-        .store
-        .get_document(name, hash)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let name = name.to_owned();
+    let hash = hash.to_owned();
+    let bytes = blocking_store(move || store.get_document(&name, &hash))
+        .await?
         .ok_or_else(|| {
             ApiError::not_found(format!("document `{}` is not stored", query.reference))
         })?;
@@ -2352,10 +2370,10 @@ async fn get_claim(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    state
-        .store
-        .claim_by_id(&id)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let id_for_read = id.clone();
+    blocking_store(move || store.claim_by_id(&id_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
 }
@@ -2396,9 +2414,9 @@ async fn list_claims(
             "a claim page limit must be between 1 and 500",
         )));
     }
-    state
-        .store
-        .claims_page(
+    let store = state.store.clone();
+    blocking_store(move || {
+        store.claims_page(
             query.subject.as_deref(),
             query.owner_run.as_deref(),
             query.after_index,
@@ -2406,8 +2424,9 @@ async fn list_claims(
             matches!(query.order, ClaimsOrder::Desc),
             query.limit,
         )
-        .map(Json)
-        .map_err(ApiError::internal)
+    })
+    .await
+    .map(Json)
 }
 
 async fn post_review(
@@ -2643,11 +2662,10 @@ async fn list_messages(
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Vec<MessageView>>, ApiError> {
     let recipient = query.to.as_deref().map(normalize_message_party);
-    state
-        .store
-        .messages(recipient.as_deref(), query.include_closed)
+    let store = state.store.clone();
+    blocking_store(move || store.messages(recipient.as_deref(), query.include_closed))
+        .await
         .map(Json)
-        .map_err(ApiError::internal)
 }
 
 async fn read_message(
@@ -2659,10 +2677,9 @@ async fn read_message(
     } else {
         format!("message/{subject}")
     };
-    state
-        .store
-        .messages(None, true)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    blocking_store(move || store.messages(None, true))
+        .await?
         .into_iter()
         .find(|message| message.subject == subject)
         .map(Json)
@@ -2761,15 +2778,16 @@ async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    state
-        .store
-        .status_at(
+    let store = state.store.clone();
+    blocking_store(move || {
+        store.status_at(
             query.subject.as_deref(),
             query.owner_run.as_deref(),
             query.at_index,
         )
-        .map(Json)
-        .map_err(ApiError::internal)
+    })
+    .await
+    .map(Json)
 }
 
 async fn reset_runtime(
@@ -2861,21 +2879,25 @@ async fn events(
     State(state): State<AppState>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventRecord>>, ApiError> {
-    let read = || {
-        state.store.events_after_filtered(
-            query.after,
-            query.subject.as_deref(),
-            query.owner_run.as_deref(),
-        )
+    let read = |state: &AppState| {
+        let store = state.store.clone();
+        let subject = query.subject.clone();
+        let owner_run = query.owner_run.clone();
+        async move {
+            blocking_store(move || {
+                store.events_after_filtered(query.after, subject.as_deref(), owner_run.as_deref())
+            })
+            .await
+        }
     };
-    let current = read().map_err(ApiError::internal)?;
+    let current = read(&state).await?;
     if !current.is_empty() || query.wait == Some(false) {
         return Ok(Json(current));
     }
     let wait = async {
         let mut event_changed = state.event_notify.subscribe();
         loop {
-            let current = read().map_err(ApiError::internal)?;
+            let current = read(&state).await?;
             if !current.is_empty() {
                 return Ok(current);
             }
@@ -3206,15 +3228,15 @@ async fn get_eval(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<EvalStatus>, ApiError> {
-    let run = state
-        .store
-        .mission_run(&run)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let run_for_read = run.clone();
+    let run = blocking_store(move || store.mission_run(&run_for_read))
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("eval mission run `{run}` does not exist")))?;
-    let verdict_claim = state
-        .store
-        .latest_claim(&run.subject, Some("eval.verdict"))
-        .map_err(ApiError::internal)?;
+    let store = state.store.clone();
+    let run_subject = run.subject.clone();
+    let verdict_claim =
+        blocking_store(move || store.latest_claim(&run_subject, Some("eval.verdict"))).await?;
     let verdict = verdict_claim
         .as_ref()
         .and_then(|claim| claim.body.pointer("/fields/verdict"))
@@ -3276,17 +3298,16 @@ async fn list_mission_runs(
     State(state): State<AppState>,
     Query(query): Query<MissionRunQuery>,
 ) -> Result<Json<Vec<MissionRunView>>, ApiError> {
-    match (query.root.as_deref(), query.mission.as_deref()) {
-        (Some(root), None) => state
-            .store
-            .mission_runs_for_root(root)
-            .map(Json)
-            .map_err(ApiError::internal),
-        (None, Some(mission)) => state
-            .store
-            .active_mission_runs_for_mission(mission)
-            .map(Json)
-            .map_err(ApiError::internal),
+    let store = state.store.clone();
+    match (query.root, query.mission) {
+        (Some(root), None) => blocking_store(move || store.mission_runs_for_root(&root))
+            .await
+            .map(Json),
+        (None, Some(mission)) => {
+            blocking_store(move || store.active_mission_runs_for_mission(&mission))
+                .await
+                .map(Json)
+        }
         _ => Err(ApiError::bad(St3Error::new(
             "invalid-mission-run-query",
             "select exactly one mission or root mission run",
@@ -3298,10 +3319,10 @@ async fn get_mission_run(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<MissionRunView>, ApiError> {
-    state
-        .store
-        .mission_run(&run)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let run_for_read = run.clone();
+    blocking_store(move || store.mission_run(&run_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))
 }
@@ -3503,21 +3524,20 @@ async fn list_run_generations(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<Vec<RunGenerationView>>, ApiError> {
-    state
-        .store
-        .run_generations(&run)
+    let store = state.store.clone();
+    blocking_store(move || store.run_generations(&run))
+        .await
         .map(Json)
-        .map_err(ApiError::internal)
 }
 
 async fn get_run_generation(
     State(state): State<AppState>,
     AxumPath(generation): AxumPath<String>,
 ) -> Result<Json<RunGenerationView>, ApiError> {
-    state
-        .store
-        .run_generation(&generation)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let generation_for_read = generation.clone();
+    blocking_store(move || store.run_generation(&generation_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("run generation `{generation}` does not exist")))
 }
@@ -3526,10 +3546,10 @@ async fn get_run_revision_proposal(
     State(state): State<AppState>,
     AxumPath(run): AxumPath<String>,
 ) -> Result<Json<RevisionProposalView>, ApiError> {
-    state
-        .store
-        .revision_proposal_for_run(&run)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let run_for_read = run.clone();
+    blocking_store(move || store.revision_proposal_for_run(&run_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| {
             ApiError::not_found(format!(
@@ -3542,10 +3562,10 @@ async fn get_revision_proposal(
     State(state): State<AppState>,
     AxumPath(proposal): AxumPath<String>,
 ) -> Result<Json<RevisionProposalView>, ApiError> {
-    state
-        .store
-        .revision_proposal(&proposal)
-        .map_err(ApiError::internal)?
+    let store = state.store.clone();
+    let proposal_for_read = proposal.clone();
+    blocking_store(move || store.revision_proposal(&proposal_for_read))
+        .await?
         .map(Json)
         .ok_or_else(|| {
             ApiError::not_found(format!("revision proposal `{proposal}` does not exist"))
@@ -3599,11 +3619,19 @@ async fn list_work(
     State(state): State<AppState>,
     Query(query): Query<WorkQuery>,
 ) -> Result<Json<Vec<StepRunView>>, ApiError> {
-    let mut work = state
-        .store
-        .work(query.actor.as_deref(), query.include_terminal)
-        .map_err(ApiError::internal)?;
-    let agents = desired_agent_grouping(&state)?;
+    let store = state.store.clone();
+    let (mut work, desired) = blocking_store(move || {
+        Ok((
+            store.work(query.actor.as_deref(), query.include_terminal)?,
+            store.desired_subjects()?,
+        ))
+    })
+    .await?;
+    let agents = desired
+        .into_iter()
+        .filter(|subject| subject.kind == "agent")
+        .map(|subject| (subject.subject, crate::graph::agent_under(&subject.desired)))
+        .collect::<BTreeMap<_, _>>();
     for step in &mut work {
         if let Some(actor) = step
             .claimant
@@ -3615,22 +3643,6 @@ async fn list_work(
         }
     }
     Ok(Json(work))
-}
-
-fn desired_agent_grouping(
-    state: &AppState,
-) -> Result<BTreeMap<String, Vec<crate::model::UnderSpec>>, ApiError> {
-    state
-        .store
-        .desired_subjects()
-        .map_err(ApiError::internal)
-        .map(|subjects| {
-            subjects
-                .into_iter()
-                .filter(|subject| subject.kind == "agent")
-                .map(|subject| (subject.subject, crate::graph::agent_under(&subject.desired)))
-                .collect()
-        })
 }
 
 async fn publish_work_mission(
@@ -3817,17 +3829,26 @@ async fn post_work_action(
     AxumPath((action, subject)): AxumPath<(String, String)>,
     Json(request): Json<WorkRequest>,
 ) -> Result<Json<StepRunView>, ApiError> {
-    let mut response = state
-        .store
-        .work_action(&subject, &action, &request)
-        .map_err(ApiError::bad)?;
+    let store = state.store.clone();
+    let (mut response, desired) = blocking_action(move || {
+        let response = store.work_action(&subject, &action, &request)?;
+        let desired = store.desired_subjects().map_err(|error| {
+            St3Error::new("store-read-failed", format!("read desired agents: {error}"))
+        })?;
+        Ok((response, desired))
+    })
+    .await?;
     if let Some(assignee) = response
         .claimant
         .as_ref()
         .or(response.assigned_to.as_ref())
         .or_else(|| (response.available_to.len() == 1).then(|| &response.available_to[0]))
     {
-        response.under = desired_agent_grouping(&state)?
+        response.under = desired
+            .into_iter()
+            .filter(|subject| subject.kind == "agent")
+            .map(|subject| (subject.subject, crate::graph::agent_under(&subject.desired)))
+            .collect::<BTreeMap<_, _>>()
             .get(assignee)
             .cloned()
             .unwrap_or_default();
@@ -5094,7 +5115,7 @@ version 2
             .expect("the first refresh did not start")
             .expect("the event sender closed");
         let first_attempt = store
-            .latest_claim(&observer, Some("observer.state"))
+            .latest_claim(&observer, Some("observer.refresh-requested"))
             .unwrap()
             .unwrap()
             .body["fields"]["attempt"]
@@ -5158,7 +5179,7 @@ version 2
             .expect("the second refresh did not start")
             .expect("the event sender closed");
         let second_attempt = store
-            .latest_claim(&observer, Some("observer.state"))
+            .latest_claim(&observer, Some("observer.refresh-requested"))
             .unwrap()
             .unwrap()
             .body["fields"]["attempt"]

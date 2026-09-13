@@ -2609,11 +2609,11 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
             })?;
             reject_unknown_children(
                 delivery_body,
-                &["mission", "resource", "workspace"],
+                &["mission", "resource", "workspace", "requester"],
                 "mission delivery",
                 "delivery",
             )?;
-            for name in ["mission", "resource", "workspace"] {
+            for name in ["mission", "resource", "workspace", "requester"] {
                 unique_child(delivery_body, name)?;
             }
             let reference = required_child_string(delivery_body, "mission", "mission delivery")?;
@@ -2626,6 +2626,15 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                     "invalid-mission-delivery-workspace",
                     "a mission delivery workspace cannot be empty",
                 ));
+            }
+            if let Some(requester) = child_string(delivery_body, "requester")? {
+                validate_full_subject(&requester)?;
+                if !requester.starts_with("agent/") && !requester.starts_with("person/") {
+                    return Err(St3Error::new(
+                        "invalid-mission-delivery-requester",
+                        "a mission delivery requester must use an `agent/` or `person/` subject",
+                    ));
+                }
             }
         }
         _ => {
@@ -3073,6 +3082,7 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             revision: None,
             resource_input: None,
             workspace: None,
+            requester: None,
             stopped: true,
         });
     }
@@ -3112,6 +3122,9 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         workspace: canonical_child_value(delivery_node, "workspace")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        requester: canonical_child_value(delivery_node, "requester")
             .and_then(Value::as_str)
             .map(str::to_owned),
         stopped: false,
@@ -4568,6 +4581,7 @@ subscription "reviews" {{
       mission "review@{revision}"
       resource "pull-request"
       workspace "/work/reviews"
+      requester "agent/fleet/repository/standing/owner"
     }}
 }}"#
         );
@@ -4582,5 +4596,9 @@ subscription "reviews" {{
         assert_eq!(spec.mission.as_deref(), Some("review"));
         assert_eq!(spec.revision.as_deref(), Some(revision.as_str()));
         assert_eq!(spec.resource_input.as_deref(), Some("pull-request"));
+        assert_eq!(
+            spec.requester.as_deref(),
+            Some("agent/fleet/repository/standing/owner")
+        );
     }
 }

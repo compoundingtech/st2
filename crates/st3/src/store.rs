@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
-use std::sync::Mutex;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
-use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -343,8 +345,125 @@ CREATE TABLE IF NOT EXISTS planning_previews (
 PRAGMA user_version = 12;
 "#;
 
-pub struct Store {
+const READ_CONNECTIONS: usize = 4;
+
+struct WriterConnection {
     connection: Mutex<Connection>,
+    committed_index: Arc<AtomicU64>,
+}
+
+struct WriterGuard<'a> {
+    connection: MutexGuard<'a, Connection>,
+    committed_index: &'a AtomicU64,
+}
+
+impl WriterConnection {
+    fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+            committed_index,
+        }
+    }
+
+    fn lock(&self) -> Result<WriterGuard<'_>, &'static str> {
+        self.connection
+            .lock()
+            .map(|connection| WriterGuard {
+                connection,
+                committed_index: &self.committed_index,
+            })
+            .map_err(|_| "store mutex poisoned")
+    }
+}
+
+impl Deref for WriterGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(index) = current_index(&self.connection) {
+            self.committed_index.store(index, Ordering::Release);
+        }
+    }
+}
+
+struct ReadPool {
+    connections: Mutex<Vec<Connection>>,
+    available: Condvar,
+}
+
+struct ReadGuard<'a> {
+    pool: &'a ReadPool,
+    connection: Option<Connection>,
+}
+
+impl ReadPool {
+    fn new(connections: Vec<Connection>) -> Self {
+        Self {
+            connections: Mutex::new(connections),
+            available: Condvar::new(),
+        }
+    }
+
+    fn get(&self) -> ReadGuard<'_> {
+        let mut connections = self
+            .connections
+            .lock()
+            .expect("store read-pool mutex poisoned");
+        while connections.is_empty() {
+            connections = self
+                .available
+                .wait(connections)
+                .expect("store read-pool mutex poisoned");
+        }
+        ReadGuard {
+            pool: self,
+            connection: connections.pop(),
+        }
+    }
+}
+
+impl Deref for ReadGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("a read guard always has a connection")
+    }
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        let mut connections = self
+            .pool
+            .connections
+            .lock()
+            .expect("store read-pool mutex poisoned");
+        connections.push(
+            self.connection
+                .take()
+                .expect("a read guard always returns its connection"),
+        );
+        self.pool.available.notify_one();
+    }
+}
+
+pub struct Store {
+    connection: WriterConnection,
+    readers: ReadPool,
+    committed_index: Arc<AtomicU64>,
     origin: String,
 }
 
@@ -489,6 +608,26 @@ fn discovered_collection_items(
         .collect()
 }
 
+fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
+    let flags = if shared_memory {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    (0..READ_CONNECTIONS)
+        .map(|_| {
+            let connection = Connection::open_with_flags(path, flags)
+                .with_context(|| format!("open st3 read connection {}", path.display()))?;
+            connection.execute_batch(
+                "PRAGMA busy_timeout = 5000;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA query_only = ON;",
+            )?;
+            Ok(connection)
+        })
+        .collect()
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
@@ -507,15 +646,28 @@ impl Store {
             seed_replica_envelopes_tx(&transaction, &origin)?;
             transaction.commit()?;
         }
+        let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
+        let readers = open_read_connections(path, false)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: WriterConnection::new(connection, committed_index.clone()),
+            readers: ReadPool::new(readers),
+            committed_index,
             origin,
         })
     }
 
     pub fn open_memory(origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
-        let mut connection = Connection::open_in_memory()?;
+        let uri = PathBuf::from(format!(
+            "file:st3-{}?mode=memory&cache=shared",
+            Uuid::now_v7().simple()
+        ));
+        let mut connection = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
@@ -526,8 +678,12 @@ impl Store {
             seed_replica_envelopes_tx(&transaction, &origin)?;
             transaction.commit()?;
         }
+        let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
+        let readers = open_read_connections(&uri, true)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: WriterConnection::new(connection, committed_index.clone()),
+            readers: ReadPool::new(readers),
+            committed_index,
             origin,
         })
     }
@@ -537,12 +693,11 @@ impl Store {
     }
 
     pub fn index(&self) -> Result<u64> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
-        current_index(&connection)
+        Ok(self.committed_index.load(Ordering::Acquire))
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let expected = expected_operations(&connection)?;
         let mut statement = connection.prepare(
             "SELECT id, request_digest, canonical_claim_id, state FROM operations ORDER BY id",
@@ -585,7 +740,7 @@ impl Store {
         &self,
         key: &str,
     ) -> Result<Option<T>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -616,7 +771,7 @@ impl Store {
         mission_id: &str,
         revision: Option<&str>,
     ) -> Result<Option<MissionSpec>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let body = if let Some(revision) = revision {
             connection
                 .query_row(
@@ -672,7 +827,7 @@ impl Store {
 
     pub fn planning_session(&self, id: &str) -> Result<Option<PlanningSessionView>> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         planning_session_view_tx(&connection, id)
     }
 
@@ -1317,7 +1472,7 @@ impl Store {
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(actor, "agent");
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let current = connection
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -1376,13 +1531,13 @@ impl Store {
 
     pub fn mission_run(&self, run: &str) -> Result<Option<MissionRunView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         Ok(mission_run_view_tx(&connection, run).optional()?)
     }
 
     pub fn run_generations(&self, run: &str) -> Result<Vec<RunGenerationView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM run_generations WHERE run_id=?1 ORDER BY created_at_unix_ms, id",
         )?;
@@ -1396,13 +1551,13 @@ impl Store {
 
     pub fn run_generation(&self, generation: &str) -> Result<Option<RunGenerationView>> {
         let generation = generation_id_from_subject(generation);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         Ok(run_generation_view_tx(&connection, generation).optional()?)
     }
 
     pub fn descendant_run_generations(&self, generation: &str) -> Result<Vec<String>> {
         let generation = generation_id_from_subject(generation);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         descendant_mission_run_ids_tx(&connection, generation)?
             .into_iter()
             .map(|run| {
@@ -1420,7 +1575,7 @@ impl Store {
 
     pub fn revision_proposal_for_run(&self, run: &str) -> Result<Option<RevisionProposalView>> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let id = connection
             .query_row(
                 "SELECT id FROM revision_proposals WHERE run_id=?1 AND status IN ('pending-approval','draining') ORDER BY created_at_unix_ms DESC LIMIT 1",
@@ -1437,7 +1592,7 @@ impl Store {
         let proposal = proposal
             .strip_prefix("revision-proposal/")
             .unwrap_or(proposal);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         Ok(revision_proposal_view_tx(&connection, proposal).optional()?)
     }
 
@@ -2374,7 +2529,7 @@ impl Store {
     }
 
     pub fn active_mission_runs(&self) -> Result<Vec<MissionRunView>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs WHERE status IN ('running','standing','blocked') ORDER BY created_at_unix_ms",
         )?;
@@ -2387,7 +2542,7 @@ impl Store {
     }
 
     pub fn next_active_mission_deadline(&self, origin: &str) -> Result<Option<u128>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT mission_run_deadlines.deadline_at_unix_ms
              FROM mission_run_deadlines
@@ -2442,7 +2597,7 @@ impl Store {
         } else {
             format!("mission-run/{run}")
         };
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT origin FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY store_index LIMIT 1",
@@ -2455,7 +2610,7 @@ impl Store {
 
     pub fn active_mission_runs_for_mission(&self, mission: &str) -> Result<Vec<MissionRunView>> {
         let mission = mission.strip_prefix("mission/").unwrap_or(mission);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs
              WHERE mission_id=?1 AND status IN ('running','standing','blocked')
@@ -2470,7 +2625,7 @@ impl Store {
     }
 
     pub fn terminal_mission_runs(&self) -> Result<Vec<MissionRunView>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs WHERE status IN ('completed','failed','cancelled') ORDER BY created_at_unix_ms",
         )?;
@@ -2484,7 +2639,7 @@ impl Store {
 
     pub fn mission_runs_for_root(&self, root: &str) -> Result<Vec<MissionRunView>> {
         let root = root.strip_prefix("mission-run/").unwrap_or(root);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT id FROM mission_runs WHERE root_run_id=?1 ORDER BY created_at_unix_ms, id",
         )?;
@@ -2498,7 +2653,7 @@ impl Store {
 
     pub fn work(&self, actor: Option<&str>, include_terminal: bool) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
@@ -2530,7 +2685,7 @@ impl Store {
 
     pub fn step_run(&self, subject: &str) -> Result<Option<StepRunView>> {
         let subject = normalize_step_run(subject);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut view = connection
             .query_row(
                 "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
@@ -2983,7 +3138,7 @@ impl Store {
         resolved_intent: IntentInput,
         at_index: Option<u64>,
     ) -> Result<MissionResponse, St3Error> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let current_index = current_index(&connection).map_err(internal)?;
         let store_index = selected_index(current_index, at_index)?;
         let mut changes = Vec::new();
@@ -4206,7 +4361,7 @@ impl Store {
     }
 
     pub fn get_document(&self, name: &str, hash: &str) -> Result<Option<Vec<u8>>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT b.bytes FROM documents d JOIN blobs b ON b.hash=d.hash WHERE d.name=?1 AND d.hash=?2",
@@ -4218,7 +4373,7 @@ impl Store {
     }
 
     pub fn list_documents(&self, name: Option<&str>) -> Result<Vec<DocumentVersion>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
                      d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
                      ,d.binding_claim_id
@@ -4363,7 +4518,7 @@ impl Store {
     }
 
     pub fn idempotent_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -4376,7 +4531,7 @@ impl Store {
     }
 
     pub fn operation_claim(&self, key: &str) -> Result<Option<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let operation_id = operation_id_for_key(key);
         connection
             .query_row(
@@ -4401,7 +4556,7 @@ impl Store {
         selected_owner_run: Option<&str>,
         at_index: Option<u64>,
     ) -> Result<StatusResponse> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
         let mut subject_names = BTreeSet::new();
@@ -4533,7 +4688,7 @@ impl Store {
         subject: Option<&str>,
         owner_run: Option<&str>,
     ) -> Result<Vec<EventRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT store_index, kind, subject, body FROM events
              WHERE store_index > ?1 AND (?2 IS NULL OR subject=?2) ORDER BY store_index",
@@ -4561,7 +4716,7 @@ impl Store {
     }
 
     pub fn desired_subjects(&self) -> Result<Vec<DesiredSubject>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
@@ -4736,7 +4891,7 @@ impl Store {
         recipient: Option<&str>,
         include_closed: bool,
     ) -> Result<Vec<MessageView>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT DISTINCT subject FROM claims WHERE subject LIKE 'message/%' ORDER BY subject",
         )?;
@@ -4843,7 +4998,7 @@ impl Store {
     }
 
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
                      FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index DESC LIMIT 1";
         connection
@@ -4852,8 +5007,32 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT json_extract(request.body, '$.fields.attempt')
+                 FROM claims request
+                 WHERE request.subject=?1
+                   AND request.kind='observer.refresh-requested'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM claims result
+                     WHERE result.subject=request.subject
+                       AND result.kind IN ('observer.observed', 'observer.state')
+                       AND json_extract(result.body, '$.fields.attempt')=
+                           json_extract(request.body, '$.fields.attempt')
+                   )
+                 ORDER BY request.store_index
+                 LIMIT 1",
+                [observer],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn gate_request_for_owner(&self, owner: &str) -> Result<Option<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -4868,7 +5047,7 @@ impl Store {
     }
 
     pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -4881,22 +5060,22 @@ impl Store {
     }
 
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
     }
 
     pub fn selected_desired_revision(&self, subject: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.revision))
     }
 
     pub fn selected_desired_kind(&self, subject: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.kind))
     }
 
     pub fn selected_desired_origin(&self, subject: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT claims.origin FROM desired
@@ -5009,6 +5188,59 @@ impl Store {
             }
         }
         let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
+        let observer_health_is_current = latest_actual(&transaction, observer)
+            .map_err(internal)?
+            .is_some_and(|actual| {
+                actual.get("state").and_then(Value::as_str) == Some("healthy")
+                    && actual.get("revision").and_then(Value::as_str) == Some(desired_revision)
+                    && actual.get("reason").is_none()
+            });
+        let mut subscription_states = BTreeMap::new();
+        for (subscription_subject, subscription) in &active_subscriptions {
+            let target_exists = if subscription.delivery == "message" {
+                transaction
+                    .query_row(
+                        "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
+                        [&subscription.to],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .is_some()
+            } else {
+                true
+            };
+            let status = if target_exists { "active" } else { "pending" };
+            let current_status = latest_actual(&transaction, subscription_subject)
+                .map_err(internal)?
+                .and_then(|actual| {
+                    actual
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            subscription_states.insert(
+                subscription_subject.clone(),
+                (
+                    target_exists,
+                    status,
+                    current_status.as_deref() != Some(status),
+                ),
+            );
+        }
+        let changed = baseline || !changed_fields.is_empty();
+        let should_record = changed
+            || attempt.is_some()
+            || !observer_health_is_current
+            || subscription_states.values().any(|(_, _, changed)| *changed);
+        if !should_record {
+            return Ok(ResourceObservationOutcome {
+                baseline,
+                changed_fields,
+                observation_claim: None,
+                message_subjects: Vec::new(),
+            });
+        }
         let now = now_ms();
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
@@ -5033,30 +5265,51 @@ impl Store {
             .map_err(internal)?
             .into_iter()
             .collect::<Vec<_>>();
-        let mut observer_fields = json!({
-            "status": "healthy",
-            "revision": desired_revision,
-            "cursor": cursor,
-            "next_check_unix_ms": next_check_unix_ms.to_string(),
-            "changed": baseline || !changed_fields.is_empty(),
-        });
-        if let Some(attempt) = attempt {
-            observer_fields
-                .as_object_mut()
-                .expect("observer fields are an object")
-                .insert("attempt".into(), Value::String(attempt.into()));
+        if !observer_health_is_current {
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                observer,
+                "observer.state",
+                None,
+                &json!({"fields": {
+                    "state": "healthy",
+                    "revision": desired_revision,
+                }}),
+                &observer_predecessors,
+                Some(&batch_id),
+            )
+            .map_err(internal)?;
         }
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            observer,
-            "observer.observed",
-            None,
-            &json!({"fields": observer_fields}),
-            &observer_predecessors,
-            Some(&batch_id),
-        )
-        .map_err(internal)?;
+        if changed || attempt.is_some() {
+            let observer_predecessors = latest_claim_id_tx(&transaction, observer)
+                .map_err(internal)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut observer_fields = json!({
+                "status": "healthy",
+                "revision": desired_revision,
+                "cursor": cursor,
+                "changed": changed,
+            });
+            if let Some(attempt) = attempt {
+                observer_fields
+                    .as_object_mut()
+                    .expect("observer fields are an object")
+                    .insert("attempt".into(), Value::String(attempt.into()));
+            }
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                observer,
+                "observer.observed",
+                None,
+                &json!({"fields": observer_fields}),
+                &observer_predecessors,
+                Some(&batch_id),
+            )
+            .map_err(internal)?;
+        }
         let observation_claim = if baseline || !changed_fields.is_empty() {
             let predecessors = latest_claim_id_tx(&transaction, resource)
                 .map_err(internal)?
@@ -5123,30 +5376,12 @@ impl Store {
             }
         }
         let mut available_subscriptions = BTreeSet::new();
-        for (subscription_subject, subscription) in &active_subscriptions {
-            let target_exists = if subscription.delivery == "message" {
-                transaction
-                    .query_row(
-                        "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
-                        [&subscription.to],
-                        |_| Ok(()),
-                    )
-                    .optional()
-                    .map_err(internal)?
-                    .is_some()
-            } else {
-                true
-            };
-            let status = if target_exists { "active" } else { "pending" };
-            let current_status = latest_actual(&transaction, subscription_subject)
-                .map_err(internal)?
-                .and_then(|actual| {
-                    actual
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            if current_status.as_deref() != Some(status) {
+        for (subscription_subject, _) in &active_subscriptions {
+            let (target_exists, status, status_changed) = subscription_states
+                .get(subscription_subject)
+                .copied()
+                .expect("an active subscription has a computed state");
+            if status_changed {
                 let predecessors = latest_claim_id_tx(&transaction, subscription_subject)
                     .map_err(internal)?
                     .into_iter()
@@ -5227,20 +5462,27 @@ impl Store {
                             .unwrap_or_default()
                     };
                     for (delivery_resource, discovery) in discoveries {
+                        let mut request_fields = json!({
+                            "mission": format!("mission/{mission}"),
+                            "mission_revision": revision,
+                            "resource": delivery_resource,
+                            "resource_input": resource_input,
+                            "workspace": workspace,
+                            "discovery": discovery,
+                        });
+                        if let Some(requester) = subscription.requester.as_deref() {
+                            request_fields
+                                .as_object_mut()
+                                .expect("subscription request fields are an object")
+                                .insert("requester".into(), Value::String(requester.into()));
+                        }
                         append_claim_tx(
                             &transaction,
                             &self.origin,
                             subscription_subject,
                             "subscription.mission-requested",
                             None,
-                            &json!({"fields": {
-                                "mission": format!("mission/{mission}"),
-                                "mission_revision": revision,
-                                "resource": delivery_resource,
-                                "resource_input": resource_input,
-                                "workspace": workspace,
-                                "discovery": discovery,
-                            }, "evidence": evidence}),
+                            &json!({"fields": request_fields, "evidence": evidence}),
                             &[],
                             Some(&batch_id),
                         )
@@ -5297,7 +5539,7 @@ impl Store {
     }
 
     pub fn claims_for(&self, subject: &str, kind: Option<&str>) -> Result<Vec<ClaimRecord>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
                      FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index";
         let mut statement = connection.prepare(query)?;
@@ -5314,7 +5556,7 @@ impl Store {
         descending: bool,
         limit: usize,
     ) -> Result<ClaimsPage> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let order = if descending { "DESC" } else { "ASC" };
         let query = format!(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
@@ -5347,12 +5589,12 @@ impl Store {
     }
 
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         latest_actual(&connection, subject)
     }
 
     pub fn latest_document_hash(&self, name: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT hash FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
@@ -5375,7 +5617,7 @@ impl Store {
         references: &BTreeSet<String>,
         at_index: Option<u64>,
     ) -> Result<BTreeMap<String, String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let current = current_index(&connection)?;
         let selected = selected_index(current, at_index).map_err(anyhow::Error::new)?;
         let mut bindings = BTreeMap::new();
@@ -5398,7 +5640,7 @@ impl Store {
     }
 
     pub fn latest_document_token(&self, name: &str) -> Result<Option<String>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT binding_claim_id FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
@@ -5432,7 +5674,7 @@ impl Store {
 
     pub fn capability(&self, secret: &str, expected_kind: &str) -> Result<Capability, St3Error> {
         let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let capability = connection
             .query_row(
                 "SELECT kind, subject, incarnation_id, expires_at_unix_ms, used FROM capabilities WHERE secret_hash=?1",
@@ -5506,7 +5748,7 @@ impl Store {
     }
 
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row("SELECT bytes FROM blobs WHERE hash=?1", [hash], |row| {
                 row.get(0)
@@ -5571,7 +5813,7 @@ impl Store {
             .take(512)
             .cloned()
             .collect::<Vec<_>>();
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
             let envelope = connection.query_row(
@@ -5903,7 +6145,7 @@ impl Store {
     }
 
     pub fn replica_records(&self, unresolved_only: bool) -> Result<Vec<ReplicaRecordView>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let filter = if unresolved_only {
             " WHERE state IN ('invalid','unknown')"
         } else {
@@ -5960,7 +6202,7 @@ impl Store {
         configured_peers: &[String],
     ) -> Result<ReplicationStatus> {
         let _ = self.replication_inventory()?;
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
                 "SELECT COUNT(*) FROM replica_records WHERE state=?1",
@@ -6036,7 +6278,7 @@ impl Store {
 
     #[cfg(test)]
     pub fn replica_heads(&self) -> Result<BTreeMap<String, u64>> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         replica_heads(&connection)
     }
 
@@ -6045,7 +6287,7 @@ impl Store {
         &self,
         heads: &BTreeMap<String, u64>,
     ) -> Result<ReplicationBatch> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         let mut batches_statement = connection.prepare(
             "SELECT id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms FROM batches
              ORDER BY origin, replica_sequence",
@@ -6099,7 +6341,7 @@ impl Store {
 
     #[cfg(test)]
     pub fn peer_cursor(&self, peer: &str) -> Result<u64> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.readers.get();
         connection
             .query_row(
                 "SELECT MAX(replica_sequence) FROM batches WHERE origin=?1",
@@ -7281,7 +7523,6 @@ fn request_declared_resource_refresh_tx(
             format!("resource `{}` has no active observer", operation.resource),
         ));
     }
-    let now = now_ms();
     let mut claims = Vec::new();
     for (observer, revision) in observers {
         let attempt = hex::encode(Sha256::digest(format!(
@@ -7292,14 +7533,11 @@ fn request_declared_resource_refresh_tx(
             transaction,
             origin,
             &observer,
-            "observer.state",
+            "observer.refresh-requested",
             None,
             &json!({"fields": {
-                "state": "healthy",
-                "reason": "published refresh",
                 "revision": revision,
                 "attempt": attempt,
-                "next_check_unix_ms": now.to_string(),
             }}),
             &[],
             Some(batch_id),
@@ -8899,19 +9137,34 @@ fn latest_actual_at(
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let mut statement = connection.prepare(
-        "SELECT body FROM claims WHERE subject=?1 AND kind!='intent.desired' AND store_index<=?2 ORDER BY store_index",
+        "SELECT kind, body FROM claims WHERE subject=?1 AND kind!='intent.desired' AND store_index<=?2 ORDER BY store_index",
     )?;
     let rows = statement
-        .query_map(params![subject, at_index], |row| row.get::<_, String>(0))?
+        .query_map(params![subject, at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     if rows.is_empty() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
-    for body in rows {
+    let registry = st3_schema::registry();
+    for (kind, body) in rows {
         let value: Value = serde_json::from_str(&body)?;
         let source = value.get("fields").unwrap_or(&value);
         if let Some(fields) = source.as_object() {
+            if registry
+                .claim(&kind)
+                .is_some_and(|spec| spec.cardinality == st3_schema::Cardinality::StateTransition)
+            {
+                for field in registry
+                    .claim(&kind)
+                    .into_iter()
+                    .flat_map(|spec| spec.fields.keys())
+                {
+                    merged.remove(field);
+                }
+            }
             for (key, value) in fields {
                 merged.insert(key.clone(), value.clone());
             }
@@ -12133,15 +12386,283 @@ resource "refresh/file" {
             .unwrap();
 
         let state = store
-            .latest_claim(&observer, Some("observer.state"))
+            .latest_claim(&observer, Some("observer.refresh-requested"))
             .unwrap()
             .unwrap();
-        assert!(
-            state.body["fields"]["next_check_unix_ms"]
-                .as_str()
-                .is_some()
-        );
         assert!(state.body["fields"]["attempt"].as_str().is_some());
+    }
+
+    #[test]
+    fn state_transition_claims_replace_their_previous_fields() {
+        let store = Store::open_memory("node").unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "observer/recovery".into(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("unreachable".into())),
+                    ("reason".into(), Value::String("the provider failed".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "observer/recovery".into(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), Value::String("healthy".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+
+        let actual = store
+            .latest_actual_value("observer/recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual["state"], "healthy");
+        assert!(actual.get("reason").is_none());
+    }
+
+    #[test]
+    fn unchanged_scheduled_observations_do_not_append_claims() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+resource "quiet/file" { kind "filesystem.file" }
+observer "quiet/file" {
+  resource "resource/quiet/file"
+  provider "local.file"
+  locator "/tmp/st3-quiet-file"
+  field "status"
+}
+"#;
+        let intent = crate::graph::parse_execution_intent(source, "node", "quiet-run").unwrap();
+        let observer = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "observer")
+            .unwrap()
+            .subject
+            .clone();
+        let resource = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "resource")
+            .unwrap()
+            .subject
+            .clone();
+        store.apply_internal(&intent, "quiet-observer").unwrap();
+        let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
+        let facts = json!({"status": "ready"});
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                1,
+                &[],
+            )
+            .unwrap();
+        let before = store.index().unwrap();
+
+        let outcome = store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                2,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(store.index().unwrap(), before);
+        assert!(outcome.observation_claim.is_none());
+        assert!(outcome.changed_fields.is_empty());
+    }
+
+    #[test]
+    fn manual_refresh_records_an_unchanged_receipt() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+resource "manual/file" { kind "filesystem.file" }
+observer "manual/file" {
+  resource "resource/manual/file"
+  provider "local.file"
+  locator "/tmp/st3-manual-file"
+  field "status"
+}
+"#;
+        let intent = crate::graph::parse_execution_intent(source, "node", "manual-run").unwrap();
+        let observer = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "observer")
+            .unwrap()
+            .subject
+            .clone();
+        let resource = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "resource")
+            .unwrap()
+            .subject
+            .clone();
+        store.apply_internal(&intent, "manual-observer").unwrap();
+        let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
+        let facts = json!({"status": "ready"});
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                None,
+                &resource,
+                None,
+                &facts,
+                1,
+                &[],
+            )
+            .unwrap();
+
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some("attempt-one"),
+                &resource,
+                Some("cursor-one"),
+                &facts,
+                2,
+                &[],
+            )
+            .unwrap();
+
+        let receipt = store
+            .latest_claim(&observer, Some("observer.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.body["fields"]["attempt"], "attempt-one");
+        assert_eq!(receipt.body["fields"]["changed"], false);
+    }
+
+    #[test]
+    fn observer_refresh_requests_complete_in_order() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+resource "ordered/file" { kind "filesystem.file" }
+observer "ordered/file" {
+  resource "resource/ordered/file"
+  provider "local.file"
+  locator "/tmp/st3-ordered-file"
+  field "status"
+}
+"#;
+        let intent = crate::graph::parse_execution_intent(source, "node", "ordered-run").unwrap();
+        let observer = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "observer")
+            .unwrap()
+            .subject
+            .clone();
+        let resource = intent
+            .subjects
+            .values()
+            .find(|subject| subject.kind == "resource")
+            .unwrap()
+            .subject
+            .clone();
+        store.apply_internal(&intent, "ordered-observer").unwrap();
+        let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
+        for attempt in ["attempt-one", "attempt-two"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: observer.clone(),
+                    kind: "observer.refresh-requested".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("attempt".into(), Value::String(attempt.into())),
+                        ("revision".into(), Value::String(revision.clone())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store.pending_observer_refresh_attempt(&observer).unwrap(),
+            Some("attempt-one".into())
+        );
+
+        store
+            .record_resource_observation(
+                &observer,
+                &revision,
+                Some("attempt-one"),
+                &resource,
+                None,
+                &json!({"status": "ready"}),
+                1,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.pending_observer_refresh_attempt(&observer).unwrap(),
+            Some("attempt-two".into())
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: observer.clone(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("attempt".into(), Value::String("attempt-two".into())),
+                    (
+                        "reason".into(),
+                        Value::String("provider unavailable".into()),
+                    ),
+                    ("revision".into(), Value::String(revision)),
+                    ("state".into(), Value::String("unreachable".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.pending_observer_refresh_attempt(&observer).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn common_reads_do_not_wait_for_the_writer_mutex() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let writer = store.connection.lock().unwrap();
+        let other = store.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            send.send((other.index().unwrap(), other.status(None).unwrap()))
+                .unwrap();
+        });
+
+        let (index, status) = receive
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a common read must not wait for the writer mutex");
+        assert_eq!(index, 0);
+        assert_eq!(status.store_index, 0);
+        drop(writer);
     }
 
     #[test]

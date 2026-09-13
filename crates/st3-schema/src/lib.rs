@@ -1088,13 +1088,22 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &["observer"],
         ),
         (
+            "observer.refresh-requested",
+            &["observer"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("observers"),
+            true,
+            &["refresh"],
+        ),
+        (
             "observer.state",
             &["observer"],
             WritePolicy::SystemOnly,
             Cardinality::StateTransition,
             Some("observers"),
             true,
-            &["observer", "refresh"],
+            &["observer"],
         ),
         (
             "subscription.state",
@@ -1668,6 +1677,10 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("changed_fields", array()),
             ("observation", reference()),
         ],
+        "observer.refresh-requested" => &[
+            ("revision", required_string()),
+            ("attempt", required_string()),
+        ],
         "observer.state" => &[
             (
                 "state",
@@ -1950,6 +1963,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("resource_input", required_string()),
             ("workspace", required_string()),
             ("discovery", required_string()),
+            ("requester", reference_to(&["agent", "person"])),
         ],
         "subscription.mission-started" => &[
             ("request", required_string()),
@@ -2030,6 +2044,12 @@ fn reference() -> FieldSpec {
 fn required_reference_to(families: &[&str]) -> FieldSpec {
     FieldSpec {
         required: true,
+        reference_families: families.iter().map(|family| (*family).into()).collect(),
+        ..reference()
+    }
+}
+fn reference_to(families: &[&str]) -> FieldSpec {
+    FieldSpec {
         reference_families: families.iter().map(|family| (*family).into()).collect(),
         ..reference()
     }
@@ -2189,6 +2209,7 @@ mod tests {
                 "mission.produced",
                 "mission.published",
                 "observer.observed",
+                "observer.refresh-requested",
                 "observer.state",
                 "planning-session.approved",
                 "planning-session.cancelled",

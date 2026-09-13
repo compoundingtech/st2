@@ -207,6 +207,8 @@ pub struct Reconciler<R = NativeRuntime> {
     event_notify: watch::Sender<u64>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     armed_observers: Arc<Mutex<std::collections::HashSet<String>>>,
+    observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
+    observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
     resource_provider: Arc<dyn ResourceProvider>,
@@ -239,6 +241,8 @@ impl Reconciler<NativeRuntime> {
             event_notify,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
+            observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
@@ -259,6 +263,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             event_notify: watch::channel(0_u64).0,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             armed_observers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
+            observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
@@ -2904,13 +2910,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let Some(root) = fields.get("workspace").and_then(Value::as_str) else {
                     continue;
                 };
+                let requester = fields
+                    .get("requester")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("daemon/{}", self.host));
                 let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
                 let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
                 let request_value = MissionRunRequest {
                     mission: mission.into(),
                     revision: Some(revision.into()),
                     workspace,
-                    requester: Some(format!("daemon/{}", self.host)),
+                    requester: Some(requester),
                     mode: None,
                     inputs: BTreeMap::from([(input.into(), format!("{resource}@{discovery}"))]),
                     idempotency_key: format!("subscription-mission:{}", request.id),
@@ -3017,24 +3028,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             let observer_actual = self.store.latest_actual_value(&observer.subject)?;
             let refresh_attempt = self
                 .store
-                .latest_claim(&observer.subject, None)?
-                .filter(|claim| claim.kind == "observer.state")
-                .filter(|claim| {
-                    claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
-                })
-                .and_then(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/attempt")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            let next_check = observer_actual
+                .pending_observer_refresh_attempt(&observer.subject)?;
+            let deadline_key = format!("{}:{revision}", observer.subject);
+            let next_check = refresh_attempt
                 .as_ref()
-                .and_then(|actual| actual.get("next_check_unix_ms"))
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse::<u128>().ok())
-                .unwrap_or_else(now_ms);
+                .map(|_| now_ms())
+                .unwrap_or_else(|| {
+                    self.observer_deadlines
+                        .lock()
+                        .expect("observer deadline mutex poisoned")
+                        .get(&deadline_key)
+                        .copied()
+                        .unwrap_or_else(now_ms)
+                });
             let operation = format!(
                 "{}:{revision}:{next_check}:{}",
                 observer.subject,
@@ -3053,16 +3059,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             let notify = self.notify.clone();
             let event_notify = self.event_notify.clone();
             let armed = self.armed_observers.clone();
+            let deadlines = self.observer_deadlines.clone();
+            let cursors = self.observer_cursors.clone();
             let observer_subject = observer.subject.clone();
             let previous_facts = self
                 .store
                 .latest_actual_value(&spec.resource)?
                 .and_then(|actual| actual.get("facts").cloned());
-            let cursor = observer_actual
-                .as_ref()
-                .and_then(|actual| actual.get("cursor"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let cursor = self
+                .observer_cursors
+                .lock()
+                .expect("observer cursor mutex poisoned")
+                .get(&deadline_key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    observer_actual
+                        .as_ref()
+                        .and_then(|actual| actual.get("cursor"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
@@ -3100,19 +3116,47 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 observation.next_check_unix_ms,
                                 &selected,
                             );
+                            deadlines
+                                .lock()
+                                .expect("observer deadline mutex poisoned")
+                                .insert(deadline_key.clone(), observation.next_check_unix_ms);
+                            cursors
+                                .lock()
+                                .expect("observer cursor mutex poisoned")
+                                .insert(deadline_key.clone(), observation.cursor);
                         }
                         Err(error) => {
+                            let retry_at = now_ms().saturating_add(60_000);
+                            let reason = error.to_string();
+                            deadlines
+                                .lock()
+                                .expect("observer deadline mutex poisoned")
+                                .insert(deadline_key.clone(), retry_at);
+                            let unchanged_failure = store
+                                .latest_actual_value(&observer_subject)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|actual| {
+                                    actual.get("state").and_then(Value::as_str)
+                                        == Some("unreachable")
+                                        && actual.get("reason").and_then(Value::as_str)
+                                            == Some(reason.as_str())
+                                });
+                            if unchanged_failure && refresh_attempt.is_none() {
+                                armed
+                                    .lock()
+                                    .expect("observer mutex poisoned")
+                                    .remove(&operation);
+                                signal_changed(&notify, &event_notify);
+                                return;
+                            }
                             let failure_hash = hex::encode(sha2::Sha256::digest(
-                                format!("{operation}:{error}").as_bytes(),
+                                format!("{operation}:{reason}").as_bytes(),
                             ));
                             let mut fields = BTreeMap::from([
                                 ("state".into(), Value::String("unreachable".into())),
-                                ("reason".into(), Value::String(error.to_string())),
+                                ("reason".into(), Value::String(reason)),
                                 ("revision".into(), Value::String(revision.clone())),
-                                (
-                                    "next_check_unix_ms".into(),
-                                    Value::String(now_ms().saturating_add(60_000).to_string()),
-                                ),
                             ]);
                             if let Some(attempt) = &refresh_attempt {
                                 fields.insert("attempt".into(), Value::String(attempt.clone()));
@@ -8139,7 +8183,12 @@ observer "repo" {{ resource "resource/repo"; provider "github.repository"; locat
 subscription "reviews" {{
   observer "observer/repo"
   on "pull_requests"
-  delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "/tmp/st3-review" }}
+  delivery "mission" {{
+    mission "review@{revision}"
+    resource "source"
+    workspace "/tmp/st3-review"
+    requester "agent/fleet/repository/standing/owner"
+  }}
 }}"#
         );
         apply_source(&store, &source, "repository-watch");
@@ -8236,6 +8285,7 @@ subscription "reviews" {{
         let runs = store.active_mission_runs_for_mission("review").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].revision, revision);
+        assert_eq!(runs[0].requester, "agent/fleet/repository/standing/owner");
         assert_eq!(
             runs[0].inputs["source"].subject.as_deref(),
             Some("resource/repo/pull-request/7")

@@ -600,6 +600,8 @@ pub struct SubscriptionSpec {
     pub resource_input: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<String>,
     pub stopped: bool,
 }
 

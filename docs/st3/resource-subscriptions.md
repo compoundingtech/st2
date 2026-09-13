@@ -113,6 +113,8 @@ st3 resource refresh resource/workspace/config --timeout 30s
 
 The command returns `changed=false` when the provider confirms the same facts. That success adds no resource claim.
 
+The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.
@@ -125,7 +127,11 @@ The daemon records that deadline as a one-shot wake. It does not run a periodic 
 
 Conditional requests use provider cursors such as an ETag. Cursors are local progress state, not resource facts.
 
+The daemon keeps each next-check deadline and cursor in local scheduler memory. A daemon restart performs one immediate observation.
+
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
+
+An unchanged failure creates no new claim. A later success replaces the complete observer health state and clears the old failure reason.
 
 An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
 
@@ -145,11 +151,14 @@ subscription "new-ready-pull-requests" {
     mission "review/pull-request@REVISION"
     resource "pull-request"
     workspace "/work/pull-request-reviews"
+    requester "agent/fleet/repository/standing/owner"
   }
 }
 ```
 
 The repository provider creates one mission request for each newly discovered item. The run input pins that item's exact discovery claim.
+
+An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs its matching `mission-authority` rule.
 
 A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
 
@@ -158,6 +167,8 @@ The GitHub issues endpoint also returns pull requests. The provider removes thos
 The delivery cites the discovery claim. A retry uses the same run. A capacity limit leaves the request pending.
 
 A later observed field change creates one `resource.observed` claim. An unchanged observation creates no resource claim.
+
+A scheduled unchanged observation creates no durable observer claim. A manual refresh creates one `observer.observed` receipt for its exact attempt.
 
 Each subscription that selected a changed field creates one message. Its stable key uses the observation claim and subscription subject.
 

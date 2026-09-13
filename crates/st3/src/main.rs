@@ -3596,10 +3596,7 @@ async fn follow_resource_refresh(
                 urlencoding::encode(claim_id)
             ))
             .await?;
-        if claim.kind != "observer.state"
-            || claim.body.pointer("/fields/reason").and_then(Value::as_str)
-                != Some("published refresh")
-        {
+        if claim.kind != "observer.refresh-requested" {
             continue;
         }
         if let Some(attempt) = claim
