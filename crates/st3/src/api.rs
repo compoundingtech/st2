@@ -789,20 +789,19 @@ async fn replication_receive(
             &request.fleet_id,
             &request.exchange,
         )?;
-        let admission = store
-            .validate_replication_backlog()
-            .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let repairs = store
-            .apply_replication_repairs()
-            .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let needs_projection =
-            replication_receive_needs_projection(receipt.received, admission.changed, repairs);
-        let projected = if needs_projection {
-            store
+        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received) {
+            let admission = store
+                .validate_replication_backlog()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            let repairs = store
+                .apply_replication_repairs()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            let projected = store
                 .project_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            (admission, repairs, projected)
         } else {
-            true
+            (Default::default(), 0, true)
         };
         let changed = projected && (admission.changed || repairs != 0);
         let store_index = store
@@ -824,12 +823,8 @@ async fn replication_receive(
     Ok(Json(response))
 }
 
-fn replication_receive_needs_projection(
-    received: usize,
-    admission_changed: bool,
-    repairs: usize,
-) -> bool {
-    received != 0 || admission_changed || repairs != 0
+fn replication_receive_has_new_data(received: usize) -> bool {
+    received != 0
 }
 
 async fn replication_peer_failure(
@@ -4927,11 +4922,9 @@ mod tests {
     }
 
     #[test]
-    fn replication_heartbeats_do_not_rebuild_the_graph() {
-        assert!(!replication_receive_needs_projection(0, false, 0));
-        assert!(replication_receive_needs_projection(1, false, 0));
-        assert!(replication_receive_needs_projection(0, true, 0));
-        assert!(replication_receive_needs_projection(0, false, 1));
+    fn replication_heartbeats_do_not_process_the_backlog() {
+        assert!(!replication_receive_has_new_data(0));
+        assert!(replication_receive_has_new_data(1));
     }
 
     fn materialize_run_agents(state: &AppState, run: &MissionRunView) {
