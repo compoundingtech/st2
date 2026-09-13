@@ -16,10 +16,10 @@ use uuid::Uuid;
 
 use crate::model::{
     ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
-    DocumentVersion, EventRecord, IntentInput, MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind,
-    MissionOutputView, MissionResponse, MissionRevisionOperation, MissionRunDeclaration,
-    MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
-    NormalizedIntent, PlannedAction, PlanningCandidateView, PlanningPreviewView,
+    DocumentVersion, EventRecord, HumanReviewView, IntentInput, MAX_EVAL_TIMEOUT_MS, MessageView,
+    MissionInputKind, MissionOutputView, MissionResponse, MissionRevisionOperation,
+    MissionRunDeclaration, MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec,
+    MissionState, NormalizedIntent, PlannedAction, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
     ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
     ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
@@ -5064,6 +5064,40 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn pending_human_reviews(&self, reviewer: Option<&str>) -> Result<Vec<HumanReviewView>> {
+        let connection = self.readers.get();
+        let requests = {
+            let mut statement = connection.prepare(
+                "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                        request.kind, request.origin, request.actor, request.body,
+                        request.predecessors, request.accepted_at_unix_ms
+                 FROM claims request
+                 WHERE request.kind='gate.requested'
+                   AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+                   AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM claims result
+                     WHERE result.subject=request.subject
+                       AND result.kind='gate.result'
+                       AND json_extract(result.body, '$.fields.request')=request.id
+                       AND result.actor=json_extract(request.body, '$.fields.reviewer')
+                       AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail')
+                   )
+                 ORDER BY request.store_index",
+            )?;
+            statement
+                .query_map([reviewer], claim_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut reviews = Vec::new();
+        for request in requests {
+            if let Some(review) = current_human_review(&connection, request)? {
+                reviews.push(review);
+            }
+        }
+        Ok(reviews)
+    }
+
     pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         connection
@@ -9409,6 +9443,128 @@ fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
         predecessors: serde_json::from_str(&predecessors).unwrap_or_default(),
         accepted_at_unix_ms: accepted.parse().unwrap_or_default(),
     })
+}
+
+fn current_human_review(
+    connection: &Connection,
+    request: ClaimRecord,
+) -> Result<Option<HumanReviewView>> {
+    let fields = request.body.get("fields").unwrap_or(&request.body);
+    let Some(owner) = fields.get("owner").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(reviewer) = fields.get("reviewer").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(mission_revision) = fields.get("mission_revision").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(step_definition) = fields.get("step_definition").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(attempt) = fields
+        .get("attempt")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return Ok(None);
+    };
+    let (run, step, title) = if owner.starts_with("step-run/") {
+        let step = connection
+            .query_row(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee,
+                        available_to, agentless, title, goals, worker_reported, lease_owner,
+                        lease_incarnation, lease_expires_at_unix_ms, blocked_reason,
+                        not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms,
+                        readiness_epoch, constraints
+                 FROM step_runs WHERE subject=?1",
+                [owner],
+                step_run_from_row,
+            )
+            .optional()?;
+        let Some(step) = step else {
+            return Ok(None);
+        };
+        let run = mission_run_view_tx(
+            connection,
+            step.run.strip_prefix("mission-run/").unwrap_or(&step.run),
+        )
+        .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let current = step.generation == run.generation
+            && mission_revision == run.revision
+            && step_definition == step.definition_hash
+            && attempt == step.attempt
+            && !is_terminal_run_state(&run.status)
+            && !is_terminal_run_state(&step.status);
+        if !current {
+            return Ok(None);
+        }
+        let title = step.title.clone();
+        (run, Some(step.step), title)
+    } else if owner.starts_with("mission-run/") {
+        let run = mission_run_view_tx(
+            connection,
+            owner.strip_prefix("mission-run/").unwrap_or(owner),
+        )
+        .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let current = mission_revision == run.revision
+            && step_definition == run.revision
+            && attempt == 1
+            && !is_terminal_run_state(&run.status);
+        if !current {
+            return Ok(None);
+        }
+        (run, None, None)
+    } else {
+        return Ok(None);
+    };
+    let strings = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(Some(HumanReviewView {
+        operation: fields
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or(&request.subject)
+            .to_owned(),
+        request: request.id,
+        owner: owner.to_owned(),
+        mission: run.mission,
+        mission_run: run.subject,
+        generation: run.generation,
+        step,
+        title,
+        reviewer: reviewer.to_owned(),
+        question: fields
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("Approve this work?")
+            .to_owned(),
+        review_targets: strings("review_targets"),
+        decisions: strings("decisions"),
+        attempt,
+        requested_at_unix_ms: request.accepted_at_unix_ms,
+    }))
+}
+
+fn is_terminal_run_state(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
 }
 
 fn canonical_hash(value: &impl Serialize) -> Result<String> {
@@ -17115,5 +17271,138 @@ mission "queue-revision" state="ready" {{
                 ("two", "pending", Some(3)),
             ]
         );
+    }
+
+    #[test]
+    fn pending_human_reviews_exclude_stale_and_terminal_owners() {
+        let store = Store::open_memory("node").unwrap();
+        let publish = |goal: &str, key: &str| {
+            publish_mission(
+                &store,
+                &format!(
+                    r#"version 2
+mission "review-current" state="ready" revision-cutover="restart-active" {{
+  goal "Review current work."
+  step "approval" {{ goal {goal:?}; agentless }}
+}}"#
+                ),
+                key,
+            )
+        };
+        let first = publish("Review the first revision.", "review-current-first");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: first.id.clone(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "review-current-run".into(),
+            })
+            .unwrap();
+        let first_step = run.steps[0].clone();
+        let add_request = |subject: &str,
+                           owner: &str,
+                           revision: &str,
+                           definition: &str,
+                           attempt: u32,
+                           key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "gate.requested".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("owner".into(), Value::String(owner.into())),
+                        ("reviewer".into(), Value::String("person/nathan".into())),
+                        ("question".into(), Value::String("Approve it?".into())),
+                        ("review_targets".into(), Value::Array(Vec::new())),
+                        (
+                            "decisions".into(),
+                            Value::Array(vec![
+                                Value::String("approved".into()),
+                                Value::String("rejected".into()),
+                            ]),
+                        ),
+                        ("operation".into(), Value::String(subject.into())),
+                        ("mission_revision".into(), Value::String(revision.into())),
+                        ("step_definition".into(), Value::String(definition.into())),
+                        ("attempt".into(), Value::from(attempt)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        add_request(
+            "gate-operation/review-current/old-generation",
+            &first_step.subject,
+            &run.revision,
+            &first_step.definition_hash,
+            first_step.attempt,
+            "old-generation-request",
+        );
+        assert_eq!(store.pending_human_reviews(None).unwrap().len(), 1);
+
+        let second = publish("Review the second revision.", "review-current-second");
+        let revised = store
+            .adopt_mission_revision(
+                &run.id,
+                &second,
+                "person/test",
+                "use the new review step",
+                "review-current-cutover",
+            )
+            .unwrap();
+        assert!(store.pending_human_reviews(None).unwrap().is_empty());
+        let current_step = revised.steps[0].clone();
+
+        add_request(
+            "gate-operation/review-current/bad-definition",
+            &current_step.subject,
+            &revised.revision,
+            "old-definition",
+            current_step.attempt,
+            "bad-definition-request",
+        );
+        add_request(
+            "gate-operation/review-current/bad-attempt",
+            &current_step.subject,
+            &revised.revision,
+            &current_step.definition_hash,
+            current_step.attempt + 1,
+            "bad-attempt-request",
+        );
+        assert!(store.pending_human_reviews(None).unwrap().is_empty());
+
+        add_request(
+            "gate-operation/review-current/terminal-step",
+            &current_step.subject,
+            &revised.revision,
+            &current_step.definition_hash,
+            current_step.attempt,
+            "terminal-step-request",
+        );
+        assert_eq!(store.pending_human_reviews(None).unwrap().len(), 1);
+        store
+            .set_step_state(&current_step.subject, "completed", None)
+            .unwrap();
+        assert!(store.pending_human_reviews(None).unwrap().is_empty());
+
+        add_request(
+            "gate-operation/review-current/terminal",
+            &revised.subject,
+            &revised.revision,
+            &revised.revision,
+            1,
+            "terminal-request",
+        );
+        assert_eq!(store.pending_human_reviews(None).unwrap().len(), 1);
+        store
+            .set_mission_run_state(&revised.id, "cancelled", "normal", None)
+            .unwrap();
+        assert!(store.pending_human_reviews(None).unwrap().is_empty());
     }
 }

@@ -19,15 +19,16 @@ use st3::config::{Config, PeerConfig};
 use st3::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
-    EvalStatus, EventRecord, GateResultRequest, IntentInput, MessageLifecycleRequest,
-    MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
-    MissionResponse, MissionRevisionRequest, MissionRunView, MissionState, PlanningApprovalRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
-    ResourceRefreshView, ResourceWatchView, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, WorkRequest,
+    EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
+    MessageLifecycleRequest, MessageSendRequest, MessageView, MissionOutputView,
+    MissionProductionRequest, MissionRequest, MissionResponse, MissionRevisionRequest,
+    MissionRunView, MissionState, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningSessionView, QuickAgentResponse, ReplicaRecordView,
+    ReplicationRepairRequest, ReplicationStatus, ResourceRefreshView, ResourceWatchView,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, StatusResponse,
+    StepRunView, WorkRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -38,7 +39,8 @@ mod presentation;
 
 use presentation::{
     OutputStyle, follow_snapshot, mission_run_signature, render_generation, render_generations,
-    render_mission_run, render_revision_proposal, render_step_run, render_work_list,
+    render_human_review_list, render_mission_run, render_revision_proposal, render_step_run,
+    render_work_list,
 };
 
 #[derive(Parser)]
@@ -766,6 +768,11 @@ enum SchemaCommand {
 
 #[derive(Subcommand)]
 enum ReviewCommand {
+    /// List pending human gates.
+    Ls {
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
     Approve(ReviewArgs),
     Reject(ReviewArgs),
 }
@@ -960,7 +967,7 @@ struct MessageReferenceArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
-    resource: String,
+    target: String,
     #[arg(long)]
     reason: Option<String>,
     #[arg(long)]
@@ -3911,10 +3918,30 @@ async fn run_schema(client: &Client, command: SchemaCommand, json_output: bool) 
 
 async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) -> Result<()> {
     let (decision, args) = match command {
+        ReviewCommand::Ls { actor } => {
+            let path = actor.as_deref().map_or_else(
+                || "/v1/reviews".to_owned(),
+                |actor| format!("/v1/reviews?reviewer={}", urlencoding::encode(actor)),
+            );
+            let reviews: Vec<HumanReviewView> = client.get(&path).await?;
+            if json_output {
+                return print_value(&reviews, true);
+            }
+            print!(
+                "{}",
+                render_human_review_list(
+                    actor.as_deref(),
+                    &reviews,
+                    OutputStyle::stdout(),
+                    now_ms(),
+                )
+            );
+            return Ok(());
+        }
         ReviewCommand::Approve(args) => ("approved", args),
         ReviewCommand::Reject(args) => ("rejected", args),
     };
-    let path = format!("/v1/reviews/{}", args.resource);
+    let path = format!("/v1/reviews/{}", args.target);
     let response: ClaimRecord = client
         .post(
             &path,
@@ -7142,6 +7169,35 @@ mod tests {
             panic!("the work revise command did not parse");
         };
         assert!(args.print_kdl);
+    }
+
+    #[test]
+    fn review_commands_parse_a_filter_and_an_owner_target() {
+        let list = Cli::try_parse_from(["st3", "review", "ls", "--as", "person/nathan"]).unwrap();
+        let Command::Review {
+            command: ReviewCommand::Ls { actor },
+        } = list.command
+        else {
+            panic!("the review list command did not parse");
+        };
+        assert_eq!(actor.as_deref(), Some("person/nathan"));
+
+        let approve = Cli::try_parse_from([
+            "st3",
+            "review",
+            "approve",
+            "mission-run/release/one",
+            "--actor",
+            "person/nathan",
+        ])
+        .unwrap();
+        let Command::Review {
+            command: ReviewCommand::Approve(args),
+        } = approve.command
+        else {
+            panic!("the review approve command did not parse");
+        };
+        assert_eq!(args.target, "mission-run/release/one");
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ use crate::model::{
     ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, GateResultRequest,
-    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
+    HumanReviewView, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/documents/content", get(get_document))
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/claims/by-id/{id}", get(get_claim))
+        .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
@@ -2519,6 +2520,21 @@ async fn list_claims(
     .map(Json)
 }
 
+#[derive(Default, Deserialize)]
+struct ReviewsQuery {
+    reviewer: Option<String>,
+}
+
+async fn list_reviews(
+    State(state): State<AppState>,
+    Query(query): Query<ReviewsQuery>,
+) -> Result<Json<Vec<HumanReviewView>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.pending_human_reviews(query.reviewer.as_deref()))
+        .await
+        .map(Json)
+}
+
 async fn post_review(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -2530,7 +2546,10 @@ async fn post_review(
             "a review decision must be approved or rejected",
         )));
     }
-    let subject = if subject.starts_with("resource/") || subject.starts_with("step-run/") {
+    let subject = if subject.starts_with("resource/")
+        || subject.starts_with("step-run/")
+        || subject.starts_with("mission-run/")
+    {
         subject
     } else {
         format!("step-run/{subject}")
@@ -2542,55 +2561,25 @@ async fn post_review(
             format!("person/{actor}")
         }
     });
-    let review_request = if subject.starts_with("step-run/") {
-        let review_request = state
+    let review_request = if subject.starts_with("step-run/") || subject.starts_with("mission-run/")
+    {
+        let pending = state
             .store
-            .gate_request_for_owner(&subject)
+            .pending_human_reviews(None)
             .map_err(ApiError::internal)?
+            .into_iter()
+            .find(|review| review.owner == subject)
             .ok_or_else(|| {
                 ApiError::bad(St3Error::new(
                     "review-not-requested",
-                    format!("step run `{subject}` has no pending human review"),
+                    format!("`{subject}` has no pending human review"),
                 ))
             })?;
-        let step = state
+        let review_request = state
             .store
-            .step_run(&subject)
+            .claim_by_id(&pending.request)
             .map_err(ApiError::internal)?
-            .ok_or_else(|| {
-                ApiError::bad(St3Error::new(
-                    "unknown-step-run",
-                    format!("step run `{subject}` does not exist"),
-                ))
-            })?;
-        let run = state
-            .store
-            .mission_run(&step.run)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| {
-                ApiError::internal(format!("mission run `{}` does not exist", step.run))
-            })?;
-        let request_is_current = review_request
-            .body
-            .pointer("/fields/mission_revision")
-            .and_then(Value::as_str)
-            == Some(run.revision.as_str())
-            && review_request
-                .body
-                .pointer("/fields/step_definition")
-                .and_then(Value::as_str)
-                == Some(step.definition_hash.as_str())
-            && review_request
-                .body
-                .pointer("/fields/attempt")
-                .and_then(Value::as_u64)
-                == Some(u64::from(step.attempt));
-        if !request_is_current {
-            return Err(ApiError::bad(St3Error::new(
-                "stale-review-request",
-                "the human review request does not match the current step attempt",
-            )));
-        }
+            .ok_or_else(|| ApiError::internal("the pending review request does not exist"))?;
         let reviewer = review_request
             .body
             .pointer("/fields/reviewer")
@@ -7093,7 +7082,7 @@ version 2
     }
 
     #[tokio::test]
-    async fn a_step_review_decision_binds_to_its_pending_request() {
+    async fn human_review_list_and_decisions_use_exact_current_requests() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
@@ -7133,31 +7122,120 @@ version 2
             })
             .unwrap();
         let step = &run.steps[0];
-        let request = state
+        let request_fields = |owner: String, definition: String, operation: &str| {
+            BTreeMap::from([
+                ("owner".into(), Value::String(owner)),
+                ("reviewer".into(), Value::String("person/nathan".into())),
+                (
+                    "question".into(),
+                    Value::String("Is the candidate ready?".into()),
+                ),
+                (
+                    "review_targets".into(),
+                    Value::Array(vec![
+                        Value::String("resource/review/candidate".into()),
+                        Value::String("doc/review/report@abc".into()),
+                    ]),
+                ),
+                (
+                    "decisions".into(),
+                    Value::Array(vec![
+                        Value::String("approved".into()),
+                        Value::String("rejected".into()),
+                    ]),
+                ),
+                ("operation".into(), Value::String(operation.into())),
+                (
+                    "mission_revision".into(),
+                    Value::String(run.revision.clone()),
+                ),
+                ("step_definition".into(), Value::String(definition)),
+                ("attempt".into(), Value::from(step.attempt)),
+            ])
+        };
+        let step_request = state
             .store
             .append_claim(&ClaimInput {
                 subject: "gate-operation/review-api/approval".into(),
                 kind: "gate.requested".into(),
                 actor: None,
+                fields: request_fields(
+                    step.subject.clone(),
+                    step.definition_hash.clone(),
+                    "gate-operation/review-api/approval",
+                ),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("step-review-request".into()),
+            })
+            .unwrap();
+        let mission_request = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/review-api/mission".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: request_fields(
+                    run.subject.clone(),
+                    run.revision.clone(),
+                    "gate-operation/review-api/mission",
+                ),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("mission-review-request".into()),
+            })
+            .unwrap();
+        let store = state.store.clone();
+        let app = router(state);
+        let (status, listed) = get_request(app.clone(), "/v1/reviews").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        assert_eq!(listed[0]["request"], step_request.id);
+        assert_eq!(listed[0]["owner"], step.subject);
+        assert_eq!(listed[0]["step"], "approval");
+        assert_eq!(listed[0]["review_targets"].as_array().unwrap().len(), 2);
+        assert_eq!(listed[1]["request"], mission_request.id);
+        assert_eq!(listed[1]["owner"], run.subject);
+        assert!(listed[1].get("step").is_none());
+
+        let (status, selected) =
+            get_request(app.clone(), "/v1/reviews?reviewer=person%2Fnathan").await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected.as_array().unwrap().len(), 2);
+
+        let (status, filtered) =
+            get_request(app.clone(), "/v1/reviews?reviewer=person%2Fsomeone-else").await;
+        assert_eq!(status, StatusCode::OK, "{filtered}");
+        assert_eq!(filtered, json!([]));
+
+        store
+            .append_claim(&ClaimInput {
+                subject: step_request.subject.clone(),
+                kind: "gate.result".into(),
+                actor: Some("person/someone-else".into()),
                 fields: BTreeMap::from([
-                    ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/nathan".into())),
-                    (
-                        "mission_revision".into(),
-                        Value::String(run.revision.clone()),
-                    ),
-                    (
-                        "step_definition".into(),
-                        Value::String(step.definition_hash.clone()),
-                    ),
-                    ("attempt".into(), Value::from(step.attempt)),
+                    ("verdict".into(), Value::String("pass".into())),
+                    ("request".into(), Value::String(step_request.id.clone())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
-                idempotency_key: Some("review-request".into()),
+                idempotency_key: Some("wrong-review-result".into()),
             })
             .unwrap();
-        let app = router(state);
+        store
+            .append_claim(&ClaimInput {
+                subject: step_request.subject.clone(),
+                kind: "gate.result".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("unbound-review-result".into()),
+            })
+            .unwrap();
+        let (_, still_pending) = get_request(app.clone(), "/v1/reviews").await;
+        assert_eq!(still_pending.as_array().unwrap().len(), 2);
+
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
                 decision: "approved".into(),
@@ -7169,23 +7247,46 @@ version 2
         };
         let (status, rejected) = json_request(
             app.clone(),
-            &format!("/v1/reviews/{}", step.subject),
+            &format!("/v1/reviews/{}", run.subject),
             body("person/someone-else"),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
         assert_eq!(rejected["code"], "wrong-reviewer");
 
-        let (status, accepted) = json_request(
-            app,
-            &format!("/v1/reviews/{}", step.subject),
+        let (status, accepted_mission) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", run.subject),
             body("person/nathan"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{accepted}");
-        assert_eq!(accepted["body"]["fields"]["request"], request.id);
-        assert_eq!(accepted["body"]["fields"]["verdict"], "pass");
-        assert_eq!(accepted["body"]["evidence"][0], request.id);
+        assert_eq!(status, StatusCode::OK, "{accepted_mission}");
+        assert_eq!(
+            accepted_mission["body"]["fields"]["request"],
+            mission_request.id
+        );
+        assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
+
+        let reject = serde_json::to_value(ReviewRequest {
+            decision: "rejected".into(),
+            reason: Some("the evidence is incomplete".into()),
+            actor: Some("person/nathan".into()),
+            expected_subject: None,
+        })
+        .unwrap();
+        let (status, accepted_step) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", step.subject),
+            reject,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted_step}");
+        assert_eq!(accepted_step["body"]["fields"]["request"], step_request.id);
+        assert_eq!(accepted_step["body"]["fields"]["verdict"], "fail");
+        assert_eq!(accepted_step["body"]["evidence"][0], step_request.id);
+
+        let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
+        assert_eq!(empty, json!([]));
     }
 
     #[tokio::test]

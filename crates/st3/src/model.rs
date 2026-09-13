@@ -969,6 +969,28 @@ pub struct ReviewRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HumanReviewView {
+    pub operation: String,
+    pub request: String,
+    pub owner: String,
+    pub mission: String,
+    pub mission_run: String,
+    pub generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub reviewer: String,
+    pub question: String,
+    #[serde(default)]
+    pub review_targets: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    pub attempt: u32,
+    pub requested_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageSendRequest {
     pub idempotency_key: String,
     pub from: String,

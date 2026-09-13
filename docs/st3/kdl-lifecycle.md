@@ -336,10 +336,15 @@ gate "the operator approves deployment" type="human" {
 The mission pauses at the gate. A later review command records the decision against the exact gate request. Editing and republishing the mission does not forge a decision.
 
 ```sh
-st3 review approve resource/release-decision \
+st3 review ls --as person/operator
+st3 review approve step-run/RELEASE_GENERATION/deploy \
   --actor person/operator \
   --reason "the exact release result is accepted"
 ```
+
+`st3 review ls` lists every pending KDL human gate. The optional `--as` value selects one reviewer.
+
+The decision target is the mission run or step run that owns the gate. The command binds the decision to the exact current request.
 
 ## Cancellation and cleanup
 

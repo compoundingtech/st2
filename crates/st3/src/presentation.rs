@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
 use st3::model::{
-    MissionInputKind, MissionRunView, RevisionCutover, RevisionProposalView, RunGenerationView,
-    StepRunView,
+    HumanReviewView, MissionInputKind, MissionRunView, RevisionCutover, RevisionProposalView,
+    RunGenerationView, StepRunView,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,6 +236,59 @@ pub(crate) fn render_work_list(
     if shown.is_empty() && other.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "{}", style.muted("No ready or active work."));
+    }
+    output
+}
+
+pub(crate) fn render_human_review_list(
+    reviewer: Option<&str>,
+    reviews: &[HumanReviewView],
+    style: OutputStyle,
+    now_unix_ms: u128,
+) -> String {
+    let mut output = String::new();
+    let title = reviewer.map_or_else(
+        || "HUMAN REVIEWS".to_owned(),
+        |reviewer| format!("HUMAN REVIEWS FOR {reviewer}"),
+    );
+    let _ = writeln!(output, "{}", style.heading(title));
+    if reviews.is_empty() {
+        let _ = writeln!(output, "{}", style.muted("No human reviews are waiting."));
+        return output;
+    }
+    let _ = writeln!(output, "{} waiting · oldest first", reviews.len());
+    for review in reviews {
+        let label = review
+            .title
+            .as_deref()
+            .or(review.step.as_deref())
+            .unwrap_or(review.mission.as_str());
+        let _ = writeln!(output);
+        let _ = writeln!(output, "  {} {label}", style.status_value("ready", "?"));
+        let _ = writeln!(output, "    {}", review.question);
+        let _ = write!(output, "    {} · {}", review.mission, review.mission_run);
+        if let Some(step) = &review.step {
+            let _ = write!(output, " · step {step}");
+        }
+        let _ = writeln!(
+            output,
+            " · requested {}",
+            relative_time(review.requested_at_unix_ms, now_unix_ms)
+        );
+        for target in &review.review_targets {
+            let _ = writeln!(output, "    review: {target}");
+        }
+        let _ = writeln!(output, "    owner: {}", review.owner);
+        let _ = writeln!(
+            output,
+            "    approve: st3 review approve {} --actor {}",
+            review.owner, review.reviewer
+        );
+        let _ = writeln!(
+            output,
+            "    reject:  st3 review reject {} --actor {}",
+            review.owner, review.reviewer
+        );
     }
     output
 }
@@ -802,6 +855,56 @@ mod tests {
             updated_at_unix_ms: 2_000,
             steps,
         }
+    }
+
+    fn review(owner: &str, requested_at_unix_ms: u128) -> HumanReviewView {
+        HumanReviewView {
+            operation: "gate-operation/demo/review".into(),
+            request: "claim/review".into(),
+            owner: owner.into(),
+            mission: "mission/release".into(),
+            mission_run: "mission-run/release/one".into(),
+            generation: "run-generation/release/one".into(),
+            step: Some("publish".into()),
+            title: Some("Publish the release".into()),
+            reviewer: "person/nathan".into(),
+            question: "Is the release ready?".into(),
+            review_targets: vec!["doc/release/report@abc".into(), "resource/release".into()],
+            decisions: vec!["approved".into(), "rejected".into()],
+            attempt: 1,
+            requested_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn human_review_list_shows_targets_age_and_decision_commands() {
+        let rendered = render_human_review_list(
+            Some("person/nathan"),
+            &[review("step-run/release/one/publish", 60_000)],
+            OutputStyle::plain(),
+            180_000,
+        );
+        assert!(rendered.contains("HUMAN REVIEWS FOR person/nathan"));
+        assert!(rendered.contains("1 waiting · oldest first"));
+        assert!(rendered.contains("Publish the release"));
+        assert!(rendered.contains("Is the release ready?"));
+        assert!(rendered.contains("requested 2m ago"));
+        assert!(rendered.contains("review: doc/release/report@abc"));
+        assert!(rendered.contains("review: resource/release"));
+        assert!(
+            rendered
+                .contains("st3 review approve step-run/release/one/publish --actor person/nathan")
+        );
+        assert!(
+            rendered
+                .contains("st3 review reject step-run/release/one/publish --actor person/nathan")
+        );
+    }
+
+    #[test]
+    fn human_review_list_has_a_clear_empty_state() {
+        let rendered = render_human_review_list(None, &[], OutputStyle::plain(), 180_000);
+        assert_eq!(rendered, "HUMAN REVIEWS\nNo human reviews are waiting.\n");
     }
 
     #[test]

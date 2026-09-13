@@ -501,6 +501,12 @@ A human gate requires a full `person/...` reviewer. The question and repeated re
 
 st3 creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
 
+`st3 review ls` shows all pending KDL human gates. `st3 review ls --as person/NAME` selects one reviewer.
+
+The human view shows the mission, owner step, question, review targets, age, and exact decision commands. `--json` returns the same current review records as structured data.
+
+The list excludes resolved requests, old generations, changed definitions, old attempts, and terminal owners. A result from a different actor does not resolve a request.
+
 ## Dependencies
 
 `depends-on` is the only step ordering language.

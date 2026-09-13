@@ -64,6 +64,31 @@ st3 work complete "$route" --as "$OWNER" --summary "Nathan must review this resu
 
 human=$(st3 --json mission show "$work_run" | jq -er '.steps[] | select(.step == "human-review") | .subject')
 st3 wait "$human" --for ready --timeout 1m >/dev/null
+review_list_ready=false
+for attempt in $(seq 1 100); do
+  st3 review ls --as person/nathan --json >pending-reviews.json
+  if jq -e --arg owner "$human" 'map(select(.owner == $owner)) | length == 1' pending-reviews.json >/dev/null; then
+    review_list_ready=true
+    break
+  fi
+  sleep 0.1
+done
+[[ "$review_list_ready" == "true" ]]
+jq -e --arg owner "$human" --arg run "$work_run" --arg source "$source_claim" '
+  map(select(.owner == $owner)) as $reviews
+  | $reviews | length == 1
+  and $reviews[0].mission == "mission/eval/review-escalation/work"
+  and $reviews[0].mission_run == $run
+  and $reviews[0].step == "human-review"
+  and $reviews[0].reviewer == "person/nathan"
+  and $reviews[0].question == "Approve human-review?"
+  and $reviews[0].review_targets == [
+    "resource/eval/review-escalation/source@" + $source,
+    "resource/mission-run/" + ($run | sub("^mission-run/"; "")) + "/review"
+  ]
+  and $reviews[0].decisions == ["approved", "rejected"]
+  and $reviews[0].attempt == 1
+' pending-reviews.json >/dev/null
 review_requested=false
 for attempt in $(seq 1 100); do
   if st3 review approve "$human" --actor person/nathan --reason "the model-free review route is correct" >/dev/null 2>&1; then
@@ -74,6 +99,8 @@ for attempt in $(seq 1 100); do
 done
 [[ "$review_requested" == "true" ]]
 st3 wait "$work_run" --for completed --timeout 1m >/dev/null
+st3 review ls --as person/nathan --json \
+  | jq -e --arg owner "$human" 'map(select(.owner == $owner)) | length == 0' >/dev/null
 
 st3 --json work revision generations "$work_run" >generations.json
 jq -e --arg old "$old_generation" --arg new "$new_generation" '
