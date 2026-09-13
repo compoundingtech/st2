@@ -8,7 +8,7 @@
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     # Rust PTY candidate with atomic registry publication and the
     # fleet-observation guarantees required by st2 reconciliation.
-    pty.url = "github:compoundingtech/pty-rust/81090e758bee1d52b07eb46ecea15f17561f4feb";
+    pty.url = "github:compoundingtech/pty-rust/a93b021743c3c50bf37d66655085149082edd8a4";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that `checks.release-integration` drives to prove
