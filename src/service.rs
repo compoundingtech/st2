@@ -1,9 +1,10 @@
-//! `st2 service install|status|uninstall` — install `st2 up` as a **systemd-user** unit so the
-//! supervisor comes back on boot and on crash.
+//! `st2 service install|render-unit|status|uninstall` — manage or render `st2 up` as a
+//! **systemd-user** unit so the supervisor comes back on boot and on crash.
 //!
-//! **Linux-only, by design (the maintainer).** The Mac stays MANUAL — the maintainer runs `st2 up` themselves there
-//! (TCC: a launchd-owned process can't inherit his GUI/keychain trust), so we deliberately do NOT
-//! ship a launchd path like fabric does. On macOS (or anything non-systemd) this bails loud.
+//! **Lifecycle commands are Linux-only, by design (the maintainer).** The Mac stays MANUAL — the
+//! maintainer runs `st2 up` themselves there (TCC: a launchd-owned process can't inherit their
+//! GUI/keychain trust), so we deliberately do NOT ship a launchd path. Read-only rendering works
+//! anywhere because it performs no service-manager operation.
 //!
 //! A service restart is safe because st2 spawns each task in its own transient scope
 //! (`systemd-run --user --scope`, see `isolate.rs`) —
@@ -31,7 +32,7 @@ pub const DEFAULT_MEMORY_MAX_MB: u64 = 1024;
 /// Everything the unit's `ExecStart` needs, resolved from the invoking environment.
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
-    /// Absolute path to the `st2` binary (`env::current_exe()` at install time).
+    /// Absolute path to the invoking `st2` binary (`env::current_exe()`).
     exe: PathBuf,
     /// Absolute catalog (or spec-file) path handed to `st2 up`.
     catalog: PathBuf,
@@ -107,12 +108,48 @@ impl ServiceSpec {
     }
 }
 
-/// Ambient `OTEL_*` variables worth carrying into a unit. Captured at install time because the
-/// systemd user manager has no shell to expand them from.
+/// Ambient `OTEL_*` variables worth carrying into a unit. Captured from the invoking environment
+/// because the systemd user manager has no shell to expand them from.
 pub(crate) fn collect_otel_env() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(key, _)| key.starts_with("OTEL_"))
         .collect()
+}
+
+fn resolve_service_spec(
+    catalog: &Path,
+    host: Option<String>,
+    pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
+    memory_max_mb: u64,
+    catalog_action: &str,
+) -> Result<ServiceSpec> {
+    let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
+    let path = service_path(&exe)?;
+    // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must
+    // exist when the unit is rendered.
+    let catalog = catalog.canonicalize().with_context(|| {
+        format!(
+            "catalog {} does not exist — create it before {catalog_action}",
+            catalog.display()
+        )
+    })?;
+    let pty_root = pty_root
+        .map(|root| {
+            root.canonicalize()
+                .with_context(|| format!("pty root {} does not exist", root.display()))
+        })
+        .transpose()?;
+    ServiceSpec::new(
+        exe,
+        catalog,
+        host,
+        path,
+        pty_root,
+        residency_policy,
+        memory_max_mb,
+        collect_otel_env(),
+    )
 }
 
 /// `st2 service install [--catalog <catalog>] [--host H] [--pty-root PATH]
@@ -124,47 +161,48 @@ pub fn install(
     residency_policy: Option<crate::residency_host::HostPolicy>,
     memory_max_mb: u64,
 ) -> Result<()> {
-    let exe = env::current_exe().context("failed to resolve the current st2 executable")?;
-    let path = service_path(&exe)?;
-    // A systemd unit runs from no shell and no cwd — the catalog MUST be absolute, and it must exist
-    // now (you install the service against an existing catalog, not a future one).
-    let catalog = catalog.canonicalize().with_context(|| {
-        format!(
-            "catalog {} does not exist — create it before installing the service",
-            catalog.display()
-        )
-    })?;
-    let pty_root = pty_root
-        .map(|root| {
-            root.canonicalize()
-                .with_context(|| format!("pty root {} does not exist", root.display()))
-        })
-        .transpose()?;
-    let spec = ServiceSpec::new(
-        exe,
-        &catalog,
+    let spec = resolve_service_spec(
+        catalog,
         host,
-        path,
         pty_root,
         residency_policy,
         memory_max_mb,
-        collect_otel_env(),
+        "installing the service",
     )?;
 
     install_systemd_user(&spec)?;
 
     println!("installed");
-    println!("catalog\t{}", catalog.display());
+    println!("catalog\t{}", spec.catalog.display());
     match &spec.host {
         Some(h) => println!("host\t{h}"),
         None => println!("host\t(auto-detected at runtime)"),
     }
     match &spec.pty_root {
         Some(root) => println!("pty-root\t{}", root.display()),
-        None => println!("pty-root\t{}/pty (catalog default)", catalog.display()),
+        None => println!("pty-root\t{}/pty (catalog default)", spec.catalog.display()),
     }
     println!("memory-max-mb\t{memory_max_mb}");
     Ok(())
+}
+
+/// Render exactly the unit `install` would write for the same invoking environment and options.
+pub fn render_unit(
+    catalog: &Path,
+    host: Option<String>,
+    pty_root: Option<PathBuf>,
+    residency_policy: Option<crate::residency_host::HostPolicy>,
+    memory_max_mb: u64,
+) -> Result<String> {
+    let spec = resolve_service_spec(
+        catalog,
+        host,
+        pty_root,
+        residency_policy,
+        memory_max_mb,
+        "rendering the service unit",
+    )?;
+    Ok(render_systemd_user_unit(&spec))
 }
 
 /// Persist the invoking PATH in the unit, prepending the installed st2 directory when necessary.

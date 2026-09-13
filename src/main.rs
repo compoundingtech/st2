@@ -2831,34 +2831,54 @@ fn context_cmd(cmd: ContextCmd) -> Result<()> {
 }
 
 fn service_cmd(cmd: ServiceCmd) -> Result<()> {
-    match cmd {
-        ServiceCmd::Install {
-            catalog,
-            host,
-            pty_root,
-            residency_idle_after,
-            residency_warm_capacity,
-            memory_max_mb,
-        } => {
-            let catalog = match catalog {
-                Some(c) => c,
-                None => catalog_root_for_env()?,
-            };
-            st2::service::install(
+    enum UnitAction {
+        Install,
+        Render,
+    }
+
+    let (action, args) = match cmd {
+        ServiceCmd::Install(args) => (UnitAction::Install, args),
+        ServiceCmd::RenderUnit(args) => (UnitAction::Render, args),
+        ServiceCmd::Status => return st2::service::status(),
+        ServiceCmd::Uninstall => return st2::service::uninstall(),
+    };
+    let ServiceUnitArgs {
+        catalog,
+        host,
+        pty_root,
+        residency_idle_after,
+        residency_warm_capacity,
+        memory_max_mb,
+    } = args;
+    let catalog = match catalog {
+        Some(catalog) => catalog,
+        None => catalog_root_for_env()?,
+    };
+    let residency_policy =
+        residency_idle_after
+            .zip(residency_warm_capacity)
+            .map(
+                |(idle_after, warm_capacity)| st2::residency_host::HostPolicy {
+                    idle_after,
+                    warm_capacity,
+                },
+            );
+
+    match action {
+        UnitAction::Install => {
+            st2::service::install(&catalog, host, pty_root, residency_policy, memory_max_mb)
+        }
+        UnitAction::Render => {
+            let unit = st2::service::render_unit(
                 &catalog,
                 host,
                 pty_root,
-                residency_idle_after.zip(residency_warm_capacity).map(
-                    |(idle_after, warm_capacity)| st2::residency_host::HostPolicy {
-                        idle_after,
-                        warm_capacity,
-                    },
-                ),
+                residency_policy,
                 memory_max_mb,
-            )
+            )?;
+            print!("{unit}");
+            Ok(())
         }
-        ServiceCmd::Status => st2::service::status(),
-        ServiceCmd::Uninstall => st2::service::uninstall(),
     }
 }
 
