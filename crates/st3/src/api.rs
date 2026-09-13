@@ -795,9 +795,15 @@ async fn replication_receive(
         let repairs = store
             .apply_replication_repairs()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let projected = store
-            .project_replication_backlog()
-            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let needs_projection =
+            replication_receive_needs_projection(receipt.received, admission.changed, repairs);
+        let projected = if needs_projection {
+            store
+                .project_replication_backlog()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?
+        } else {
+            true
+        };
         let changed = projected && (admission.changed || repairs != 0);
         let store_index = store
             .index()
@@ -816,6 +822,14 @@ async fn replication_receive(
             .send_modify(|generation| *generation = generation.saturating_add(1));
     }
     Ok(Json(response))
+}
+
+fn replication_receive_needs_projection(
+    received: usize,
+    admission_changed: bool,
+    repairs: usize,
+) -> bool {
+    received != 0 || admission_changed || repairs != 0
 }
 
 async fn replication_peer_failure(
@@ -4910,6 +4924,14 @@ mod tests {
             fleet_id: None,
             configured_peers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn replication_heartbeats_do_not_rebuild_the_graph() {
+        assert!(!replication_receive_needs_projection(0, false, 0));
+        assert!(replication_receive_needs_projection(1, false, 0));
+        assert!(replication_receive_needs_projection(0, true, 0));
+        assert!(replication_receive_needs_projection(0, false, 1));
     }
 
     fn materialize_run_agents(state: &AppState, run: &MissionRunView) {
