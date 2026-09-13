@@ -36,12 +36,13 @@ use crate::model::{
     MissionRevisionRequest, MissionRunRequest, MissionRunView, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus,
-    ResourceUnwatchRequest, ResourceWatchRequest, ResourceWatchView, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error,
-    StatusResponse, StepRunView, WorkRequest,
+    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationRepairRequest, ReplicationStatus, ResourceUnwatchRequest, ResourceWatchRequest,
+    ResourceWatchView, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest,
 };
 use crate::store::Store;
 
@@ -176,6 +177,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
         .route("/v1/replication/repair", post(repair_replication_record))
+        .route("/v1/internal/replication/export", post(replication_export))
+        .route(
+            "/v1/internal/replication/receive",
+            post(replication_receive),
+        )
+        .route(
+            "/v1/internal/replication/peer-failure",
+            post(replication_peer_failure),
+        )
         .route("/v1/internal/replication-wake", post(replication_wake))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
@@ -747,6 +757,73 @@ async fn repair_replication_record(
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+async fn replication_export(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationExportRequest>,
+) -> Result<Json<ReplicationExportResponse>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || {
+        let exchange = store.export_replication_exchange(&request.fleet_id, &request.inventory)?;
+        Ok(Json(ReplicationExportResponse {
+            exchange,
+            store_index: store.index()?,
+        }))
+    })
+    .await
+}
+
+async fn replication_receive(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationReceiveRequest>,
+) -> Result<Json<ReplicationReceiveResponse>, ApiError> {
+    let store = state.store.clone();
+    let response = blocking_action(move || {
+        let receipt = store.receive_replication_exchange(
+            &request.peer,
+            &request.fleet_id,
+            &request.exchange,
+        )?;
+        let admission = store
+            .validate_replication_backlog()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let repairs = store
+            .apply_replication_repairs()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let projected = store
+            .project_replication_backlog()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        let changed = projected && (admission.changed || repairs != 0);
+        let store_index = store
+            .index()
+            .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        Ok(ReplicationReceiveResponse {
+            receipt,
+            changed,
+            store_index,
+        })
+    })
+    .await?;
+    if response.changed {
+        state.notify.notify_one();
+        state
+            .event_notify
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+    }
+    Ok(Json(response))
+}
+
+async fn replication_peer_failure(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationPeerFailureRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || {
+        store.record_peer_failure(&request.peer, &request.status, &request.error)?;
+        Ok(Json(json!({ "recorded": true })))
+    })
+    .await
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

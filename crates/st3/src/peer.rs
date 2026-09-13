@@ -21,7 +21,12 @@ use tokio::sync::watch;
 
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
-use crate::model::{ApiResponse, ReplicationExchange, ReplicationInventory};
+use crate::model::{
+    ApiResponse, ReplicationExchange, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationInventory, ReplicationPeerFailureRequest, ReplicationReceiveRequest,
+    ReplicationReceiveResponse,
+};
+#[cfg(test)]
 use crate::store::Store;
 
 const PROTOCOL: &str = "st3-replication-v1";
@@ -203,12 +208,102 @@ fn headers(
 
 #[derive(Clone)]
 struct PeerState {
-    store: Arc<Store>,
+    backend: PeerBackend,
     node: String,
     auth: FleetAuth,
     peers: BTreeSet<String>,
     main_socket: PathBuf,
     outbound_notify: watch::Sender<u64>,
+}
+
+#[derive(Clone)]
+enum PeerBackend {
+    Main(Client),
+    #[cfg(test)]
+    Local(Arc<Store>),
+}
+
+impl PeerBackend {
+    async fn export(
+        &self,
+        fleet_id: &str,
+        inventory: &ReplicationInventory,
+    ) -> Result<ReplicationExportResponse> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/export",
+                        &ReplicationExportRequest {
+                            fleet_id: fleet_id.to_owned(),
+                            inventory: inventory.clone(),
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => Ok(ReplicationExportResponse {
+                exchange: store.export_replication_exchange(fleet_id, inventory)?,
+                store_index: store.index()?,
+            }),
+        }
+    }
+
+    async fn receive(
+        &self,
+        peer: &str,
+        fleet_id: &str,
+        exchange: &ReplicationExchange,
+    ) -> Result<ReplicationReceiveResponse> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/receive",
+                        &ReplicationReceiveRequest {
+                            peer: peer.to_owned(),
+                            fleet_id: fleet_id.to_owned(),
+                            exchange: exchange.clone(),
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => {
+                let receipt = store
+                    .receive_replication_exchange(peer, fleet_id, exchange)
+                    .map_err(anyhow::Error::msg)?;
+                let admission = store.validate_replication_backlog()?;
+                let repairs = store.apply_replication_repairs()?;
+                let projected = store.project_replication_backlog()?;
+                Ok(ReplicationReceiveResponse {
+                    receipt,
+                    changed: projected && (admission.changed || repairs != 0),
+                    store_index: store.index()?,
+                })
+            }
+        }
+    }
+
+    async fn record_failure(&self, peer: &str, status: &str, error: &str) -> Result<()> {
+        match self {
+            Self::Main(client) => {
+                let _: serde_json::Value = client
+                    .post(
+                        "/v1/internal/replication/peer-failure",
+                        &ReplicationPeerFailureRequest {
+                            peer: peer.to_owned(),
+                            status: status.to_owned(),
+                            error: error.to_owned(),
+                        },
+                    )
+                    .await?;
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.record_peer_failure(peer, status, error),
+        }
+    }
 }
 
 pub async fn run_worker(config: Config) -> Result<()> {
@@ -227,11 +322,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         .context("the replication worker needs peer_listen")?;
     let auth = FleetAuth::load(fleet_id, secret_file)?;
     wait_for_main_daemon(&config.socket).await;
-    let store = Arc::new(Store::open(
-        &config.state_dir.join("claims.sqlite3"),
-        &config.node,
-    )?);
-    store.bind_fleet(fleet_id)?;
+    let backend = PeerBackend::Main(Client::unix(config.socket.clone()));
     let (notify, _notify_receiver) = watch::channel(0_u64);
     let wake_file = config.state_dir.join("replication.wake");
     if !wake_file.exists() {
@@ -246,7 +337,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         })?;
     database_watcher.watch(&wake_file, notify::RecursiveMode::NonRecursive)?;
     let state = PeerState {
-        store: store.clone(),
+        backend: backend.clone(),
         node: config.node.clone(),
         auth: auth.clone(),
         peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
@@ -254,7 +345,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         outbound_notify: notify.clone(),
     };
     start_outbound(
-        store,
+        backend,
         config.node.clone(),
         config.peers,
         auth,
@@ -282,7 +373,7 @@ async fn wait_for_main_daemon(socket: &Path) {
 }
 
 fn start_outbound(
-    store: Arc<Store>,
+    backend: PeerBackend,
     node: String,
     peers: Vec<PeerConfig>,
     auth: FleetAuth,
@@ -290,7 +381,7 @@ fn start_outbound(
     notify: watch::Sender<u64>,
 ) {
     for peer in peers {
-        let store = store.clone();
+        let backend = backend.clone();
         let node = node.clone();
         let auth = auth.clone();
         let main_socket = main_socket.clone();
@@ -298,7 +389,7 @@ fn start_outbound(
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match exchange(&store, &node, &peer, &auth, &main_socket).await {
+                match exchange(&backend, &node, &peer, &auth, &main_socket).await {
                     Ok(_) => {
                         backoff = Duration::from_secs(1);
                         tokio::select! {
@@ -314,7 +405,9 @@ fn start_outbound(
                         } else {
                             "down"
                         };
-                        let _ = store.record_peer_failure(&peer.name, status, &error.to_string());
+                        let _ = backend
+                            .record_failure(&peer.name, status, &error.to_string())
+                            .await;
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                     }
@@ -347,33 +440,39 @@ async fn receive_exchange(
         anyhow::ensure!(state.peers.contains(&relay), "the peer is not configured");
         let request: ReplicationExchange =
             serde_json::from_slice(&body).context("decode the replication exchange")?;
-        let receipt = state
-            .store
-            .receive_replication_exchange(&relay, state.auth.fleet_id(), &request)?;
-        let admission = state.store.validate_replication_backlog()?;
-        state.store.apply_replication_repairs()?;
-        if admission.changed {
+        let received = state
+            .backend
+            .receive(&relay, state.auth.fleet_id(), &request)
+            .await?;
+        if received.changed {
             wake_main(&state.main_socket).await;
         }
-        if receipt.received != 0 {
+        if received.receipt.received != 0 {
             state
                 .outbound_notify
                 .send_modify(|generation| *generation = generation.saturating_add(1));
         }
         let response = state
-            .store
-            .export_replication_exchange(state.auth.fleet_id(), &request.inventory)?;
-        signed_response(&state, &request_digest, response)
+            .backend
+            .export(state.auth.fleet_id(), &request.inventory)
+            .await?;
+        signed_response(
+            &state,
+            &request_digest,
+            response.store_index,
+            response.exchange,
+        )
     }
     .await;
     match result {
         Ok(response) => response,
         Err(error) => {
             let message = format!("replication request failed: {error:#}");
-            let _ = state.store.record_peer_failure(&relay, "down", &message);
+            let _ = state.backend.record_failure(&relay, "down", &message).await;
             signed_error_response(
                 &state,
                 &request_digest,
+                0,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &message,
             )
@@ -385,13 +484,14 @@ async fn receive_exchange(
 fn signed_response<T: Serialize>(
     state: &PeerState,
     request_digest: &str,
+    store_index: u64,
     value: T,
 ) -> Result<Response> {
     let envelope = ApiResponse {
         api_version: "st3.v1".into(),
         request_id: uuid::Uuid::now_v7().to_string(),
         snapshot_host: state.node.clone(),
-        store_index: state.store.index()?,
+        store_index,
         value,
     };
     let body = serde_json::to_vec(&envelope)?;
@@ -409,6 +509,7 @@ fn signed_response<T: Serialize>(
 fn signed_error_response(
     state: &PeerState,
     request_digest: &str,
+    store_index: u64,
     status: StatusCode,
     message: &str,
 ) -> Result<Response> {
@@ -416,7 +517,7 @@ fn signed_error_response(
         api_version: "st3.v1".into(),
         request_id: uuid::Uuid::now_v7().to_string(),
         snapshot_host: state.node.clone(),
-        store_index: state.store.index()?,
+        store_index,
         value: serde_json::json!({
             "code": "replication-request-failed",
             "message": message,
@@ -435,34 +536,39 @@ fn signed_error_response(
 }
 
 async fn exchange(
-    store: &Store,
+    backend: &PeerBackend,
     node: &str,
     peer: &PeerConfig,
     auth: &FleetAuth,
     main_socket: &Path,
 ) -> Result<bool> {
-    let first =
-        store.export_replication_exchange(auth.fleet_id(), &ReplicationInventory::default())?;
+    let first = backend
+        .export(auth.fleet_id(), &ReplicationInventory::default())
+        .await?
+        .exchange;
     let query = ReplicationExchange {
         envelopes: Vec::new(),
         ..first
     };
     let remote = post_signed(peer, node, auth, &query).await?;
     let pulled = !remote.envelopes.is_empty();
-    store.receive_replication_exchange(&peer.name, auth.fleet_id(), &remote)?;
-    let admission = store.validate_replication_backlog()?;
-    store.apply_replication_repairs()?;
-    if admission.changed {
+    let received = backend
+        .receive(&peer.name, auth.fleet_id(), &remote)
+        .await?;
+    if received.changed {
         wake_main(main_socket).await;
     }
-    let push = store.export_replication_exchange(auth.fleet_id(), &remote.inventory)?;
+    let push = backend
+        .export(auth.fleet_id(), &remote.inventory)
+        .await?
+        .exchange;
     let pushed = !push.envelopes.is_empty();
     if pushed {
         let response = post_signed(peer, node, auth, &push).await?;
-        store.receive_replication_exchange(&peer.name, auth.fleet_id(), &response)?;
-        let admission = store.validate_replication_backlog()?;
-        store.apply_replication_repairs()?;
-        if admission.changed {
+        let received = backend
+            .receive(&peer.name, auth.fleet_id(), &response)
+            .await?;
+        if received.changed {
             wake_main(main_socket).await;
         }
     }
@@ -613,7 +719,7 @@ mod tests {
         let request_digest = FleetAuth::body_digest(&body);
         let response = receive_exchange(
             State(PeerState {
-                store: Arc::new(Store::open_memory("target").unwrap()),
+                backend: PeerBackend::Local(Arc::new(Store::open_memory("target").unwrap())),
                 node: "target".into(),
                 auth: auth.clone(),
                 peers: BTreeSet::from(["source".into()]),
@@ -642,7 +748,7 @@ mod tests {
     async fn signed_peer_exchange_moves_new_authority_in_both_directions() {
         let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
         let auth = FleetAuth::test(fleet, &[6; 32]);
-        let source = Store::open_memory("source").unwrap();
+        let source = Arc::new(Store::open_memory("source").unwrap());
         let target = Arc::new(Store::open_memory("target").unwrap());
         source.bind_fleet(fleet).unwrap();
         target.bind_fleet(fleet).unwrap();
@@ -661,7 +767,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = PeerState {
-            store: target.clone(),
+            backend: PeerBackend::Local(target.clone()),
             node: "target".into(),
             auth: auth.clone(),
             peers: BTreeSet::from(["source".into()]),
@@ -682,7 +788,7 @@ mod tests {
             url: format!("http://{address}"),
         };
         exchange(
-            &source,
+            &PeerBackend::Local(source.clone()),
             "source",
             &peer,
             &auth,
@@ -709,7 +815,7 @@ mod tests {
             })
             .unwrap();
         exchange(
-            &source,
+            &PeerBackend::Local(source.clone()),
             "source",
             &peer,
             &auth,
@@ -728,6 +834,73 @@ mod tests {
         assert_eq!(
             source_status.authority_digest,
             target_status.authority_digest
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_worker_uses_the_main_daemon_as_the_only_database_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "target").unwrap());
+        store.bind_fleet(fleet).unwrap();
+        let app = crate::api::router(crate::api::AppState {
+            store: store.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "target".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            fleet_id: Some(fleet.into()),
+            configured_peers: vec!["source".into()],
+        });
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "the main daemon socket did not start");
+
+        let source = Store::open_memory("source").unwrap();
+        source.bind_fleet(fleet).unwrap();
+        source
+            .append_claim(&ClaimInput {
+                subject: "host/source".into(),
+                kind: "transport.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("source-up".into()),
+            })
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        let backend = PeerBackend::Main(Client::unix(socket));
+        let received = backend.receive("source", fleet, &exchange).await.unwrap();
+        assert!(received.changed);
+        assert!(received.receipt.received > 0);
+        let exported = backend
+            .export(fleet, &ReplicationInventory::default())
+            .await
+            .unwrap();
+        assert!(!exported.exchange.inventory.envelopes.is_empty());
+        backend
+            .record_failure("source", "down", "test outage")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .latest_claim("host/source", Some("transport.observed"))
+                .unwrap()
+                .is_some()
         );
         server.abort();
     }
@@ -757,7 +930,7 @@ mod tests {
         let body = Bytes::from(serde_json::to_vec(&exchange).unwrap());
         let (outbound_notify, mut outbound_wake) = watch::channel(0_u64);
         let state = PeerState {
-            store: target,
+            backend: PeerBackend::Local(target),
             node: "target".into(),
             auth: auth.clone(),
             peers: BTreeSet::from(["source".into()]),

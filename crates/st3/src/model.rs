@@ -1387,6 +1387,39 @@ pub struct ReplicationReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationExportRequest {
+    pub fleet_id: String,
+    pub inventory: ReplicationInventory,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationExportResponse {
+    pub exchange: ReplicationExchange,
+    pub store_index: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationReceiveRequest {
+    pub peer: String,
+    pub fleet_id: String,
+    pub exchange: ReplicationExchange,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationReceiveResponse {
+    pub receipt: ReplicationReceipt,
+    pub changed: bool,
+    pub store_index: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationPeerFailureRequest {
+    pub peer: String,
+    pub status: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicaRecordView {
     pub record_ref: String,
     pub writer: String,
