@@ -991,6 +991,74 @@ pub struct HumanReviewView {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionActionView {
+    pub label: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionItemView {
+    pub kind: String,
+    pub subject: String,
+    pub person: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    pub requested_at_unix_ms: u128,
+    #[serde(default)]
+    pub actions: Vec<AttentionActionView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionRequest {
+    pub reviewer: String,
+    pub title: String,
+    pub reason: String,
+    pub severity: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionResolveRequest {
+    pub outcome: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttentionRequestView {
+    pub subject: String,
+    pub request: String,
+    pub reviewer: String,
+    pub title: String,
+    pub reason: String,
+    pub severity: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    pub actor: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_reason: Option<String>,
+    pub requested_at_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<u128>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageSendRequest {
     pub idempotency_key: String,
     pub from: String,

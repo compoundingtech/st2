@@ -517,6 +517,12 @@ fn build_registry() -> Registry {
             false,
         ),
         (
+            "attention",
+            "attention/ID",
+            "An explicit request for human attention.",
+            true,
+        ),
+        (
             "custom",
             "custom/NAMESPACE/NAME",
             "An extension subject.",
@@ -835,6 +841,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::StateTransition,
             Some("agents"),
+            false,
+            &[],
+        ),
+        (
+            "attention.requested",
+            &["attention"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Once,
+            Some("attention"),
+            false,
+            &[],
+        ),
+        (
+            "attention.resolved",
+            &["attention"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Once,
+            Some("attention"),
             false,
             &[],
         ),
@@ -1506,6 +1530,18 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
         "agent.account" => &[("account", required_reference_to(&["account"]))],
+        "attention.requested" => &[
+            ("reviewer", required_reference_to(&["person"])),
+            ("title", required_string()),
+            ("reason", required_string()),
+            ("severity", required_enum(&["warning", "error"])),
+            ("targets", array()),
+        ],
+        "attention.resolved" => &[
+            ("request", required_string()),
+            ("outcome", required_enum(&["resolved", "dismissed"])),
+            ("reason", string()),
+        ],
         "intent.desired" => &[
             ("kind", string()),
             ("revision", string()),
@@ -2137,6 +2173,7 @@ mod tests {
             [
                 "account",
                 "agent",
+                "attention",
                 "custom",
                 "daemon",
                 "doc",
@@ -2187,6 +2224,8 @@ mod tests {
             [
                 "agent.account",
                 "agent.presence",
+                "attention.requested",
+                "attention.resolved",
                 "daemon.diagnostic",
                 "daemon.started",
                 "doc.bound",
@@ -2407,6 +2446,8 @@ mod tests {
                 .map(|claim| claim.kind.as_str())
                 .collect::<Vec<_>>(),
             [
+                "attention.requested",
+                "attention.resolved",
                 "message.closed",
                 "message.read",
                 "planning-session.candidate-submitted",

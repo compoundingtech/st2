@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `56478e4e620e909fa26a636a51e8181e58343ff4aeecee7d5824020b5dd44153`
+Digest: `71a70255d50ac0dc6b430fc3eb8cf3f18b135278bda5de411e41412ad85b5a35`
 
 ## Subject families
 
@@ -11,6 +11,7 @@ Digest: `56478e4e620e909fa26a636a51e8181e58343ff4aeecee7d5824020b5dd44153`
 |---|---|---:|---|
 | `account` | `account/NAME` | no | An external provider account identity. |
 | `agent` | `agent/RUN/LOCAL_ID` | no | A mission-run agent runtime. |
+| `attention` | `attention/ID` | yes | An explicit request for human attention. |
 | `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
@@ -56,6 +57,8 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 |---|---|---|---|---|---|
 | `agent.account` | `agent` | `same-subject-actor` | `state-transition` | `account!:subject-reference(account)` |  |
 | `agent.presence` | `agent` | `same-subject-actor` | `append` | `presence!:string`, `reachability:string`, `reason:string` |  |
+| `attention.requested` | `attention` | `authorized-participant` | `once` | `reason!:string`, `reviewer!:subject-reference(person)`, `severity!:string`, `targets:array`, `title!:string` |  |
+| `attention.resolved` | `attention` | `authorized-participant` | `once` | `outcome!:string`, `reason:string`, `request!:string` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
 | `daemon.started` | `daemon` | `system-only` | `append` | `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
 | `doc.bound` | `doc` | `authorized-requester` | `append` | `executable:boolean`, `hash:string`, `name:string`, `size:integer` | `doc` |

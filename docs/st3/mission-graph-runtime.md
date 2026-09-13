@@ -507,6 +507,22 @@ The human view shows the mission, owner step, question, review targets, age, and
 
 The list excludes resolved requests, old generations, changed definitions, old attempts, and terminal owners. A result from a different actor does not resolve a request.
 
+### Human attention inbox
+
+`st3 attention ls` combines every current item that needs a person. It includes human gates, planning approvals, revision approvals, unread person messages, and explicit fault requests.
+
+`st3 attention ls --as person/NAME` selects one person. `--json` returns typed records and exact action argument arrays.
+
+The formatted view shows each item in oldest-first order. It includes the item kind, age, graph context, targets, and safe commands.
+
+A planning item appears only for the current valid preview. A preview with blockers does not appear. A revision item appears once for each reviewer who has not approved it.
+
+A person message remains until its `message.read` claim. Reading a sent message records delivery first. Archiving is separate and is not required to clear attention.
+
+An explicit fault uses the `attention/ID` subject family. `attention.requested` stores the reviewer, title, reason, severity, and optional targets. `attention.resolved` records a `resolved` or `dismissed` outcome.
+
+Only dedicated attention commands create these fault requests. The runtime does not convert every diagnostic into human work.
+
 ## Dependencies
 
 `depends-on` is the only step ordering language.
@@ -1100,7 +1116,7 @@ Mission execution uses these important claim kinds:
 - `step-run.carried`, `step-run.state`, and `step-run.retried` record generation-specific step history.
 - `mission.produced` binds a generated mission to one producing attempt.
 - `gate.requested` and `gate.result` record gate operations and evidence.
-- `gate.requested` and `gate.result` record exact human gates.
+- `attention.requested` and `attention.resolved` record explicit human fault attention.
 
 Evidence is a list of claim IDs or immutable graph references that support a result. The evidence does not replace the gate. The gate definition says what must be decided; evidence records why the result is trustworthy.
 

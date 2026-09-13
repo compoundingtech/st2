@@ -346,6 +346,53 @@ st3 review approve step-run/RELEASE_GENERATION/deploy \
 
 The decision target is the mission run or step run that owns the gate. The command binds the decision to the exact current request.
 
+## Human attention
+
+`st3 attention ls` is the complete human inbox. It includes these current items:
+
+- pending human gates;
+- planning previews that have no blockers;
+- pending mission revision approvals;
+- unread messages to a person;
+- explicit fault attention requests.
+
+```sh
+st3 attention ls --as person/operator
+st3 attention ls --as person/operator --json
+```
+
+The formatted view shows each item with its age, graph context, targets, and exact action commands. The JSON view returns the same items as structured data. The list uses oldest-first order across all item kinds.
+
+`st3 review ls` remains the narrow view for KDL human gates. Use `st3 attention ls` when a person wants all current work that needs a decision or reading.
+
+A message leaves attention when the person reads it. Reading a sent message records delivery before the read. The person does not need to archive it. A blocked planning preview does not enter attention.
+
+The runtime does not infer a fault request from ordinary diagnostics. A component creates one explicit request when it needs a person:
+
+```sh
+st3 attention request \
+  --for person/operator \
+  --title "The deployment needs recovery" \
+  --reason "The automatic rollback could not restore the service." \
+  --severity error \
+  --target mission-run/release/demo \
+  --as agent/release/operator \
+  --idempotency-key release-demo-recovery
+```
+
+The idempotency key gives one stable `attention/ID` subject. A retry with the same key returns the same request.
+
+Only the selected person can close the request. The person records whether the fault was resolved or dismissed:
+
+```sh
+st3 attention resolve attention/REQUEST_ID \
+  --outcome resolved \
+  --reason "The service is healthy after the manual rollback." \
+  --as person/operator
+```
+
+An attention request can target any registered graph subject. It does not change that subject or its lifecycle.
+
 ## Cancellation and cleanup
 
 Cancellation is explicit and additive. Omission never cancels a run.

@@ -28,7 +28,8 @@ use tower::ServiceExt as _;
 use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
 use crate::model::{
-    ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
+    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
+    AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentPutRequest, DocumentVersion,
     EvalStartRequest, EvalStartResponse, EvalStatus, EventRecord, GateResultRequest,
     HumanReviewView, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessageSendRequest, MessageView,
@@ -167,6 +168,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
+        .route("/v1/attention", get(list_attention).post(request_attention))
+        .route("/v1/attention/resolve/{*subject}", post(resolve_attention))
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/close/{*subject}", post(close_message))
@@ -790,7 +793,8 @@ async fn replication_receive(
             &request.fleet_id,
             &request.exchange,
         )?;
-        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received) {
+        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received)
+        {
             let admission = store
                 .validate_replication_backlog()
                 .map_err(|error| St3Error::new("internal", error.to_string()))?;
@@ -2533,6 +2537,64 @@ async fn list_reviews(
     blocking_store(move || store.pending_human_reviews(query.reviewer.as_deref()))
         .await
         .map(Json)
+}
+
+#[derive(Default, Deserialize)]
+struct AttentionQuery {
+    person: Option<String>,
+}
+
+async fn list_attention(
+    State(state): State<AppState>,
+    Query(query): Query<AttentionQuery>,
+) -> Result<Json<Vec<AttentionItemView>>, ApiError> {
+    let person = query.person.map(|person| {
+        if person.contains('/') {
+            person
+        } else {
+            format!("person/{person}")
+        }
+    });
+    if person
+        .as_deref()
+        .is_some_and(|person| !person.starts_with("person/"))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-attention-person",
+            "an attention filter must name a person subject",
+        )));
+    }
+    let store = state.store.clone();
+    blocking_store(move || store.attention_items(person.as_deref()))
+        .await
+        .map(Json)
+}
+
+async fn request_attention(
+    State(state): State<AppState>,
+    Json(request): Json<AttentionRequest>,
+) -> Result<Json<AttentionRequestView>, ApiError> {
+    let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
+    let subject = format!("attention/{}", &id[..32]);
+    let response = state
+        .store
+        .request_attention(&subject, &request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
+}
+
+async fn resolve_attention(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+    Json(request): Json<AttentionResolveRequest>,
+) -> Result<Json<AttentionRequestView>, ApiError> {
+    let response = state
+        .store
+        .resolve_attention(&subject, &request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
 }
 
 async fn post_review(
@@ -5573,6 +5635,13 @@ version 2
                 .unwrap()
                 .contains("mission/planned/work")
         );
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        assert_eq!(attention.as_array().unwrap().len(), 1);
+        assert_eq!(attention[0]["kind"], "planning-approval");
+        assert_eq!(
+            attention[0]["subject"],
+            format!("planning-session/{session}")
+        );
 
         let (status, revised) = json_request(
             app.clone(),
@@ -5589,6 +5658,8 @@ version 2
         assert_eq!(revised["status"], "revision-requested");
         assert!(revised.get("preview").is_none());
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        assert_eq!(attention, json!([]));
 
         let second = br#"
 version 2
@@ -5631,6 +5702,9 @@ version 2
         assert_eq!(status, StatusCode::OK, "{previewed}");
         let current_hash = previewed["preview"]["hash"].as_str().unwrap().to_owned();
         assert_ne!(current_hash, first_hash);
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        assert_eq!(attention.as_array().unwrap().len(), 1);
+        assert_eq!(attention[0]["kind"], "planning-approval");
 
         let (status, unauthorized) = json_request(
             app.clone(),
@@ -5685,6 +5759,8 @@ version 2
         assert_eq!(active[0].phase, "cleanup-cancelled");
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        assert_eq!(attention, json!([]));
 
         let documents = store
             .latest_claim(
@@ -7202,6 +7278,17 @@ version 2
             get_request(app.clone(), "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 2);
+        let (status, attention) =
+            get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+        assert_eq!(status, StatusCode::OK, "{attention}");
+        assert_eq!(attention.as_array().unwrap().len(), 2);
+        assert!(
+            attention
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["kind"] == "human-gate")
+        );
 
         let (status, filtered) =
             get_request(app.clone(), "/v1/reviews?reviewer=person%2Fsomeone-else").await;
@@ -7286,6 +7373,69 @@ version 2
         assert_eq!(accepted_step["body"]["evidence"][0], step_request.id);
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
+        assert_eq!(empty, json!([]));
+    }
+
+    #[tokio::test]
+    async fn attention_routes_request_filter_and_resolve_one_fault() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let request = serde_json::to_value(AttentionRequest {
+            reviewer: "nathan".into(),
+            title: "Fabric needs review".into(),
+            reason: "The queue did not recover.".into(),
+            severity: "error".into(),
+            targets: vec!["resource/fabric/queue".into()],
+            actor: "agent/fabric/worker".into(),
+            idempotency_key: "api-attention-fabric".into(),
+        })
+        .unwrap();
+        let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["reviewer"], "person/nathan");
+        assert_eq!(created["status"], "pending");
+
+        let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        assert_eq!(selected.as_array().unwrap().len(), 1);
+        assert_eq!(selected[0]["kind"], "fault");
+        let (_, filtered) =
+            get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
+        assert_eq!(filtered, json!([]));
+
+        let subject = created["subject"].as_str().unwrap();
+        let wrong = serde_json::to_value(AttentionResolveRequest {
+            outcome: "resolved".into(),
+            reason: None,
+            actor: "person/someone-else".into(),
+            idempotency_key: "api-attention-wrong".into(),
+        })
+        .unwrap();
+        let (status, rejected) = json_request(
+            app.clone(),
+            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
+            wrong,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["code"], "wrong-attention-reviewer");
+
+        let resolution = serde_json::to_value(AttentionResolveRequest {
+            outcome: "resolved".into(),
+            reason: Some("The queue recovered.".into()),
+            actor: "person/nathan".into(),
+            idempotency_key: "api-attention-resolve".into(),
+        })
+        .unwrap();
+        let (status, resolved) = json_request(
+            app.clone(),
+            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
+            resolution,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resolved}");
+        assert_eq!(resolved["status"], "resolved");
+        let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
     }
 

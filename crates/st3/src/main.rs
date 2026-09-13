@@ -17,7 +17,8 @@ use st3::archive::archive_eval;
 use st3::client::{Client, Endpoint};
 use st3::config::{Config, PeerConfig};
 use st3::model::{
-    ApplyRequest, ApplyResponse, AttachRequest, Attachment, ClaimInput, ClaimRecord, ClaimsPage,
+    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
+    AttentionRequestView, AttentionResolveRequest, ClaimInput, ClaimRecord, ClaimsPage,
     DoctorReport, DocumentPutRequest, DocumentVersion, EvalStartRequest, EvalStartResponse,
     EvalStatus, EventRecord, GateResultRequest, HumanReviewView, IntentInput,
     MessageLifecycleRequest, MessageSendRequest, MessageView, MissionOutputView,
@@ -38,9 +39,9 @@ use walkdir::WalkDir;
 mod presentation;
 
 use presentation::{
-    OutputStyle, follow_snapshot, mission_run_signature, render_generation, render_generations,
-    render_human_review_list, render_mission_run, render_revision_proposal, render_step_run,
-    render_work_list,
+    OutputStyle, follow_snapshot, mission_run_signature, render_attention_list, render_generation,
+    render_generations, render_human_review_list, render_mission_run, render_revision_proposal,
+    render_step_run, render_work_list,
 };
 
 #[derive(Parser)]
@@ -151,6 +152,11 @@ enum Command {
     Review {
         #[command(subcommand)]
         command: ReviewCommand,
+    },
+    /// Show and manage work that needs a person.
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommand,
     },
     /// Claim and update durable mission work.
     Work {
@@ -778,6 +784,48 @@ enum ReviewCommand {
 }
 
 #[derive(Subcommand)]
+enum AttentionCommand {
+    /// List all current human attention items.
+    Ls {
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
+    /// Request attention after an explicit fault.
+    Request(AttentionRequestArgs),
+    /// Resolve or dismiss an explicit attention request.
+    Resolve(AttentionResolveArgs),
+}
+
+#[derive(Args)]
+struct AttentionRequestArgs {
+    #[arg(long = "for")]
+    reviewer: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, value_parser = ["warning", "error"], default_value = "error")]
+    severity: String,
+    #[arg(long = "target")]
+    targets: Vec<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+struct AttentionResolveArgs {
+    subject: String,
+    #[arg(long, value_parser = ["resolved", "dismissed"])]
+    outcome: String,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: Option<String>,
+}
+
+#[derive(Subcommand)]
 enum WorkCommand {
     Ls {
         #[arg(long = "as", env = "ST_AGENT")]
@@ -1121,6 +1169,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Claim(args) => run_claim(&client, args, cli.json).await,
         Command::Schema { command } => run_schema(&client, command, cli.json).await,
         Command::Review { command } => run_review(&client, command, cli.json).await,
+        Command::Attention { command } => run_attention(&client, command, cli.json).await,
         Command::Work { command } => run_work(&client, command, cli.json).await,
         Command::Message { command } => run_message(&client, command, cli.json).await,
         Command::GateResult(args) => run_gate_result(&client, args, cli.json).await,
@@ -3956,6 +4005,90 @@ async fn run_review(client: &Client, command: ReviewCommand, json_output: bool) 
     print_value(&response, json_output)
 }
 
+async fn run_attention(
+    client: &Client,
+    command: AttentionCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        AttentionCommand::Ls { actor } => {
+            let path = actor.as_deref().map_or_else(
+                || "/v1/attention".to_owned(),
+                |actor| format!("/v1/attention?person={}", urlencoding::encode(actor)),
+            );
+            let items: Vec<AttentionItemView> = client.get(&path).await?;
+            if json_output {
+                print_value(&items, true)
+            } else {
+                print!(
+                    "{}",
+                    render_attention_list(
+                        actor.as_deref(),
+                        &items,
+                        OutputStyle::stdout(),
+                        now_ms(),
+                    )
+                );
+                Ok(())
+            }
+        }
+        AttentionCommand::Request(args) => {
+            let actor = args
+                .actor
+                .context("an attention request needs --as or ST_AGENT")?;
+            let idempotency_key = args
+                .idempotency_key
+                .unwrap_or_else(|| format!("attention-request:{}", uuid::Uuid::now_v7().simple()));
+            let response: AttentionRequestView = client
+                .post(
+                    "/v1/attention",
+                    &AttentionRequest {
+                        reviewer: args.reviewer,
+                        title: args.title,
+                        reason: args.reason,
+                        severity: args.severity,
+                        targets: args.targets,
+                        actor,
+                        idempotency_key,
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!("{}\t{}", response.status, response.subject);
+                Ok(())
+            }
+        }
+        AttentionCommand::Resolve(args) => {
+            let actor = args
+                .actor
+                .context("an attention resolution needs --as or ST_AGENT")?;
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let response: AttentionRequestView = client
+                .post(
+                    &format!(
+                        "/v1/attention/resolve/{}",
+                        urlencoding::encode(&args.subject)
+                    ),
+                    &AttentionResolveRequest {
+                        outcome: args.outcome,
+                        reason: args.reason,
+                        actor,
+                        idempotency_key: format!("attention-resolve:{}:{nonce}", args.subject),
+                    },
+                )
+                .await?;
+            if json_output {
+                print_value(&response, true)
+            } else {
+                println!("{}\t{}", response.status, response.subject);
+                Ok(())
+            }
+        }
+    }
+}
+
 async fn run_work(client: &Client, command: WorkCommand, json_output: bool) -> Result<()> {
     match command {
         WorkCommand::Ls { actor, all } => {
@@ -4540,16 +4673,26 @@ async fn read_message(client: &Client, reference: &str) -> Result<MessageView> {
 }
 
 async fn accept_message(client: &Client, message: &MessageView, actor: Option<&str>) -> Result<()> {
-    if message.status != "delivered" {
+    if !matches!(message.status.as_str(), "sent" | "delivered") {
         return Ok(());
     }
     let reference = message.subject.trim_start_matches("message/");
+    let actor = actor.unwrap_or(&message.to);
+    if message.status == "sent" {
+        deliver_message(
+            client,
+            reference,
+            actor,
+            format!("message-delivered-by-read:{}", message.subject),
+        )
+        .await?;
+    }
     let _: ClaimRecord = client
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(reference)),
             &MessageLifecycleRequest {
                 lifecycle: "read".into(),
-                actor: actor.map(str::to_owned),
+                actor: Some(actor.to_owned()),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: format!("message-read:{}", message.subject),
@@ -7198,6 +7341,66 @@ mod tests {
             panic!("the review approve command did not parse");
         };
         assert_eq!(args.target, "mission-run/release/one");
+    }
+
+    #[test]
+    fn attention_commands_parse_list_request_and_resolution() {
+        let list =
+            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
+        let Command::Attention {
+            command: AttentionCommand::Ls { actor },
+        } = list.command
+        else {
+            panic!("the attention list command did not parse");
+        };
+        assert_eq!(actor.as_deref(), Some("person/nathan"));
+
+        let request = Cli::try_parse_from([
+            "st3",
+            "attention",
+            "request",
+            "--for",
+            "person/nathan",
+            "--title",
+            "Fabric needs review",
+            "--reason",
+            "The queue did not recover.",
+            "--target",
+            "mission-run/fabric",
+            "--as",
+            "agent/fabric/worker",
+            "--idempotency-key",
+            "fabric-fault",
+        ])
+        .unwrap();
+        let Command::Attention {
+            command: AttentionCommand::Request(args),
+        } = request.command
+        else {
+            panic!("the attention request command did not parse");
+        };
+        assert_eq!(args.severity, "error");
+        assert_eq!(args.targets, ["mission-run/fabric"]);
+
+        let resolve = Cli::try_parse_from([
+            "st3",
+            "attention",
+            "resolve",
+            "attention/fabric",
+            "--outcome",
+            "dismissed",
+            "--as",
+            "person/nathan",
+        ])
+        .unwrap();
+        let Command::Attention {
+            command: AttentionCommand::Resolve(args),
+        } = resolve.command
+        else {
+            panic!("the attention resolve command did not parse");
+        };
+        assert_eq!(args.subject, "attention/fabric");
+        assert_eq!(args.outcome, "dismissed");
     }
 
     #[tokio::test]

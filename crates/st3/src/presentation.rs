@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
 use st3::model::{
-    HumanReviewView, MissionInputKind, MissionRunView, RevisionCutover, RevisionProposalView,
-    RunGenerationView, StepRunView,
+    AttentionItemView, HumanReviewView, MissionInputKind, MissionRunView, RevisionCutover,
+    RevisionProposalView, RunGenerationView, StepRunView,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +291,76 @@ pub(crate) fn render_human_review_list(
         );
     }
     output
+}
+
+pub(crate) fn render_attention_list(
+    person: Option<&str>,
+    items: &[AttentionItemView],
+    style: OutputStyle,
+    now_unix_ms: u128,
+) -> String {
+    let mut output = String::new();
+    let title = person.map_or_else(
+        || "HUMAN ATTENTION".to_owned(),
+        |person| format!("HUMAN ATTENTION FOR {person}"),
+    );
+    let _ = writeln!(output, "{}", style.heading(title));
+    if items.is_empty() {
+        let _ = writeln!(output, "{}", style.muted("No human attention is waiting."));
+        return output;
+    }
+    let _ = writeln!(output, "{} waiting · oldest first", items.len());
+    for item in items {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  {} [{}] {}",
+            style.status_value("ready", "?"),
+            item.kind,
+            item.title
+        );
+        let _ = writeln!(output, "    {}", item.detail);
+        let _ = write!(output, "    {}", item.person);
+        if let Some(mission) = &item.mission {
+            let _ = write!(output, " · {mission}");
+        }
+        if let Some(run) = &item.mission_run {
+            let _ = write!(output, " · {run}");
+        }
+        if let Some(step) = &item.step {
+            let _ = write!(output, " · step {step}");
+        }
+        let _ = writeln!(
+            output,
+            " · requested {}",
+            relative_time(item.requested_at_unix_ms, now_unix_ms)
+        );
+        for target in &item.targets {
+            let _ = writeln!(output, "    review: {target}");
+        }
+        let _ = writeln!(output, "    subject: {}", item.subject);
+        for action in &item.actions {
+            let command = action
+                .argv
+                .iter()
+                .map(|argument| shell_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(output, "    {}: {command}", action.label);
+        }
+    }
+    output
+}
+
+fn shell_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b':' | b'@' | b'_' | b'-')
+        })
+    {
+        return value.into();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_ms: u128) -> String {
@@ -905,6 +975,54 @@ mod tests {
     fn human_review_list_has_a_clear_empty_state() {
         let rendered = render_human_review_list(None, &[], OutputStyle::plain(), 180_000);
         assert_eq!(rendered, "HUMAN REVIEWS\nNo human reviews are waiting.\n");
+    }
+
+    #[test]
+    fn attention_list_shows_kind_age_targets_and_safe_commands() {
+        let item = AttentionItemView {
+            kind: "fault".into(),
+            subject: "attention/fabric".into(),
+            person: "person/nathan".into(),
+            title: "Fabric needs review".into(),
+            detail: "The queue did not recover.".into(),
+            mission: Some("mission/fabric".into()),
+            mission_run: Some("mission-run/fabric/one".into()),
+            step: None,
+            targets: vec!["doc/fabric/report@abc".into()],
+            requested_at_unix_ms: 60_000,
+            actions: vec![st3::model::AttentionActionView {
+                label: "resolve".into(),
+                argv: vec![
+                    "st3".into(),
+                    "attention".into(),
+                    "resolve".into(),
+                    "attention/fabric".into(),
+                    "--reason".into(),
+                    "It is fixed".into(),
+                ],
+            }],
+        };
+        let rendered = render_attention_list(
+            Some("person/nathan"),
+            &[item],
+            OutputStyle::plain(),
+            180_000,
+        );
+        assert!(rendered.contains("HUMAN ATTENTION FOR person/nathan"));
+        assert!(rendered.contains("1 waiting · oldest first"));
+        assert!(rendered.contains("[fault] Fabric needs review"));
+        assert!(rendered.contains("requested 2m ago"));
+        assert!(rendered.contains("review: doc/fabric/report@abc"));
+        assert!(rendered.contains("--reason 'It is fixed'"));
+    }
+
+    #[test]
+    fn attention_list_has_a_clear_empty_state() {
+        let rendered = render_attention_list(None, &[], OutputStyle::plain(), 180_000);
+        assert_eq!(
+            rendered,
+            "HUMAN ATTENTION\nNo human attention is waiting.\n"
+        );
     }
 
     #[test]

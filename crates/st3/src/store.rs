@@ -15,18 +15,19 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::model::{
-    ApplyResponse, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec, DesiredSubject,
-    DocumentVersion, EventRecord, HumanReviewView, IntentInput, MAX_EVAL_TIMEOUT_MS, MessageView,
-    MissionInputKind, MissionOutputView, MissionResponse, MissionRevisionOperation,
-    MissionRunDeclaration, MissionRunInput, MissionRunRequest, MissionRunView, MissionSpec,
-    MissionState, NormalizedIntent, PlannedAction, PlanningCandidateView, PlanningPreviewView,
-    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
-    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
-    ReplicationExchange, ReplicationInventory, ReplicationPeerStatus, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionSpec,
-    WorkRequest, WorkSelector,
+    ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
+    AttentionResolveRequest, Capability, ClaimInput, ClaimRecord, ClaimsPage, DependencySpec,
+    DesiredSubject, DocumentVersion, EventRecord, HumanReviewView, IntentInput,
+    MAX_EVAL_TIMEOUT_MS, MessageView, MissionInputKind, MissionOutputView, MissionResponse,
+    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunRequest,
+    MissionRunView, MissionSpec, MissionState, NormalizedIntent, PlannedAction,
+    PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView,
+    PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView,
+    ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory, ReplicationPeerStatus,
+    ReplicationReceipt, ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionSpec, WorkRequest, WorkSelector,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -5066,36 +5067,253 @@ impl Store {
 
     pub fn pending_human_reviews(&self, reviewer: Option<&str>) -> Result<Vec<HumanReviewView>> {
         let connection = self.readers.get();
-        let requests = {
-            let mut statement = connection.prepare(
-                "SELECT request.id, request.store_index, request.batch_id, request.subject,
-                        request.kind, request.origin, request.actor, request.body,
-                        request.predecessors, request.accepted_at_unix_ms
-                 FROM claims request
-                 WHERE request.kind='gate.requested'
-                   AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
-                   AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM claims result
-                     WHERE result.subject=request.subject
-                       AND result.kind='gate.result'
-                       AND json_extract(result.body, '$.fields.request')=request.id
-                       AND result.actor=json_extract(request.body, '$.fields.reviewer')
-                       AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail')
-                   )
-                 ORDER BY request.store_index",
-            )?;
-            statement
-                .query_map([reviewer], claim_from_row)?
-                .collect::<Result<Vec<_>, _>>()?
+        pending_human_reviews_tx(&connection, reviewer)
+    }
+
+    pub fn request_attention(
+        &self,
+        subject: &str,
+        request: &AttentionRequest,
+    ) -> Result<AttentionRequestView, St3Error> {
+        let reviewer = normalize_actor(&request.reviewer, "person");
+        if !reviewer.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-attention-reviewer",
+                "an attention reviewer must be a person subject",
+            ));
+        }
+        if request.title.trim().is_empty() || request.reason.trim().is_empty() {
+            return Err(St3Error::new(
+                "invalid-attention-request",
+                "an attention request needs a title and a reason",
+            ));
+        }
+        if !matches!(request.severity.as_str(), "warning" | "error") {
+            return Err(St3Error::new(
+                "invalid-attention-severity",
+                "attention severity must be warning or error",
+            ));
+        }
+        for target in &request.targets {
+            st3_schema::registry()
+                .validate_subject(target)
+                .map_err(|error| St3Error::new(error.code, error.message))?;
+        }
+        let actor = normalize_actor(&request.actor, "agent");
+        self.append_claim(&ClaimInput {
+            subject: subject.to_owned(),
+            kind: "attention.requested".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("reviewer".into(), Value::String(reviewer)),
+                ("title".into(), Value::String(request.title.clone())),
+                ("reason".into(), Value::String(request.reason.clone())),
+                ("severity".into(), Value::String(request.severity.clone())),
+                (
+                    "targets".into(),
+                    Value::Array(request.targets.iter().cloned().map(Value::String).collect()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        })?;
+        self.attention_request(subject)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("internal", "the attention request was not stored"))
+    }
+
+    pub fn resolve_attention(
+        &self,
+        subject: &str,
+        request: &AttentionResolveRequest,
+    ) -> Result<AttentionRequestView, St3Error> {
+        if !matches!(request.outcome.as_str(), "resolved" | "dismissed") {
+            return Err(St3Error::new(
+                "invalid-attention-outcome",
+                "an attention outcome must be resolved or dismissed",
+            ));
+        }
+        let subject = if subject.starts_with("attention/") {
+            subject.to_owned()
+        } else {
+            format!("attention/{subject}")
         };
-        let mut reviews = Vec::new();
-        for request in requests {
-            if let Some(review) = current_human_review(&connection, request)? {
-                reviews.push(review);
+        let current = self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-attention-request",
+                    format!("attention request `{subject}` does not exist"),
+                )
+            })?;
+        let actor = normalize_actor(&request.actor, "person");
+        if actor != current.reviewer {
+            return Err(St3Error::new(
+                "wrong-attention-reviewer",
+                format!(
+                    "attention request `{subject}` requires `{}`",
+                    current.reviewer
+                ),
+            ));
+        }
+        self.append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "attention.resolved".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("request".into(), Value::String(current.request)),
+                ("outcome".into(), Value::String(request.outcome.clone())),
+                (
+                    "reason".into(),
+                    request
+                        .reason
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(request.idempotency_key.clone()),
+        })?;
+        self.attention_request(&subject)
+            .map_err(internal)?
+            .ok_or_else(|| St3Error::new("internal", "the attention resolution was not stored"))
+    }
+
+    pub fn attention_request(&self, subject: &str) -> Result<Option<AttentionRequestView>> {
+        let subject = if subject.starts_with("attention/") {
+            subject.to_owned()
+        } else {
+            format!("attention/{subject}")
+        };
+        let connection = self.readers.get();
+        attention_request_view_tx(&connection, &subject)
+    }
+
+    pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
+        let reviews = self.pending_human_reviews(person)?;
+        items.extend(reviews.into_iter().map(attention_item_from_review));
+
+        {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT id FROM planning_sessions
+                 WHERE status='review' AND (?1 IS NULL OR requester=?1)
+                 ORDER BY created_at_unix_ms, id",
+            )?;
+            let ids = statement
+                .query_map([person], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in ids {
+                let Some(session) = planning_session_view_tx(&connection, &id)? else {
+                    continue;
+                };
+                let (Some(candidate), Some(preview)) = (&session.candidate, &session.preview)
+                else {
+                    continue;
+                };
+                if preview.candidate_revision != candidate.revision
+                    || !preview.mission.blockers.is_empty()
+                {
+                    continue;
+                }
+                if let Some(run) = &session.target_mission_run {
+                    let Some(run) = mission_run_view_tx(
+                        &connection,
+                        run.strip_prefix("mission-run/").unwrap_or(run),
+                    )
+                    .optional()?
+                    else {
+                        continue;
+                    };
+                    if session.source_generation.as_deref() != Some(run.generation.as_str())
+                        || is_terminal_run_state(&run.status)
+                    {
+                        continue;
+                    }
+                }
+                items.push(attention_item_from_planning(&session, candidate, preview));
             }
         }
-        Ok(reviews)
+
+        {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT id FROM revision_proposals
+                 WHERE status='pending-approval'
+                 ORDER BY created_at_unix_ms, id",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in ids {
+                let proposal = revision_proposal_view_tx(&connection, &id)?;
+                let run = mission_run_view_tx(
+                    &connection,
+                    proposal
+                        .run
+                        .strip_prefix("mission-run/")
+                        .unwrap_or(&proposal.run),
+                )
+                .optional()?;
+                let Some(run) = run else {
+                    continue;
+                };
+                if run.generation != proposal.source_generation
+                    || is_terminal_run_state(&run.status)
+                {
+                    continue;
+                }
+                for reviewer in proposal
+                    .reviewers
+                    .iter()
+                    .filter(|reviewer| !proposal.approvals.contains(*reviewer))
+                    .filter(|reviewer| person.is_none_or(|person| person == reviewer.as_str()))
+                {
+                    items.push(attention_item_from_revision(&proposal, &run, reviewer));
+                }
+            }
+        }
+
+        let messages = self.messages(person, false)?;
+        if !messages.is_empty() {
+            let connection = self.readers.get();
+            for message in messages.into_iter().filter(|message| {
+                message.to.starts_with("person/")
+                    && matches!(message.status.as_str(), "sent" | "delivered")
+            }) {
+                let requested_at_unix_ms = connection.query_row(
+                    "SELECT accepted_at_unix_ms FROM claims
+                     WHERE subject=?1 AND kind='message.sent'
+                     ORDER BY store_index LIMIT 1",
+                    [&message.subject],
+                    |row| row.get::<_, String>(0),
+                )?;
+                items.push(attention_item_from_message(
+                    message,
+                    requested_at_unix_ms.parse().unwrap_or(0),
+                ));
+            }
+        }
+
+        {
+            let connection = self.readers.get();
+            for request in pending_attention_requests_tx(&connection, person)? {
+                items.push(attention_item_from_request(request));
+            }
+        }
+        items.sort_by(|left, right| {
+            left.requested_at_unix_ms
+                .cmp(&right.requested_at_unix_ms)
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.subject.cmp(&right.subject))
+                .then_with(|| left.person.cmp(&right.person))
+        });
+        Ok(items)
     }
 
     pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
@@ -9563,6 +9781,371 @@ fn current_human_review(
     }))
 }
 
+fn pending_human_reviews_tx(
+    connection: &Connection,
+    reviewer: Option<&str>,
+) -> Result<Vec<HumanReviewView>> {
+    let requests = {
+        let mut statement = connection.prepare(
+            "SELECT request.id, request.store_index, request.batch_id, request.subject,
+                    request.kind, request.origin, request.actor, request.body,
+                    request.predecessors, request.accepted_at_unix_ms
+             FROM claims request
+             WHERE request.kind='gate.requested'
+               AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
+               AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims result
+                 WHERE result.subject=request.subject
+                   AND result.kind='gate.result'
+                   AND json_extract(result.body, '$.fields.request')=request.id
+                   AND result.actor=json_extract(request.body, '$.fields.reviewer')
+                   AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail')
+               )
+             ORDER BY request.store_index",
+        )?;
+        statement
+            .query_map([reviewer], claim_from_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut reviews = Vec::new();
+    for request in requests {
+        if let Some(review) = current_human_review(connection, request)? {
+            reviews.push(review);
+        }
+    }
+    Ok(reviews)
+}
+
+fn attention_request_view_tx(
+    connection: &Connection,
+    subject: &str,
+) -> Result<Option<AttentionRequestView>> {
+    let requested = connection
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='attention.requested'
+             ORDER BY store_index LIMIT 1",
+            [subject],
+            claim_from_row,
+        )
+        .optional()?;
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let resolved = connection
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                    predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='attention.resolved'
+             ORDER BY store_index DESC LIMIT 1",
+            [subject],
+            claim_from_row,
+        )
+        .optional()?;
+    let fields = requested.body.get("fields").unwrap_or(&requested.body);
+    let strings = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let resolution_fields = resolved
+        .as_ref()
+        .map(|claim| claim.body.get("fields").unwrap_or(&claim.body));
+    let outcome = resolution_fields
+        .and_then(|fields| fields.get("outcome"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(Some(AttentionRequestView {
+        subject: requested.subject,
+        request: requested.id,
+        reviewer: fields
+            .get("reviewer")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        title: fields
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        reason: fields
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        severity: fields
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("error")
+            .to_owned(),
+        targets: strings("targets"),
+        actor: requested.actor.unwrap_or_default(),
+        status: outcome.clone().unwrap_or_else(|| "pending".into()),
+        outcome,
+        resolution_reason: resolution_fields
+            .and_then(|fields| fields.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        requested_at_unix_ms: requested.accepted_at_unix_ms,
+        resolved_at_unix_ms: resolved.map(|claim| claim.accepted_at_unix_ms),
+    }))
+}
+
+fn pending_attention_requests_tx(
+    connection: &Connection,
+    person: Option<&str>,
+) -> Result<Vec<AttentionRequestView>> {
+    let mut statement = connection.prepare(
+        "SELECT request.subject FROM claims request
+         WHERE request.kind='attention.requested'
+           AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
+           AND NOT EXISTS (
+             SELECT 1 FROM claims resolution
+             WHERE resolution.subject=request.subject
+               AND resolution.kind='attention.resolved'
+           )
+         ORDER BY request.store_index",
+    )?;
+    let subjects = statement
+        .query_map([person], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    subjects
+        .iter()
+        .filter_map(|subject| attention_request_view_tx(connection, subject).transpose())
+        .collect()
+}
+
+fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
+    AttentionActionView {
+        label: label.into(),
+        argv: argv.iter().map(|value| (*value).to_owned()).collect(),
+    }
+}
+
+fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
+    AttentionItemView {
+        kind: "human-gate".into(),
+        subject: review.owner.clone(),
+        person: review.reviewer.clone(),
+        title: review
+            .title
+            .clone()
+            .or_else(|| review.step.clone())
+            .unwrap_or_else(|| "Human review".into()),
+        detail: review.question,
+        mission: Some(review.mission),
+        mission_run: Some(review.mission_run),
+        step: review.step,
+        targets: review.review_targets,
+        requested_at_unix_ms: review.requested_at_unix_ms,
+        actions: vec![
+            attention_action(
+                "approve",
+                &[
+                    "st3",
+                    "review",
+                    "approve",
+                    &review.owner,
+                    "--actor",
+                    &review.reviewer,
+                ],
+            ),
+            attention_action(
+                "reject",
+                &[
+                    "st3",
+                    "review",
+                    "reject",
+                    &review.owner,
+                    "--actor",
+                    &review.reviewer,
+                ],
+            ),
+        ],
+    }
+}
+
+fn attention_item_from_planning(
+    session: &PlanningSessionView,
+    candidate: &PlanningCandidateView,
+    preview: &PlanningPreviewView,
+) -> AttentionItemView {
+    AttentionItemView {
+        kind: "planning-approval".into(),
+        subject: session.subject.clone(),
+        person: session.requester.clone(),
+        title: format!("Approve mission/{}", session.mission),
+        detail: "The current planning preview is ready for approval.".into(),
+        mission: Some(format!("mission/{}", session.mission)),
+        mission_run: session.target_mission_run.clone(),
+        step: None,
+        targets: vec![
+            session.request.clone(),
+            candidate.markdown.clone(),
+            candidate.kdl.clone(),
+        ],
+        requested_at_unix_ms: preview.created_at_unix_ms,
+        actions: vec![
+            attention_action("show", &["st3", "planning", "show", &session.id]),
+            attention_action(
+                "approve",
+                &[
+                    "st3",
+                    "planning",
+                    "approve",
+                    &session.id,
+                    &preview.hash,
+                    "--as",
+                    &session.requester,
+                ],
+            ),
+            attention_action(
+                "cancel",
+                &[
+                    "st3",
+                    "planning",
+                    "cancel",
+                    &session.id,
+                    "--as",
+                    &session.requester,
+                ],
+            ),
+        ],
+    }
+}
+
+fn attention_item_from_revision(
+    proposal: &RevisionProposalView,
+    run: &MissionRunView,
+    reviewer: &str,
+) -> AttentionItemView {
+    let preview_hash = proposal.preview_hash.as_deref().unwrap_or_default();
+    AttentionItemView {
+        kind: "revision-approval".into(),
+        subject: proposal.subject.clone(),
+        person: reviewer.to_owned(),
+        title: format!("Approve a revision of {}", run.mission),
+        detail: proposal.reason.clone(),
+        mission: Some(run.mission.clone()),
+        mission_run: Some(run.subject.clone()),
+        step: None,
+        targets: vec![format!("{}@{}", run.mission, proposal.candidate_revision)],
+        requested_at_unix_ms: proposal.created_at_unix_ms,
+        actions: vec![
+            attention_action("show", &["st3", "work", "revision", "show", &run.subject]),
+            attention_action(
+                "approve",
+                &[
+                    "st3",
+                    "work",
+                    "revision",
+                    "approve",
+                    &proposal.subject,
+                    preview_hash,
+                    "--as",
+                    reviewer,
+                ],
+            ),
+            attention_action(
+                "cancel",
+                &[
+                    "st3",
+                    "work",
+                    "revision",
+                    "cancel",
+                    &proposal.subject,
+                    "--as",
+                    reviewer,
+                ],
+            ),
+        ],
+    }
+}
+
+fn attention_item_from_message(
+    message: MessageView,
+    requested_at_unix_ms: u128,
+) -> AttentionItemView {
+    AttentionItemView {
+        kind: "unread-message".into(),
+        subject: message.subject.clone(),
+        person: message.to.clone(),
+        title: message
+            .title
+            .unwrap_or_else(|| format!("Message from {}", message.from)),
+        detail: format!("Unread message from {}.", message.from),
+        mission: None,
+        mission_run: None,
+        step: None,
+        targets: Vec::new(),
+        requested_at_unix_ms,
+        actions: vec![attention_action(
+            "read",
+            &[
+                "st3",
+                "message",
+                "read",
+                &message.subject,
+                "--as",
+                &message.to,
+            ],
+        )],
+    }
+}
+
+fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
+    AttentionItemView {
+        kind: "fault".into(),
+        subject: request.subject.clone(),
+        person: request.reviewer.clone(),
+        title: request.title,
+        detail: request.reason,
+        mission: None,
+        mission_run: None,
+        step: None,
+        targets: request.targets,
+        requested_at_unix_ms: request.requested_at_unix_ms,
+        actions: vec![
+            attention_action(
+                "resolve",
+                &[
+                    "st3",
+                    "attention",
+                    "resolve",
+                    &request.subject,
+                    "--outcome",
+                    "resolved",
+                    "--as",
+                    &request.reviewer,
+                ],
+            ),
+            attention_action(
+                "dismiss",
+                &[
+                    "st3",
+                    "attention",
+                    "resolve",
+                    &request.subject,
+                    "--outcome",
+                    "dismissed",
+                    "--as",
+                    &request.reviewer,
+                ],
+            ),
+        ],
+    }
+}
+
 fn is_terminal_run_state(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
@@ -13435,6 +14018,10 @@ mission "reviewed" state="ready" revisions="human-only" {
         let proposal = store.revision_proposal_for_run(&run.id).unwrap().unwrap();
         assert_eq!(proposal.status, "pending-approval");
         assert_eq!(proposal.reviewers, ["person/operator"]);
+        let attention = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].kind, "revision-approval");
+        assert_eq!(attention[0].subject, proposal.subject);
 
         let approved = store
             .approve_revision_proposal(
@@ -13447,6 +14034,12 @@ mission "reviewed" state="ready" revisions="human-only" {
         assert_eq!(approved.status, "applied");
         assert_eq!(approved.mission_run.revision, candidate.revision);
         assert_ne!(approved.mission_run.generation, run.generation);
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -16087,6 +16680,14 @@ version 2
             proposal.reviewers,
             vec!["person/mission-reviewer", "person/step-reviewer"]
         );
+        assert_eq!(store.attention_items(None).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .attention_items(Some("person/mission-reviewer"))
+                .unwrap()
+                .len(),
+            1
+        );
         let error = store
             .approve_revision_proposal(
                 &proposal.id,
@@ -16106,6 +16707,19 @@ version 2
             .unwrap();
         assert_eq!(first_approval.status, "pending-approval");
         assert_eq!(first_approval.mission_run.generation, run.generation);
+        assert!(
+            store
+                .attention_items(Some("person/mission-reviewer"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .attention_items(Some("person/step-reviewer"))
+                .unwrap()
+                .len(),
+            1
+        );
         let applied = store
             .approve_revision_proposal(
                 &proposal.id,
@@ -17404,5 +18018,129 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .set_mission_run_state(&revised.id, "cancelled", "normal", None)
             .unwrap();
         assert!(store.pending_human_reviews(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_attention_is_idempotent_authorized_and_terminal() {
+        let store = Store::open_memory("node").unwrap();
+        let request = AttentionRequest {
+            reviewer: "nathan".into(),
+            title: "Fabric needs review".into(),
+            reason: "The queue did not recover.".into(),
+            severity: "error".into(),
+            targets: vec!["resource/fabric/queue".into()],
+            actor: "agent/fabric/worker".into(),
+            idempotency_key: "attention-fabric-queue".into(),
+        };
+        let first = store
+            .request_attention("attention/fabric-queue", &request)
+            .unwrap();
+        let retry = store
+            .request_attention("attention/fabric-queue", &request)
+            .unwrap();
+        assert_eq!(first.request, retry.request);
+        assert_eq!(first.reviewer, "person/nathan");
+        assert_eq!(first.status, "pending");
+        let items = store.attention_items(Some("person/nathan")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "fault");
+        assert_eq!(items[0].actions.len(), 2);
+        assert!(
+            store
+                .attention_items(Some("person/someone-else"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let wrong = AttentionResolveRequest {
+            outcome: "resolved".into(),
+            reason: None,
+            actor: "person/someone-else".into(),
+            idempotency_key: "resolve-fabric-wrong".into(),
+        };
+        assert_eq!(
+            store
+                .resolve_attention(&first.subject, &wrong)
+                .unwrap_err()
+                .code,
+            "wrong-attention-reviewer"
+        );
+        let resolution = AttentionResolveRequest {
+            outcome: "dismissed".into(),
+            reason: Some("The fault is expected during maintenance.".into()),
+            actor: "nathan".into(),
+            idempotency_key: "resolve-fabric".into(),
+        };
+        let closed = store
+            .resolve_attention(&first.subject, &resolution)
+            .unwrap();
+        assert_eq!(closed.status, "dismissed");
+        assert_eq!(closed.outcome.as_deref(), Some("dismissed"));
+        assert!(store.attention_items(None).unwrap().is_empty());
+        let retry = store
+            .resolve_attention(&first.subject, &resolution)
+            .unwrap();
+        assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
+    }
+
+    #[test]
+    fn unread_person_messages_leave_attention_after_read() {
+        let store = Store::open_memory("node").unwrap();
+        let message = store
+            .append_claim(&ClaimInput {
+                subject: "message/human-attention".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/demo/worker".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("agent/demo/worker".into())),
+                    ("to".into(), Value::String("person/nathan".into())),
+                    ("content".into(), Value::String("Please read this.".into())),
+                    ("status".into(), Value::String("sent".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("human-attention-message".into()),
+            })
+            .unwrap();
+        let items = store.attention_items(Some("person/nathan")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "unread-message");
+        assert_eq!(items[0].actions[0].label, "read");
+
+        store
+            .append_claim(&ClaimInput {
+                subject: message.subject.clone(),
+                kind: "message.delivered".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("delivered".into())),
+                    ("recipient".into(), Value::String("person/nathan".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("deliver-human-attention-message".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            store.attention_items(Some("person/nathan")).unwrap()[0].kind,
+            "unread-message"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: message.subject,
+                kind: "message.read".into(),
+                actor: Some("person/nathan".into()),
+                fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("read-human-attention-message".into()),
+            })
+            .unwrap();
+        assert!(
+            store
+                .attention_items(Some("person/nathan"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
