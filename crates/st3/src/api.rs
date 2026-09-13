@@ -765,7 +765,11 @@ async fn replication_export(
 ) -> Result<Json<ReplicationExportResponse>, ApiError> {
     let store = state.store.clone();
     blocking_store(move || {
-        let exchange = store.export_replication_exchange(&request.fleet_id, &request.inventory)?;
+        let exchange = if request.summary_only {
+            store.export_replication_summary(&request.fleet_id)?
+        } else {
+            store.export_replication_exchange(&request.fleet_id, &request.inventory)?
+        };
         Ok(Json(ReplicationExportResponse {
             exchange,
             store_index: store.index()?,

@@ -464,7 +464,18 @@ pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
     committed_index: Arc<AtomicU64>,
+    replica_generation: AtomicU64,
+    replication_snapshot: Mutex<Option<ReplicationSnapshot>>,
     origin: String,
+}
+
+#[derive(Clone)]
+struct ReplicationSnapshot {
+    store_index: u64,
+    replica_generation: u64,
+    inventory: ReplicationInventory,
+    authority_digest: String,
+    graph_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -652,6 +663,8 @@ impl Store {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers: ReadPool::new(readers),
             committed_index,
+            replica_generation: AtomicU64::new(0),
+            replication_snapshot: Mutex::new(None),
             origin,
         })
     }
@@ -684,6 +697,8 @@ impl Store {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers: ReadPool::new(readers),
             committed_index,
+            replica_generation: AtomicU64::new(0),
+            replication_snapshot: Mutex::new(None),
             origin,
         })
     }
@@ -5779,6 +5794,26 @@ impl Store {
     }
 
     pub fn replication_inventory(&self) -> Result<ReplicationInventory> {
+        Ok(self.replication_snapshot()?.inventory)
+    }
+
+    fn replication_snapshot(&self) -> Result<ReplicationSnapshot> {
+        let store_index = self.index()?;
+        let replica_generation = self.replica_generation.load(Ordering::Acquire);
+        if let Some(snapshot) = self
+            .replication_snapshot
+            .lock()
+            .expect("replication snapshot mutex poisoned")
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.store_index == store_index
+                    && snapshot.replica_generation == replica_generation
+            })
+            .cloned()
+        {
+            return Ok(snapshot);
+        }
+
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let transaction = connection.transaction()?;
         seed_replica_envelopes_tx(&transaction, &self.origin)?;
@@ -5796,7 +5831,38 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ReplicationInventory { envelopes })
+        let inventory = ReplicationInventory {
+            digest: replication_inventory_digest(&envelopes),
+            envelopes,
+        };
+        let snapshot = ReplicationSnapshot {
+            store_index: current_index(&connection)?,
+            replica_generation: self.replica_generation.load(Ordering::Acquire),
+            inventory,
+            authority_digest: authority_digest(&connection)?,
+            graph_digest: graph_digest(&connection)?,
+        };
+        *self
+            .replication_snapshot
+            .lock()
+            .expect("replication snapshot mutex poisoned") = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
+        let snapshot = self.replication_snapshot()?;
+        Ok(ReplicationExchange {
+            peer: self.origin.clone(),
+            fleet_id: fleet_id.to_owned(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: snapshot.authority_digest,
+            graph_digest: snapshot.graph_digest,
+            inventory: ReplicationInventory {
+                digest: snapshot.inventory.digest,
+                envelopes: Vec::new(),
+            },
+            envelopes: Vec::new(),
+        })
     }
 
     pub fn export_replication_exchange(
@@ -5804,15 +5870,26 @@ impl Store {
         fleet_id: &str,
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
-        let inventory = self.replication_inventory()?;
-        let known = remote.envelopes.iter().cloned().collect::<BTreeSet<_>>();
-        let missing = inventory
-            .envelopes
-            .iter()
-            .filter(|identity| !known.contains(*identity))
-            .take(512)
-            .cloned()
-            .collect::<Vec<_>>();
+        let snapshot = self.replication_snapshot()?;
+        let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
+        let remote_is_complete = if remote.digest.is_empty() {
+            true
+        } else {
+            remote.digest == replication_inventory_digest(&remote.envelopes)
+        };
+        let missing = if same || !remote_is_complete {
+            Vec::new()
+        } else {
+            let known = remote.envelopes.iter().cloned().collect::<BTreeSet<_>>();
+            snapshot
+                .inventory
+                .envelopes
+                .iter()
+                .filter(|identity| !known.contains(*identity))
+                .take(512)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let connection = self.readers.get();
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
@@ -5839,9 +5916,16 @@ impl Store {
             peer: self.origin.clone(),
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
-            authority_digest: authority_digest(&connection)?,
-            graph_digest: graph_digest(&connection)?,
-            inventory,
+            authority_digest: snapshot.authority_digest,
+            graph_digest: snapshot.graph_digest,
+            inventory: if same {
+                ReplicationInventory {
+                    digest: snapshot.inventory.digest,
+                    envelopes: Vec::new(),
+                }
+            } else {
+                snapshot.inventory
+            },
             envelopes,
         })
     }
@@ -5907,12 +5991,18 @@ impl Store {
             )
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
+        if received != 0 {
+            self.replica_generation.fetch_add(1, Ordering::AcqRel);
+        }
         drop(connection);
-        let inventory = self.replication_inventory().map_err(internal)?;
+        let snapshot = self.replication_snapshot().map_err(internal)?;
         Ok(ReplicationReceipt {
             received,
             duplicate,
-            inventory,
+            inventory: ReplicationInventory {
+                digest: snapshot.inventory.digest,
+                envelopes: Vec::new(),
+            },
         })
     }
 
@@ -9593,6 +9683,22 @@ fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position
             .as_bytes(),
     );
     format!("record/{}", hex::encode(digest))
+}
+
+fn replication_inventory_digest(envelopes: &[ReplicaEnvelopeId]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"st3-replication-inventory-v1\0");
+    for envelope in envelopes {
+        for field in [
+            envelope.writer.as_str(),
+            &envelope.sequence.to_string(),
+            envelope.hash.as_str(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+    }
+    hex::encode(digest.finalize())
 }
 
 fn authority_digest(connection: &Connection) -> Result<String> {
@@ -14130,6 +14236,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
+                digest: String::new(),
                 envelopes: vec![ReplicaEnvelopeId {
                     writer: candidate.writer.clone(),
                     sequence: candidate.sequence,
@@ -14194,6 +14301,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             authority_digest: String::new(),
             graph_digest: String::new(),
             inventory: ReplicationInventory {
+                digest: String::new(),
                 envelopes: envelopes
                     .iter()
                     .map(|envelope| ReplicaEnvelopeId {

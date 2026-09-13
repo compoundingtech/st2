@@ -228,6 +228,7 @@ impl PeerBackend {
         &self,
         fleet_id: &str,
         inventory: &ReplicationInventory,
+        summary_only: bool,
     ) -> Result<ReplicationExportResponse> {
         match self {
             Self::Main(client) => {
@@ -237,15 +238,23 @@ impl PeerBackend {
                         &ReplicationExportRequest {
                             fleet_id: fleet_id.to_owned(),
                             inventory: inventory.clone(),
+                            summary_only,
                         },
                     )
                     .await
             }
             #[cfg(test)]
-            Self::Local(store) => Ok(ReplicationExportResponse {
-                exchange: store.export_replication_exchange(fleet_id, inventory)?,
-                store_index: store.index()?,
-            }),
+            Self::Local(store) => {
+                let exchange = if summary_only {
+                    store.export_replication_summary(fleet_id)?
+                } else {
+                    store.export_replication_exchange(fleet_id, inventory)?
+                };
+                Ok(ReplicationExportResponse {
+                    exchange,
+                    store_index: store.index()?,
+                })
+            }
         }
     }
 
@@ -454,7 +463,7 @@ async fn receive_exchange(
         }
         let response = state
             .backend
-            .export(state.auth.fleet_id(), &request.inventory)
+            .export(state.auth.fleet_id(), &request.inventory, false)
             .await?;
         signed_response(
             &state,
@@ -543,14 +552,16 @@ async fn exchange(
     main_socket: &Path,
 ) -> Result<bool> {
     let first = backend
-        .export(auth.fleet_id(), &ReplicationInventory::default())
+        .export(auth.fleet_id(), &ReplicationInventory::default(), true)
         .await?
         .exchange;
+    let local_digest = first.inventory.digest.clone();
     let query = ReplicationExchange {
         envelopes: Vec::new(),
         ..first
     };
     let remote = post_signed(peer, node, auth, &query).await?;
+    let different = remote.inventory.digest != local_digest;
     let pulled = !remote.envelopes.is_empty();
     let received = backend
         .receive(&peer.name, auth.fleet_id(), &remote)
@@ -558,13 +569,16 @@ async fn exchange(
     if received.changed {
         wake_main(main_socket).await;
     }
-    let push = backend
-        .export(auth.fleet_id(), &remote.inventory)
-        .await?
-        .exchange;
-    let pushed = !push.envelopes.is_empty();
-    if pushed {
+    let mut pushed = false;
+    let mut pulled_follow_up = false;
+    if different {
+        let push = backend
+            .export(auth.fleet_id(), &remote.inventory, false)
+            .await?
+            .exchange;
+        pushed = !push.envelopes.is_empty();
         let response = post_signed(peer, node, auth, &push).await?;
+        pulled_follow_up = !response.envelopes.is_empty();
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &response)
             .await?;
@@ -572,7 +586,7 @@ async fn exchange(
             wake_main(main_socket).await;
         }
     }
-    Ok(pulled || pushed)
+    Ok(pulled || pulled_follow_up || pushed)
 }
 
 async fn post_signed(
@@ -835,6 +849,14 @@ mod tests {
             source_status.authority_digest,
             target_status.authority_digest
         );
+        let summary = source.export_replication_summary(fleet).unwrap();
+        assert!(summary.inventory.envelopes.is_empty());
+        assert!(!summary.inventory.digest.is_empty());
+        let converged = target
+            .export_replication_exchange(fleet, &summary.inventory)
+            .unwrap();
+        assert!(converged.inventory.envelopes.is_empty());
+        assert!(converged.envelopes.is_empty());
         server.abort();
     }
 
@@ -888,10 +910,16 @@ mod tests {
         assert!(received.changed);
         assert!(received.receipt.received > 0);
         let exported = backend
-            .export(fleet, &ReplicationInventory::default())
+            .export(fleet, &ReplicationInventory::default(), false)
             .await
             .unwrap();
         assert!(!exported.exchange.inventory.envelopes.is_empty());
+        let summary = backend
+            .export(fleet, &ReplicationInventory::default(), true)
+            .await
+            .unwrap();
+        assert!(summary.exchange.inventory.envelopes.is_empty());
+        assert!(!summary.exchange.inventory.digest.is_empty());
         backend
             .record_failure("source", "down", "test outage")
             .await

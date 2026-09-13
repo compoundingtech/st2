@@ -1364,6 +1364,8 @@ pub struct ReplicaEnvelope {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ReplicationInventory {
     #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelopeId>,
 }
 
@@ -1390,6 +1392,8 @@ pub struct ReplicationReceipt {
 pub struct ReplicationExportRequest {
     pub fleet_id: String,
     pub inventory: ReplicationInventory,
+    #[serde(default)]
+    pub summary_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
