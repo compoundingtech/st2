@@ -266,7 +266,9 @@ impl Ledger {
                     },
                 )
                 .and_then(|recovered| ledger.seed(recovered, &correlate)),
-            Err(error) => Err(error).with_context(|| format!("reading delivery ledger {}", path.display())),
+            Err(error) => {
+                Err(error).with_context(|| format!("reading delivery ledger {}", path.display()))
+            }
         };
         if let Err(error) = outcome {
             ledger.record.entries.clear();
@@ -318,11 +320,7 @@ impl Ledger {
     }
 
     /// Every check a set of entries from outside this process must pass.
-    fn accept(
-        &self,
-        entries: &[Entry],
-        correlate: &impl Fn(&str, &str) -> String,
-    ) -> Result<()> {
+    fn accept(&self, entries: &[Entry], correlate: &impl Fn(&str, &str) -> String) -> Result<()> {
         for entry in entries {
             self.validate(entry, correlate)?;
         }
@@ -335,11 +333,7 @@ impl Ledger {
         Ok(())
     }
 
-    fn validate(
-        &self,
-        entry: &Entry,
-        correlate: &impl Fn(&str, &str) -> String,
-    ) -> Result<()> {
+    fn validate(&self, entry: &Entry, correlate: &impl Fn(&str, &str) -> String) -> Result<()> {
         anyhow::ensure!(
             message::is_message_filename(&entry.filename) && !entry.binding.is_empty(),
             "delivery ledger entry has an invalid binding or filename"
@@ -820,9 +814,7 @@ mod tests {
         let mut ledger = open(tmp.path(), Harness::Codex);
         begin(&mut ledger, "thread-main", FILE_A);
         ledger.record(FILE_A, Evidence::Consumed).unwrap();
-        ledger
-            .record(FILE_A, Evidence::TransportAccepted)
-            .unwrap();
+        ledger.record(FILE_A, Evidence::TransportAccepted).unwrap();
         assert_eq!(ledger.entry(FILE_A).unwrap().phase, Phase::Consumed);
         assert_eq!(ledger.retention(FILE_A), Retention::Release);
     }

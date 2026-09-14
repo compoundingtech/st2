@@ -951,7 +951,10 @@ mod tests {
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|name| name.starts_with(".harness-state.tmp-"))
                 .collect::<Vec<_>>();
-            assert!(residue.is_empty(), "staging residue in {dir:?}: {residue:?}");
+            assert!(
+                residue.is_empty(),
+                "staging residue in {dir:?}: {residue:?}"
+            );
         }
 
         let blocked = tmp.path().join("blocked");
@@ -2191,7 +2194,10 @@ mod tests {
             .unwrap()
             .is_some()
         };
-        assert!(!probe(), "a live record-lock holder must exclude a second writer");
+        assert!(
+            !probe(),
+            "a live record-lock holder must exclude a second writer"
+        );
         drop(held);
         assert!(probe(), "dropping the guard must release the record lock");
     }

@@ -224,7 +224,12 @@ fn cli_managed_by_authority_retires_a_projected_seat_and_refuses_every_inexact_c
 
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_st2"))
-            .args(["--catalog", root.to_str().unwrap(), "agent", "desired-state"])
+            .args([
+                "--catalog",
+                root.to_str().unwrap(),
+                "agent",
+                "desired-state",
+            ])
             .args(args)
             .args(["--host", "h", "--json"])
             .env_remove("ST_AGENT")

@@ -490,10 +490,9 @@ fn resource_node_to_raw(node: &DeclaredNode) -> anyhow::Result<(String, RawResou
                 }
                 let encoded = value
                     .ok_or_else(|| anyhow::anyhow!("resource binding needs string `selector`"))?;
-                selector = Some(
-                    serde_json::from_str(&encoded)
-                        .map_err(|error| anyhow::anyhow!("resource binding `selector` is not valid JSON: {error}"))?,
-                );
+                selector = Some(serde_json::from_str(&encoded).map_err(|error| {
+                    anyhow::anyhow!("resource binding `selector` is not valid JSON: {error}")
+                })?);
             }
             other => anyhow::bail!("resource binding has unsupported property `{other}`"),
         }

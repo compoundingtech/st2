@@ -548,9 +548,7 @@ fn graph_without_explicit_ids_keeps_its_legacy_wire_shape() {
     // `runtime` is an opaque `Value` whose key order is not this contract.
     let emitted = agents_slice
         .lines()
-        .filter(|line| {
-            line.len() - line.trim_start().len() == 6 && line.starts_with("      \"")
-        })
+        .filter(|line| line.len() - line.trim_start().len() == 6 && line.starts_with("      \""))
         .filter_map(|line| {
             let rest = line.trim_start().strip_prefix('"')?;
             let key = rest.split_once('"')?.0;
@@ -584,10 +582,7 @@ fn graph_without_explicit_ids_keeps_its_legacy_wire_shape() {
     ];
     assert_eq!(
         emitted,
-        row_fields
-            .into_iter()
-            .chain(row_fields)
-            .collect::<Vec<_>>(),
+        row_fields.into_iter().chain(row_fields).collect::<Vec<_>>(),
         "existing fields must keep their order and the new ones must come last:\n{raw}"
     );
 
@@ -632,7 +627,11 @@ fn graph_reports_a_duplicate_explicit_agent_id_with_null_topology() {
         &format!("agent \"two\" {{ id \"{SHARED_ID}\"; host \"h2\"; command \"true\" }}\n"),
     );
 
-    let graph = json(&st2(root, &["catalog", "graph", "--host", "h", "--json"], None));
+    let graph = json(&st2(
+        root,
+        &["catalog", "graph", "--host", "h", "--json"],
+        None,
+    ));
     assert!(
         graph["conflicts"]
             .as_array()

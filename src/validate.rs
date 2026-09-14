@@ -291,9 +291,7 @@ pub(crate) fn validate_discovered(root: &Path, this_host: Option<&str>, d: &Disc
         let address_host = s.resolved_host(collision_host).to_string();
         let address = s.effective_address().to_string();
         let duplicate_address = (!s.desired_state.is_retired())
-            .then(|| {
-                seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone())
-            })
+            .then(|| seen_addresses.insert((address_host.clone(), address.clone()), s.path.clone()))
             .flatten();
         if let Some(prev) = &duplicate_id {
             issues.push(Issue::error(

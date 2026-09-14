@@ -20,8 +20,9 @@ use crate::native_channel::{channel_content, write_json};
 const POLL: Duration = Duration::from_millis(250);
 
 pub fn run(catalog_root: &Path, identity: &str) -> Result<()> {
-    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
-        .with_context(|| format!("Claude MCP agent '{identity}' is not declared"))?;
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| format!("Claude MCP agent '{identity}' is not declared"))?;
     let inbox = message::inbox_dir(&agent_dir);
     let (input_tx, input_rx) = mpsc::channel();
     thread::spawn(move || {

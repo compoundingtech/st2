@@ -2785,12 +2785,18 @@ fn explicit_id_and_address_lower_as_separate_typed_namespaces() {
     let found = discover_strict(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     let spec = find(&found.specs, "verifier");
-    assert_eq!(spec.id.as_deref(), Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"));
+    assert_eq!(
+        spec.id.as_deref(),
+        Some("0199b8f4-8d3a-7c21-9a44-6f85b7320ea1")
+    );
     assert_eq!(
         spec.effective_id("dev3"),
         "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1"
     );
-    assert_eq!(spec.address.as_deref(), Some("dotfiles.fractal.keymap.verifier"));
+    assert_eq!(
+        spec.address.as_deref(),
+        Some("dotfiles.fractal.keymap.verifier")
+    );
     assert_eq!(spec.effective_address(), "dotfiles.fractal.keymap.verifier");
     assert_eq!(
         spec.bus_address("other"),
@@ -2877,7 +2883,13 @@ fn the_address_grammar_is_bounded_lowercase_dotted_segments() {
     // overruns it while every segment stays legal on its own.
     let over_budget = format!(
         "{}.e",
-        ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(63)].join(".")
+        [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        ]
+        .join(".")
     );
     for (rejected, expected) in [
         ("Worker", "must match [a-z0-9-]+"),
@@ -2991,7 +3003,10 @@ fn id_and_address_have_equivalent_kdl_toml_and_json_lowering() {
     assert!(found.errors.is_empty(), "{:?}", found.errors);
     for format in ["kdl", "toml", "json"] {
         let spec = find(&found.specs, format);
-        assert_eq!(spec.id.as_deref(), Some(format!("frozen.{format}").as_str()));
+        assert_eq!(
+            spec.id.as_deref(),
+            Some(format!("frozen.{format}").as_str())
+        );
         assert_eq!(spec.effective_address(), format!("{format}.route"));
     }
 }

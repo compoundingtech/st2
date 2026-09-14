@@ -615,9 +615,7 @@ impl AgentSpec {
     /// `<host>.<identity>` bus identity — which is exactly the value catalog ID migration freezes
     /// as this subject's explicit ID, so a mixed catalog stays coherent while it is migrated.
     pub fn effective_id(&self, this_host: &str) -> String {
-        self.id
-            .clone()
-            .unwrap_or_else(|| self.bus_id(this_host))
+        self.id.clone().unwrap_or_else(|| self.bus_id(this_host))
     }
 
     /// The effective agent address (R24): the explicit `address` when present, otherwise the
@@ -1672,10 +1670,7 @@ pub fn validate_agent_address(value: &str) -> anyhow::Result<()> {
         value.len() <= AGENT_ADDRESS_MAX_BYTES,
         "agent `address` '{value}' exceeds the {AGENT_ADDRESS_MAX_BYTES}-character limit"
     );
-    anyhow::ensure!(
-        value.is_ascii(),
-        "agent `address` '{value}' must be ASCII"
-    );
+    anyhow::ensure!(value.is_ascii(), "agent `address` '{value}' must be ASCII");
     for segment in value.split('.') {
         anyhow::ensure!(
             !segment.is_empty(),

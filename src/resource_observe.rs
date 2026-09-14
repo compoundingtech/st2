@@ -976,7 +976,10 @@ mod tests {
             .unwrap()
             .is_some()
         };
-        assert!(!probe(), "a live scope-lock holder must exclude a second writer");
+        assert!(
+            !probe(),
+            "a live scope-lock holder must exclude a second writer"
+        );
         drop(held);
         assert!(probe(), "dropping the guard must release the scope lock");
     }

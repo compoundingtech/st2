@@ -114,8 +114,11 @@ pub fn run_omp(catalog_root: &Path, identity: &str) -> Result<()> {
 }
 
 fn run_for(catalog_root: &Path, identity: &str, kind: &ChannelKind) -> Result<()> {
-    let agent_dir = message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
-        .with_context(|| format!("{} channel agent '{identity}' is not declared", kind.label))?;
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| {
+                format!("{} channel agent '{identity}' is not declared", kind.label)
+            })?;
     let inbox = message::inbox_dir(&agent_dir);
     // Composed here rather than in the extension: what a restarted agent is told is st2's contract,
     // not the asset's, and the Codex and Claude hooks compose the same three blocks in bash.
@@ -699,10 +702,7 @@ mod tests {
         .unwrap();
         assert_eq!(question.blocked_on, harness_state::BlockedOn::Human);
         assert_eq!(question.ask, harness_state::Ask::Question);
-        assert_eq!(
-            question.reason.as_deref(),
-            Some("Which deployment target?")
-        );
+        assert_eq!(question.reason.as_deref(), Some("Which deployment target?"));
 
         let unknown_ask = state_observation(&json!({
             "type":"state","state":"active","blockedOn":"human",

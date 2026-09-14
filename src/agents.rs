@@ -116,8 +116,7 @@ pub fn roster_from_discovered(
                 id: s.effective_id(this_host),
                 address: s.effective_address().to_owned(),
                 // A retired subject does not resolve and does not occupy the address namespace.
-                bus_address: (!s.desired_state.is_retired())
-                    .then(|| s.bus_address(this_host)),
+                bus_address: (!s.desired_state.is_retired()).then(|| s.bus_address(this_host)),
             })
         })
         .collect();

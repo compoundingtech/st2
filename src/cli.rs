@@ -716,8 +716,14 @@ pub(crate) struct PresentationArgs {
 
 impl PresentationArgs {
     /// The selected subject and the requested value, where `None` is the cleared representation.
-    pub(crate) fn selection(self) -> Result<(st2::identity::AgentSelector, Option<String>, bool, Option<String>)>
-    {
+    pub(crate) fn selection(
+        self,
+    ) -> Result<(
+        st2::identity::AgentSelector,
+        Option<String>,
+        bool,
+        Option<String>,
+    )> {
         let (selector, value) = match self.agent_id {
             Some(id) => (st2::identity::AgentSelector::Id(id), self.first),
             None => (
@@ -1124,7 +1130,10 @@ pub(crate) enum EventCmd {
     /// Emit one producer-identified event into a declared agent stream.
     Emit {
         /// Owning agent: a bus address (`<host>.<address>`) or a bare local address.
-        #[arg(required_unless_present = "recipient_id", conflicts_with = "recipient_id")]
+        #[arg(
+            required_unless_present = "recipient_id",
+            conflicts_with = "recipient_id"
+        )]
         recipient: Option<String>,
         /// Owning agent by exact immutable agent ID (R24).
         #[arg(long = "recipient-id")]

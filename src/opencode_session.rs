@@ -1426,7 +1426,11 @@ impl Delivery {
         };
         // A newly selected session is a different delivery binding (the Codex thread rule): the
         // old binding's receipt may neither suppress nor acknowledge delivery to this one.
-        if self.ledger.binding().is_some_and(|binding| binding != target) {
+        if self
+            .ledger
+            .binding()
+            .is_some_and(|binding| binding != target)
+        {
             self.ledger.rebind(&target)?;
         }
         // Fail closed. An unreadable ledger holds and surfaces instead of guessing, and it never
@@ -1553,8 +1557,10 @@ impl Delivery {
         }
         // The transport call succeeded. That is a fact about the call, not about the server's
         // state, so it grades no higher than `transportAccepted`.
-        self.ledger
-            .record(&entry.filename, delivery_ledger::Evidence::TransportAccepted)?;
+        self.ledger.record(
+            &entry.filename,
+            delivery_ledger::Evidence::TransportAccepted,
+        )?;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.clear(DiagnosticStage::Delivery);
         }
@@ -2281,7 +2287,10 @@ mod tests {
             [expected_id.clone()]
         );
         // Same server fixture, same single-POST conclusion, honest label: `GET 200` is storage.
-        let entry = reopen_ledger(&state_path).entry(&filename).cloned().unwrap();
+        let entry = reopen_ledger(&state_path)
+            .entry(&filename)
+            .cloned()
+            .unwrap();
         assert_eq!(entry.phase, delivery_ledger::Phase::Persisted);
         assert_eq!(entry.correlation.value, expected_id);
         assert_eq!(
@@ -2302,8 +2311,6 @@ mod tests {
         delivery.pump(&client);
         assert_eq!(server.posts.lock().unwrap().len(), 1);
     }
-
-
 
     #[test]
     fn a_failed_transport_retries_the_same_identity_never_a_second_one() {

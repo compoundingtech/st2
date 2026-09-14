@@ -1011,7 +1011,9 @@ fn another_hosts_long_identity_is_not_judged_against_this_hosts_pty_root() {
     let long_identity = "a".repeat(200);
     let c = catalog(&[(
         &format!("elsewhere/{long_identity}/agent.kdl"),
-        &format!(r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#),
+        &format!(
+            r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#
+        ),
     )]);
 
     let r = validate_for_host(c.path(), "hetz");
@@ -1046,10 +1048,9 @@ fn two_hosts_may_not_share_one_explicit_agent_id() {
         .unwrap_or_else(|| panic!("catalog-global id collision must fail: {:?}", r.issues));
     assert_eq!(issue.severity, Severity::Error);
     assert!(
-        issue
-            .message
-            .contains("duplicate agent id '0199b8f4-8d3a-7c21-9a44-6f85b7320ea1' (also declared in")
-            && issue.message.contains("agent.kdl"),
+        issue.message.contains(
+            "duplicate agent id '0199b8f4-8d3a-7c21-9a44-6f85b7320ea1' (also declared in"
+        ) && issue.message.contains("agent.kdl"),
         "the diagnostic must name the id and the other declaration: {}",
         issue.message
     );

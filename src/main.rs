@@ -219,9 +219,8 @@ fn dispatch(command: Command, catalog_path: Option<&std::path::Path>) -> Result<
                 Some(_) => (None, first),
                 None => (first, second),
             };
-            let state = state.context(
-                "a desired state is required: `running`, `suspended`, or `retired`",
-            )?;
+            let state = state
+                .context("a desired state is required: `running`, `suspended`, or `retired`")?;
             anyhow::ensure!(
                 matches!(state.as_str(), "running" | "suspended" | "retired"),
                 "desired state must be `running`, `suspended`, or `retired`, not '{state}'"
@@ -2071,10 +2070,12 @@ fn message_cmd(cmd: MessageCmd) -> Result<()> {
                 Some(id) => id,
                 None => acting_route(&root, &host, &ctx)?,
             };
-            let mut view =
-                message::with_resolved_agent_dir(&root, &route_selector(&id), &host, |agent_dir| {
-                message::list_sent(agent_dir, include_body)
-            })?;
+            let mut view = message::with_resolved_agent_dir(
+                &root,
+                &route_selector(&id),
+                &host,
+                |agent_dir| message::list_sent(agent_dir, include_body),
+            )?;
             if let Some(recipient) = &to {
                 view.messages.retain(|message| message.to == *recipient);
             }
@@ -2304,8 +2305,7 @@ fn event_cmd(cmd: EventCmd) -> Result<()> {
             ctx,
         } => {
             let (root, host) = resolve_ctx(&ctx)?;
-            let recipient =
-                resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
+            let recipient = resolve_route(&root, &host, one_selector(recipient, recipient_id)?)?;
             let body = body_or_stdin(body)?;
             let receipt = st2::event::emit(
                 &root,
