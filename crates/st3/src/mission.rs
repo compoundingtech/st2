@@ -437,6 +437,8 @@ fn parse_step(
     let mut gates = Vec::new();
     let mut nested_mission = None;
     let mut retry = RetrySpec::default();
+    let mut retry_seen = false;
+    let mut looping = false;
     let mut revision_owners = Vec::new();
     if let Some(children) = node.children() {
         let mut names = BTreeSet::new();
@@ -538,7 +540,26 @@ fn parse_step(
                     rewrite_nested_paths(&mut mission, &path)?;
                     nested_mission = Some(Box::new(mission));
                 }
-                "retry" => retry = parse_retry(child)?,
+                "retry" => {
+                    if looping {
+                        return Err(St3Error::new(
+                            "conflicting-step-repeat",
+                            format!("step `{path}` cannot contain both `retry` and `loop`"),
+                        ));
+                    }
+                    retry = parse_retry(child)?;
+                    retry_seen = true;
+                }
+                "loop" => {
+                    if retry_seen {
+                        return Err(St3Error::new(
+                            "conflicting-step-repeat",
+                            format!("step `{path}` cannot contain both `retry` and `loop`"),
+                        ));
+                    }
+                    retry = parse_loop(child)?;
+                    looping = true;
+                }
                 other => {
                     return Err(St3Error::new(
                         "unknown-step-field",
@@ -547,6 +568,12 @@ fn parse_step(
                 }
             }
         }
+    }
+    if looping && gates.is_empty() {
+        return Err(St3Error::new(
+            "loop-without-gate",
+            format!("step `{path}` loop needs at least one gate"),
+        ));
     }
     validate_goal_count(&format!("step `{path}`"), &goals, false)?;
     let work_selector = build_work_selector(
@@ -1267,6 +1294,37 @@ fn parse_retry(node: &KdlNode) -> Result<RetrySpec, St3Error> {
     })
 }
 
+fn parse_loop(node: &KdlNode) -> Result<RetrySpec, St3Error> {
+    ensure_bare(node)?;
+    let body = node
+        .children()
+        .ok_or_else(|| St3Error::new("empty-loop", "loop is empty"))?;
+    for child in body.nodes() {
+        if !matches!(child.name().value(), "max-rounds" | "backoff") {
+            return Err(St3Error::new(
+                "invalid-loop-field",
+                format!("loop cannot contain `{}`", child.name().value()),
+            ));
+        }
+    }
+    let rounds = child_integer(body, "max-rounds")?
+        .ok_or_else(|| St3Error::new("missing-loop-rounds", "loop needs `max-rounds`"))?;
+    if !(2..=100).contains(&rounds) {
+        return Err(St3Error::new(
+            "invalid-loop-rounds",
+            "loop max-rounds must be between 2 and 100",
+        ));
+    }
+    let backoff_ms = child_string(body, "backoff")?
+        .map(|value| parse_duration(&value))
+        .transpose()?
+        .unwrap_or(0);
+    Ok(RetrySpec {
+        attempts: rounds as u32,
+        backoff_ms,
+    })
+}
+
 fn validate_dependencies(
     mission: &str,
     steps: &BTreeMap<String, StepSpec>,
@@ -1734,6 +1792,69 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn step_loops_use_one_bounded_repeat_policy() {
+        let source = r#"
+version 2
+
+mission "loop" state="ready" {
+  goal "Repeat one step until its gate passes."
+  step "improve" {
+    loop { max-rounds 4; backoff "2s" }
+    gate "the result is ready" { exists "resource/result" }
+  }
+}
+"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let retry = &intent.missions["loop"].steps["improve"].retry;
+        assert_eq!(retry.attempts, 4);
+        assert_eq!(retry.backoff_ms, 2_000);
+
+        for (source, code) in [
+            (
+                r#"version 2
+mission "bad" state="ready" {
+  goal "Reject an unbounded loop."
+  step "work" { loop { backoff "1s" }; gate "ready" { exists "resource/result" } }
+}"#,
+                "missing-loop-rounds",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" {
+  goal "Reject a one-round loop."
+  step "work" { loop { max-rounds 1 }; gate "ready" { exists "resource/result" } }
+}"#,
+                "invalid-loop-rounds",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" {
+  goal "Reject a loop without a gate."
+  step "work" { loop { max-rounds 2 } }
+}"#,
+                "loop-without-gate",
+            ),
+            (
+                r#"version 2
+mission "bad" state="ready" {
+  goal "Reject two repeat policies."
+  step "work" {
+    retry { attempts 2 }
+    loop { max-rounds 2 }
+    gate "ready" { exists "resource/result" }
+  }
+}"#,
+                "conflicting-step-repeat",
+            ),
+        ] {
+            assert_eq!(
+                crate::graph::parse_intent(source, "node").unwrap_err().code,
+                code
+            );
+        }
+    }
+
     #[test]
     fn parses_parallel_steps_nested_work_and_products() {
         let source = r#"

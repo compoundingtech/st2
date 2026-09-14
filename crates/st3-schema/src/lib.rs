@@ -39,6 +39,7 @@ pub enum Cardinality {
     Append,
     Once,
     OncePerActor,
+    OncePerAttempt,
     StateTransition,
 }
 
@@ -1034,7 +1035,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             "work.submitted",
             &["step-run"],
             WritePolicy::AuthorizedParticipant,
-            Cardinality::Once,
+            Cardinality::OncePerAttempt,
             Some("work"),
             true,
             &[],
@@ -1043,7 +1044,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             "work.failed",
             &["step-run"],
             WritePolicy::AuthorizedParticipant,
-            Cardinality::Once,
+            Cardinality::OncePerAttempt,
             Some("work"),
             true,
             &[],
@@ -1634,6 +1635,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[
+            ("attempt", integer()),
             ("status", string()),
             ("summary", string()),
             ("reason", string()),
@@ -2489,6 +2491,15 @@ mod tests {
                 .cardinality,
             Cardinality::Append
         );
+    }
+
+    #[test]
+    fn terminal_work_reports_are_once_per_attempt() {
+        for kind in ["work.submitted", "work.failed"] {
+            let spec = registry().claim(kind).unwrap();
+            assert_eq!(spec.cardinality, Cardinality::OncePerAttempt);
+            assert!(spec.fields.contains_key("attempt"));
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ The examples use local names and workspaces. Change them before production use.
 - [`nested-mission.kdl`](nested-mission.kdl) delegates a step into an inline child mission.
 - [`resource-observation.kdl`](resource-observation.kdl) gates work on a local observed resource.
 - [`mission-revision.kdl`](mission-revision.kdl) prepares a mission for controlled run generations.
+- [`loop-until-green.kdl`](loop-until-green.kdl) repeats one step until its gates pass or its round limit ends.
 
 `concurrent-intake.kdl` and `recurring-stewardship.kdl` contain a zero revision placeholder. Publish
 the child mission first. Replace the placeholder with the exact revision from `st mission show`.

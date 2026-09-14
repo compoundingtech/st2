@@ -1,0 +1,24 @@
+version 2
+
+mission "example/loop-until-green" state="ready" {
+  completion { when "all-steps-exhausted" }
+  goal "Improve one change until its tests pass or the round limit stops it."
+
+  agent "worker" {
+    workspace "."
+    harness "codex" { effort "high" }
+    restart "always"
+  }
+
+  step "improve" timeout="1h" {
+    assigned-to "agent/${ST_MISSION_RUN}/worker"
+    goal "Fix the failing test. In later rounds, inspect the prior gate result first."
+    loop { max-rounds 5; backoff "10s" }
+    gate "the test suite passes" {
+      exec "cargo test --workspace"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "20m"
+    }
+  }
+}

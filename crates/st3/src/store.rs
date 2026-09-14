@@ -2903,6 +2903,7 @@ impl Store {
             now,
         )?;
         let body = json!({"fields": {
+            "attempt": current.attempt,
             "status": status,
             "summary": request.summary,
             "reason": request.reason,
@@ -2931,7 +2932,7 @@ impl Store {
             &request.evidence,
             None,
         )
-        .map_err(internal)?;
+        .map_err(claim_append_error)?;
         let mut view = transaction.query_row(
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
@@ -8580,6 +8581,7 @@ fn validate_claim_cardinality(
     subject: &str,
     kind: &str,
     actor: Option<&str>,
+    fields: &BTreeMap<String, Value>,
     cardinality: &st3_schema::Cardinality,
 ) -> Result<(), St3Error> {
     let duplicate = match cardinality {
@@ -8602,6 +8604,21 @@ fn validate_claim_cardinality(
             .optional()
             .map_err(internal)?
             .is_some(),
+        st3_schema::Cardinality::OncePerAttempt => {
+            let attempt = fields.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+            transaction
+                .query_row(
+                    "SELECT 1 FROM claims
+                     WHERE subject=?1 AND kind=?2
+                       AND CAST(COALESCE(json_extract(body, '$.fields.attempt'), 1) AS INTEGER)=?3
+                     LIMIT 1",
+                    params![subject, kind, attempt],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(internal)?
+                .is_some()
+        }
     };
     if duplicate {
         return Err(St3Error::new(
@@ -9292,8 +9309,15 @@ fn append_claim_tx(
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
         .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
-    validate_claim_cardinality(transaction, subject, kind, actor, &claim_spec.cardinality)
-        .map_err(anyhow::Error::new)?;
+    validate_claim_cardinality(
+        transaction,
+        subject,
+        kind,
+        actor,
+        &fields,
+        &claim_spec.cardinality,
+    )
+    .map_err(anyhow::Error::new)?;
     let now = now_ms();
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
@@ -11366,6 +11390,18 @@ fn project_mission_run_update(
         return Ok(());
     }
     if claim.kind.starts_with("work.") {
+        let claim_attempt = fields.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+        let current_attempt = transaction
+            .query_row(
+                "SELECT attempt FROM step_runs WHERE subject=?1",
+                [&claim.subject],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if current_attempt != Some(claim_attempt) {
+            return Ok(());
+        }
         let lease_expiry = fields
             .get("claim_expires_at_unix_ms")
             .and_then(Value::as_u64)
@@ -16246,6 +16282,92 @@ mission "nested-work" state="ready" {
         assert_eq!(view.status, "pending");
         assert_eq!(view.attempt, 2);
         assert!(view.not_before_unix_ms.unwrap() >= view.updated_at_unix_ms + 59_000);
+    }
+
+    #[test]
+    fn a_worker_can_submit_each_loop_attempt_once() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"version 2
+
+agent "worker" { workspace "/tmp"; command "true" }
+
+mission "loop" state="ready" {
+  goal "Repeat work until its gate passes."
+  step "work" {
+    assigned-to "agent/worker"
+    loop { max-rounds 3 }
+    gate "the result is ready" { exists "resource/result" }
+  }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "loop-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "loop".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "loop-run".into(),
+            })
+            .unwrap();
+        let subject = &run.steps[0].subject;
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("current".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+
+        store.set_step_state(subject, "ready", None).unwrap();
+        store
+            .work_action(subject, "claim", &request("claim-round-1"))
+            .unwrap();
+        store
+            .work_action(subject, "complete", &request("complete-round-1"))
+            .unwrap();
+        store
+            .set_step_state(subject, "failed", Some("the gate failed"))
+            .unwrap();
+        store.retry_step(subject, "loop round 2", 0).unwrap();
+        store.set_step_state(subject, "ready", None).unwrap();
+        store
+            .work_action(subject, "claim", &request("claim-round-2"))
+            .unwrap();
+        let completed = store
+            .work_action(subject, "complete", &request("complete-round-2"))
+            .unwrap();
+        assert_eq!(completed.status, "verifying");
+        assert_eq!(completed.attempt, 2);
+
+        let connection = store.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT CAST(json_extract(body, '$.fields.attempt') AS INTEGER)
+                 FROM claims WHERE subject=?1 AND kind='work.submitted' ORDER BY store_index",
+            )
+            .unwrap();
+        let attempts = statement
+            .query_map([subject], |row| row.get::<_, u64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(attempts, [1, 2]);
     }
 
     #[test]

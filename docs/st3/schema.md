@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `71a70255d50ac0dc6b430fc3eb8cf3f18b135278bda5de411e41412ad85b5a35`
+Digest: `373c772c1336af04e13ecc06a29f982c486a155ee2c64dbb311119e9aa230d64`
 
 ## Subject families
 
@@ -121,11 +121,11 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `byte_count:integer`, `incarnation_id:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |
 | `terminal.input.result` | `agent`, `pty` | `system-only` | `append` | `incarnation_id:string`, `reason:string`, `result!:string`, `runtime_id:string`, `sequence:integer` |  |
 | `transport.observed` | `host` | `system-only` | `append` | `last_success_at:integer`, `protocol:string`, `reason:string`, `remote_heads:object`, `status!:string` |  |
-| `work.claimed` | `step-run` | `authorized-participant` | `state-transition` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
-| `work.failed` | `step-run` | `authorized-participant` | `once` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
-| `work.progress` | `step-run` | `authorized-participant` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
-| `work.released` | `step-run` | `authorized-participant` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
-| `work.renewed` | `step-run` | `authorized-participant` | `append` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
-| `work.submitted` | `step-run` | `authorized-participant` | `once` | `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.claimed` | `step-run` | `authorized-participant` | `state-transition` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.failed` | `step-run` | `authorized-participant` | `once-per-attempt` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.progress` | `step-run` | `authorized-participant` | `append` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.released` | `step-run` | `authorized-participant` | `append` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.renewed` | `step-run` | `authorized-participant` | `append` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.submitted` | `step-run` | `authorized-participant` | `once-per-attempt` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
 
 `resource.observed` validates facts against the resource kind. Custom resource facts remain open.

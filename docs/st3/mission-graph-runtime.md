@@ -256,6 +256,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   DESIRED_STATE...
   mission "nested-work" { ... }
   retry { attempts 3; backoff "30s" }
+  loop { max-rounds 5; backoff "30s" }
   produces { PRODUCT... }
   produces-mission "generated-mission"
   uses-mission output-of="producer-step"
@@ -263,7 +264,11 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, and `uses-mission` are single fields.
+`title`, `assigned-to`, `agentless`, `mission`, `retry`, `loop`, `produces`, `produces-mission`, and `uses-mission` are single fields.
+
+A step can contain `retry` or `loop`, but not both. A retry handles a bounded transient failure.
+
+A loop repeats the complete step until all its gates pass. It needs at least one gate and an explicit `max-rounds` cap.
 
 `available-to`, `goal`, `constraint`, `document`, `depends-on`, `baseline`, and `gate` can repeat. A step accepts at most three goals.
 
@@ -562,7 +567,13 @@ For a normal step, st3 performs this sequence:
 13. Evaluate gates.
 14. Mark the step completed or failed.
 
-When a step fails and its retry policy permits another attempt, st3 increments the attempt, applies backoff, and starts again at dependency and baseline admission. Retryable failure does not terminate the mission before the retry.
+When a step fails and its repeat policy permits another attempt, st3 increments the attempt, applies backoff, and starts at dependency admission.
+
+Each attempt can submit or fail its work once. A failed gate can therefore return the same step to its worker for another loop round.
+
+`ST_ATTEMPT` contains the current attempt or loop round. The step subject stays stable across all rounds.
+
+A retryable failure does not terminate the mission before the next attempt.
 
 The `completion` frontier selects when st3 checks mission products and gates. st3 then enters the final phase when one exists.
 
