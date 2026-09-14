@@ -882,6 +882,7 @@ pub struct ExternalInbox {
     root: PathBuf,
     identity: String,
     inbox: PathBuf,
+    sender: Option<String>,
 }
 
 impl ExternalInbox {
@@ -897,7 +898,22 @@ impl ExternalInbox {
             root: root.to_path_buf(),
             identity: identity.to_owned(),
             inbox: root.join(identity).join("inbox"),
+            sender: None,
         })
+    }
+
+    /// Add the exact canonical eval participant that can keep sending after its admitted
+    /// declaration changes. The eval runner owns this authority and injects it per task.
+    pub fn with_sender(mut self, sender: &str) -> anyhow::Result<Self> {
+        let mut components = Path::new(sender).components();
+        let safe = matches!(components.next(), Some(Component::Normal(component)) if component == sender)
+            && components.next().is_none();
+        anyhow::ensure!(
+            safe,
+            "external requester sender must be one non-empty relative path component"
+        );
+        self.sender = Some(sender.to_owned());
+        Ok(self)
     }
 
     pub fn provision(root: &Path, identity: &str) -> anyhow::Result<Self> {
@@ -1768,8 +1784,10 @@ pub fn send_to_resolved_inbox(
     let from = selector_reference(sender);
     let recipient = resolve_delivery_endpoint(catalog_root, recipient, this_host, external)?;
     let sender = optional_agent_handle(catalog_root, sender, this_host)?;
-    let external_sender =
-        external.is_some_and(|external| external.root == catalog_root && external.identity == from);
+    let external_sender = external.is_some_and(|external| {
+        external.root == catalog_root
+            && (external.identity == from || external.sender.as_deref() == Some(from))
+    });
     if matches!(&recipient, DeliveryEndpoint::External { .. }) || external_sender {
         anyhow::ensure!(
             idempotency_key.is_none(),
@@ -2941,6 +2959,13 @@ mod tests {
             assert!(
                 ExternalInbox::new(tmp.path(), identity).is_err(),
                 "accepted unsafe external identity {identity:?}"
+            );
+            assert!(
+                ExternalInbox::new(tmp.path(), "requester")
+                    .unwrap()
+                    .with_sender(identity)
+                    .is_err(),
+                "accepted unsafe external sender {identity:?}"
             );
         }
     }

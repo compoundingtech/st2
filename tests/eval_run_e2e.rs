@@ -741,7 +741,7 @@ for _ in $(seq 1 100); do
   set -- "$CATALOG/agents/evalhost/interviewer/resources/inbox/"*.md
   if [ -e "$1" ]; then
     sleep 0.02
-    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done" >/dev/null 2>&1
+    st2 message send requester --root "$ST_ROOT" --as evalhost.interviewer -m "done"
     echo "completed through frozen route"
     break
   fi

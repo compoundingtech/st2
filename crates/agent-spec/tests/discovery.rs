@@ -1124,7 +1124,11 @@ args = ["--agent", "build"]
     });
     for identity in ["claude-kdl", "claude-harness", "claude-toml", "claude-json"] {
         let spec = find(&found.specs, identity);
-        assert_eq!(spec.driver.as_ref(), Some(&claude));
+        assert_eq!(
+            spec.driver.as_ref(),
+            Some(&claude),
+            "driver mismatch for {identity}"
+        );
         assert!(!spec.is_runnable());
     }
     let codex = Driver::Codex(CodexDriver {

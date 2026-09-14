@@ -354,18 +354,6 @@ fn admitted_topology(
     {
         return None;
     }
-    let host = spec.resolved_host(this_host);
-    if specs
-        .iter()
-        .filter(|candidate| {
-            candidate.resolved_host(this_host) == host
-                && crate::supervisor_chain::is_counted_root(candidate)
-        })
-        .count()
-        != 1
-    {
-        return None;
-    }
     let chain = crate::supervisor_chain::chain(specs, spec, this_host).ok()?;
     let ancestor_ids = chain
         .iter()

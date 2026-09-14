@@ -395,7 +395,13 @@ fn load_canonical_eval_team(catalog: &Path, host: &str) -> Result<CanonicalEvalT
             );
         }
         for task in &spec.tasks {
-            for root in ["CATALOG", "ST_ROOT", "PTY_ROOT", "ST2_EVAL_REQUESTER"] {
+            for root in [
+                "CATALOG",
+                "ST_ROOT",
+                "PTY_ROOT",
+                "ST2_EVAL_REQUESTER",
+                "ST2_EVAL_SENDER",
+            ] {
                 if task.env.contains_key(root) {
                     anyhow::bail!(
                         "canonical-agents Agent Spec `{bus_id}` must not override eval-owned `{root}`"
@@ -528,6 +534,7 @@ fn sanitize_agent_env() {
             || k.starts_with("CODEX_")
             || k.starts_with("PI_")
             || k.starts_with("ST2_PI_CHANNEL_")
+            || matches!(k, "ST2_EVAL_REQUESTER" | "ST2_EVAL_SENDER")
     };
     let victims: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
@@ -1387,9 +1394,12 @@ fn run_eval_inner(
             }
             crate::message::ExternalInbox::provision(&bus, &requester)?;
             for spec in &mut specs {
+                let sender = spec.bus_id(host);
                 for task in &mut spec.tasks {
                     task.env
                         .insert("ST2_EVAL_REQUESTER".to_owned(), requester.clone());
+                    task.env
+                        .insert("ST2_EVAL_SENDER".to_owned(), sender.clone());
                 }
             }
         }
@@ -2118,6 +2128,18 @@ agent "worker" { identity "worker"; host "evalhost"; argv "true" }
   identity "worker"
   host "evalhost"
   env { ST2_EVAL_REQUESTER "shadow-requester" }
+  argv "true"
+}"#,
+                )],
+            ),
+            (
+                "ST2_EVAL_SENDER",
+                vec![(
+                    "agents/evalhost/worker/agent.kdl",
+                    r#"agent "worker" {
+  identity "worker"
+  host "evalhost"
+  env { ST2_EVAL_SENDER "shadow-sender" }
   argv "true"
 }"#,
                 )],

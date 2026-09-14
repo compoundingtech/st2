@@ -3636,8 +3636,28 @@ fn marker_time_state_routes_existing_orphans_but_never_flat_falls_back_for_new_a
             .next()
             .is_some()
     );
-    let ambiguous = send(&catalog, "remote.worker", "ambiguous");
-    assert!(!ambiguous.status.success());
+    let local_dotted = send(&catalog, "remote.worker", "local dotted address");
+    assert!(
+        local_dotted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local_dotted.stderr)
+    );
+    assert!(
+        agent_dir(&catalog, "remote.worker")
+            .join("resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(
+        catalog
+            .join("agents/remote/worker/resources/inbox")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
     let trapped = send(&catalog, "trap", "must not escape");
     assert!(!trapped.status.success());
     assert!(external.read_dir().unwrap().next().is_none());
