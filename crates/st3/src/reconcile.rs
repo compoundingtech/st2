@@ -6000,6 +6000,7 @@ version 2
     #[test]
     fn a_mission_step_waits_for_native_driver_readiness_before_starting_a_gate() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
         let source = r#"
             version 2
 
@@ -6033,7 +6034,7 @@ version 2
             .create_mission_run(&crate::model::MissionRunRequest {
                 mission: "proof".into(),
                 revision: None,
-                workspace: "/tmp".into(),
+                workspace: workspace.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
@@ -6109,6 +6110,7 @@ version 2
     #[test]
     fn a_mission_step_fails_when_its_non_restarting_driver_exits_before_readiness() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
         let source = r#"
             version 2
 
@@ -6130,7 +6132,7 @@ version 2
             .create_mission_run(&crate::model::MissionRunRequest {
                 mission: "driver-start-failure".into(),
                 revision: None,
-                workspace: "/tmp".into(),
+                workspace: workspace.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
@@ -6176,6 +6178,7 @@ version 2
     #[test]
     fn a_simulated_codex_graph_reaches_completion_and_cleans_its_runtimes() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
         let source = r#"
             version 2
 
@@ -6255,7 +6258,7 @@ version 2
             .create_mission_run(&crate::model::MissionRunRequest {
                 mission: "eval/simulated-codex".into(),
                 revision: None,
-                workspace: "/tmp".into(),
+                workspace: workspace.path().display().to_string(),
                 requester: Some("person/test".into()),
                 mode: Some("eval".into()),
                 inputs: BTreeMap::new(),
