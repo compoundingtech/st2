@@ -8,7 +8,7 @@ The held-out gates require a feature commit and reject changes to `main` or its 
 
 Start the st3 daemon. Then run `st3 eval ./evals/st3/weird-git-setup --graph` from an interactive terminal.
 
-The [live eval graph runbook](../../../docs/st3/live-eval-graph-runbook.md) gives the complete two-terminal procedure.
+Use `st3 graph RUN --follow` to inspect the live eval graph in another terminal.
 
 The `receipts/` directory contains the 2026-08-30 live graph proof.
 

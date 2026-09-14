@@ -1,25 +1,32 @@
 # st3 product roadmap
 
-Status: planning input, not a release schedule.
+This file records accepted future work. Active fleet work belongs in st3 missions.
 
-This file records work that needs a future design or implementation session. Current fleet work remains in st3 missions.
+## Agent continuity
 
-## Product surface
-
-- [ ] Make the root README describe Small Talk and st3 first. Keep an `st2` section that links to a separate legacy README until st2 is removed.
-- [ ] Expose an `st` executable that runs the st3 command surface. Keep the `st3` executable during the migration.
-- [ ] Reduce the general design document to stable system decisions. Keep detailed technical contracts in focused documents.
-
-## Agent continuity and presentation
-
-- [ ] Build agent session freeze-drying and rehydration into st3. A long graph wait can suspend a harness and retain its resumable session state. A later graph change can restore that session before work resumes. A human gate is one important suspension case. The design must define safe suspension points, stored state, timing policy, and recovery failure behavior.
-- [ ] Define a harness-neutral session view contract in the harness drivers. The contract must support custom conversation views in SwiftUI, React, and other native clients. It must describe ordered messages, roles, tool activity, runtime status, errors, usage, and incremental updates. It must not expose driver-specific storage as the public contract.
+- [ ] Freeze-dry an idle harness session at a long graph wait or human gate.
+- [ ] Rehydrate the exact session when the graph makes work ready again.
+- [ ] Define safe suspension points, stored state, timing, and recovery failure behavior.
+- [ ] Add a harness-neutral session view for SwiftUI, React, and other native clients.
+- [ ] Include ordered messages, roles, tool activity, status, errors, usage, and incremental updates.
 
 ## User interfaces
 
-- [ ] Hold one product design session for `stui` and the Small Talk mobile app. Define the shared product model before the two interfaces diverge. Specify separate v0 and v1 outcomes, supported views, human actions, live-update behavior, transport, authentication, and offline behavior.
+- [ ] Hold a product design session for `stui` and the Small Talk mobile application.
+- [ ] Define separate v0 and v1 outcomes for views, actions, live updates, transport, authentication, and offline behavior.
+- [ ] Build structured sitrep data from graph queries and exec missions instead of a permanent Markdown report.
 
-## Examples and migration knowledge
+## Runtime containment
 
-- [ ] Add a tested st3 examples collection. Show standing agents, queued work, human gates, concurrent intake, recurring work, planning, revision generations, nested missions, resource observation, attention, and cleanup. Keep each example smaller than an eval and validate every KDL file in tests.
-- [ ] Capture the st2 repository agent's current responsibilities before its st3 migration. Store current work in missions, stable product knowledge in repository documentation, and behavioral guarantees in tests or examples. Do not copy raw conversation history into a permanent prompt.
+- [ ] Add optional CPU, memory, process, and disk limits for each mission-owned runtime.
+- [ ] Use cgroups on Linux where available.
+- [ ] Evaluate the macOS sandbox and resource-limit surfaces before selecting an enforcement contract.
+
+## Harness accounts
+
+- [ ] Design quota-aware account pools for Codex and OMP harnesses.
+- [ ] Keep each conversation sticky to its selected account.
+- [ ] Select an eligible account from current usage and health information.
+- [ ] Support round-robin or threshold-based selection without moving active conversations.
+- [ ] Keep credentials local and make account failure isolate to one account.
+- [ ] Evaluate [Comradex](https://github.com/nicosuave/comradex) as a reference for Codex account routing.

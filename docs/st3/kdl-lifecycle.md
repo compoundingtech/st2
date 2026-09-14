@@ -446,4 +446,4 @@ An accepted operation can cause later runtime work. A later start, stop, observe
 
 This split keeps authored intent atomic and keeps real-world effects observable.
 
-The [lifecycle eval receipts](kdl-lifecycle-eval-receipts.md) record the exact paid runs, discovered defects, fixes, and retained continuation proof.
+The st3 eval suite proves these workflows with isolated state and bounded run time.

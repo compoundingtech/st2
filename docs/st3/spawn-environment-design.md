@@ -251,7 +251,7 @@ Every absence test prints the examined environment-name count. An empty observat
 4. Move st2 exec and PTY launches to the same contract.
 5. Add receipts, inspection, and doctor checks.
 6. Migrate host profiles and explicit declaration dependencies.
-7. Run the candidate-catalog rollout gate before any deployment.
+7. Run the migration rehearsal and service checks before any deployment.
 
 Each step is separately reversible. No step authorizes a live member restart.
 
