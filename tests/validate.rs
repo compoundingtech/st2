@@ -111,7 +111,6 @@ fn explicit_and_typed_session_drivers_reject_ding() {
     }
 }
 
-
 #[test]
 fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
     let c = catalog(&[
@@ -648,6 +647,118 @@ fn the_future_schedule_preview_is_explicitly_rejected() {
     ));
 }
 
+#[test]
+fn lifecycle_matrix_splits_structural_validity_from_ambient_readiness() {
+    for (name, lifecycle, running) in [
+        ("running", "", true),
+        (
+            "suspended",
+            r#"desired-state "suspended" reason="Waiting""#,
+            false,
+        ),
+        (
+            "canonical-retired",
+            r#"desired-state "retired" reason="Finished""#,
+            false,
+        ),
+        ("legacy-retired", "retired #true", false),
+    ] {
+        let ambient = format!(
+            r#"agent "worker" {{
+  host "h"
+  supervisor "h.base"
+  {lifecycle}
+  workspace "$CATALOG/missing-workspace"
+  render {{ copy "_templates/missing-source" "safe" }}
+}}"#
+        );
+        let c = catalog(&[
+            (
+                "h/base/agent.kdl",
+                r#"agent "base" { host "h"; command "true" }"#,
+            ),
+            (&format!("h/{name}/agent.kdl"), &ambient),
+        ]);
+        let report = validate_for_host(c.path(), "h");
+        for code in ["bad-path", "not-runnable", "render-error"] {
+            assert_eq!(
+                has(&report, code, Severity::Error),
+                running,
+                "{name}: {code}: {:?}",
+                report.issues
+            );
+        }
+
+        let structural = format!(
+            r#"agent "worker" {{
+  host "h"
+  supervisor "h.base"
+  {lifecycle}
+  workspace "unsafe/relative"
+  delivery-readiness "credential" account-id="tokengate/shared"
+  render {{ file "../escape" "content" }}
+}}"#
+        );
+        let c = catalog(&[
+            (
+                "h/base/agent.kdl",
+                r#"agent "base" { host "h"; command "true" }"#,
+            ),
+            (&format!("h/{name}/agent.kdl"), &structural),
+        ]);
+        let report = validate_for_host(c.path(), "h");
+        for code in ["bad-path", "native-driver-missing", "render-error"] {
+            assert!(
+                has(&report, code, Severity::Error),
+                "{name}: structural {code}: {:?}",
+                report.issues
+            );
+        }
+    }
+}
+
+#[test]
+fn delivery_readiness_presence_is_required_only_while_running() {
+    for (name, lifecycle, running) in [
+        ("running", "", true),
+        (
+            "suspended",
+            r#"desired-state "suspended" reason="Waiting""#,
+            false,
+        ),
+        (
+            "canonical-retired",
+            r#"desired-state "retired" reason="Finished""#,
+            false,
+        ),
+        ("legacy-retired", "retired #true", false),
+    ] {
+        let declaration = format!(
+            r#"agent "worker" {{
+  host "h"
+  supervisor "h.base"
+  {lifecycle}
+  argv "axe"
+  session-driver "codex"
+}}"#
+        );
+        let c = catalog(&[
+            (
+                "h/base/agent.kdl",
+                r#"agent "base" { host "h"; command "true" }"#,
+            ),
+            (&format!("h/{name}/agent.kdl"), &declaration),
+        ]);
+        let report = validate_for_host(c.path(), "h");
+        assert_eq!(
+            has(&report, "delivery-readiness-missing", Severity::Error),
+            running,
+            "{name}: {:?}",
+            report.issues
+        );
+    }
+}
+
 // ---- warnings --------------------------------------------------------------------------------
 
 #[test]
@@ -743,7 +854,6 @@ fn a_suspended_root_still_holds_the_root_slot() {
     ]);
     assert_eq!(
         validate(with_rival.path()).errors(),
-
         0,
         "a retired tombstone must not rival a suspended root"
     );
@@ -875,6 +985,50 @@ fn a_dangling_overlay_import_is_a_warning() {
     std::fs::create_dir_all(d.path().join("hetz/w")).unwrap();
     std::fs::write(d.path().join("hetz/w/agent.kdl"), agent).unwrap();
     assert!(has(&validate(d.path()), "dangling-import", Severity::Warn));
+}
+
+#[test]
+fn overlay_availability_is_checked_only_while_running() {
+    for (name, lifecycle, running) in [
+        ("running", "", true),
+        (
+            "suspended",
+            r#"desired-state "suspended" reason="Waiting""#,
+            false,
+        ),
+        (
+            "canonical-retired",
+            r#"desired-state "retired" reason="Finished""#,
+            false,
+        ),
+        ("legacy-retired", "retired #true", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".claude/rules")).unwrap();
+        std::fs::write(
+            workspace.join(".claude/rules/st2.md"),
+            "@../../.st2/PERSONA.md\n",
+        )
+        .unwrap();
+        let declaration = format!(
+            r#"agent "{name}" {{
+  host "h"
+  {lifecycle}
+  workspace "{}"
+  command "true"
+}}"#,
+            workspace.display()
+        );
+        let c = catalog(&[(&format!("h/{name}/agent.kdl"), &declaration)]);
+        let report = validate_for_host(c.path(), "h");
+        assert_eq!(
+            has(&report, "dangling-import", Severity::Warn),
+            running,
+            "{name}: {:?}",
+            report.issues
+        );
+    }
 }
 
 // ---- CLI: exit codes, --strict, --json, native example ---------------------------------------
@@ -1034,6 +1188,85 @@ fn an_unbindable_session_socket_path_is_rejected_at_admission() {
     );
 }
 
+#[test]
+fn inactive_unbindable_session_sockets_are_accepted() {
+    let long_identity = "a".repeat(200);
+    for (name, lifecycle) in [
+        ("suspended", r#"desired-state "suspended" reason="Waiting""#),
+        (
+            "canonical-retired",
+            r#"desired-state "retired" reason="Finished""#,
+        ),
+        ("legacy-retired", "retired #true"),
+    ] {
+        let declaration = format!(
+            r#"agent "{long_identity}" {{
+  host "hetz"
+  supervisor "hetz.base"
+  {lifecycle}
+  pty "agent" {{ command "x" }}
+}}"#
+        );
+        let c = catalog(&[
+            (
+                "hetz/base/agent.kdl",
+                r#"agent "base" { host "hetz"; command "x" }"#,
+            ),
+            (&format!("hetz/{long_identity}/agent.kdl"), &declaration),
+        ]);
+        let report = validate_for_host(c.path(), "hetz");
+        assert!(
+            !has(&report, "socket-path-too-long", Severity::Error),
+            "{name}: inactive declarations do not bind sockets: {:?}",
+            report.issues
+        );
+        assert_eq!(
+            report.errors(),
+            0,
+            "{name}: inactive declaration must pass admission: {:?}",
+            report.issues
+        );
+    }
+}
+
+#[test]
+fn activating_an_unbindable_session_socket_restores_the_admission_refusal() {
+    let long_identity = "a".repeat(200);
+    let path = format!("hetz/{long_identity}/agent.kdl");
+    let suspended = format!(
+        r#"agent "{long_identity}" {{
+  host "hetz"
+  supervisor "hetz.base"
+  desired-state "suspended" reason="Waiting"
+  pty "agent" {{ command "x" }}
+}}"#
+    );
+    let c = catalog(&[
+        (
+            "hetz/base/agent.kdl",
+            r#"agent "base" { host "hetz"; command "x" }"#,
+        ),
+        (&path, &suspended),
+    ]);
+    let inactive = validate_for_host(c.path(), "hetz");
+    assert!(!has(&inactive, "socket-path-too-long", Severity::Error));
+    assert_eq!(inactive.errors(), 0, "{:?}", inactive.issues);
+
+    std::fs::write(
+        c.path().join(path),
+        format!(
+            r#"agent "{long_identity}" {{ host "hetz"; supervisor "hetz.base"; pty "agent" {{ command "x" }} }}"#
+        ),
+    )
+    .unwrap();
+    let report = validate_for_host(c.path(), "hetz");
+    assert!(
+        has(&report, "socket-path-too-long", Severity::Error),
+        "activation must refuse before attempting the impossible bind: {:?}",
+        report.issues
+    );
+}
+
 /// An exec task binds no session socket, so its id is not subject to the bound.
 #[test]
 fn a_long_exec_task_id_is_not_a_socket_path_issue() {
@@ -1058,7 +1291,9 @@ fn another_hosts_long_identity_is_not_judged_against_this_hosts_pty_root() {
     let long_identity = "a".repeat(200);
     let c = catalog(&[(
         &format!("elsewhere/{long_identity}/agent.kdl"),
-        &format!(r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#),
+        &format!(
+            r#"agent "{long_identity}" {{ host "elsewhere"; pty "agent" {{ command "x" }} }}"#
+        ),
     )]);
 
     let r = validate_for_host(c.path(), "hetz");
@@ -1093,10 +1328,9 @@ fn two_hosts_may_not_share_one_explicit_agent_id() {
         .unwrap_or_else(|| panic!("catalog-global id collision must fail: {:?}", r.issues));
     assert_eq!(issue.severity, Severity::Error);
     assert!(
-        issue
-            .message
-            .contains("duplicate agent id '0199b8f4-8d3a-7c21-9a44-6f85b7320ea1' (also declared in")
-            && issue.message.contains("agent.kdl"),
+        issue.message.contains(
+            "duplicate agent id '0199b8f4-8d3a-7c21-9a44-6f85b7320ea1' (also declared in"
+        ) && issue.message.contains("agent.kdl"),
         "the diagnostic must name the id and the other declaration: {}",
         issue.message
     );

@@ -265,6 +265,7 @@ fn selected_codex_gate_suppresses_launch_on_stale_hooks() {
         workspace: None,
         supervisor: None,
         desired_state: crate::AgentDesiredState::Running,
+        residency_policy: crate::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,
@@ -324,6 +325,7 @@ fn selected_identity_conflict_refuses_before_hook_verification_or_inventory() {
         workspace: None,
         supervisor: None,
         desired_state: crate::AgentDesiredState::Running,
+        residency_policy: crate::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,
@@ -498,6 +500,84 @@ fn supervisor_wakes_and_launches_a_new_direct_declaration() {
 
     assert_eq!(passes, 2, "the 60s timer must not be the publication path");
     assert_eq!(runner.spawned.borrow().as_slice(), ["test-host.live"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn residency_wake_control_file_triggers_an_immediate_reconcile() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent = catalog.path().join("agents/test-host/worker");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("agent.kdl"),
+        r#"agent "worker" {
+  host "test-host"
+  residency-policy "on-demand"
+  session-driver "omp"
+  argv "omp" "--prompt" "continue"
+}
+"#,
+    )
+    .unwrap();
+    let stop = AtomicBool::new(false);
+    let runner = SpawnCountingRunner::default();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let mut wake_path = None;
+    let mut passes = 0usize;
+
+    std::thread::scope(|scope| {
+        let watchdog_stop = &stop;
+        scope.spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                watchdog_stop.store(true, Ordering::SeqCst);
+            }
+        });
+        up_loop_until_with_residency(
+            catalog.path(),
+            "test-host",
+            &runner,
+            Duration::from_secs(60),
+            &stop,
+            |root, tx| {
+                assert!(
+                    root.join(".st2/control/residency-wake").is_dir(),
+                    "the dedicated control directory must exist before watcher registration"
+                );
+                best_effort_catalog_watcher(root, tx)
+            },
+            Some(crate::residency_host::HostPolicy {
+                idle_after: Duration::from_secs(60),
+                warm_capacity: 1,
+            }),
+            |_| {
+                passes += 1;
+                match passes {
+                    1 => {
+                        wake_path = Some(
+                            crate::residency_host::request_wake(
+                                catalog.path(),
+                                "test-host",
+                                "test-host.worker",
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    2 => {
+                        assert!(
+                            !wake_path.as_ref().unwrap().exists(),
+                            "the targeted residency pass must consume the exact wake request"
+                        );
+                        let _ = done_tx.send(());
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    _ => panic!("one residency request must cause exactly one prompt pass"),
+                }
+            },
+        )
+        .unwrap();
+    });
+
+    assert_eq!(passes, 2, "the 60s timer must not be the wake path");
 }
 
 #[test]
@@ -687,6 +767,33 @@ impl Runner for SpawnCountingRunner {
     fn patch_presentation(&self, _presentation: &PtyPresentation) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn on_demand_agents_do_not_launch_without_host_policy() {
+    let catalog = tempfile::tempdir().unwrap();
+    let agent_dir = catalog.path().join("agents/hetz/worker");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("agent.kdl"),
+        r#"agent "worker" {
+  host "hetz"
+  residency-policy "on-demand"
+  session-driver "omp"
+  argv "omp" "--prompt" "continue"
+}
+"#,
+    )
+    .unwrap();
+    let runner = SpawnCountingRunner::default();
+
+    let report = up_once(catalog.path(), "hetz", &runner).unwrap();
+
+    assert!(runner.spawned.borrow().is_empty());
+    assert!(report.errors.iter().any(|error| {
+        error.contains("on-demand agents require host --residency-idle-after")
+            && error.contains("hetz.worker")
+    }));
 }
 
 /// `execute` must close every pass, or a task that recovers is never forgiven and eventually
@@ -883,6 +990,7 @@ fn spec_fixture() -> AgentSpec {
         workspace: None,
         supervisor: None,
         desired_state: crate::AgentDesiredState::Running,
+        residency_policy: crate::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,

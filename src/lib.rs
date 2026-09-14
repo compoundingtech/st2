@@ -44,9 +44,9 @@ pub mod materialize;
 pub mod message;
 /// The stdio framing shared by the native channels; crate-internal.
 mod native_channel;
-pub mod omp_session;
 pub mod metrics;
 pub mod migrations;
+pub mod omp_session;
 pub mod opencode_session;
 pub mod park;
 pub mod pi_channel;
@@ -58,6 +58,8 @@ pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
 pub mod request;
+pub mod residency;
+pub mod residency_host;
 pub mod resource_observe;
 pub mod resource_profile;
 pub mod resource_profile_supervisor;
@@ -80,8 +82,8 @@ pub use agent_spec::{discovery, spec};
 pub use agent_spec::discovery::{Discovered, SpecError, discover, discover_file, discover_strict};
 pub use agent_spec::spec::{
     AgentDesiredState, AgentSpec, ClaudeDriver, CodexDriver, DeliveryTransport, Driver, JobType,
-    OmpDriver, OpenCodeDriver, PiDriver, Resource, Restart, RestartMode, SessionDriver, Task,
-    TaskKind, TaskLifecycle, parse_duration,
+    OmpDriver, OpenCodeDriver, PiDriver, ResidencyPolicy, Resource, Restart, RestartMode,
+    SessionDriver, Task, TaskKind, TaskLifecycle, parse_duration,
 };
 pub use catalog_lock::CatalogLock;
 pub use exec_backend::ExecBackend;
@@ -93,5 +95,6 @@ pub use reconcile::{
 };
 pub use run::{
     PtyCli, Runner, SystemRunner, UpReport, detect_host, down, down_specs, exec_state_dir, execute,
-    up_loop, up_loop_specs, up_once, up_once_selected, up_once_selected_specs, up_once_specs,
+    up_loop, up_loop_specs, up_loop_with_residency, up_once, up_once_selected,
+    up_once_selected_specs, up_once_specs, up_once_with_residency,
 };

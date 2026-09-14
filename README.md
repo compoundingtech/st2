@@ -499,12 +499,13 @@ Use the typed inventory instead of parsing `doctor` prose:
 st2 tasks --catalog "$CATALOG" --host <host> --json
 ```
 
-The `st2.task-inventory.v2` envelope joins the selected host's desired PTY and exec tasks to
-read-only runtime evidence. A complete observation exits zero. Catalog parse errors, declaration
-drift during observation, duplicate runtime IDs, timeouts, malformed output, PID reuse, and
-otherwise unprovable generations emit `complete: false` and exit non-zero. Missing runtime rows
-become `absent` only when the corresponding backend observation is complete; uncertainty remains
-`indeterminate`.
+The `st2.task-inventory.v3` envelope joins the selected host's desired PTY and exec tasks to
+read-only runtime evidence. Each row keeps the declared `residencyPolicy` separate from nullable
+host-local `runtimeResidency`. A complete observation exits zero. Catalog parse errors, declaration
+drift during observation, duplicate runtime IDs, malformed residency records, timeouts, malformed
+output, PID reuse, and otherwise unprovable generations emit `complete: false` and exit non-zero.
+Missing runtime rows become `absent` only when the corresponding backend observation is complete;
+uncertainty remains `indeterminate`.
 
 Every runtime has a tagged `resourceTarget`. A live Linux process reports
 `{"type":"linuxCgroupV2","path":"/..."}` from its exact unified

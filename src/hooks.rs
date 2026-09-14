@@ -282,7 +282,8 @@ pub fn required_by_codex_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(
             spec.driver.as_ref(),
             Some(agent_spec::spec::Driver::Codex(_))
@@ -317,7 +318,8 @@ pub fn required_by_pi_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Pi(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -358,7 +360,8 @@ pub fn required_by_omp_agent(
     this_host: &str,
     catalog_root: &Path,
 ) -> bool {
-    spec.host.as_deref().is_none_or(|host| host == this_host)
+    spec.desired_state.is_running()
+        && spec.host.as_deref().is_none_or(|host| host == this_host)
         && (matches!(spec.driver.as_ref(), Some(agent_spec::spec::Driver::Omp(_)))
             || spec.tasks.iter().any(|task| {
                 task.name == "agent"
@@ -758,6 +761,7 @@ mod tests {
         assert_eq!(registered, claude_settings_registration());
     }
 
+
     #[test]
     fn omp_launch_classification_is_exact() {
         let root = Path::new("/catalog");
@@ -918,6 +922,52 @@ mod tests {
     }
 
     #[test]
+    fn hook_demand_is_running_only_across_every_lifecycle_spelling() {
+        for (name, lifecycle, expected) in [
+            ("running", "", true),
+            (
+                "suspended",
+                r#"desired-state "suspended" reason="Waiting""#,
+                false,
+            ),
+            (
+                "canonical-retired",
+                r#"desired-state "retired" reason="Finished""#,
+                false,
+            ),
+            ("legacy-retired", "retired #true", false),
+        ] {
+            for provider in ["codex", "pi", "omp"] {
+                let root = tempfile::tempdir().unwrap();
+                let identity = format!("{name}-{provider}");
+                let path = root.path().join(format!("agents/h/{identity}/agent.kdl"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(
+                    path,
+                    format!(
+                        r#"agent "{identity}" {{
+  host "h"
+  {lifecycle}
+  command "{provider}"
+}}"#
+                    ),
+                )
+                .unwrap();
+                let found = crate::discover(root.path());
+                assert!(found.errors.is_empty(), "{identity}: {:?}", found.errors);
+                let spec = &found.specs[0];
+                let demanded = match provider {
+                    "codex" => required_by_codex_agent(spec, "h", root.path()),
+                    "pi" => required_by_pi_agent(spec, "h", root.path()),
+                    "omp" => required_by_omp_agent(spec, "h", root.path()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(demanded, expected, "{identity}");
+            }
+        }
+    }
+
+    #[test]
     fn explicit_install_is_idempotent_receipted_and_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let first = install_at(tmp.path(), false).unwrap();
@@ -1047,5 +1097,43 @@ mod tests {
             b"partial\n",
             "the explicit installer must not rewrite a partial content-addressed set"
         );
+    }
+
+    #[test]
+    fn claude_observer_propagates_only_mandatory_resume_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join("claude-observe.sh");
+        let fake_st2 = temp.path().join("st2");
+        fs::write(&hook, CLAUDE_OBSERVE).unwrap();
+        fs::write(&fake_st2, "#!/bin/sh\nexit 7\n").unwrap();
+        for path in [&hook, &fake_st2] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |mandatory: bool, event: &str| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&hook)
+                .arg(event)
+                .env("PATH", &path)
+                .env("ST_AGENT", "h.worker")
+                .env("CATALOG", temp.path());
+            if mandatory {
+                command.env("ST2_CLAUDE_RESUME_GENERATION", "2");
+            }
+            command.status().unwrap()
+        };
+        assert!(run(false, "SessionStart").success());
+        assert!(run(true, "PreToolUse").success());
+        assert_eq!(run(true, "SessionStart").code(), Some(7));
     }
 }

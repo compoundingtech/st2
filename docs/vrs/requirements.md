@@ -50,6 +50,14 @@ accepted.
   directly owned by a declaration.
 - **R03 Host-pinned placement:** Every runnable agent or task resolves to its
   declared host; host-local roots own reconciliation.
+- **R43 Lifecycle-scoped launch readiness:** Declaration parsing, path
+  resolution and authority, render grammar and destination safety, delivery
+  shape and coherence, identity, and topology validity apply in every desired
+  lifecycle state. Address occupancy applies to running and suspended subjects.
+  Ambient filesystem, render-input, socket, overlay, hook, and delivery
+  readiness apply only to running subjects. Suspended and retired declarations
+  neither require those dependencies to be present nor cause Resource Profile
+  resolution; activation re-establishes every readiness gate before launch.
 
 ### Must provide intelligent host supervision
 
@@ -57,6 +65,31 @@ accepted.
   deterministic st2 reconciler keeps declared local processes converged; the
   root observes host-local runtime health, diagnoses failures, performs bounded
   recovery, and escalates what it cannot resolve.
+- **R44 Declared residency policy:** An Agent Spec declares `residency-policy`
+  as `always` or `on-demand`; omission means `always`. The field controls only
+  whether a desired-running agent is eligible to become cold. It never changes
+  desired state, and suspended or retired agents remain owned by ordinary
+  desired-state reconciliation. `on-demand` requires a declared native session
+  driver. Host policy owns idle thresholds and warm capacity. Inventory exposes
+  declaration policy and runtime residency as separate inputs to the effective
+  decision.
+- **R45 Lossless on-demand transition:** An on-demand transition preserves the
+  exact provider-native session. st2 checkpoints that native binding, stops the
+  complete owned task group, verifies absence, resumes the saved binding,
+  verifies that exact resumed session, and only then delivers demand. Unsupported,
+  mismatched, malformed, or indeterminate evidence refuses the transition; st2
+  never substitutes a fresh session. Runtime residency is one closed axis:
+  `active`, `quiescing`, `stopping`, `cold`, `starting`, or `refused`, distinct
+  from desired state, process observation, harness state, and delivery evidence.
+  Its host-local ledger is durable, generation-fenced, atomically replaced, and
+  restored fail-closed.
+- **R46 Durable wake demand:** The initial authoritative wake sources are a
+  durable inbox message and an explicit operator wake or attach request.
+  Passive CPU, PTY attachment state, filesystem access, and Resource observation
+  do not wake a cold agent. Once checkpointing starts, racing demand remains
+  durable while st2 completes stop, verified absence, exact native resume, and
+  readiness; no cancellation path is required. st2 measures resume-to-ready and
+  demand-to-delivery latency before assigning a latency objective.
 - **R40 Prompt catalog convergence:** A resident catalog supervisor begins a
   new serialized reconciliation pass promptly after a supported declaration
   publication becomes durably visible; it does not normally wait for the
@@ -247,9 +280,8 @@ accepted.
   no owned bytes and require no assertion; a candidate that merely claims a
   marker is not an authority, so the receipt records only a marker the
   incumbent confirmed.
-  A caller binds single-agent publication to the exact no-follow source capture
-  with an authoritative input digest. A canonical whole-catalog snapshot
-  externalizes the declaration-root digest while excluding runtime state and
+  A canonical whole-catalog snapshot externalizes the
+  `st2.catalog-declaration-root.v1` projection while excluding runtime state and
   workspace content. Its closed projection includes every regular file in a
   bounded `_templates` library and exact declared canonical workspace directory
   facts. Whole-catalog apply binds its exact captured desired projection to a
@@ -439,15 +471,20 @@ accepted.
   refuses malformed, ambiguous, or unsupported declarations. A Nix-owned
   declaration refuses authoring unless the caller asserts exactly the ownership
   marker that declaration carries; a mismatched, absent, unresolvable, or
-  malformed assertion fails closed, and the asserted arm additionally admits the
-  complete prospective catalog exactly as a compare-and-swap publication of the
-  same bytes would, so it cannot commit a declaration the catalog would reject.
-  It is the only authoring verb with that authority, because a projection has
-  one transition its own source cannot express: the source change being
-  projected is the seat's removal. A
-  transition from retired to running or suspended validates effective-address
-  uniqueness against the complete prospective catalog before publication,
-  including the positional identity fallback. Running is canonically omitted;
+  malformed assertion fails closed. Every desired-state mutation builds one
+  complete prospective catalog under the authoring lock and compares incumbent
+  and prospective core `ERROR` identities as `(code, catalog-relative path,
+  agent)` multisets. It refuses every positive delta, without using messages
+  that contain shadow paths, so lifecycle authoring cannot introduce a core
+  error but an unrelated pre-existing error does not block repair or teardown.
+  This lifecycle-delta admission applies equally to ordinary and marker-matched
+  authoring; the marker remains authority only. It is the only authoring verb
+  with asserted generator authority, because a projection has one transition
+  its own source cannot express: the source change being projected is the
+  seat's removal. Entering running activates launch readiness and address
+  admission; entering suspended reacquires address and topology admission while
+  readiness remains inactive; entering retired exposes retirement topology
+  admission. Running is canonically omitted;
   suspended and retired states persist their rationale. Its receipt proves the
   declaration edit, never runtime convergence. Human listing, roster JSON, task
   inventory, and Doctor expose desired state without conflating it with

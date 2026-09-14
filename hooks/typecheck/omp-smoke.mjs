@@ -67,6 +67,7 @@ for (const name of ["message_end", "turn_end", "session_compact"]) {
 const bareCtx = {
   isIdle: () => true,
   ui: { notify: () => {} },
+  sessionManager: { getSessionId: () => "session-smoke" },
 };
 // A ctx carrying the surfaces measured on omp 18.0.9 (and reproduced on 18.0.3). `tokens` is the
 // prompt figure — deliberately not this message's `totalTokens`. Without this ctx the producer's
@@ -76,7 +77,10 @@ const fullCtx = {
   ...bareCtx,
   model: { id: "fake-1", provider: "fakelab", contextWindow: 4000 },
   getContextUsage: () => ({ tokens: 22500, contextWindow: 4000, percent: 562.5 }),
-  sessionManager: { getEntries: () => [{ type: "message" }, { type: "compaction" }] },
+  sessionManager: {
+    getSessionId: () => "session-smoke",
+    getEntries: () => [{ type: "message" }, { type: "compaction" }],
+  },
 };
 // And the hostile ctx: every telemetry pull throws. A guarded producer withholds; an unguarded one
 // takes a turn down with it.
@@ -89,6 +93,7 @@ const throwingCtx = {
     throw new Error("smoke: usage is not readable");
   },
   sessionManager: {
+    getSessionId: () => "session-smoke",
     getEntries: () => {
       throw new Error("smoke: entries are not readable");
     },
@@ -136,7 +141,10 @@ await handlers.get("tool_call")(
 );
 await handlers.get("tool_result")({ toolName: "read", toolCallId: "unrelated" }, activeCtx);
 await new Promise((resolve) => setTimeout(resolve, 50));
-let askStates = readFrames().filter((frame) => frame.type === "state").slice(beforeAsk);
+let askStates = readFrames()
+  .filter((frame) => frame.type === "state")
+  .slice(beforeAsk)
+  .filter((frame) => frame.blockedOn === "human");
 assert.deepStrictEqual(askStates, [
   {
     type: "state",
@@ -250,6 +258,18 @@ assert.strictEqual(
 // Give the recorder a moment to drain, then assert the wire the Rust decoder reads.
 await new Promise((resolve) => setTimeout(resolve, 500));
 const frames = readFrames();
+assert.ok(
+  frames.some(
+    (frame) => frame.type === "session" && frame.sessionId === "session-smoke",
+  ),
+  "session_start must bind the native OMP session before channel readiness",
+);
+assert.ok(
+  frames.some(
+    (frame) => frame.type === "ready" && frame.sessionId === "session-smoke",
+  ),
+  "session_start must acknowledge the bound native OMP session after Rust hello",
+);
 assert.ok(
   frames.some((frame) => frame.type === "pre_compact"),
   "session_before_compact must emit the Rust-owned recovery edge",
