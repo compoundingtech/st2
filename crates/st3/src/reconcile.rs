@@ -1375,7 +1375,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if view.attempt < step.spec.retry.attempts {
                     changed |= self.store.retry_step(
                         &view.subject,
-                        "the step retry policy permits another attempt",
+                        "the step repeat policy permits another attempt",
                         step.spec.retry.backoff_ms,
                     )?;
                 }
