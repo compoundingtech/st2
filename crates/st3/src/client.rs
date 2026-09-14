@@ -1,5 +1,3 @@
-use std::io::{Read as _, Write as _};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -65,13 +63,7 @@ impl Client {
             .transpose()?
             .unwrap_or_default();
         let response = match &self.endpoint {
-            Endpoint::Unix(socket) => {
-                let socket = socket.clone();
-                let method = method.to_owned();
-                let path = path.to_owned();
-                tokio::task::spawn_blocking(move || unix_request(&socket, &method, &path, &bytes))
-                    .await??
-            }
+            Endpoint::Unix(socket) => unix_request(socket, method, path, &bytes).await?,
             Endpoint::Http(base) => {
                 let url = format!("{base}{path}");
                 let request = match method {
@@ -199,23 +191,29 @@ impl Drop for RawTerminal {
     }
 }
 
-fn unix_request(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-    let mut stream = UnixStream::connect(socket).with_context(|| {
-        format!(
-            "connect to the st3 API at {}; run `st3 up` first",
-            socket.display()
-        )
-    })?;
-    stream.write_all(
+async fn unix_request(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| {
+            format!(
+                "connect to the st3 API at {}; run `st3 up` first",
+                socket.display()
+            )
+        })?;
+    stream
+        .write_all(
         format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .as_bytes(),
-    )?;
-    stream.write_all(body)?;
+    )
+        .await?;
+    stream.write_all(body).await?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    stream.read_to_end(&mut response).await?;
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

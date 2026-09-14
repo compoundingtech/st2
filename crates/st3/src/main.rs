@@ -6681,10 +6681,11 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     let mut initialized = false;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut event_cursor = None;
+    let mut initial_sync = tokio::time::interval(Duration::from_secs(1));
+    initial_sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renewal_interval = tokio::time::interval(Duration::from_secs(30));
+    renewal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut announced = BTreeSet::new();
     let mut renewed_minute = None;
     let mut ready = false;
@@ -6722,66 +6723,58 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
                     stdout.flush().await?;
                 }
             }
-            _ = interval.tick(), if initialized => {
+            _ = initial_sync.tick(), if initialized && event_cursor.is_none() => {
                 let tick: Result<()> = async {
-                    if !ready {
-                        let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
-                            subject: subject.into(),
-                            kind: "harness.observed".into(),
-                            actor: Some(subject.into()),
-                            fields: BTreeMap::from([
-                                ("state".into(), Value::String("ready".into())),
-                                ("driver".into(), Value::String("claude".into())),
-                            ]),
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!("claude-ready:{subject}")),
-                        }).await?;
-                        ready = true;
-                    }
-                    let messages: Vec<MessageView> = client
-                        .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
-                        .await?;
-                    for message in messages.into_iter().filter(|message| message.status == "sent") {
-                        if !announced.contains(&message.subject) {
-                            let content = message_content(client, &message).await?;
-                            let content = message.title.as_ref().map_or(content.clone(), |title| format!("Subject: {title}\n\n{content}"));
-                            let notification = json!({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/claude/channel",
-                                "params": {
-                                    "content": content,
-                                    "meta": {
-                                        "from": message.from,
-                                        "messageId": message.subject,
-                                        "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
-                                        "identity": subject
-                                    }
-                                }
-                            });
-                            stdout.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                            stdout.write_all(b"\n").await?;
-                            stdout.flush().await?;
-                            announced.insert(message.subject.clone());
-                        }
-                        deliver_message(
-                            client,
-                            &message.subject,
-                            subject,
-                            format!("message-delivered:{}:{subject}", message.subject),
-                        )
-                        .await?;
-                        announced.remove(&message.subject);
-                    }
+                    let health: Value = client.get("/v1/health").await?;
+                    let cursor = health
+                        .get("store_index")
+                        .and_then(Value::as_u64)
+                        .context("the st3 health response lacks a store index")?;
+                    sync_claude_mcp_state(
+                        client,
+                        subject,
+                        &mut stdout,
+                        &mut announced,
+                        &mut ready,
+                    )
+                    .await?;
+                    event_cursor = Some(cursor);
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
                     tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
                 }
             }
-            _ = work_interval.tick(), if initialized => {
+            events = wait_for_channel_events(client, event_cursor.unwrap_or_default()), if initialized && event_cursor.is_some() => {
+                match events {
+                    Ok(events) => {
+                        if let Some(cursor) = event_cursor.as_mut() {
+                            for event in &events {
+                                *cursor = (*cursor).max(event.store_index);
+                            }
+                        }
+                        if !events.is_empty()
+                            && let Err(error) = sync_claude_mcp_state(
+                                client,
+                                subject,
+                                &mut stdout,
+                                &mut announced,
+                                &mut ready,
+                            )
+                            .await
+                        {
+                            tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                    Err(error) => {
+                        tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            _ = renewal_interval.tick(), if initialized && event_cursor.is_some() => {
                 let tick: Result<()> = async {
-                    sync_work_messages(client, subject).await?;
                     let minute = unix_minute()?;
                     if renewed_minute != Some(minute) {
                         renew_claimed_work(client, subject, minute).await?;
@@ -6795,6 +6788,87 @@ async fn run_claude_mcp(client: &Client, subject: &str) -> Result<()> {
             }
         }
     }
+}
+
+async fn wait_for_channel_events(client: &Client, cursor: u64) -> Result<Vec<EventRecord>> {
+    client
+        .get(&format!(
+            "/v1/events?after={cursor}&wait=true&timeout_ms=30000"
+        ))
+        .await
+}
+
+async fn sync_claude_mcp_state(
+    client: &Client,
+    subject: &str,
+    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
+    announced: &mut BTreeSet<String>,
+    ready: &mut bool,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    if !*ready {
+        let _: ClaimRecord = client
+            .post(
+                "/v1/claims",
+                &ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("ready".into())),
+                        ("driver".into(), Value::String("claude".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("claude-ready:{subject}")),
+                },
+            )
+            .await?;
+        *ready = true;
+    }
+    let messages: Vec<MessageView> = client
+        .get(&format!("/v1/messages?to={}", urlencoding::encode(subject)))
+        .await?;
+    for message in messages
+        .into_iter()
+        .filter(|message| message.status == "sent")
+    {
+        if !announced.contains(&message.subject) {
+            let content = message_content(client, &message).await?;
+            let content = message.title.as_ref().map_or(content.clone(), |title| {
+                format!("Subject: {title}\n\n{content}")
+            });
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel",
+                "params": {
+                    "content": content,
+                    "meta": {
+                        "from": message.from,
+                        "messageId": message.subject,
+                        "threadId": message.in_reply_to.clone().unwrap_or_else(|| message.subject.clone()),
+                        "identity": subject
+                    }
+                }
+            });
+            stdout
+                .write_all(serde_json::to_string(&notification)?.as_bytes())
+                .await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+            announced.insert(message.subject.clone());
+        }
+        deliver_message(
+            client,
+            &message.subject,
+            subject,
+            format!("message-delivered:{}:{subject}", message.subject),
+        )
+        .await?;
+        announced.remove(&message.subject);
+    }
+    sync_work_messages(client, subject).await
 }
 
 fn read_intent(path: Option<&Path>) -> Result<(String, Option<String>)> {
@@ -7466,6 +7540,69 @@ mod tests {
             config["mcpServers"]["st3"]["args"],
             json!(["driver", "claude-mcp", "--subject", "agent/node.worker"])
         );
+    }
+
+    #[tokio::test]
+    async fn the_claude_channel_waits_for_a_graph_event() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let notify = Arc::new(Notify::new());
+        let (event_notify, _event_receiver) = watch::channel(0_u64);
+        let app = router(AppState {
+            store,
+            notify,
+            event_notify,
+            node: "node".into(),
+            state_dir: root.path().into(),
+            pty_root: root.path().join("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+        });
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve_unix(&server_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(socket.exists(), "the test API did not create its socket");
+        let client = Client::unix(&socket);
+        let waiter_client = client.clone();
+        let waiter = tokio::spawn(async move { wait_for_channel_events(&waiter_client, 0).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the channel event wait returned without a graph event"
+        );
+
+        let claim: ClaimRecord = client
+            .post(
+                "/v1/claims",
+                &ClaimInput {
+                    subject: "custom/test/channel-wake".into(),
+                    kind: "custom.channel.changed".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some("channel-wake".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the graph event did not wake the channel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].store_index, claim.store_index);
+        assert_eq!(events[0].subject, "custom/test/channel-wake");
+        server.abort();
     }
 
     #[test]
