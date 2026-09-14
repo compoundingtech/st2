@@ -565,6 +565,11 @@ Runtime failure stays visible as claims. It is not removed from history after re
 
 A missing `under` target is different. It is presentation metadata, so it produces a warning and does not fail unrelated work.
 
+## Near-term design backlog
+
+- [ ] Build agent session freeze-drying and rehydration into st3. A long graph wait can suspend a harness and retain its resumable session state. A later graph change can restore that session before work resumes. A human gate is one important suspension case. The design must define safe suspension points, stored state, timing policy, and recovery failure behavior.
+- [ ] Define a harness-neutral session view contract in the harness drivers. The contract must support custom conversation views in SwiftUI, React, and other native clients. It must describe ordered messages, roles, tool activity, runtime status, errors, usage, and incremental updates. It must not expose driver-specific storage as the public contract.
+
 ## Delivery sequence
 
 The rollout order is:
